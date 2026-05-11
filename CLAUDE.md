@@ -44,6 +44,7 @@ There is a `[patch.crates-io]` pin on `x11-clipboard` in the root `Cargo.toml` (
 
 ## Conventions specific to this fork
 
+- Mirror upstream alacritty wherever possible. Before implementing input handling, config parsing, terminal behavior, key bindings, clipboard, scrolling, selection, or anything else that alacritty already solves, look at how `alacritty/` does it and follow the same approach. This fork swaps the renderer (egui instead of winit/OpenGL) but should otherwise behave like alacritty — divergence is a last resort, not the default, and should be justified in a comment when unavoidable.
 - Two TOML files: `alacritty.toml` (shared with the alacritty terminal — palette, cursor, scrolling, shell, key bindings) and `alacritree.toml` (sidebar/UI overrides under `[ui]`). When adding a config field, decide whether it belongs in the shared file or the alacritree-only file, and document it in the relevant `Raw*` struct in `config.rs`.
 - Sessions outlive workspace switches. Don't introduce code that drops a `Session` just because it isn't visible.
 - `EventProxy::send_event` calls `request_repaint` — this is what wakes the egui loop on PTY output. Anything that produces terminal events on a background thread must go through an `EventProxy` (or otherwise call `request_repaint`) or it will appear to hang until the next input event.

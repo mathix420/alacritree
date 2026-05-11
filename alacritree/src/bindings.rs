@@ -47,6 +47,10 @@ pub enum NamedAction {
     Quit,
     /// Used to unbind a key — consumes the press without acting on it.
     NoOp,
+    /// Alacritty's pass-through marker: the matching binding runs (no-op for
+    /// us) but suppress_chars stays off so the key still reaches the PTY.
+    /// Mirrors `Action::ReceiveChar` in `alacritty/src/input/keyboard.rs`.
+    ReceiveChar,
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,8 +197,16 @@ fn default_bindings() -> Vec<KeyBinding> {
     b
 }
 
-pub fn matches(bindings: &[KeyBinding], key: Key, mods: Modifiers) -> Option<&BindingAction> {
-    bindings.iter().find(|b| b.key == key && mods_match(b.mods, mods)).map(|b| &b.action)
+/// Every binding that fires for `(key, mods)`.  Alacritty runs *all* matching
+/// bindings (see `Processor::process_key_bindings`), so the user's typical
+/// pattern of stacking `ClearLogNotice` + `chars = "\f"` on Ctrl+L works:
+/// the first action is our `Unsupported` no-op, the second writes 0x0c.
+pub fn all_matches(
+    bindings: &[KeyBinding],
+    key: Key,
+    mods: Modifiers,
+) -> Vec<&BindingAction> {
+    bindings.iter().filter(|b| b.key == key && mods_match(b.mods, mods)).map(|b| &b.action).collect()
 }
 
 /// Alacritty semantics: `Control|Shift` does not fire on Ctrl alone even though
@@ -408,6 +420,7 @@ fn parse_action(name: &str) -> BindingAction {
         "SelectLastTab" => BindingAction::Named(SelectLastTab),
         "Quit" => BindingAction::Named(Quit),
         "None" => BindingAction::Named(NoOp),
+        "ReceiveChar" => BindingAction::Named(ReceiveChar),
         other => BindingAction::Unsupported(other.to_string()),
     }
 }
