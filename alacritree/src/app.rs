@@ -464,11 +464,19 @@ impl AlacritreeApp {
             let mut actions = Vec::new();
             i.events.retain(|ev| {
                 if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
-                    if let Some(action) =
-                        crate::bindings::matches(&self.config.bindings, *key, *modifiers)
-                    {
-                        actions.push(action.clone());
-                        return false;
+                    let matched = crate::bindings::all_matches(
+                        &self.config.bindings,
+                        *key,
+                        *modifiers,
+                    );
+                    if !matched.is_empty() {
+                        let suppress_chars = matched
+                            .iter()
+                            .all(|a| !matches!(a, BindingAction::Named(NamedAction::ReceiveChar)));
+                        for a in matched {
+                            actions.push(a.clone());
+                        }
+                        return !suppress_chars;
                     }
                 }
                 true
@@ -541,6 +549,7 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::SelectTab(n)) => self.select_tab(n),
             BindingAction::Named(NamedAction::SelectLastTab) => self.select_last_tab(),
             BindingAction::Named(NamedAction::NoOp) => {},
+            BindingAction::Named(NamedAction::ReceiveChar) => {},
             BindingAction::Named(other) => {
                 self.dispatch_scroll_or_other(other);
             },
