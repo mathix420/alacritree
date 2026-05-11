@@ -11,6 +11,7 @@ use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::config::Config;
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, StatusCache};
+use crate::paste;
 use crate::projects::{Project, Worktree};
 use crate::session::{Session, SessionId, SessionKind, TermSize};
 use crate::state::{self, PersistedProject, PersistedState};
@@ -523,26 +524,27 @@ impl AlacritreeApp {
                 }
             },
             BindingAction::Named(NamedAction::Paste) => {
-                if let Some(text) = clipboard::read(Target::Clipboard) {
-                    if let Some(idx) = self.active_session_index() {
-                        self.sessions[idx].write(text.into_bytes());
-                    }
+                if let (Some(text), Some(idx)) =
+                    (clipboard::read(Target::Clipboard), self.active_session_index())
+                {
+                    paste::paste(&self.sessions[idx], &text, true);
                 }
             },
             BindingAction::Named(NamedAction::PasteSelection) => {
-                if let Some(text) = clipboard::read(Target::Primary) {
-                    if let Some(idx) = self.active_session_index() {
-                        self.sessions[idx].write(text.into_bytes());
-                    }
+                if let (Some(text), Some(idx)) =
+                    (clipboard::read(Target::Primary), self.active_session_index())
+                {
+                    paste::paste(&self.sessions[idx], &text, true);
                 }
             },
             BindingAction::Named(NamedAction::Copy) => {
                 if let Some(idx) = self.active_session_index() {
-                    if let Some(text) = self.sessions[idx].term.lock().selection_to_string() {
-                        if !text.is_empty() {
-                            clipboard::write(Target::Clipboard, &text);
-                        }
-                    }
+                    paste::copy_selection(&self.sessions[idx], &self.config, Target::Clipboard);
+                }
+            },
+            BindingAction::Named(NamedAction::CopySelection) => {
+                if let Some(idx) = self.active_session_index() {
+                    paste::copy_selection(&self.sessions[idx], &self.config, Target::Primary);
                 }
             },
             BindingAction::Named(NamedAction::SpawnNewInstance) => {

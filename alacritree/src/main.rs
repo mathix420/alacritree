@@ -10,6 +10,7 @@ mod fonts;
 mod git_status;
 mod input;
 mod links;
+mod paste;
 mod projects;
 mod session;
 mod state;

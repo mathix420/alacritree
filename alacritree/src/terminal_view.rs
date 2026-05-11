@@ -18,6 +18,7 @@ use crate::config::Config;
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
 use crate::input::event_to_bytes;
 use crate::links::{self, Link};
+use crate::paste;
 use crate::session::{EventProxy, Session, TermSize};
 
 pub fn show(
@@ -120,14 +121,24 @@ pub fn show(
     );
 
     if allow_focus && response.has_focus() {
-        let consumed: Vec<Vec<u8>> =
-            ui.input(|i| i.events.iter().filter_map(event_to_bytes).collect());
+        let consumed: Vec<ConsumedEvent> = ui.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Paste(s) => Some(ConsumedEvent::Paste(s.clone())),
+                    _ => event_to_bytes(e).map(ConsumedEvent::Bytes),
+                })
+                .collect()
+        });
         if !consumed.is_empty() {
             // Typing should drop any active selection — matches alacritty's UX.
             session.term.lock().selection = None;
         }
-        for bytes in consumed {
-            session.write(bytes);
+        for event in consumed {
+            match event {
+                ConsumedEvent::Bytes(bytes) => session.write(bytes),
+                ConsumedEvent::Paste(text) => paste::paste(session, &text, true),
+            }
         }
     }
 
@@ -182,7 +193,7 @@ fn handle_selection(
     // Middle-click pastes the PRIMARY (selection) buffer — alacritty's default.
     if response.clicked_by(middle) {
         if let Some(text) = clipboard::read(Target::Primary) {
-            session.write(text.into_bytes());
+            paste::paste(session, &text, true);
         }
         return;
     }
@@ -199,7 +210,7 @@ fn handle_selection(
                 if let Some(sel) = term.selection.as_mut() {
                     sel.update(point, side);
                 }
-                copy_active_selection(&term, config);
+                paste::write_selection(&term, config, Target::Primary);
             }
         }
         return;
@@ -268,7 +279,7 @@ fn handle_selection(
             }
         }
     } else if response.drag_stopped_by(primary) {
-        copy_active_selection(&session.term.lock(), config);
+        paste::write_selection(&session.term.lock(), config, Target::Primary);
     } else if response.clicked_by(primary) {
         // A bare primary click on a link follows it instead of clearing the
         // selection.  That matches alacritty's default URL hint, which fires
@@ -395,7 +406,7 @@ fn start_selection_at(
     let display_offset = term.grid().display_offset() as i32;
     let (point, side) = cell_at_pos(pos, rect, cell_w, cell_h, cols, rows, display_offset);
     term.selection = Some(Selection::new(ty, point, side));
-    copy_active_selection(&term, config);
+    paste::write_selection(&term, config, Target::Primary);
 }
 
 /// Pointer position to use for click handlers.  Triple/double click are
@@ -425,20 +436,9 @@ fn cell_at_pos(
     (Point::new(Line(row as i32 - display_offset), Column(col)), side)
 }
 
-fn copy_active_selection(term: &Term<EventProxy>, config: &Config) {
-    let Some(text) = term.selection_to_string() else {
-        return;
-    };
-    if text.is_empty() {
-        return;
-    }
-    // alacritty default: drag-select feeds the PRIMARY (middle-click) buffer.
-    // The regular clipboard is mirrored only when `selection.save_to_clipboard`
-    // is on.
-    clipboard::write(Target::Primary, &text);
-    if config.selection.save_to_clipboard {
-        clipboard::write(Target::Clipboard, &text);
-    }
+enum ConsumedEvent {
+    Bytes(Vec<u8>),
+    Paste(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -688,7 +688,7 @@ fn paint_run(
 fn paint_cursor(
     painter: &egui::Painter,
     rect: Rect,
-    term: &alacritty_terminal::term::Term<crate::session::EventProxy>,
+    term: &Term<EventProxy>,
     config: &Config,
     cursor_point: Point,
     cursor_visible_line: i32,
