@@ -105,31 +105,38 @@ fn current_branch(repo: &Repository) -> Option<String> {
 
 /// Best-effort detection of the repository's default branch.
 ///
-/// Order: `init.defaultBranch` config → `refs/remotes/origin/HEAD` → presence of
-/// `main` / `master`.  Returns the branch name (without `refs/heads/`) or
-/// `None` if nothing fits.
+/// `refs/remotes/origin/HEAD` is the source of truth when present — it's what
+/// `origin` says the default branch is.  We fall back to common local names
+/// only if the remote ref is missing.  `init.defaultBranch` is checked LAST
+/// and only if it names a branch that actually exists in this repo, because
+/// that config is about what `git init` names new repos — not the default
+/// branch of an already-cloned project (a global `init.defaultBranch=master`
+/// would otherwise hijack repos whose actual default is `main` or anything
+/// else).  Returns the branch name (without `refs/heads/`) or `None`.
 fn detect_default_branch(repo: &Repository) -> Option<String> {
-    if let Ok(cfg) = repo.config() {
-        if let Ok(name) = cfg.get_string("init.defaultBranch") {
-            if !name.is_empty() {
-                return Some(name);
-            }
-        }
-    }
-
     if let Ok(reference) = repo.find_reference("refs/remotes/origin/HEAD") {
         if let Some(target) = reference.symbolic_target() {
-            // Strip the leading "refs/remotes/origin/".
             if let Some(name) = target.strip_prefix("refs/remotes/origin/") {
                 return Some(name.to_string());
             }
         }
     }
 
-    for candidate in ["main", "master"] {
+    for candidate in ["main", "master", "trunk", "develop"] {
         if repo.find_reference(&format!("refs/heads/{candidate}")).is_ok() {
             return Some(candidate.to_string());
         }
     }
+
+    if let Ok(cfg) = repo.config() {
+        if let Ok(name) = cfg.get_string("init.defaultBranch") {
+            if !name.is_empty()
+                && repo.find_reference(&format!("refs/heads/{name}")).is_ok()
+            {
+                return Some(name);
+            }
+        }
+    }
+
     None
 }

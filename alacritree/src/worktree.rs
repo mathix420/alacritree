@@ -71,16 +71,19 @@ fn run_create(
         ctx.request_repaint();
     };
 
-    let base =
-        req.default_branch.clone().ok_or_else(|| "no default branch detected".to_string())?;
-
     send("Syncing with remote…");
     if !has_remote(&req.project_root, "origin") {
         return Err("no `origin` remote configured".into());
     }
 
+    // The cached `default_branch` is a hint; if it's missing or stale (e.g.
+    // user has a global `init.defaultBranch=master` but the repo's actual
+    // default is `main`), ask origin what its HEAD really points to.
+    let (base, base_ref) = resolve_base_branch(&req.project_root, req.default_branch.as_deref())
+        .map_err(|attempts| {
+            format!("could not determine base branch (tried: {})", attempts.join(", "))
+        })?;
     send(&format!("Verifying base branch `{base}`"));
-    let base_ref = verify_base_branch(&req.project_root, &base)?;
 
     send("Fetching latest changes…");
     run_git(&req.project_root, &["fetch", "origin", &base])?;
@@ -166,33 +169,88 @@ fn has_remote(cwd: &Path, name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn verify_base_branch(cwd: &Path, branch: &str) -> Result<String, String> {
-    let remote = format!("origin/{branch}");
-    if Command::new("git")
+/// Resolve the base branch dynamically.  Tries the caller's hint first, then
+/// asks origin via `git ls-remote --symref HEAD` (the authoritative source),
+/// then falls back through common names.  Returns `(branch_name, ref_to_use)`
+/// where `ref_to_use` is what `git worktree add -b … <ref>` should branch
+/// from (prefer `origin/<branch>` so we start from the fetched remote tip).
+/// On total failure, returns the list of names we tried.
+fn resolve_base_branch(cwd: &Path, hint: Option<&str>) -> Result<(String, String), Vec<String>> {
+    let mut tried: Vec<String> = Vec::new();
+
+    let try_branch = |name: &str, tried: &mut Vec<String>| -> Option<(String, String)> {
+        if tried.iter().any(|t| t == name) {
+            return None;
+        }
+        tried.push(name.to_string());
+        if rev_parse_verify(cwd, &format!("origin/{name}")) {
+            return Some((name.to_string(), format!("origin/{name}")));
+        }
+        if rev_parse_verify(cwd, name) {
+            return Some((name.to_string(), name.to_string()));
+        }
+        None
+    };
+
+    if let Some(name) = hint {
+        if let Some(found) = try_branch(name, &mut tried) {
+            return Ok(found);
+        }
+    }
+
+    if let Some(remote_head) = query_origin_head(cwd) {
+        if let Some(found) = try_branch(&remote_head, &mut tried) {
+            return Ok(found);
+        }
+    }
+
+    for candidate in ["main", "master", "trunk", "develop"] {
+        if let Some(found) = try_branch(candidate, &mut tried) {
+            return Ok(found);
+        }
+    }
+
+    Err(tried)
+}
+
+fn rev_parse_verify(cwd: &Path, name: &str) -> bool {
+    Command::new("git")
         .arg("-C")
         .arg(cwd)
-        .args(["rev-parse", "--verify", "--quiet", &remote])
+        .args(["rev-parse", "--verify", "--quiet", name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
-    {
-        return Ok(remote);
-    }
-    if Command::new("git")
+}
+
+/// Ask origin which branch HEAD points to.  Output looks like:
+///   ref: refs/heads/main\tHEAD
+///   <sha>\tHEAD
+/// We pull the `refs/heads/<name>` from the symref line.
+fn query_origin_head(cwd: &Path) -> Option<String> {
+    let output = Command::new("git")
         .arg("-C")
         .arg(cwd)
-        .args(["rev-parse", "--verify", "--quiet", branch])
-        .stdout(Stdio::null())
+        .args(["ls-remote", "--symref", "origin", "HEAD"])
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-    {
-        return Ok(branch.to_string());
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-    Err(format!("base branch `{branch}` not found locally or on origin"))
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("ref: ") {
+            let target = rest.split_whitespace().next()?;
+            if let Some(name) = target.strip_prefix("refs/heads/") {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Worktrees live under `~/.alacritree/worktrees/<project>-<hash>/<branch>` so

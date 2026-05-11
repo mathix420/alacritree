@@ -1845,7 +1845,7 @@ impl AlacritreeApp {
                 ui.label(
                     RichText::new(match default_branch.as_deref() {
                         Some(b) => format!("Branched from origin/{b}"),
-                        None => "No default branch detected — create may fail.".to_string(),
+                        None => "Base branch will be resolved from origin/HEAD.".to_string(),
                     })
                     .color(theme.text_muted)
                     .small(),

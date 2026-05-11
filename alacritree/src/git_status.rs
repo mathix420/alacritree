@@ -191,14 +191,9 @@ fn current_branch_name(repo: &Repository) -> Option<String> {
     }
 }
 
+/// Mirrors `projects::detect_default_branch` — see that function for the
+/// rationale behind the ordering.
 fn detect_default_branch(repo: &Repository) -> Option<String> {
-    if let Ok(cfg) = repo.config() {
-        if let Ok(name) = cfg.get_string("init.defaultBranch") {
-            if !name.is_empty() {
-                return Some(name);
-            }
-        }
-    }
     if let Ok(reference) = repo.find_reference("refs/remotes/origin/HEAD") {
         if let Some(target) = reference.symbolic_target() {
             if let Some(name) = target.strip_prefix("refs/remotes/origin/") {
@@ -206,9 +201,18 @@ fn detect_default_branch(repo: &Repository) -> Option<String> {
             }
         }
     }
-    for c in ["main", "master"] {
+    for c in ["main", "master", "trunk", "develop"] {
         if repo.find_reference(&format!("refs/heads/{c}")).is_ok() {
             return Some(c.to_string());
+        }
+    }
+    if let Ok(cfg) = repo.config() {
+        if let Ok(name) = cfg.get_string("init.defaultBranch") {
+            if !name.is_empty()
+                && repo.find_reference(&format!("refs/heads/{name}")).is_ok()
+            {
+                return Some(name);
+            }
         }
     }
     None
