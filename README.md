@@ -10,40 +10,18 @@
 
 ## About
 
-Alacritree is a native desktop terminal built on top of [Alacritty]'s
-headless PTY + VT parser + grid, rendered with [egui]/[eframe]. The feature
-set added on top is **intentionally minimal** — three things, all aimed at
-parallel Git work:
+The first ultrafast, FOSS alternative to the LLM/worktree management apps cropping up everywhere. Built around the amazing [Alacritty] terminal emulator and drop-in compatible with your `alacritty.toml`.
 
-- **Worktree + LLM-config management.** The left sidebar lists your
-  projects and their worktrees; spawning a shell in any of them is one
-  click. Creating a worktree validates the branch name, runs `git worktree
-  add` on a background thread, and copies your AI-assistant configs into
-  the new tree (`CLAUDE.md`, `.claude/`, `AGENTS.md`, `.cursorrules`,
-  `.cursor/`, Aider / Copilot / Windsurf / Codeium / Continue, …) so your
-  agent picks up the same instructions on day one.
-- **Git status bar.** A per-worktree panel on the right with the current
-  branch and staged / unstaged file lists, refreshed in the background.
-- **Pretty branch diffs.** A file-level summary of every change between the
-  worktree's HEAD and its merge base with the project's default branch —
-  see at a glance what the worktree actually contains.
+Minimalist approach, only 3 features:
 
-Everything else is upstream Alacritty: same VT engine, same PTY plumbing,
-same scrollback, same OSC 8 + regex link handling. The goal is to **keep
-Alacritty's lightning speed** and stay **drop-in compatible with your
-existing `alacritty.toml`** — palette, cursor, scrolling, shell, and every
-`[[keyboard.bindings]]` entry carry over unchanged. An optional
-`alacritree.toml` deep-merges sidebar UI overrides under `[ui]` on top, with
-arrays concatenating so your bindings *add to* Alacritty's defaults rather
-than replacing them.
+- **Worktree management.** Sidebar lists projects and worktrees; one click spawns a shell. Create fresh worktrees in seconds with pre-configured AI configs.
+- **Git status bar.** Per-workspace panel with branch + staged/unstaged files, refreshed in the background.
+- **Branch diffs.** Beautiful and meaningful diffs powered by [Delta].
 
-No Chromium runtime, no AI agent stack bolted on, no telemetry. Sessions
-are tabbed and outlive workspace switches, so running commands and scrollback
-survive every jump between worktrees.
+No Chromium, no bundled agents, no telemetry. No company behind it, and there never will be.
 
 [Alacritty]: https://github.com/alacritty/alacritty
-[egui]: https://github.com/emilk/egui
-[eframe]: https://github.com/emilk/egui/tree/master/crates/eframe
+[Delta]: https://github.com/dandavison/delta
 
 ## Screenshots
 
