@@ -1253,12 +1253,23 @@ fn file_row(
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.set_min_height(row_h);
-                ui.label(RichText::new(change.kind.glyph()).color(color).monospace().small());
+                // Labels default to `Sense::click_and_drag` for text selection;
+                // hit testing picks the smallest covering widget, so a clickable
+                // label inside our row would eat clicks before the row sees
+                // them.  Opt out of selection on every label that lives inside
+                // a clickable row so the click falls through.
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(change.kind.glyph()).color(color).monospace().small(),
+                    )
+                    .selectable(false),
+                );
                 ui.add(
                     egui::Label::new(
                         RichText::new(&change.path).color(path_color).monospace().small(),
                     )
-                    .truncate(),
+                    .truncate()
+                    .selectable(false),
                 );
                 fill_row(ui);
             },
@@ -1293,19 +1304,25 @@ fn branch_diff_row(
             |ui| {
                 ui.set_min_height(row_h);
                 if stat.deletions > 0 {
-                    ui.label(
-                        RichText::new(format!("-{}", stat.deletions))
-                            .color(removed)
-                            .small()
-                            .monospace(),
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("-{}", stat.deletions))
+                                .color(removed)
+                                .small()
+                                .monospace(),
+                        )
+                        .selectable(false),
                     );
                 }
                 if stat.additions > 0 {
-                    ui.label(
-                        RichText::new(format!("+{}", stat.additions))
-                            .color(added)
-                            .small()
-                            .monospace(),
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("+{}", stat.additions))
+                                .color(added)
+                                .small()
+                                .monospace(),
+                        )
+                        .selectable(false),
                     );
                 }
                 let remaining = ui.available_width();
@@ -1319,7 +1336,8 @@ fn branch_diff_row(
                                 egui::Label::new(
                                     RichText::new(&stat.path).color(path_color).monospace().small(),
                                 )
-                                .truncate(),
+                                .truncate()
+                                .selectable(false),
                             );
                             fill_row(ui);
                         },
