@@ -5,28 +5,41 @@
 <h1 align="center">Alacritree</h1>
 
 <p align="center">
-    A worktree-aware terminal that pairs <a href="https://github.com/alacritty/alacritty"><code>alacritty_terminal</code></a> with project and git sidebars.
+    A native terminal that turns Git worktrees into first-class workspaces, built on <a href="https://github.com/alacritty/alacritty">Alacritty</a>.
 </p>
 
 ## About
 
-Alacritree is a fork of [Alacritty]. It reuses Alacritty's headless
-`alacritty_terminal` crate (PTY, VT parser, grid) but replaces the winit/OpenGL
-GUI with an [egui]/[eframe] shell that adds two things the upstream terminal
-intentionally leaves out:
+Alacritree is a native desktop terminal built on top of [Alacritty]'s
+headless PTY + VT parser + grid, rendered with [egui]/[eframe]. The feature
+set added on top is **intentionally minimal** — three things, all aimed at
+parallel Git work:
 
-- **A project / worktree sidebar** on the left. Add a git repository and
-  Alacritree lists its worktrees; switching worktrees switches you to a shell
-  rooted in that path. Non-git folders work too — they show up as a single
-  pseudo-worktree so you can still spawn a shell there.
-- **A git status sidebar** on the right. Per-worktree staged/unstaged file
-  lists and a diff-stat against the project's default branch, refreshed in the
-  background.
+- **Worktree + LLM-config management.** The left sidebar lists your
+  projects and their worktrees; spawning a shell in any of them is one
+  click. Creating a worktree validates the branch name, runs `git worktree
+  add` on a background thread, and copies your AI-assistant configs into
+  the new tree (`CLAUDE.md`, `.claude/`, `AGENTS.md`, `.cursorrules`,
+  `.cursor/`, Aider / Copilot / Windsurf / Codeium / Continue, …) so your
+  agent picks up the same instructions on day one.
+- **Git status bar.** A per-worktree panel on the right with the current
+  branch and staged / unstaged file lists, refreshed in the background.
+- **Pretty branch diffs.** A file-level summary of every change between the
+  worktree's HEAD and its merge base with the project's default branch —
+  see at a glance what the worktree actually contains.
 
-Sessions are tabbed and outlive workspace switches: jumping between worktrees
-doesn't kill running shells. Configuration is the same `alacritty.toml` you
-already use (palette, cursor, scrolling, shell, key bindings), with an
-optional `alacritree.toml` for sidebar-specific UI overrides.
+Everything else is upstream Alacritty: same VT engine, same PTY plumbing,
+same scrollback, same OSC 8 + regex link handling. The goal is to **keep
+Alacritty's lightning speed** and stay **drop-in compatible with your
+existing `alacritty.toml`** — palette, cursor, scrolling, shell, and every
+`[[keyboard.bindings]]` entry carry over unchanged. An optional
+`alacritree.toml` deep-merges sidebar UI overrides under `[ui]` on top, with
+arrays concatenating so your bindings *add to* Alacritty's defaults rather
+than replacing them.
+
+No Chromium runtime, no AI agent stack bolted on, no telemetry. Sessions
+are tabbed and outlive workspace switches, so running commands and scrollback
+survive every jump between worktrees.
 
 [Alacritty]: https://github.com/alacritty/alacritty
 [egui]: https://github.com/emilk/egui
@@ -130,6 +143,24 @@ them), tables merge recursively, primitives replace.
 Alacritree-only options live under `[ui]` in `alacritree.toml` — sidebar
 colours, panel visibility, etc. See `alacritree/src/config.rs` for the
 current schema.
+
+## Documentation
+
+- [`docs/alacritree.md`](docs/alacritree.md) — full feature reference for the
+  fork: workspaces and sessions, the project/worktree sidebar (create/delete
+  flows, AI-config copy, branch validation), the git-status panel, the
+  terminal grid (built-in box-drawing, OSC 8 + regex links, OSC 52 clipboard),
+  the two-file config model, and how Alacritree compares against worktree
+  CLIs, AI-agent orchestrators, and other native terminals in the space.
+- [`docs/keyboard-shortcuts.md`](docs/keyboard-shortcuts.md) — every key
+  binding the app understands, split between hard-coded app shortcuts
+  (sidebar toggles, workspace and session switching, modals) and the
+  configurable `[[keyboard.bindings]]` layer, including the full list of
+  supported `action = "…"` values and which Alacritty actions are
+  intentionally not wired up.
+- [`docs/features.md`](docs/features.md) — upstream Alacritty's feature
+  overview (vi mode, search, hints, selection expansion). Kept for reference;
+  not everything listed is implemented in the egui shell yet.
 
 ## Repository layout
 
