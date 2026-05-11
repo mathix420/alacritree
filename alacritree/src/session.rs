@@ -61,12 +61,24 @@ impl Dimensions for TermSize {
 
 pub type SessionId = u64;
 
+/// What this session is showing.  Shells are persistent; Diff panes are
+/// throwaway — replaced when the user clicks a different file in the git
+/// sidebar, and reaped on the user's `q` inside delta.  The key disambiguates
+/// (file, source) so the sidebar can highlight the active row and toggle the
+/// pane closed on a repeat click.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum SessionKind {
+    Shell,
+    Diff { key: String },
+}
+
 /// PTY child + parsed terminal state.  The read/write loop is on its own
 /// thread and survives workspace switches, so running processes aren't killed.
 pub struct Session {
     pub id: SessionId,
     pub title: String,
     pub working_directory: Option<PathBuf>,
+    pub kind: SessionKind,
     pub size: TermSize,
     pub cell_size: (f32, f32),
     pub term: Arc<FairMutex<Term<EventProxy>>>,
@@ -223,6 +235,59 @@ impl Session {
         size: TermSize,
         cell_size: (f32, f32),
     ) -> std::io::Result<Self> {
+        let shell = config.shell.as_ref().map(|s| Shell::new(s.program.clone(), s.args.clone()));
+        let title = working_directory
+            .as_ref()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "shell".to_string());
+        Self::spawn_with(
+            ctx,
+            config,
+            working_directory,
+            size,
+            cell_size,
+            shell,
+            title,
+            SessionKind::Shell,
+        )
+    }
+
+    /// Spawn a session running `program args` instead of the user's shell.
+    /// Used by the git sidebar to drop into `delta` for an inline diff view —
+    /// once the command exits, `reap_exited_sessions` removes the tab.
+    pub fn spawn_command(
+        ctx: egui::Context,
+        config: &Config,
+        working_directory: Option<PathBuf>,
+        size: TermSize,
+        cell_size: (f32, f32),
+        program: String,
+        args: Vec<String>,
+        title: String,
+        kind: SessionKind,
+    ) -> std::io::Result<Self> {
+        Self::spawn_with(
+            ctx,
+            config,
+            working_directory,
+            size,
+            cell_size,
+            Some(Shell::new(program, args)),
+            title,
+            kind,
+        )
+    }
+
+    fn spawn_with(
+        ctx: egui::Context,
+        config: &Config,
+        working_directory: Option<PathBuf>,
+        size: TermSize,
+        cell_size: (f32, f32),
+        shell: Option<Shell>,
+        title: String,
+        kind: SessionKind,
+    ) -> std::io::Result<Self> {
         let window_size = window_size(size, cell_size);
 
         let (proxy, events) = EventProxy::new(ctx);
@@ -237,7 +302,7 @@ impl Session {
         let term = Arc::new(FairMutex::new(term));
 
         let pty_options = PtyOptions {
-            shell: config.shell.as_ref().map(|s| Shell::new(s.program.clone(), s.args.clone())),
+            shell,
             working_directory: working_directory.clone(),
             drain_on_exit: false,
             env: config.env.clone(),
@@ -255,15 +320,11 @@ impl Session {
         let sender = event_loop.channel();
         event_loop.spawn();
 
-        let title = working_directory
-            .as_ref()
-            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| "shell".to_string());
-
         Ok(Self {
             id: next_session_id(),
             title,
             working_directory,
+            kind,
             size,
             cell_size,
             term,
