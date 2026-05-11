@@ -1484,20 +1484,19 @@ fn home_row(
     let panel_x = ui.max_rect().x_range();
 
     let frame = Frame::default().inner_margin(Margin { left: 6, right: 6, top: 3, bottom: 3 });
-    let resp = frame
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                paint_row_status_icon(ui, theme, attention, agent_glyph, "⌂", is_active);
-                ui.label(
-                    RichText::new("Home")
-                        .color(if is_active { theme.text } else { theme.text_dim })
-                        .strong()
-                        .small(),
-                );
-            });
-        })
-        .response
-        .interact(egui::Sense::click());
+    let inner_resp = frame.show(ui, |ui| {
+        ui.horizontal(|ui| {
+            paint_row_status_icon(ui, theme, attention, agent_glyph, "⌂", is_active);
+            ui.label(
+                RichText::new("Home")
+                    .color(if is_active { theme.text } else { theme.text_dim })
+                    .strong()
+                    .small(),
+            );
+        });
+    });
+    let hit_rect = egui::Rect::from_x_y_ranges(panel_x, inner_resp.response.rect.y_range());
+    let resp = ui.interact(hit_rect, inner_resp.response.id, egui::Sense::click());
 
     let bg = if is_active {
         theme.row_active_bg
@@ -1507,8 +1506,7 @@ fn home_row(
         Color32::TRANSPARENT
     };
     if bg != Color32::TRANSPARENT {
-        let rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
-        ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
+        ui.painter().set(bg_idx, egui::Shape::rect_filled(hit_rect, 0.0, bg));
     }
     resp
 }
