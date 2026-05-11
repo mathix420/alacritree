@@ -7,7 +7,8 @@ pub fn event_to_bytes(event: &Event) -> Option<Vec<u8>> {
         Event::Key { key, pressed: true, modifiers, repeat: _, .. } => {
             key_to_bytes(*key, *modifiers)
         },
-        Event::Paste(s) => Some(s.as_bytes().to_vec()),
+        // `Event::Paste` is handled by the caller via `paste::paste` so it
+        // gets bracketed-paste wrapping and newline normalization.
         // egui_winit eats Ctrl+C / Ctrl+X and re-emits them as Copy/Cut without a
         // matching Key event, so the PTY would otherwise never see ETX/CAN.
         // Skip on macOS where the gesture is Cmd+C (Ctrl+C still flows as a Key

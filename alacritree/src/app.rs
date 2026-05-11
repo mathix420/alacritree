@@ -11,8 +11,9 @@ use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::config::Config;
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, StatusCache};
+use crate::paste;
 use crate::projects::{Project, Worktree};
-use crate::session::{Session, SessionId, TermSize};
+use crate::session::{Session, SessionId, SessionKind, TermSize};
 use crate::state::{self, PersistedProject, PersistedState};
 use crate::terminal_view;
 use crate::worktree::{self as wt, CreateRequest, Progress};
@@ -137,6 +138,36 @@ enum CreateState {
     Prompt { project_idx: usize, branch: String, error: Option<String> },
     Running { project_idx: usize, branch: String, steps: Vec<String>, rx: Receiver<Progress> },
     Done { project_idx: usize, steps: Vec<String>, result: Result<PathBuf, String> },
+}
+
+/// Which `git diff` flavor a sidebar click should open in delta.
+enum DiffSource {
+    Staged,
+    Worktree,
+    Untracked,
+    /// Triple-dot diff against this base ref (merge-base, matching the
+    /// `Changes vs <branch>` sidebar section).
+    Branch {
+        base: String,
+    },
+}
+
+struct DiffRequest {
+    file: String,
+    source: DiffSource,
+}
+
+/// Stable identifier for "the diff this click would open" — matched against
+/// the active diff session's `SessionKind::Diff { key }` to highlight the
+/// originating row and toggle the pane off when clicked again.
+fn diff_key(req: &DiffRequest) -> String {
+    let tag = match &req.source {
+        DiffSource::Staged => "staged",
+        DiffSource::Worktree => "worktree",
+        DiffSource::Untracked => "untracked",
+        DiffSource::Branch { .. } => "branch",
+    };
+    format!("{tag}:{}", req.file)
 }
 
 impl AlacritreeApp {
@@ -464,11 +495,8 @@ impl AlacritreeApp {
             let mut actions = Vec::new();
             i.events.retain(|ev| {
                 if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
-                    let matched = crate::bindings::all_matches(
-                        &self.config.bindings,
-                        *key,
-                        *modifiers,
-                    );
+                    let matched =
+                        crate::bindings::all_matches(&self.config.bindings, *key, *modifiers);
                     if !matched.is_empty() {
                         let suppress_chars = matched
                             .iter()
@@ -496,26 +524,27 @@ impl AlacritreeApp {
                 }
             },
             BindingAction::Named(NamedAction::Paste) => {
-                if let Some(text) = clipboard::read(Target::Clipboard) {
-                    if let Some(idx) = self.active_session_index() {
-                        self.sessions[idx].write(text.into_bytes());
-                    }
+                if let (Some(text), Some(idx)) =
+                    (clipboard::read(Target::Clipboard), self.active_session_index())
+                {
+                    paste::paste(&self.sessions[idx], &text, true);
                 }
             },
             BindingAction::Named(NamedAction::PasteSelection) => {
-                if let Some(text) = clipboard::read(Target::Primary) {
-                    if let Some(idx) = self.active_session_index() {
-                        self.sessions[idx].write(text.into_bytes());
-                    }
+                if let (Some(text), Some(idx)) =
+                    (clipboard::read(Target::Primary), self.active_session_index())
+                {
+                    paste::paste(&self.sessions[idx], &text, true);
                 }
             },
             BindingAction::Named(NamedAction::Copy) => {
                 if let Some(idx) = self.active_session_index() {
-                    if let Some(text) = self.sessions[idx].term.lock().selection_to_string() {
-                        if !text.is_empty() {
-                            clipboard::write(Target::Clipboard, &text);
-                        }
-                    }
+                    paste::copy_selection(&self.sessions[idx], &self.config, Target::Clipboard);
+                }
+            },
+            BindingAction::Named(NamedAction::CopySelection) => {
+                if let Some(idx) = self.active_session_index() {
+                    paste::copy_selection(&self.sessions[idx], &self.config, Target::Primary);
                 }
             },
             BindingAction::Named(NamedAction::SpawnNewInstance) => {
@@ -873,6 +902,8 @@ impl AlacritreeApp {
     fn show_git_sidebar(&mut self, ctx: &Context, panel_frame: Frame) -> egui::Rect {
         let theme = self.theme;
         let palette = self.config.palette.clone();
+        let active_diff_key = self.active_diff_key();
+        let diff_request: std::cell::Cell<Option<DiffRequest>> = std::cell::Cell::new(None);
         let panel_resp = SidePanel::right("right_sidebar")
             .resizable(true)
             .default_width(300.0 * theme.ui_scale)
@@ -958,13 +989,27 @@ impl AlacritreeApp {
 
                     section(ui, &theme, "Staged", status.staged.len(), |ui| {
                         for f in &status.staged {
-                            file_row(ui, f, &theme, &palette);
+                            let req =
+                                DiffRequest { file: f.path.clone(), source: DiffSource::Staged };
+                            let is_active = active_diff_key.as_deref() == Some(&diff_key(&req));
+                            if file_row(ui, f, &theme, &palette, is_active).clicked() {
+                                diff_request.set(Some(req));
+                            }
                         }
                     });
 
                     section(ui, &theme, "Unstaged", status.unstaged.len(), |ui| {
                         for f in &status.unstaged {
-                            file_row(ui, f, &theme, &palette);
+                            let source = if f.kind == ChangeKind::Untracked {
+                                DiffSource::Untracked
+                            } else {
+                                DiffSource::Worktree
+                            };
+                            let req = DiffRequest { file: f.path.clone(), source };
+                            let is_active = active_diff_key.as_deref() == Some(&diff_key(&req));
+                            if file_row(ui, f, &theme, &palette, is_active).clicked() {
+                                diff_request.set(Some(req));
+                            }
                         }
                     });
 
@@ -974,49 +1019,121 @@ impl AlacritreeApp {
                             (Some(b), _) => format!("Changes vs {}", b),
                             _ => "Changes vs default".to_string(),
                         };
-                        let added = rgb_to_color32(palette.normal[2]);
-                        let removed = rgb_to_color32(palette.normal[1]);
+                        // Prefer the resolved ref (e.g. `refs/remotes/origin/main`) so the
+                        // sidebar's merge-base diff matches what delta will show.
+                        let base = status
+                            .default_branch_resolved
+                            .clone()
+                            .or_else(|| status.default_branch.clone());
                         section(ui, &theme, &label, status.branch_diff.len(), |ui| {
                             for stat in &status.branch_diff {
-                                row_with_trailing(
-                                    ui,
-                                    |ui| {
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(&stat.path)
-                                                    .color(theme.text_dim)
-                                                    .monospace()
-                                                    .small(),
-                                            )
-                                            .truncate(),
-                                        );
-                                    },
-                                    |ui| {
-                                        if stat.deletions > 0 {
-                                            ui.label(
-                                                RichText::new(format!("-{}", stat.deletions))
-                                                    .color(removed)
-                                                    .small()
-                                                    .monospace(),
-                                            );
-                                        }
-                                        if stat.additions > 0 {
-                                            ui.label(
-                                                RichText::new(format!("+{}", stat.additions))
-                                                    .color(added)
-                                                    .small()
-                                                    .monospace(),
-                                            );
-                                        }
-                                    },
-                                );
+                                let Some(base) = base.clone() else {
+                                    branch_diff_row(ui, stat, &theme, &palette, false);
+                                    continue;
+                                };
+                                let req = DiffRequest {
+                                    file: stat.path.clone(),
+                                    source: DiffSource::Branch { base },
+                                };
+                                let is_active = active_diff_key.as_deref() == Some(&diff_key(&req));
+                                if branch_diff_row(ui, stat, &theme, &palette, is_active).clicked()
+                                {
+                                    diff_request.set(Some(req));
+                                }
                             }
                         });
                     }
                 });
             });
+        if let Some(req) = diff_request.take() {
+            self.open_diff(ctx, req);
+        }
         panel_resp.response.rect
     }
+
+    /// Clicking a sidebar row either opens, replaces, or closes the workspace's
+    /// single diff pane:
+    /// - row matches the active diff → toggle off (close)
+    /// - row matches a different diff → drop the old pane, open this one
+    /// - no active diff → open a new pane
+    /// Dropping the old `Session` runs `Drop`, which sends `Msg::Shutdown` to
+    /// the event loop and exits delta cleanly.
+    fn open_diff(&mut self, ctx: &Context, req: DiffRequest) {
+        let Some(workspace) = self.current_workspace.clone() else {
+            return;
+        };
+        let new_key = diff_key(&req);
+        let already_showing = self.sessions.iter().any(|s| {
+            s.working_directory.as_deref() == Some(&workspace)
+                && matches!(&s.kind, SessionKind::Diff { key } if key == &new_key)
+        });
+        self.sessions.retain(|s| {
+            !(matches!(s.kind, SessionKind::Diff { .. })
+                && s.working_directory.as_deref() == Some(&workspace))
+        });
+        if already_showing {
+            // Active-session fallback to the workspace's shell happens next
+            // frame: `active_session_index()` returns None for the stale id, and
+            // `ensure_active_session` picks up an existing shell or spawns one.
+            return;
+        }
+
+        let (program, args) = build_diff_command(&req);
+        let title = format!("diff: {}", req.file);
+        match Session::spawn_command(
+            ctx.clone(),
+            &self.config,
+            Some(workspace.clone()),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            program,
+            args,
+            title,
+            SessionKind::Diff { key: new_key },
+        ) {
+            Ok(session) => {
+                let id = session.id;
+                self.sessions.push(session);
+                self.active_session.insert(Some(workspace), id);
+            },
+            Err(e) => {
+                self.last_error = Some(format!("failed to open diff: {e}"));
+            },
+        }
+    }
+
+    /// Key of the diff currently displayed in this workspace, if any.  Used by
+    /// the sidebar to highlight the originating row so the toggle-on-reclick
+    /// behavior is discoverable.
+    fn active_diff_key(&self) -> Option<String> {
+        self.sessions.iter().find_map(|s| {
+            if s.working_directory != self.current_workspace {
+                return None;
+            }
+            if let SessionKind::Diff { key } = &s.kind { Some(key.clone()) } else { None }
+        })
+    }
+}
+
+/// Pipe `git diff` for the clicked file through delta. Positional args via
+/// `sh -c '…' name "$1" "$2"` keep path/branch names out of the script body so
+/// no shell metacharacter in the file name can be interpreted.
+fn build_diff_command(req: &DiffRequest) -> (String, Vec<String>) {
+    let script: &str = match &req.source {
+        DiffSource::Staged => r#"git diff --cached -- "$1" | delta --paging=always"#,
+        DiffSource::Worktree => r#"git diff -- "$1" | delta --paging=always"#,
+        // `--no-index` is git's "diff arbitrary files" mode; against /dev/null it
+        // shows the untracked file as a pure addition. Exits non-zero by design.
+        DiffSource::Untracked => r#"git diff --no-index -- /dev/null "$1" | delta --paging=always"#,
+        // Triple-dot diff = "from merge-base to HEAD" — matches the sidebar's
+        // `Changes vs <branch>` stat semantics in git_status.rs.
+        DiffSource::Branch { .. } => r#"git diff "$2"... -- "$1" | delta --paging=always"#,
+    };
+    let mut args = vec!["-c".to_string(), script.to_string(), "sh".to_string(), req.file.clone()];
+    if let DiffSource::Branch { base } = &req.source {
+        args.push(base.clone());
+    }
+    ("sh".to_string(), args)
 }
 
 fn dirty_warning(counts: &DirtyCounts) -> Option<String> {
@@ -1114,21 +1231,154 @@ fn file_row(
     change: &FileChange,
     theme: &Theme,
     palette: &crate::config::Palette,
+    is_active: bool,
+) -> egui::Response {
+    let bg_idx = ui.painter().add(egui::Shape::Noop);
+    let panel_x = ui.max_rect().x_range();
+    let row_h = ui.spacing().interact_size.y;
+    let color = match change.kind {
+        ChangeKind::Added | ChangeKind::Untracked => rgb_to_color32(palette.normal[2]),
+        ChangeKind::Modified => rgb_to_color32(palette.normal[3]),
+        ChangeKind::Deleted => rgb_to_color32(palette.normal[1]),
+        ChangeKind::Renamed => rgb_to_color32(palette.normal[4]),
+        ChangeKind::Conflicted => rgb_to_color32(palette.bright[1]),
+    };
+    let path_color = if is_active { theme.text } else { theme.text_dim };
+    // `ui.horizontal` sizes its response rect to the (often short) path text,
+    // leaving most of the row's width as a dead zone — and short labels make
+    // the row barely taller than the text, so vertical misses are easy too.
+    // Allocate an explicit interact-sized row and pad it out so the click hit
+    // box spans the full panel width and the row's full height.
+    let resp = ui
+        .allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), row_h),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.set_min_height(row_h);
+                // Labels default to `Sense::click_and_drag` for text selection;
+                // hit testing picks the smallest covering widget, so a clickable
+                // label inside our row would eat clicks before the row sees
+                // them.  Opt out of selection on every label that lives inside
+                // a clickable row so the click falls through.
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(change.kind.glyph()).color(color).monospace().small(),
+                    )
+                    .selectable(false),
+                );
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&change.path).color(path_color).monospace().small(),
+                    )
+                    .truncate()
+                    .selectable(false),
+                );
+                fill_row(ui);
+            },
+        )
+        .response
+        .interact(egui::Sense::click());
+    paint_row_bg(ui, &resp, bg_idx, panel_x, theme, is_active);
+    resp
+}
+
+fn branch_diff_row(
+    ui: &mut egui::Ui,
+    stat: &crate::git_status::DiffStat,
+    theme: &Theme,
+    palette: &crate::config::Palette,
+    is_active: bool,
+) -> egui::Response {
+    let bg_idx = ui.painter().add(egui::Shape::Noop);
+    let panel_x = ui.max_rect().x_range();
+    let row_h = ui.spacing().interact_size.y;
+    let added = rgb_to_color32(palette.normal[2]);
+    let removed = rgb_to_color32(palette.normal[1]);
+    let path_color = if is_active { theme.text } else { theme.text_dim };
+
+    // Same shape as row_with_trailing (right_to_left wrapping a left_to_right)
+    // so +/- counts pin to the right edge while the path truncates cleanly;
+    // `set_min_height` + `fill_row` push the hit box to the full row size.
+    let resp = ui
+        .allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), row_h),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                ui.set_min_height(row_h);
+                if stat.deletions > 0 {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("-{}", stat.deletions))
+                                .color(removed)
+                                .small()
+                                .monospace(),
+                        )
+                        .selectable(false),
+                    );
+                }
+                if stat.additions > 0 {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(format!("+{}", stat.additions))
+                                .color(added)
+                                .small()
+                                .monospace(),
+                        )
+                        .selectable(false),
+                    );
+                }
+                let remaining = ui.available_width();
+                if remaining > 0.0 {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(remaining, row_h),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_min_height(row_h);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&stat.path).color(path_color).monospace().small(),
+                                )
+                                .truncate()
+                                .selectable(false),
+                            );
+                            fill_row(ui);
+                        },
+                    );
+                }
+            },
+        )
+        .response
+        .interact(egui::Sense::click());
+    paint_row_bg(ui, &resp, bg_idx, panel_x, theme, is_active);
+    resp
+}
+
+/// Extend a row's bounding rect to its parent's full width so the response
+/// covers the empty space past short labels, instead of just the content.
+fn fill_row(ui: &mut egui::Ui) {
+    let remaining = ui.available_width();
+    if remaining > 0.0 {
+        ui.allocate_space(egui::vec2(remaining, 0.0));
+    }
+}
+
+fn paint_row_bg(
+    ui: &mut egui::Ui,
+    resp: &egui::Response,
+    bg_idx: egui::layers::ShapeIdx,
+    panel_x: egui::Rangef,
+    theme: &Theme,
+    is_active: bool,
 ) {
-    ui.horizontal(|ui| {
-        let color = match change.kind {
-            ChangeKind::Added | ChangeKind::Untracked => rgb_to_color32(palette.normal[2]),
-            ChangeKind::Modified => rgb_to_color32(palette.normal[3]),
-            ChangeKind::Deleted => rgb_to_color32(palette.normal[1]),
-            ChangeKind::Renamed => rgb_to_color32(palette.normal[4]),
-            ChangeKind::Conflicted => rgb_to_color32(palette.bright[1]),
-        };
-        ui.label(RichText::new(change.kind.glyph()).color(color).monospace().small());
-        ui.add(
-            egui::Label::new(RichText::new(&change.path).color(theme.text_dim).monospace().small())
-                .truncate(),
-        );
-    });
+    let bg = if is_active {
+        theme.row_active_bg
+    } else if resp.hovered() {
+        theme.row_hover_bg
+    } else {
+        return;
+    };
+    let rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
+    ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
 }
 
 /// Lay out a row whose `trailing` widgets pin to the right edge while `leading`

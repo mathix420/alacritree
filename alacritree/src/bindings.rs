@@ -23,6 +23,7 @@ pub enum NamedAction {
     Paste,
     PasteSelection,
     Copy,
+    CopySelection,
     ScrollPageUp,
     ScrollPageDown,
     ScrollHalfPageUp,
@@ -201,12 +202,12 @@ fn default_bindings() -> Vec<KeyBinding> {
 /// bindings (see `Processor::process_key_bindings`), so the user's typical
 /// pattern of stacking `ClearLogNotice` + `chars = "\f"` on Ctrl+L works:
 /// the first action is our `Unsupported` no-op, the second writes 0x0c.
-pub fn all_matches(
-    bindings: &[KeyBinding],
-    key: Key,
-    mods: Modifiers,
-) -> Vec<&BindingAction> {
-    bindings.iter().filter(|b| b.key == key && mods_match(b.mods, mods)).map(|b| &b.action).collect()
+pub fn all_matches(bindings: &[KeyBinding], key: Key, mods: Modifiers) -> Vec<&BindingAction> {
+    bindings
+        .iter()
+        .filter(|b| b.key == key && mods_match(b.mods, mods))
+        .map(|b| &b.action)
+        .collect()
 }
 
 /// Alacritty semantics: `Control|Shift` does not fire on Ctrl alone even though
@@ -388,6 +389,7 @@ fn parse_action(name: &str) -> BindingAction {
         "Paste" => BindingAction::Named(Paste),
         "PasteSelection" => BindingAction::Named(PasteSelection),
         "Copy" => BindingAction::Named(Copy),
+        "CopySelection" => BindingAction::Named(CopySelection),
         "ScrollPageUp" => BindingAction::Named(ScrollPageUp),
         "ScrollPageDown" => BindingAction::Named(ScrollPageDown),
         "ScrollHalfPageUp" => BindingAction::Named(ScrollHalfPageUp),
