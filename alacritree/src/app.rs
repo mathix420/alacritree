@@ -1233,6 +1233,7 @@ fn file_row(
 ) -> egui::Response {
     let bg_idx = ui.painter().add(egui::Shape::Noop);
     let panel_x = ui.max_rect().x_range();
+    let row_h = ui.spacing().interact_size.y;
     let color = match change.kind {
         ChangeKind::Added | ChangeKind::Untracked => rgb_to_color32(palette.normal[2]),
         ChangeKind::Modified => rgb_to_color32(palette.normal[3]),
@@ -1241,14 +1242,27 @@ fn file_row(
         ChangeKind::Conflicted => rgb_to_color32(palette.bright[1]),
     };
     let path_color = if is_active { theme.text } else { theme.text_dim };
+    // `ui.horizontal` sizes its response rect to the (often short) path text,
+    // leaving most of the row's width as a dead zone — and short labels make
+    // the row barely taller than the text, so vertical misses are easy too.
+    // Allocate an explicit interact-sized row and pad it out so the click hit
+    // box spans the full panel width and the row's full height.
     let resp = ui
-        .horizontal(|ui| {
-            ui.label(RichText::new(change.kind.glyph()).color(color).monospace().small());
-            ui.add(
-                egui::Label::new(RichText::new(&change.path).color(path_color).monospace().small())
+        .allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), row_h),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.set_min_height(row_h);
+                ui.label(RichText::new(change.kind.glyph()).color(color).monospace().small());
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(&change.path).color(path_color).monospace().small(),
+                    )
                     .truncate(),
-            );
-        })
+                );
+                fill_row(ui);
+            },
+        )
         .response
         .interact(egui::Sense::click());
     paint_row_bg(ui, &resp, bg_idx, panel_x, theme, is_active);
@@ -1264,49 +1278,68 @@ fn branch_diff_row(
 ) -> egui::Response {
     let bg_idx = ui.painter().add(egui::Shape::Noop);
     let panel_x = ui.max_rect().x_range();
+    let row_h = ui.spacing().interact_size.y;
     let added = rgb_to_color32(palette.normal[2]);
     let removed = rgb_to_color32(palette.normal[1]);
     let path_color = if is_active { theme.text } else { theme.text_dim };
 
-    // Mirror row_with_trailing's layout (right_to_left wrapping a left_to_right)
-    // so the path truncates cleanly while the +/- counts pin to the right edge.
-    let row_size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+    // Same shape as row_with_trailing (right_to_left wrapping a left_to_right)
+    // so +/- counts pin to the right edge while the path truncates cleanly;
+    // `set_min_height` + `fill_row` push the hit box to the full row size.
     let resp = ui
-        .allocate_ui_with_layout(row_size, egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if stat.deletions > 0 {
-                ui.label(
-                    RichText::new(format!("-{}", stat.deletions))
-                        .color(removed)
-                        .small()
-                        .monospace(),
-                );
-            }
-            if stat.additions > 0 {
-                ui.label(
-                    RichText::new(format!("+{}", stat.additions)).color(added).small().monospace(),
-                );
-            }
-            let remaining = ui.available_width();
-            if remaining > 0.0 {
-                let row_h = ui.available_height();
-                ui.allocate_ui_with_layout(
-                    egui::vec2(remaining, row_h),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(&stat.path).color(path_color).monospace().small(),
-                            )
-                            .truncate(),
-                        );
-                    },
-                );
-            }
-        })
+        .allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), row_h),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                ui.set_min_height(row_h);
+                if stat.deletions > 0 {
+                    ui.label(
+                        RichText::new(format!("-{}", stat.deletions))
+                            .color(removed)
+                            .small()
+                            .monospace(),
+                    );
+                }
+                if stat.additions > 0 {
+                    ui.label(
+                        RichText::new(format!("+{}", stat.additions))
+                            .color(added)
+                            .small()
+                            .monospace(),
+                    );
+                }
+                let remaining = ui.available_width();
+                if remaining > 0.0 {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(remaining, row_h),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_min_height(row_h);
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&stat.path).color(path_color).monospace().small(),
+                                )
+                                .truncate(),
+                            );
+                            fill_row(ui);
+                        },
+                    );
+                }
+            },
+        )
         .response
         .interact(egui::Sense::click());
     paint_row_bg(ui, &resp, bg_idx, panel_x, theme, is_active);
     resp
+}
+
+/// Extend a row's bounding rect to its parent's full width so the response
+/// covers the empty space past short labels, instead of just the content.
+fn fill_row(ui: &mut egui::Ui) {
+    let remaining = ui.available_width();
+    if remaining > 0.0 {
+        ui.allocate_space(egui::vec2(remaining, 0.0));
+    }
 }
 
 fn paint_row_bg(
