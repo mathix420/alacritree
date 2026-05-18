@@ -1,0 +1,76 @@
+name: Update Homebrew formula
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to bump to (e.g. v0.2.0)"
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Push and PR-create with the bot PAT so the auto-merge PR
+          # actually triggers `pull_request` CI checks — GITHUB_TOKEN
+          # PRs don't fire them.
+          token: ${{ secrets.ALACRITREE_BOT_TOKEN }}
+
+      - name: Bump Formula/alacritree.rb
+        env:
+          GH_TOKEN: ${{ secrets.ALACRITREE_BOT_TOKEN }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          asset="alacritree-${TAG}-aarch64-macos.tar.gz"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${asset}"
+
+          # Bail cleanly if the release exists but doesn't have the macOS
+          # asset attached yet (e.g. while platform support is being
+          # wired up). Avoids opening a broken PR.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+                --json assets --jq '.assets[].name' \
+                | grep -qx "$asset"; then
+            echo "Release $TAG has no $asset asset; skipping Homebrew bump."
+            exit 0
+          fi
+
+          curl --fail --location --output "/tmp/$asset" "$url"
+          hash=$(sha256sum "/tmp/$asset" | cut -d' ' -f1)
+
+          sed -i \
+            -e "s/^  version \".*\"/  version \"${version}\"/" \
+            -e "s/^      sha256 \".*\"/      sha256 \"${hash}\"/" \
+            Formula/alacritree.rb
+
+          if git diff --quiet Formula/alacritree.rb; then
+            echo "Formula already at $TAG; nothing to do."
+            exit 0
+          fi
+
+          branch="homebrew/bump-${TAG}"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -b "$branch"
+          git add Formula/alacritree.rb
+          git commit -m "homebrew: bump alacritree to ${TAG}"
+          git push --force-with-lease -u origin "$branch"
+          gh pr create \
+            --title "homebrew: bump alacritree to ${TAG}" \
+            --body "Automated formula bump triggered by the release of \`${TAG}\`." \
+            --base master \
+            --head "$branch" \
+            || gh pr edit "$branch" --body "Automated formula bump triggered by the release of \`${TAG}\`."
+
+          # Flip auto-merge on so the PR lands itself once required
+          # checks pass. Same setup as scoop-update.yml.
+          gh pr merge "$branch" --auto --squash
