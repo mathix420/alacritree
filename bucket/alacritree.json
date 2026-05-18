@@ -1,12 +1,12 @@
 {
-    "version": "0.2.5",
+    "version": "0.2.6",
     "description": "Alacritty fork with worktree-aware sidebars",
     "homepage": "https://github.com/mathix420/alacritree",
     "license": "Apache-2.0",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/mathix420/alacritree/releases/download/v0.2.5/alacritree-v0.2.5-x86_64-windows.zip",
-            "hash": "e22337c3cb87632741995c923e36ee706d4d039077a8d617945953de23abfbd9"
+            "url": "https://github.com/mathix420/alacritree/releases/download/v0.2.6/alacritree-v0.2.6-x86_64-windows.zip",
+            "hash": "88b418e56ab137d58dcfd942327e6e8a7f1221ad9868562573a7826e274e6a38"
         }
     },
     "bin": "alacritree.exe",
