@@ -92,8 +92,11 @@ fn lighten(c: Color32, amount: f32) -> Color32 {
 }
 
 fn paint_panel_border(ctx: &Context, x: f32, y_range: egui::Rangef, color: Color32) {
+    // `Middle` keeps the line above the panel content (`Background`) but below
+    // modals, popups, and tooltips (`Foreground`/`Tooltip`) — otherwise the
+    // border bleeds through whatever modal is open.
     let layer =
-        egui::LayerId::new(egui::Order::Foreground, egui::Id::new(("sidebar_border", x.to_bits())));
+        egui::LayerId::new(egui::Order::Middle, egui::Id::new(("sidebar_border", x.to_bits())));
     ctx.layer_painter(layer).vline(x, y_range, Stroke::new(1.0, color));
 }
 
