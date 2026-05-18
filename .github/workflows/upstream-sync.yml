@@ -1,0 +1,122 @@
+name: Check upstream alacritty
+
+# Nightly check against alacritty/alacritty. We don't auto-merge upstream
+# code into the vendored crates — that's a manual review step — but we
+# do open a single PR that bumps a marker SHA whenever upstream advances,
+# so it's visible in the PR list rather than buried in cron logs.
+
+on:
+  schedule:
+    # 03:00 UTC daily. Off-hours and well clear of release/CI traffic.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.ALACRITREE_BOT_TOKEN }}
+          # We rev-parse upstream/master to compare commit ranges, which
+          # needs the full history rather than the shallow default.
+          fetch-depth: 0
+
+      - name: Check for upstream updates
+        env:
+          GH_TOKEN: ${{ secrets.ALACRITREE_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          marker=.github/upstream-sync.toml
+
+          # Tiny TOML reader — the marker has a fixed 3-line shape so a
+          # full toml parser would be overkill.
+          read_field() {
+            awk -F' *= *' -v k="$1" '$1==k {gsub(/^"|"$/,"",$2); print $2; exit}' "$marker"
+          }
+
+          upstream_repo=$(read_field upstream)
+          upstream_branch=$(read_field branch)
+          current_sha=$(read_field sha)
+
+          git remote add upstream "$upstream_repo" 2>/dev/null || true
+          git fetch upstream "$upstream_branch" --quiet
+          upstream_sha=$(git rev-parse "upstream/$upstream_branch")
+
+          if [[ "$current_sha" == "$upstream_sha" ]]; then
+            echo "Already at upstream $upstream_sha; nothing to do."
+            exit 0
+          fi
+
+          # On the very first run the marker is all zeros; we don't want
+          # to dump the entire upstream history into a PR body. Initialize
+          # the marker silently and let subsequent runs do the comparison.
+          if [[ "$current_sha" =~ ^0+$ ]]; then
+            summary="(initial marker bootstrap — no commit list)"
+          else
+            total=$(git rev-list --count "${current_sha}..${upstream_sha}" || echo 0)
+            summary=$(git log --oneline --no-decorate "${current_sha}..${upstream_sha}" | head -50)
+            if [[ "$total" -gt 50 ]]; then
+              summary="${summary}"$'\n'"… and $((total - 50)) more"
+            fi
+          fi
+
+          sed -i "s|^sha *=.*|sha      = \"${upstream_sha}\"|" "$marker"
+          if git diff --quiet "$marker"; then
+            echo "Marker unchanged after sed (race?); nothing to do."
+            exit 0
+          fi
+
+          # Single long-lived branch — force-pushing keeps exactly one
+          # sync PR open at a time, so daily upstream activity doesn't
+          # accumulate stale PRs.
+          branch=chore/sync-upstream
+          short=$(git rev-parse --short=7 "$upstream_sha")
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -B "$branch"
+          git add "$marker"
+          git commit -m "chore: sync upstream alacritty marker to ${short}"
+          git push --force-with-lease -u origin "$branch"
+
+          body=$(cat <<EOF
+          Upstream [alacritty/alacritty](${upstream_repo}) has advanced
+          since our last review.
+
+          **Commits since \`${current_sha:0:7}\`:**
+
+          \`\`\`
+          ${summary}
+          \`\`\`
+
+          This PR only bumps the sync marker — it does **not** vendor any
+          upstream code into our \`alacritty/\`, \`alacritty_terminal/\`,
+          or \`alacritty_config*/\` crates. Review the commits above and:
+
+          - If nothing in the diff is relevant to our fork, merge as-is.
+          - If something needs vendoring, push the actual sync commits to
+            this branch before merging, or open a separate PR.
+          EOF
+          )
+
+          # Reuse the existing PR if there's one open; otherwise create.
+          if gh pr view "$branch" --json number >/dev/null 2>&1; then
+            gh pr edit "$branch" \
+              --title "chore: sync upstream alacritty marker to ${short}" \
+              --body "$body"
+          else
+            gh pr create \
+              --title "chore: sync upstream alacritty marker to ${short}" \
+              --body "$body" \
+              --base master \
+              --head "$branch"
+          fi

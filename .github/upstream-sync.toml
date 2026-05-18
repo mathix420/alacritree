@@ -1,0 +1,6 @@
+# Marker tracking the last alacritty/alacritty commit we've reviewed
+# for vendoring sync. Updated automatically by
+# .github/workflows/upstream-sync.yml when it opens a sync PR.
+upstream = "https://github.com/alacritty/alacritty"
+branch   = "master"
+sha      = "0000000000000000000000000000000000000000"
