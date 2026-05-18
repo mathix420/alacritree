@@ -169,9 +169,13 @@ fn has_remote(cwd: &Path, name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Resolve the base branch dynamically.  Tries the caller's hint first, then
-/// asks origin via `git ls-remote --symref HEAD` (the authoritative source),
-/// then falls back through common names.  Returns `(branch_name, ref_to_use)`
+/// Resolve the base branch dynamically.  Asks origin first via
+/// `git ls-remote --symref HEAD` — the only source that reflects the
+/// upstream's *current* default branch.  The caller's hint comes from
+/// `refs/remotes/origin/HEAD`, which can lag if the upstream default was
+/// renamed since the last sync; trusting it would feed a defunct branch
+/// name to `git fetch`.  Falls back to the hint and then to common names
+/// when the remote is unreachable.  Returns `(branch_name, ref_to_use)`
 /// where `ref_to_use` is what `git worktree add -b … <ref>` should branch
 /// from (prefer `origin/<branch>` so we start from the fetched remote tip).
 /// On total failure, returns the list of names we tried.
@@ -192,14 +196,14 @@ fn resolve_base_branch(cwd: &Path, hint: Option<&str>) -> Result<(String, String
         None
     };
 
-    if let Some(name) = hint {
-        if let Some(found) = try_branch(name, &mut tried) {
+    if let Some(remote_head) = query_origin_head(cwd) {
+        if let Some(found) = try_branch(&remote_head, &mut tried) {
             return Ok(found);
         }
     }
 
-    if let Some(remote_head) = query_origin_head(cwd) {
-        if let Some(found) = try_branch(&remote_head, &mut tried) {
+    if let Some(name) = hint {
+        if let Some(found) = try_branch(name, &mut tried) {
             return Ok(found);
         }
     }
