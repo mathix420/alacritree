@@ -84,17 +84,6 @@ is shipped — Intel Macs need to build from source via the
 [Build](#build) section (install `cmake`, `pkg-config`, `fontconfig`
 and `freetype` through Homebrew first).
 
-**Other macOS package managers** — not packaged yet, but if you'd
-rather not use Homebrew:
-
-- **MacPorts** — no port yet; mirror the Homebrew formula with a
-  `Portfile` if you want to contribute one.
-- **Nix / nix-darwin** — `nixpkgs` doesn't have a derivation yet either.
-  A flake build is straightforward (workspace MSRV 1.85, single crate
-  to compile) and would be a welcome PR.
-- **Cargo** — `cargo install --path alacritree --locked` works on any
-  platform with a Rust toolchain, but you lose desktop integration.
-
 ## Build
 
 Workspace MSRV is **Rust 1.85** (edition 2024). System packages required on
