@@ -18,10 +18,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Authenticate git operations with the PAT so the push (and the
+          # PR that wraps it) is attributed to ALACRITREE_BOT_TOKEN. This
+          # is what lets the bot's PR trigger `pull_request` CI checks —
+          # PRs opened by GITHUB_TOKEN don't fire them.
+          token: ${{ secrets.ALACRITREE_BOT_TOKEN }}
 
       - name: Bump bucket/alacritree.json
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.ALACRITREE_BOT_TOKEN }}
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           set -euo pipefail

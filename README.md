@@ -71,12 +71,29 @@ is bumped automatically when a release is published. Windows binaries are
 not produced yet (see *Status* above); the bucket is wired up and waiting
 for the first cross-platform release.
 
-### macOS (Apple Silicon)
+### macOS (Homebrew, Apple Silicon)
 
-No prebuilt binary yet. Build from source via the [Build](#build) section
-once you've installed `cmake`, `pkg-config`, `fontconfig` and `freetype`
-through Homebrew. Only `aarch64-apple-darwin` is targeted — Intel Macs
-aren't on the release matrix.
+```sh
+brew tap mathix420/alacritree https://github.com/mathix420/alacritree
+brew install alacritree
+```
+
+The formula lives in [`Formula/alacritree.rb`](Formula/alacritree.rb)
+and is bumped automatically on every release. Only `aarch64-apple-darwin`
+is shipped — Intel Macs need to build from source via the
+[Build](#build) section (install `cmake`, `pkg-config`, `fontconfig`
+and `freetype` through Homebrew first).
+
+**Other macOS package managers** — not packaged yet, but if you'd
+rather not use Homebrew:
+
+- **MacPorts** — no port yet; mirror the Homebrew formula with a
+  `Portfile` if you want to contribute one.
+- **Nix / nix-darwin** — `nixpkgs` doesn't have a derivation yet either.
+  A flake build is straightforward (workspace MSRV 1.85, single crate
+  to compile) and would be a welcome PR.
+- **Cargo** — `cargo install --path alacritree --locked` works on any
+  platform with a Rust toolchain, but you lose desktop integration.
 
 ## Build
 

@@ -22,7 +22,7 @@ jobs:
 
       - name: Stamp PKGBUILD with version and asset hashes
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.ALACRITREE_BOT_TOKEN }}
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           set -euo pipefail
