@@ -81,4 +81,15 @@ jobs:
           # Flip auto-merge on so the PR lands itself once required checks
           # pass. Repo-level "Allow auto-merge" must be on (it is); branch
           # protection on master decides what counts as ready-to-merge.
-          gh pr merge "$branch" --auto --squash
+          #
+          # Retry loop: PRs authored by our PAT trigger `pull_request` CI
+          # immediately, putting the PR in UNSTABLE state for a few seconds
+          # before any check is reported. GitHub's auto-merge API rejects
+          # while in that transient state, so we back off and retry.
+          for attempt in 1 2 3 4 5; do
+            if gh pr merge "$branch" --auto --squash; then
+              break
+            fi
+            echo "auto-merge enable attempt ${attempt} failed; retrying in 10s"
+            sleep 10
+          done

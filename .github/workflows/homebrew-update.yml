@@ -72,5 +72,13 @@ jobs:
             || gh pr edit "$branch" --body "Automated formula bump triggered by the release of \`${TAG}\`."
 
           # Flip auto-merge on so the PR lands itself once required
-          # checks pass. Same setup as scoop-update.yml.
-          gh pr merge "$branch" --auto --squash
+          # checks pass. Same retry behavior as scoop-update.yml — PRs
+          # authored by the PAT trigger `pull_request` CI immediately
+          # and the auto-merge API briefly rejects while UNSTABLE.
+          for attempt in 1 2 3 4 5; do
+            if gh pr merge "$branch" --auto --squash; then
+              break
+            fi
+            echo "auto-merge enable attempt ${attempt} failed; retrying in 10s"
+            sleep 10
+          done
