@@ -25,6 +25,7 @@ const TTL: Duration = Duration::from_secs(300);
 pub struct PrInfo {
     pub number: u64,
     pub base_branch: String,
+    pub url: String,
 }
 
 #[derive(Default)]
@@ -120,7 +121,7 @@ fn spawn_lookup(
 fn query_gh(path: &Path, branch: &str) -> Option<PrInfo> {
     let output = Command::new("gh")
         .current_dir(path)
-        .args(["pr", "view", branch, "--json", "number,baseRefName"])
+        .args(["pr", "view", branch, "--json", "number,baseRefName,url"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .stdin(Stdio::null())
@@ -136,7 +137,8 @@ fn parse_gh_output(stdout: &[u8]) -> Option<PrInfo> {
     let value: serde_json::Value = serde_json::from_slice(stdout).ok()?;
     let number = value.get("number")?.as_u64()?;
     let base = value.get("baseRefName")?.as_str()?.to_string();
-    Some(PrInfo { number, base_branch: base })
+    let url = value.get("url")?.as_str()?.to_string();
+    Some(PrInfo { number, base_branch: base, url })
 }
 
 #[cfg(test)]
@@ -145,10 +147,11 @@ mod tests {
 
     #[test]
     fn parses_gh_json() {
-        let stdout = br#"{"baseRefName":"main","number":42}"#;
+        let stdout = br#"{"baseRefName":"main","number":42,"url":"https://github.com/o/r/pull/42"}"#;
         let info = parse_gh_output(stdout).unwrap();
         assert_eq!(info.number, 42);
         assert_eq!(info.base_branch, "main");
+        assert_eq!(info.url, "https://github.com/o/r/pull/42");
     }
 
     #[test]

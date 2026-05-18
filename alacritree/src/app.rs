@@ -12,7 +12,7 @@ use crate::colors::rgb_to_color32;
 use crate::config::Config;
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, StatusCache};
 use crate::paste;
-use crate::pr_status::{PrCache, PrInfo};
+use crate::pr_status::PrCache;
 use crate::projects::{Project, Worktree};
 use crate::session::{Session, SessionId, SessionKind, TermSize};
 use crate::state::{self, PersistedProject, PersistedState};
@@ -1025,15 +1025,9 @@ impl AlacritreeApp {
                     });
 
                     if !status.branch_diff.is_empty() {
-                        let label = match (&status.default_branch, &status.default_branch_resolved)
-                        {
-                            (Some(b), _) => match &pr_info {
-                                Some(PrInfo { number, .. }) => {
-                                    format!("Changes vs {} (PR #{})", b, number)
-                                },
-                                None => format!("Changes vs {}", b),
-                            },
-                            _ => "Changes vs default".to_string(),
+                        let base_label = match &status.default_branch {
+                            Some(b) => format!("Changes vs {b}"),
+                            None => "Changes vs default".to_string(),
                         };
                         // Prefer the resolved ref (e.g. `refs/remotes/origin/main`) so the
                         // sidebar's merge-base diff matches what delta will show.
@@ -1041,23 +1035,46 @@ impl AlacritreeApp {
                             .default_branch_resolved
                             .clone()
                             .or_else(|| status.default_branch.clone());
-                        section(ui, &theme, &label, status.branch_diff.len(), |ui| {
-                            for stat in &status.branch_diff {
-                                let Some(base) = base.clone() else {
-                                    branch_diff_row(ui, stat, &theme, &palette, false);
-                                    continue;
-                                };
-                                let req = DiffRequest {
-                                    file: stat.path.clone(),
-                                    source: DiffSource::Branch { base },
-                                };
-                                let is_active = active_diff_key.as_deref() == Some(&diff_key(&req));
-                                if branch_diff_row(ui, stat, &theme, &palette, is_active).clicked()
-                                {
-                                    diff_request.set(Some(req));
-                                }
+                        let count = status.branch_diff.len();
+
+                        // Open-coded section header so the PR number can be a
+                        // hyperlink while the rest stays plain text.
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(&base_label).color(theme.text).strong().small(),
+                            );
+                            if let Some(pr) = &pr_info {
+                                ui.label(
+                                    RichText::new("·").color(theme.text_muted).small(),
+                                );
+                                ui.hyperlink_to(
+                                    RichText::new(format!("PR #{}", pr.number))
+                                        .color(theme.accent)
+                                        .small()
+                                        .strong(),
+                                    &pr.url,
+                                );
                             }
+                            ui.label(
+                                RichText::new(format!("{count}")).color(theme.text_muted).small(),
+                            );
                         });
+                        ui.add_space(2.0);
+                        for stat in &status.branch_diff {
+                            let Some(base) = base.clone() else {
+                                branch_diff_row(ui, stat, &theme, &palette, false);
+                                continue;
+                            };
+                            let req = DiffRequest {
+                                file: stat.path.clone(),
+                                source: DiffSource::Branch { base },
+                            };
+                            let is_active = active_diff_key.as_deref() == Some(&diff_key(&req));
+                            if branch_diff_row(ui, stat, &theme, &palette, is_active).clicked() {
+                                diff_request.set(Some(req));
+                            }
+                        }
+                        ui.add_space(10.0);
                     }
                 });
             });
