@@ -11,6 +11,7 @@ mod git_status;
 mod input;
 mod links;
 mod paste;
+mod pr_status;
 mod projects;
 mod session;
 mod state;

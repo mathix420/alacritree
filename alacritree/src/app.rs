@@ -12,6 +12,7 @@ use crate::colors::rgb_to_color32;
 use crate::config::Config;
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, StatusCache};
 use crate::paste;
+use crate::pr_status::{PrCache, PrInfo};
 use crate::projects::{Project, Worktree};
 use crate::session::{Session, SessionId, SessionKind, TermSize};
 use crate::state::{self, PersistedProject, PersistedState};
@@ -115,6 +116,7 @@ pub struct AlacritreeApp {
     active_session: HashMap<WorkspaceKey, SessionId>,
     projects: Vec<Project>,
     git_status: HashMap<PathBuf, StatusCache>,
+    pr_cache: PrCache,
     config: Config,
     theme: Theme,
     last_error: Option<String>,
@@ -251,6 +253,7 @@ impl AlacritreeApp {
             active_session: HashMap::new(),
             projects,
             git_status: HashMap::new(),
+            pr_cache: PrCache::new(),
             config,
             theme,
             last_error: None,
@@ -933,14 +936,22 @@ impl AlacritreeApp {
                     },
                 };
 
-                let default_branch = self.project_default_branch_for(&path);
+                let project_default = self.project_default_branch_for(&path);
                 let cache = self
                     .git_status
                     .entry(path.clone())
                     .or_insert_with(|| StatusCache::new(path.clone()));
 
                 let mut status = cache.get().clone();
-                if let Some(branch) = default_branch.as_deref() {
+                // Look up the PR base for the checked-out branch.  The lookup
+                // is non-blocking — on a cold cache we get `None` this frame
+                // and the answer arrives on a later repaint.
+                let pr_info = self.pr_cache.poll(&path, status.branch.as_deref(), ctx);
+                // PR base takes precedence over the repo's default branch so
+                // the sidebar diff matches what GitHub will review.
+                let effective_default =
+                    pr_info.as_ref().map(|p| p.base_branch.clone()).or(project_default);
+                if let Some(branch) = effective_default.as_deref() {
                     if status.default_branch.as_deref() != Some(branch) {
                         cache.force_refresh(Some(branch));
                         status = cache.get().clone();
@@ -1016,7 +1027,12 @@ impl AlacritreeApp {
                     if !status.branch_diff.is_empty() {
                         let label = match (&status.default_branch, &status.default_branch_resolved)
                         {
-                            (Some(b), _) => format!("Changes vs {}", b),
+                            (Some(b), _) => match &pr_info {
+                                Some(PrInfo { number, .. }) => {
+                                    format!("Changes vs {} (PR #{})", b, number)
+                                },
+                                None => format!("Changes vs {}", b),
+                            },
                             _ => "Changes vs default".to_string(),
                         };
                         // Prefer the resolved ref (e.g. `refs/remotes/origin/main`) so the

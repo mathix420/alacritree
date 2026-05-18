@@ -208,9 +208,7 @@ fn detect_default_branch(repo: &Repository) -> Option<String> {
     }
     if let Ok(cfg) = repo.config() {
         if let Ok(name) = cfg.get_string("init.defaultBranch") {
-            if !name.is_empty()
-                && repo.find_reference(&format!("refs/heads/{name}")).is_ok()
-            {
+            if !name.is_empty() && repo.find_reference(&format!("refs/heads/{name}")).is_ok() {
                 return Some(name);
             }
         }
