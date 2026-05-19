@@ -945,21 +945,19 @@ impl AlacritreeApp {
                     .entry(path.clone())
                     .or_insert_with(|| StatusCache::new(path.clone()));
 
-                let mut status = cache.get().clone();
-                // Look up the PR base for the checked-out branch.  The lookup
-                // is non-blocking — on a cold cache we get `None` this frame
-                // and the answer arrives on a later repaint.
-                let pr_info = self.pr_cache.poll(&path, status.branch.as_deref(), ctx);
+                // Use whatever branch the cache already knows to query the PR
+                // cache without waiting for a fresh compute — first frame may
+                // be `None`, which `pr_cache.poll` handles by returning early.
+                let cached_branch = cache.current_branch().map(str::to_string);
+                let pr_info = self.pr_cache.poll(&path, cached_branch.as_deref(), ctx);
                 // PR base takes precedence over the repo's default branch so
                 // the sidebar diff matches what GitHub will review.
                 let effective_default =
                     pr_info.as_ref().map(|p| p.base_branch.clone()).or(project_default);
-                if let Some(branch) = effective_default.as_deref() {
-                    if status.default_branch.as_deref() != Some(branch) {
-                        cache.force_refresh(Some(branch));
-                        status = cache.get().clone();
-                    }
-                }
+                // Single non-blocking poll: returns the last known status and
+                // kicks off a background refresh if stale or if the hint
+                // changed since the last completed compute.
+                let status = cache.poll(effective_default.as_deref(), ctx);
 
                 ScrollArea::vertical().show(ui, |ui| {
                     if let Some(err) = &status.error {

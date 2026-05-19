@@ -1,6 +1,9 @@
 //! Working-tree status + a summary of changes vs the project's default branch.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use git2::{Delta, DiffOptions, Repository, Status, StatusOptions};
@@ -102,30 +105,84 @@ pub struct GitStatus {
     pub error: Option<String>,
 }
 
+/// Background-refreshed cache.  `compute` walks the working tree and runs a
+/// tree-to-tree diff against the default branch — on a large repo that can
+/// take long enough to be felt as a stutter when done on the UI thread, so we
+/// spawn the work on a helper thread and let `poll` adopt the result on a
+/// later frame.  Callers always see the last known status immediately.
 pub struct StatusCache {
     path: PathBuf,
-    last: Option<(Instant, GitStatus)>,
+    last: GitStatus,
+    last_refreshed: Option<Instant>,
+    last_hint: Option<String>,
+    pending: Option<Pending>,
+}
+
+struct Pending {
+    /// Hint the in-flight compute was started with, so we can tell whether
+    /// the result that lands matches what the UI is currently asking for.
+    hint: Option<String>,
+    rx: Receiver<GitStatus>,
 }
 
 impl StatusCache {
     pub fn new(path: PathBuf) -> Self {
-        Self { path, last: None }
-    }
-
-    pub fn get(&mut self) -> &GitStatus {
-        let needs_refresh =
-            self.last.as_ref().map_or(true, |(when, _)| when.elapsed() > REFRESH_INTERVAL);
-        if needs_refresh {
-            let status = compute(&self.path, None);
-            self.last = Some((Instant::now(), status));
+        Self {
+            path,
+            last: GitStatus::default(),
+            last_refreshed: None,
+            last_hint: None,
+            pending: None,
         }
-        &self.last.as_ref().unwrap().1
     }
 
-    pub fn force_refresh(&mut self, default_branch_hint: Option<&str>) {
-        let status = compute(&self.path, default_branch_hint);
-        self.last = Some((Instant::now(), status));
+    /// Last branch we resolved, for callers that need it before triggering a
+    /// new poll (e.g. the PR cache wants the branch name to query `gh`).
+    pub fn current_branch(&self) -> Option<&str> {
+        self.last.branch.as_deref()
     }
+
+    /// Returns the most recent known status, kicking off a background refresh
+    /// when stale or when the default-branch hint changed since the last
+    /// completed compute.  Never blocks the caller.
+    pub fn poll(&mut self, default_branch_hint: Option<&str>, ctx: &egui::Context) -> &GitStatus {
+        // Drain any completed background result before deciding whether to
+        // spawn another — a fresh answer shouldn't be ignored just because
+        // the staleness timer also tripped.
+        if let Some(pending) = &self.pending {
+            if let Ok(status) = pending.rx.try_recv() {
+                self.last = status;
+                self.last_refreshed = Some(Instant::now());
+                self.last_hint = pending.hint.clone();
+                self.pending = None;
+            }
+        }
+
+        let hint_changed = self.last_hint.as_deref() != default_branch_hint;
+        let stale = self.last_refreshed.map_or(true, |when| when.elapsed() > REFRESH_INTERVAL);
+        let needs_refresh = self.last_refreshed.is_none() || hint_changed || stale;
+
+        if needs_refresh && self.pending.is_none() {
+            self.pending = Some(spawn_compute(
+                self.path.clone(),
+                default_branch_hint.map(str::to_string),
+                ctx.clone(),
+            ));
+        }
+
+        &self.last
+    }
+}
+
+fn spawn_compute(path: PathBuf, hint: Option<String>, ctx: egui::Context) -> Pending {
+    let (tx, rx) = mpsc::channel();
+    let worker_hint = hint.clone();
+    thread::spawn(move || {
+        let status = compute(&path, worker_hint.as_deref());
+        let _ = tx.send(status);
+        ctx.request_repaint();
+    });
+    Pending { hint, rx }
 }
 
 pub fn compute(path: &Path, default_branch_hint: Option<&str>) -> GitStatus {
@@ -267,13 +324,35 @@ fn diff_against_branch(
     let head_tree = head_commit.tree()?;
 
     let mut opts = DiffOptions::new();
-    opts.include_untracked(false).recurse_untracked_dirs(false);
+    opts.include_untracked(false)
+        .recurse_untracked_dirs(false)
+        // We only need +/- counts, never the surrounding code, so asking
+        // libgit2 to emit zero context (and no inter-hunk padding) trims a
+        // material amount of streaming work on diffs with many small hunks.
+        .context_lines(0)
+        .interhunk_lines(0);
     let diff = repo.diff_tree_to_tree(Some(&base_tree), Some(&head_tree), Some(&mut opts))?;
 
-    let mut stats = Vec::new();
+    // Single foreach pass: `file_cb` seeds a `DiffStat` per changed file and
+    // `line_cb` bumps additions/deletions on the most-recently-seeded entry.
+    // libgit2 calls `file_cb` once per file and then streams that file's
+    // lines before moving on, so tracking "current index" is sufficient.
+    //
+    // This replaces a `Patch::from_diff(diff, i)` loop that, for every file,
+    // re-fetched both blobs and re-ran the diff algorithm just so a
+    // throw-away `line_stats()` could count +/- — easily the dominant cost
+    // on branches with hundreds of changes.
+    struct Accum {
+        stats: Vec<DiffStat>,
+        current: Option<usize>,
+    }
+    let accum = RefCell::new(Accum { stats: Vec::new(), current: None });
+
     diff.foreach(
         &mut |delta, _| {
+            let mut a = accum.borrow_mut();
             if matches!(delta.status(), Delta::Unmodified | Delta::Ignored) {
+                a.current = None;
                 return true;
             }
             let path = delta
@@ -282,25 +361,26 @@ fn diff_against_branch(
                 .or_else(|| delta.old_file().path())
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            stats.push(DiffStat { path, additions: 0, deletions: 0 });
+            a.current = Some(a.stats.len());
+            a.stats.push(DiffStat { path, additions: 0, deletions: 0 });
             true
         },
         None,
         None,
-        None,
+        Some(&mut |_delta, _hunk, line| {
+            let mut a = accum.borrow_mut();
+            if let Some(idx) = a.current {
+                match line.origin() {
+                    '+' => a.stats[idx].additions += 1,
+                    '-' => a.stats[idx].deletions += 1,
+                    _ => {},
+                }
+            }
+            true
+        }),
     )?;
 
-    for i in 0..diff.deltas().len() {
-        if let Ok(Some(patch)) = git2::Patch::from_diff(&diff, i) {
-            let (_, additions, deletions) = patch.line_stats().unwrap_or((0, 0, 0));
-            if let Some(stat) = stats.get_mut(i) {
-                stat.additions = additions;
-                stat.deletions = deletions;
-            }
-        }
-    }
-
-    Ok((stats, resolved))
+    Ok((accum.into_inner().stats, resolved))
 }
 
 fn resolve_base_commit<'a>(
