@@ -131,8 +131,9 @@ pub fn show(
                 .collect()
         });
         if !consumed.is_empty() {
-            // Typing should drop any active selection — matches alacritty's UX.
-            session.term.lock().selection = None;
+            // Typing drops the selection and snaps back to the prompt so the
+            // user sees their input — matches alacritty's on_terminal_input_start.
+            paste::on_terminal_input_start(session);
         }
         for event in consumed {
             match event {

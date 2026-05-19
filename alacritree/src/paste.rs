@@ -52,7 +52,10 @@ pub fn write_selection(term: &Term<EventProxy>, config: &Config, target: Target)
     clipboard::write(target, &text);
 }
 
-fn on_terminal_input_start(session: &Session) {
+/// Mirrors alacritty's `on_terminal_input_start`: any keypress or paste that
+/// reaches the PTY clears the active selection and snaps the view back to the
+/// active line so the user sees what they just typed.
+pub fn on_terminal_input_start(session: &Session) {
     let mut term = session.term.lock();
     let _ = term.selection.take();
     if term.grid().display_offset() != 0 {

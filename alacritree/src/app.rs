@@ -526,6 +526,7 @@ impl AlacritreeApp {
         match action {
             BindingAction::Chars(bytes) => {
                 if let Some(idx) = self.active_session_index() {
+                    paste::on_terminal_input_start(&self.sessions[idx]);
                     self.sessions[idx].write(bytes);
                 }
             },
@@ -1043,13 +1044,9 @@ impl AlacritreeApp {
                         // Open-coded section header so the PR number can be a
                         // hyperlink while the rest stays plain text.
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(&base_label).color(theme.text).strong().small(),
-                            );
+                            ui.label(RichText::new(&base_label).color(theme.text).strong().small());
                             if let Some(pr) = &pr_info {
-                                ui.label(
-                                    RichText::new("·").color(theme.text_muted).small(),
-                                );
+                                ui.label(RichText::new("·").color(theme.text_muted).small());
                                 ui.hyperlink_to(
                                     RichText::new(format!("PR #{}", pr.number))
                                         .color(theme.accent)
