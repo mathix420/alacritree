@@ -10,6 +10,10 @@
         }
     },
     "bin": "alacritree.exe",
+    "depends": [
+        "main/git",
+        "main/delta"
+    ],
     "shortcuts": [
         [
             "alacritree.exe",

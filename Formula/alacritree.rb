@@ -4,6 +4,17 @@ class Alacritree < Formula
   version "0.2.7"
   license "Apache-2.0"
 
+  # Linked dynamically through the `fontconfig` Rust crate (alacritty's font
+  # matching path); freetype is pulled in transitively but listed here too so
+  # `brew uses --recursive` reflects the real link graph.
+  depends_on "fontconfig"
+  depends_on "freetype"
+  # Runtime deps for the sidebar diff view: we shell out to `git diff … | delta`.
+  # macOS preinstalls a system `git` via Command Line Tools, but pinning the
+  # Homebrew one guarantees a recent enough version for the merge-base syntax.
+  depends_on "git"
+  depends_on "git-delta"
+
   # The release workflow only ships aarch64-apple-darwin today; Intel Macs
   # need to build from source until the release matrix grows an x86_64
   # target. The `on_macos` / `on_arm` guard makes the formula install fail
