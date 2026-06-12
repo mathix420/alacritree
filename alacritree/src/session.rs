@@ -306,9 +306,14 @@ impl Session {
             working_directory: working_directory.clone(),
             drain_on_exit: false,
             env: config.env.clone(),
-            // `Options` has a Windows-only `escape_args` field; leaning on
-            // `Default` keeps the literal compilable on every target.
-            ..Default::default()
+            // Windows has no argv: alacritty_terminal joins these args into a
+            // single CreateProcess command line, quoting them only when this
+            // is set.  Diff panes pass argv built in code, where an arg with a
+            // space (delta's pager spec, file paths) must survive as one
+            // argument; shell args from alacritty.toml stay raw to match
+            // upstream alacritty.
+            #[cfg(windows)]
+            escape_args: matches!(kind, SessionKind::Diff { .. }),
         };
 
         // alacritty routes OSC 7 / signals by this id, so each session needs its own.
