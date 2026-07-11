@@ -375,3 +375,77 @@ pub fn delete_worktree(
     }
     Ok(())
 }
+
+/// Remove the git metadata of a worktree whose checkout directory is gone
+/// (git calls these *prunable*). Uses git2's per-worktree prune rather than
+/// shelling out to `git worktree prune`, which would sweep every stale
+/// worktree in the repo instead of just the one the user asked about.
+pub fn prune_worktree(
+    project_root: &Path,
+    worktree_name: &str,
+    branch: Option<&str>,
+    delete_branch: bool,
+) -> Result<(), String> {
+    let repo = git2::Repository::open(project_root)
+        .map_err(|e| format!("failed to open repository: {}", e.message()))?;
+    let wt = repo
+        .find_worktree(worktree_name)
+        .map_err(|e| format!("failed to find worktree `{worktree_name}`: {}", e.message()))?;
+    // Default prune options refuse valid or locked worktrees — exactly the
+    // safety we want if the directory reappeared since discovery; the error
+    // surfaces to the caller.
+    wt.prune(None).map_err(|e| format!("failed to prune: {}", e.message()))?;
+    if delete_branch {
+        if let Some(branch) = branch {
+            // Branch may already be gone — ignore errors, as delete_worktree does.
+            let _ = run_git(project_root, &["branch", "-D", branch]);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::{add_worktree, init_repo};
+
+    #[test]
+    fn prune_removes_stale_metadata_and_keeps_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let repo = init_repo(&repo_dir);
+        let wt_path = add_worktree(&repo, "stale");
+        std::fs::remove_dir_all(&wt_path).unwrap();
+
+        prune_worktree(&repo_dir, "stale", Some("stale"), false).unwrap();
+
+        assert!(repo.find_worktree("stale").is_err());
+        assert!(repo.find_branch("stale", git2::BranchType::Local).is_ok());
+    }
+
+    #[test]
+    fn prune_deletes_branch_when_asked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let repo = init_repo(&repo_dir);
+        let wt_path = add_worktree(&repo, "stale");
+        std::fs::remove_dir_all(&wt_path).unwrap();
+
+        prune_worktree(&repo_dir, "stale", Some("stale"), true).unwrap();
+
+        assert!(repo.find_worktree("stale").is_err());
+        assert!(repo.find_branch("stale", git2::BranchType::Local).is_err());
+    }
+
+    #[test]
+    fn prune_refuses_a_live_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let repo = init_repo(&repo_dir);
+        add_worktree(&repo, "live");
+
+        assert!(prune_worktree(&repo_dir, "live", Some("live"), false).is_err());
+        assert!(repo.find_worktree("live").is_ok());
+        assert!(repo.find_branch("live", git2::BranchType::Local).is_ok());
+    }
+}
