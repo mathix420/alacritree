@@ -425,7 +425,11 @@ impl AlacritreeApp {
         let mut order: Vec<WorkspaceKey> = vec![None];
         for project in &self.projects {
             for wt in &project.worktrees {
-                order.push(Some(wt.path.clone()));
+                // Prunable rows can't host a shell; cycling into one would
+                // just bounce off the activate guard on every keypress.
+                if !wt.prunable {
+                    order.push(Some(wt.path.clone()));
+                }
             }
         }
         order
@@ -865,6 +869,11 @@ impl AlacritreeApp {
                                     activate_request.set(Some(wt.path.clone()));
                                 }
                                 if action.delete {
+                                    // Discovery marking can be stale; a dir
+                                    // deleted since the last refresh should
+                                    // still get the prune flow, not a doomed
+                                    // `git worktree remove`.
+                                    let prunable = wt.prunable || !wt.path.is_dir();
                                     delete_request.set(Some(DeleteRequest {
                                         project_idx: idx,
                                         worktree_path: wt.path.clone(),
@@ -872,12 +881,12 @@ impl AlacritreeApp {
                                         branch: wt.branch.clone(),
                                         // A missing dir has nothing to be dirty;
                                         // skip the status probe.
-                                        dirty: if wt.prunable {
+                                        dirty: if prunable {
                                             DirtyCounts::default()
                                         } else {
                                             git_status::dirty_counts(&wt.path)
                                         },
-                                        prunable: wt.prunable,
+                                        prunable,
                                         delete_branch: true,
                                     }));
                                 }
