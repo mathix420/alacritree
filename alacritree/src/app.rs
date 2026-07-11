@@ -1585,7 +1585,13 @@ fn worktree_row(
     let resp = frame
         .show(ui, |ui| {
             let default_icon = if wt.is_main { "●" } else { "○" };
-            let name_color = if is_active { theme.text } else { theme.text_dim };
+            let name_color = if wt.prunable {
+                theme.text_muted
+            } else if is_active {
+                theme.text
+            } else {
+                theme.text_dim
+            };
             row_with_trailing(
                 ui,
                 |ui| {
@@ -1604,8 +1610,13 @@ fn worktree_row(
                 },
                 |ui| {
                     if !wt.is_main {
-                        let btn = icon_button(ui, "×", theme.text_muted, theme)
-                            .on_hover_text("delete worktree and branch");
+                        let hover = if wt.prunable {
+                            "prune worktree"
+                        } else {
+                            "delete worktree and branch"
+                        };
+                        let btn =
+                            icon_button(ui, "×", theme.text_muted, theme).on_hover_text(hover);
                         delete_rect = Some(btn.rect);
                         if btn.clicked() {
                             delete_clicked = true;
@@ -1616,6 +1627,11 @@ fn worktree_row(
         })
         .response
         .interact(egui::Sense::click());
+    let resp = if wt.prunable {
+        resp.on_hover_text("worktree directory is missing — × prunes it")
+    } else {
+        resp
+    };
 
     // Frame allocates its space at end-of-show, so its retroactive `interact`
     // registers *after* the inner button in egui's z-order — meaning clicks on
@@ -1640,7 +1656,10 @@ fn worktree_row(
         let rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
         ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
     }
-    WorktreeAction { activate: resp.clicked() && !delete_clicked, delete: delete_clicked }
+    WorktreeAction {
+        activate: resp.clicked() && !delete_clicked && !wt.prunable,
+        delete: delete_clicked,
+    }
 }
 
 impl AlacritreeApp {
