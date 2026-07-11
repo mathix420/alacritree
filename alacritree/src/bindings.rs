@@ -45,6 +45,11 @@ pub enum NamedAction {
     /// 1-indexed.
     SelectTab(u8),
     SelectLastTab,
+    ToggleLeftSidebar,
+    ToggleRightSidebar,
+    SelectNextWorkspace,
+    SelectPreviousWorkspace,
+    AddProject,
     Quit,
     /// Used to unbind a key — consumes the press without acting on it.
     NoOp,
@@ -420,6 +425,11 @@ fn parse_action(name: &str) -> BindingAction {
         "SelectTab8" => BindingAction::Named(SelectTab(8)),
         "SelectTab9" => BindingAction::Named(SelectTab(9)),
         "SelectLastTab" => BindingAction::Named(SelectLastTab),
+        "ToggleLeftSidebar" => BindingAction::Named(ToggleLeftSidebar),
+        "ToggleRightSidebar" => BindingAction::Named(ToggleRightSidebar),
+        "SelectNextWorkspace" => BindingAction::Named(SelectNextWorkspace),
+        "SelectPreviousWorkspace" => BindingAction::Named(SelectPreviousWorkspace),
+        "AddProject" => BindingAction::Named(AddProject),
         "Quit" => BindingAction::Named(Quit),
         "None" => BindingAction::Named(NoOp),
         "ReceiveChar" => BindingAction::Named(ReceiveChar),
@@ -465,4 +475,52 @@ fn unescape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw_action(key: &str, mods: Option<&str>, action: &str) -> RawBinding {
+        RawBinding {
+            key: key.into(),
+            mods: mods.map(Into::into),
+            mode: None,
+            chars: None,
+            action: Some(action.into()),
+            command: None,
+        }
+    }
+
+    /// The `NamedAction`s that fire for a key press, ignoring other kinds.
+    fn named_matches(bindings: &[KeyBinding], key: Key, mods: Modifiers) -> Vec<NamedAction> {
+        all_matches(bindings, key, mods)
+            .into_iter()
+            .filter_map(|a| match a {
+                BindingAction::Named(n) => Some(*n),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn new_action_names_parse() {
+        for (name, expected) in [
+            ("ToggleLeftSidebar", NamedAction::ToggleLeftSidebar),
+            ("ToggleRightSidebar", NamedAction::ToggleRightSidebar),
+            ("SelectNextWorkspace", NamedAction::SelectNextWorkspace),
+            ("SelectPreviousWorkspace", NamedAction::SelectPreviousWorkspace),
+            ("AddProject", NamedAction::AddProject),
+        ] {
+            let b = parse_bindings(vec![raw_action("F1", None, name)]);
+            assert_eq!(named_matches(&b, Key::F1, Modifiers::NONE), vec![expected], "{name}");
+        }
+    }
+
+    #[test]
+    fn unknown_action_is_unsupported() {
+        let b = parse_bindings(vec![raw_action("F1", None, "FlyToTheMoon")]);
+        let m = all_matches(&b, Key::F1, Modifiers::NONE);
+        assert!(matches!(m.as_slice(), [BindingAction::Unsupported(n)] if n == "FlyToTheMoon"));
+    }
 }
