@@ -5,6 +5,7 @@
 //! end of the composition.
 
 use egui::ImeEvent;
+use unicode_width::UnicodeWidthChar;
 
 use crate::session::SessionId;
 
@@ -57,6 +58,37 @@ impl Ime {
             },
         }
     }
+}
+
+/// Terminal cell width of one char.  Control/zero-width chars count 1 so a
+/// malformed preedit still advances and stays visible.
+pub fn char_cells(c: char) -> usize {
+    c.width().unwrap_or(1).max(1)
+}
+
+pub struct PreeditLayout<'a> {
+    pub start_col: usize,
+    pub visible: &'a str,
+    pub width: usize,
+}
+
+/// Where the preedit overlay sits on the grid.  Mirrors alacritty's
+/// `draw_ime_preview` placement rule: the *end* of the composition (where
+/// the caret is) stays visible — right-aligned against the grid edge when
+/// the cursor is too far right, truncated from the left (whole chars) when
+/// wider than the grid.
+pub fn preedit_layout(text: &str, cursor_col: usize, cols: usize) -> PreeditLayout<'_> {
+    let mut width: usize = text.chars().map(char_cells).sum();
+    let mut start_byte = 0;
+    let mut chars = text.char_indices();
+    while width > cols {
+        let Some((idx, c)) = chars.next() else { break };
+        width -= char_cells(c);
+        start_byte = idx + c.len_utf8();
+    }
+    let visible = &text[start_byte..];
+    let end = (cursor_col + width).min(cols);
+    PreeditLayout { start_col: end.saturating_sub(width), visible, width }
 }
 
 #[cfg(test)]
@@ -118,5 +150,40 @@ mod tests {
         assert_eq!(ime.preedit(), Some("あ"));
         ime.retarget(2);
         assert_eq!(ime.preedit(), None);
+    }
+
+    #[test]
+    fn layout_ascii_at_cursor() {
+        let l = preedit_layout("abc", 5, 80);
+        assert_eq!((l.start_col, l.visible, l.width), (5, "abc", 3));
+    }
+
+    #[test]
+    fn layout_wide_chars_take_two_cells() {
+        let l = preedit_layout("あい", 5, 80);
+        assert_eq!((l.start_col, l.visible, l.width), (5, "あい", 4));
+    }
+
+    #[test]
+    fn layout_right_aligns_at_grid_edge() {
+        // Cursor at col 78 of 80: a 4-cell preedit must end at the last
+        // column, so it starts at 76.
+        let l = preedit_layout("あい", 78, 80);
+        assert_eq!((l.start_col, l.width), (76, 4));
+    }
+
+    #[test]
+    fn layout_truncates_from_the_left_keeping_the_end() {
+        // 6 cells of text in a 4-column grid: the first wide char drops.
+        let l = preedit_layout("あいう", 0, 4);
+        assert_eq!((l.start_col, l.visible, l.width), (0, "いう", 4));
+    }
+
+    #[test]
+    fn layout_empty_and_degenerate_grid() {
+        let l = preedit_layout("", 3, 80);
+        assert_eq!((l.start_col, l.visible, l.width), (3, "", 0));
+        let l = preedit_layout("あ", 0, 0);
+        assert_eq!((l.visible, l.width), ("", 0));
     }
 }

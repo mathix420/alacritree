@@ -20,6 +20,7 @@ serde_json = "1"
 toml = { workspace = true }
 xdg = "3.0.0"
 home = "0.5.5"
+unicode-width = "0.2.0"
 fontdb = { version = "0.23", default-features = false, features = ["fontconfig", "memmap"] }
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 png = "0.17"
