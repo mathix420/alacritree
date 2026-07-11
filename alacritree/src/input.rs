@@ -17,7 +17,7 @@ pub fn event_to_bytes(event: &Event) -> Option<Vec<u8>> {
 
 fn key_to_bytes(key: Key, mods: Modifiers) -> Option<Vec<u8>> {
     if mods.ctrl && !mods.alt {
-        if let Some(b) = ctrl_byte(key) {
+        if let Some(b) = control_byte(key, mods) {
             return Some(vec![b]);
         }
     }
@@ -63,41 +63,149 @@ fn key_to_bytes(key: Key, mods: Modifiers) -> Option<Vec<u8>> {
     }
 }
 
-fn ctrl_byte(key: Key) -> Option<u8> {
-    let b = match key {
-        Key::A => 0x01,
-        Key::B => 0x02,
-        Key::C => 0x03,
-        Key::D => 0x04,
-        Key::E => 0x05,
-        Key::F => 0x06,
-        Key::G => 0x07,
-        Key::H => 0x08,
-        Key::I => 0x09,
-        Key::J => 0x0a,
-        Key::K => 0x0b,
-        Key::L => 0x0c,
-        Key::M => 0x0d,
-        Key::N => 0x0e,
-        Key::O => 0x0f,
-        Key::P => 0x10,
-        Key::Q => 0x11,
-        Key::R => 0x12,
-        Key::S => 0x13,
-        Key::T => 0x14,
-        Key::U => 0x15,
-        Key::V => 0x16,
-        Key::W => 0x17,
-        Key::X => 0x18,
-        Key::Y => 0x19,
-        Key::Z => 0x1a,
-        Key::OpenBracket => 0x1b,
-        Key::Backslash => 0x1c,
-        Key::CloseBracket => 0x1d,
-        Key::Space => 0x00,
+/// Character a printable key produces, as far as byte encoding is concerned.
+/// Letters honor `shift` for case; shifted punctuation already arrives as its
+/// own logical key in egui (`?`, `{`, `|`, …), so those map one-to-one.
+fn key_char(key: Key, shift: bool) -> Option<char> {
+    let c = match key {
+        Key::A => 'a',
+        Key::B => 'b',
+        Key::C => 'c',
+        Key::D => 'd',
+        Key::E => 'e',
+        Key::F => 'f',
+        Key::G => 'g',
+        Key::H => 'h',
+        Key::I => 'i',
+        Key::J => 'j',
+        Key::K => 'k',
+        Key::L => 'l',
+        Key::M => 'm',
+        Key::N => 'n',
+        Key::O => 'o',
+        Key::P => 'p',
+        Key::Q => 'q',
+        Key::R => 'r',
+        Key::S => 's',
+        Key::T => 't',
+        Key::U => 'u',
+        Key::V => 'v',
+        Key::W => 'w',
+        Key::X => 'x',
+        Key::Y => 'y',
+        Key::Z => 'z',
+        Key::Num0 => '0',
+        Key::Num1 => '1',
+        Key::Num2 => '2',
+        Key::Num3 => '3',
+        Key::Num4 => '4',
+        Key::Num5 => '5',
+        Key::Num6 => '6',
+        Key::Num7 => '7',
+        Key::Num8 => '8',
+        Key::Num9 => '9',
+        Key::Space => ' ',
+        Key::Minus => '-',
+        Key::Plus => '+',
+        Key::Equals => '=',
+        Key::Slash => '/',
+        Key::Questionmark => '?',
+        Key::Backslash => '\\',
+        Key::Pipe => '|',
+        Key::OpenBracket => '[',
+        Key::CloseBracket => ']',
+        Key::OpenCurlyBracket => '{',
+        Key::CloseCurlyBracket => '}',
+        Key::Semicolon => ';',
+        Key::Colon => ':',
+        Key::Comma => ',',
+        Key::Period => '.',
+        Key::Backtick => '`',
+        Key::Quote => '\'',
+        Key::Exclamationmark => '!',
         _ => return None,
     };
-    Some(b)
+    Some(if shift && c.is_ascii_alphabetic() { c.to_ascii_uppercase() } else { c })
+}
+
+/// xterm's legacy Ctrl encoding. Upstream alacritty receives these bytes
+/// pre-composed by winit as key text; egui reports only the logical key, so
+/// the byte is derived from the key's character here instead.
+fn control_byte(key: Key, mods: Modifiers) -> Option<u8> {
+    let c = key_char(key, false)?;
+    let byte = match c {
+        ' ' | '2' => 0x00,
+        'a'..='z' => c as u8 & 0x1f,
+        '[' => 0x1b,
+        '\\' => 0x1c,
+        ']' => 0x1d,
+        '6' => 0x1e,
+        '-' | '/' => 0x1f,
+        '?' => 0x7f,
+        _ => return None,
+    };
+    let _ = mods;
+    Some(byte)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use Modifiers as M;
+
+    // egui ships `Modifiers::NONE/CTRL/SHIFT/ALT` constants; combos are
+    // built with struct-update syntax inside test bodies.
+    fn ctrl_shift() -> Modifiers {
+        Modifiers { ctrl: true, shift: true, ..M::NONE }
+    }
+
+    #[test]
+    fn ctrl_slash_sends_unit_separator() {
+        assert_eq!(key_to_bytes(Key::Slash, M::CTRL), Some(vec![0x1f]));
+    }
+
+    #[test]
+    fn ctrl_letters_send_c0_bytes() {
+        assert_eq!(key_to_bytes(Key::A, M::CTRL), Some(vec![0x01]));
+        assert_eq!(key_to_bytes(Key::C, M::CTRL), Some(vec![0x03]));
+        assert_eq!(key_to_bytes(Key::Z, M::CTRL), Some(vec![0x1a]));
+        // Shift+Ctrl+letter sends the same byte as Ctrl+letter.
+        assert_eq!(key_to_bytes(Key::C, ctrl_shift()), Some(vec![0x03]));
+    }
+
+    #[test]
+    fn ctrl_punctuation_matches_xterm() {
+        assert_eq!(key_to_bytes(Key::Space, M::CTRL), Some(vec![0x00]));
+        assert_eq!(key_to_bytes(Key::Num2, M::CTRL), Some(vec![0x00]));
+        assert_eq!(key_to_bytes(Key::OpenBracket, M::CTRL), Some(vec![0x1b]));
+        assert_eq!(key_to_bytes(Key::Backslash, M::CTRL), Some(vec![0x1c]));
+        assert_eq!(key_to_bytes(Key::CloseBracket, M::CTRL), Some(vec![0x1d]));
+        assert_eq!(key_to_bytes(Key::Num6, M::CTRL), Some(vec![0x1e]));
+        assert_eq!(key_to_bytes(Key::Minus, M::CTRL), Some(vec![0x1f]));
+        assert_eq!(key_to_bytes(Key::Questionmark, M::CTRL), Some(vec![0x7f]));
+    }
+
+    #[test]
+    fn ctrl_unmapped_key_sends_nothing() {
+        assert_eq!(key_to_bytes(Key::Quote, M::CTRL), None);
+    }
+
+    #[test]
+    fn plain_named_keys_unchanged() {
+        assert_eq!(key_to_bytes(Key::ArrowUp, M::NONE), Some(b"\x1b[A".to_vec()));
+        assert_eq!(key_to_bytes(Key::Enter, M::NONE), Some(b"\r".to_vec()));
+        assert_eq!(key_to_bytes(Key::Tab, M::NONE), Some(b"\t".to_vec()));
+        assert_eq!(key_to_bytes(Key::Backspace, M::NONE), Some(b"\x7f".to_vec()));
+        assert_eq!(key_to_bytes(Key::F1, M::NONE), Some(b"\x1bOP".to_vec()));
+        assert_eq!(key_to_bytes(Key::F5, M::NONE), Some(b"\x1b[15~".to_vec()));
+    }
+
+    #[test]
+    fn text_event_passes_through() {
+        let ev = Event::Text("é".to_string());
+        assert_eq!(event_to_bytes(&ev), Some("é".as_bytes().to_vec()));
+    }
 }
 
 #[cfg(test)]
