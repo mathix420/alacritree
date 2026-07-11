@@ -5,6 +5,12 @@
 //! the same directory and overrides anything in `alacritty.toml` via a
 //! deep-merge.  alacritree-specific options (sidebar colors, etc.) live under
 //! a `[ui]` table and are only valid in `alacritree.toml`.
+//!
+//! Binding actions that only exist in alacritree (`ToggleLeftSidebar`,
+//! `SelectNextWorkspace`, `AddProject`, …) belong in `alacritree.toml` too:
+//! real alacritty warns about unknown actions if it sees them in the shared
+//! `alacritty.toml`, and the array-concatenating merge means bindings placed
+//! in `alacritree.toml` still add to (never clobber) the shared ones.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

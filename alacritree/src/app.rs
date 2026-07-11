@@ -426,77 +426,11 @@ impl AlacritreeApp {
         self.quit_dialog_open || self.pending_delete.is_some() || self.pending_create.is_some()
     }
 
+    /// Match key events against the binding table (user bindings + defaults)
+    /// before the terminal sees raw events, so a binding wins over plain
+    /// text input.  Matched events are consumed unless every matched action
+    /// is `ReceiveChar` (alacritty's pass-through marker).
     fn handle_shortcuts(&mut self, ctx: &Context) {
-        let mut sidebars_changed = false;
-        let mut cycle_tabs_delta: Option<i32> = None;
-        let mut cycle_ws_delta: Option<i32> = None;
-        let mut quit_requested = false;
-        let mut add_project_requested = false;
-        ctx.input_mut(|i| {
-            if consume_exact(i, egui::Modifiers::CTRL, egui::Key::B) {
-                self.show_left_sidebar = !self.show_left_sidebar;
-                sidebars_changed = true;
-            }
-            if consume_exact(i, egui::Modifiers::CTRL, egui::Key::G) {
-                self.show_right_sidebar = !self.show_right_sidebar;
-                sidebars_changed = true;
-            }
-            // Ctrl+Shift+Tab must be checked before Ctrl+Tab — even with exact
-            // matching, leaving them in the opposite order works, but ordering
-            // forward→backward keeps the "modifier-richer wins" intent obvious.
-            if consume_exact(i, egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Tab) {
-                cycle_tabs_delta = Some(-1);
-            }
-            if consume_exact(i, egui::Modifiers::CTRL, egui::Key::Tab) {
-                cycle_tabs_delta = Some(1);
-            }
-            if consume_exact(i, egui::Modifiers::ALT, egui::Key::ArrowRight) {
-                cycle_ws_delta = Some(1);
-            }
-            if consume_exact(i, egui::Modifiers::ALT, egui::Key::ArrowLeft) {
-                cycle_ws_delta = Some(-1);
-            }
-            if consume_exact(i, egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::O) {
-                add_project_requested = true;
-            }
-            if consume_exact(i, egui::Modifiers::CTRL, egui::Key::Q) {
-                quit_requested = true;
-            }
-        });
-
-        // Split out so spawn_session can take &mut self without tripping the borrow.
-        let ctrl_t = ctx.input_mut(|i| consume_exact(i, egui::Modifiers::CTRL, egui::Key::T));
-        if ctrl_t {
-            let ws = self.current_workspace.clone();
-            if let Err(e) = self.spawn_session(ctx, ws) {
-                self.last_error = Some(format!("failed to spawn shell: {e}"));
-            }
-        }
-        if add_project_requested {
-            self.add_project_via_dialog();
-        }
-        if let Some(d) = cycle_tabs_delta {
-            self.cycle_tabs(d);
-        }
-        if let Some(d) = cycle_ws_delta {
-            self.cycle_workspaces(ctx, d);
-        }
-        if quit_requested {
-            self.quit_dialog_open = true;
-        }
-        if sidebars_changed {
-            self.persist();
-        }
-
-        // After built-in shortcuts (so we don't shadow them) but before the
-        // terminal sees raw events (so a binding wins over plain text input).
-        self.dispatch_user_bindings(ctx);
-    }
-
-    fn dispatch_user_bindings(&mut self, ctx: &Context) {
-        if self.config.bindings.is_empty() {
-            return;
-        }
         let actions: Vec<BindingAction> = ctx.input_mut(|i| {
             let mut actions = Vec::new();
             i.events.retain(|ev| {
@@ -586,6 +520,21 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::SelectLastTab) => self.select_last_tab(),
             BindingAction::Named(NamedAction::NoOp) => {},
             BindingAction::Named(NamedAction::ReceiveChar) => {},
+            BindingAction::Named(NamedAction::ToggleLeftSidebar) => {
+                self.show_left_sidebar = !self.show_left_sidebar;
+                self.persist();
+            },
+            BindingAction::Named(NamedAction::ToggleRightSidebar) => {
+                self.show_right_sidebar = !self.show_right_sidebar;
+                self.persist();
+            },
+            BindingAction::Named(NamedAction::SelectNextWorkspace) => {
+                self.cycle_workspaces(ctx, 1);
+            },
+            BindingAction::Named(NamedAction::SelectPreviousWorkspace) => {
+                self.cycle_workspaces(ctx, -1);
+            },
+            BindingAction::Named(NamedAction::AddProject) => self.add_project_via_dialog(),
             BindingAction::Named(other) => {
                 self.dispatch_scroll_or_other(other);
             },
@@ -1200,24 +1149,6 @@ fn modal_frame(theme: &Theme) -> Frame {
         .fill(theme.sidebar_bg)
         .stroke(Stroke::new(1.0, theme.sidebar_border))
         .inner_margin(Margin { left: pad_x, right: pad_x, top: pad_y, bottom: pad_y })
-}
-
-/// `InputState::consume_shortcut` matches modifiers as a *subset*: `Ctrl+G`
-/// fires on `Ctrl+Shift+G`, `Ctrl+Tab` fires on `Ctrl+Shift+Tab`, and the
-/// stronger binding never gets a chance to consume the event.  Use exact
-/// modifier matching so each shortcut only triggers on its own combination.
-fn consume_exact(input: &mut egui::InputState, mods: egui::Modifiers, key: egui::Key) -> bool {
-    let mut hit = false;
-    input.events.retain(|ev| {
-        if let egui::Event::Key { key: k, pressed: true, modifiers, .. } = ev {
-            if *k == key && modifiers.matches_exact(mods) {
-                hit = true;
-                return false;
-            }
-        }
-        true
-    });
-    hit
 }
 
 fn consume_modal_keys(ctx: &Context) -> (bool, bool) {
