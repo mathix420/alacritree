@@ -120,7 +120,15 @@ pub fn show(
         builtin_glyphs,
         ui.ctx(),
         hovered_link.as_ref().map(|l| &l.bounds),
+        // The preedit overlay replaces the cursor while composing
+        // (alacritty hides it the same way, display/content.rs).
+        ime.preedit().is_some(),
     );
+
+    let preedit_caret = ime
+        .preedit()
+        .map(|p| p.to_owned())
+        .and_then(|p| paint_preedit(&painter, rect, session, config, &font_id, cell_w, cell_h, &p));
 
     if allow_focus && response.has_focus() {
         let consumed: Vec<ConsumedEvent> = ui.input(|i| {
@@ -168,7 +176,9 @@ pub fn show(
         // follows the caret like alacritty's `update_ime_position`
         // (TextEdit passes its whole widget rect there, which for a
         // fullscreen terminal would pin the popup to the window corner).
-        let caret = cursor_cell_rect(session, rect, cell_w, cell_h).unwrap_or(rect);
+        let caret = preedit_caret
+            .or_else(|| cursor_cell_rect(session, rect, cell_w, cell_h))
+            .unwrap_or(rect);
         ui.ctx().output_mut(|o| {
             o.ime = Some(egui::output::IMEOutput { rect: caret, cursor_rect: caret });
         });
@@ -551,6 +561,7 @@ fn paint_grid(
     builtin_glyphs: &mut BuiltinGlyphCache,
     ctx: &egui::Context,
     link_bounds: Option<&Match>,
+    cursor_hidden: bool,
 ) {
     let term = session.term.lock();
     let runtime_palette = term.colors();
@@ -619,7 +630,7 @@ fn paint_grid(
         }
     }
 
-    if cursor_visible_line >= 0 && cursor_visible_line < screen_lines {
+    if !cursor_hidden && cursor_visible_line >= 0 && cursor_visible_line < screen_lines {
         let cursor_shape = cursor_shape(&term);
         paint_cursor(
             painter,
@@ -846,6 +857,68 @@ fn paint_cursor(
             glyph_color,
         );
     }
+}
+
+/// Draw the in-progress IME composition at the cursor, mirroring alacritty's
+/// `draw_ime_preview`: default foreground on default background, underlined,
+/// with a beam caret after the last char (egui-winit drops the preedit
+/// cursor offset, so the caret can only sit at the end).  Returns the caret
+/// cell rect so the candidate window can follow it.
+#[allow(clippy::too_many_arguments)]
+fn paint_preedit(
+    painter: &egui::Painter,
+    rect: Rect,
+    session: &Session,
+    config: &Config,
+    font_id: &FontId,
+    cell_w: f32,
+    cell_h: f32,
+    preedit: &str,
+) -> Option<Rect> {
+    let (cursor_col, line, cols) = {
+        let term = session.term.lock();
+        let grid = term.grid();
+        let line = grid.cursor.point.line.0 + grid.display_offset() as i32;
+        if line < 0 || line >= grid.screen_lines() as i32 {
+            return None;
+        }
+        (grid.cursor.point.column.0, line, grid.columns())
+    };
+
+    let layout = crate::ime::preedit_layout(preedit, cursor_col, cols);
+    let fg = foreground(&config.palette);
+    let bg = background(&config.palette);
+    let y = rect.min.y + line as f32 * cell_h;
+    let x = rect.min.x + layout.start_col as f32 * cell_w;
+    let width_pt = layout.width as f32 * cell_w;
+
+    painter.rect_filled(Rect::from_min_size(Pos2::new(x, y), Vec2::new(width_pt, cell_h)), 0.0, bg);
+
+    let mut col = layout.start_col;
+    let mut buf = [0u8; 4];
+    for ch in layout.visible.chars() {
+        painter.text(
+            Pos2::new(rect.min.x + col as f32 * cell_w, y),
+            egui::Align2::LEFT_TOP,
+            ch.encode_utf8(&mut buf).to_string(),
+            font_id.clone(),
+            fg,
+        );
+        col += crate::ime::char_cells(ch);
+    }
+
+    let uy = y + cell_h - 1.5;
+    painter.line_segment([Pos2::new(x, uy), Pos2::new(x + width_pt, uy)], Stroke::new(1.0, fg));
+
+    // Beam caret on the cell the next char lands in, clamped to the grid.
+    let caret_col = (layout.start_col + layout.width).min(cols.saturating_sub(1));
+    let caret_x = rect.min.x + caret_col as f32 * cell_w;
+    painter.rect_filled(
+        Rect::from_min_size(Pos2::new(caret_x, y), Vec2::new(2.0, cell_h)),
+        0.0,
+        fg,
+    );
+    Some(Rect::from_min_size(Pos2::new(caret_x, y), Vec2::new(cell_w, cell_h)))
 }
 
 /// Place the cached pixel-space glyph into the cell.  alacritty positions
