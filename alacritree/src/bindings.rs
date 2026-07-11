@@ -420,6 +420,16 @@ fn parse_mods(s: &str) -> Modifiers {
             other => log::warn!("unknown modifier '{other}'"),
         }
     }
+    // egui has no separate Super modifier: on non-mac platforms egui-winit
+    // folds the Ctrl key into `command`, so a "Command"/"Super" binding
+    // already fires on Ctrl at match time.  Canonicalize to `ctrl` so
+    // parse-time trigger comparison (default replacement) agrees with
+    // runtime matching.
+    #[cfg(not(target_os = "macos"))]
+    if m.command {
+        m.ctrl = true;
+        m.command = false;
+    }
     m
 }
 
@@ -602,6 +612,15 @@ mod tests {
         let b = parse_bindings(vec![raw_action("F1", None, "FlyToTheMoon")]);
         let m = all_matches(&b, Key::F1, Modifiers::NONE);
         assert!(matches!(m.as_slice(), [BindingAction::Unsupported(n)] if n == "FlyToTheMoon"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn command_mods_replace_ctrl_default_on_non_mac() {
+        // "Super"/"Command" fire on Ctrl at runtime (egui folds them), so
+        // they must also replace Ctrl defaults at parse time.
+        let b = parse_bindings(vec![raw_action("T", Some("Super"), "None")]);
+        assert_eq!(named_matches(&b, Key::T, Modifiers::CTRL), vec![NamedAction::NoOp]);
     }
 
     #[test]
