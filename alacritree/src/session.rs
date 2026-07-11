@@ -91,11 +91,11 @@ pub struct Session {
     pub accumulated_scroll: (f64, f64),
     /// Shell pid spawned for this PTY.  Used to walk to the foreground
     /// process group when identifying which agent is running.  None on
-    /// platforms where we don't yet capture it (Windows).
+    /// platforms where we don't yet capture it.
     shell_pid: Option<u32>,
     /// Cached result of the last foreground-process probe — refreshed on a
-    /// timer instead of polling `/proc` every frame.  `Cell` is enough since
-    /// `Session` isn't `Sync` and the values are `Copy`.
+    /// timer instead of polling the process table every frame.  `Cell` is
+    /// enough since `Session` isn't `Sync` and the values are `Copy`.
     agent_cache: Cell<AgentCache>,
     notifier: Notifier,
     sender: EventLoopSender,
@@ -111,9 +111,10 @@ struct AgentCache {
 
 const AGENT_CACHE_TTL: Duration = Duration::from_millis(1000);
 
-/// Map a foreground process name (from `/proc/<pid>/comm`) to its static
-/// sidebar glyph.  `comm` is kernel-truncated to 15 bytes, so we compare with
-/// `starts_with` — `cursor-agent` would otherwise miss.
+/// Map a foreground process name (`/proc/<pid>/comm` on Linux, image name
+/// on Windows) to its static sidebar glyph.  Compared with `starts_with`:
+/// Linux `comm` is kernel-truncated to 15 bytes (`cursor-agent` would
+/// otherwise miss) and Windows names carry an `.exe` suffix.
 const AGENT_PROCESS_GLYPHS: &[(&str, char)] = &[
     ("claude", '✳'),
     ("codex", '◇'),
@@ -122,6 +123,50 @@ const AGENT_PROCESS_GLYPHS: &[(&str, char)] = &[
     ("cursor-agent", '❖'),
     ("continue", '⊕'),
 ];
+
+/// Pids in the tree rooted at `root` (inclusive), from a `(pid, parent)`
+/// snapshot.  Root-inclusive so a session whose spawned program *is* the
+/// agent still matches.  Parent links in a snapshot can be stale or cyclic
+/// (pid reuse), so the walk tracks visited pids.
+#[cfg(any(test, windows))]
+fn process_tree_pids(procs: &[(u32, Option<u32>)], root: u32) -> Vec<u32> {
+    use std::collections::HashSet;
+    let mut tree = vec![root];
+    let mut visited: HashSet<u32> = tree.iter().copied().collect();
+    let mut cursor = 0;
+    while cursor < tree.len() {
+        let parent = tree[cursor];
+        cursor += 1;
+        for &(pid, ppid) in procs {
+            if ppid == Some(parent) && visited.insert(pid) {
+                tree.push(pid);
+            }
+        }
+    }
+    tree
+}
+
+/// Match process names against the agent map.  Lowercased `starts_with`,
+/// mirroring the Linux `comm` match while tolerating Windows' `.exe`
+/// suffix and case-insensitive filenames.
+#[cfg(any(test, windows))]
+fn agent_glyph_by_name(names: impl IntoIterator<Item = impl AsRef<str>>) -> Option<char> {
+    names.into_iter().find_map(|n| {
+        let n = n.as_ref().to_ascii_lowercase();
+        AGENT_PROCESS_GLYPHS.iter().find(|(name, _)| n.starts_with(name)).map(|(_, g)| *g)
+    })
+}
+
+/// Match full command lines against the agent map — picks up
+/// `node ...\claude-code\cli.js`-style wrappers that hide behind their
+/// runtime's name, same as the Linux cmdline pass.
+#[cfg(any(test, windows))]
+fn agent_glyph_by_cmdline(cmds: impl IntoIterator<Item = impl AsRef<str>>) -> Option<char> {
+    cmds.into_iter().find_map(|c| {
+        let c = c.as_ref().to_ascii_lowercase();
+        AGENT_PROCESS_GLYPHS.iter().find(|(name, _)| c.contains(name)).map(|(_, g)| *g)
+    })
+}
 
 #[derive(Default)]
 pub struct DrainOutcome {
@@ -162,7 +207,14 @@ fn pty_shell_pid(pty: &alacritty_terminal::tty::Pty) -> Option<u32> {
     Some(pty.child().id())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn pty_shell_pid(pty: &alacritty_terminal::tty::Pty) -> Option<u32> {
+    // Under ConPTY the PTY child *is* the shell; everything the user runs
+    // is spawned beneath it.
+    pty.child_watcher().pid().map(std::num::NonZeroU32::get)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn pty_shell_pid(_pty: &alacritty_terminal::tty::Pty) -> Option<u32> {
     None
 }
@@ -220,11 +272,84 @@ fn read_tpgid(shell_pid: u32) -> Option<i32> {
     after.split_whitespace().nth(5)?.parse::<i32>().ok()
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Windows has no foreground process group, so "foreground" is approximated
+/// as *any* recognized agent in the shell's descendant tree.  This is what
+/// the glyph means to the user — "an agent is running here" — and it stays
+/// stable while agents run their own subprocesses, where a deepest-leaf
+/// heuristic would flicker.
+#[cfg(windows)]
+fn foreground_process_glyph(shell_pid: u32) -> Option<char> {
+    windows_process_probe::agent_glyph_under(shell_pid)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn foreground_process_glyph(_shell_pid: u32) -> Option<char> {
     // macOS would use `libproc::proc_pidfdinfo` / `tcgetpgrp` on the master
-    // FD; Windows is its own world.  Not wired up yet.
+    // FD.  Not wired up yet.
     None
+}
+
+#[cfg(windows)]
+mod windows_process_probe {
+    //! Shared, throttled process-table snapshot.  Every session probes at
+    //! its own `AGENT_CACHE_TTL` cadence; keeping one global `System` means
+    //! N sessions cost one enumeration per tick, not N.  Two-phase refresh:
+    //! names + parent pids for the whole table (one cheap system call
+    //! class), command lines only for the shell's descendants and only when
+    //! no name matched.
+    use std::sync::{Mutex, PoisonError};
+    use std::time::{Duration, Instant};
+
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    use super::{agent_glyph_by_cmdline, agent_glyph_by_name, process_tree_pids};
+
+    /// Slightly under `AGENT_CACHE_TTL` so the first session to tick
+    /// refreshes and the rest reuse the same table.
+    const SNAPSHOT_TTL: Duration = Duration::from_millis(900);
+
+    static SNAPSHOT: Mutex<Option<(Instant, System)>> = Mutex::new(None);
+
+    pub(super) fn agent_glyph_under(shell_pid: u32) -> Option<char> {
+        let mut guard = SNAPSHOT.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.as_ref().is_none_or(|(at, _)| at.elapsed() >= SNAPSHOT_TTL) {
+            let mut sys = guard.take().map(|(_, sys)| sys).unwrap_or_default();
+            sys.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                ProcessRefreshKind::nothing(),
+            );
+            *guard = Some((Instant::now(), sys));
+        }
+        let (_, sys) = guard.as_mut().expect("snapshot populated above");
+
+        let table: Vec<(u32, Option<u32>)> = sys
+            .processes()
+            .iter()
+            .map(|(pid, p)| (pid.as_u32(), p.parent().map(|pp| pp.as_u32())))
+            .collect();
+        let tree = process_tree_pids(&table, shell_pid);
+        let tree: Vec<Pid> = tree.into_iter().map(Pid::from_u32).collect();
+
+        let names =
+            tree.iter().filter_map(|pid| sys.process(*pid)).map(|p| p.name().to_string_lossy());
+        if let Some(glyph) = agent_glyph_by_name(names) {
+            return Some(glyph);
+        }
+
+        // Names missed: fetch command lines for just the tree to catch
+        // agents launched through node/python shims.
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&tree),
+            false,
+            ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+        );
+        let cmds = tree
+            .iter()
+            .filter_map(|pid| sys.process(*pid))
+            .map(|p| p.cmd().iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "));
+        agent_glyph_by_cmdline(cmds)
+    }
 }
 
 impl Session {
@@ -448,4 +573,57 @@ fn next_session_id() -> SessionId {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tree_walk_collects_root_and_descendants_only() {
+        // 1 → {10 → {20 → 30}, 40 → 50}; rooting at 10 must exclude 40's branch.
+        let procs = [
+            (1, None),
+            (10, Some(1)),
+            (20, Some(10)),
+            (30, Some(20)),
+            (40, Some(1)),
+            (50, Some(40)),
+        ];
+        let mut tree = process_tree_pids(&procs, 10);
+        tree.sort_unstable();
+        assert_eq!(tree, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn tree_walk_includes_root_even_without_children() {
+        // A session can be spawned with the agent as the shell program itself.
+        assert_eq!(process_tree_pids(&[(7, None)], 7), vec![7]);
+    }
+
+    #[test]
+    fn tree_walk_survives_cyclic_parent_links() {
+        // Snapshot parent data can be stale (pid reuse) and form cycles.
+        let procs = [(10, Some(20)), (20, Some(10))];
+        let mut tree = process_tree_pids(&procs, 10);
+        tree.sort_unstable();
+        assert_eq!(tree, vec![10, 20]);
+    }
+
+    #[test]
+    fn name_match_handles_exe_suffix_and_case() {
+        assert_eq!(agent_glyph_by_name(["pwsh.exe", "Claude.exe"]), Some('✳'));
+        assert_eq!(agent_glyph_by_name(["cursor-agent.exe"]), Some('❖'));
+        assert_eq!(agent_glyph_by_name(["pwsh.exe", "git.exe"]), None);
+        assert_eq!(agent_glyph_by_name(["not-claude.exe"]), None);
+        assert_eq!(agent_glyph_by_name(std::iter::empty::<&str>()), None);
+    }
+
+    #[test]
+    fn cmdline_match_catches_runtime_wrappers() {
+        let cmd =
+            r"node C:\Users\lev\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js";
+        assert_eq!(agent_glyph_by_cmdline([cmd]), Some('✳'));
+        assert_eq!(agent_glyph_by_cmdline([r"pwsh.exe -NoLogo"]), None);
+    }
 }
