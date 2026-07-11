@@ -140,6 +140,7 @@ pub struct AlacritreeApp {
     _ipc_socket: Option<ipc::SocketHandle>,
     /// Shared across sessions; auto-invalidated when cell size changes.
     builtin_glyphs: crate::builtin_font::BuiltinGlyphCache,
+    ime: crate::ime::Ime,
 }
 
 struct DeleteRequest {
@@ -239,6 +240,11 @@ impl AlacritreeApp {
         }
         cc.egui_ctx.set_style(style);
 
+        // Terminal IME hint — matches alacritty's set_ime_purpose.
+        cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::IMEPurpose(
+            egui::viewport::IMEPurpose::Terminal,
+        ));
+
         alacritty_terminal::tty::setup_env();
 
         // Before the first PTY spawn so children inherit ALACRITREE_SOCKET.
@@ -295,6 +301,7 @@ impl AlacritreeApp {
             ipc_rx,
             _ipc_socket: ipc_socket,
             builtin_glyphs: crate::builtin_font::BuiltinGlyphCache::new(),
+            ime: crate::ime::Ime::default(),
         };
 
         if let Err(e) = app.spawn_session(&cc.egui_ctx, None) {
@@ -2388,12 +2395,14 @@ impl eframe::App for AlacritreeApp {
                     return;
                 };
                 let session = &mut self.sessions[idx];
+                let ime = &mut self.ime;
                 let _ = terminal_view::show(
                     ui,
                     session,
                     &self.config,
                     !modal_open,
                     &mut self.builtin_glyphs,
+                    ime,
                 );
             });
 

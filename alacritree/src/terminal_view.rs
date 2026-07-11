@@ -7,8 +7,8 @@ use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::search::Match;
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape};
 use egui::{
-    Color32, CursorIcon, Event, FontFamily, FontId, Modifiers, MouseWheelUnit, PointerButton, Pos2,
-    Rect, Response, Sense, Stroke, Ui, Vec2,
+    Color32, CursorIcon, Event, FontFamily, FontId, ImeEvent, Modifiers, MouseWheelUnit,
+    PointerButton, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2,
 };
 
 use crate::builtin_font::{BuiltinGlyphCache, Metrics, is_builtin_glyph};
@@ -27,6 +27,7 @@ pub fn show(
     config: &Config,
     allow_focus: bool,
     builtin_glyphs: &mut BuiltinGlyphCache,
+    ime: &mut crate::ime::Ime,
 ) -> Response {
     let font_id = FontId::monospace(config.font.egui_size());
     let (cell_w_pt, cell_h_pt) = ui.ctx().fonts(|f| {
@@ -74,6 +75,7 @@ pub fn show(
     if allow_focus && !response.has_focus() {
         response.request_focus();
     }
+    ime.retarget(session.id);
 
     let painter = ui.painter_at(rect);
 
@@ -125,22 +127,52 @@ pub fn show(
             i.events
                 .iter()
                 .filter_map(|e| match e {
+                    Event::Ime(ev) => Some(ConsumedEvent::Ime(ev.clone())),
                     Event::Paste(s) => Some(ConsumedEvent::Paste(s.clone())),
                     _ => event_to_bytes(e).map(ConsumedEvent::Bytes),
                 })
                 .collect()
         });
-        if !consumed.is_empty() {
-            // Typing drops the selection and snaps back to the prompt so the
-            // user sees their input — matches alacritty's on_terminal_input_start.
-            paste::on_terminal_input_start(session);
-        }
         for event in consumed {
             match event {
-                ConsumedEvent::Bytes(bytes) => session.write(bytes),
+                ConsumedEvent::Ime(ev) => {
+                    if let Some(text) = ime.process(&ev) {
+                        // Mirrors alacritty: single-char commits skip
+                        // bracketed paste (event.rs "Don't use bracketed
+                        // paste for single char input").
+                        paste::paste(session, &text, text.chars().count() > 1);
+                    }
+                },
+                // While composing, candidate-window navigation
+                // (Space/Enter/arrows/Backspace/Escape) arrives as ordinary
+                // key events; none of it may reach the PTY.  Mirrors
+                // alacritty's early return in `key_input`.
+                _ if ime.preedit().is_some() => {},
+                ConsumedEvent::Bytes(bytes) => {
+                    // Typing drops the selection and snaps back to the prompt
+                    // so the user sees their input — matches alacritty's
+                    // on_terminal_input_start.
+                    paste::on_terminal_input_start(session);
+                    session.write(bytes);
+                },
                 ConsumedEvent::Paste(text) => paste::paste(session, &text, true),
             }
         }
+        // Setting `PlatformOutput::ime` is what makes egui-winit call
+        // `set_ime_allowed(true)` — without it the OS IME never engages.
+        // The rect drives `set_ime_cursor_area`, so the candidate window
+        // follows the caret like alacritty's `update_ime_position`
+        // (TextEdit passes its whole widget rect there, which for a
+        // fullscreen terminal would pin the popup to the window corner).
+        let caret = cursor_cell_rect(session, rect, cell_w, cell_h).unwrap_or(rect);
+        ui.ctx().output_mut(|o| {
+            o.ime = Some(egui::output::IMEOutput { rect: caret, cursor_rect: caret });
+        });
+    } else {
+        // The IME's `Disabled` event arrives only while input is still
+        // drained; on focus loss it never lands, so drop the composition
+        // here or the painted preedit sticks.
+        ime.clear();
     }
 
     response
@@ -440,6 +472,23 @@ fn cell_at_pos(
 enum ConsumedEvent {
     Bytes(Vec<u8>),
     Paste(String),
+    Ime(ImeEvent),
+}
+
+/// Viewport rect of the terminal cursor's cell; `None` while the cursor is
+/// scrolled out of view.
+fn cursor_cell_rect(session: &Session, rect: Rect, cell_w: f32, cell_h: f32) -> Option<Rect> {
+    let term = session.term.lock();
+    let grid = term.grid();
+    let cursor = grid.cursor.point;
+    let line = cursor.line.0 + grid.display_offset() as i32;
+    if line < 0 || line >= grid.screen_lines() as i32 {
+        return None;
+    }
+    Some(Rect::from_min_size(
+        Pos2::new(rect.min.x + cursor.column.0 as f32 * cell_w, rect.min.y + line as f32 * cell_h),
+        Vec2::new(cell_w, cell_h),
+    ))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
