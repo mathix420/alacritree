@@ -22,45 +22,88 @@ fn key_to_bytes(key: Key, mods: Modifiers) -> Option<Vec<u8>> {
         }
     }
 
-    let bytes: &[u8] = match key {
-        Key::Enter => b"\r",
-        Key::Tab => b"\t",
-        Key::Backspace => b"\x7f",
-        Key::Escape => b"\x1b",
-        Key::ArrowUp => b"\x1b[A",
-        Key::ArrowDown => b"\x1b[B",
-        Key::ArrowRight => b"\x1b[C",
-        Key::ArrowLeft => b"\x1b[D",
-        Key::Home => b"\x1b[H",
-        Key::End => b"\x1b[F",
-        Key::PageUp => b"\x1b[5~",
-        Key::PageDown => b"\x1b[6~",
-        Key::Insert => b"\x1b[2~",
-        Key::Delete => b"\x1b[3~",
-        Key::F1 => b"\x1bOP",
-        Key::F2 => b"\x1bOQ",
-        Key::F3 => b"\x1bOR",
-        Key::F4 => b"\x1bOS",
-        Key::F5 => b"\x1b[15~",
-        Key::F6 => b"\x1b[17~",
-        Key::F7 => b"\x1b[18~",
-        Key::F8 => b"\x1b[19~",
-        Key::F9 => b"\x1b[20~",
-        Key::F10 => b"\x1b[21~",
-        Key::F11 => b"\x1b[23~",
-        Key::F12 => b"\x1b[24~",
-        _ => return None,
+    named_key_bytes(key, mods)
+}
+
+/// xterm modifier parameter: `1 + (Shift=1 | Alt=2 | Ctrl=4)`, as an ASCII
+/// digit.  `None` when no encodable modifier is held, so callers can emit
+/// the shorter unmodified sequence.
+fn csi_modifier(mods: Modifiers) -> Option<u8> {
+    let m = (mods.shift as u8) | ((mods.alt as u8) << 1) | ((mods.ctrl as u8) << 2);
+    (m != 0).then_some(b'1' + m)
+}
+
+/// Encoding for keys that never produce composed text.  Because no
+/// `Event::Text` follows these, every modifier combination is safe to encode
+/// here — including Ctrl+Alt, which on printables must stay silent (AltGr).
+fn named_key_bytes(key: Key, mods: Modifiers) -> Option<Vec<u8>> {
+    // Arrows/Home/End: `ESC [ <final>`, or `ESC [ 1 ; <m> <final>` modified.
+    let csi = |final_byte: u8| match csi_modifier(mods) {
+        Some(m) => vec![0x1b, b'[', b'1', b';', m, final_byte],
+        None => vec![0x1b, b'[', final_byte],
+    };
+    // F1-F4 are SS3 (`ESC O <f>`) unmodified but switch to CSI when modified.
+    let ss3 = |final_byte: u8| match csi_modifier(mods) {
+        Some(m) => vec![0x1b, b'[', b'1', b';', m, final_byte],
+        None => vec![0x1b, b'O', final_byte],
+    };
+    // Editing/function keys: `ESC [ <n> ~`, or `ESC [ <n> ; <m> ~` modified.
+    let tilde = |num: &[u8]| {
+        let mut v = vec![0x1b, b'['];
+        v.extend_from_slice(num);
+        if let Some(m) = csi_modifier(mods) {
+            v.push(b';');
+            v.push(m);
+        }
+        v.push(b'~');
+        v
     };
 
-    if mods.alt {
-        // Long-standing meta convention: Alt+key sends ESC + key.
-        let mut out = Vec::with_capacity(bytes.len() + 1);
-        out.push(0x1b);
-        out.extend_from_slice(bytes);
-        Some(out)
-    } else {
-        Some(bytes.to_vec())
-    }
+    let bytes = match key {
+        Key::ArrowUp => csi(b'A'),
+        Key::ArrowDown => csi(b'B'),
+        Key::ArrowRight => csi(b'C'),
+        Key::ArrowLeft => csi(b'D'),
+        Key::Home => csi(b'H'),
+        Key::End => csi(b'F'),
+        Key::Insert => tilde(b"2"),
+        Key::Delete => tilde(b"3"),
+        Key::PageUp => tilde(b"5"),
+        Key::PageDown => tilde(b"6"),
+        Key::F1 => ss3(b'P'),
+        Key::F2 => ss3(b'Q'),
+        Key::F3 => ss3(b'R'),
+        Key::F4 => ss3(b'S'),
+        Key::F5 => tilde(b"15"),
+        Key::F6 => tilde(b"17"),
+        Key::F7 => tilde(b"18"),
+        Key::F8 => tilde(b"19"),
+        Key::F9 => tilde(b"20"),
+        Key::F10 => tilde(b"21"),
+        Key::F11 => tilde(b"23"),
+        Key::F12 => tilde(b"24"),
+        Key::Tab if mods.shift => vec![0x1b, b'[', b'Z'],
+        Key::Enter | Key::Tab | Key::Backspace | Key::Escape => {
+            let base: &[u8] = match key {
+                Key::Enter => b"\r",
+                Key::Tab => b"\t",
+                Key::Backspace => b"\x7f",
+                Key::Escape => b"\x1b",
+                _ => unreachable!(),
+            };
+            if mods.alt {
+                // Long-standing meta convention: Alt+key sends ESC + key.
+                let mut out = Vec::with_capacity(base.len() + 1);
+                out.push(0x1b);
+                out.extend_from_slice(base);
+                out
+            } else {
+                base.to_vec()
+            }
+        },
+        _ => return None,
+    };
+    Some(bytes)
 }
 
 /// Character a printable key produces, as far as byte encoding is concerned.
@@ -205,6 +248,45 @@ mod tests {
     fn text_event_passes_through() {
         let ev = Event::Text("é".to_string());
         assert_eq!(event_to_bytes(&ev), Some("é".as_bytes().to_vec()));
+    }
+
+    #[test]
+    fn modified_arrows_and_nav_keys_use_csi_modifiers() {
+        assert_eq!(key_to_bytes(Key::ArrowRight, M::CTRL), Some(b"\x1b[1;5C".to_vec()));
+        assert_eq!(key_to_bytes(Key::ArrowLeft, M::ALT), Some(b"\x1b[1;3D".to_vec()));
+        assert_eq!(key_to_bytes(Key::ArrowUp, M::SHIFT), Some(b"\x1b[1;2A".to_vec()));
+        assert_eq!(
+            key_to_bytes(Key::Home, Modifiers { ctrl: true, shift: true, ..Modifiers::NONE }),
+            Some(b"\x1b[1;6H".to_vec())
+        );
+        assert_eq!(key_to_bytes(Key::Delete, M::SHIFT), Some(b"\x1b[3;2~".to_vec()));
+        assert_eq!(key_to_bytes(Key::PageUp, M::CTRL), Some(b"\x1b[5;5~".to_vec()));
+    }
+
+    #[test]
+    fn modified_function_keys() {
+        // Modified F1-F4 switch from SS3 to CSI form.
+        assert_eq!(key_to_bytes(Key::F1, M::SHIFT), Some(b"\x1b[1;2P".to_vec()));
+        assert_eq!(key_to_bytes(Key::F5, M::CTRL), Some(b"\x1b[15;5~".to_vec()));
+    }
+
+    #[test]
+    fn shift_tab_sends_backtab() {
+        assert_eq!(key_to_bytes(Key::Tab, M::SHIFT), Some(b"\x1b[Z".to_vec()));
+    }
+
+    #[test]
+    fn alt_on_simple_named_keys_prefixes_esc() {
+        assert_eq!(key_to_bytes(Key::Enter, M::ALT), Some(b"\x1b\r".to_vec()));
+        assert_eq!(key_to_bytes(Key::Backspace, M::ALT), Some(b"\x1b\x7f".to_vec()));
+    }
+
+    #[test]
+    fn ctrl_alt_on_named_keys_is_encoded_not_suppressed() {
+        // AltGr suppression applies to printables only; arrows never compose
+        // text, so Ctrl+Alt encodes as modifier 7.
+        let ctrl_alt = Modifiers { ctrl: true, alt: true, ..Modifiers::NONE };
+        assert_eq!(key_to_bytes(Key::ArrowRight, ctrl_alt), Some(b"\x1b[1;7C".to_vec()));
     }
 }
 
