@@ -2345,7 +2345,10 @@ impl eframe::App for AlacritreeApp {
 
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         let modal_open = self.is_modal_open();
-        if !modal_open {
+        // Keys pressed mid-composition drive the IME's candidate window,
+        // not the app — alacritty's key_input returns early the same way,
+        // above binding dispatch.
+        if !modal_open && self.ime.preedit().is_none() {
             self.handle_shortcuts(ctx);
         }
         self.process_notification_actions(ctx);
