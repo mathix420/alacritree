@@ -624,6 +624,29 @@ mod tests {
     }
 
     #[test]
+    fn stacked_user_bindings_all_run() {
+        let b = parse_bindings(vec![
+            raw_action("L", Some("Control"), "ClearHistory"),
+            raw_chars("L", Some("Control"), "\\x0c"),
+        ]);
+        let m = all_matches(&b, Key::L, Modifiers::CTRL);
+        assert_eq!(m.len(), 2);
+        assert!(matches!(m[0], BindingAction::Named(NamedAction::ClearHistory)));
+        assert!(matches!(m[1], BindingAction::Chars(c) if c == b"\x0c"));
+    }
+
+    #[test]
+    fn mode_binding_does_not_replace_default() {
+        let mut r = raw_action("B", Some("Control"), "ToggleViMode");
+        r.mode = Some("Vi".into());
+        let b = parse_bindings(vec![r]);
+        assert_eq!(
+            named_matches(&b, Key::B, Modifiers::CTRL),
+            vec![NamedAction::ToggleLeftSidebar]
+        );
+    }
+
+    #[test]
     fn default_app_shortcuts_present_without_user_config() {
         use NamedAction::*;
         let ctrl = Modifiers::CTRL;
