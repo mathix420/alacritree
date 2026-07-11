@@ -146,7 +146,11 @@ pub fn show(
                 // While composing, candidate-window navigation
                 // (Space/Enter/arrows/Backspace/Escape) arrives as ordinary
                 // key events; none of it may reach the PTY.  Mirrors
-                // alacritty's early return in `key_input`.
+                // alacritty's early return in `key_input`. That early return
+                // also runs before alacritty dispatches keyboard-triggered
+                // clipboard paste, so a keyboard paste shortcut is likewise
+                // dropped while composing (alacritty/src/input/keyboard.rs,
+                // alacritty/src/input/mod.rs `key_input`).
                 _ if ime.preedit().is_some() => {},
                 ConsumedEvent::Bytes(bytes) => {
                     // Typing drops the selection and snaps back to the prompt
@@ -169,9 +173,34 @@ pub fn show(
             o.ime = Some(egui::output::IMEOutput { rect: caret, cursor_rect: caret });
         });
     } else {
+        // IMEs commonly auto-commit an in-progress composition when focus
+        // moves away (winit pairs the `Commit` with an immediate
+        // `Disabled`, both landing in the same event batch as the focus
+        // loss). If a composition was in progress, drain Ime events one
+        // more time so that commit still reaches the PTY instead of being
+        // silently discarded. An unfocused terminal with no composition in
+        // flight must never consume Ime events — they belong to whatever
+        // widget (e.g. a modal dialog's text field) is focused instead.
+        if ime.preedit().is_some() {
+            let events: Vec<ImeEvent> = ui.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|e| match e {
+                        Event::Ime(ev) => Some(ev.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            });
+            for ev in events {
+                if let Some(text) = ime.process(&ev) {
+                    paste::paste(session, &text, text.chars().count() > 1);
+                }
+            }
+        }
         // The IME's `Disabled` event arrives only while input is still
-        // drained; on focus loss it never lands, so drop the composition
-        // here or the painted preedit sticks.
+        // drained; a composition abandoned without any terminal Ime event
+        // (e.g. the OS cancels it outright) never sends one, so this is the
+        // backstop that drops the painted preedit either way.
         ime.clear();
     }
 
