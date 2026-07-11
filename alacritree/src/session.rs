@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -227,6 +227,19 @@ fn foreground_process_glyph(_shell_pid: u32) -> Option<char> {
     None
 }
 
+/// A vanished cwd would otherwise surface as the PTY backend's raw error
+/// (`os error 267`, "The directory name is invalid", on Windows) — reject it
+/// up front with a message the error toast can show as-is.
+fn ensure_working_directory(dir: Option<&Path>) -> std::io::Result<()> {
+    match dir {
+        Some(d) if !d.is_dir() => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("working directory no longer exists: {}", d.display()),
+        )),
+        _ => Ok(()),
+    }
+}
+
 impl Session {
     pub fn spawn(
         ctx: egui::Context,
@@ -288,6 +301,7 @@ impl Session {
         title: String,
         kind: SessionKind,
     ) -> std::io::Result<Self> {
+        ensure_working_directory(working_directory.as_deref())?;
         let window_size = window_size(size, cell_size);
 
         let (proxy, events) = EventProxy::new(ctx);
@@ -448,4 +462,25 @@ fn next_session_id() -> SessionId {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_working_directory;
+
+    #[test]
+    fn missing_dir_is_a_readable_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("gone");
+        let err = ensure_working_directory(Some(&gone)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("no longer exists"));
+    }
+
+    #[test]
+    fn none_and_existing_dirs_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(ensure_working_directory(None).is_ok());
+        assert!(ensure_working_directory(Some(tmp.path())).is_ok());
+    }
 }

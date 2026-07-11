@@ -306,6 +306,19 @@ impl AlacritreeApp {
     }
 
     fn activate_worktree(&mut self, ctx: &Context, path: &Path) {
+        // The dir can vanish between discovery marking the row live and the
+        // click. Switching first would strand the user on a dead workspace
+        // with a failed spawn — stay put and let the sidebar re-mark the row.
+        if !path.is_dir() {
+            self.last_error =
+                Some("worktree directory is missing — prune it from the sidebar".to_string());
+            if let Some(idx) =
+                self.projects.iter().position(|p| p.worktrees.iter().any(|w| w.path == path))
+            {
+                self.projects[idx].refresh();
+            }
+            return;
+        }
         self.current_workspace = Some(path.to_path_buf());
         self.ensure_active_session(ctx);
     }
