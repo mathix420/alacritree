@@ -17,6 +17,8 @@ mod projects;
 mod session;
 mod state;
 mod terminal_view;
+#[cfg(test)]
+mod test_util;
 mod worktree;
 
 use app::AlacritreeApp;
