@@ -16,13 +16,41 @@ pub fn event_to_bytes(event: &Event) -> Option<Vec<u8>> {
 }
 
 fn key_to_bytes(key: Key, mods: Modifiers) -> Option<Vec<u8>> {
-    if mods.ctrl && !mods.alt {
-        if let Some(b) = control_byte(key, mods) {
-            return Some(vec![b]);
-        }
+    // Named keys never produce composed text, so every modifier combination
+    // is safe to encode.
+    if let Some(bytes) = named_key_bytes(key, mods) {
+        return Some(bytes);
     }
 
-    named_key_bytes(key, mods)
+    // winit reports AltGr as Ctrl+Alt.  A printable key carrying both must
+    // stay silent: the composed character arrives via `Event::Text`, and
+    // emitting bytes here too would double the input.
+    if mods.ctrl && mods.alt {
+        return None;
+    }
+
+    if mods.ctrl {
+        return control_byte(key, mods).map(|b| vec![b]);
+    }
+
+    // Plain Alt is meta only where no composed text follows the key event.
+    // Windows delivers no `Event::Text` alongside Alt+<printable>, so the
+    // ESC prefix is safe there. On macOS, Option composes characters
+    // (Option+B is "∫"), and on Linux xkb composes the plain character
+    // regardless of Alt — both arrive via `Event::Text`, so emitting bytes
+    // here as well would double the input. Matches upstream alacritty's
+    // macOS default (`option_as_alt = "None"`: Option composes, not meta).
+    #[cfg(windows)]
+    if mods.alt {
+        // Long-standing meta convention: Alt+char sends ESC + char.
+        let c = key_char(key, mods.shift)?;
+        let mut out = vec![0x1b];
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        return Some(out);
+    }
+
+    None
 }
 
 /// xterm modifier parameter: `1 + (Shift=1 | Alt=2 | Ctrl=4)`, as an ASCII
@@ -175,10 +203,11 @@ fn key_char(key: Key, shift: bool) -> Option<char> {
 /// pre-composed by winit as key text; egui reports only the logical key, so
 /// the byte is derived from the key's character here instead.
 fn control_byte(key: Key, mods: Modifiers) -> Option<u8> {
-    let c = key_char(key, false)?;
+    let c = key_char(key, mods.shift)?;
     let byte = match c {
         ' ' | '2' => 0x00,
         'a'..='z' => c as u8 & 0x1f,
+        'A'..='Z' => c.to_ascii_lowercase() as u8 & 0x1f,
         '[' => 0x1b,
         '\\' => 0x1c,
         ']' => 0x1d,
@@ -187,7 +216,6 @@ fn control_byte(key: Key, mods: Modifiers) -> Option<u8> {
         '?' => 0x7f,
         _ => return None,
     };
-    let _ = mods;
     Some(byte)
 }
 
@@ -288,11 +316,37 @@ mod tests {
         let ctrl_alt = Modifiers { ctrl: true, alt: true, ..Modifiers::NONE };
         assert_eq!(key_to_bytes(Key::ArrowRight, ctrl_alt), Some(b"\x1b[1;7C".to_vec()));
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn alt_printables_send_esc_prefixed_char() {
+        assert_eq!(key_to_bytes(Key::B, M::ALT), Some(b"\x1bb".to_vec()));
+        assert_eq!(
+            key_to_bytes(Key::B, Modifiers { alt: true, shift: true, ..Modifiers::NONE }),
+            Some(b"\x1bB".to_vec())
+        );
+        assert_eq!(key_to_bytes(Key::Period, M::ALT), Some(b"\x1b.".to_vec()));
+        assert_eq!(key_to_bytes(Key::Num1, M::ALT), Some(b"\x1b1".to_vec()));
+    }
+
+    /// Off Windows the composed character arrives via `Event::Text`, so the
+    /// key event itself must stay silent (see the cfg in `key_to_bytes`).
+    #[cfg(not(windows))]
+    #[test]
+    fn alt_printables_stay_silent_where_text_composes() {
+        assert_eq!(key_to_bytes(Key::B, M::ALT), None);
+        assert_eq!(key_to_bytes(Key::Period, M::ALT), None);
+    }
+
+    #[test]
+    fn ctrl_alt_printables_stay_silent_for_altgr() {
+        // winit reports AltGr as Ctrl+Alt; the composed character arrives via
+        // Event::Text, so emitting bytes here would double the input.
+        let ctrl_alt = Modifiers { ctrl: true, alt: true, ..Modifiers::NONE };
+        assert_eq!(key_to_bytes(Key::Q, ctrl_alt), None);
+        assert_eq!(key_to_bytes(Key::Num2, ctrl_alt), None);
+        assert_eq!(key_to_bytes(Key::OpenBracket, ctrl_alt), None);
+    }
 
     /// egui's clipboard commands ignore Shift, so Ctrl+Shift+C raises the same
     /// synthetic `Copy` as Ctrl+C.  Encoding it would send the interrupt on the
