@@ -114,9 +114,9 @@ fn default_bindings() -> Vec<KeyBinding> {
     let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
     let ctrl = Modifiers::CTRL;
     let shift = Modifiers::SHIFT;
+    let alt = Modifiers::ALT;
     let alt_shift = Modifiers::ALT | Modifiers::SHIFT;
 
-    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut b = vec![
         KeyBinding { key: Key::V, mods: ctrl_shift, action: BindingAction::Named(Paste) },
         KeyBinding { key: Key::C, mods: ctrl_shift, action: BindingAction::Named(Copy) },
@@ -142,6 +142,34 @@ fn default_bindings() -> Vec<KeyBinding> {
             action: BindingAction::Chars(b"\x1b\x1b[Z".to_vec()),
         },
     ];
+
+    // App-level (alacritree) shortcuts: sidebars, session/workspace cycling,
+    // project management.  Each can be rebound, or freed for the PTY with a
+    // user binding on the same key+mods (`ReceiveChar` forwards the key,
+    // `None` swallows it).
+    b.extend([
+        KeyBinding { key: Key::B, mods: ctrl, action: BindingAction::Named(ToggleLeftSidebar) },
+        KeyBinding { key: Key::G, mods: ctrl, action: BindingAction::Named(ToggleRightSidebar) },
+        KeyBinding { key: Key::Tab, mods: ctrl, action: BindingAction::Named(SelectNextTab) },
+        KeyBinding {
+            key: Key::Tab,
+            mods: ctrl_shift,
+            action: BindingAction::Named(SelectPreviousTab),
+        },
+        KeyBinding {
+            key: Key::ArrowRight,
+            mods: alt,
+            action: BindingAction::Named(SelectNextWorkspace),
+        },
+        KeyBinding {
+            key: Key::ArrowLeft,
+            mods: alt,
+            action: BindingAction::Named(SelectPreviousWorkspace),
+        },
+        KeyBinding { key: Key::O, mods: ctrl_shift, action: BindingAction::Named(AddProject) },
+        KeyBinding { key: Key::T, mods: ctrl, action: BindingAction::Named(SpawnNewInstance) },
+        KeyBinding { key: Key::Q, mods: ctrl, action: BindingAction::Named(Quit) },
+    ]);
 
     // macOS uses Cmd instead of Ctrl+Shift for clipboard / window actions.
     #[cfg(target_os = "macos")]
@@ -522,5 +550,27 @@ mod tests {
         let b = parse_bindings(vec![raw_action("F1", None, "FlyToTheMoon")]);
         let m = all_matches(&b, Key::F1, Modifiers::NONE);
         assert!(matches!(m.as_slice(), [BindingAction::Unsupported(n)] if n == "FlyToTheMoon"));
+    }
+
+    #[test]
+    fn default_app_shortcuts_present_without_user_config() {
+        use NamedAction::*;
+        let ctrl = Modifiers::CTRL;
+        let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+        let alt = Modifiers::ALT;
+        let b = parse_bindings(Vec::new());
+        for (key, mods, expected) in [
+            (Key::B, ctrl, ToggleLeftSidebar),
+            (Key::G, ctrl, ToggleRightSidebar),
+            (Key::Tab, ctrl, SelectNextTab),
+            (Key::Tab, ctrl_shift, SelectPreviousTab),
+            (Key::ArrowRight, alt, SelectNextWorkspace),
+            (Key::ArrowLeft, alt, SelectPreviousWorkspace),
+            (Key::O, ctrl_shift, AddProject),
+            (Key::T, ctrl, SpawnNewInstance),
+            (Key::Q, ctrl, Quit),
+        ] {
+            assert_eq!(named_matches(&b, key, mods), vec![expected], "{key:?}+{mods:?}");
+        }
     }
 }
