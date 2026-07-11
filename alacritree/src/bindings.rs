@@ -99,9 +99,16 @@ pub fn parse_bindings(raw: Vec<RawBinding>) -> Vec<KeyBinding> {
         };
         out.push(KeyBinding { key, mods, action });
     }
-    // Append alacritty's hardcoded defaults at the end so user-supplied bindings
-    // (parsed first) take precedence — `matches` returns the first hit.
-    out.extend(default_bindings());
+    // Alacritty replaces a default binding when a user binding has the same
+    // trigger — key + mods (`Binding::triggers_match` in
+    // `alacritty/src/config/bindings.rs`; modes don't apply here because
+    // mode-bindings are dropped above).  Without the filter, a rebound key
+    // would run both the user action and the default one, and a key freed
+    // via `ReceiveChar` would still trigger the default.
+    let user_triggers: Vec<_> = out.iter().map(|b| (b.key, b.mods)).collect();
+    let defaults =
+        default_bindings().into_iter().filter(|d| !user_triggers.contains(&(d.key, d.mods)));
+    out.extend(defaults);
     out
 }
 
@@ -529,6 +536,51 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn raw_chars(key: &str, mods: Option<&str>, chars: &str) -> RawBinding {
+        RawBinding {
+            key: key.into(),
+            mods: mods.map(Into::into),
+            mode: None,
+            chars: Some(chars.into()),
+            action: None,
+            command: None,
+        }
+    }
+
+    #[test]
+    fn user_binding_replaces_same_trigger_default() {
+        // `ReceiveChar` on Ctrl+B frees the tmux prefix: the default
+        // ToggleLeftSidebar must be gone, not merely outvoted.
+        let b = parse_bindings(vec![raw_action("B", Some("Control"), "ReceiveChar")]);
+        assert_eq!(named_matches(&b, Key::B, Modifiers::CTRL), vec![NamedAction::ReceiveChar]);
+    }
+
+    #[test]
+    fn replacement_requires_exact_mods() {
+        let b = parse_bindings(vec![raw_action("Tab", Some("Control|Shift"), "SelectLastTab")]);
+        assert_eq!(
+            named_matches(&b, Key::Tab, Modifiers::CTRL),
+            vec![NamedAction::SelectNextTab],
+            "Ctrl+Tab default must survive a Ctrl+Shift+Tab user binding"
+        );
+        assert_eq!(
+            named_matches(&b, Key::Tab, Modifiers::CTRL | Modifiers::SHIFT),
+            vec![NamedAction::SelectLastTab]
+        );
+    }
+
+    #[test]
+    fn user_rebind_suppresses_default_action() {
+        // Regression guard: a rebound Ctrl+Shift+V must not also run the
+        // default Paste.
+        let b = parse_bindings(vec![raw_chars("V", Some("Control|Shift"), "x")]);
+        let m = all_matches(&b, Key::V, Modifiers::CTRL | Modifiers::SHIFT);
+        assert!(
+            matches!(m.as_slice(), [BindingAction::Chars(c)] if c == b"x"),
+            "expected only the user Chars binding, got {m:?}"
+        );
     }
 
     #[test]
