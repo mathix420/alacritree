@@ -10,6 +10,7 @@ mod config;
 mod doppler;
 mod fonts;
 mod git_status;
+mod ime;
 mod input;
 mod ipc;
 mod links;
