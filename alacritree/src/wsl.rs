@@ -160,12 +160,22 @@ fn is_utility_distro(name: &str) -> bool {
 /// source (no process spawn, knows the default); `wsl -l -q` is the
 /// fallback when the key is unreadable.  Empty means WSL features stay
 /// dormant.
+///
+/// Cached for the process lifetime: one caller is a per-frame UI path (the
+/// sidebar), and the CLI fallback spawns `wsl.exe` — without caching, every
+/// repaint would probe the registry or shell out. A distro registered or
+/// unregistered after startup is picked up only on restart; that's an
+/// acceptable trade since mid-session registration churn is rare, and a
+/// stale entry just falls through the existing spawn-failure/degrade paths.
 #[cfg(windows)]
 pub fn distros() -> Vec<WslDistro> {
-    match registry_distros() {
-        Some(list) if !list.is_empty() => list,
-        _ => cli_distros(),
-    }
+    static DISTROS: OnceLock<Vec<WslDistro>> = OnceLock::new();
+    DISTROS
+        .get_or_init(|| match registry_distros() {
+            Some(list) if !list.is_empty() => list,
+            _ => cli_distros(),
+        })
+        .clone()
 }
 
 #[cfg(not(windows))]
