@@ -118,6 +118,14 @@ entry. Names match alacritty's own action names, so existing configs port over.
 - `SelectTab1` … `SelectTab9` — select the Nth session in the current
   workspace. Out-of-range indices are ignored.
 - `SelectLastTab` — select the last session in the current workspace.
+- `SpawnProfile1` … `SpawnProfile9` — spawn the Nth `[[ui.profiles]]` entry
+  in the current workspace. Example binding:
+  ```toml
+  [[keyboard.bindings]]
+  key = "2"
+  mods = "Control|Shift"
+  action = "SpawnProfile2"
+  ```
 - `ToggleFullscreen`
 - `ToggleMaximized`
 - `Minimize`

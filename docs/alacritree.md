@@ -216,6 +216,35 @@ opacity = 0.92   # restart required — transparency is a ViewportBuilder flag
 Everything Alacritty's TOML accepts for palette, cursor, scrolling, window
 padding, shell, env, and bindings is parsed by the same `Raw*` structs.
 
+### Shell launch profiles
+
+Named launch profiles live in `alacritree.toml`:
+
+```toml
+[ui]
+default_profile = "ubuntu"       # what plain new-session (Ctrl+T) uses
+
+[[ui.profiles]]
+name = "ubuntu"
+program = "wsl.exe"
+args = ["-d", "ubuntu"]
+
+[[ui.profiles]]
+name = "pwsh"
+program = "pwsh"
+args = ["-NoLogo"]
+```
+
+Launch a profile from the small **+** segment at the right end of the
+session tab strip (left-click: default new session; right-click: pick a
+profile), bind one to a key with the `SpawnProfile1`…`SpawnProfile9`
+actions (1-indexed into the `[[ui.profiles]]` order), or right-click a
+project row and pin a profile as that project's shell override.
+
+Shell selection precedence for a plain new session: per-project override →
+WSL auto-selection by project location → `default_profile` →
+`[terminal.shell]` / OS default.
+
 ## Persistence
 
 Two files are written:
