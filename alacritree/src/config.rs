@@ -3,8 +3,9 @@
 //! `alacritty.toml` is alacritty's own config — we share the file so the user
 //! gets matching colors/cursor in both terminals.  `alacritree.toml` lives in
 //! the same directory and overrides anything in `alacritty.toml` via a
-//! deep-merge.  alacritree-specific options (sidebar colors, etc.) live under
-//! a `[ui]` table and are only valid in `alacritree.toml`.
+//! deep-merge.  alacritree-specific options live under the `[ui]` (sidebar
+//! colors, etc.) and `[workspace]` (worktree location) tables and are only
+//! valid in `alacritree.toml`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
