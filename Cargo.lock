@@ -67,6 +67,7 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+ "winreg",
  "xdg",
 ]
 

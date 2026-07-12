@@ -5,7 +5,9 @@
 //! empty and `classify` never returns `Wsl`, so all WSL code paths are
 //! dormant without cfg-gating at call sites.
 
+use crate::command_ext::CommandExt;
 use std::path::{Component, Path, PathBuf, Prefix};
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 /// Where a path physically lives.  `linux_path` is the path as seen from
@@ -119,6 +121,125 @@ fn windows_to_linux_with(path: &Path, automount_root: &str) -> Option<String> {
     Some(out)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WslDistro {
+    pub name: String,
+    pub is_default: bool,
+}
+
+/// Docker/Rancher register utility distros the user never shells into.
+fn is_utility_distro(name: &str) -> bool {
+    name.starts_with("docker-desktop") || name.starts_with("rancher-desktop")
+}
+
+/// Registered distros, default first-classed.  Registry is the primary
+/// source (no process spawn, knows the default); `wsl -l -q` is the
+/// fallback when the key is unreadable.  Empty means WSL features stay
+/// dormant.
+#[cfg(windows)]
+pub fn distros() -> Vec<WslDistro> {
+    match registry_distros() {
+        Some(list) if !list.is_empty() => list,
+        _ => cli_distros(),
+    }
+}
+
+#[cfg(not(windows))]
+pub fn distros() -> Vec<WslDistro> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn registry_distros() -> Option<Vec<WslDistro>> {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
+
+    let lxss = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Lxss")
+        .ok()?;
+    let default_guid: String = lxss.get_value("DefaultDistribution").unwrap_or_default();
+    let mut out = Vec::new();
+    for guid in lxss.enum_keys().flatten() {
+        let Ok(subkey) = lxss.open_subkey(&guid) else { continue };
+        let Ok(name) = subkey.get_value::<String, _>("DistributionName") else { continue };
+        if is_utility_distro(&name) {
+            continue;
+        }
+        out.push(WslDistro { is_default: guid == default_guid, name });
+    }
+    Some(out)
+}
+
+#[cfg(windows)]
+fn cli_distros() -> Vec<WslDistro> {
+    let output = command_bare()
+        .args(["-l", "-q"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    match output {
+        Ok(o) if o.status.success() => parse_distro_list(&o.stdout),
+        _ => Vec::new(),
+    }
+}
+
+/// `wsl -l -q` lists the default distro first.  Output is UTF-8 when
+/// WSL_UTF8=1 is honored (WSL 0.64.0+); older versions emit UTF-16LE,
+/// detected by the NUL bytes ASCII names acquire in that encoding.
+pub fn parse_distro_list(stdout: &[u8]) -> Vec<WslDistro> {
+    let text = if stdout.contains(&0) {
+        let units: Vec<u16> =
+            stdout.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(stdout).into_owned()
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !is_utility_distro(line))
+        .enumerate()
+        .map(|(i, name)| WslDistro { name: name.to_string(), is_default: i == 0 })
+        .collect()
+}
+
+/// `wsl.exe -d <distro> [--cd <dir>] --exec` with the console window
+/// suppressed and wsl.exe's own messages forced to UTF-8 (they are UTF-16LE
+/// otherwise; the relayed Linux byte stream is unaffected).  Callers append
+/// the argv to run — `--exec` passes it verbatim to the process, skipping
+/// the user's shell and rc files (per-invocation rc sourcing is a known
+/// latency trap).  `--cd` natively accepts Windows, UNC, and Linux paths.
+pub fn command(distro: &str, cd: Option<&Path>) -> Command {
+    let mut cmd = command_bare();
+    cmd.arg("-d").arg(distro);
+    if let Some(dir) = cd {
+        cmd.arg("--cd").arg(dir);
+    }
+    cmd.arg("--exec");
+    cmd
+}
+
+fn command_bare() -> Command {
+    let mut cmd = Command::new("wsl.exe");
+    cmd.hide_console().env("WSL_UTF8", "1");
+    cmd
+}
+
+/// Program + args for a session whose shell runs inside `distro`.  No
+/// `--exec`: wsl.exe launches the distro's own default login shell, which
+/// is the contract — we never guess shells.
+pub fn shell_invocation(distro: &str, workdir: &Path) -> (String, Vec<String>) {
+    (
+        "wsl.exe".to_string(),
+        vec![
+            "-d".to_string(),
+            distro.to_string(),
+            "--cd".to_string(),
+            workdir.to_string_lossy().into_owned(),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +330,41 @@ mod tests {
                 .as_deref(),
             Some("/home/lev")
         );
+    }
+
+    #[test]
+    fn parses_utf8_distro_list() {
+        let out = b"kali-linux\nUbuntu\ndocker-desktop\n";
+        let distros = parse_distro_list(out);
+        assert_eq!(distros.len(), 2);
+        assert_eq!(distros[0], WslDistro { name: "kali-linux".to_string(), is_default: true });
+        assert_eq!(distros[1], WslDistro { name: "Ubuntu".to_string(), is_default: false });
+    }
+
+    #[test]
+    fn parses_utf16_distro_list() {
+        // wsl.exe older than 0.64.0 ignores WSL_UTF8 and emits UTF-16LE.
+        let text = "kali-linux\r\n";
+        let bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let distros = parse_distro_list(&bytes);
+        assert_eq!(distros, vec![WslDistro { name: "kali-linux".to_string(), is_default: true }]);
+    }
+
+    #[test]
+    fn command_builds_expected_argv() {
+        let cmd = command("kali-linux", Some(Path::new(r"\\wsl.localhost\kali-linux\home")));
+        let args: Vec<String> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(cmd.get_program().to_string_lossy(), "wsl.exe");
+        assert_eq!(
+            args,
+            vec!["-d", "kali-linux", "--cd", r"\\wsl.localhost\kali-linux\home", "--exec"]
+        );
+    }
+
+    #[test]
+    fn shell_invocation_has_no_exec() {
+        let (program, args) = shell_invocation("kali-linux", Path::new(r"C:\proj"));
+        assert_eq!(program, "wsl.exe");
+        assert_eq!(args, vec!["-d", "kali-linux", "--cd", r"C:\proj"]);
     }
 }
