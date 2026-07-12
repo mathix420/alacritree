@@ -2379,6 +2379,10 @@ impl eframe::App for AlacritreeApp {
                 self.show_tab_strip(ui);
 
                 if let Some(err) = self.last_error.as_deref() {
+                    // A preedit can only be finalized or cancelled by the terminal
+                    // view's event drain, so without a session view to run it the
+                    // preedit would go stale and keep shortcuts suppressed forever.
+                    self.ime.clear();
                     ui.label(
                         RichText::new(err)
                             .color(rgb_to_color32(self.config.palette.normal[1]))
@@ -2392,6 +2396,9 @@ impl eframe::App for AlacritreeApp {
                 }
 
                 let Some(idx) = self.active_session_index() else {
+                    // Same rationale as the last_error branch above: without an
+                    // active session view, no code path can advance the preedit.
+                    self.ime.clear();
                     ui.label(
                         RichText::new("no session — Ctrl+T to open one").color(theme.text_dim),
                     );
