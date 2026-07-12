@@ -393,6 +393,7 @@ impl AlacritreeApp {
     /// explicitly.
     fn spawn_profile_session(&mut self, ctx: &Context, name: &str) {
         let Some(profile) = self.config.profile(name) else {
+            log::warn!("no shell profile named `{name}`");
             self.last_error = Some(format!("no shell profile named `{name}`"));
             return;
         };
@@ -808,8 +809,9 @@ impl AlacritreeApp {
             ui.allocate_exact_size(egui::vec2(avail, strip_height + 2.0), egui::Sense::hover());
 
         let mut activate: Option<SessionId> = None;
-        // Session segments only when there is a choice to make; the trailing
-        // + segment renders regardless so new-session stays reachable.
+        // Session segments only when there is a choice to make, but the
+        // trailing + segment always renders alongside them once the strip
+        // itself renders (i.e. at least one session exists).
         if indices.len() >= 2 {
             let seg_avail = avail - plus_width - gap;
             let segment_width =
@@ -873,7 +875,12 @@ impl AlacritreeApp {
                 }
             });
         }
-        resp.on_hover_text("New session (right-click: profiles)");
+        let hover_text = if profile_names.is_empty() {
+            "New session"
+        } else {
+            "New session (right-click: profiles)"
+        };
+        resp.on_hover_text(hover_text);
 
         if let Some(id) = activate {
             self.set_active_in_current_workspace(id);

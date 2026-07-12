@@ -880,12 +880,19 @@ fn rgb_to_color32(r: Rgb) -> Color32 {
 /// bad config degrades with a warning, matching the rest of this module.
 fn build_profiles(raw: Vec<RawProfile>) -> Vec<Profile> {
     let mut out: Vec<Profile> = Vec::with_capacity(raw.len());
-    for p in raw {
+    for (i, p) in raw.into_iter().enumerate() {
         let name = p.name.filter(|n| !n.is_empty());
         let program = p.program.filter(|x| !x.is_empty());
-        let (Some(name), Some(program)) = (name, program) else {
-            log::warn!("[[ui.profiles]] entry needs non-empty `name` and `program`; dropping");
-            continue;
+        let (name, program) = match (name, program) {
+            (Some(name), Some(program)) => (name, program),
+            (Some(name), None) => {
+                log::warn!("[[ui.profiles]] entry `{name}` needs a non-empty `program`; dropping");
+                continue;
+            },
+            (None, _) => {
+                log::warn!("[[ui.profiles]] entry {i} needs a non-empty `name`; dropping");
+                continue;
+            },
         };
         if out.iter().any(|e| e.name == name) {
             log::warn!("duplicate profile name `{name}`; keeping the first");
@@ -966,6 +973,7 @@ program = "second"
         let config = raw.into_config();
         assert_eq!(config.profiles.len(), 1, "empty name, missing program, and dup dropped");
         assert_eq!(config.profiles[0].program, "first");
+        assert!(config.profiles[0].args.is_empty(), "no args in TOML defaults to empty");
         assert_eq!(config.default_profile, None, "dangling default_profile is ignored");
     }
 
