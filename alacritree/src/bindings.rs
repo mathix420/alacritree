@@ -50,6 +50,9 @@ pub enum NamedAction {
     SelectNextWorkspace,
     SelectPreviousWorkspace,
     AddProject,
+    ToggleSidebarFocus,
+    FocusProjectsSidebar,
+    FocusTerminal,
     Quit,
     /// Used to unbind a key — consumes the press without acting on it.
     NoOp,
@@ -174,6 +177,11 @@ fn default_bindings() -> Vec<KeyBinding> {
             action: BindingAction::Named(SelectPreviousWorkspace),
         },
         KeyBinding { key: Key::O, mods: ctrl_shift, action: BindingAction::Named(AddProject) },
+        KeyBinding {
+            key: Key::B,
+            mods: ctrl_shift,
+            action: BindingAction::Named(ToggleSidebarFocus),
+        },
         KeyBinding { key: Key::T, mods: ctrl, action: BindingAction::Named(SpawnNewInstance) },
         KeyBinding { key: Key::Q, mods: ctrl, action: BindingAction::Named(Quit) },
     ]);
@@ -475,6 +483,9 @@ fn parse_action(name: &str) -> BindingAction {
         "SelectNextWorkspace" => BindingAction::Named(SelectNextWorkspace),
         "SelectPreviousWorkspace" => BindingAction::Named(SelectPreviousWorkspace),
         "AddProject" => BindingAction::Named(AddProject),
+        "ToggleSidebarFocus" => BindingAction::Named(ToggleSidebarFocus),
+        "FocusProjectsSidebar" => BindingAction::Named(FocusProjectsSidebar),
+        "FocusTerminal" => BindingAction::Named(FocusTerminal),
         "Quit" => BindingAction::Named(Quit),
         "None" => BindingAction::Named(NoOp),
         "ReceiveChar" => BindingAction::Named(ReceiveChar),
@@ -601,10 +612,22 @@ mod tests {
             ("SelectNextWorkspace", NamedAction::SelectNextWorkspace),
             ("SelectPreviousWorkspace", NamedAction::SelectPreviousWorkspace),
             ("AddProject", NamedAction::AddProject),
+            ("ToggleSidebarFocus", NamedAction::ToggleSidebarFocus),
+            ("FocusProjectsSidebar", NamedAction::FocusProjectsSidebar),
+            ("FocusTerminal", NamedAction::FocusTerminal),
         ] {
             let b = parse_bindings(vec![raw_action("F1", None, name)]);
             assert_eq!(named_matches(&b, Key::F1, Modifiers::NONE), vec![expected], "{name}");
         }
+    }
+
+    #[test]
+    fn user_binding_replaces_sidebar_focus_default() {
+        let b = parse_bindings(vec![raw_action("B", Some("Control|Shift"), "ReceiveChar")]);
+        assert_eq!(
+            named_matches(&b, Key::B, Modifiers::CTRL | Modifiers::SHIFT),
+            vec![NamedAction::ReceiveChar]
+        );
     }
 
     #[test]
@@ -663,6 +686,7 @@ mod tests {
             (Key::O, ctrl_shift, AddProject),
             (Key::T, ctrl, SpawnNewInstance),
             (Key::Q, ctrl, Quit),
+            (Key::B, ctrl_shift, ToggleSidebarFocus),
         ] {
             assert_eq!(named_matches(&b, key, mods), vec![expected], "{key:?}+{mods:?}");
         }
