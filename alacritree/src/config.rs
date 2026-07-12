@@ -637,6 +637,8 @@ struct RawUi {
     sidebar_border: Option<RgbStr>,
     sidebar_accent: Option<RgbStr>,
     notifications: Option<bool>,
+    /// When the sidebar × on a session row asks before killing the PTY:
+    /// "never" (default) | "busy" | "always".
     confirm_session_close: Option<String>,
 }
 

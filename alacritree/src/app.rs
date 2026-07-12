@@ -1708,10 +1708,13 @@ struct SessionRowData {
     is_displayed: bool,
 }
 
-/// Spawn-ordered ids of the sessions in `ws`.  Pure over (workspace, id)
-/// pairs so the grouping rule is testable without spawning PTYs.
+/// Spawn-ordered ids of the sessions in `ws`, or empty below the two-session
+/// list threshold — a single-session workspace row keeps its compact form,
+/// mirroring the tab strip. Pure over (workspace, id) pairs so the grouping
+/// rule is testable without spawning PTYs.
 fn sidebar_session_ids(pairs: &[(WorkspaceKey, SessionId)], ws: &WorkspaceKey) -> Vec<SessionId> {
-    pairs.iter().filter(|(w, _)| w == ws).map(|(_, id)| *id).collect()
+    let ids: Vec<SessionId> = pairs.iter().filter(|(w, _)| w == ws).map(|(_, id)| *id).collect();
+    if ids.len() < 2 { Vec::new() } else { ids }
 }
 
 fn worktree_row(
@@ -1971,16 +1974,12 @@ impl AlacritreeApp {
         active_glyph.or(other_glyph)
     }
 
-    /// Session rows for `ws`'s sidebar list.  Empty below two sessions — a
-    /// single-session workspace row keeps its compact form, mirroring the
-    /// tab strip's threshold.
+    /// Session rows for `ws`'s sidebar list, per `sidebar_session_ids`'s
+    /// two-session threshold.
     fn workspace_session_rows(&self, ws: &WorkspaceKey) -> Vec<SessionRowData> {
         let pairs: Vec<(WorkspaceKey, SessionId)> =
             self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect();
         let ids = sidebar_session_ids(&pairs, ws);
-        if ids.len() < 2 {
-            return Vec::new();
-        }
         let active = self.active_session.get(ws).copied();
         let is_current = self.current_workspace == *ws;
         ids.iter()
@@ -2611,12 +2610,25 @@ mod tests {
         let pairs = vec![(None, 1), (ws("/a"), 2), (None, 3), (ws("/b"), 4), (ws("/a"), 5)];
         assert_eq!(sidebar_session_ids(&pairs, &None), vec![1, 3]);
         assert_eq!(sidebar_session_ids(&pairs, &ws("/a")), vec![2, 5]);
-        assert_eq!(sidebar_session_ids(&pairs, &ws("/b")), vec![4]);
+        // /b has a single session, below the two-session list threshold.
+        assert!(sidebar_session_ids(&pairs, &ws("/b")).is_empty());
     }
 
     #[test]
     fn session_ids_empty_for_unknown_workspace() {
         let pairs = vec![(None, 1)];
         assert!(sidebar_session_ids(&pairs, &ws("/missing")).is_empty());
+    }
+
+    #[test]
+    fn session_ids_apply_two_session_threshold() {
+        let no_match: Vec<(WorkspaceKey, SessionId)> = vec![(ws("/other"), 1)];
+        assert!(sidebar_session_ids(&no_match, &ws("/a")).is_empty());
+
+        let one_match = vec![(ws("/a"), 1), (ws("/other"), 2)];
+        assert!(sidebar_session_ids(&one_match, &ws("/a")).is_empty());
+
+        let two_match = vec![(ws("/a"), 1), (ws("/other"), 2), (ws("/a"), 3)];
+        assert_eq!(sidebar_session_ids(&two_match, &ws("/a")), vec![1, 3]);
     }
 }
