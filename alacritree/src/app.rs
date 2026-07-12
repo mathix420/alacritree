@@ -1717,6 +1717,23 @@ fn sidebar_session_ids(pairs: &[(WorkspaceKey, SessionId)], ws: &WorkspaceKey) -
     if ids.len() < 2 { Vec::new() } else { ids }
 }
 
+/// Agent glyphs usually come from the title's own leading char
+/// (`Session::agent_glyph`), and the session row paints that glyph as its
+/// status icon right next to the title — showing it in both places doubles
+/// the icon. Drop the leading glyph from the label when it's exactly what
+/// the icon paints, unless that would leave the label empty.
+fn session_row_title(title: &str, agent_glyph: Option<char>) -> String {
+    if let Some(g) = agent_glyph {
+        if let Some(rest) = title.strip_prefix(g) {
+            let rest = rest.trim_start();
+            if !rest.is_empty() {
+                return rest.to_string();
+            }
+        }
+    }
+    title.to_string()
+}
+
 fn worktree_row(
     ui: &mut egui::Ui,
     wt: &Worktree,
@@ -1986,7 +2003,7 @@ impl AlacritreeApp {
             .filter_map(|id| self.sessions.iter().find(|s| s.id == *id))
             .map(|s| SessionRowData {
                 id: s.id,
-                title: s.title.clone(),
+                title: session_row_title(&s.title, s.agent_glyph()),
                 needs_attention: s.needs_attention,
                 agent_glyph: s.agent_glyph(),
                 is_active: active == Some(s.id),
@@ -2618,6 +2635,17 @@ mod tests {
     fn session_ids_empty_for_unknown_workspace() {
         let pairs = vec![(None, 1)];
         assert!(sidebar_session_ids(&pairs, &ws("/missing")).is_empty());
+    }
+
+    #[test]
+    fn session_row_title_drops_glyph_the_icon_already_shows() {
+        assert_eq!(session_row_title("✳ claude", Some('✳')), "claude");
+        // Attention/plain rows keep the title untouched.
+        assert_eq!(session_row_title("✳ claude", None), "✳ claude");
+        // A static process glyph absent from the title strips nothing.
+        assert_eq!(session_row_title("node build", Some('◇')), "node build");
+        // Never strip down to an empty label.
+        assert_eq!(session_row_title("✳ ", Some('✳')), "✳ ");
     }
 
     #[test]
