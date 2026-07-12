@@ -18,6 +18,7 @@ mod session;
 mod state;
 mod terminal_view;
 mod worktree;
+mod wsl;
 
 use app::AlacritreeApp;
 
