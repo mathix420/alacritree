@@ -15,6 +15,7 @@ use crate::paste;
 use crate::pr_status::PrCache;
 use crate::projects::{Project, Worktree};
 use crate::session::{Session, SessionId, SessionKind, TermSize};
+use crate::sidebar_nav::{self, SidebarRow};
 use crate::state::{self, PersistedProject, PersistedState};
 use crate::terminal_view;
 use crate::worktree::{self as wt, CreateRequest, Progress};
@@ -111,9 +112,25 @@ fn blend_toward(c: Color32, target: Color32, amount: f32) -> Color32 {
     Color32::from_rgb(mix(c.r(), target.r()), mix(c.g(), target.g()), mix(c.b(), target.b()))
 }
 
+/// Which pane owns keyboard input.  The terminal re-requests egui focus
+/// every frame while it owns this; anything else holding focus (modals
+/// aside) must win here first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaneFocus {
+    Terminal,
+    ProjectsSidebar,
+}
+
 pub struct AlacritreeApp {
     show_left_sidebar: bool,
     show_right_sidebar: bool,
+    focus: PaneFocus,
+    sidebar_cursor: Option<SidebarRow>,
+    /// The focus toggle opened a hidden sidebar; returning focus closes it
+    /// again so a keyboard round trip leaves the layout untouched.
+    sidebar_auto_shown: bool,
+    /// One-shot: scroll the cursor row into view on the next sidebar paint.
+    sidebar_cursor_moved: bool,
     sessions: Vec<Session>,
     current_workspace: WorkspaceKey,
     active_session: HashMap<WorkspaceKey, SessionId>,
@@ -251,6 +268,10 @@ impl AlacritreeApp {
         let mut app = Self {
             show_left_sidebar: persisted.show_left_sidebar,
             show_right_sidebar: persisted.show_right_sidebar,
+            focus: PaneFocus::Terminal,
+            sidebar_cursor: None,
+            sidebar_auto_shown: false,
+            sidebar_cursor_moved: false,
             sessions: Vec::new(),
             current_workspace: None,
             active_session: HashMap::new(),
@@ -426,6 +447,27 @@ impl AlacritreeApp {
         self.quit_dialog_open || self.pending_delete.is_some() || self.pending_create.is_some()
     }
 
+    fn focus_sidebar(&mut self) {
+        if !self.show_left_sidebar {
+            self.show_left_sidebar = true;
+            self.sidebar_auto_shown = true;
+            self.persist();
+        }
+        self.focus = PaneFocus::ProjectsSidebar;
+        self.sidebar_cursor =
+            Some(sidebar_nav::seed(&self.projects, self.current_workspace.as_deref()));
+        self.sidebar_cursor_moved = true;
+    }
+
+    fn focus_terminal(&mut self) {
+        self.focus = PaneFocus::Terminal;
+        if self.sidebar_auto_shown {
+            self.show_left_sidebar = false;
+            self.sidebar_auto_shown = false;
+            self.persist();
+        }
+    }
+
     /// Match key events against the binding table (user bindings + defaults)
     /// before the terminal sees raw events, so a binding wins over plain
     /// text input.  Matched events are consumed unless every matched action
@@ -522,6 +564,12 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::ReceiveChar) => {},
             BindingAction::Named(NamedAction::ToggleLeftSidebar) => {
                 self.show_left_sidebar = !self.show_left_sidebar;
+                // A deliberate visibility change opts out of the auto-shown
+                // round trip, and a hidden sidebar cannot keep keyboard focus.
+                self.sidebar_auto_shown = false;
+                if !self.show_left_sidebar && self.focus == PaneFocus::ProjectsSidebar {
+                    self.focus = PaneFocus::Terminal;
+                }
                 self.persist();
             },
             BindingAction::Named(NamedAction::ToggleRightSidebar) => {
@@ -535,6 +583,16 @@ impl AlacritreeApp {
                 self.cycle_workspaces(ctx, -1);
             },
             BindingAction::Named(NamedAction::AddProject) => self.add_project_via_dialog(),
+            BindingAction::Named(NamedAction::ToggleSidebarFocus) => match self.focus {
+                PaneFocus::Terminal => self.focus_sidebar(),
+                PaneFocus::ProjectsSidebar => self.focus_terminal(),
+            },
+            BindingAction::Named(NamedAction::FocusProjectsSidebar) => {
+                if self.focus != PaneFocus::ProjectsSidebar {
+                    self.focus_sidebar();
+                }
+            },
+            BindingAction::Named(NamedAction::FocusTerminal) => self.focus_terminal(),
             BindingAction::Named(other) => {
                 self.dispatch_scroll_or_other(other);
             },
@@ -2101,13 +2159,16 @@ impl eframe::App for AlacritreeApp {
                     return;
                 };
                 let session = &mut self.sessions[idx];
-                let _ = terminal_view::show(
+                let response = terminal_view::show(
                     ui,
                     session,
                     &self.config,
-                    !modal_open,
+                    !modal_open && self.focus == PaneFocus::Terminal,
                     &mut self.builtin_glyphs,
                 );
+                if response.clicked() && self.focus != PaneFocus::Terminal {
+                    self.focus_terminal();
+                }
             });
 
         if self.pending_create.is_some() {
