@@ -10,6 +10,30 @@ use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
+/// Per-project shell override, persisted in state.toml as `"windows"` or
+/// `"wsl:<distro>"`.  Absent means auto-by-location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellChoice {
+    Windows,
+    Wsl(String),
+}
+
+impl ShellChoice {
+    pub fn parse(s: &str) -> Option<Self> {
+        if s == "windows" {
+            return Some(Self::Windows);
+        }
+        s.strip_prefix("wsl:").filter(|d| !d.is_empty()).map(|d| Self::Wsl(d.to_string()))
+    }
+
+    pub fn to_state_string(&self) -> String {
+        match self {
+            Self::Windows => "windows".to_string(),
+            Self::Wsl(distro) => format!("wsl:{distro}"),
+        }
+    }
+}
+
 /// Where a path physically lives.  `linux_path` is the path as seen from
 /// inside the distro, always with forward slashes and a leading `/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -433,6 +457,19 @@ mod tests {
         input.extend_from_slice(SECTION_SEP);
         input.extend_from_slice(SECTION_SEP);
         assert_eq!(split_sections(&input), vec![&b""[..], &b""[..], &b""[..]]);
+    }
+
+    #[test]
+    fn shell_choice_round_trips() {
+        assert_eq!(ShellChoice::parse("windows"), Some(ShellChoice::Windows));
+        assert_eq!(
+            ShellChoice::parse("wsl:kali-linux"),
+            Some(ShellChoice::Wsl("kali-linux".to_string()))
+        );
+        assert_eq!(ShellChoice::parse("wsl:"), None);
+        assert_eq!(ShellChoice::parse("plan9"), None);
+        assert_eq!(ShellChoice::Wsl("u".to_string()).to_state_string(), "wsl:u");
+        assert_eq!(ShellChoice::Windows.to_state_string(), "windows");
     }
 
     /// Live round trip against the default distro.  Requires WSL; run

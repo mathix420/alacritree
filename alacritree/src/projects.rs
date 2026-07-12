@@ -13,6 +13,7 @@ pub struct Project {
     pub default_branch: Option<String>,
     pub worktrees: Vec<Worktree>,
     pub expanded: bool,
+    pub shell_override: Option<crate::wsl::ShellChoice>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +55,7 @@ impl Project {
             name,
             default_branch: None,
             expanded: true,
+            shell_override: None,
         }
     }
 
@@ -106,6 +108,7 @@ impl Project {
             root,
             name,
             expanded: true,
+            shell_override: None,
         }
     }
 
@@ -142,6 +145,7 @@ impl Project {
             root,
             name,
             expanded: true,
+            shell_override: None,
         }
     }
 

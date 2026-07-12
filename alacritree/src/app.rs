@@ -248,6 +248,7 @@ impl AlacritreeApp {
                     wsl::Location::Wsl { .. } => Project::placeholder(p.root.clone()),
                 };
                 project.expanded = p.expanded;
+                project.shell_override = p.shell.as_deref().and_then(wsl::ShellChoice::parse);
                 project
             })
             .collect();
@@ -302,7 +303,11 @@ impl AlacritreeApp {
             projects: self
                 .projects
                 .iter()
-                .map(|p| PersistedProject { root: p.root.clone(), expanded: p.expanded })
+                .map(|p| PersistedProject {
+                    root: p.root.clone(),
+                    expanded: p.expanded,
+                    shell: p.shell_override.as_ref().map(|c| c.to_state_string()),
+                })
                 .collect(),
             show_left_sidebar: self.show_left_sidebar,
             show_right_sidebar: self.show_right_sidebar,
