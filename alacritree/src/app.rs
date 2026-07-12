@@ -302,7 +302,10 @@ impl AlacritreeApp {
                 .iter()
                 .map(|p| PersistedProject { root: p.root.clone(), expanded: p.expanded })
                 .collect(),
-            show_left_sidebar: self.show_left_sidebar,
+            // Don't persist a sidebar the user never opened — an auto-shown
+            // sidebar (e.g. from Ctrl+Shift+B while it was hidden) should not
+            // reappear on next launch.
+            show_left_sidebar: self.show_left_sidebar && !self.sidebar_auto_shown,
             show_right_sidebar: self.show_right_sidebar,
         };
         state::save(&state);
@@ -1635,7 +1638,17 @@ fn is_sidebar_nav_key(key: egui::Key) -> bool {
     use egui::Key;
     matches!(
         key,
-        Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight | Key::Enter | Key::Escape
+        Key::ArrowUp
+            | Key::ArrowDown
+            | Key::ArrowLeft
+            | Key::ArrowRight
+            | Key::Enter
+            // egui synthesizes a click on the natively focused widget from
+            // Space (like Enter); consuming it here stops keyboard clicks on
+            // widgets the cursor model doesn't govern while the sidebar owns
+            // focus.
+            | Key::Space
+            | Key::Escape
     )
 }
 
@@ -2327,7 +2340,12 @@ impl eframe::App for AlacritreeApp {
                     !modal_open && self.focus == PaneFocus::Terminal,
                     &mut self.builtin_glyphs,
                 );
-                if response.clicked() && self.focus != PaneFocus::Terminal {
+                // egui fake-clicks the natively focused widget on Space/Enter,
+                // and the terminal keeps native focus while the sidebar owns
+                // app focus — so keyboard "clicks" must not steal it back.
+                if response.clicked_by(egui::PointerButton::Primary)
+                    && self.focus != PaneFocus::Terminal
+                {
                     self.focus_terminal();
                 }
             });
