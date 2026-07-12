@@ -28,6 +28,9 @@ pub struct Config {
     pub selection: SelectionConfig,
     pub bindings: Vec<KeyBinding>,
     pub wsl_automount_root: String,
+    pub profiles: Vec<Profile>,
+    /// Validated at load: always names an entry in `profiles` when `Some`.
+    pub default_profile: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +128,15 @@ pub struct ShellConfig {
     pub args: Vec<String>,
 }
 
+/// A named shell launch profile from `[[ui.profiles]]`.  Program + args
+/// only; cwd and env come from the session as usual.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Profile {
+    pub name: String,
+    pub program: String,
+    pub args: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SelectionConfig {
     pub semantic_escape_chars: String,
@@ -137,6 +149,10 @@ pub struct SelectionConfig {
 impl Config {
     pub fn cursor_style(&self) -> CursorStyle {
         CursorStyle { shape: self.cursor.shape, blinking: self.cursor.blinking }
+    }
+
+    pub fn profile(&self, name: &str) -> Option<&Profile> {
+        self.profiles.iter().find(|p| p.name == name)
     }
 }
 
@@ -193,6 +209,8 @@ impl Default for Config {
             selection: SelectionConfig::default(),
             bindings: Vec::new(),
             wsl_automount_root: "/mnt".to_string(),
+            profiles: Vec::new(),
+            default_profile: None,
         }
     }
 }
@@ -612,6 +630,18 @@ struct RawUi {
     sidebar_accent: Option<RgbStr>,
     notifications: Option<bool>,
     wsl: RawUiWsl,
+    profiles: Vec<RawProfile>,
+    default_profile: Option<String>,
+}
+
+/// One `[[ui.profiles]]` entry.  Fields are optional so a malformed entry
+/// degrades to a warning instead of failing the whole config parse.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawProfile {
+    name: Option<String>,
+    program: Option<String>,
+    args: Vec<String>,
 }
 
 /// Wrapper that parses `"0xrrggbb"`, `"#rrggbb"`, or `"rrggbb"` into an `Rgb`.
@@ -781,6 +811,16 @@ impl RawConfig {
             .filter(|r| r.starts_with('/') && r.len() > 1)
             .unwrap_or_else(|| "/mnt".to_string());
 
+        // ---- Profiles ----
+        let profiles = build_profiles(self.ui.profiles);
+        let default_profile = self.ui.default_profile.filter(|n| {
+            let known = profiles.iter().any(|p| &p.name == n);
+            if !known {
+                log::warn!("default_profile `{n}` names no [[ui.profiles]] entry; ignoring");
+            }
+            known
+        });
+
         Config {
             palette,
             ui,
@@ -793,6 +833,8 @@ impl RawConfig {
             selection,
             bindings,
             wsl_automount_root,
+            profiles,
+            default_profile,
         }
     }
 }
@@ -834,6 +876,26 @@ fn rgb_to_color32(r: Rgb) -> Color32 {
     Color32::from_rgb(r.r, r.g, r.b)
 }
 
+/// Drop unusable `[[ui.profiles]]` entries instead of failing the parse:
+/// bad config degrades with a warning, matching the rest of this module.
+fn build_profiles(raw: Vec<RawProfile>) -> Vec<Profile> {
+    let mut out: Vec<Profile> = Vec::with_capacity(raw.len());
+    for p in raw {
+        let name = p.name.filter(|n| !n.is_empty());
+        let program = p.program.filter(|x| !x.is_empty());
+        let (Some(name), Some(program)) = (name, program) else {
+            log::warn!("[[ui.profiles]] entry needs non-empty `name` and `program`; dropping");
+            continue;
+        };
+        if out.iter().any(|e| e.name == name) {
+            log::warn!("duplicate profile name `{name}`; keeping the first");
+            continue;
+        }
+        out.push(Profile { name, program, args: p.args });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -849,5 +911,69 @@ mod tests {
         // Nonsense values fall back rather than corrupting every translation.
         let raw: RawConfig = toml::from_str("[ui.wsl]\nautomount_root = \"mnt\"").unwrap();
         assert_eq!(raw.into_config().wsl_automount_root, "/mnt");
+    }
+
+    #[test]
+    fn profiles_parse_and_validate() {
+        let toml_src = r#"
+[ui]
+default_profile = "pwsh"
+
+[[ui.profiles]]
+name = "pwsh"
+program = "pwsh"
+args = ["-NoLogo"]
+
+[[ui.profiles]]
+name = "ubuntu"
+program = "wsl.exe"
+args = ["-d", "ubuntu"]
+"#;
+        let raw: RawConfig = toml::from_str(toml_src).unwrap();
+        let config = raw.into_config();
+        assert_eq!(config.profiles.len(), 2);
+        assert_eq!(
+            config.profiles[0],
+            Profile { name: "pwsh".into(), program: "pwsh".into(), args: vec!["-NoLogo".into()] }
+        );
+        assert_eq!(config.default_profile.as_deref(), Some("pwsh"));
+        assert_eq!(config.profile("ubuntu").unwrap().program, "wsl.exe");
+        assert!(config.profile("nope").is_none());
+    }
+
+    #[test]
+    fn invalid_profiles_are_dropped() {
+        let toml_src = r#"
+[ui]
+default_profile = "ghost"
+
+[[ui.profiles]]
+name = ""
+program = "pwsh"
+
+[[ui.profiles]]
+name = "noprog"
+
+[[ui.profiles]]
+name = "dup"
+program = "first"
+
+[[ui.profiles]]
+name = "dup"
+program = "second"
+"#;
+        let raw: RawConfig = toml::from_str(toml_src).unwrap();
+        let config = raw.into_config();
+        assert_eq!(config.profiles.len(), 1, "empty name, missing program, and dup dropped");
+        assert_eq!(config.profiles[0].program, "first");
+        assert_eq!(config.default_profile, None, "dangling default_profile is ignored");
+    }
+
+    #[test]
+    fn no_profiles_by_default() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        let config = raw.into_config();
+        assert!(config.profiles.is_empty());
+        assert_eq!(config.default_profile, None);
     }
 }
