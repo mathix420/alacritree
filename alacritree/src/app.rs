@@ -780,6 +780,15 @@ impl AlacritreeApp {
                     {
                         home_clicked = true;
                     }
+                    for row in &home_session_rows {
+                        let act = session_row(ui, row, &theme);
+                        if act.activate {
+                            activate_session_request.set(Some((None, row.id)));
+                        }
+                        if act.close {
+                            close_session_request.set(Some(row.id));
+                        }
+                    }
                     ui.add_space(2.0);
 
                     if self.projects.is_empty() {
