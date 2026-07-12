@@ -121,12 +121,15 @@ pub fn show(
     );
 
     if allow_focus && response.has_focus() {
+        // Kitty-protocol and mouse modes negotiated by the running app decide
+        // how events encode, so the encoder needs the live terminal mode.
+        let mode = *session.term.lock().mode();
         let consumed: Vec<ConsumedEvent> = ui.input(|i| {
             i.events
                 .iter()
                 .filter_map(|e| match e {
                     Event::Paste(s) => Some(ConsumedEvent::Paste(s.clone())),
-                    _ => event_to_bytes(e).map(ConsumedEvent::Bytes),
+                    _ => event_to_bytes(e, mode).map(ConsumedEvent::Bytes),
                 })
                 .collect()
         });
