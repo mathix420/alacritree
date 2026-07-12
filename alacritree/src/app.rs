@@ -802,6 +802,12 @@ impl AlacritreeApp {
         let mut expand_toggled = false;
         let mut home_clicked = false;
         let theme = self.theme;
+        let cursor_row = if self.focus == PaneFocus::ProjectsSidebar {
+            self.sidebar_cursor.clone()
+        } else {
+            None
+        };
+        let cursor_moved = std::mem::take(&mut self.sidebar_cursor_moved);
 
         // Snapshot attention + agent-glyph state up-front so the `iter_mut`
         // over projects below isn't blocked from calling back into `&self`
@@ -854,6 +860,8 @@ impl AlacritreeApp {
                     if home_row(
                         ui,
                         self.current_workspace.is_none(),
+                        matches!(&cursor_row, Some(SidebarRow::Home)),
+                        cursor_moved,
                         home_attention,
                         home_agent_glyph,
                         &theme,
@@ -881,7 +889,7 @@ impl AlacritreeApp {
                         // worktree rows already show the dot, and doubling it
                         // on the parent reads as noise.
                         let show_proj_dot = proj_attention && !project.expanded;
-                        row_with_trailing(
+                        let row_rect = row_with_trailing(
                             ui,
                             |ui| {
                                 let arrow = if project.expanded { "▾" } else { "▸" };
@@ -924,6 +932,17 @@ impl AlacritreeApp {
                                 }
                             },
                         );
+                        if matches!(&cursor_row, Some(SidebarRow::Project(r)) if *r == project.root)
+                        {
+                            let rect = egui::Rect::from_x_y_ranges(
+                                ui.max_rect().x_range(),
+                                row_rect.y_range(),
+                            );
+                            paint_cursor_outline(ui, rect, &theme);
+                            if cursor_moved {
+                                ui.scroll_to_rect(rect, None);
+                            }
+                        }
 
                         if project.expanded {
                             for (wt_idx, wt) in project.worktrees.iter().enumerate() {
@@ -938,8 +957,20 @@ impl AlacritreeApp {
                                     .and_then(|v| v.get(wt_idx))
                                     .copied()
                                     .unwrap_or(None);
-                                let action =
-                                    worktree_row(ui, wt, is_active, wt_attention, wt_glyph, &theme);
+                                let is_cursor = matches!(
+                                    &cursor_row,
+                                    Some(SidebarRow::Worktree(p)) if *p == wt.path
+                                );
+                                let action = worktree_row(
+                                    ui,
+                                    wt,
+                                    is_active,
+                                    is_cursor,
+                                    cursor_moved,
+                                    wt_attention,
+                                    wt_glyph,
+                                    &theme,
+                                );
                                 if action.activate {
                                     activate_request.set(Some(wt.path.clone()));
                                 }
@@ -1566,7 +1597,7 @@ fn icon_button(ui: &mut egui::Ui, glyph: &str, color: Color32, theme: &Theme) ->
     resp
 }
 
-fn row_with_trailing<L, T>(ui: &mut egui::Ui, leading: L, trailing: T)
+fn row_with_trailing<L, T>(ui: &mut egui::Ui, leading: L, trailing: T) -> egui::Rect
 where
     L: FnOnce(&mut egui::Ui),
     T: FnOnce(&mut egui::Ui),
@@ -1584,7 +1615,20 @@ where
             egui::Layout::left_to_right(egui::Align::Center),
             leading,
         );
-    });
+    })
+    .response
+    .rect
+}
+
+/// Keyboard-cursor indicator: an outline rather than a fill so it stays
+/// legible on top of the active row's lightened background.
+fn paint_cursor_outline(ui: &egui::Ui, rect: egui::Rect, theme: &Theme) {
+    ui.painter().rect_stroke(
+        rect,
+        0.0,
+        egui::Stroke::new(1.0, theme.accent),
+        egui::StrokeKind::Inside,
+    );
 }
 
 fn is_sidebar_nav_key(key: egui::Key) -> bool {
@@ -1598,6 +1642,8 @@ fn is_sidebar_nav_key(key: egui::Key) -> bool {
 fn home_row(
     ui: &mut egui::Ui,
     is_active: bool,
+    is_cursor: bool,
+    scroll_into_view: bool,
     attention: bool,
     agent_glyph: Option<char>,
     theme: &Theme,
@@ -1631,6 +1677,12 @@ fn home_row(
     if bg != Color32::TRANSPARENT {
         ui.painter().set(bg_idx, egui::Shape::rect_filled(hit_rect, 0.0, bg));
     }
+    if is_cursor {
+        paint_cursor_outline(ui, hit_rect, theme);
+        if scroll_into_view {
+            ui.scroll_to_rect(hit_rect, None);
+        }
+    }
     resp
 }
 
@@ -1643,6 +1695,8 @@ fn worktree_row(
     ui: &mut egui::Ui,
     wt: &Worktree,
     is_active: bool,
+    is_cursor: bool,
+    scroll_into_view: bool,
     attention: bool,
     agent_glyph: Option<char>,
     theme: &Theme,
@@ -1710,9 +1764,15 @@ fn worktree_row(
     } else {
         Color32::TRANSPARENT
     };
+    let full_rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
     if bg != Color32::TRANSPARENT {
-        let rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
-        ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
+        ui.painter().set(bg_idx, egui::Shape::rect_filled(full_rect, 0.0, bg));
+    }
+    if is_cursor {
+        paint_cursor_outline(ui, full_rect, theme);
+        if scroll_into_view {
+            ui.scroll_to_rect(full_rect, None);
+        }
     }
     WorktreeAction { activate: resp.clicked() && !delete_clicked, delete: delete_clicked }
 }
