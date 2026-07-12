@@ -82,18 +82,27 @@ pub fn show(
     if hovered_link.is_some() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
-    handle_selection(
-        ui,
-        &response,
-        session,
-        config,
-        rect,
-        cell_w,
-        cell_h,
-        cols,
-        rows,
-        hovered_link.as_ref(),
-    );
+    // Apps that negotiate mouse tracking want the raw button/motion stream, not
+    // local selection — matching alacritty, Shift is the escape hatch that still
+    // selects text while the app is in mouse mode.
+    let mouse_mode = session.term.lock().mode().intersects(TermMode::MOUSE_MODE);
+    let report_mouse = mouse_mode && !ui.input(|i| i.modifiers.shift);
+    if report_mouse {
+        handle_mouse_reporting(ui, session, rect, cell_w, cell_h, cols, rows);
+    } else {
+        handle_selection(
+            ui,
+            &response,
+            session,
+            config,
+            rect,
+            cell_w,
+            cell_h,
+            cols,
+            rows,
+            hovered_link.as_ref(),
+        );
+    }
     handle_wheel_scroll(ui, &response, session, config, rect, cell_w, cell_h, cols, rows);
     // Built-in renderer expects the *unadjusted* pixel cell size so it can
     // re-apply `font.offset` itself — passing `cell_w * ppp` (which already
@@ -292,6 +301,112 @@ fn handle_selection(
         }
         // Bare click outside an existing drag clears the selection, matching alacritty.
         session.term.lock().selection = None;
+    }
+}
+
+/// Forward raw button and motion events to a mouse-tracking app, mirroring
+/// alacritty's `on_mouse_press` / `on_mouse_release` / `mouse_moved`.  Presses
+/// and releases report the clicked cell; motion reports only when the pointer
+/// crosses into a new cell and the app opted into motion (any-motion) or drag
+/// tracking.  Events outside the grid are ignored so sidebar clicks don't leak.
+#[allow(clippy::too_many_arguments)]
+fn handle_mouse_reporting(
+    ui: &Ui,
+    session: &mut Session,
+    rect: Rect,
+    cell_w: f32,
+    cell_h: f32,
+    cols: usize,
+    rows: usize,
+) {
+    let mode = *session.term.lock().mode();
+    let motion_tracked = mode.intersects(TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG);
+
+    enum Raw {
+        Button { pos: Pos2, code: u8, pressed: bool, modifiers: Modifiers },
+        Motion { pos: Pos2, modifiers: Modifiers },
+    }
+
+    let (raws, held) = ui.input(|i| {
+        let held = if i.pointer.primary_down() {
+            Some(mouse::BUTTON_LEFT)
+        } else if i.pointer.middle_down() {
+            Some(mouse::BUTTON_MIDDLE)
+        } else if i.pointer.secondary_down() {
+            Some(mouse::BUTTON_RIGHT)
+        } else {
+            None
+        };
+        let motion_mods = i.modifiers;
+        let raws: Vec<Raw> = i
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::PointerButton { pos, button, pressed, modifiers } => button_code(*button)
+                    .map(|code| Raw::Button {
+                        pos: *pos,
+                        code,
+                        pressed: *pressed,
+                        modifiers: *modifiers,
+                    }),
+                Event::PointerMoved(pos) if motion_tracked => {
+                    Some(Raw::Motion { pos: *pos, modifiers: motion_mods })
+                },
+                _ => None,
+            })
+            .collect();
+        (raws, held)
+    });
+
+    if raws.is_empty() {
+        return;
+    }
+
+    let display_offset = session.term.lock().grid().display_offset() as i32;
+    let mut bytes = Vec::new();
+    for raw in raws {
+        match raw {
+            Raw::Button { pos, code, pressed, modifiers } => {
+                if !rect.contains(pos) {
+                    continue;
+                }
+                let (point, _) = cell_at_pos(pos, rect, cell_w, cell_h, cols, rows, display_offset);
+                session.last_report_cell = Some(point);
+                if let Some(report) = mouse::mouse_report(mode, point, code, pressed, modifiers) {
+                    bytes.extend_from_slice(&report);
+                }
+            },
+            Raw::Motion { pos, modifiers } => {
+                if !rect.contains(pos) {
+                    continue;
+                }
+                let (point, _) = cell_at_pos(pos, rect, cell_w, cell_h, cols, rows, display_offset);
+                if session.last_report_cell == Some(point) {
+                    continue;
+                }
+                session.last_report_cell = Some(point);
+                let base = match held {
+                    Some(button) => button + mouse::MOTION_OFFSET,
+                    None if mode.contains(TermMode::MOUSE_MOTION) => mouse::MOTION_NONE,
+                    None => continue,
+                };
+                if let Some(report) = mouse::mouse_report(mode, point, base, true, modifiers) {
+                    bytes.extend_from_slice(&report);
+                }
+            },
+        }
+    }
+    if !bytes.is_empty() {
+        session.write(bytes);
+    }
+}
+
+fn button_code(button: PointerButton) -> Option<u8> {
+    match button {
+        PointerButton::Primary => Some(mouse::BUTTON_LEFT),
+        PointerButton::Middle => Some(mouse::BUTTON_MIDDLE),
+        PointerButton::Secondary => Some(mouse::BUTTON_RIGHT),
+        _ => None,
     }
 }
 

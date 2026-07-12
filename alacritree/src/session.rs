@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::event::{Event as TermEvent, EventListener, Notify, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, Notifier};
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::Point;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{ClipboardType, Config as TermConfig, Term};
@@ -93,6 +94,9 @@ pub struct Session {
     /// trackpad pixel-deltas accumulate into whole-line scrolls instead of
     /// being dropped when each frame's delta is smaller than a cell.
     pub accumulated_scroll: (f64, f64),
+    /// Last grid cell reported to a mouse-tracking app, so pointer motion emits
+    /// at most one report per cell crossed instead of one per pixel.
+    pub last_report_cell: Option<Point>,
     /// Shell pid spawned for this PTY.  Used to walk to the foreground
     /// process group when identifying which agent is running.  None on
     /// platforms where we don't yet capture it (Windows).
@@ -391,6 +395,7 @@ impl Session {
             events,
             needs_attention: false,
             accumulated_scroll: (0.0, 0.0),
+            last_report_cell: None,
             shell_pid,
             agent_cache: Cell::new(AgentCache::default()),
             notifier: Notifier(sender.clone()),
