@@ -25,8 +25,9 @@ pub struct Worktree {
 }
 
 impl Project {
-    /// Non-git roots get a single pseudo-worktree pointing at themselves so
-    /// the user can still spawn a shell there from the sidebar.
+    /// Classify the root and discover through the owning backend: in-distro
+    /// git for WSL paths, git2 for Windows paths, and a pseudo-worktree
+    /// placeholder when the root is not a repository.
     pub fn discover(root: PathBuf) -> Self {
         let name = display_name(&root);
         match wsl::classify(&root) {
