@@ -1274,7 +1274,10 @@ impl AlacritreeApp {
             return;
         }
 
-        let (program, args) = build_diff_command(&req);
+        let (program, args) = match wsl::classify(&workspace) {
+            wsl::Location::Wsl { distro, .. } => build_wsl_diff_command(&distro, &workspace, &req),
+            wsl::Location::Windows(_) => build_diff_command(&req),
+        };
         let title = format!("diff: {}", req.file);
         match Session::spawn_command(
             ctx.clone(),
@@ -1311,13 +1314,10 @@ impl AlacritreeApp {
     }
 }
 
-/// Show the clicked file's `git diff` in delta, wired in as git's pager so git
-/// drives the pipe itself.  This drops the POSIX-`sh` dependency the old
-/// `sh -c '… | delta'` had — which had no equivalent on Windows, so diffs never
-/// opened there.  Paths/branches stay in argv, so no file name is shell-parsed.
-fn build_diff_command(req: &DiffRequest) -> (String, Vec<String>) {
-    let mut args =
-        vec!["-c".to_string(), "core.pager=delta --paging=always".to_string(), "diff".to_string()];
+/// git arguments (everything after `git`) for the requested diff — shared
+/// by the Windows and WSL pane commands.
+fn diff_args(req: &DiffRequest) -> Vec<String> {
+    let mut args = vec!["diff".to_string()];
     match &req.source {
         DiffSource::Staged => args.push("--cached".to_string()),
         DiffSource::Worktree => {},
@@ -1334,7 +1334,42 @@ fn build_diff_command(req: &DiffRequest) -> (String, Vec<String>) {
         args.push("/dev/null".to_string());
     }
     args.push(req.file.clone());
+    args
+}
+
+/// Show the clicked file's `git diff` in delta, wired in as git's pager so git
+/// drives the pipe itself.  This drops the POSIX-`sh` dependency the old
+/// `sh -c '… | delta'` had — which had no equivalent on Windows, so diffs never
+/// opened there.  Paths/branches stay in argv, so no file name is shell-parsed.
+fn build_diff_command(req: &DiffRequest) -> (String, Vec<String>) {
+    let mut args = vec!["-c".to_string(), "core.pager=delta --paging=always".to_string()];
+    args.extend(diff_args(req));
     ("git".to_string(), args)
+}
+
+/// The same diff run inside the repo's distro.  `sh -l` sources the user's
+/// profile so `delta` resolves from their PATH (`--exec` alone only sees the
+/// default system PATH; a missing delta prints in the pane, same failure
+/// surface as Windows).  Diff arguments travel as positional parameters, so
+/// no file name is shell-parsed.
+fn build_wsl_diff_command(
+    distro: &str,
+    workspace: &Path,
+    req: &DiffRequest,
+) -> (String, Vec<String>) {
+    let mut args = vec![
+        "-d".to_string(),
+        distro.to_string(),
+        "--cd".to_string(),
+        workspace.to_string_lossy().into_owned(),
+        "--exec".to_string(),
+        "sh".to_string(),
+        "-lc".to_string(),
+        r#"exec git -c "core.pager=delta --paging=always" "$@""#.to_string(),
+        "sh".to_string(),
+    ];
+    args.extend(diff_args(req));
+    ("wsl.exe".to_string(), args)
 }
 
 /// WSL-resident paths get their distro's shell; everything else falls back
