@@ -15,6 +15,7 @@ mod paste;
 mod pr_status;
 mod projects;
 mod session;
+mod sidebar_nav;
 mod state;
 mod terminal_view;
 mod worktree;
