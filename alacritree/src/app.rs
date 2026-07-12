@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 
+use alacritty_terminal::tty::Shell;
 use eframe::CreationContext;
 use egui::{Color32, Context, Frame, Margin, RichText, ScrollArea, SidePanel, Stroke};
 
@@ -18,7 +19,7 @@ use crate::session::{Session, SessionId, SessionKind, TermSize};
 use crate::state::{self, PersistedProject, PersistedState};
 use crate::terminal_view;
 use crate::worktree::{self as wt, CreateRequest, Progress};
-use crate::wsl;
+use crate::wsl::{self, ShellChoice};
 
 /// `None` is the home workspace (sessions inherit `$PWD`); `Some` is a worktree path.
 type WorkspaceKey = Option<PathBuf>;
@@ -360,17 +361,45 @@ impl AlacritreeApp {
         ctx: &Context,
         working_directory: WorkspaceKey,
     ) -> std::io::Result<SessionId> {
+        let shell = self.resolve_shell(&working_directory);
         let session = Session::spawn(
             ctx.clone(),
             &self.config,
             working_directory.clone(),
             TermSize::new(80, 24),
             (8.0, 16.0),
+            shell,
         )?;
         let id = session.id;
         self.sessions.push(session);
         self.active_session.insert(working_directory, id);
         Ok(id)
+    }
+
+    /// Shell for a workspace: the owning project's override wins, then a WSL
+    /// location auto-selects that distro's default shell, then the
+    /// configured shell.  The home tab (None) always uses the configured
+    /// shell.  `None` means "no override" — `Session::spawn` falls through
+    /// to alacritty's config-driven shell with its OS-guaranteed fallback.
+    fn resolve_shell(&self, workspace: &WorkspaceKey) -> Option<Shell> {
+        let path = workspace.as_ref()?;
+        let choice = self
+            .projects
+            .iter()
+            .find(|p| p.worktrees.iter().any(|wt| &wt.path == path))
+            .and_then(|p| p.shell_override.clone());
+        match choice {
+            Some(ShellChoice::Windows) => None,
+            Some(ShellChoice::Wsl(distro)) => {
+                if wsl::distros().iter().any(|d| d.name == distro) {
+                    Some(wsl_shell(&distro, path))
+                } else {
+                    log::warn!("shell override names unknown WSL distro `{distro}`; using auto");
+                    auto_wsl_shell(path)
+                }
+            },
+            None => auto_wsl_shell(path),
+        }
     }
 
     fn activate_worktree(&mut self, ctx: &Context, path: &Path) {
@@ -1245,6 +1274,20 @@ fn build_diff_command(req: &DiffRequest) -> (String, Vec<String>) {
     }
     args.push(req.file.clone());
     ("git".to_string(), args)
+}
+
+/// WSL-resident paths get their distro's shell; everything else falls back
+/// to the configured shell.
+fn auto_wsl_shell(path: &Path) -> Option<Shell> {
+    match wsl::classify(path) {
+        wsl::Location::Wsl { distro, .. } => Some(wsl_shell(&distro, path)),
+        wsl::Location::Windows(_) => None,
+    }
+}
+
+fn wsl_shell(distro: &str, workdir: &Path) -> Shell {
+    let (program, args) = wsl::shell_invocation(distro, workdir);
+    Shell::new(program, args)
 }
 
 fn dirty_warning(counts: &DirtyCounts) -> Option<String> {

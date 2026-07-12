@@ -234,8 +234,15 @@ impl Session {
         working_directory: Option<PathBuf>,
         size: TermSize,
         cell_size: (f32, f32),
+        shell_override: Option<Shell>,
     ) -> std::io::Result<Self> {
-        let shell = config.shell.as_ref().map(|s| Shell::new(s.program.clone(), s.args.clone()));
+        // Overrides are argv built in code (`wsl.exe -d <distro> --cd <dir>`),
+        // so their args need Windows quoting like diff-pane argv; config
+        // shells stay raw to match upstream alacritty.
+        let escape_args = shell_override.is_some();
+        let shell = shell_override.or_else(|| {
+            config.shell.as_ref().map(|s| Shell::new(s.program.clone(), s.args.clone()))
+        });
         let title = working_directory
             .as_ref()
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
@@ -249,6 +256,7 @@ impl Session {
             shell,
             title,
             SessionKind::Shell,
+            escape_args,
         )
     }
 
@@ -275,6 +283,7 @@ impl Session {
             Some(Shell::new(program, args)),
             title,
             kind,
+            true,
         )
     }
 
@@ -287,6 +296,7 @@ impl Session {
         shell: Option<Shell>,
         title: String,
         kind: SessionKind,
+        escape_args: bool,
     ) -> std::io::Result<Self> {
         let window_size = window_size(size, cell_size);
 
@@ -301,6 +311,8 @@ impl Session {
         let term = Term::new(term_config, &size, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
 
+        #[cfg(not(windows))]
+        let _ = escape_args;
         let pty_options = PtyOptions {
             shell,
             working_directory: working_directory.clone(),
@@ -308,12 +320,12 @@ impl Session {
             env: config.env.clone(),
             // Windows has no argv: alacritty_terminal joins these args into a
             // single CreateProcess command line, quoting them only when this
-            // is set.  Diff panes pass argv built in code, where an arg with a
-            // space (delta's pager spec, file paths) must survive as one
-            // argument; shell args from alacritty.toml stay raw to match
-            // upstream alacritty.
+            // is set.  True for argv built in code (diff panes, WSL shells),
+            // where an arg with a space (delta's pager spec, UNC paths) must
+            // survive as one argument; shell args from alacritty.toml stay
+            // raw to match upstream alacritty.
             #[cfg(windows)]
-            escape_args: matches!(kind, SessionKind::Diff { .. }),
+            escape_args,
         };
 
         // alacritty routes OSC 7 / signals by this id, so each session needs its own.
