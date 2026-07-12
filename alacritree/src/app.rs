@@ -769,16 +769,18 @@ impl AlacritreeApp {
                 ui.separator();
 
                 ScrollArea::vertical().show(ui, |ui| {
-                    if home_row(
+                    let home_action = home_row(
                         ui,
                         self.current_workspace.is_none(),
                         home_attention,
                         home_agent_glyph,
                         &theme,
-                    )
-                    .clicked()
-                    {
+                    );
+                    if home_action.activate {
                         home_clicked = true;
+                    }
+                    if home_action.spawn {
+                        spawn_shell_request.set(Some(None));
                     }
                     for row in &home_session_rows {
                         let act = session_row(ui, row, &theme);
@@ -879,6 +881,9 @@ impl AlacritreeApp {
                                         dirty: git_status::dirty_counts(&wt.path),
                                     }));
                                 }
+                                if action.spawn {
+                                    spawn_shell_request.set(Some(Some(wt.path.clone())));
+                                }
                                 let session_rows = worktree_session_rows
                                     .get(idx)
                                     .and_then(|v| v.get(wt_idx))
@@ -936,6 +941,14 @@ impl AlacritreeApp {
         }
         if let Some(id) = close_session_request.take() {
             self.close_session(id);
+        }
+        if let Some(ws) = spawn_shell_request.take() {
+            // Spawning activates the workspace and the new session, matching
+            // Ctrl+T and worktree-creation's open-on-done.
+            self.current_workspace = ws.clone();
+            if let Err(e) = self.spawn_session(ctx, ws) {
+                self.last_error = Some(format!("failed to spawn shell: {e}"));
+            }
         }
         panel_resp.response.rect
     }
@@ -1557,31 +1570,60 @@ where
     });
 }
 
+struct HomeAction {
+    activate: bool,
+    spawn: bool,
+}
+
 fn home_row(
     ui: &mut egui::Ui,
     is_active: bool,
     attention: bool,
     agent_glyph: Option<char>,
     theme: &Theme,
-) -> egui::Response {
+) -> HomeAction {
     // Reserve a slot *before* the labels so the hover bg paints beneath them.
     let bg_idx = ui.painter().add(egui::Shape::Noop);
     let panel_x = ui.max_rect().x_range();
 
-    let frame = Frame::default().inner_margin(Margin { left: 6, right: 6, top: 3, bottom: 3 });
-    let inner_resp = frame.show(ui, |ui| {
-        ui.horizontal(|ui| {
-            paint_row_status_icon(ui, theme, attention, agent_glyph, "⌂", is_active);
-            ui.label(
-                RichText::new("Home")
-                    .color(if is_active { theme.text } else { theme.text_dim })
-                    .strong()
-                    .small(),
+    let mut spawn_clicked = false;
+    let mut spawn_rect: Option<egui::Rect> = None;
+    let frame = Frame::default().inner_margin(Margin { left: 6, right: 0, top: 3, bottom: 3 });
+    let resp = frame
+        .show(ui, |ui| {
+            row_with_trailing(
+                ui,
+                |ui| {
+                    paint_row_status_icon(ui, theme, attention, agent_glyph, "⌂", is_active);
+                    ui.label(
+                        RichText::new("Home")
+                            .color(if is_active { theme.text } else { theme.text_dim })
+                            .strong()
+                            .small(),
+                    );
+                },
+                |ui| {
+                    let btn =
+                        icon_button(ui, "+", theme.text_muted, theme).on_hover_text("new shell");
+                    spawn_rect = Some(btn.rect);
+                    if btn.clicked() {
+                        spawn_clicked = true;
+                    }
+                },
             );
-        });
-    });
-    let hit_rect = egui::Rect::from_x_y_ranges(panel_x, inner_resp.response.rect.y_range());
-    let resp = ui.interact(hit_rect, inner_resp.response.id, egui::Sense::click());
+        })
+        .response
+        .interact(egui::Sense::click());
+
+    // Same z-order recovery as worktree_row: the retroactive frame interact
+    // shadows the inner button, so route clicks inside its rect to spawn.
+    if resp.clicked() && !spawn_clicked {
+        if let (Some(rect), Some(pos)) = (spawn_rect, resp.interact_pointer_pos()) {
+            if rect.contains(pos) {
+                spawn_clicked = true;
+            }
+        }
+    }
 
     let bg = if is_active {
         theme.row_active_bg
@@ -1591,14 +1633,16 @@ fn home_row(
         Color32::TRANSPARENT
     };
     if bg != Color32::TRANSPARENT {
-        ui.painter().set(bg_idx, egui::Shape::rect_filled(hit_rect, 0.0, bg));
+        let rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
+        ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
     }
-    resp
+    HomeAction { activate: resp.clicked() && !spawn_clicked, spawn: spawn_clicked }
 }
 
 struct WorktreeAction {
     activate: bool,
     delete: bool,
+    spawn: bool,
 }
 
 /// Everything a sidebar session row needs, snapshotted before the panel
@@ -1635,6 +1679,8 @@ fn worktree_row(
 
     let mut delete_clicked = false;
     let mut delete_rect: Option<egui::Rect> = None;
+    let mut spawn_clicked = false;
+    let mut spawn_rect: Option<egui::Rect> = None;
     // right: 0 keeps the worktree `×` at the same x as the project row's `×`,
     // which has no frame margin and sits flush against the panel's outer padding.
     let frame = Frame::default().inner_margin(Margin { left: 16, right: 0, top: 3, bottom: 3 });
@@ -1667,6 +1713,12 @@ fn worktree_row(
                             delete_clicked = true;
                         }
                     }
+                    let btn =
+                        icon_button(ui, "+", theme.text_muted, theme).on_hover_text("new shell");
+                    spawn_rect = Some(btn.rect);
+                    if btn.clicked() {
+                        spawn_clicked = true;
+                    }
                 },
             );
         })
@@ -1677,10 +1729,12 @@ fn worktree_row(
     // registers *after* the inner button in egui's z-order — meaning clicks on
     // the × land on this row response, not the button.  Recover by routing
     // clicks whose position falls inside the button rect to delete.
-    if resp.clicked() && !delete_clicked {
-        if let (Some(rect), Some(pos)) = (delete_rect, resp.interact_pointer_pos()) {
-            if rect.contains(pos) {
+    if resp.clicked() && !delete_clicked && !spawn_clicked {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            if delete_rect.is_some_and(|r| r.contains(pos)) {
                 delete_clicked = true;
+            } else if spawn_rect.is_some_and(|r| r.contains(pos)) {
+                spawn_clicked = true;
             }
         }
     }
@@ -1696,7 +1750,11 @@ fn worktree_row(
         let rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
         ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
     }
-    WorktreeAction { activate: resp.clicked() && !delete_clicked, delete: delete_clicked }
+    WorktreeAction {
+        activate: resp.clicked() && !delete_clicked && !spawn_clicked,
+        delete: delete_clicked,
+        spawn: spawn_clicked,
+    }
 }
 
 struct SessionRowAction {
