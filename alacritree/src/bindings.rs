@@ -45,6 +45,8 @@ pub enum NamedAction {
     /// 1-indexed.
     SelectTab(u8),
     SelectLastTab,
+    /// 1-indexed into the `[[ui.profiles]]` order.
+    SpawnProfile(u8),
     Quit,
     /// Used to unbind a key — consumes the press without acting on it.
     NoOp,
@@ -420,6 +422,15 @@ fn parse_action(name: &str) -> BindingAction {
         "SelectTab8" => BindingAction::Named(SelectTab(8)),
         "SelectTab9" => BindingAction::Named(SelectTab(9)),
         "SelectLastTab" => BindingAction::Named(SelectLastTab),
+        "SpawnProfile1" => BindingAction::Named(SpawnProfile(1)),
+        "SpawnProfile2" => BindingAction::Named(SpawnProfile(2)),
+        "SpawnProfile3" => BindingAction::Named(SpawnProfile(3)),
+        "SpawnProfile4" => BindingAction::Named(SpawnProfile(4)),
+        "SpawnProfile5" => BindingAction::Named(SpawnProfile(5)),
+        "SpawnProfile6" => BindingAction::Named(SpawnProfile(6)),
+        "SpawnProfile7" => BindingAction::Named(SpawnProfile(7)),
+        "SpawnProfile8" => BindingAction::Named(SpawnProfile(8)),
+        "SpawnProfile9" => BindingAction::Named(SpawnProfile(9)),
         "Quit" => BindingAction::Named(Quit),
         "None" => BindingAction::Named(NoOp),
         "ReceiveChar" => BindingAction::Named(ReceiveChar),
@@ -465,4 +476,45 @@ fn unescape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_one(action: &str) -> BindingAction {
+        let raw = RawBinding {
+            key: "F1".into(),
+            mods: None,
+            mode: None,
+            chars: None,
+            action: Some(action.into()),
+            command: None,
+        };
+        // User bindings are parsed before the appended defaults, so the
+        // first entry is ours.
+        parse_bindings(vec![raw]).remove(0).action
+    }
+
+    #[test]
+    fn spawn_profile_actions_parse() {
+        for n in 1..=9u8 {
+            let action = parse_one(&format!("SpawnProfile{n}"));
+            assert!(
+                matches!(action, BindingAction::Named(NamedAction::SpawnProfile(m)) if m == n),
+                "SpawnProfile{n} parsed to {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_range_spawn_profile_is_unsupported() {
+        for name in ["SpawnProfile0", "SpawnProfile10", "SpawnProfile"] {
+            let action = parse_one(name);
+            assert!(
+                matches!(&action, BindingAction::Unsupported(s) if s == name),
+                "{name} parsed to {action:?}"
+            );
+        }
+    }
 }
