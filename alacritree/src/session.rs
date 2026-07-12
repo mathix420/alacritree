@@ -301,11 +301,21 @@ impl Session {
         let term = Term::new(term_config, &size, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
 
+        let mut env = config.env.clone();
+        if matches!(kind, SessionKind::Diff { .. }) {
+            // git hands its pager `LESS=FRX`; the `F` (quit-if-one-screen) makes
+            // delta's `less` exit the instant a diff fits the pane, so the tab is
+            // reaped before it can be read. Keep git's other defaults but drop
+            // `F` so the pager waits for `q` regardless of diff length. A `LESS`
+            // set by the user (via `[env]`) wins.
+            env.entry("LESS".to_string()).or_insert_with(|| "RX".to_string());
+        }
+
         let pty_options = PtyOptions {
             shell,
             working_directory: working_directory.clone(),
             drain_on_exit: false,
-            env: config.env.clone(),
+            env,
             // Windows has no argv: alacritty_terminal joins these args into a
             // single CreateProcess command line, quoting them only when this
             // is set.  Diff panes pass argv built in code, where an arg with a
