@@ -240,6 +240,52 @@ pub fn shell_invocation(distro: &str, workdir: &Path) -> (String, Vec<String>) {
     )
 }
 
+/// Separates the outputs of the individual commands a batch script runs.
+/// Scripts emit it between sections via `sep() { printf '\n@@ALACRITREE@@\n'; }`;
+/// NUL-delimited porcelain payloads pass through untouched because the
+/// separator is matched as raw bytes, and the leading newline absorbs the
+/// section's own trailing newline when it has one.
+pub const SECTION_SEP: &[u8] = b"\n@@ALACRITREE@@\n";
+
+/// Run `script` through `sh -c` inside `distro`, with `args` bound to
+/// `$1..`.  One wsl.exe round trip (~400 ms warm on a dev machine, seconds
+/// while the VM cold-boots) — callers batch every query for a repo into a
+/// single script and must never call this on the UI thread.
+pub fn run_batch(distro: &str, script: &str, args: &[&str]) -> Result<Vec<u8>, String> {
+    let output = command(distro, None)
+        .arg("sh")
+        .arg("-c")
+        .arg(script)
+        .arg("sh")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to run wsl.exe: {e}"))?;
+    // Scripts guard individual commands with `2>/dev/null || true`-style
+    // fallbacks; a hard failure with no stdout means wsl.exe itself refused
+    // (deregistered distro, WSL not installed).
+    if !output.status.success() && output.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() { "wsl.exe failed".to_string() } else { stderr });
+    }
+    Ok(output.stdout)
+}
+
+/// Split batched stdout on `SECTION_SEP`.  Always returns at least one
+/// section; a script with N separators yields N+1.
+pub fn split_sections(stdout: &[u8]) -> Vec<&[u8]> {
+    let mut sections = Vec::new();
+    let mut rest = stdout;
+    while let Some(pos) = rest.windows(SECTION_SEP.len()).position(|w| w == SECTION_SEP) {
+        sections.push(&rest[..pos]);
+        rest = &rest[pos + SECTION_SEP.len()..];
+    }
+    sections.push(rest);
+    sections
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,5 +412,36 @@ mod tests {
         let (program, args) = shell_invocation("kali-linux", Path::new(r"C:\proj"));
         assert_eq!(program, "wsl.exe");
         assert_eq!(args, vec!["-d", "kali-linux", "--cd", r"C:\proj"]);
+    }
+
+    #[test]
+    fn splits_sections_preserving_nuls() {
+        let mut input = Vec::new();
+        input.extend_from_slice(b"yes");
+        input.extend_from_slice(SECTION_SEP);
+        input.extend_from_slice(b"a\0b\0\0c\0");
+        input.extend_from_slice(SECTION_SEP);
+        input.extend_from_slice(b"tail");
+        let sections = split_sections(&input);
+        assert_eq!(sections, vec![&b"yes"[..], &b"a\0b\0\0c\0"[..], &b"tail"[..]]);
+    }
+
+    #[test]
+    fn split_handles_empty_and_missing_sections() {
+        assert_eq!(split_sections(b""), vec![&b""[..]]);
+        let mut input = Vec::new();
+        input.extend_from_slice(SECTION_SEP);
+        input.extend_from_slice(SECTION_SEP);
+        assert_eq!(split_sections(&input), vec![&b""[..], &b""[..], &b""[..]]);
+    }
+
+    /// Live round trip against the default distro.  Requires WSL; run
+    /// manually: `cargo test -p alacritree wsl:: -- --ignored`
+    #[test]
+    #[ignore]
+    fn run_batch_round_trips() {
+        let distro = distros().into_iter().find(|d| d.is_default).expect("a default distro");
+        let out = run_batch(&distro.name, r#"printf '%s' "$1""#, &["hello"]).unwrap();
+        assert_eq!(out, b"hello");
     }
 }
