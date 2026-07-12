@@ -699,6 +699,10 @@ impl AlacritreeApp {
         let activate_request: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
         let delete_request: std::cell::Cell<Option<DeleteRequest>> = std::cell::Cell::new(None);
         let create_request: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
+        let spawn_shell_request: std::cell::Cell<Option<WorkspaceKey>> = std::cell::Cell::new(None);
+        let activate_session_request: std::cell::Cell<Option<(WorkspaceKey, SessionId)>> =
+            std::cell::Cell::new(None);
+        let close_session_request: std::cell::Cell<Option<SessionId>> = std::cell::Cell::new(None);
         let mut add_project_clicked = false;
         let mut refresh_idx: Option<usize> = None;
         let mut remove_idx: Option<usize> = None;
@@ -730,6 +734,17 @@ impl AlacritreeApp {
                 p.worktrees
                     .iter()
                     .map(|wt| self.workspace_agent_glyph(&Some(wt.path.clone())))
+                    .collect()
+            })
+            .collect();
+        let home_session_rows = self.workspace_session_rows(&None);
+        let worktree_session_rows: Vec<Vec<Vec<SessionRowData>>> = self
+            .projects
+            .iter()
+            .map(|p| {
+                p.worktrees
+                    .iter()
+                    .map(|wt| self.workspace_session_rows(&Some(wt.path.clone())))
                     .collect()
             })
             .collect();
@@ -855,6 +870,21 @@ impl AlacritreeApp {
                                         dirty: git_status::dirty_counts(&wt.path),
                                     }));
                                 }
+                                let session_rows = worktree_session_rows
+                                    .get(idx)
+                                    .and_then(|v| v.get(wt_idx))
+                                    .map(Vec::as_slice)
+                                    .unwrap_or(&[]);
+                                for row in session_rows {
+                                    let act = session_row(ui, row, &theme);
+                                    if act.activate {
+                                        activate_session_request
+                                            .set(Some((Some(wt.path.clone()), row.id)));
+                                    }
+                                    if act.close {
+                                        close_session_request.set(Some(row.id));
+                                    }
+                                }
                             }
                             ui.add_space(4.0);
                         }
@@ -887,6 +917,16 @@ impl AlacritreeApp {
         if let Some(idx) = create_request.take() {
             self.pending_create =
                 Some(CreateState::Prompt { project_idx: idx, branch: String::new(), error: None });
+        }
+        if let Some((ws, id)) = activate_session_request.take() {
+            // A stale id (session reaped this frame) self-heals next frame:
+            // active_session_index() misses and ensure_active_session picks
+            // an existing shell or spawns one.
+            self.current_workspace = ws.clone();
+            self.active_session.insert(ws, id);
+        }
+        if let Some(id) = close_session_request.take() {
+            self.close_session(id);
         }
         panel_resp.response.rect
     }
@@ -1552,6 +1592,26 @@ struct WorktreeAction {
     delete: bool,
 }
 
+/// Everything a sidebar session row needs, snapshotted before the panel
+/// closure so rendering doesn't borrow `self.sessions`.
+struct SessionRowData {
+    id: SessionId,
+    title: String,
+    needs_attention: bool,
+    agent_glyph: Option<char>,
+    /// This workspace's remembered active session (accent icon).
+    is_active: bool,
+    /// Active *and* the workspace is current — the session on screen
+    /// (row background highlight).
+    is_displayed: bool,
+}
+
+/// Spawn-ordered ids of the sessions in `ws`.  Pure over (workspace, id)
+/// pairs so the grouping rule is testable without spawning PTYs.
+fn sidebar_session_ids(pairs: &[(WorkspaceKey, SessionId)], ws: &WorkspaceKey) -> Vec<SessionId> {
+    pairs.iter().filter(|(w, _)| w == ws).map(|(_, id)| *id).collect()
+}
+
 fn worktree_row(
     ui: &mut egui::Ui,
     wt: &Worktree,
@@ -1628,6 +1688,79 @@ fn worktree_row(
         ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
     }
     WorktreeAction { activate: resp.clicked() && !delete_clicked, delete: delete_clicked }
+}
+
+struct SessionRowAction {
+    activate: bool,
+    close: bool,
+}
+
+fn session_row(ui: &mut egui::Ui, row: &SessionRowData, theme: &Theme) -> SessionRowAction {
+    // Reserve a slot *before* the labels so the hover bg paints beneath them.
+    let bg_idx = ui.painter().add(egui::Shape::Noop);
+    let panel_x = ui.max_rect().x_range();
+
+    let mut close_clicked = false;
+    let mut close_rect: Option<egui::Rect> = None;
+    // One indent level deeper than worktree rows (16); right: 0 keeps the ×
+    // at the same x as the other rows' trailing icons.
+    let frame = Frame::default().inner_margin(Margin { left: 28, right: 0, top: 3, bottom: 3 });
+    let resp = frame
+        .show(ui, |ui| {
+            let title_color = if row.is_active { theme.text } else { theme.text_dim };
+            row_with_trailing(
+                ui,
+                |ui| {
+                    paint_row_status_icon(
+                        ui,
+                        theme,
+                        row.needs_attention,
+                        row.agent_glyph,
+                        "▪",
+                        row.is_active,
+                    );
+                    ui.add(
+                        egui::Label::new(RichText::new(&row.title).color(title_color).small())
+                            .truncate(),
+                    );
+                },
+                |ui| {
+                    let btn = icon_button(ui, "×", theme.text_muted, theme)
+                        .on_hover_text("close session");
+                    close_rect = Some(btn.rect);
+                    if btn.clicked() {
+                        close_clicked = true;
+                    }
+                },
+            );
+        })
+        .response
+        .interact(egui::Sense::click());
+
+    // Frame allocates its space at end-of-show, so its retroactive `interact`
+    // registers *after* the inner button in egui's z-order — meaning clicks on
+    // the × land on this row response, not the button.  Recover by routing
+    // clicks whose position falls inside the button rect to close.
+    if resp.clicked() && !close_clicked {
+        if let (Some(rect), Some(pos)) = (close_rect, resp.interact_pointer_pos()) {
+            if rect.contains(pos) {
+                close_clicked = true;
+            }
+        }
+    }
+
+    let bg = if row.is_displayed {
+        theme.row_active_bg
+    } else if resp.hovered() {
+        theme.row_hover_bg
+    } else {
+        Color32::TRANSPARENT
+    };
+    if bg != Color32::TRANSPARENT {
+        let rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
+        ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
+    }
+    SessionRowAction { activate: resp.clicked() && !close_clicked, close: close_clicked }
 }
 
 impl AlacritreeApp {
@@ -1720,6 +1853,31 @@ impl AlacritreeApp {
             }
         }
         active_glyph.or(other_glyph)
+    }
+
+    /// Session rows for `ws`'s sidebar list.  Empty below two sessions — a
+    /// single-session workspace row keeps its compact form, mirroring the
+    /// tab strip's threshold.
+    fn workspace_session_rows(&self, ws: &WorkspaceKey) -> Vec<SessionRowData> {
+        let pairs: Vec<(WorkspaceKey, SessionId)> =
+            self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect();
+        let ids = sidebar_session_ids(&pairs, ws);
+        if ids.len() < 2 {
+            return Vec::new();
+        }
+        let active = self.active_session.get(ws).copied();
+        let is_current = self.current_workspace == *ws;
+        ids.iter()
+            .filter_map(|id| self.sessions.iter().find(|s| s.id == *id))
+            .map(|s| SessionRowData {
+                id: s.id,
+                title: s.title.clone(),
+                needs_attention: s.needs_attention,
+                agent_glyph: s.agent_glyph(),
+                is_active: active == Some(s.id),
+                is_displayed: is_current && active == Some(s.id),
+            })
+            .collect()
     }
 
     fn show_delete_dialog(&mut self, ctx: &Context) {
@@ -2251,5 +2409,28 @@ fn notify_worker(body: String, _key: WorkspaceKey, _ctx: egui::Context) {
     // notify-rust today — fall back to a fire-and-forget toast.
     if let Err(e) = notify_rust::Notification::new().summary("alacritree").body(&body).show() {
         log::debug!("desktop notification failed: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ws(p: &str) -> WorkspaceKey {
+        Some(PathBuf::from(p))
+    }
+
+    #[test]
+    fn session_ids_filter_by_workspace_and_keep_spawn_order() {
+        let pairs = vec![(None, 1), (ws("/a"), 2), (None, 3), (ws("/b"), 4), (ws("/a"), 5)];
+        assert_eq!(sidebar_session_ids(&pairs, &None), vec![1, 3]);
+        assert_eq!(sidebar_session_ids(&pairs, &ws("/a")), vec![2, 5]);
+        assert_eq!(sidebar_session_ids(&pairs, &ws("/b")), vec![4]);
+    }
+
+    #[test]
+    fn session_ids_empty_for_unknown_workspace() {
+        let pairs = vec![(None, 1)];
+        assert!(sidebar_session_ids(&pairs, &ws("/missing")).is_empty());
     }
 }
