@@ -70,10 +70,14 @@ background thread and streams progress steps back to the UI:
    the terminal — every other key in the file is preserved.
 
 Worktrees are created under
-`~/.alacritree/worktrees/<project>-<hash>/<branch>` so they never clutter the
-repo's parent directory and stay grouped per app. The `<hash>` disambiguates
-same-named repos in different locations. `/` in branch names is rewritten to
-`-`, and a numeric suffix is appended if the target already exists.
+`<base>/<project>-<hash>/<branch>`, where `<base>` defaults to
+`~/.alacritree/worktrees` so they never clutter the repo's parent directory
+and stay grouped per app. The base is configurable per `[workspace]` in
+`alacritree.toml` (see Configuration below); changing it never moves existing
+worktrees — discovery goes through `git worktree list`. The `<hash>`
+disambiguates same-named repos in different locations. `/` in branch names is
+rewritten to `-`, and a numeric suffix is appended if the target already
+exists.
 
 ### Deleting a worktree
 
@@ -198,8 +202,8 @@ Search path (matches Alacritty exactly):
 Then the same locations for `alacritree.toml`. The two-file split keeps
 shared options (palette, cursor, scrolling, shell, key bindings) in
 `alacritty.toml` — usable by both the upstream alacritty terminal and
-Alacritree — while Alacritree-specific UI options live in `alacritree.toml`
-under `[ui]`:
+Alacritree — while Alacritree-specific options live in `alacritree.toml`
+under `[ui]` and `[workspace]`:
 
 ```toml
 [ui]
@@ -208,6 +212,13 @@ sidebar_foreground = "#d8d8d8"
 sidebar_border     = "#2a2a2a"
 sidebar_accent     = "#6a9fb5"
 notifications      = true   # desktop notification when a hidden session bells
+
+[workspace]
+worktree_dir = "~/dev/worktrees"   # base dir for new worktrees (default ~/.alacritree/worktrees)
+
+[[workspace.overrides]]            # optional per-project override
+project = "~/Git/github/alacritree"
+worktree_dir = "D:/wt"
 
 [window]
 opacity = 0.92   # restart required — transparency is a ViewportBuilder flag
