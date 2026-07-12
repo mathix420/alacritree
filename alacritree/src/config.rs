@@ -27,6 +27,7 @@ pub struct Config {
     pub shell: Option<ShellConfig>,
     pub selection: SelectionConfig,
     pub bindings: Vec<KeyBinding>,
+    pub wsl_automount_root: String,
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +192,7 @@ impl Default for Config {
             shell: None,
             selection: SelectionConfig::default(),
             bindings: Vec::new(),
+            wsl_automount_root: "/mnt".to_string(),
         }
     }
 }
@@ -593,12 +595,23 @@ struct RawIndexed {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
+struct RawUiWsl {
+    /// Distro-side mount point for Windows drives, mirroring wsl.conf's
+    /// `[automount] root`.  Only used for paths *we* translate (git output
+    /// from inside a distro); `wsl.exe --cd` translates with the distro's
+    /// real mount table regardless of this value.
+    automount_root: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 struct RawUi {
     sidebar_background: Option<RgbStr>,
     sidebar_foreground: Option<RgbStr>,
     sidebar_border: Option<RgbStr>,
     sidebar_accent: Option<RgbStr>,
     notifications: Option<bool>,
+    wsl: RawUiWsl,
 }
 
 /// Wrapper that parses `"0xrrggbb"`, `"#rrggbb"`, or `"rrggbb"` into an `Rgb`.
@@ -759,6 +772,15 @@ impl RawConfig {
 
         let bindings = bindings::parse_bindings(self.keyboard.bindings);
 
+        // ---- WSL ----
+        let wsl_automount_root = self
+            .ui
+            .wsl
+            .automount_root
+            .map(|r| r.trim_end_matches('/').to_string())
+            .filter(|r| r.starts_with('/') && r.len() > 1)
+            .unwrap_or_else(|| "/mnt".to_string());
+
         Config {
             palette,
             ui,
@@ -770,6 +792,7 @@ impl RawConfig {
             shell,
             selection,
             bindings,
+            wsl_automount_root,
         }
     }
 }
@@ -809,4 +832,22 @@ fn apply_set(target: &mut [Rgb; 8], set: RawSet) {
 
 fn rgb_to_color32(r: Rgb) -> Color32 {
     Color32::from_rgb(r.r, r.g, r.b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn automount_root_defaults_and_normalizes() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        assert_eq!(raw.into_config().wsl_automount_root, "/mnt");
+
+        let raw: RawConfig = toml::from_str("[ui.wsl]\nautomount_root = \"/drives/\"").unwrap();
+        assert_eq!(raw.into_config().wsl_automount_root, "/drives");
+
+        // Nonsense values fall back rather than corrupting every translation.
+        let raw: RawConfig = toml::from_str("[ui.wsl]\nautomount_root = \"mnt\"").unwrap();
+        assert_eq!(raw.into_config().wsl_automount_root, "/mnt");
+    }
 }

@@ -33,6 +33,7 @@ fn main() -> eframe::Result<()> {
         .init();
 
     let config = config::load();
+    wsl::set_automount_root(config.wsl_automount_root.clone());
     let translucent = config.window.opacity < 1.0;
 
     let mut viewport = egui::ViewportBuilder::default()
