@@ -18,6 +18,7 @@ use crate::config::Config;
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
 use crate::input::event_to_bytes;
 use crate::links::{self, Link};
+use crate::mouse;
 use crate::paste;
 use crate::session::{EventProxy, Session, TermSize};
 
@@ -93,7 +94,7 @@ pub fn show(
         rows,
         hovered_link.as_ref(),
     );
-    handle_wheel_scroll(ui, &response, session, config, cell_w, cell_h);
+    handle_wheel_scroll(ui, &response, session, config, rect, cell_w, cell_h, cols, rows);
     // Built-in renderer expects the *unadjusted* pixel cell size so it can
     // re-apply `font.offset` itself — passing `cell_w * ppp` (which already
     // includes the offset) would double-add it.  Descent is zero here: the
@@ -297,13 +298,17 @@ fn handle_selection(
 /// Mouse-wheel scrolling.  Mirrors alacritty's `scroll_terminal`: accumulate
 /// pixel deltas across frames, divide by cell height for whole-line steps,
 /// and route to the PTY or scrollback depending on terminal mode.
+#[allow(clippy::too_many_arguments)]
 fn handle_wheel_scroll(
     ui: &Ui,
     response: &Response,
     session: &mut Session,
     config: &Config,
+    rect: Rect,
     cell_w: f32,
     cell_h: f32,
+    cols: usize,
+    rows: usize,
 ) {
     if !response.hovered() {
         return;
@@ -320,6 +325,11 @@ fn handle_wheel_scroll(
     if wheels.is_empty() {
         return;
     }
+    // Mouse-tracking apps receive wheel reports addressed to the hovered cell.
+    let pointer_cell = ui.input(|i| i.pointer.hover_pos()).map(|pos| {
+        let display_offset = session.term.lock().grid().display_offset() as i32;
+        cell_at_pos(pos, rect, cell_w, cell_h, cols, rows, display_offset).0
+    });
     let cell_w_pt = cell_w as f64;
     let cell_h_pt = cell_h as f64;
     for (unit, delta, modifiers) in wheels {
@@ -331,10 +341,11 @@ fn handle_wheel_scroll(
                 delta.y as f64 * session.size.screen_lines as f64 * cell_h_pt,
             ),
         };
-        apply_scroll(session, config, dx_pt, dy_pt, cell_w_pt, cell_h_pt, modifiers);
+        apply_scroll(session, config, dx_pt, dy_pt, cell_w_pt, cell_h_pt, modifiers, pointer_cell);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_scroll(
     session: &mut Session,
     config: &Config,
@@ -343,6 +354,7 @@ fn apply_scroll(
     cell_w_pt: f64,
     cell_h_pt: f64,
     modifiers: Modifiers,
+    pointer_cell: Option<Point>,
 ) {
     let mode = *session.term.lock().mode();
     let mouse_mode = mode.intersects(TermMode::MOUSE_MODE);
@@ -360,9 +372,26 @@ fn apply_scroll(
     let is_up = dy_pt > 0.0;
 
     if mouse_mode {
-        // CSI mouse-wheel reports (codes 64/65) aren't wired up yet; until they
-        // are we leave the wheel alone in mouse-tracking mode so apps that
-        // requested raw mouse input aren't fed garbled scrollback events.
+        // One button report per accumulated line/column tick, addressed to the
+        // hovered cell — alacritty's `scroll_terminal` in mouse mode.
+        if let Some(point) = pointer_cell {
+            let mut bytes = Vec::new();
+            let line_btn = if is_up { mouse::WHEEL_UP } else { mouse::WHEEL_DOWN };
+            for _ in 0..lines {
+                if let Some(report) = mouse::wheel_report(mode, point, line_btn, modifiers) {
+                    bytes.extend_from_slice(&report);
+                }
+            }
+            let column_btn = if dx_pt > 0.0 { mouse::WHEEL_LEFT } else { mouse::WHEEL_RIGHT };
+            for _ in 0..columns {
+                if let Some(report) = mouse::wheel_report(mode, point, column_btn, modifiers) {
+                    bytes.extend_from_slice(&report);
+                }
+            }
+            if !bytes.is_empty() {
+                session.write(bytes);
+            }
+        }
     } else if alt_alt_scroll && !modifiers.shift {
         // Alt-screen apps (vim/less/man) opted into ALTERNATE_SCROLL ask for
         // arrow keys instead of touching the scrollback (which doesn't exist

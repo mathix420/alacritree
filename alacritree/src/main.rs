@@ -14,6 +14,7 @@ mod input;
 mod ipc;
 mod links;
 mod mcp;
+mod mouse;
 mod paste;
 mod pr_status;
 mod projects;
