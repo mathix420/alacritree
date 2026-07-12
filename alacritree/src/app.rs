@@ -243,10 +243,13 @@ impl AlacritreeApp {
             .map(|p| {
                 // WSL roots discover in the background after construction —
                 // a cold distro takes seconds to boot and would block first
-                // paint.
-                let mut project = match wsl::classify(&p.root) {
-                    wsl::Location::Windows(_) => Project::discover(p.root.clone()),
-                    wsl::Location::Wsl { .. } => Project::placeholder(p.root.clone()),
+                // paint. Normalize the root first so a persisted `\\wsl$\`
+                // spelling converges with the `\\wsl.localhost\` paths that
+                // background discovery later swaps in via `poll_project_refreshes`.
+                let root = wsl::normalize_root(p.root.clone());
+                let mut project = match wsl::classify(&root) {
+                    wsl::Location::Windows(_) => Project::discover(root),
+                    wsl::Location::Wsl { .. } => Project::placeholder(root),
                 };
                 project.expanded = p.expanded;
                 project.shell_override = p.shell.as_deref().and_then(wsl::ShellChoice::parse);
@@ -512,6 +515,7 @@ impl AlacritreeApp {
 
     fn add_project_via_dialog(&mut self, ctx: &Context) {
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            let path = wsl::normalize_root(path);
             if !self.projects.iter().any(|p| p.root == path) {
                 match wsl::classify(&path) {
                     wsl::Location::Windows(_) => self.projects.push(Project::discover(path)),

@@ -115,6 +115,16 @@ fn linux_to_windows_with(linux: &str, distro: &str, automount_root: &str) -> Pat
     PathBuf::from(out)
 }
 
+/// Canonical spelling for a project root: WSL paths re-emitted through
+/// `linux_to_windows`, so `\\wsl$\` and `\\wsl.localhost\` inputs converge
+/// on one form and path equality holds across discovery refreshes.
+pub fn normalize_root(path: PathBuf) -> PathBuf {
+    match classify(&path) {
+        Location::Wsl { distro, linux_path } => linux_to_windows(&linux_path, &distro),
+        Location::Windows(_) => path,
+    }
+}
+
 /// Translate a Windows path to what git inside a distro can resolve:
 /// WSL UNC paths strip to their Linux part; drive paths map under the
 /// automount root; anything else (non-WSL UNC shares) is untranslatable.
@@ -363,6 +373,20 @@ mod tests {
     fn classifies_drive_and_non_wsl_unc_as_windows() {
         assert!(matches!(classify(Path::new(r"C:\Users\Lev")), Location::Windows(_)));
         assert!(matches!(classify(Path::new(r"\\server\share\x")), Location::Windows(_)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_root_converges_wsl_dollar_and_localhost() {
+        let normalized = normalize_root(PathBuf::from(r"\\wsl$\kali-linux\home\lev"));
+        assert_eq!(normalized, PathBuf::from(r"\\wsl.localhost\kali-linux\home\lev"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_root_leaves_windows_paths_unchanged() {
+        let normalized = normalize_root(PathBuf::from(r"C:\x"));
+        assert_eq!(normalized, PathBuf::from(r"C:\x"));
     }
 
     #[test]
