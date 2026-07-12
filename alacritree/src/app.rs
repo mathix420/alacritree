@@ -713,30 +713,6 @@ impl AlacritreeApp {
         // Snapshot attention + agent-glyph state up-front so the `iter_mut`
         // over projects below isn't blocked from calling back into `&self`
         // helpers.
-        let home_attention = self.workspace_needs_attention(&None);
-        let home_agent_glyph = self.workspace_agent_glyph(&None);
-        let project_attention: Vec<bool> =
-            self.projects.iter().map(|p| self.project_needs_attention(p)).collect();
-        let worktree_attention: Vec<Vec<bool>> = self
-            .projects
-            .iter()
-            .map(|p| {
-                p.worktrees
-                    .iter()
-                    .map(|wt| self.workspace_needs_attention(&Some(wt.path.clone())))
-                    .collect()
-            })
-            .collect();
-        let worktree_agent: Vec<Vec<Option<char>>> = self
-            .projects
-            .iter()
-            .map(|p| {
-                p.worktrees
-                    .iter()
-                    .map(|wt| self.workspace_agent_glyph(&Some(wt.path.clone())))
-                    .collect()
-            })
-            .collect();
         let home_session_rows = self.workspace_session_rows(&None);
         let worktree_session_rows: Vec<Vec<Vec<SessionRowData>>> = self
             .projects
@@ -745,6 +721,56 @@ impl AlacritreeApp {
                 p.worktrees
                     .iter()
                     .map(|wt| self.workspace_session_rows(&Some(wt.path.clone())))
+                    .collect()
+            })
+            .collect();
+
+        // A rendered session list carries its own per-session dots and
+        // glyphs; repeating them on the parent row reads as noise — the same
+        // rule the project row applies when expanded.  Aggregates therefore
+        // apply only while the list is hidden (fewer than two sessions).
+        let home_attention = home_session_rows.is_empty() && self.workspace_needs_attention(&None);
+        let home_agent_glyph =
+            if home_session_rows.is_empty() { self.workspace_agent_glyph(&None) } else { None };
+        let project_attention: Vec<bool> =
+            self.projects.iter().map(|p| self.project_needs_attention(p)).collect();
+        let worktree_attention: Vec<Vec<bool>> = self
+            .projects
+            .iter()
+            .enumerate()
+            .map(|(p_idx, p)| {
+                p.worktrees
+                    .iter()
+                    .enumerate()
+                    .map(|(w_idx, wt)| {
+                        let listed = worktree_session_rows
+                            .get(p_idx)
+                            .and_then(|v| v.get(w_idx))
+                            .is_some_and(|rows| !rows.is_empty());
+                        !listed && self.workspace_needs_attention(&Some(wt.path.clone()))
+                    })
+                    .collect()
+            })
+            .collect();
+        let worktree_agent: Vec<Vec<Option<char>>> = self
+            .projects
+            .iter()
+            .enumerate()
+            .map(|(p_idx, p)| {
+                p.worktrees
+                    .iter()
+                    .enumerate()
+                    .map(|(w_idx, wt)| {
+                        let listed = worktree_session_rows
+                            .get(p_idx)
+                            .and_then(|v| v.get(w_idx))
+                            .is_some_and(|rows| !rows.is_empty());
+                        if listed {
+                            None
+                        } else {
+                            self.workspace_agent_glyph(&Some(wt.path.clone()))
+                        }
+                    })
                     .collect()
             })
             .collect();
