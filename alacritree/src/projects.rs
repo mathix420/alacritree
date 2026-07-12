@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use git2::Repository;
 
+use crate::wsl;
+
 #[derive(Debug, Clone)]
 pub struct Project {
     pub root: PathBuf,
@@ -25,25 +27,85 @@ impl Project {
     /// Non-git roots get a single pseudo-worktree pointing at themselves so
     /// the user can still spawn a shell there from the sidebar.
     pub fn discover(root: PathBuf) -> Self {
-        let name = root
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| root.display().to_string());
-
-        match Repository::open(&root) {
-            Ok(repo) => Self::from_repo(root, name, &repo),
-            Err(_) => Project {
-                worktrees: vec![Worktree {
-                    name: name.clone(),
-                    path: root.clone(),
-                    branch: None,
-                    is_main: true,
-                }],
-                root,
-                name,
-                default_branch: None,
-                expanded: true,
+        let name = display_name(&root);
+        match wsl::classify(&root) {
+            wsl::Location::Wsl { distro, linux_path } => {
+                Self::discover_wsl(root, name, &distro, &linux_path)
             },
+            wsl::Location::Windows(_) => match Repository::open(&root) {
+                Ok(repo) => Self::from_repo(root, name, &repo),
+                Err(_) => Self::placeholder(root),
+            },
+        }
+    }
+
+    /// Pseudo-worktree entry: what non-git roots get permanently, and what a
+    /// WSL project shows until background discovery fills in worktrees.
+    pub fn placeholder(root: PathBuf) -> Self {
+        let name = display_name(&root);
+        Project {
+            worktrees: vec![Worktree {
+                name: name.clone(),
+                path: root.clone(),
+                branch: None,
+                is_main: true,
+            }],
+            root,
+            name,
+            default_branch: None,
+            expanded: true,
+        }
+    }
+
+    /// One wsl.exe round trip answers everything discovery needs; sections
+    /// are split on `wsl::SECTION_SEP`.  Any failure degrades to the same
+    /// pseudo-worktree a non-git folder gets.
+    fn discover_wsl(root: PathBuf, name: String, distro: &str, linux_path: &str) -> Self {
+        let stdout = match wsl::run_batch(distro, DISCOVER_SCRIPT, &[linux_path]) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("WSL discovery failed for {}: {e}", root.display());
+                return Self::placeholder(root);
+            },
+        };
+        let sections = wsl::split_sections(&stdout);
+        let text = |i: usize| {
+            sections
+                .get(i)
+                .map(|s| String::from_utf8_lossy(s).trim().to_string())
+                .unwrap_or_default()
+        };
+
+        if text(0) != "yes" {
+            return Self::placeholder(root);
+        }
+
+        let records = parse_worktree_list_z(sections.get(1).copied().unwrap_or_default());
+        let worktrees: Vec<Worktree> = records
+            .iter()
+            .enumerate()
+            .map(|(i, rec)| {
+                let path = wsl::linux_to_windows(&rec.path, distro);
+                // Same rendering as the git2 arm: branch name, or the short
+                // OID when detached.
+                let branch = rec
+                    .branch
+                    .clone()
+                    .or_else(|| rec.head.as_ref().map(|h| h.chars().take(7).collect()));
+                let wt_name = if i == 0 { "main".to_string() } else { display_name(&path) };
+                Worktree { name: wt_name, path, branch, is_main: i == 0 }
+            })
+            .collect();
+        if worktrees.is_empty() {
+            return Self::placeholder(root);
+        }
+
+        Project {
+            default_branch: default_branch_from_batch(&text(2), &text(3), &text(4)),
+            worktrees,
+            root,
+            name,
+            expanded: true,
         }
     }
 
@@ -137,4 +199,135 @@ fn detect_default_branch(repo: &Repository) -> Option<String> {
     }
 
     None
+}
+
+fn display_name(root: &std::path::Path) -> String {
+    root.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.display().to_string())
+}
+
+/// Sections: 0 repo-or-not, 1 `worktree list --porcelain -z`,
+/// 2 origin/HEAD symref, 3 which common default-branch names exist,
+/// 4 `init.defaultBranch` only if it names an existing branch.
+const DISCOVER_SCRIPT: &str = r#"
+p="$1"
+sep() { printf '\n@@ALACRITREE@@\n'; }
+git -C "$p" rev-parse --is-inside-work-tree >/dev/null 2>&1 && printf yes || printf no
+sep
+git -C "$p" worktree list --porcelain -z 2>/dev/null
+sep
+git -C "$p" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null
+sep
+git -C "$p" for-each-ref --format='%(refname:short)' refs/heads/main refs/heads/master refs/heads/trunk refs/heads/develop 2>/dev/null
+sep
+cfg=$(git -C "$p" config init.defaultBranch 2>/dev/null)
+if [ -n "$cfg" ] && git -C "$p" rev-parse --verify --quiet "refs/heads/$cfg" >/dev/null 2>&1; then printf '%s' "$cfg"; fi
+"#;
+
+/// One record from `git worktree list --porcelain -z`.  The main worktree is
+/// always the first record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorktreeRecord {
+    path: String,
+    head: Option<String>,
+    branch: Option<String>,
+}
+
+/// Parse `git worktree list --porcelain -z`: attributes are NUL-terminated
+/// `label value` lines; an empty line (two consecutive NULs) ends a record.
+/// `detached`/`bare`/`locked`/`prunable` labels need no handling — a
+/// detached record simply carries no `branch`.
+fn parse_worktree_list_z(bytes: &[u8]) -> Vec<WorktreeRecord> {
+    let mut records = Vec::new();
+    let mut current: Option<WorktreeRecord> = None;
+    for token in bytes.split(|&b| b == 0) {
+        let token = String::from_utf8_lossy(token);
+        let token = token.trim_matches('\n');
+        if token.is_empty() {
+            if let Some(record) = current.take() {
+                records.push(record);
+            }
+            continue;
+        }
+        if let Some(path) = token.strip_prefix("worktree ") {
+            if let Some(record) = current.take() {
+                records.push(record);
+            }
+            current = Some(WorktreeRecord { path: path.to_string(), head: None, branch: None });
+        } else if let Some(record) = current.as_mut() {
+            if let Some(sha) = token.strip_prefix("HEAD ") {
+                record.head = Some(sha.to_string());
+            } else if let Some(branch) = token.strip_prefix("branch ") {
+                record.branch =
+                    Some(branch.strip_prefix("refs/heads/").unwrap_or(branch).to_string());
+            }
+        }
+    }
+    if let Some(record) = current.take() {
+        records.push(record);
+    }
+    records
+}
+
+/// Replicates `detect_default_branch`'s priority from batched output — see
+/// that function for why `init.defaultBranch` comes last.
+fn default_branch_from_batch(
+    origin_head: &str,
+    existing: &str,
+    config_default: &str,
+) -> Option<String> {
+    if let Some(name) = origin_head.trim().strip_prefix("refs/remotes/origin/") {
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    let present: Vec<&str> = existing.lines().map(str::trim).collect();
+    for candidate in ["main", "master", "trunk", "develop"] {
+        if present.contains(&candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    let cfg = config_default.trim();
+    (!cfg.is_empty()).then(|| cfg.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_worktree_list_porcelain_z() {
+        let bytes = b"worktree /home/lev/proj\0HEAD 1234567890abcdef\0branch refs/heads/main\0\0\
+worktree /home/lev/wt/feat-x\0HEAD fedcba0987654321\0branch refs/heads/feat-x\0\0\
+worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
+        let records = parse_worktree_list_z(bytes);
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].path, "/home/lev/proj");
+        assert_eq!(records[0].branch.as_deref(), Some("main"));
+        assert_eq!(records[1].branch.as_deref(), Some("feat-x"));
+        assert_eq!(records[2].branch, None);
+        assert_eq!(records[2].head.as_deref(), Some("0011223344556677"));
+    }
+
+    #[test]
+    fn worktree_paths_with_spaces_survive() {
+        let bytes = b"worktree /home/lev/my proj\0HEAD abc\0branch refs/heads/main\0\0";
+        let records = parse_worktree_list_z(bytes);
+        assert_eq!(records[0].path, "/home/lev/my proj");
+    }
+
+    #[test]
+    fn default_branch_priority_matches_git2_arm() {
+        // origin/HEAD wins.
+        assert_eq!(
+            default_branch_from_batch("refs/remotes/origin/dev\n", "main\nmaster", "master"),
+            Some("dev".to_string())
+        );
+        // Then common names in priority order, regardless of listing order.
+        assert_eq!(default_branch_from_batch("", "develop\nmain", ""), Some("main".to_string()));
+        // init.defaultBranch is last (already existence-verified by the script).
+        assert_eq!(default_branch_from_batch("", "", "trunk2"), Some("trunk2".to_string()));
+        assert_eq!(default_branch_from_batch("", "", ""), None);
+    }
 }
