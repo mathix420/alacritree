@@ -125,6 +125,16 @@ pub fn normalize_root(path: PathBuf) -> PathBuf {
     }
 }
 
+/// User-facing spelling of a path: WSL-resident paths render as their
+/// in-distro Linux form (`/home/…`) instead of the `\\wsl.localhost\` UNC
+/// form the app stores internally.
+pub fn display_path(path: &Path) -> String {
+    match classify(path) {
+        Location::Wsl { linux_path, .. } => linux_path,
+        Location::Windows(p) => p.display().to_string(),
+    }
+}
+
 /// Translate a Windows path to what git inside a distro can resolve:
 /// WSL UNC paths strip to their Linux part; drive paths map under the
 /// automount root; anything else (non-WSL UNC shares) is untranslatable.
@@ -387,6 +397,16 @@ mod tests {
     fn normalize_root_leaves_windows_paths_unchanged() {
         let normalized = normalize_root(PathBuf::from(r"C:\x"));
         assert_eq!(normalized, PathBuf::from(r"C:\x"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn display_path_renders_wsl_paths_as_linux() {
+        assert_eq!(
+            display_path(Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj")),
+            "/home/lev/proj"
+        );
+        assert_eq!(display_path(Path::new(r"C:\Users\Lev")), r"C:\Users\Lev");
     }
 
     #[test]

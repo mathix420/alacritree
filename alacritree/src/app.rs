@@ -1139,9 +1139,7 @@ impl AlacritreeApp {
 
                     ui.add(
                         egui::Label::new(
-                            RichText::new(path.display().to_string())
-                                .color(theme.text_muted)
-                                .small(),
+                            RichText::new(wsl::display_path(&path)).color(theme.text_muted).small(),
                         )
                         .truncate(),
                     );
