@@ -18,6 +18,7 @@ use crate::session::{Session, SessionId, SessionKind, TermSize};
 use crate::state::{self, PersistedProject, PersistedState};
 use crate::terminal_view;
 use crate::worktree::{self as wt, CreateRequest, Progress};
+use crate::wsl;
 
 /// `None` is the home workspace (sessions inherit `$PWD`); `Some` is a worktree path.
 type WorkspaceKey = Option<PathBuf>;
@@ -129,6 +130,10 @@ pub struct AlacritreeApp {
     notify_rx: Receiver<WorkspaceKey>,
     /// Shared across sessions; auto-invalidated when cell size changes.
     builtin_glyphs: crate::builtin_font::BuiltinGlyphCache,
+    /// In-flight background re-discoveries, keyed by project root.  WSL
+    /// discovery shells out to wsl.exe and must never block paint; results
+    /// are adopted in `poll_project_refreshes`.
+    pending_project_refresh: HashMap<PathBuf, Receiver<Project>>,
 }
 
 struct DeleteRequest {
@@ -231,11 +236,17 @@ impl AlacritreeApp {
         alacritty_terminal::tty::setup_env();
 
         let persisted = state::load();
-        let projects = persisted
+        let projects: Vec<Project> = persisted
             .projects
             .iter()
             .map(|p| {
-                let mut project = Project::discover(p.root.clone());
+                // WSL roots discover in the background after construction —
+                // a cold distro takes seconds to boot and would block first
+                // paint.
+                let mut project = match wsl::classify(&p.root) {
+                    wsl::Location::Windows(_) => Project::discover(p.root.clone()),
+                    wsl::Location::Wsl { .. } => Project::placeholder(p.root.clone()),
+                };
                 project.expanded = p.expanded;
                 project
             })
@@ -265,7 +276,19 @@ impl AlacritreeApp {
             pending_create: None,
             notify_rx,
             builtin_glyphs: crate::builtin_font::BuiltinGlyphCache::new(),
+            pending_project_refresh: HashMap::new(),
         };
+
+        let wsl_indices: Vec<usize> = app
+            .projects
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| matches!(wsl::classify(&p.root), wsl::Location::Wsl { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        for idx in wsl_indices {
+            app.refresh_project(&cc.egui_ctx, idx);
+        }
 
         if let Err(e) = app.spawn_session(&cc.egui_ctx, None) {
             app.last_error = Some(format!("failed to spawn shell: {e}"));
@@ -285,6 +308,46 @@ impl AlacritreeApp {
             show_right_sidebar: self.show_right_sidebar,
         };
         state::save(&state);
+    }
+
+    /// Windows projects re-discover synchronously (git2, fast).  WSL
+    /// projects re-discover on a worker thread: wsl.exe takes ~400 ms warm
+    /// and seconds while the distro VM boots.
+    fn refresh_project(&mut self, ctx: &Context, idx: usize) {
+        let root = self.projects[idx].root.clone();
+        if matches!(wsl::classify(&root), wsl::Location::Windows(_)) {
+            self.projects[idx].refresh();
+            return;
+        }
+        if self.pending_project_refresh.contains_key(&root) {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        let worker_root = root.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Project::discover(worker_root));
+            ctx.request_repaint();
+        });
+        self.pending_project_refresh.insert(root, rx);
+    }
+
+    /// Adopt completed background discoveries.  Only worktrees and the
+    /// default branch are copied — `expanded` and the shell override are
+    /// user state that survives refreshes (mirrors `Project::refresh`).
+    fn poll_project_refreshes(&mut self) {
+        let projects = &mut self.projects;
+        self.pending_project_refresh.retain(|root, rx| match rx.try_recv() {
+            Ok(fresh) => {
+                if let Some(project) = projects.iter_mut().find(|p| p.root == *root) {
+                    project.worktrees = fresh.worktrees;
+                    project.default_branch = fresh.default_branch;
+                }
+                false
+            },
+            Err(mpsc::TryRecvError::Empty) => true,
+            Err(mpsc::TryRecvError::Disconnected) => false,
+        });
     }
 
     fn spawn_session(
@@ -413,10 +476,17 @@ impl AlacritreeApp {
         order
     }
 
-    fn add_project_via_dialog(&mut self) {
+    fn add_project_via_dialog(&mut self, ctx: &Context) {
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
             if !self.projects.iter().any(|p| p.root == path) {
-                self.projects.push(Project::discover(path));
+                match wsl::classify(&path) {
+                    wsl::Location::Windows(_) => self.projects.push(Project::discover(path)),
+                    wsl::Location::Wsl { .. } => {
+                        self.projects.push(Project::placeholder(path));
+                        let idx = self.projects.len() - 1;
+                        self.refresh_project(ctx, idx);
+                    },
+                }
                 self.persist();
             }
         }
@@ -473,7 +543,7 @@ impl AlacritreeApp {
             }
         }
         if add_project_requested {
-            self.add_project_via_dialog();
+            self.add_project_via_dialog(ctx);
         }
         if let Some(d) = cycle_tabs_delta {
             self.cycle_tabs(d);
@@ -863,10 +933,10 @@ impl AlacritreeApp {
             });
 
         if add_project_clicked {
-            self.add_project_via_dialog();
+            self.add_project_via_dialog(ctx);
         }
         if let Some(idx) = refresh_idx {
-            self.projects[idx].refresh();
+            self.refresh_project(ctx, idx);
         }
         if let Some(idx) = remove_idx {
             self.projects.remove(idx);
@@ -1780,7 +1850,7 @@ impl AlacritreeApp {
         );
 
         if confirm_via_key || confirmed {
-            self.run_pending_delete();
+            self.run_pending_delete(ctx);
             return;
         }
         if cancel_via_key || cancelled || modal.should_close() {
@@ -1788,7 +1858,7 @@ impl AlacritreeApp {
         }
     }
 
-    fn run_pending_delete(&mut self) {
+    fn run_pending_delete(&mut self, ctx: &Context) {
         let Some(req) = self.pending_delete.take() else {
             return;
         };
@@ -1808,7 +1878,7 @@ impl AlacritreeApp {
         {
             self.last_error = Some(format!("delete failed: {e}"));
         }
-        self.projects[req.project_idx].refresh();
+        self.refresh_project(ctx, req.project_idx);
     }
 
     fn show_create_dialog(&mut self, ctx: &Context) {
@@ -1836,7 +1906,7 @@ impl AlacritreeApp {
             CreateState::Done { project_idx, steps, result } => {
                 if self.show_create_done(ctx, project_idx, &steps, &result) {
                     if let Ok(path) = &result {
-                        self.projects[project_idx].refresh();
+                        self.refresh_project(ctx, project_idx);
                         let path = path.clone();
                         self.activate_worktree(ctx, &path);
                     }
@@ -2120,6 +2190,7 @@ impl eframe::App for AlacritreeApp {
     }
 
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.poll_project_refreshes();
         let modal_open = self.is_modal_open();
         if !modal_open {
             self.handle_shortcuts(ctx);
