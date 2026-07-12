@@ -156,6 +156,41 @@ pub struct Palette {
     pub draw_bold_with_bright: bool,
 }
 
+/// When the sidebar's per-session `×` asks before killing the PTY.
+/// Confirmations otherwise exist only at worktree/app level, so the
+/// default keeps session close immediate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConfirmSessionClose {
+    #[default]
+    Never,
+    /// Prompt only when the session looks busy (agent glyph or spinner title).
+    Busy,
+    Always,
+}
+
+impl ConfirmSessionClose {
+    pub fn requires_prompt(self, busy: bool) -> bool {
+        match self {
+            Self::Never => false,
+            Self::Busy => busy,
+            Self::Always => true,
+        }
+    }
+}
+
+fn parse_confirm_session_close(raw: Option<&str>) -> ConfirmSessionClose {
+    match raw {
+        None => ConfirmSessionClose::default(),
+        Some("never") => ConfirmSessionClose::Never,
+        Some("busy") => ConfirmSessionClose::Busy,
+        Some("always") => ConfirmSessionClose::Always,
+        Some(other) => {
+            log::warn!("unknown ui.confirm_session_close value {other:?}, using \"never\"");
+            ConfirmSessionClose::default()
+        },
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UiTheme {
     pub sidebar_background: Option<Color32>,
@@ -164,6 +199,8 @@ pub struct UiTheme {
     pub sidebar_accent: Option<Color32>,
     /// Fire a desktop notification when a non-visible session needs attention.
     pub notifications: bool,
+    /// Ask before the sidebar's per-session `×` kills the PTY.
+    pub confirm_session_close: ConfirmSessionClose,
 }
 
 impl Default for UiTheme {
@@ -174,6 +211,7 @@ impl Default for UiTheme {
             sidebar_border: None,
             sidebar_accent: None,
             notifications: true,
+            confirm_session_close: ConfirmSessionClose::Never,
         }
     }
 }
@@ -599,6 +637,7 @@ struct RawUi {
     sidebar_border: Option<RgbStr>,
     sidebar_accent: Option<RgbStr>,
     notifications: Option<bool>,
+    confirm_session_close: Option<String>,
 }
 
 /// Wrapper that parses `"0xrrggbb"`, `"#rrggbb"`, or `"rrggbb"` into an `Rgb`.
@@ -677,6 +716,9 @@ impl RawConfig {
             sidebar_border: self.ui.sidebar_border.map(|v| rgb_to_color32(v.0)),
             sidebar_accent: self.ui.sidebar_accent.map(|v| rgb_to_color32(v.0)),
             notifications: self.ui.notifications.unwrap_or(true),
+            confirm_session_close: parse_confirm_session_close(
+                self.ui.confirm_session_close.as_deref(),
+            ),
         };
 
         // ---- Font ----
@@ -809,4 +851,54 @@ fn apply_set(target: &mut [Rgb; 8], set: RawSet) {
 
 fn rgb_to_color32(r: Rgb) -> Color32 {
     Color32::from_rgb(r.r, r.g, r.b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ui_from_toml(input: &str) -> UiTheme {
+        let value: toml::Value = toml::from_str(input).expect("valid toml");
+        let raw: RawConfig = value.try_into().expect("valid config");
+        raw.into_config().ui
+    }
+
+    #[test]
+    fn confirm_session_close_defaults_to_never() {
+        let ui = ui_from_toml("");
+        assert_eq!(ui.confirm_session_close, ConfirmSessionClose::Never);
+    }
+
+    #[test]
+    fn confirm_session_close_parses_all_values() {
+        for (raw, expected) in [
+            ("never", ConfirmSessionClose::Never),
+            ("busy", ConfirmSessionClose::Busy),
+            ("always", ConfirmSessionClose::Always),
+        ] {
+            let ui = ui_from_toml(&format!("[ui]\nconfirm_session_close = \"{raw}\""));
+            assert_eq!(ui.confirm_session_close, expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn confirm_session_close_invalid_falls_back_to_never() {
+        let ui = ui_from_toml("[ui]\nconfirm_session_close = \"sometimes\"");
+        assert_eq!(ui.confirm_session_close, ConfirmSessionClose::Never);
+    }
+
+    #[test]
+    fn requires_prompt_covers_policy_matrix() {
+        use ConfirmSessionClose::*;
+        for (policy, busy, expected) in [
+            (Never, false, false),
+            (Never, true, false),
+            (Busy, false, false),
+            (Busy, true, true),
+            (Always, false, true),
+            (Always, true, true),
+        ] {
+            assert_eq!(policy.requires_prompt(busy), expected, "{policy:?} busy={busy}");
+        }
+    }
 }
