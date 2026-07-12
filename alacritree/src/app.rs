@@ -498,6 +498,96 @@ impl AlacritreeApp {
         }
     }
 
+    /// Arrow/Enter/Escape navigation while the projects sidebar owns
+    /// keyboard focus.  Consumes only unmodified keys, so modifier-bound
+    /// app shortcuts still match in `handle_shortcuts` afterwards.
+    fn handle_sidebar_nav(&mut self, ctx: &Context) {
+        use egui::Key;
+        let keys: Vec<Key> = ctx.input_mut(|i| {
+            let mut pressed = Vec::new();
+            i.events.retain(|ev| {
+                if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
+                    if modifiers.is_none() && is_sidebar_nav_key(*key) {
+                        pressed.push(*key);
+                        return false;
+                    }
+                }
+                true
+            });
+            pressed
+        });
+        for key in keys {
+            self.apply_sidebar_nav(ctx, key);
+        }
+    }
+
+    fn apply_sidebar_nav(&mut self, ctx: &Context, key: egui::Key) {
+        use egui::Key;
+        let rows = sidebar_nav::visible_rows(&self.projects);
+        let cursor = match self.sidebar_cursor.clone() {
+            Some(c) if rows.contains(&c) => c,
+            // Stale or unseeded cursor (worktree removed, project collapsed
+            // by mouse): land on Home and let the next press act from there.
+            _ => {
+                self.set_sidebar_cursor(SidebarRow::Home);
+                return;
+            },
+        };
+        match key {
+            Key::ArrowUp => self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, -1)),
+            Key::ArrowDown => self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, 1)),
+            Key::ArrowRight => {
+                if let SidebarRow::Project(root) = &cursor {
+                    self.set_project_expanded(root, true);
+                }
+            },
+            Key::ArrowLeft => match &cursor {
+                SidebarRow::Project(root) => self.set_project_expanded(root, false),
+                SidebarRow::Worktree(_) => {
+                    if let Some(target) = sidebar_nav::left_target(&rows, &cursor) {
+                        self.set_sidebar_cursor(target);
+                    }
+                },
+                SidebarRow::Home => {},
+            },
+            Key::Enter => match &cursor {
+                SidebarRow::Home => {
+                    self.activate_home(ctx);
+                    self.focus_terminal();
+                },
+                SidebarRow::Worktree(path) => {
+                    let path = path.clone();
+                    self.activate_worktree(ctx, &path);
+                    self.focus_terminal();
+                },
+                SidebarRow::Project(root) => {
+                    let root = root.clone();
+                    let expanded =
+                        self.projects.iter().find(|p| p.root == root).is_some_and(|p| p.expanded);
+                    self.set_project_expanded(&root, !expanded);
+                },
+            },
+            Key::Escape => self.focus_terminal(),
+            _ => {},
+        }
+    }
+
+    fn set_sidebar_cursor(&mut self, row: SidebarRow) {
+        if self.sidebar_cursor.as_ref() != Some(&row) {
+            self.sidebar_cursor = Some(row);
+            self.sidebar_cursor_moved = true;
+        }
+    }
+
+    fn set_project_expanded(&mut self, root: &Path, expanded: bool) {
+        if let Some(p) = self.projects.iter_mut().find(|p| p.root == *root) {
+            if p.expanded != expanded {
+                p.expanded = expanded;
+                self.persist();
+            }
+        }
+    }
+
     fn dispatch_action(&mut self, ctx: &Context, action: BindingAction) {
         match action {
             BindingAction::Chars(bytes) => {
@@ -1497,6 +1587,14 @@ where
     });
 }
 
+fn is_sidebar_nav_key(key: egui::Key) -> bool {
+    use egui::Key;
+    matches!(
+        key,
+        Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight | Key::Enter | Key::Escape
+    )
+}
+
 fn home_row(
     ui: &mut egui::Ui,
     is_active: bool,
@@ -2111,6 +2209,9 @@ impl eframe::App for AlacritreeApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         let modal_open = self.is_modal_open();
         if !modal_open {
+            if self.focus == PaneFocus::ProjectsSidebar {
+                self.handle_sidebar_nav(ctx);
+            }
             self.handle_shortcuts(ctx);
         }
         self.process_notification_actions(ctx);
