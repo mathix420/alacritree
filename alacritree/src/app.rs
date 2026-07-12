@@ -126,6 +126,7 @@ pub struct AlacritreeApp {
     quit_dialog_open: bool,
     pending_delete: Option<DeleteRequest>,
     pending_create: Option<CreateState>,
+    pending_session_close: Option<SessionId>,
     notify_rx: Receiver<WorkspaceKey>,
     /// Shared across sessions; auto-invalidated when cell size changes.
     builtin_glyphs: crate::builtin_font::BuiltinGlyphCache,
@@ -263,6 +264,7 @@ impl AlacritreeApp {
             quit_dialog_open: false,
             pending_delete: None,
             pending_create: None,
+            pending_session_close: None,
             notify_rx,
             builtin_glyphs: crate::builtin_font::BuiltinGlyphCache::new(),
         };
@@ -351,6 +353,17 @@ impl AlacritreeApp {
         }
     }
 
+    fn request_close_session(&mut self, id: SessionId) {
+        let Some(session) = self.sessions.iter().find(|s| s.id == id) else {
+            return;
+        };
+        if self.config.ui.confirm_session_close.requires_prompt(session.is_busy()) {
+            self.pending_session_close = Some(id);
+        } else {
+            self.close_session(id);
+        }
+    }
+
     fn workspace_session_indices(&self, ws: &WorkspaceKey) -> Vec<usize> {
         self.sessions
             .iter()
@@ -423,7 +436,10 @@ impl AlacritreeApp {
     }
 
     fn is_modal_open(&self) -> bool {
-        self.quit_dialog_open || self.pending_delete.is_some() || self.pending_create.is_some()
+        self.quit_dialog_open
+            || self.pending_delete.is_some()
+            || self.pending_create.is_some()
+            || self.pending_session_close.is_some()
     }
 
     fn handle_shortcuts(&mut self, ctx: &Context) {
@@ -973,7 +989,7 @@ impl AlacritreeApp {
             self.active_session.insert(ws, id);
         }
         if let Some(id) = close_session_request.take() {
-            self.close_session(id);
+            self.request_close_session(id);
         }
         if let Some(ws) = spawn_shell_request.take() {
             // Spawning activates the workspace and the new session, matching
@@ -2046,6 +2062,73 @@ impl AlacritreeApp {
         }
     }
 
+    fn show_close_session_dialog(&mut self, ctx: &Context) {
+        let theme = self.theme;
+        let danger = rgb_to_color32(self.config.palette.normal[1]);
+        let Some(id) = self.pending_session_close else {
+            return;
+        };
+        let Some(session) = self.sessions.iter().find(|s| s.id == id) else {
+            // Exited between the click and this frame — nothing left to close.
+            self.pending_session_close = None;
+            return;
+        };
+        let title = format!("Close session `{}`?", session.title);
+        let busy = session.is_busy();
+
+        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let frame = modal_frame(&theme);
+        let mut confirmed = false;
+        let mut cancelled = false;
+
+        let s = theme.ui_scale;
+        let modal = egui::Modal::new(egui::Id::new("alacritree_close_session_dialog"))
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.set_width(320.0 * s);
+                ui.spacing_mut().item_spacing.y = 6.0 * s;
+                ui.label(RichText::new(title).color(theme.text).strong());
+                if busy {
+                    ui.label(
+                        RichText::new("A process appears to be running.").color(danger).small(),
+                    );
+                }
+                ui.add_space(4.0 * s);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Enter to close · Esc to cancel")
+                            .color(theme.text_muted)
+                            .small(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let close_btn = ui.add(
+                            egui::Button::new(RichText::new("Close").color(danger)).frame(false),
+                        );
+                        if close_btn.clicked() {
+                            confirmed = true;
+                        }
+                        let cancel = ui.add(
+                            egui::Button::new(RichText::new("Cancel").color(theme.text_dim))
+                                .frame(false),
+                        );
+                        if cancel.clicked() {
+                            cancelled = true;
+                        }
+                        focus_default(ui.ctx(), close_btn.id);
+                    });
+                });
+            });
+
+        if confirm_via_key || confirmed {
+            self.pending_session_close = None;
+            self.close_session(id);
+            return;
+        }
+        if cancel_via_key || cancelled || modal.should_close() {
+            self.pending_session_close = None;
+        }
+    }
+
     fn run_pending_delete(&mut self) {
         let Some(req) = self.pending_delete.take() else {
             return;
@@ -2442,6 +2525,9 @@ impl eframe::App for AlacritreeApp {
         }
         if self.pending_delete.is_some() {
             self.show_delete_dialog(ctx);
+        }
+        if self.pending_session_close.is_some() {
+            self.show_close_session_dialog(ctx);
         }
         if self.quit_dialog_open {
             self.show_quit_dialog(ctx);
