@@ -105,12 +105,12 @@ mod tests {
             projects: vec![PersistedProject {
                 root: PathBuf::from("C:/x"),
                 expanded: true,
-                shell: Some("wsl:kali-linux".to_string()),
+                shell: Some("wsl:arch".to_string()),
             }],
             ..Default::default()
         };
         let text = toml::to_string_pretty(&state).unwrap();
         let back: PersistedState = toml::from_str(&text).unwrap();
-        assert_eq!(back.projects[0].shell.as_deref(), Some("wsl:kali-linux"));
+        assert_eq!(back.projects[0].shell.as_deref(), Some("wsl:arch"));
     }
 }

@@ -376,14 +376,14 @@ mod tests {
 
     #[test]
     fn git_path_arg_wsl_repo_translates_worktree_path() {
-        let repo = Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj");
-        let path = Path::new(r"\\wsl.localhost\kali-linux\home\lev\wt");
-        assert_eq!(git_path_arg(repo, path).as_deref(), Ok("/home/lev/wt"));
+        let repo = Path::new(r"\\wsl.localhost\arch\home\user\proj");
+        let path = Path::new(r"\\wsl.localhost\arch\home\user\wt");
+        assert_eq!(git_path_arg(repo, path).as_deref(), Ok("/home/user/wt"));
     }
 
     #[test]
     fn git_path_arg_wsl_repo_errors_outside_distro_mapping() {
-        let repo = Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj");
+        let repo = Path::new(r"\\wsl.localhost\arch\home\user\proj");
         let path = Path::new("wt");
         assert!(git_path_arg(repo, path).is_err());
     }

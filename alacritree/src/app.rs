@@ -2506,8 +2506,8 @@ mod tests {
     #[test]
     fn wsl_diff_command_wraps_diff_args_in_login_shell() {
         let (program, args) = build_wsl_diff_command(
-            "kali-linux",
-            Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj"),
+            "arch",
+            Path::new(r"\\wsl.localhost\arch\home\user\proj"),
             &req("a.rs", DiffSource::Staged),
         );
         assert_eq!(program, "wsl.exe");
@@ -2515,9 +2515,9 @@ mod tests {
             args[..8],
             [
                 "-d",
-                "kali-linux",
+                "arch",
                 "--cd",
-                r"\\wsl.localhost\kali-linux\home\lev\proj",
+                r"\\wsl.localhost\arch\home\user\proj",
                 "--exec",
                 "sh",
                 "-lc",

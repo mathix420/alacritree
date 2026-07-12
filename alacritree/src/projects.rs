@@ -303,12 +303,12 @@ mod tests {
 
     #[test]
     fn parses_worktree_list_porcelain_z() {
-        let bytes = b"worktree /home/lev/proj\0HEAD 1234567890abcdef\0branch refs/heads/main\0\0\
-worktree /home/lev/wt/feat-x\0HEAD fedcba0987654321\0branch refs/heads/feat-x\0\0\
-worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
+        let bytes = b"worktree /home/user/proj\0HEAD 1234567890abcdef\0branch refs/heads/main\0\0\
+worktree /home/user/wt/feat-x\0HEAD fedcba0987654321\0branch refs/heads/feat-x\0\0\
+worktree /home/user/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
         let records = parse_worktree_list_z(bytes);
         assert_eq!(records.len(), 3);
-        assert_eq!(records[0].path, "/home/lev/proj");
+        assert_eq!(records[0].path, "/home/user/proj");
         assert_eq!(records[0].branch.as_deref(), Some("main"));
         assert_eq!(records[1].branch.as_deref(), Some("feat-x"));
         assert_eq!(records[2].branch, None);
@@ -317,9 +317,9 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
 
     #[test]
     fn worktree_paths_with_spaces_survive() {
-        let bytes = b"worktree /home/lev/my proj\0HEAD abc\0branch refs/heads/main\0\0";
+        let bytes = b"worktree /home/user/my proj\0HEAD abc\0branch refs/heads/main\0\0";
         let records = parse_worktree_list_z(bytes);
-        assert_eq!(records[0].path, "/home/lev/my proj");
+        assert_eq!(records[0].path, "/home/user/my proj");
     }
 
     #[test]
