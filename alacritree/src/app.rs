@@ -365,6 +365,15 @@ impl AlacritreeApp {
         working_directory: WorkspaceKey,
     ) -> std::io::Result<SessionId> {
         let shell = self.resolve_shell(&working_directory);
+        self.spawn_session_with_shell(ctx, working_directory, shell)
+    }
+
+    fn spawn_session_with_shell(
+        &mut self,
+        ctx: &Context,
+        working_directory: WorkspaceKey,
+        shell: Option<Shell>,
+    ) -> std::io::Result<SessionId> {
         let session = Session::spawn(
             ctx.clone(),
             &self.config,
@@ -377,6 +386,21 @@ impl AlacritreeApp {
         self.sessions.push(session);
         self.active_session.insert(working_directory, id);
         Ok(id)
+    }
+
+    /// Spawn a named profile into the current workspace, bypassing the
+    /// override/auto resolution chain — the user asked for this profile
+    /// explicitly.
+    fn spawn_profile_session(&mut self, ctx: &Context, name: &str) {
+        let Some(profile) = self.config.profile(name) else {
+            self.last_error = Some(format!("no shell profile named `{name}`"));
+            return;
+        };
+        let shell = Some(profile_shell(profile));
+        let ws = self.current_workspace.clone();
+        if let Err(e) = self.spawn_session_with_shell(ctx, ws, shell) {
+            self.last_error = Some(format!("failed to spawn profile `{name}`: {e}"));
+        }
     }
 
     /// Shell for a workspace; `None` means "no override" — `Session::spawn`
@@ -698,6 +722,18 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::SelectPreviousTab) => self.cycle_tabs(-1),
             BindingAction::Named(NamedAction::SelectTab(n)) => self.select_tab(n),
             BindingAction::Named(NamedAction::SelectLastTab) => self.select_last_tab(),
+            BindingAction::Named(NamedAction::SpawnProfile(n)) => {
+                match self.config.profiles.get((n - 1) as usize).map(|p| p.name.clone()) {
+                    Some(name) => self.spawn_profile_session(ctx, &name),
+                    None => {
+                        log::warn!(
+                            "SpawnProfile{n}: only {} profiles configured",
+                            self.config.profiles.len()
+                        );
+                        self.last_error = Some(format!("SpawnProfile{n}: no such profile"));
+                    },
+                }
+            },
             BindingAction::Named(NamedAction::NoOp) => {},
             BindingAction::Named(NamedAction::ReceiveChar) => {},
             BindingAction::Named(other) => {
