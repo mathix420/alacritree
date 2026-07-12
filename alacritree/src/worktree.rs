@@ -362,6 +362,33 @@ fn copy_llm_configs(src_root: &Path, dst_root: &Path) -> usize {
     copied
 }
 
+#[cfg(test)]
+#[cfg(windows)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_path_arg_windows_repo_passes_path_through() {
+        let repo = Path::new(r"C:\x");
+        let path = Path::new(r"C:\x\y");
+        assert_eq!(git_path_arg(repo, path).as_deref(), Ok(r"C:\x\y"));
+    }
+
+    #[test]
+    fn git_path_arg_wsl_repo_translates_worktree_path() {
+        let repo = Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj");
+        let path = Path::new(r"\\wsl.localhost\kali-linux\home\lev\wt");
+        assert_eq!(git_path_arg(repo, path).as_deref(), Ok("/home/lev/wt"));
+    }
+
+    #[test]
+    fn git_path_arg_wsl_repo_errors_outside_distro_mapping() {
+        let repo = Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj");
+        let path = Path::new("wt");
+        assert!(git_path_arg(repo, path).is_err());
+    }
+}
+
 fn copy_path(src: &Path, dst: &Path) -> std::io::Result<()> {
     if src.is_dir() {
         std::fs::create_dir_all(dst)?;

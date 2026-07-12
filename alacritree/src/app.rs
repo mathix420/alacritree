@@ -2472,3 +2472,61 @@ fn notify_worker(body: String, _key: WorkspaceKey, _ctx: egui::Context) {
         log::debug!("desktop notification failed: {e}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(file: &str, source: DiffSource) -> DiffRequest {
+        DiffRequest { file: file.to_string(), source }
+    }
+
+    #[test]
+    fn diff_args_staged() {
+        let args = diff_args(&req("a.rs", DiffSource::Staged));
+        assert_eq!(args, vec!["diff", "--cached", "--", "a.rs"]);
+    }
+
+    #[test]
+    fn diff_args_worktree() {
+        let args = diff_args(&req("a.rs", DiffSource::Worktree));
+        assert_eq!(args, vec!["diff", "--", "a.rs"]);
+    }
+
+    #[test]
+    fn diff_args_untracked() {
+        let args = diff_args(&req("a.rs", DiffSource::Untracked));
+        assert_eq!(args, vec!["diff", "--no-index", "--", "/dev/null", "a.rs"]);
+    }
+
+    #[test]
+    fn diff_args_branch() {
+        let args = diff_args(&req("a.rs", DiffSource::Branch { base: "main".to_string() }));
+        assert_eq!(args, vec!["diff", "main...", "--", "a.rs"]);
+    }
+
+    #[test]
+    fn wsl_diff_command_wraps_diff_args_in_login_shell() {
+        let (program, args) = build_wsl_diff_command(
+            "kali-linux",
+            Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj"),
+            &req("a.rs", DiffSource::Staged),
+        );
+        assert_eq!(program, "wsl.exe");
+        assert_eq!(
+            args[..8],
+            [
+                "-d",
+                "kali-linux",
+                "--cd",
+                r"\\wsl.localhost\kali-linux\home\lev\proj",
+                "--exec",
+                "sh",
+                "-lc",
+                r#"exec git -c "core.pager=delta --paging=always" "$@""#,
+            ]
+        );
+        assert_eq!(args[8], "sh");
+        assert_eq!(&args[9..], diff_args(&req("a.rs", DiffSource::Staged)).as_slice());
+    }
+}
