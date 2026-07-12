@@ -837,6 +837,8 @@ impl AlacritreeApp {
                     .collect()
             })
             .collect();
+        let distros = wsl::distros();
+        let mut shell_override_changed = false;
 
         let panel_resp = SidePanel::left("left_sidebar")
             .resizable(true)
@@ -888,6 +890,7 @@ impl AlacritreeApp {
                         // worktree rows already show the dot, and doubling it
                         // on the parent reads as noise.
                         let show_proj_dot = proj_attention && !project.expanded;
+                        let mut name_resp: Option<egui::Response> = None;
                         row_with_trailing(
                             ui,
                             |ui| {
@@ -896,14 +899,17 @@ impl AlacritreeApp {
                                     project.expanded = !project.expanded;
                                     expand_toggled = true;
                                 }
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&project.name)
-                                            .color(theme.text)
-                                            .strong()
-                                            .small(),
-                                    )
-                                    .truncate(),
+                                name_resp = Some(
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&project.name)
+                                                .color(theme.text)
+                                                .strong()
+                                                .small(),
+                                        )
+                                        .truncate()
+                                        .sense(egui::Sense::click()),
+                                    ),
                                 );
                             },
                             |ui| {
@@ -931,6 +937,58 @@ impl AlacritreeApp {
                                 }
                             },
                         );
+
+                        // Right-click: choose which shell this project's
+                        // sessions use. Hidden entirely when no distros are
+                        // registered so non-WSL setups see zero new UI.
+                        if !distros.is_empty() {
+                            if let Some(resp) = name_resp {
+                                resp.context_menu(|ui| {
+                                    ui.label(
+                                        RichText::new("Open in…").color(theme.text_muted).small(),
+                                    );
+                                    let mark =
+                                        |selected: bool| if selected { "• " } else { "   " };
+                                    let auto = project.shell_override.is_none();
+                                    if ui
+                                        .button(format!("{}Auto (by location)", mark(auto)))
+                                        .clicked()
+                                    {
+                                        project.shell_override = None;
+                                        shell_override_changed = true;
+                                        ui.close_menu();
+                                    }
+                                    let win = matches!(
+                                        project.shell_override,
+                                        Some(ShellChoice::Windows)
+                                    );
+                                    if ui.button(format!("{}Windows shell", mark(win))).clicked() {
+                                        project.shell_override = Some(ShellChoice::Windows);
+                                        shell_override_changed = true;
+                                        ui.close_menu();
+                                    }
+                                    for distro in &distros {
+                                        let selected = matches!(
+                                            &project.shell_override,
+                                            Some(ShellChoice::Wsl(name)) if name == &distro.name
+                                        );
+                                        if ui
+                                            .button(format!(
+                                                "{}WSL ({})",
+                                                mark(selected),
+                                                distro.name
+                                            ))
+                                            .clicked()
+                                        {
+                                            project.shell_override =
+                                                Some(ShellChoice::Wsl(distro.name.clone()));
+                                            shell_override_changed = true;
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
+                            }
+                        }
 
                         if project.expanded {
                             for (wt_idx, wt) in project.worktrees.iter().enumerate() {
@@ -977,6 +1035,9 @@ impl AlacritreeApp {
             self.persist();
         }
         if expand_toggled {
+            self.persist();
+        }
+        if shell_override_changed {
             self.persist();
         }
         if home_clicked {
