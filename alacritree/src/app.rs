@@ -884,6 +884,8 @@ impl AlacritreeApp {
             })
             .collect();
         let distros = wsl::distros();
+        let profile_names: Vec<String> =
+            self.config.profiles.iter().map(|p| p.name.clone()).collect();
         let mut shell_override_changed = false;
 
         let panel_resp = SidePanel::left("left_sidebar")
@@ -985,9 +987,10 @@ impl AlacritreeApp {
                         );
 
                         // Right-click: choose which shell this project's
-                        // sessions use. Hidden entirely when no distros are
-                        // registered so non-WSL setups see zero new UI.
-                        if !distros.is_empty() {
+                        // sessions use. Hidden entirely when there is nothing
+                        // to choose (no distros, no profiles) so minimal
+                        // setups see zero new UI.
+                        if !distros.is_empty() || !profile_names.is_empty() {
                             if let Some(resp) = name_resp {
                                 resp.context_menu(|ui| {
                                     ui.label(
@@ -1028,6 +1031,21 @@ impl AlacritreeApp {
                                         {
                                             project.shell_override =
                                                 Some(ShellChoice::Wsl(distro.name.clone()));
+                                            shell_override_changed = true;
+                                            ui.close_menu();
+                                        }
+                                    }
+                                    for name in &profile_names {
+                                        let selected = matches!(
+                                            &project.shell_override,
+                                            Some(ShellChoice::Profile(n)) if n == name
+                                        );
+                                        if ui
+                                            .button(format!("{}Profile: {}", mark(selected), name))
+                                            .clicked()
+                                        {
+                                            project.shell_override =
+                                                Some(ShellChoice::Profile(name.clone()));
                                             shell_override_changed = true;
                                             ui.close_menu();
                                         }
