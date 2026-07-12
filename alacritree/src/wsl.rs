@@ -10,12 +10,13 @@ use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
-/// Per-project shell override, persisted in state.toml as `"windows"` or
-/// `"wsl:<distro>"`.  Absent means auto-by-location.
+/// Per-project shell override, persisted in state.toml as `"windows"`,
+/// `"wsl:<distro>"`, or `"profile:<name>"`.  Absent means auto-by-location.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellChoice {
     Windows,
     Wsl(String),
+    Profile(String),
 }
 
 impl ShellChoice {
@@ -23,13 +24,17 @@ impl ShellChoice {
         if s == "windows" {
             return Some(Self::Windows);
         }
-        s.strip_prefix("wsl:").filter(|d| !d.is_empty()).map(|d| Self::Wsl(d.to_string()))
+        if let Some(d) = s.strip_prefix("wsl:").filter(|d| !d.is_empty()) {
+            return Some(Self::Wsl(d.to_string()));
+        }
+        s.strip_prefix("profile:").filter(|n| !n.is_empty()).map(|n| Self::Profile(n.to_string()))
     }
 
     pub fn to_state_string(&self) -> String {
         match self {
             Self::Windows => "windows".to_string(),
             Self::Wsl(distro) => format!("wsl:{distro}"),
+            Self::Profile(name) => format!("profile:{name}"),
         }
     }
 }
@@ -504,6 +509,16 @@ mod tests {
         assert_eq!(ShellChoice::parse("plan9"), None);
         assert_eq!(ShellChoice::Wsl("u".to_string()).to_state_string(), "wsl:u");
         assert_eq!(ShellChoice::Windows.to_state_string(), "windows");
+    }
+
+    #[test]
+    fn profile_choice_round_trips() {
+        assert_eq!(
+            ShellChoice::parse("profile:pwsh"),
+            Some(ShellChoice::Profile("pwsh".to_string()))
+        );
+        assert_eq!(ShellChoice::parse("profile:"), None);
+        assert_eq!(ShellChoice::Profile("pwsh".to_string()).to_state_string(), "profile:pwsh");
     }
 
     /// Live round trip against the default distro.  Requires WSL; run

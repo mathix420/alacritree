@@ -19,8 +19,8 @@ pub struct PersistedProject {
     pub root: PathBuf,
     #[serde(default = "default_true")]
     pub expanded: bool,
-    /// Shell override: `"windows"` or `"wsl:<distro>"`.  Absent = auto by
-    /// project location.
+    /// Shell override: `"windows"`, `"wsl:<distro>"`, or `"profile:<name>"`.
+    /// Absent = auto by project location.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
 }

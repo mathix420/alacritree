@@ -401,6 +401,7 @@ impl AlacritreeApp {
                     auto_wsl_shell(path)
                 }
             },
+            Some(ShellChoice::Profile(_)) => auto_wsl_shell(path),
             None => auto_wsl_shell(path),
         }
     }
