@@ -725,6 +725,11 @@ impl AlacritreeApp {
             })
             .collect();
 
+        let worktree_listed: Vec<Vec<bool>> = worktree_session_rows
+            .iter()
+            .map(|v| v.iter().map(|rows| !rows.is_empty()).collect())
+            .collect();
+
         // A rendered session list carries its own per-session dots and
         // glyphs; repeating them on the parent row reads as noise — the same
         // rule the project row applies when expanded.  Aggregates therefore
@@ -743,10 +748,11 @@ impl AlacritreeApp {
                     .iter()
                     .enumerate()
                     .map(|(w_idx, wt)| {
-                        let listed = worktree_session_rows
+                        let listed = worktree_listed
                             .get(p_idx)
                             .and_then(|v| v.get(w_idx))
-                            .is_some_and(|rows| !rows.is_empty());
+                            .copied()
+                            .unwrap_or(false);
                         !listed && self.workspace_needs_attention(&Some(wt.path.clone()))
                     })
                     .collect()
@@ -761,10 +767,11 @@ impl AlacritreeApp {
                     .iter()
                     .enumerate()
                     .map(|(w_idx, wt)| {
-                        let listed = worktree_session_rows
+                        let listed = worktree_listed
                             .get(p_idx)
                             .and_then(|v| v.get(w_idx))
-                            .is_some_and(|rows| !rows.is_empty());
+                            .copied()
+                            .unwrap_or(false);
                         if listed {
                             None
                         } else {
