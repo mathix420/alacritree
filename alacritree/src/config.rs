@@ -7,7 +7,7 @@
 //! a `[ui]` table and are only valid in `alacritree.toml`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Rgb};
 use egui::Color32;
@@ -19,6 +19,7 @@ use crate::bindings::{self, KeyBinding};
 pub struct Config {
     pub palette: Palette,
     pub ui: UiTheme,
+    pub workspace: WorkspaceConfig,
     pub font: FontConfig,
     pub cursor: CursorConfig,
     pub scrolling: ScrollingConfig,
@@ -178,11 +179,49 @@ impl Default for UiTheme {
     }
 }
 
+/// Where new git worktrees are created.  alacritree-only, lives under
+/// `[workspace]` in `alacritree.toml`.  Every base directory — default,
+/// global, or override — gets the `<project>-<hash>/<branch>` layout beneath
+/// it; changing these options never moves existing worktrees because
+/// discovery goes through `git worktree list`.
+#[derive(Debug, Clone, Default)]
+pub struct WorkspaceConfig {
+    /// Global base directory for new worktrees; `None` means the built-in
+    /// `~/.alacritree/worktrees`.
+    pub worktree_dir: Option<PathBuf>,
+    pub overrides: Vec<WorktreeOverride>,
+}
+
+/// Per-project base-directory override, matched against the project root.
+#[derive(Debug, Clone)]
+pub struct WorktreeOverride {
+    pub project: PathBuf,
+    pub worktree_dir: PathBuf,
+}
+
+impl WorkspaceConfig {
+    /// Base directory for a project's new worktrees: first matching override,
+    /// then the global `worktree_dir`, then `None` (the caller falls back to
+    /// the built-in default).  Paths compare canonicalized so a symlinked
+    /// spelling of the same root still matches; canonicalization failure
+    /// (path doesn't exist) falls back to the literal path.
+    pub fn base_dir_for(&self, project_root: &Path) -> Option<PathBuf> {
+        let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let root = canonical(project_root);
+        self.overrides
+            .iter()
+            .find(|o| canonical(&o.project) == root)
+            .map(|o| o.worktree_dir.clone())
+            .or_else(|| self.worktree_dir.clone())
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             palette: Palette::default(),
             ui: UiTheme::default(),
+            workspace: WorkspaceConfig::default(),
             font: FontConfig::default(),
             cursor: CursorConfig::default(),
             scrolling: ScrollingConfig::default(),
@@ -424,6 +463,7 @@ fn merge_tables(
 struct RawConfig {
     colors: RawColors,
     ui: RawUi,
+    workspace: RawWorkspace,
     font: RawFont,
     cursor: RawCursor,
     scrolling: RawScrolling,
@@ -601,6 +641,19 @@ struct RawUi {
     notifications: Option<bool>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawWorkspace {
+    worktree_dir: Option<String>,
+    overrides: Vec<RawWorktreeOverride>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawWorktreeOverride {
+    project: String,
+    worktree_dir: String,
+}
+
 /// Wrapper that parses `"0xrrggbb"`, `"#rrggbb"`, or `"rrggbb"` into an `Rgb`.
 #[derive(Debug, Clone, Copy)]
 struct RgbStr(Rgb);
@@ -627,6 +680,27 @@ fn parse_hex_rgb(s: &str) -> Option<Rgb> {
     let g = u8::from_str_radix(&stripped[2..4], 16).ok()?;
     let b = u8::from_str_radix(&stripped[4..6], 16).ok()?;
     Some(Rgb { r, g, b })
+}
+
+/// Expand a leading `~` to the home directory and require the result to be
+/// absolute.  Relative paths are rejected rather than resolved against the
+/// process CWD, which is meaningless for a GUI app; `~user` expansion is not
+/// supported.  Returns `None` (after logging) for anything unusable.
+fn parse_config_path(raw: &str, key: &str) -> Option<PathBuf> {
+    let path = if raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
+        let Some(home) = home::home_dir() else {
+            log::warn!("{key}: cannot expand `~` in {raw:?}: no home directory");
+            return None;
+        };
+        home.join(raw[1..].trim_start_matches(['/', '\\']))
+    } else {
+        PathBuf::from(raw)
+    };
+    if !path.is_absolute() {
+        log::warn!("{key}: ignoring non-absolute path {raw:?}");
+        return None;
+    }
+    Some(path)
 }
 
 impl RawConfig {
@@ -759,9 +833,30 @@ impl RawConfig {
 
         let bindings = bindings::parse_bindings(self.keyboard.bindings);
 
+        // ---- Workspace ----
+        let workspace = WorkspaceConfig {
+            worktree_dir: self
+                .workspace
+                .worktree_dir
+                .as_deref()
+                .and_then(|raw| parse_config_path(raw, "workspace.worktree_dir")),
+            overrides: self
+                .workspace
+                .overrides
+                .iter()
+                .filter_map(|o| {
+                    let project = parse_config_path(&o.project, "workspace.overrides.project")?;
+                    let worktree_dir =
+                        parse_config_path(&o.worktree_dir, "workspace.overrides.worktree_dir")?;
+                    Some(WorktreeOverride { project, worktree_dir })
+                })
+                .collect(),
+        };
+
         Config {
             palette,
             ui,
+            workspace,
             font,
             cursor,
             scrolling,
@@ -809,4 +904,73 @@ fn apply_set(target: &mut [Rgb; 8], set: RawSet) {
 
 fn rgb_to_color32(r: Rgb) -> Color32 {
     Color32::from_rgb(r.r, r.g, r.b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn abs(tail: &str) -> String {
+        if cfg!(windows) { format!("C:\\{tail}") } else { format!("/{tail}") }
+    }
+
+    #[test]
+    fn tilde_expands_to_home() {
+        let home = home::home_dir().unwrap();
+        assert_eq!(parse_config_path("~/wt", "test"), Some(home.join("wt")));
+        assert_eq!(parse_config_path("~", "test"), Some(home));
+    }
+
+    #[test]
+    fn absolute_path_passes_through() {
+        let raw = abs("wt");
+        assert_eq!(parse_config_path(&raw, "test"), Some(PathBuf::from(raw)));
+    }
+
+    #[test]
+    fn relative_and_user_tilde_paths_are_rejected() {
+        assert_eq!(parse_config_path("relative/dir", "test"), None);
+        assert_eq!(parse_config_path("~user/dir", "test"), None);
+    }
+
+    #[test]
+    fn workspace_table_parses_into_config() {
+        let toml_src = format!(
+            r#"
+            [workspace]
+            worktree_dir = "{global}"
+
+            [[workspace.overrides]]
+            project = "{proj}"
+            worktree_dir = "{over}"
+            "#,
+            global = abs("global-wt").replace('\\', "\\\\"),
+            proj = abs("proj").replace('\\', "\\\\"),
+            over = abs("proj-wt").replace('\\', "\\\\"),
+        );
+        let raw: RawConfig = toml::from_str(&toml_src).unwrap();
+        let config = raw.into_config();
+        assert_eq!(config.workspace.worktree_dir, Some(PathBuf::from(abs("global-wt"))));
+        assert_eq!(config.workspace.overrides.len(), 1);
+        assert_eq!(config.workspace.overrides[0].project, PathBuf::from(abs("proj")));
+        assert_eq!(config.workspace.overrides[0].worktree_dir, PathBuf::from(abs("proj-wt")));
+    }
+
+    #[test]
+    fn base_dir_for_prefers_override_then_global_then_none() {
+        let ws = WorkspaceConfig {
+            worktree_dir: Some(PathBuf::from(abs("global-wt"))),
+            overrides: vec![WorktreeOverride {
+                project: PathBuf::from(abs("proj")),
+                worktree_dir: PathBuf::from(abs("proj-wt")),
+            }],
+        };
+        assert_eq!(ws.base_dir_for(Path::new(&abs("proj"))), Some(PathBuf::from(abs("proj-wt"))));
+        assert_eq!(
+            ws.base_dir_for(Path::new(&abs("other"))),
+            Some(PathBuf::from(abs("global-wt")))
+        );
+        let empty = WorkspaceConfig::default();
+        assert_eq!(empty.base_dir_for(Path::new(&abs("proj"))), None);
+    }
 }
