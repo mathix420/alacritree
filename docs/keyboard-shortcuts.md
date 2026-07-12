@@ -19,7 +19,6 @@ These cannot be rebound today.
 | Shortcut             | Action                                                |
 | -------------------- | ----------------------------------------------------- |
 | `Ctrl+B`             | Toggle the left (projects/worktrees) sidebar          |
-| `Ctrl+Shift+B`       | Toggle keyboard focus between terminal and sidebar |
 | `Ctrl+G`             | Toggle the right (git status) sidebar                 |
 | `Ctrl+T`             | Open a new shell session in the current workspace     |
 | `Ctrl+Tab`           | Cycle to the next session in the current workspace    |
@@ -57,6 +56,7 @@ and your TOML entries are checked first — so your config overrides any default
 | `Shift+PageDown`     | Scroll one page down                                  |
 | `Shift+Tab`          | Send `CSI Z` (reverse tab — readline/vim)             |
 | `Alt+Shift+Tab`      | Send `ESC` + `CSI Z`                                  |
+| `Ctrl+Shift+B`       | Toggle keyboard focus between terminal and sidebar    |
 
 ### Additional defaults on macOS
 
@@ -135,9 +135,10 @@ entry. Names match alacritty's own action names, so existing configs port over.
 
 While the sidebar has focus: `Up`/`Down` move between rows, `Right`/`Left`
 expand/collapse a project (`Left` on a worktree jumps to its project),
-`Enter` activates the selected workspace and returns to the terminal (on a project header it toggles expansion instead),
-`Escape` returns without switching. All other keys behave as usual — the
-shell receives nothing while the sidebar is focused.
+`Enter` activates the selected workspace and returns to the terminal (on
+a project header it toggles expansion instead), `Escape` returns without
+switching. All other keys keep their bindings; unbound keys reach
+neither the shell nor the UI.
 
 ### Misc
 
