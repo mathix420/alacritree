@@ -1,6 +1,11 @@
 //! Persists the sidebar across restarts at `$XDG_CONFIG_HOME/alacritree/state.toml`.
+//!
+//! The file is shared by every running alacritree, so it is never written from a
+//! snapshot: [`mutate`] re-reads it, applies one change, and writes it back.  A
+//! window that dumped its whole in-memory state would republish a project list
+//! it read at startup, deleting whatever another window has added since.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -52,7 +57,23 @@ pub fn load() -> PersistedState {
     let Some(path) = config_path() else {
         return PersistedState::default();
     };
-    let Ok(contents) = std::fs::read_to_string(&path) else {
+    load_from(&path)
+}
+
+/// Apply one change to the state on disk.
+///
+/// The state is re-read first, so a window only overwrites the fields it
+/// actually touched: hiding a sidebar must not republish the project list this
+/// window happened to read at startup.
+pub fn mutate(change: impl FnOnce(&mut PersistedState)) {
+    let Some(path) = config_path() else {
+        return;
+    };
+    mutate_at(&path, change);
+}
+
+pub fn load_from(path: &Path) -> PersistedState {
+    let Ok(contents) = std::fs::read_to_string(path) else {
         return PersistedState::default();
     };
     match toml::from_str(&contents) {
@@ -64,10 +85,13 @@ pub fn load() -> PersistedState {
     }
 }
 
-pub fn save(state: &PersistedState) {
-    let Some(path) = config_path() else {
-        return;
-    };
+pub fn mutate_at(path: &Path, change: impl FnOnce(&mut PersistedState)) {
+    let mut state = load_from(path);
+    change(&mut state);
+    save_to(path, &state);
+}
+
+pub fn save_to(path: &Path, state: &PersistedState) {
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             log::warn!("failed to create {}: {e}", parent.display());
@@ -81,7 +105,129 @@ pub fn save(state: &PersistedState) {
             return;
         },
     };
-    if let Err(e) = std::fs::write(&path, body) {
-        log::warn!("failed to write {}: {e}", path.display());
+
+    // Another window may be reading the file right now, and `fs::write`
+    // truncates before it writes.  Renaming a fully-written sibling into place
+    // is atomic, so a reader sees either the old file or the new one.
+    let tmp = path.with_extension("toml.tmp");
+    if let Err(e) = std::fs::write(&tmp, body) {
+        log::warn!("failed to write {}: {e}", tmp.display());
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        log::warn!("failed to replace {}: {e}", path.display());
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn project(root: &str) -> PersistedProject {
+        PersistedProject { root: PathBuf::from(root), expanded: true }
+    }
+
+    fn state_file(dir: &TempDir) -> PathBuf {
+        dir.path().join("state.toml")
+    }
+
+    fn roots(state: &PersistedState) -> Vec<PathBuf> {
+        state.projects.iter().map(|p| p.root.clone()).collect()
+    }
+
+    /// Two windows share one state file.  The window that hides a sidebar took
+    /// its copy of the project list at startup, so writing that copy back would
+    /// delete every project the other window has added since — with Ctrl+B, an
+    /// action that has nothing to do with projects.
+    #[test]
+    fn hiding_a_sidebar_keeps_a_project_another_window_added() {
+        let dir = TempDir::new().unwrap();
+        let path = state_file(&dir);
+
+        // The other window adds a project while this one is running.
+        save_to(
+            &path,
+            &PersistedState { projects: vec![project("/repo/theirs")], ..Default::default() },
+        );
+
+        // This window, whose startup snapshot predates that project, hides a
+        // sidebar.
+        mutate_at(&path, |s| s.show_left_sidebar = false);
+
+        let state = load_from(&path);
+        assert_eq!(
+            roots(&state),
+            vec![PathBuf::from("/repo/theirs")],
+            "hiding a sidebar deleted a project another window had added",
+        );
+        assert!(!state.show_left_sidebar, "the sidebar toggle was not persisted");
+    }
+
+    /// The mirror image: a project this window adds must survive whatever the
+    /// other window's stale snapshot contains.
+    #[test]
+    fn adding_a_project_keeps_the_ones_already_on_disk() {
+        let dir = TempDir::new().unwrap();
+        let path = state_file(&dir);
+        save_to(
+            &path,
+            &PersistedState { projects: vec![project("/repo/theirs")], ..Default::default() },
+        );
+
+        mutate_at(&path, |s| s.projects.push(project("/repo/ours")));
+
+        assert_eq!(
+            roots(&load_from(&path)),
+            vec![PathBuf::from("/repo/theirs"), PathBuf::from("/repo/ours"),]
+        );
+    }
+
+    /// Re-reading the file must not resurrect a project the user deleted — the
+    /// case a "merge the union of both lists" fix would get wrong.
+    #[test]
+    fn removing_a_project_deletes_it() {
+        let dir = TempDir::new().unwrap();
+        let path = state_file(&dir);
+        save_to(
+            &path,
+            &PersistedState {
+                projects: vec![project("/repo/keep"), project("/repo/drop")],
+                ..Default::default()
+            },
+        );
+
+        mutate_at(&path, |s| s.projects.retain(|p| p.root != PathBuf::from("/repo/drop")));
+
+        assert_eq!(roots(&load_from(&path)), vec![PathBuf::from("/repo/keep")]);
+    }
+
+    #[test]
+    fn mutating_a_missing_file_creates_it() {
+        let dir = TempDir::new().unwrap();
+        let path = state_file(&dir);
+
+        mutate_at(&path, |s| s.projects.push(project("/repo/first")));
+
+        assert_eq!(roots(&load_from(&path)), vec![PathBuf::from("/repo/first")]);
+    }
+
+    /// The temporary file `save_to` renames into place is not left behind.
+    #[test]
+    fn saving_leaves_no_temporary_file() {
+        let dir = TempDir::new().unwrap();
+        let path = state_file(&dir);
+
+        save_to(&path, &PersistedState::default());
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .filter(|n| n != "state.toml")
+            .collect();
+        assert!(leftovers.is_empty(), "save left {leftovers:?} behind");
     }
 }

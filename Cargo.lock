@@ -67,6 +67,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "tempfile",
  "toml",
  "windows-sys 0.59.0",
  "xdg",
