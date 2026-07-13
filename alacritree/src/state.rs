@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedState {
     #[serde(default)]
     pub projects: Vec<PersistedProject>,
@@ -17,6 +17,15 @@ pub struct PersistedState {
     pub show_left_sidebar: bool,
     #[serde(default = "default_true")]
     pub show_right_sidebar: bool,
+}
+
+/// The `default_true` attributes above only speak for a file that omits the
+/// field.  A first run has no file at all and lands here instead, so deriving
+/// this would open alacritree with both sidebars hidden.
+impl Default for PersistedState {
+    fn default() -> Self {
+        Self { projects: Vec::new(), show_left_sidebar: true, show_right_sidebar: true }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +221,19 @@ mod tests {
         mutate_at(&path, |s| s.projects.push(project("/repo/first")));
 
         assert_eq!(roots(&load_from(&path)), vec![PathBuf::from("/repo/first")]);
+    }
+
+    /// A first run has no state file at all, and must not come up with both
+    /// sidebars hidden.  The `default_true` attributes only speak for a file
+    /// that omits the field; an absent file goes through `Default`.
+    #[test]
+    fn a_first_run_shows_both_sidebars() {
+        let dir = TempDir::new().unwrap();
+
+        let state = load_from(&state_file(&dir));
+
+        assert!(state.show_left_sidebar, "the left sidebar is hidden on a first run");
+        assert!(state.show_right_sidebar, "the right sidebar is hidden on a first run");
     }
 
     /// The temporary file `save_to` renames into place is not left behind.
