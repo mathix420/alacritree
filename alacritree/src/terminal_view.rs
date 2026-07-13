@@ -5,7 +5,7 @@ use alacritty_terminal::term::Term;
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::search::Match;
-use alacritty_terminal::vte::ansi::Color as AnsiColor;
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape};
 use egui::{
     Color32, CursorIcon, Event, FontFamily, FontId, Modifiers, MouseWheelUnit, PointerButton, Pos2,
     Rect, Response, Sense, Stroke, Ui, Vec2,
@@ -542,7 +542,7 @@ fn paint_grid(
     }
 
     if cursor_visible_line >= 0 && cursor_visible_line < screen_lines {
-        let cursor_shape = term.cursor_style().shape;
+        let cursor_shape = cursor_shape(&term);
         paint_cursor(
             painter,
             rect,
@@ -555,6 +555,20 @@ fn paint_grid(
             font_id,
             cursor_shape,
         );
+    }
+}
+
+/// The cursor shape the terminal wants drawn, mirroring alacritty's
+/// `RenderableCursor::new`.  `cursor_style()` reports the configured shape and
+/// never `Hidden`, so DECTCEM has to be read off the mode: full-screen apps
+/// hide the cursor while they repaint and leave it parked wherever their last
+/// write landed, and drawing it regardless puts a block in an arbitrary spot
+/// on top of their UI.
+fn cursor_shape(term: &Term<EventProxy>) -> CursorShape {
+    if term.mode().contains(TermMode::SHOW_CURSOR) {
+        term.cursor_style().shape
+    } else {
+        CursorShape::Hidden
     }
 }
 
@@ -778,4 +792,48 @@ fn paint_builtin_glyph(
         Rect::from_min_size(Pos2::new(cell_x + dx_pt, cell_y + dy_pt), Vec2::new(w_pt, h_pt));
     let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
     painter.image(cached.texture.id(), glyph_rect, uv, fg);
+}
+
+#[cfg(test)]
+mod tests {
+    use alacritty_terminal::term::Config as TermConfig;
+    use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+    use super::*;
+
+    fn term_running(output: &[u8]) -> Term<EventProxy> {
+        let (proxy, _events) = EventProxy::new(egui::Context::default());
+        let mut term = Term::new(TermConfig::default(), &TermSize::new(80, 24), proxy);
+        Processor::<StdSyncHandler>::new().advance(&mut term, output);
+        term
+    }
+
+    /// Full-screen apps hide the cursor with DECTCEM while they repaint, then
+    /// leave it parked wherever their last write landed.  Drawing it anyway
+    /// drops a block into an arbitrary spot on top of their UI.
+    #[test]
+    fn a_cursor_the_app_hid_is_not_drawn() {
+        let term = term_running(b"\x1b[?25l\x1b[10;40Hrepainting");
+
+        assert_eq!(
+            cursor_shape(&term),
+            CursorShape::Hidden,
+            "the app asked for the cursor to be hidden, but it is still painted at {:?}",
+            term.grid().cursor.point,
+        );
+    }
+
+    #[test]
+    fn a_cursor_the_app_unhid_is_drawn_again() {
+        let term = term_running(b"\x1b[?25l\x1b[?25h");
+
+        assert_ne!(cursor_shape(&term), CursorShape::Hidden);
+    }
+
+    #[test]
+    fn a_cursor_no_app_touched_is_drawn() {
+        let term = term_running(b"$ ");
+
+        assert_ne!(cursor_shape(&term), CursorShape::Hidden);
+    }
 }
