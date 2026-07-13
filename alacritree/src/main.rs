@@ -7,6 +7,7 @@ mod clipboard;
 mod colors;
 mod command_ext;
 mod config;
+mod doppler;
 mod fonts;
 mod git_status;
 mod input;

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
@@ -10,6 +10,7 @@ use crate::bindings::{BindingAction, NamedAction};
 use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::config::Config;
+use crate::doppler;
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, StatusCache};
 use crate::paste;
 use crate::pr_status::PrCache;
@@ -126,6 +127,9 @@ pub struct AlacritreeApp {
     quit_dialog_open: bool,
     pending_delete: Option<DeleteRequest>,
     pending_create: Option<CreateState>,
+    /// Worktrees already given a Doppler scope pass this app run, so opening
+    /// more shells there doesn't re-invoke the doppler CLI.
+    doppler_synced: HashSet<PathBuf>,
     notify_rx: Receiver<WorkspaceKey>,
     /// Shared across sessions; auto-invalidated when cell size changes.
     builtin_glyphs: crate::builtin_font::BuiltinGlyphCache,
@@ -263,6 +267,7 @@ impl AlacritreeApp {
             quit_dialog_open: false,
             pending_delete: None,
             pending_create: None,
+            doppler_synced: HashSet::new(),
             notify_rx,
             builtin_glyphs: crate::builtin_font::BuiltinGlyphCache::new(),
         };
@@ -292,6 +297,11 @@ impl AlacritreeApp {
         ctx: &Context,
         working_directory: WorkspaceKey,
     ) -> std::io::Result<SessionId> {
+        // Before the PTY exists, so the shell can't race `doppler run`
+        // against the scope write.
+        if let Some(dir) = &working_directory {
+            self.sync_doppler_scopes(dir.clone());
+        }
         let session = Session::spawn(
             ctx.clone(),
             &self.config,
@@ -303,6 +313,30 @@ impl AlacritreeApp {
         self.sessions.push(session);
         self.active_session.insert(working_directory, id);
         Ok(id)
+    }
+
+    /// Mirror Doppler scopes into a worktree the first time a shell opens
+    /// there.  The create-time hook in `worktree.rs` covers worktrees we
+    /// make; this lazy pass covers ones created outside alacritree, which
+    /// otherwise hit "Doppler Error: You must specify a project".
+    fn sync_doppler_scopes(&mut self, worktree: PathBuf) {
+        if !self.doppler_synced.insert(worktree.clone()) {
+            return;
+        }
+        let main_checkout = self.projects.iter().find_map(|p| {
+            let owns = p.worktrees.iter().any(|wt| !wt.is_main && wt.path == worktree);
+            if !owns {
+                return None;
+            }
+            p.worktrees.iter().find(|wt| wt.is_main).map(|wt| wt.path.clone())
+        });
+        let Some(main_checkout) = main_checkout else {
+            return;
+        };
+        let linked = doppler::mirror_scopes(&main_checkout, &worktree);
+        if linked > 0 {
+            log::info!("linked {linked} doppler scope(s) into {}", worktree.display());
+        }
     }
 
     fn activate_worktree(&mut self, ctx: &Context, path: &Path) {
