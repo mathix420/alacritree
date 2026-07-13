@@ -140,10 +140,38 @@ claude mcp add alacritree -- alacritree mcp
 An agent running *inside* an Alacritree session automatically targets its host
 instance (advertised via the `ALACRITREE_SOCKET` env var); other clients can
 pass `alacritree mcp --socket <path>`. The transport mirrors Alacritty's IPC
-design and is unix-only — disable it with `ipc_socket = false` under
-`[general]`. See
+design — disable it with `ipc_socket = false` under `[general]`. See
 [`docs/alacritree.md`](docs/alacritree.md#mcp-server--drive-alacritree-from-an-llm)
 for the full tool list.
+
+## Command line
+
+The same surface is available as a CLI, for agents that shell out rather than
+speak MCP — and for setting Alacritree up without the folder picker:
+
+```sh
+alacritree project add ~/Git/myrepo     # also: list, remove, refresh
+alacritree worktree create ~/Git/myrepo my-feature
+alacritree git-status ~/Git/myrepo
+
+alacritree session create --workspace ~/Git/myrepo   # prints the new session id
+alacritree session send-text 3 'cargo test' --enter
+alacritree session read-screen 3
+```
+
+`send-text` types the text; `--enter` submits it. (A shell passes arguments
+through verbatim, so a trailing `\r` in the text would arrive as a backslash and
+an `r`.)
+
+Commands print a short human summary; `--json` prints the raw reply instead,
+which is what a script or an agent wants.
+
+Anything that needs a window — sessions, workspace selection — requires a
+running Alacritree. The rest do not: with no instance listening, projects, git
+status, and worktree creation are served straight from `state.toml` and git, so
+an agent can set Alacritree up before anyone has opened it.
+
+`alacritree completions <shell>` writes a completion script to stdout.
 
 ## Documentation
 
