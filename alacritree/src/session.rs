@@ -8,10 +8,9 @@ use alacritty_terminal::event::{Event as TermEvent, EventListener, Notify, Windo
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, Notifier};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{ClipboardType, Config as TermConfig, Term};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
-
-use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::Rgb;
 
 use crate::clipboard::Target;
