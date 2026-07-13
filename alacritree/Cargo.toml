@@ -26,6 +26,10 @@ png = "0.17"
 # Desktop notifications when a background session rings the bell.
 notify-rust = "4"
 
+[dev-dependencies]
+# Throwaway state files, so the persistence tests don't touch the real one.
+tempfile = "3"
+
 [target.'cfg(unix)'.dependencies]
 # Used for font matching: matches what alacritty does via crossfont so that
 # fontconfig <alias> rules and weight/slant substitution behave identically

@@ -19,7 +19,7 @@ use crate::paste;
 use crate::pr_status::PrCache;
 use crate::projects::{Project, Worktree};
 use crate::session::{Session, SessionId, SessionKind, TermSize};
-use crate::state::{self, PersistedProject, PersistedState};
+use crate::state::{self, PersistedProject};
 use crate::terminal_view;
 use crate::worktree::{self as wt, CreateRequest, Progress};
 
@@ -304,17 +304,12 @@ impl AlacritreeApp {
         app
     }
 
-    fn persist(&self) {
-        let state = PersistedState {
-            projects: self
-                .projects
-                .iter()
-                .map(|p| PersistedProject { root: p.root.clone(), expanded: p.expanded })
-                .collect(),
-            show_left_sidebar: self.show_left_sidebar,
-            show_right_sidebar: self.show_right_sidebar,
-        };
-        state::save(&state);
+    fn persist_sidebars(&self) {
+        let (left, right) = (self.show_left_sidebar, self.show_right_sidebar);
+        state::mutate(|s| {
+            s.show_left_sidebar = left;
+            s.show_right_sidebar = right;
+        });
     }
 
     fn spawn_session(
@@ -473,12 +468,20 @@ impl AlacritreeApp {
     }
 
     fn add_project_via_dialog(&mut self) {
-        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-            if !self.projects.iter().any(|p| p.root == path) {
-                self.projects.push(Project::discover(path));
-                self.persist();
-            }
+        let Some(path) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        if self.projects.iter().any(|p| p.root == path) {
+            return;
         }
+        let project = Project::discover(path);
+        let (root, expanded) = (project.root.clone(), project.expanded);
+        self.projects.push(project);
+        state::mutate(|s| {
+            if !s.projects.iter().any(|p| p.root == root) {
+                s.projects.push(PersistedProject { root, expanded });
+            }
+        });
     }
 
     fn is_modal_open(&self) -> bool {
@@ -544,7 +547,7 @@ impl AlacritreeApp {
             self.quit_dialog_open = true;
         }
         if sidebars_changed {
-            self.persist();
+            self.persist_sidebars();
         }
 
         // After built-in shortcuts (so we don't shadow them) but before the
@@ -761,7 +764,7 @@ impl AlacritreeApp {
         let mut add_project_clicked = false;
         let mut refresh_idx: Option<usize> = None;
         let mut remove_idx: Option<usize> = None;
-        let mut expand_toggled = false;
+        let mut expand_toggled: Option<(PathBuf, bool)> = None;
         let mut home_clicked = false;
         let theme = self.theme;
 
@@ -849,7 +852,7 @@ impl AlacritreeApp {
                                 let arrow = if project.expanded { "▾" } else { "▸" };
                                 if icon_button(ui, arrow, theme.text_dim, &theme).clicked() {
                                     project.expanded = !project.expanded;
-                                    expand_toggled = true;
+                                    expand_toggled = Some((project.root.clone(), project.expanded));
                                 }
                                 ui.add(
                                     egui::Label::new(
@@ -928,11 +931,15 @@ impl AlacritreeApp {
             self.projects[idx].refresh();
         }
         if let Some(idx) = remove_idx {
-            self.projects.remove(idx);
-            self.persist();
+            let root = self.projects.remove(idx).root;
+            state::mutate(|s| s.projects.retain(|p| p.root != root));
         }
-        if expand_toggled {
-            self.persist();
+        if let Some((root, expanded)) = expand_toggled {
+            state::mutate(|s| {
+                if let Some(p) = s.projects.iter_mut().find(|p| p.root == root) {
+                    p.expanded = expanded;
+                }
+            });
         }
         if home_clicked {
             self.activate_home(ctx);
