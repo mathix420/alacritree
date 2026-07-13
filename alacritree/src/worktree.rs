@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 use crate::command_ext::CommandExt;
@@ -53,25 +53,27 @@ pub fn validate_branch_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Run [`create`] on a background thread, waking the UI for each step.
 pub fn spawn_create(req: CreateRequest, ctx: egui::Context) -> Receiver<Progress> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let result = run_create(&req, &tx, &ctx);
+        let result = create(&req, |step| {
+            let _ = tx.send(Progress::Step(step.to_string()));
+            ctx.request_repaint();
+        });
         let _ = tx.send(Progress::Done(result));
         ctx.request_repaint();
     });
     rx
 }
 
-fn run_create(
-    req: &CreateRequest,
-    tx: &Sender<Progress>,
-    ctx: &egui::Context,
-) -> Result<PathBuf, String> {
-    let send = |s: &str| {
-        let _ = tx.send(Progress::Step(s.to_string()));
-        ctx.request_repaint();
-    };
+/// Create the worktree on the calling thread, reporting each step as it starts.
+///
+/// Nothing here needs a window, so callers without one (the CLI, with no
+/// running app to talk to) drive this directly rather than through
+/// [`spawn_create`].
+pub fn create(req: &CreateRequest, mut on_step: impl FnMut(&str)) -> Result<PathBuf, String> {
+    let send = &mut on_step;
 
     send("Syncing with remote…");
     if !has_remote(&req.project_root, "origin") {
