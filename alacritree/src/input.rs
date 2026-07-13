@@ -538,4 +538,34 @@ mod tests {
         };
         assert_eq!(event_to_bytes(&event, TermMode::empty()), Some(vec![0x03]));
     }
+
+    /// The kitty encodings above only ever run if the terminal negotiates the
+    /// protocol, and `Term` ignores an app's request for it unless
+    /// `TermConfig::kitty_keyboard` is set.  Drives the enable sequence a real
+    /// app sends through a terminal built from alacritree's own config, so the
+    /// negotiation and the encoding are covered as one path rather than the
+    /// mode being assumed.
+    #[test]
+    fn shift_enter_is_kitty_encoded_once_an_app_enables_the_protocol() {
+        use alacritty_terminal::Term;
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+        use crate::config::Config;
+        use crate::session::{TermSize, term_config};
+
+        let size = TermSize::new(80, 24);
+        let mut term = Term::new(term_config(&Config::default()), &size, VoidListener);
+
+        // `CSI > 1 u`: push a keyboard mode with the disambiguate flag, which
+        // is what Claude Code and neovim send on startup.
+        Processor::<StdSyncHandler>::new().advance(&mut term, b"\x1b[>1u");
+
+        let mode = *term.mode();
+        assert!(
+            mode.contains(TermMode::DISAMBIGUATE_ESC_CODES),
+            "terminal ignored the kitty enable sequence; mode is {mode:?}"
+        );
+        assert_eq!(super::key_to_bytes(Key::Enter, M::SHIFT, mode), Some(b"\x1b[13;2u".to_vec()));
+    }
 }

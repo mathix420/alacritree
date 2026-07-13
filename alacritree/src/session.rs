@@ -272,6 +272,21 @@ fn foreground_process_glyph(_shell_pid: u32) -> Option<char> {
     None
 }
 
+/// Terminal options derived from the user config.
+pub fn term_config(config: &Config) -> TermConfig {
+    TermConfig {
+        scrolling_history: config.scrolling.history,
+        default_cursor_style: config.cursor_style(),
+        semantic_escape_chars: config.selection.semantic_escape_chars.clone(),
+        // `Term` drops every kitty keyboard request — push, pop, and the
+        // support query — unless this is set, so without it an app never gets
+        // to enable the protocol and modified keys stay legacy.  alacritty
+        // enables it unconditionally too (config/ui_config.rs `term_options`).
+        kitty_keyboard: true,
+        ..TermConfig::default()
+    }
+}
+
 impl Session {
     pub fn spawn(
         ctx: egui::Context,
@@ -337,13 +352,7 @@ impl Session {
 
         let (proxy, events) = EventProxy::new(ctx);
 
-        let term_config = TermConfig {
-            scrolling_history: config.scrolling.history,
-            default_cursor_style: config.cursor_style(),
-            semantic_escape_chars: config.selection.semantic_escape_chars.clone(),
-            ..TermConfig::default()
-        };
-        let term = Term::new(term_config, &size, proxy.clone());
+        let term = Term::new(term_config(config), &size, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
 
         let mut env = config.env.clone();
