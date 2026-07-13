@@ -25,14 +25,18 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          token: ${{ secrets.ALACRITREE_BOT_TOKEN }}
           # We rev-parse upstream/master to compare commit ranges, which
           # needs the full history rather than the shallow default.
           fetch-depth: 0
 
       - name: Check for upstream updates
         env:
-          GH_TOKEN: ${{ secrets.ALACRITREE_BOT_TOKEN }}
+          # The built-in GITHUB_TOKEN is enough: we only push a marker branch
+          # and open a PR in our own repo, both covered by the contents/
+          # pull-requests write perms above. A PAT would only matter if we
+          # needed the sync PR to trigger CI — it bumps one TOML line, so that
+          # buys nothing, and fine-grained PATs can't create the PR anyway.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           marker=.github/upstream-sync.toml
