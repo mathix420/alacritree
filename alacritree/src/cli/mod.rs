@@ -98,8 +98,19 @@ enum SessionCommand {
     },
     /// Close a session, terminating whatever runs in it.
     Close { session_id: u64 },
-    /// Write text to a session exactly as if typed.  End with a newline to submit.
-    SendText { session_id: u64, text: String },
+    /// Write text to a session exactly as if typed.
+    SendText {
+        session_id: u64,
+        text: String,
+        /// Append a carriage return, submitting the line.
+        ///
+        /// A shell passes argv through verbatim, so a trailing `\r` in the text
+        /// arrives as a backslash and an `r` — the command would be typed and
+        /// never run.  (An MCP client has no such problem: JSON decodes the
+        /// escape for it.)
+        #[arg(long)]
+        enter: bool,
+    },
     /// Print a session's terminal contents.
     ReadScreen {
         session_id: u64,
@@ -198,7 +209,8 @@ fn to_request(command: Command) -> IpcRequest {
                 IpcRequest::CreateSession { workspace: workspace.map(absolute) }
             },
             SessionCommand::Close { session_id } => IpcRequest::CloseSession { session_id },
-            SessionCommand::SendText { session_id, text } => {
+            SessionCommand::SendText { session_id, text, enter } => {
+                let text = if enter { text + "\r" } else { text };
                 IpcRequest::SendText { session_id, text }
             },
             SessionCommand::ReadScreen { session_id, scrollback } => {
@@ -264,8 +276,8 @@ mod tests {
             IpcRequest::CloseSession { session_id: 7 }
         ));
         assert!(matches!(
-            request_for(&["alacritree", "session", "send-text", "7", "ls\r"]),
-            IpcRequest::SendText { session_id: 7, text } if text == "ls\r"
+            request_for(&["alacritree", "session", "send-text", "7", "ls"]),
+            IpcRequest::SendText { session_id: 7, text } if text == "ls"
         ));
         assert!(matches!(
             request_for(&["alacritree", "session", "read-screen", "7", "--scrollback", "50"]),
@@ -274,6 +286,21 @@ mod tests {
         assert!(matches!(
             request_for(&["alacritree", "worktree", "create", ".", "topic"]),
             IpcRequest::CreateWorktree { branch, .. } if branch == "topic"
+        ));
+    }
+
+    /// The shell hands us argv verbatim, so a user who writes `'ls\r'` sends a
+    /// backslash and an `r` — the command is typed into the terminal and never
+    /// runs.  `--enter` is the only way to submit a line from a shell.
+    #[test]
+    fn enter_submits_the_line_and_is_off_by_default() {
+        assert!(matches!(
+            request_for(&["alacritree", "session", "send-text", "1", "ls", "--enter"]),
+            IpcRequest::SendText { text, .. } if text == "ls\r"
+        ));
+        assert!(matches!(
+            request_for(&["alacritree", "session", "send-text", "1", "ls"]),
+            IpcRequest::SendText { text, .. } if text == "ls"
         ));
     }
 
