@@ -116,7 +116,25 @@ impl Drop for SocketHandle {
 }
 
 pub fn spawn_listener(ctx: egui::Context) -> std::io::Result<(SocketHandle, Receiver<AppCall>)> {
-    let path = socket_path();
+    let listener = listen_at(socket_path(), ctx)?;
+
+    // Advertise the socket to child PTYs, like alacritty does with
+    // ALACRITTY_SOCKET.  Startup runs before the first session spawns, so
+    // no other thread is reading the environment concurrently.
+    unsafe { std::env::set_var(SOCKET_ENV, listener.0.path()) };
+
+    Ok(listener)
+}
+
+/// Listen on a caller-chosen path, without advertising it.
+///
+/// The real socket is named after the process id, which is unique per alacritree
+/// but not per *listener*: two tests in one test binary would otherwise bind the
+/// same name and answer each other's requests.
+fn listen_at(
+    path: PathBuf,
+    ctx: egui::Context,
+) -> std::io::Result<(SocketHandle, Receiver<AppCall>)> {
     // A leftover socket file at our pid (crashed predecessor) blocks bind; only
     // remove it once we've confirmed nothing is listening.
     #[cfg(unix)]
@@ -125,11 +143,6 @@ pub fn spawn_listener(ctx: egui::Context) -> std::io::Result<(SocketHandle, Rece
     }
     let name = path.clone().to_fs_name::<GenericFilePath>()?;
     let listener = ListenerOptions::new().name(name).create_sync()?;
-
-    // Advertise the socket to child PTYs, like alacritty does with
-    // ALACRITTY_SOCKET.  Startup runs before the first session spawns, so
-    // no other thread is reading the environment concurrently.
-    unsafe { std::env::set_var(SOCKET_ENV, &path) };
 
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new().name("alacritree-ipc".into()).spawn(move || {
@@ -222,7 +235,7 @@ fn create_worktree(
     }
 }
 
-fn git_status_json(status: &GitStatus) -> Value {
+pub fn git_status_json(status: &GitStatus) -> Value {
     if let Some(err) = &status.error {
         return json!({ "error": err });
     }
@@ -253,7 +266,28 @@ fn kind_name(kind: ChangeKind) -> &'static str {
     }
 }
 
-// --- Client side (used by `alacritree mcp`) ---------------------------------
+// --- Client side (used by `alacritree mcp` and the CLI) ----------------------
+
+/// Why a request did not produce a reply.
+///
+/// [`NoInstance`](SendError::NoInstance) is kept apart from every other failure
+/// because it is not really an error: it is how the CLI learns there is no app
+/// to talk to, and falls back to serving the request itself.  Distinguishing it
+/// by matching on an error message would break the day someone rewords one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendError {
+    NoInstance,
+    Failed(String),
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SendError::NoInstance => f.write_str("no running alacritree instance found"),
+            SendError::Failed(e) => f.write_str(e),
+        }
+    }
+}
 
 /// Send one request to a running alacritree and wait for its reply.
 ///
@@ -261,8 +295,12 @@ fn kind_name(kind: ChangeKind) -> &'static str {
 /// timeout (`set_recv_timeout` is an error on Windows), so the bound has to
 /// come from this side.  A request that times out leaves its thread parked on
 /// the read until the app answers or dies — only reachable when the app is
-/// already wedged, and `alacritree mcp` is a short-lived bridge process.
-pub fn send_request(socket: Option<&Path>, request: &IpcRequest, timeout: Duration) -> IpcResult {
+/// already wedged, and both clients are short-lived processes.
+pub fn send_request(
+    socket: Option<&Path>,
+    request: &IpcRequest,
+    timeout: Duration,
+) -> Result<Value, SendError> {
     let socket = socket.map(Path::to_path_buf);
     let request = request.clone();
     let (tx, rx) = mpsc::channel();
@@ -271,15 +309,18 @@ pub fn send_request(socket: Option<&Path>, request: &IpcRequest, timeout: Durati
         .spawn(move || {
             let _ = tx.send(exchange(socket.as_deref(), &request));
         })
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| SendError::Failed(e.to_string()))?;
 
-    rx.recv_timeout(timeout).unwrap_or_else(|_| Err("alacritree did not reply in time".to_string()))
+    rx.recv_timeout(timeout)
+        .unwrap_or_else(|_| Err(SendError::Failed("alacritree did not reply in time".to_string())))
 }
 
-fn exchange(socket: Option<&Path>, request: &IpcRequest) -> IpcResult {
-    let stream =
-        find_socket(socket).map_err(|e| format!("no running alacritree instance found: {e}"))?;
+fn exchange(socket: Option<&Path>, request: &IpcRequest) -> Result<Value, SendError> {
+    let stream = find_socket(socket).map_err(|_| SendError::NoInstance)?;
+    exchange_on(stream, request).map_err(SendError::Failed)
+}
 
+fn exchange_on(stream: Stream, request: &IpcRequest) -> Result<Value, String> {
     let mut writer = &stream;
     let body = serde_json::to_string(request).map_err(|e| e.to_string())?;
     writer.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
@@ -367,6 +408,15 @@ fn socket_dir() -> PathBuf {
 #[cfg(windows)]
 fn socket_dir() -> PathBuf {
     PathBuf::from(r"\\.\pipe\")
+}
+
+/// A listener on a name no other test in this binary will bind.
+#[cfg(test)]
+pub fn listen_for_test(
+    label: &str,
+    ctx: egui::Context,
+) -> std::io::Result<(SocketHandle, Receiver<AppCall>)> {
+    listen_at(socket_dir().join(format!("alacritree-test-{label}.sock")), ctx)
 }
 
 #[cfg(test)]

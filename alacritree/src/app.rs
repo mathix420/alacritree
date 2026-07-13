@@ -17,7 +17,7 @@ use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, StatusCache};
 use crate::ipc;
 use crate::paste;
 use crate::pr_status::PrCache;
-use crate::projects::{Project, Worktree};
+use crate::projects::{Project, Worktree, project_json};
 use crate::session::{Session, SessionId, SessionKind, TermSize};
 use crate::state::{self, PersistedProject};
 use crate::terminal_view;
@@ -2326,24 +2326,6 @@ impl AlacritreeApp {
 
 fn unknown_worktree(path: &Path) -> String {
     format!("{} is not a worktree in the sidebar — see list_projects", path.display())
-}
-
-fn project_json(project: &Project) -> Value {
-    json!({
-        "name": project.name,
-        "root": project.root,
-        "default_branch": project.default_branch,
-        "worktrees": project
-            .worktrees
-            .iter()
-            .map(|wt| json!({
-                "name": wt.name,
-                "path": wt.path,
-                "branch": wt.branch,
-                "is_main": wt.is_main,
-            }))
-            .collect::<Vec<_>>(),
-    })
 }
 
 fn session_json(session: &Session, is_active_tab: bool) -> Value {

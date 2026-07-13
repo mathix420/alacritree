@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use git2::Repository;
+use serde_json::{Value, json};
 
 #[derive(Debug, Clone)]
 pub struct Project {
@@ -88,6 +89,26 @@ impl Project {
         self.worktrees = updated.worktrees;
         self.default_branch = updated.default_branch;
     }
+}
+
+/// The wire form of a project, shared by the running app and the CLI's
+/// app-less path so a client cannot tell which one answered it.
+pub fn project_json(project: &Project) -> Value {
+    json!({
+        "name": project.name,
+        "root": project.root,
+        "default_branch": project.default_branch,
+        "worktrees": project
+            .worktrees
+            .iter()
+            .map(|wt| json!({
+                "name": wt.name,
+                "path": wt.path,
+                "branch": wt.branch,
+                "is_main": wt.is_main,
+            }))
+            .collect::<Vec<_>>(),
+    })
 }
 
 fn current_branch(repo: &Repository) -> Option<String> {

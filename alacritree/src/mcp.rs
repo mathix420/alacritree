@@ -106,7 +106,7 @@ fn tool_call_response(id: Value, params: Option<&Value>, socket: Option<&Path>) 
         // message and adapt, e.g. call list_projects after "unknown worktree".
         Err(e) => result_response(
             id,
-            json!({ "content": [{ "type": "text", "text": e }], "isError": true }),
+            json!({ "content": [{ "type": "text", "text": e.to_string() }], "isError": true }),
         ),
     }
 }

@@ -3,6 +3,7 @@
 mod app;
 mod bindings;
 mod builtin_font;
+mod cli;
 mod clipboard;
 mod colors;
 mod command_ext;
@@ -23,6 +24,7 @@ mod terminal_view;
 mod worktree;
 
 use app::AlacritreeApp;
+use clap::Parser;
 
 /// Pre-resized from the 2048x2048 source so we don't embed a 4 MB blob for
 /// what egui only needs at ~256x256.
@@ -63,9 +65,11 @@ fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter))
         .init();
 
-    let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("mcp") {
-        run_mcp_server(args);
+    // A subcommand talks to an alacritree instead of being one.  Log output
+    // goes to stderr (env_logger's default), leaving stdout to the reply.
+    attach_parent_console();
+    if let Some(code) = cli::run(cli::Cli::parse()) {
+        std::process::exit(code);
     }
 
     let config = config::load();
@@ -89,23 +93,27 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// `alacritree mcp [--socket <path>]`: run as an MCP stdio server bridging to
-/// a running instance's IPC socket instead of opening a window.  Log output
-/// goes to stderr (env_logger's default), leaving stdout to the protocol.
-fn run_mcp_server(mut args: impl Iterator<Item = String>) -> ! {
-    let mut socket = None;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--socket" => socket = args.next().map(std::path::PathBuf::from),
-            other => {
-                eprintln!("unknown argument to `alacritree mcp`: {other}");
-                std::process::exit(2);
-            },
-        }
-    }
-    mcp::run(socket);
-    std::process::exit(0);
+/// Borrow the console of whatever shell launched us, if there is one.
+///
+/// A `windows_subsystem = "windows"` binary starts with no console attached, so
+/// in a release build `println!` writes to a handle that goes nowhere and the
+/// CLI is silent at a prompt.  (A debug build has a console and looks fine,
+/// which is how this hides.)  Redirected output is unaffected either way —
+/// `GetStdHandle` returns the pipe — so only the interactive case needs this.
+///
+/// Must run before anything touches `std::io::stdout()`, which caches the
+/// handle it first sees.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+
+    // Fails when the parent has no console (launched from a GUI shell), which
+    // is exactly when there is nothing to attach to and nothing to report.
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
 }
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}
 
 /// A bad icon is cosmetic — log and fall back to the OS default rather than
 /// refusing to start.
