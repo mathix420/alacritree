@@ -11,8 +11,12 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{ClipboardType, Config as TermConfig, Term};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
 
+use alacritty_terminal::term::color::Colors;
+use alacritty_terminal::vte::ansi::Rgb;
+
 use crate::clipboard::Target;
-use crate::config::Config;
+use crate::colors;
+use crate::config::{Config, Palette};
 
 #[derive(Clone)]
 pub struct EventProxy {
@@ -145,6 +149,20 @@ pub struct DrainOutcome {
     /// written here so the drain — which runs once per frame for every session
     /// — stays free of OS clipboard access.
     pub clipboard: Vec<(Target, String)>,
+}
+
+/// Bytes answering an OSC colour query, or `None` when the query has no
+/// answer and the sender should be left to its own default.  `format` is the
+/// terminal's own response builder, so the reply carries whatever prefix and
+/// string terminator the query arrived with.
+fn color_query_reply(
+    index: usize,
+    format: &dyn Fn(Rgb) -> String,
+    runtime: &Colors,
+    palette: &Palette,
+) -> Option<Vec<u8>> {
+    let rgb = colors::query(index, runtime, palette)?;
+    Some(format(rgb).into_bytes())
 }
 
 /// Heuristic for "this title looks like a working/spinner state".  Matches
@@ -378,13 +396,34 @@ impl Session {
     /// Pull every pending event out of the PTY channel.  Called once per frame
     /// for every session — including background ones — so bells, title
     /// changes, and child-exits from non-visible sessions don't pile up.
-    pub fn drain_events(&mut self) -> DrainOutcome {
+    pub fn drain_events(&mut self, palette: &Palette) -> DrainOutcome {
         let mut outcome = DrainOutcome::default();
         while let Ok(event) = self.events.try_recv() {
-            if let Some(bytes) =
-                apply_term_event(event, &mut self.title, &mut self.exited, &mut outcome)
-            {
-                self.write(bytes);
+            match event {
+                // OSC 4 / 10 / 11 / 12.  Programs that ask the terminal for its
+                // palette (delta, vim, terminal-colorsaurus) block on the reply,
+                // so leaving the query unanswered costs them a timeout on every
+                // run rather than degrading gracefully.  Answered here rather
+                // than in apply_term_event, which stays free of the term lock
+                // the live palette sits behind.
+                TermEvent::ColorRequest(index, format) => {
+                    let reply = color_query_reply(
+                        index,
+                        format.as_ref(),
+                        self.term.lock().colors(),
+                        palette,
+                    );
+                    if let Some(bytes) = reply {
+                        self.write(bytes);
+                    }
+                },
+                event => {
+                    if let Some(bytes) =
+                        apply_term_event(event, &mut self.title, &mut self.exited, &mut outcome)
+                    {
+                        self.write(bytes);
+                    }
+                },
             }
         }
         outcome
@@ -553,6 +592,8 @@ fn next_session_id() -> SessionId {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use alacritty_terminal::Term;
     use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 
@@ -621,5 +662,70 @@ mod tests {
             "`cmd /c echo ready` took {exited:?}; the console host is stalling on a \
              handshake (the foreign conpty.dll stall is ~3s)"
         );
+    }
+
+    #[derive(Default)]
+    struct Collector(Mutex<Vec<TermEvent>>);
+
+    impl EventListener for &Collector {
+        fn send_event(&self, event: TermEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    /// Drive `bytes` through a real VT parser and return the reply the session
+    /// would put back on the PTY for the colour query they contain.
+    fn reply_to(bytes: &[u8], palette: &Palette) -> Option<Vec<u8>> {
+        let collector = Collector::default();
+        let size = TermSize::new(80, 24);
+        let mut term = Term::new(TermConfig::default(), &size, &collector);
+        Processor::<StdSyncHandler>::new().advance(&mut term, bytes);
+
+        let events = collector.0.lock().unwrap();
+        events.iter().find_map(|event| match event {
+            TermEvent::ColorRequest(index, format) => {
+                Some(color_query_reply(*index, format.as_ref(), term.colors(), palette))
+            },
+            _ => None,
+        })?
+    }
+
+    fn expected(prefix: &str, rgb: Rgb) -> Vec<u8> {
+        format!(
+            "\x1b]{prefix};rgb:{0:02x}{0:02x}/{1:02x}{1:02x}/{2:02x}{2:02x}\x07",
+            rgb.r, rgb.g, rgb.b
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn osc11_background_query_is_answered_from_the_palette() {
+        let palette = Palette::default();
+        assert_eq!(reply_to(b"\x1b]11;?\x07", &palette), Some(expected("11", palette.bg)));
+    }
+
+    #[test]
+    fn osc10_foreground_query_is_answered_from_the_palette() {
+        let palette = Palette::default();
+        assert_eq!(reply_to(b"\x1b]10;?\x07", &palette), Some(expected("10", palette.fg)));
+    }
+
+    #[test]
+    fn osc4_indexed_query_is_answered_from_the_palette() {
+        let palette = Palette::default();
+        assert_eq!(reply_to(b"\x1b]4;1;?\x07", &palette), Some(expected("4;1", palette.normal[1])));
+    }
+
+    #[test]
+    fn a_color_the_app_set_at_runtime_wins_over_the_palette() {
+        let palette = Palette::default();
+        let red = Rgb { r: 0xff, g: 0x00, b: 0x00 };
+        let reply = reply_to(b"\x1b]11;rgb:ff/00/00\x07\x1b]11;?\x07", &palette);
+        assert_eq!(reply, Some(expected("11", red)));
+    }
+
+    #[test]
+    fn an_unset_cursor_color_is_left_unanswered() {
+        assert_eq!(reply_to(b"\x1b]12;?\x07", &Palette::default()), None);
     }
 }

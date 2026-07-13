@@ -1723,7 +1723,7 @@ impl AlacritreeApp {
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
 
         for idx in 0..self.sessions.len() {
-            let outcome = self.sessions[idx].drain_events();
+            let outcome = self.sessions[idx].drain_events(&self.config.palette);
             // Ahead of the attention early-out: a background session copying
             // with OSC 52 still owns the clipboard.
             for (target, text) in &outcome.clipboard {
