@@ -344,9 +344,13 @@ mod tests {
     }
 
     /// With an app listening, the request must reach it — and the offline path
-    /// must stay out of it.  Falling back while a window is open would add the
-    /// project to `state.toml` behind the app's back, where it would not appear
-    /// in the sidebar until the next restart.
+    /// must stay out of it.  Falling back while a window is open would edit
+    /// `state.toml` behind the app's back, where the change would not show in
+    /// the sidebar until the next restart.
+    ///
+    /// The request is deliberately a read-only one.  `offline::handle` resolves
+    /// the *real* `state.toml` — the user's — so a test that fell through to it
+    /// with a mutating request would edit the config of whoever ran the suite.
     #[test]
     fn a_running_app_answers_instead_of_the_offline_path() {
         let (socket, requests) =
@@ -354,15 +358,16 @@ mod tests {
 
         let app = std::thread::spawn(move || {
             let call = requests.recv().expect("the request reached the app");
-            assert!(matches!(call.request, IpcRequest::AddProject { .. }));
-            call.reply_tx.send(Ok(serde_json::json!({ "name": "answered by the app" }))).unwrap();
+            call.reply_tx
+                .send(Ok(serde_json::json!({ "projects": "answered by the app" })))
+                .unwrap();
         });
 
-        let reply =
-            dispatch(&IpcRequest::AddProject { path: PathBuf::from("/repo") }, Some(socket.path()))
-                .expect("the app replied");
+        let reply = dispatch(&IpcRequest::ListProjects, Some(socket.path())).expect("a reply");
 
-        assert_eq!(reply["name"], "answered by the app");
+        // The offline path would answer with the real project list, so this
+        // sentinel is only reachable through the socket.
+        assert_eq!(reply["projects"], "answered by the app");
         app.join().unwrap();
     }
 
