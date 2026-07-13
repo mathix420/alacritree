@@ -123,6 +123,18 @@ const AGENT_PROCESS_GLYPHS: &[(&str, char)] = &[
     ("continue", '⊕'),
 ];
 
+/// Plain-text dump of a session's grid for IPC clients.
+pub struct ScreenSnapshot {
+    /// Requested scrollback (top) followed by the full visible screen, one
+    /// string per row, trailing blanks trimmed.
+    pub lines: Vec<String>,
+    /// Cursor row as an index into `lines`.
+    pub cursor_line: usize,
+    pub cursor_column: usize,
+    /// Total scrollback rows available above the visible screen.
+    pub history_size: usize,
+}
+
 #[derive(Default)]
 pub struct DrainOutcome {
     /// Set if any event in this batch warrants flagging the session: BEL, or
@@ -416,6 +428,53 @@ impl Session {
         let glyph = self.shell_pid.and_then(foreground_process_glyph);
         self.agent_cache.set(AgentCache { polled_at: Some(Instant::now()), process_glyph: glyph });
         glyph
+    }
+
+    /// Text dump of the visible screen plus up to `scrollback_lines` of
+    /// history above it.  Reads the live (unscrolled) screen regardless of
+    /// the user's display offset so IPC clients always see where output and
+    /// the cursor actually are.
+    pub fn screen_snapshot(&self, scrollback_lines: usize) -> ScreenSnapshot {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+
+        let term = self.term.lock();
+        let grid = term.grid();
+        let cols = grid.columns();
+        let screen_lines = grid.screen_lines() as i32;
+        let history_size = grid.history_size();
+        let back = scrollback_lines.min(history_size) as i32;
+
+        let mut lines = Vec::with_capacity((back + screen_lines) as usize);
+        for line_idx in -back..screen_lines {
+            let row = &grid[Line(line_idx)];
+            let mut text = String::with_capacity(cols);
+            for col in 0..cols {
+                let cell = &row[Column(col)];
+                // Spacer cells are the second half of a wide glyph (or its
+                // line-wrap placeholder) — the glyph itself was already pushed.
+                if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                let ch =
+                    if cell.c == '\0' || cell.flags.contains(Flags::HIDDEN) { ' ' } else { cell.c };
+                text.push(ch);
+                if let Some(zerowidth) = cell.zerowidth() {
+                    text.extend(zerowidth);
+                }
+            }
+            text.truncate(text.trim_end().len());
+            lines.push(text);
+        }
+
+        let cursor = grid.cursor.point;
+        ScreenSnapshot {
+            lines,
+            cursor_line: (cursor.line.0 + back).max(0) as usize,
+            cursor_column: cursor.column.0,
+            history_size,
+        }
     }
 
     pub fn shutdown(&self) {

@@ -6,11 +6,14 @@ use std::sync::{Mutex, OnceLock};
 use eframe::CreationContext;
 use egui::{Color32, Context, Frame, Margin, RichText, ScrollArea, SidePanel, Stroke};
 
+use serde_json::{Value, json};
+
 use crate::bindings::{BindingAction, NamedAction};
 use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::config::Config;
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, StatusCache};
+use crate::ipc;
 use crate::paste;
 use crate::pr_status::PrCache;
 use crate::projects::{Project, Worktree};
@@ -127,6 +130,10 @@ pub struct AlacritreeApp {
     pending_delete: Option<DeleteRequest>,
     pending_create: Option<CreateState>,
     notify_rx: Receiver<WorkspaceKey>,
+    /// Requests from IPC connection threads, drained once per frame.
+    ipc_rx: Option<Receiver<ipc::AppCall>>,
+    /// Held for its Drop: unlinks the socket file on shutdown.
+    _ipc_socket: Option<ipc::SocketHandle>,
     /// Shared across sessions; auto-invalidated when cell size changes.
     builtin_glyphs: crate::builtin_font::BuiltinGlyphCache,
 }
@@ -230,6 +237,22 @@ impl AlacritreeApp {
 
         alacritty_terminal::tty::setup_env();
 
+        // Before the first PTY spawn so children inherit ALACRITREE_SOCKET.
+        let (ipc_socket, ipc_rx) = if config.ipc_socket {
+            match ipc::spawn_listener(cc.egui_ctx.clone()) {
+                Ok((handle, rx)) => {
+                    log::info!("IPC socket: {}", handle.path().display());
+                    (Some(handle), Some(rx))
+                },
+                Err(e) => {
+                    log::warn!("failed to create IPC socket: {e}");
+                    (None, None)
+                },
+            }
+        } else {
+            (None, None)
+        };
+
         let persisted = state::load();
         let projects = persisted
             .projects
@@ -264,6 +287,8 @@ impl AlacritreeApp {
             pending_delete: None,
             pending_create: None,
             notify_rx,
+            ipc_rx,
+            _ipc_socket: ipc_socket,
             builtin_glyphs: crate::builtin_font::BuiltinGlyphCache::new(),
         };
 
@@ -2112,6 +2137,159 @@ impl AlacritreeApp {
     }
 }
 
+/// IPC request handling.  Runs on the UI thread inside `update` so every
+/// request sees (and mutates) app state the same way user input does; the
+/// connection thread blocks on `reply_tx` meanwhile.
+impl AlacritreeApp {
+    fn process_ipc_calls(&mut self, ctx: &Context) {
+        let Some(rx) = &self.ipc_rx else { return };
+        let calls: Vec<ipc::AppCall> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        for call in calls {
+            let result = self.handle_ipc_request(ctx, call.request);
+            // A send error means the client gave up waiting — nothing to do.
+            let _ = call.reply_tx.send(result);
+        }
+    }
+
+    fn handle_ipc_request(&mut self, ctx: &Context, request: ipc::IpcRequest) -> ipc::IpcResult {
+        use ipc::IpcRequest as Req;
+        match request {
+            Req::ListProjects => Ok(json!({
+                "current_workspace": self.current_workspace,
+                "projects": self.projects.iter().map(project_json).collect::<Vec<_>>(),
+            })),
+            Req::ListSessions => {
+                let sessions: Vec<Value> = self
+                    .sessions
+                    .iter()
+                    .map(|s| {
+                        let active =
+                            self.active_session.get(&s.working_directory).copied() == Some(s.id);
+                        session_json(s, active)
+                    })
+                    .collect();
+                Ok(json!({ "current_workspace": self.current_workspace, "sessions": sessions }))
+            },
+            Req::SelectWorkspace { path } => match path {
+                None => {
+                    self.activate_home(ctx);
+                    Ok(json!({ "workspace": Value::Null }))
+                },
+                Some(p) => {
+                    let known = self.known_worktree_path(&p).ok_or_else(|| unknown_worktree(&p))?;
+                    self.activate_worktree(ctx, &known);
+                    Ok(json!({ "workspace": known }))
+                },
+            },
+            Req::CreateSession { workspace } => {
+                let workspace = match workspace {
+                    None => None,
+                    Some(p) => {
+                        Some(self.known_worktree_path(&p).ok_or_else(|| unknown_worktree(&p))?)
+                    },
+                };
+                let id = self
+                    .spawn_session(ctx, workspace)
+                    .map_err(|e| format!("failed to spawn shell: {e}"))?;
+                Ok(json!({ "session_id": id }))
+            },
+            Req::CloseSession { session_id } => {
+                if !self.sessions.iter().any(|s| s.id == session_id) {
+                    return Err(format!("no session with id {session_id}"));
+                }
+                self.close_session(session_id);
+                Ok(json!({ "closed": session_id }))
+            },
+            Req::SendText { session_id, text } => {
+                let session = self
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == session_id)
+                    .ok_or_else(|| format!("no session with id {session_id}"))?;
+                paste::on_terminal_input_start(session);
+                let bytes = text.into_bytes();
+                let written = bytes.len();
+                session.write(bytes);
+                Ok(json!({ "bytes_written": written }))
+            },
+            Req::ReadScreen { session_id, scrollback_lines } => {
+                let session = self
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == session_id)
+                    .ok_or_else(|| format!("no session with id {session_id}"))?;
+                let snapshot = session.screen_snapshot(scrollback_lines);
+                Ok(json!({
+                    "title": session.title,
+                    "lines": snapshot.lines,
+                    "cursor": { "line": snapshot.cursor_line, "column": snapshot.cursor_column },
+                    "scrollback_available": snapshot.history_size,
+                }))
+            },
+            Req::RefreshProject { root } => {
+                let project =
+                    self.projects.iter_mut().find(|p| p.root == root).ok_or_else(|| {
+                        format!("{} is not a project in the sidebar", root.display())
+                    })?;
+                project.refresh();
+                Ok(project_json(project))
+            },
+            // Dispatched on the IPC connection thread; never forwarded here.
+            Req::GitStatus { .. } | Req::CreateWorktree { .. } => {
+                Err("request is handled off the UI thread".to_string())
+            },
+        }
+    }
+
+    /// Resolve `path` to a sidebar worktree, tolerating symlinks and trailing
+    /// slashes via canonicalization.
+    fn known_worktree_path(&self, path: &Path) -> Option<PathBuf> {
+        let canonical = path.canonicalize().ok();
+        self.projects.iter().flat_map(|p| &p.worktrees).find_map(|wt| {
+            (wt.path == path || canonical.as_deref() == Some(wt.path.as_path()))
+                .then(|| wt.path.clone())
+        })
+    }
+}
+
+fn unknown_worktree(path: &Path) -> String {
+    format!("{} is not a worktree in the sidebar — see list_projects", path.display())
+}
+
+fn project_json(project: &Project) -> Value {
+    json!({
+        "name": project.name,
+        "root": project.root,
+        "default_branch": project.default_branch,
+        "worktrees": project
+            .worktrees
+            .iter()
+            .map(|wt| json!({
+                "name": wt.name,
+                "path": wt.path,
+                "branch": wt.branch,
+                "is_main": wt.is_main,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn session_json(session: &Session, is_active_tab: bool) -> Value {
+    json!({
+        "id": session.id,
+        "title": session.title,
+        "workspace": session.working_directory,
+        "kind": match &session.kind {
+            SessionKind::Shell => "shell",
+            SessionKind::Diff { .. } => "diff",
+        },
+        "columns": session.size.columns,
+        "lines": session.size.screen_lines,
+        "is_active_tab": is_active_tab,
+        "needs_attention": session.needs_attention,
+    })
+}
+
 impl eframe::App for AlacritreeApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         let bg = self.theme.terminal_bg;
@@ -2125,6 +2303,7 @@ impl eframe::App for AlacritreeApp {
             self.handle_shortcuts(ctx);
         }
         self.process_notification_actions(ctx);
+        self.process_ipc_calls(ctx);
         self.process_session_events(ctx);
         let theme = self.theme;
         // GL clear is the sole source of the bg when opacity < 1; painting any
