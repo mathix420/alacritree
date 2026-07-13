@@ -165,6 +165,17 @@ fn color_query_reply(
     Some(format(rgb).into_bytes())
 }
 
+/// Bytes answering a CSI 14 t text-area-size query.  Fed the same geometry the
+/// PTY was last resized with, so the pixel answer can't drift from the cell
+/// grid the child already knows about.
+fn text_area_size_reply(
+    format: &dyn Fn(WindowSize) -> String,
+    size: TermSize,
+    cell_size: (f32, f32),
+) -> Vec<u8> {
+    format(window_size(size, cell_size)).into_bytes()
+}
+
 /// Heuristic for "this title looks like a working/spinner state".  Matches
 /// any title containing a Braille glyph (`U+2800..=U+28FF`), which is the
 /// near-universal spinner alphabet (Claude Code, oh-my-posh, ollama, cargo's
@@ -416,6 +427,12 @@ impl Session {
                     if let Some(bytes) = reply {
                         self.write(bytes);
                     }
+                },
+                // CSI 14 t.  Image protocols and TUIs that size themselves in
+                // pixels block on this the same way the color queries do.
+                TermEvent::TextAreaSizeRequest(format) => {
+                    let reply = text_area_size_reply(format.as_ref(), self.size, self.cell_size);
+                    self.write(reply);
                 },
                 event => {
                     if let Some(bytes) =
@@ -696,6 +713,28 @@ mod tests {
             rgb.r, rgb.g, rgb.b
         )
         .into_bytes()
+    }
+
+    /// Drive `bytes` through a real VT parser and return the reply the session
+    /// would put back on the PTY for the text-area-size query they contain.
+    fn size_reply_to(bytes: &[u8], size: TermSize, cell_size: (f32, f32)) -> Option<Vec<u8>> {
+        let collector = Collector::default();
+        let mut term = Term::new(TermConfig::default(), &size, &collector);
+        Processor::<StdSyncHandler>::new().advance(&mut term, bytes);
+
+        let events = collector.0.lock().unwrap();
+        events.iter().find_map(|event| match event {
+            TermEvent::TextAreaSizeRequest(format) => {
+                Some(text_area_size_reply(format.as_ref(), size, cell_size))
+            },
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn csi14t_size_query_is_answered_in_pixels() {
+        let reply = size_reply_to(b"\x1b[14t", TermSize::new(80, 24), (7.0, 15.0));
+        assert_eq!(reply, Some(b"\x1b[4;360;560t".to_vec()));
     }
 
     #[test]
