@@ -471,17 +471,36 @@ impl AlacritreeApp {
         let Some(path) = rfd::FileDialog::new().pick_folder() else {
             return;
         };
-        if self.projects.iter().any(|p| p.root == path) {
-            return;
-        }
-        let project = Project::discover(path);
-        let (root, expanded) = (project.root.clone(), project.expanded);
-        self.projects.push(project);
-        state::mutate(|s| {
-            if !s.projects.iter().any(|p| p.root == root) {
-                s.projects.push(PersistedProject { root, expanded });
-            }
+        self.add_project(path);
+    }
+
+    /// Put a project in the sidebar, discovering its worktrees.  A project that
+    /// is already there is left alone rather than duplicated, so callers that
+    /// cannot see the sidebar (the folder picker, IPC) need not check first.
+    fn add_project(&mut self, path: PathBuf) -> &Project {
+        let existing = self.projects.iter().position(|p| p.root == path);
+        let idx = existing.unwrap_or_else(|| {
+            let project = Project::discover(path);
+            let (root, expanded) = (project.root.clone(), project.expanded);
+            self.projects.push(project);
+            state::mutate(|s| {
+                if !s.projects.iter().any(|p| p.root == root) {
+                    s.projects.push(PersistedProject { root, expanded });
+                }
+            });
+            self.projects.len() - 1
         });
+        &self.projects[idx]
+    }
+
+    /// Drop a project from the sidebar.  Nothing on disk is touched, and
+    /// sessions already open in its worktrees keep running — they outlive the
+    /// sidebar entry the same way they outlive a workspace switch.
+    fn remove_project(&mut self, idx: usize) -> PathBuf {
+        let root = self.projects.remove(idx).root;
+        let key = root.clone();
+        state::mutate(move |s| s.projects.retain(|p| p.root != key));
+        root
     }
 
     fn is_modal_open(&self) -> bool {
@@ -931,8 +950,7 @@ impl AlacritreeApp {
             self.projects[idx].refresh();
         }
         if let Some(idx) = remove_idx {
-            let root = self.projects.remove(idx).root;
-            state::mutate(|s| s.projects.retain(|p| p.root != root));
+            self.remove_project(idx);
         }
         if let Some((root, expanded)) = expand_toggled {
             state::mutate(|s| {
@@ -2279,6 +2297,14 @@ impl AlacritreeApp {
                     })?;
                 project.refresh();
                 Ok(project_json(project))
+            },
+            Req::AddProject { path } => Ok(project_json(self.add_project(path))),
+            Req::RemoveProject { root } => {
+                let idx =
+                    self.projects.iter().position(|p| p.root == root).ok_or_else(|| {
+                        format!("{} is not a project in the sidebar", root.display())
+                    })?;
+                Ok(json!({ "removed": self.remove_project(idx) }))
             },
             // Dispatched on the IPC connection thread; never forwarded here.
             Req::GitStatus { .. } | Req::CreateWorktree { .. } => {

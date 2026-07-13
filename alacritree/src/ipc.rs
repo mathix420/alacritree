@@ -73,6 +73,12 @@ pub enum IpcRequest {
     RefreshProject {
         root: PathBuf,
     },
+    AddProject {
+        path: PathBuf,
+    },
+    RemoveProject {
+        root: PathBuf,
+    },
     GitStatus {
         path: PathBuf,
     },

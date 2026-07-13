@@ -222,5 +222,112 @@ fn tool_definitions() -> Value {
                 "required": ["root"],
             },
         },
+        {
+            "name": "add_project",
+            "description": "Add a project to alacritree's sidebar by its root path, and return it with its worktrees. A path that is not a git repository is still added, as a single pseudo-worktree you can open a shell in. Adding a project that is already there is not an error.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Project root path." },
+                },
+                "required": ["path"],
+            },
+        },
+        {
+            "name": "remove_project",
+            "description": "Remove a project from alacritree's sidebar. Only the sidebar entry is removed — no files, worktrees, or branches are touched. Sessions already open in its worktrees keep running.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "root": { "type": "string", "description": "Project root path from list_projects." },
+                },
+                "required": ["root"],
+            },
+        },
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// One of every `IpcRequest`, so the tests below can walk the whole surface.
+    ///
+    /// `tag_of` matches these exhaustively: a new variant stops this module
+    /// compiling until it is named here too.
+    fn every_request() -> Vec<IpcRequest> {
+        let repo = || PathBuf::from("/repo");
+        vec![
+            IpcRequest::ListProjects,
+            IpcRequest::ListSessions,
+            IpcRequest::SelectWorkspace { path: None },
+            IpcRequest::CreateSession { workspace: None },
+            IpcRequest::CloseSession { session_id: 1 },
+            IpcRequest::SendText { session_id: 1, text: "hi".into() },
+            IpcRequest::ReadScreen { session_id: 1, scrollback_lines: 0 },
+            IpcRequest::GitStatus { path: repo() },
+            IpcRequest::CreateWorktree { project_root: repo(), branch: "topic".into() },
+            IpcRequest::RefreshProject { root: repo() },
+            IpcRequest::AddProject { path: repo() },
+            IpcRequest::RemoveProject { root: repo() },
+        ]
+    }
+
+    fn tag_of(request: &IpcRequest) -> &'static str {
+        match request {
+            IpcRequest::ListProjects => "list_projects",
+            IpcRequest::ListSessions => "list_sessions",
+            IpcRequest::SelectWorkspace { .. } => "select_workspace",
+            IpcRequest::CreateSession { .. } => "create_session",
+            IpcRequest::CloseSession { .. } => "close_session",
+            IpcRequest::SendText { .. } => "send_text",
+            IpcRequest::ReadScreen { .. } => "read_screen",
+            IpcRequest::GitStatus { .. } => "git_status",
+            IpcRequest::CreateWorktree { .. } => "create_worktree",
+            IpcRequest::RefreshProject { .. } => "refresh_project",
+            IpcRequest::AddProject { .. } => "add_project",
+            IpcRequest::RemoveProject { .. } => "remove_project",
+        }
+    }
+
+    fn tool_names() -> Vec<String> {
+        tool_definitions()
+            .as_array()
+            .expect("tool list")
+            .iter()
+            .map(|t| t["name"].as_str().expect("tool name").to_string())
+            .collect()
+    }
+
+    /// A tool call becomes an `IpcRequest` by using the tool's name as the
+    /// request's serde tag.  Nothing in the type system ties the two together,
+    /// so a rename on either side fails at runtime, in the model's face.
+    #[test]
+    fn every_tool_name_is_an_ipc_request_tag() {
+        let tags: Vec<&str> = every_request().iter().map(tag_of).collect();
+        for name in tool_names() {
+            assert!(tags.contains(&name.as_str()), "tool `{name}` is not an IpcRequest tag");
+        }
+    }
+
+    /// The mirror image: a request no tool exposes is a hole in the MCP surface.
+    #[test]
+    fn every_ipc_request_tag_is_a_tool_name() {
+        let tools = tool_names();
+        for tag in every_request().iter().map(tag_of) {
+            assert!(tools.iter().any(|t| t == tag), "no MCP tool exposes `{tag}`");
+        }
+    }
+
+    /// `tag_of` is the tests' own opinion of the tags; serde's is the one that
+    /// ships.  If they ever disagree the two tests above are checking a fiction.
+    #[test]
+    fn serde_agrees_with_the_expected_tags() {
+        for request in every_request() {
+            let encoded = serde_json::to_value(&request).expect("serialize");
+            assert_eq!(encoded["type"], json!(tag_of(&request)));
+        }
+    }
 }
