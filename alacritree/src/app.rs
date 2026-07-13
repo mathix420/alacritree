@@ -1724,6 +1724,11 @@ impl AlacritreeApp {
 
         for idx in 0..self.sessions.len() {
             let outcome = self.sessions[idx].drain_events();
+            // Ahead of the attention early-out: a background session copying
+            // with OSC 52 still owns the clipboard.
+            for (target, text) in &outcome.clipboard {
+                clipboard::write(*target, text);
+            }
             if !outcome.attention {
                 continue;
             }

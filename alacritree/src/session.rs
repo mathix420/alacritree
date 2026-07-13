@@ -8,9 +8,10 @@ use alacritty_terminal::event::{Event as TermEvent, EventListener, Notify, Windo
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, Notifier};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::{Config as TermConfig, Term};
+use alacritty_terminal::term::{ClipboardType, Config as TermConfig, Term};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
 
+use crate::clipboard::Target;
 use crate::config::Config;
 
 #[derive(Clone)]
@@ -140,6 +141,10 @@ pub struct DrainOutcome {
     /// Set if any event in this batch warrants flagging the session: BEL, or
     /// a title transitioning out of a spinner state.
     pub attention: bool,
+    /// Text the app copied with OSC 52.  Carried out to the caller rather than
+    /// written here so the drain — which runs once per frame for every session
+    /// — stays free of OS clipboard access.
+    pub clipboard: Vec<(Target, String)>,
 }
 
 /// Heuristic for "this title looks like a working/spinner state".  Matches
@@ -376,20 +381,10 @@ impl Session {
     pub fn drain_events(&mut self) -> DrainOutcome {
         let mut outcome = DrainOutcome::default();
         while let Ok(event) = self.events.try_recv() {
-            match event {
-                TermEvent::PtyWrite(s) => self.write(s.into_bytes()),
-                TermEvent::Title(t) => {
-                    // A spinner-shaped title transitioning to a non-spinner one
-                    // is how Claude Code (and similar tools that don't ring
-                    // BEL) signal "done — your turn".  Treat it like a bell.
-                    if is_spinner_title(&self.title) && !is_spinner_title(&t) {
-                        outcome.attention = true;
-                    }
-                    self.title = t;
-                },
-                TermEvent::ChildExit(_) => self.exited = true,
-                TermEvent::Bell => outcome.attention = true,
-                _ => {},
+            if let Some(bytes) =
+                apply_term_event(event, &mut self.title, &mut self.exited, &mut outcome)
+            {
+                self.write(bytes);
             }
         }
         outcome
@@ -498,6 +493,43 @@ impl Drop for Session {
     }
 }
 
+/// Apply one terminal event, returning any bytes owed back to the PTY.  Free
+/// of `Session` so the classification stays testable without spawning a shell.
+fn apply_term_event(
+    event: TermEvent,
+    title: &mut String,
+    exited: &mut bool,
+    outcome: &mut DrainOutcome,
+) -> Option<Vec<u8>> {
+    match event {
+        TermEvent::PtyWrite(s) => return Some(s.into_bytes()),
+        TermEvent::Title(t) => {
+            // A spinner-shaped title transitioning to a non-spinner one
+            // is how Claude Code (and similar tools that don't ring
+            // BEL) signal "done — your turn".  Treat it like a bell.
+            if is_spinner_title(title) && !is_spinner_title(&t) {
+                outcome.attention = true;
+            }
+            *title = t;
+        },
+        TermEvent::ChildExit(_) => *exited = true,
+        TermEvent::Bell => outcome.attention = true,
+        // OSC 52.  Apps that copy this way (Claude Code, tmux, vim) get no
+        // acknowledgement, so dropping it leaves them reporting a successful
+        // copy while the system clipboard keeps its previous contents.
+        TermEvent::ClipboardStore(ty, text) => outcome.clipboard.push((clipboard_target(ty), text)),
+        _ => {},
+    }
+    None
+}
+
+fn clipboard_target(ty: ClipboardType) -> Target {
+    match ty {
+        ClipboardType::Clipboard => Target::Clipboard,
+        ClipboardType::Selection => Target::Primary,
+    }
+}
+
 fn window_size(size: TermSize, cell_size: (f32, f32)) -> WindowSize {
     WindowSize {
         num_lines: size.screen_lines as u16,
@@ -517,4 +549,34 @@ fn next_session_id() -> SessionId {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use alacritty_terminal::Term;
+    use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+    use super::*;
+
+    /// OSC 52 is how Claude Code, tmux and vim copy.  The sequence is
+    /// fire-and-forget — the app reports a successful copy either way — so a
+    /// dropped `ClipboardStore` shows up only as a stale paste later.  Drives
+    /// the real sequence through a real terminal into the real drain.
+    #[test]
+    fn osc52_copy_is_carried_out_to_the_clipboard() {
+        let (proxy, events) = EventProxy::new(egui::Context::default());
+        let size = TermSize::new(80, 24);
+        let mut term = Term::new(TermConfig::default(), &size, proxy);
+
+        // `OSC 52 ; c ; <base64> BEL` — copy "hello" to the clipboard.
+        Processor::<StdSyncHandler>::new().advance(&mut term, b"\x1b]52;c;aGVsbG8=\x07");
+
+        let event = events.try_recv().expect("terminal emitted no event for OSC 52");
+        let mut outcome = DrainOutcome::default();
+        let mut title = String::new();
+        let mut exited = false;
+        apply_term_event(event, &mut title, &mut exited, &mut outcome);
+
+        assert_eq!(outcome.clipboard, vec![(Target::Clipboard, "hello".to_owned())]);
+    }
 }
