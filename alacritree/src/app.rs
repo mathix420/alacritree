@@ -1880,7 +1880,7 @@ fn wsl_shell(distro: &str, workdir: &Path) -> Shell {
 /// What shell a new session should run, decided from plain data so the
 /// precedence chain stays testable off the GUI.
 #[derive(Debug, PartialEq, Eq)]
-enum ShellDecision {
+pub enum ShellDecision {
     /// Fall through to `[terminal.shell]` / the OS default.
     ConfigShell,
     /// A shell inside this WSL distro (`wsl_shell` builds the argv).
@@ -1893,7 +1893,7 @@ enum ShellDecision {
 /// profile, then the config shell.  A stale override (distro unregistered,
 /// profile removed from config) warns and continues down the chain rather
 /// than failing the spawn.
-fn shell_decision(
+pub fn shell_decision(
     override_choice: Option<&ShellChoice>,
     location_distro: Option<&str>,
     known_distros: &[String],

@@ -18,10 +18,12 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::app::{ShellDecision, shell_decision};
 use crate::command_ext::CommandExt;
-use crate::config::{self, ConfigDiagnosis, ConfigFile, ShellConfig};
+use crate::config::{self, Config, ConfigDiagnosis, ConfigFile, Profile, ShellConfig};
 use crate::ipc::{self, IpcRequest, SendError};
 use crate::state;
+use crate::wsl::{self, ShellChoice};
 
 /// An instance that is wedged should not wedge the report too.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -96,7 +98,7 @@ fn report(socket: Option<&Path>) -> Vec<Check> {
     checks.extend(gh_auth_check());
     checks.push(shell_check(config.shell.as_ref()));
     checks.extend(config_checks(&config::diagnose()));
-    checks.extend(persisted_state_checks());
+    checks.extend(persisted_state_checks(&config));
     checks.extend(ipc_checks(socket, config.ipc_socket));
     checks
 }
@@ -221,17 +223,16 @@ fn config_file_check(file: &ConfigFile) -> Check {
     }
 }
 
-fn persisted_state_checks() -> Vec<Check> {
-    match state::config_path() {
-        Some(path) => state_checks(&path),
-        None => {
-            let detail = "no config directory — the sidebar cannot persist";
-            vec![check("state", "state.toml", Status::Fail, detail)]
-        },
-    }
+fn persisted_state_checks(config: &Config) -> Vec<Check> {
+    let Some(path) = state::config_path() else {
+        let detail = "no config directory — the sidebar cannot persist";
+        return vec![check("state", "state.toml", Status::Fail, detail)];
+    };
+    let distros: Vec<String> = wsl::distros().into_iter().map(|d| d.name).collect();
+    state_checks(&path, &distros, &config.profiles)
 }
 
-fn state_checks(path: &Path) -> Vec<Check> {
+fn state_checks(path: &Path, distros: &[String], profiles: &[Profile]) -> Vec<Check> {
     if let Some(e) = state::parse_error(path) {
         let detail = format!("unreadable, the sidebar opens empty ({})\n{e}", path.display());
         return vec![check("state", "state.toml", Status::Fail, detail)];
@@ -242,11 +243,51 @@ fn state_checks(path: &Path) -> Vec<Check> {
     let summary = format!("{} project{plural}  {}", projects.len(), path.display());
     let mut checks = vec![check("state", "state.toml", Status::Ok, summary)];
 
+    for project in &projects {
+        let Some(raw) = project.shell.as_deref() else {
+            continue;
+        };
+        if let Some(problem) = ignored_override(raw, distros, profiles) {
+            let detail = format!("{}: {problem}", project.root.display());
+            checks.push(check("state", "shell override", Status::Warn, detail));
+        }
+    }
+
     for project in projects.iter().filter(|p| !p.root.is_dir()) {
         let detail = format!("{} no longer exists", project.root.display());
         checks.push(check("state", "project root", Status::Warn, detail));
     }
     checks
+}
+
+/// Why a project's shell override is not being honoured, if it isn't.
+///
+/// A stale override never fails a spawn: `shell_decision` logs it and carries on
+/// down the precedence chain, so the project quietly opens the automatic shell
+/// instead of the one it was pinned to.  A value that does not even parse is
+/// dropped earlier still, when the sidebar loads.
+///
+/// The verdict comes from `shell_decision` itself rather than from a second copy
+/// of its rules, so this cannot drift from the behaviour it reports on.  Neither
+/// a location distro nor a default profile is offered to it: both are fallbacks
+/// the chain reaches *after* the override, and passing them would mask an
+/// override that had already been passed over.
+fn ignored_override(raw: &str, distros: &[String], profiles: &[Profile]) -> Option<String> {
+    let Some(choice) = ShellChoice::parse(raw) else {
+        return Some(format!("`{raw}` is not a shell override — the automatic shell is used"));
+    };
+
+    match (&choice, shell_decision(Some(&choice), None, distros, profiles, None)) {
+        // Pinning to Windows *is* a decision to use the config shell.
+        (ShellChoice::Windows, _) => None,
+        (ShellChoice::Wsl(distro), ShellDecision::ConfigShell) => {
+            Some(format!("WSL distro `{distro}` is not installed — the automatic shell is used"))
+        },
+        (ShellChoice::Profile(name), ShellDecision::ConfigShell) => {
+            Some(format!("no `[[ui.profiles]]` entry named `{name}` — the automatic shell is used"))
+        },
+        _ => None,
+    }
 }
 
 fn ipc_checks(socket: Option<&Path>, enabled: bool) -> Vec<Check> {
@@ -609,6 +650,101 @@ mod tests {
         path
     }
 
+    /// A project pinned to `shell`, on a machine with `distros` installed and
+    /// `profiles` configured.
+    fn state_pinned_to(dir: &TempDir, shell: &str) -> PathBuf {
+        let path = dir.path().join("state.toml");
+        let project = PersistedProject {
+            root: dir.path().join("repo"),
+            expanded: true,
+            shell: Some(shell.to_string()),
+        };
+        let state = PersistedState { projects: vec![project], ..PersistedState::default() };
+        state::save_to(&path, &state);
+        path
+    }
+
+    fn profile(name: &str) -> Profile {
+        Profile { name: name.to_string(), program: "bash".to_string(), args: Vec::new() }
+    }
+
+    /// The check has to survive the whole path a real override takes: written to
+    /// `state.toml`, read back, and judged against this machine.
+    #[test]
+    fn a_project_pinned_to_an_uninstalled_distro_warns() {
+        let dir = TempDir::new().unwrap();
+        let path = state_pinned_to(&dir, "wsl:Ubuntu");
+
+        let checks = state_checks(&path, &["Debian".to_string()], &[]);
+
+        let warning = checks
+            .iter()
+            .find(|c| c.name == "shell override")
+            .expect("a warning about the missing distro");
+        assert_eq!(warning.status, Status::Warn);
+        assert!(warning.detail.contains("Ubuntu"), "{:?} does not name the distro", warning.detail);
+    }
+
+    #[test]
+    fn a_project_pinned_to_an_installed_distro_is_not_reported() {
+        let dir = TempDir::new().unwrap();
+        let path = state_pinned_to(&dir, "wsl:Ubuntu");
+
+        let checks = state_checks(&path, &["Ubuntu".to_string()], &[]);
+
+        assert!(!checks.iter().any(|c| c.name == "shell override"), "{:?}", names(&checks));
+    }
+
+    #[test]
+    fn a_project_pinned_to_a_profile_that_was_deleted_from_config_warns() {
+        let dir = TempDir::new().unwrap();
+        let path = state_pinned_to(&dir, "profile:work");
+
+        let checks = state_checks(&path, &[], &[profile("home")]);
+
+        let warning = checks.iter().find(|c| c.name == "shell override").expect("a warning");
+        assert_eq!(warning.status, Status::Warn);
+        assert!(warning.detail.contains("work"), "{:?} does not name the profile", warning.detail);
+    }
+
+    #[test]
+    fn a_project_pinned_to_a_profile_that_exists_is_not_reported() {
+        let dir = TempDir::new().unwrap();
+        let path = state_pinned_to(&dir, "profile:work");
+
+        let checks = state_checks(&path, &[], &[profile("work")]);
+
+        assert!(!checks.iter().any(|c| c.name == "shell override"), "{:?}", names(&checks));
+    }
+
+    /// A hand-edited `state.toml` can hold anything.  The sidebar drops a value
+    /// it cannot parse the moment it loads, so the override is gone before any
+    /// distro or profile is ever consulted.
+    #[test]
+    fn a_shell_override_that_is_not_even_a_shell_override_warns() {
+        assert!(ignored_override("nonsense", &[], &[]).is_some());
+    }
+
+    /// Pinning to Windows resolves to the config shell, which every machine has.
+    #[test]
+    fn pinning_to_windows_is_always_honoured() {
+        assert_eq!(ignored_override("windows", &[], &[]), None);
+    }
+
+    /// A project with no override at all has nothing to report — most projects
+    /// are this, and a row each would bury the real warnings.
+    #[test]
+    fn a_project_with_no_override_is_not_reported() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let path = state_with(&dir, std::slice::from_ref(&repo));
+
+        let checks = state_checks(&path, &[], &[]);
+
+        assert!(!checks.iter().any(|c| c.name == "shell override"), "{:?}", names(&checks));
+    }
+
     /// `load_from` hands back an empty state on a parse error, so a corrupt file
     /// presents as a first run — with the project list quietly gone.  A user
     /// staring at an empty sidebar needs to be told the file is broken, not
@@ -619,7 +755,7 @@ mod tests {
         let path = dir.path().join("state.toml");
         std::fs::write(&path, "this is not toml {{").unwrap();
 
-        assert_eq!(status_of(&state_checks(&path), "state.toml"), Status::Fail);
+        assert_eq!(status_of(&state_checks(&path, &[], &[]), "state.toml"), Status::Fail);
     }
 
     /// No state file is a first run, which is fine.
@@ -627,7 +763,7 @@ mod tests {
     fn an_absent_state_file_is_a_first_run() {
         let dir = TempDir::new().unwrap();
 
-        let checks = state_checks(&dir.path().join("state.toml"));
+        let checks = state_checks(&dir.path().join("state.toml"), &[], &[]);
 
         assert_eq!(status_of(&checks, "state.toml"), Status::Ok);
     }
@@ -639,7 +775,7 @@ mod tests {
         std::fs::create_dir(&repo).unwrap();
         let path = state_with(&dir, &[repo]);
 
-        let checks = state_checks(&path);
+        let checks = state_checks(&path, &[], &[]);
 
         assert_eq!(status_of(&checks, "state.toml"), Status::Ok);
         assert!(
@@ -657,7 +793,7 @@ mod tests {
         let gone = dir.path().join("gone");
         let path = state_with(&dir, std::slice::from_ref(&gone));
 
-        let checks = state_checks(&path);
+        let checks = state_checks(&path, &[], &[]);
 
         let missing = checks
             .iter()
