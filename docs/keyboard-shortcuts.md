@@ -56,6 +56,7 @@ and your TOML entries are checked first — so your config overrides any default
 | `Shift+PageDown`     | Scroll one page down                                  |
 | `Shift+Tab`          | Send `CSI Z` (reverse tab — readline/vim)             |
 | `Alt+Shift+Tab`      | Send `ESC` + `CSI Z`                                  |
+| `Ctrl+Shift+B`       | Toggle keyboard focus between terminal and sidebar    |
 
 ### Additional defaults on macOS
 
@@ -122,6 +123,22 @@ entry. Names match alacritty's own action names, so existing configs port over.
 - `ToggleMaximized`
 - `Minimize`
 - `Quit` — open the quit confirmation dialog.
+
+### Focus navigation
+
+- `ToggleSidebarFocus` — flip keyboard focus between the terminal and the
+  projects sidebar. Focusing a hidden sidebar shows it; returning focus
+  hides it again unless you toggled it open yourself.
+- `FocusProjectsSidebar` / `FocusTerminal` — the same moves as explicit
+  directional actions (no default keys) for users who prefer distinct
+  bindings.
+
+While the sidebar has focus: `Up`/`Down` move between rows, `Right`/`Left`
+expand/collapse a project (`Left` on a worktree jumps to its project),
+`Enter` activates the selected workspace and returns to the terminal (on
+a project header it toggles expansion instead), `Escape` returns without
+switching. All other keys keep their bindings; unbound keys reach
+neither the shell nor the UI.
 
 ### Misc
 

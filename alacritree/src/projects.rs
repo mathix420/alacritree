@@ -19,6 +19,10 @@ pub struct Worktree {
     pub path: PathBuf,
     pub branch: Option<String>,
     pub is_main: bool,
+    /// The checkout directory is gone but git's worktree metadata remains
+    /// (`git worktree list` still shows it as prunable). Such a row cannot
+    /// host a shell and only offers cleanup.
+    pub prunable: bool,
 }
 
 impl Project {
@@ -38,6 +42,7 @@ impl Project {
                     path: root.clone(),
                     branch: None,
                     is_main: true,
+                    prunable: false,
                 }],
                 root,
                 name,
@@ -56,16 +61,23 @@ impl Project {
             path: main_path.clone(),
             branch: current_branch(repo),
             is_main: true,
+            prunable: false,
         });
 
         if let Ok(names) = repo.worktrees() {
             for name in names.iter().flatten() {
                 if let Ok(wt) = repo.find_worktree(name) {
                     let path = wt.path().to_path_buf();
-                    let branch =
-                        Repository::open(&path).ok().and_then(|wt_repo| current_branch(&wt_repo));
+                    let branch = Repository::open(&path)
+                        .ok()
+                        .and_then(|wt_repo| current_branch(&wt_repo))
+                        .or_else(|| branch_from_admin_head(repo, name));
                     worktrees.push(Worktree {
                         name: name.to_string(),
+                        // Directory existence, not git2's `is_prunable`, is
+                        // the signal: a *locked* worktree with a missing dir
+                        // is not git-prunable but still can't host a shell.
+                        prunable: !path.is_dir(),
                         path,
                         branch,
                         is_main: false,
@@ -103,6 +115,15 @@ fn current_branch(repo: &Repository) -> Option<String> {
     }
 }
 
+/// A prunable worktree's checkout is gone, so its HEAD can't be read via
+/// `Repository::open`. Git still records it in the main repo's admin area
+/// (`.git/worktrees/<name>/HEAD`) — parse the symref line from there.
+fn branch_from_admin_head(repo: &Repository, worktree_name: &str) -> Option<String> {
+    let head = repo.path().join("worktrees").join(worktree_name).join("HEAD");
+    let contents = std::fs::read_to_string(head).ok()?;
+    contents.trim().strip_prefix("ref: refs/heads/").map(str::to_string)
+}
+
 /// Best-effort detection of the repository's default branch.
 ///
 /// `refs/remotes/origin/HEAD` is the source of truth when present — it's what
@@ -137,4 +158,48 @@ fn detect_default_branch(repo: &Repository) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::{add_worktree, init_repo};
+
+    #[test]
+    fn live_worktree_is_not_prunable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let repo = init_repo(&repo_dir);
+        add_worktree(&repo, "feature");
+
+        let project = Project::discover(repo_dir);
+        let wt = project.worktrees.iter().find(|w| w.name == "feature").unwrap();
+        assert!(!wt.prunable);
+        assert_eq!(wt.branch.as_deref(), Some("feature"));
+    }
+
+    #[test]
+    fn missing_dir_marks_worktree_prunable_and_keeps_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let repo = init_repo(&repo_dir);
+        let wt_path = add_worktree(&repo, "feature");
+        std::fs::remove_dir_all(&wt_path).unwrap();
+
+        let project = Project::discover(repo_dir);
+        let wt = project.worktrees.iter().find(|w| w.name == "feature").unwrap();
+        assert!(wt.prunable);
+        assert_eq!(wt.branch.as_deref(), Some("feature"));
+    }
+
+    #[test]
+    fn main_worktree_is_never_prunable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        init_repo(&repo_dir);
+
+        let project = Project::discover(repo_dir);
+        assert!(project.worktrees[0].is_main);
+        assert!(!project.worktrees[0].prunable);
+    }
 }
