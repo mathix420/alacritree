@@ -50,6 +50,21 @@ pub fn resolve(
     }
 }
 
+/// The color to report for an OSC 4 / 10 / 11 / 12 query.  `None` for a cursor
+/// color the app never set: alacritty leaves that query unanswered rather than
+/// naming a color it doesn't have, and the asking app falls back to its own.
+pub fn query(index: usize, runtime: &Colors, palette: &Palette) -> Option<Rgb> {
+    if let Some(rgb) = runtime[index] {
+        return Some(rgb);
+    }
+    match index {
+        0..=255 => Some(resolve_indexed(index as u8, runtime, palette)),
+        i if i == NamedColor::Foreground as usize => Some(palette.fg),
+        i if i == NamedColor::Background as usize => Some(palette.bg),
+        _ => None,
+    }
+}
+
 fn resolve_indexed(index: u8, runtime: &Colors, palette: &Palette) -> Rgb {
     if let Some(rgb) = runtime[index as usize] {
         return rgb;

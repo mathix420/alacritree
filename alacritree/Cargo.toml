@@ -20,11 +20,13 @@ serde_json = "1"
 toml = { workspace = true }
 xdg = "3.0.0"
 home = "0.5.5"
+unicode-width = "0.2.0"
 fontdb = { version = "0.23", default-features = false, features = ["fontconfig", "memmap"] }
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 png = "0.17"
 # Desktop notifications when a background session rings the bell.
 notify-rust = "4"
+interprocess = { version = "2.4.2", default-features = false }
 
 [dev-dependencies]
 # Throwaway repos for worktree discovery/prune tests.
@@ -37,6 +39,10 @@ tempfile = "3"
 # against `yeslogic-fontconfig-sys = "^5"`, which is also what `crossfont`
 # (alacritty's font backend, present in this workspace) pulls in.
 fontconfig = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+# Restricts the DLL search path at startup; see `harden_dll_search_path`.
+windows-sys = { version = "0.59", features = ["Win32_System_LibraryLoader"] }
 
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3.0.2"
