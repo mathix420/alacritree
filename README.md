@@ -173,6 +173,29 @@ an agent can set Alacritree up before anyone has opened it.
 
 `alacritree completions <shell>` writes a completion script to stdout.
 
+### Diagnosing a setup
+
+```sh
+alacritree doctor          # --json for the machine-readable form
+```
+
+Alacritree degrades quietly on purpose: a missing `gh` falls back to the repo's
+default branch, a missing `doppler` skips scope mirroring, a malformed
+`alacritty.toml` loads defaults, and a corrupt `state.toml` opens an empty
+sidebar. Each is the right call on its own — none should stop a terminal from
+opening — but together they mean a broken setup looks much like a working one.
+
+`doctor` reports the external tools it found (with versions and paths), which
+config files were loaded and whether they actually parse, whether the persisted
+projects still exist on disk, and whether a running instance is reachable. It
+needs no running window — "nothing happens when I run it" is exactly when it
+gets used.
+
+It exits non-zero only when something is genuinely broken. A missing optional
+tool is a warning, and a tool driving a feature you have never opted into (an
+absent `doppler` on a machine with no Doppler config) is not even that — a report
+that always carries a warning is a report nobody reads.
+
 ## Documentation
 
 - [`docs/alacritree.md`](docs/alacritree.md) — full feature reference for the
