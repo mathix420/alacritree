@@ -3,11 +3,18 @@
 //! `alacritty.toml` is alacritty's own config — we share the file so the user
 //! gets matching colors/cursor in both terminals.  `alacritree.toml` lives in
 //! the same directory and overrides anything in `alacritty.toml` via a
-//! deep-merge.  alacritree-specific options (sidebar colors, etc.) live under
-//! a `[ui]` table and are only valid in `alacritree.toml`.
+//! deep-merge.  alacritree-specific options live under the `[ui]` (sidebar
+//! colors, etc.) and `[workspace]` (worktree location) tables and are only
+//! valid in `alacritree.toml`.
+//!
+//! Binding actions that only exist in alacritree (`ToggleLeftSidebar`,
+//! `SelectNextWorkspace`, `AddProject`, …) belong in `alacritree.toml` too:
+//! real alacritty warns about unknown actions if it sees them in the shared
+//! `alacritty.toml`, and the array-concatenating merge means bindings placed
+//! in `alacritree.toml` still add to (never clobber) the shared ones.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Rgb};
 use egui::Color32;
@@ -19,6 +26,7 @@ use crate::bindings::{self, KeyBinding};
 pub struct Config {
     pub palette: Palette,
     pub ui: UiTheme,
+    pub workspace: WorkspaceConfig,
     pub font: FontConfig,
     pub cursor: CursorConfig,
     pub scrolling: ScrollingConfig,
@@ -27,6 +35,9 @@ pub struct Config {
     pub shell: Option<ShellConfig>,
     pub selection: SelectionConfig,
     pub bindings: Vec<KeyBinding>,
+    /// Offer the IPC socket that `alacritree mcp` connects to.  Mirrors
+    /// alacritty's `[general] ipc_socket` (default on).
+    pub ipc_socket: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +170,41 @@ pub struct Palette {
     pub draw_bold_with_bright: bool,
 }
 
+/// When the sidebar's per-session `×` asks before killing the PTY.
+/// Confirmations otherwise exist only at worktree/app level, so the
+/// default keeps session close immediate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConfirmSessionClose {
+    #[default]
+    Never,
+    /// Prompt only when the session looks busy (agent glyph or spinner title).
+    Busy,
+    Always,
+}
+
+impl ConfirmSessionClose {
+    pub fn requires_prompt(self, busy: bool) -> bool {
+        match self {
+            Self::Never => false,
+            Self::Busy => busy,
+            Self::Always => true,
+        }
+    }
+}
+
+fn parse_confirm_session_close(raw: Option<&str>) -> ConfirmSessionClose {
+    match raw {
+        None => ConfirmSessionClose::default(),
+        Some("never") => ConfirmSessionClose::Never,
+        Some("busy") => ConfirmSessionClose::Busy,
+        Some("always") => ConfirmSessionClose::Always,
+        Some(other) => {
+            log::warn!("unknown ui.confirm_session_close value {other:?}, using \"never\"");
+            ConfirmSessionClose::default()
+        },
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UiTheme {
     pub sidebar_background: Option<Color32>,
@@ -167,6 +213,8 @@ pub struct UiTheme {
     pub sidebar_accent: Option<Color32>,
     /// Fire a desktop notification when a non-visible session needs attention.
     pub notifications: bool,
+    /// Ask before the sidebar's per-session `×` kills the PTY.
+    pub confirm_session_close: ConfirmSessionClose,
 }
 
 impl Default for UiTheme {
@@ -177,7 +225,45 @@ impl Default for UiTheme {
             sidebar_border: None,
             sidebar_accent: None,
             notifications: true,
+            confirm_session_close: ConfirmSessionClose::Never,
         }
+    }
+}
+
+/// Where new git worktrees are created.  alacritree-only, lives under
+/// `[workspace]` in `alacritree.toml`.  Every base directory — default,
+/// global, or override — gets the `<project>-<hash>/<branch>` layout beneath
+/// it; changing these options never moves existing worktrees because
+/// discovery goes through `git worktree list`.
+#[derive(Debug, Clone, Default)]
+pub struct WorkspaceConfig {
+    /// Global base directory for new worktrees; `None` means the built-in
+    /// `~/.alacritree/worktrees`.
+    pub worktree_dir: Option<PathBuf>,
+    pub overrides: Vec<WorktreeOverride>,
+}
+
+/// Per-project base-directory override, matched against the project root.
+#[derive(Debug, Clone)]
+pub struct WorktreeOverride {
+    pub project: PathBuf,
+    pub worktree_dir: PathBuf,
+}
+
+impl WorkspaceConfig {
+    /// Base directory for a project's new worktrees: first matching override,
+    /// then the global `worktree_dir`, then `None` (the caller falls back to
+    /// the built-in default).  Paths compare canonicalized so a symlinked
+    /// spelling of the same root still matches; canonicalization failure
+    /// (path doesn't exist) falls back to the literal path.
+    pub fn base_dir_for(&self, project_root: &Path) -> Option<PathBuf> {
+        let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let root = canonical(project_root);
+        self.overrides
+            .iter()
+            .find(|o| canonical(&o.project) == root)
+            .map(|o| o.worktree_dir.clone())
+            .or_else(|| self.worktree_dir.clone())
     }
 }
 
@@ -186,6 +272,7 @@ impl Default for Config {
         Self {
             palette: Palette::default(),
             ui: UiTheme::default(),
+            workspace: WorkspaceConfig::default(),
             font: FontConfig::default(),
             cursor: CursorConfig::default(),
             scrolling: ScrollingConfig::default(),
@@ -194,6 +281,7 @@ impl Default for Config {
             shell: None,
             selection: SelectionConfig::default(),
             bindings: Vec::new(),
+            ipc_socket: true,
         }
     }
 }
@@ -428,6 +516,7 @@ fn merge_tables(
 struct RawConfig {
     colors: RawColors,
     ui: RawUi,
+    workspace: RawWorkspace,
     font: RawFont,
     cursor: RawCursor,
     scrolling: RawScrolling,
@@ -437,6 +526,17 @@ struct RawConfig {
     terminal: RawTerminal,
     selection: RawSelection,
     keyboard: RawKeyboard,
+    general: RawGeneral,
+}
+
+/// Subset of alacritty's `[general]` section that alacritree honors.  It
+/// lives in the shared `alacritty.toml`, so disabling alacritty's socket
+/// disables ours too — the two sockets are separate files, but the intent
+/// ("no IPC") is the same.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawGeneral {
+    ipc_socket: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -609,6 +709,22 @@ struct RawUi {
     sidebar_border: Option<RgbStr>,
     sidebar_accent: Option<RgbStr>,
     notifications: Option<bool>,
+    /// When the sidebar × on a session row asks before killing the PTY:
+    /// "never" (default) | "busy" | "always".
+    confirm_session_close: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawWorkspace {
+    worktree_dir: Option<String>,
+    overrides: Vec<RawWorktreeOverride>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawWorktreeOverride {
+    project: String,
+    worktree_dir: String,
 }
 
 /// Wrapper that parses `"0xrrggbb"`, `"#rrggbb"`, or `"rrggbb"` into an `Rgb`.
@@ -637,6 +753,27 @@ fn parse_hex_rgb(s: &str) -> Option<Rgb> {
     let g = u8::from_str_radix(&stripped[2..4], 16).ok()?;
     let b = u8::from_str_radix(&stripped[4..6], 16).ok()?;
     Some(Rgb { r, g, b })
+}
+
+/// Expand a leading `~` to the home directory and require the result to be
+/// absolute.  Relative paths are rejected rather than resolved against the
+/// process CWD, which is meaningless for a GUI app; `~user` expansion is not
+/// supported.  Returns `None` (after logging) for anything unusable.
+fn parse_config_path(raw: &str, key: &str) -> Option<PathBuf> {
+    let path = if raw == "~" || raw.starts_with("~/") || raw.starts_with("~\\") {
+        let Some(home) = home::home_dir() else {
+            log::warn!("{key}: cannot expand `~` in {raw:?}: no home directory");
+            return None;
+        };
+        home.join(raw[1..].trim_start_matches(['/', '\\']))
+    } else {
+        PathBuf::from(raw)
+    };
+    if !path.is_absolute() {
+        log::warn!("{key}: ignoring non-absolute path {raw:?}");
+        return None;
+    }
+    Some(path)
 }
 
 impl RawConfig {
@@ -687,6 +824,9 @@ impl RawConfig {
             sidebar_border: self.ui.sidebar_border.map(|v| rgb_to_color32(v.0)),
             sidebar_accent: self.ui.sidebar_accent.map(|v| rgb_to_color32(v.0)),
             notifications: self.ui.notifications.unwrap_or(true),
+            confirm_session_close: parse_confirm_session_close(
+                self.ui.confirm_session_close.as_deref(),
+            ),
         };
 
         // ---- Font ----
@@ -770,9 +910,30 @@ impl RawConfig {
 
         let bindings = bindings::parse_bindings(self.keyboard.bindings);
 
+        // ---- Workspace ----
+        let workspace = WorkspaceConfig {
+            worktree_dir: self
+                .workspace
+                .worktree_dir
+                .as_deref()
+                .and_then(|raw| parse_config_path(raw, "workspace.worktree_dir")),
+            overrides: self
+                .workspace
+                .overrides
+                .iter()
+                .filter_map(|o| {
+                    let project = parse_config_path(&o.project, "workspace.overrides.project")?;
+                    let worktree_dir =
+                        parse_config_path(&o.worktree_dir, "workspace.overrides.worktree_dir")?;
+                    Some(WorktreeOverride { project, worktree_dir })
+                })
+                .collect(),
+        };
+
         Config {
             palette,
             ui,
+            workspace,
             font,
             cursor,
             scrolling,
@@ -781,6 +942,7 @@ impl RawConfig {
             shell,
             selection,
             bindings,
+            ipc_socket: self.general.ipc_socket.unwrap_or(true),
         }
     }
 }
@@ -825,6 +987,115 @@ fn rgb_to_color32(r: Rgb) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ui_from_toml(input: &str) -> UiTheme {
+        let value: toml::Value = toml::from_str(input).expect("valid toml");
+        let raw: RawConfig = value.try_into().expect("valid config");
+        raw.into_config().ui
+    }
+
+    #[test]
+    fn confirm_session_close_defaults_to_never() {
+        let ui = ui_from_toml("");
+        assert_eq!(ui.confirm_session_close, ConfirmSessionClose::Never);
+    }
+
+    #[test]
+    fn confirm_session_close_parses_all_values() {
+        for (raw, expected) in [
+            ("never", ConfirmSessionClose::Never),
+            ("busy", ConfirmSessionClose::Busy),
+            ("always", ConfirmSessionClose::Always),
+        ] {
+            let ui = ui_from_toml(&format!("[ui]\nconfirm_session_close = \"{raw}\""));
+            assert_eq!(ui.confirm_session_close, expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn confirm_session_close_invalid_falls_back_to_never() {
+        let ui = ui_from_toml("[ui]\nconfirm_session_close = \"sometimes\"");
+        assert_eq!(ui.confirm_session_close, ConfirmSessionClose::Never);
+    }
+
+    #[test]
+    fn requires_prompt_covers_policy_matrix() {
+        use ConfirmSessionClose::*;
+        for (policy, busy, expected) in [
+            (Never, false, false),
+            (Never, true, false),
+            (Busy, false, false),
+            (Busy, true, true),
+            (Always, false, true),
+            (Always, true, true),
+        ] {
+            assert_eq!(policy.requires_prompt(busy), expected, "{policy:?} busy={busy}");
+        }
+    }
+
+    fn abs(tail: &str) -> String {
+        if cfg!(windows) { format!("C:\\{tail}") } else { format!("/{tail}") }
+    }
+
+    #[test]
+    fn tilde_expands_to_home() {
+        let home = home::home_dir().unwrap();
+        assert_eq!(parse_config_path("~/wt", "test"), Some(home.join("wt")));
+        assert_eq!(parse_config_path("~", "test"), Some(home));
+    }
+
+    #[test]
+    fn absolute_path_passes_through() {
+        let raw = abs("wt");
+        assert_eq!(parse_config_path(&raw, "test"), Some(PathBuf::from(raw)));
+    }
+
+    #[test]
+    fn relative_and_user_tilde_paths_are_rejected() {
+        assert_eq!(parse_config_path("relative/dir", "test"), None);
+        assert_eq!(parse_config_path("~user/dir", "test"), None);
+    }
+
+    #[test]
+    fn workspace_table_parses_into_config() {
+        let toml_src = format!(
+            r#"
+            [workspace]
+            worktree_dir = "{global}"
+
+            [[workspace.overrides]]
+            project = "{proj}"
+            worktree_dir = "{over}"
+            "#,
+            global = abs("global-wt").replace('\\', "\\\\"),
+            proj = abs("proj").replace('\\', "\\\\"),
+            over = abs("proj-wt").replace('\\', "\\\\"),
+        );
+        let raw: RawConfig = toml::from_str(&toml_src).unwrap();
+        let config = raw.into_config();
+        assert_eq!(config.workspace.worktree_dir, Some(PathBuf::from(abs("global-wt"))));
+        assert_eq!(config.workspace.overrides.len(), 1);
+        assert_eq!(config.workspace.overrides[0].project, PathBuf::from(abs("proj")));
+        assert_eq!(config.workspace.overrides[0].worktree_dir, PathBuf::from(abs("proj-wt")));
+    }
+
+    #[test]
+    fn base_dir_for_prefers_override_then_global_then_none() {
+        let ws = WorkspaceConfig {
+            worktree_dir: Some(PathBuf::from(abs("global-wt"))),
+            overrides: vec![WorktreeOverride {
+                project: PathBuf::from(abs("proj")),
+                worktree_dir: PathBuf::from(abs("proj-wt")),
+            }],
+        };
+        assert_eq!(ws.base_dir_for(Path::new(&abs("proj"))), Some(PathBuf::from(abs("proj-wt"))));
+        assert_eq!(
+            ws.base_dir_for(Path::new(&abs("other"))),
+            Some(PathBuf::from(abs("global-wt")))
+        );
+        let empty = WorkspaceConfig::default();
+        assert_eq!(empty.base_dir_for(Path::new(&abs("proj"))), None);
+    }
 
     fn parse(s: &str) -> Config {
         let value: toml::Value = toml::from_str(s).unwrap();
