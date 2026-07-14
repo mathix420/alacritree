@@ -379,18 +379,19 @@ pub struct ChainFace {
     pub color_only: bool,
 }
 
-/// Bookkeeping shared by all fallback registration within one install: which
-/// files already back an egui font, which font id serves each file (so one
-/// file can join several variants' family lists without duplicate data), and
+/// Bookkeeping shared by all fallback registration within one install, keyed
+/// by `(file, face index)` because a collection file holds many faces: which
+/// faces already back an egui font, which font id serves each face (so one
+/// face can join several variants' family lists without duplicate data), and
 /// which user entries have already produced a warning.
 #[derive(Default)]
 struct FallbackBook {
-    loaded_paths: HashSet<PathBuf>,
-    ids_by_path: HashMap<PathBuf, String>,
+    loaded_faces: HashSet<(PathBuf, u32)>,
+    ids_by_face: HashMap<(PathBuf, u32), String>,
     warned_entries: HashSet<String>,
     /// Faces withheld from egui because they carry no outlines.  Kept so a
-    /// later variant's chain doesn't re-read and re-probe the same file.
-    color_only: HashSet<PathBuf>,
+    /// later variant's chain doesn't re-read and re-probe the same face.
+    color_only: HashSet<(PathBuf, u32)>,
     /// Height ratio of the primary normal face, used to normalize fallback
     /// faces to the same visual size at a given point size.
     primary_height_ratio: Option<f32>,
@@ -505,18 +506,19 @@ fn register_user_fallbacks(
             }
             continue;
         };
-        if book.color_only.contains(&resolved.path) {
+        let key = (resolved.path.clone(), resolved.face_index);
+        if book.color_only.contains(&key) {
             book.extend_chain(variant, &resolved.path, resolved.face_index, true);
             continue;
         }
-        if let Some(id) = book.ids_by_path.get(&resolved.path) {
+        if let Some(id) = book.ids_by_face.get(&key) {
             for family in targets {
                 defs.families.entry(family.clone()).or_default().push(id.clone());
             }
             book.extend_chain(variant, &resolved.path, resolved.face_index, false);
             continue;
         }
-        if book.loaded_paths.contains(&resolved.path) {
+        if book.loaded_faces.contains(&key) {
             // Already registered as a primary face, which sits ahead of every
             // fallback in the family lists; appending it again is pointless.
             continue;
@@ -532,7 +534,7 @@ fn register_user_fallbacks(
             log::debug!(
                 "font.fallback entry '{entry}' has no outlines; drawing it as colour glyphs"
             );
-            book.color_only.insert(resolved.path.clone());
+            book.color_only.insert(key);
             book.extend_chain(variant, &resolved.path, resolved.face_index, true);
             continue;
         }
@@ -544,8 +546,8 @@ fn register_user_fallbacks(
             defs.families.entry(family.clone()).or_default().push(id.clone());
         }
         book.extend_chain(variant, &resolved.path, resolved.face_index, false);
-        book.loaded_paths.insert(resolved.path.clone());
-        book.ids_by_path.insert(resolved.path, id);
+        book.loaded_faces.insert(key.clone());
+        book.ids_by_face.insert(key, id);
     }
 }
 
@@ -596,7 +598,7 @@ fn install_ui_font(defs: &mut FontDefinitions, family_or_path: &str, fonts: &Sys
             return false;
         },
     };
-    insert_face(defs, UI_FONT_ID, bytes);
+    insert_face(defs, UI_FONT_ID, bytes, resolved.face_index);
     let ui_family = FontFamily::Name(UI_FAMILY.into());
     defs.families.insert(ui_family.clone(), vec![UI_FONT_ID.to_string()]);
 
@@ -604,7 +606,7 @@ fn install_ui_font(defs: &mut FontDefinitions, family_or_path: &str, fonts: &Sys
     // chain (which feeds the colour-glyph renderer), and fallback height
     // normalization must anchor to the UI face, not the terminal face.
     let mut book = FallbackBook::default();
-    book.loaded_paths.insert(resolved.path.clone());
+    book.loaded_faces.insert((resolved.path.clone(), resolved.face_index));
     book.primary_height_ratio = face_height_ratio(bytes, resolved.face_index);
     let targets = [ui_family.clone()];
     register_fallback_faces(
@@ -635,26 +637,41 @@ pub fn install_terminal_fonts(
     font: &FontConfig,
     ui_family: Option<&str>,
 ) -> Vec<ChainFace> {
+    let fonts = SystemFonts::default();
+    match build_font_definitions(font, ui_family, &fonts) {
+        Some((defs, chain)) => {
+            ctx.set_fonts(defs);
+            chain
+        },
+        None => Vec::new(),
+    }
+}
+
+/// Resolve and register every face for `install_terminal_fonts`, separated
+/// from the egui handoff so tests can inspect what registration produced.
+fn build_font_definitions(
+    font: &FontConfig,
+    ui_family: Option<&str>,
+    fonts: &SystemFonts,
+) -> Option<(FontDefinitions, Vec<ChainFace>)> {
     let (normal, bold, italic, bold_italic) =
         (&font.normal, &font.bold, &font.italic, &font.bold_italic);
     let family = normal.family.as_deref().unwrap_or(DEFAULT_FAMILY);
-    let fonts = SystemFonts::default();
 
     // The variant lookups compare their resolved path against this one to
     // detect when fontconfig substituted the regular face for a missing variant.
-    let normal_match = match resolve_face(family, normal.style.as_deref(), Variant::Normal, &fonts)
-    {
+    let normal_match = match resolve_face(family, normal.style.as_deref(), Variant::Normal, fonts) {
         Some(m) => m,
         None => {
             log::warn!("could not resolve font '{family}'; using bundled monospace");
-            return Vec::new();
+            return None;
         },
     };
     let normal_bytes = match map_font_file(&normal_match.path) {
         Ok(b) => b,
         Err(e) => {
             log::warn!("could not read font file {}: {e}", normal_match.path.display());
-            return Vec::new();
+            return None;
         },
     };
 
@@ -663,41 +680,37 @@ pub fn install_terminal_fonts(
     let italic_family = italic.family.as_deref().unwrap_or(family);
     let bold_italic_family = bold_italic.family.as_deref().unwrap_or(family);
 
-    let bold_bytes =
-        load_variant(bold_family, bold.style.as_deref(), Variant::Bold, &normal_match.path, &fonts);
-    let italic_bytes = load_variant(
-        italic_family,
-        italic.style.as_deref(),
-        Variant::Italic,
-        &normal_match.path,
-        &fonts,
-    );
-    let bold_italic_bytes = load_variant(
+    let bold_face =
+        load_variant(bold_family, bold.style.as_deref(), Variant::Bold, &normal_match, fonts);
+    let italic_face =
+        load_variant(italic_family, italic.style.as_deref(), Variant::Italic, &normal_match, fonts);
+    let bold_italic_face = load_variant(
         bold_italic_family,
         bold_italic.style.as_deref(),
         Variant::BoldItalic,
-        &normal_match.path,
-        &fonts,
+        &normal_match,
+        fonts,
     );
 
     let mut defs = FontDefinitions::default();
+    let normal_face = (normal_bytes, normal_match.face_index);
 
-    insert_face(&mut defs, NORMAL_FONT_ID, normal_bytes);
+    insert_face(&mut defs, NORMAL_FONT_ID, normal_bytes, normal_match.face_index);
     register_default_family(&mut defs, FontFamily::Monospace, NORMAL_FONT_ID);
     register_default_family(&mut defs, FontFamily::Proportional, NORMAL_FONT_ID);
 
-    register_variant(&mut defs, BOLD_FONT_ID, BOLD_FAMILY, bold_bytes, normal_bytes);
-    register_variant(&mut defs, ITALIC_FONT_ID, ITALIC_FAMILY, italic_bytes, normal_bytes);
+    register_variant(&mut defs, BOLD_FONT_ID, BOLD_FAMILY, bold_face, normal_face);
+    register_variant(&mut defs, ITALIC_FONT_ID, ITALIC_FAMILY, italic_face, normal_face);
     register_variant(
         &mut defs,
         BOLD_ITALIC_FONT_ID,
         BOLD_ITALIC_FAMILY,
-        bold_italic_bytes,
-        normal_bytes,
+        bold_italic_face,
+        normal_face,
     );
 
     let mut book = FallbackBook::default();
-    book.loaded_paths.insert(normal_match.path.clone());
+    book.loaded_faces.insert((normal_match.path.clone(), normal_match.face_index));
     book.primary_height_ratio = face_height_ratio(normal_bytes, normal_match.face_index);
     // The primary is registered unconditionally above, so it heads the chain
     // as an egui-drawable face even in the pathological case of a colour-only
@@ -726,16 +739,15 @@ pub fn install_terminal_fonts(
         ),
     ];
     for (family, style, variant, targets) in seeds {
-        register_user_fallbacks(&mut defs, &font.fallback, variant, targets, &fonts, &mut book);
-        register_fallback_faces(&mut defs, family, style, variant, targets, &fonts, &mut book);
+        register_user_fallbacks(&mut defs, &font.fallback, variant, targets, fonts, &mut book);
+        register_fallback_faces(&mut defs, family, style, variant, targets, fonts, &mut book);
     }
 
     if let Some(ui_family) = ui_family {
-        install_ui_font(&mut defs, ui_family, &fonts);
+        install_ui_font(&mut defs, ui_family, fonts);
     }
 
-    ctx.set_fonts(defs);
-    book.chain
+    Some((defs, book.chain))
 }
 
 /// Append every font from fontconfig's trimmed sort to `target_families` so
@@ -753,10 +765,10 @@ fn register_fallback_faces(
 ) {
     // Only primaries lack an id to reuse; everything else the chain finds
     // can join this variant's family list without reloading.
-    let primaries: HashSet<PathBuf> = book
-        .loaded_paths
+    let primaries: HashSet<(PathBuf, u32)> = book
+        .loaded_faces
         .iter()
-        .filter(|path| !book.ids_by_path.contains_key(*path))
+        .filter(|face| !book.ids_by_face.contains_key(*face))
         .cloned()
         .collect();
     let fallbacks =
@@ -766,11 +778,12 @@ fn register_fallback_faces(
     }
 
     for face in fallbacks {
-        if book.color_only.contains(&face.path) {
+        let key = (face.path.clone(), face.face_index);
+        if book.color_only.contains(&key) {
             book.extend_chain(variant, &face.path, face.face_index, true);
             continue;
         }
-        if let Some(id) = book.ids_by_path.get(&face.path) {
+        if let Some(id) = book.ids_by_face.get(&key) {
             for family in target_families {
                 defs.families.entry(family.clone()).or_default().push(id.clone());
             }
@@ -785,7 +798,7 @@ fn register_fallback_faces(
             },
         };
         if is_color_only(bytes, face.face_index) {
-            book.color_only.insert(face.path.clone());
+            book.color_only.insert(key);
             book.extend_chain(variant, &face.path, face.face_index, true);
             continue;
         }
@@ -798,8 +811,8 @@ fn register_fallback_faces(
             defs.families.entry(family.clone()).or_default().push(id.clone());
         }
         book.extend_chain(variant, &face.path, face.face_index, false);
-        book.loaded_paths.insert(face.path.clone());
-        book.ids_by_path.insert(face.path, id);
+        book.loaded_faces.insert(key.clone());
+        book.ids_by_face.insert(key, id);
     }
 }
 
@@ -813,11 +826,11 @@ fn gather_fallback_faces(
     family: &str,
     style: Option<&str>,
     variant: Variant,
-    skip_paths: &HashSet<PathBuf>,
+    skip_faces: &HashSet<(PathBuf, u32)>,
     limit: usize,
     _fonts: &SystemFonts,
 ) -> Vec<FallbackFace> {
-    fontconfig_resolve::sorted_fallbacks(family, style, variant, skip_paths, limit)
+    fontconfig_resolve::sorted_fallbacks(family, style, variant, skip_faces, limit)
 }
 
 #[cfg(not(unix))]
@@ -833,12 +846,12 @@ fn cmap_coverage(face: &ttf_parser::Face) -> Option<coverage::Coverage> {
     Some(coverage::Coverage::from_codepoints(codepoints))
 }
 
-/// Coverage of an already-resolved primary face.  Reads index 0, matching
-/// how the primary bytes are handed to egui.
+/// Coverage of an already-resolved primary face, read at its resolved face
+/// index — face 0 of a collection file can be an unrelated family.
 #[cfg(not(unix))]
-fn face_coverage_from_path(path: &Path) -> Option<coverage::Coverage> {
+fn face_coverage(path: &Path, face_index: u32) -> Option<coverage::Coverage> {
     let data = std::fs::read(path).ok()?;
-    let parsed = ttf_parser::Face::parse(&data, 0).ok()?;
+    let parsed = ttf_parser::Face::parse(&data, face_index).ok()?;
     cmap_coverage(&parsed)
 }
 
@@ -850,18 +863,20 @@ fn gather_fallback_faces(
     family: &str,
     style: Option<&str>,
     variant: Variant,
-    skip_paths: &HashSet<PathBuf>,
+    skip_faces: &HashSet<(PathBuf, u32)>,
     limit: usize,
     fonts: &SystemFonts,
 ) -> Vec<FallbackFace> {
     let seed_coverage = resolve_face(family, style, variant, fonts)
-        .and_then(|face| face_coverage_from_path(&face.path))
+        .and_then(|face| face_coverage(&face.path, face.face_index))
         .unwrap_or_default();
 
     let mut candidates: Vec<_> = fonts
         .scanned_coverage()
         .iter()
-        .filter(|(candidate, _)| !skip_paths.contains(&candidate.path))
+        .filter(|(candidate, _)| {
+            !skip_faces.contains(&(candidate.path.clone(), candidate.face_index))
+        })
         .cloned()
         .collect();
     let (weight, db_style) = variant_query(variant);
@@ -913,8 +928,9 @@ fn map_font_file(path: &Path) -> std::io::Result<&'static [u8]> {
     Ok(bytes)
 }
 
-fn insert_face(defs: &mut FontDefinitions, id: &str, bytes: &'static [u8]) {
-    defs.font_data.insert(id.to_string(), Arc::new(FontData::from_static(bytes)));
+fn insert_face(defs: &mut FontDefinitions, id: &str, bytes: &'static [u8], face_index: u32) {
+    let data = FontData { index: face_index, ..FontData::from_static(bytes) };
+    defs.font_data.insert(id.to_string(), Arc::new(data));
 }
 
 fn register_default_family(defs: &mut FontDefinitions, family: FontFamily, id: &str) {
@@ -925,26 +941,29 @@ fn register_variant(
     defs: &mut FontDefinitions,
     font_id: &str,
     family_name: &str,
-    bytes: Option<&'static [u8]>,
-    fallback: &'static [u8],
+    face: Option<(&'static [u8], u32)>,
+    fallback: (&'static [u8], u32),
 ) {
-    let bytes = bytes.unwrap_or(fallback);
-    insert_face(defs, font_id, bytes);
+    let (bytes, face_index) = face.unwrap_or(fallback);
+    insert_face(defs, font_id, bytes, face_index);
     defs.families.insert(FontFamily::Name(family_name.into()), vec![font_id.to_string()]);
 }
 
-/// Returns the bytes of the variant face if a *real* variant exists, or
-/// `None` if the matcher fell back to the normal file.  The caller registers
-/// the normal face as a fallback under the variant's family name.
+/// Returns the bytes and face index of the variant face if a *real* variant
+/// exists, or `None` if the matcher fell back to the normal face.  A
+/// collection file holds many faces, so "fell back" means the same file *and*
+/// the same face index — the bold sibling of a `.ttc` family lives in the
+/// same file.  The caller registers the normal face as a fallback under the
+/// variant's family name.
 fn load_variant(
     family: &str,
     style: Option<&str>,
     variant: Variant,
-    normal_path: &Path,
+    normal: &ResolvedFace,
     fonts: &SystemFonts,
-) -> Option<&'static [u8]> {
+) -> Option<(&'static [u8], u32)> {
     let resolved = resolve_face(family, style, variant, fonts)?;
-    if resolved.path == normal_path {
+    if resolved.path == normal.path && resolved.face_index == normal.face_index {
         log::debug!(
             "no real {} face for '{family}'; cells with that style will use the regular face",
             variant.label()
@@ -952,7 +971,7 @@ fn load_variant(
         return None;
     }
     match map_font_file(&resolved.path) {
-        Ok(b) => Some(b),
+        Ok(b) => Some((b, resolved.face_index)),
         Err(e) => {
             log::warn!(
                 "could not read {} font file {}: {e}",
@@ -1118,7 +1137,7 @@ mod fontconfig_resolve {
         family: &str,
         style: Option<&str>,
         variant: Variant,
-        skip_paths: &HashSet<PathBuf>,
+        skip_faces: &HashSet<(PathBuf, u32)>,
         limit: usize,
     ) -> Vec<FallbackFace> {
         let Some(fc) = Fontconfig::new() else {
@@ -1161,10 +1180,10 @@ mod fontconfig_resolve {
                 continue;
             };
             let path = PathBuf::from(path_str);
-            if skip_paths.contains(&path) {
+            let face_index = matched.face_index().unwrap_or(0).max(0) as u32;
+            if skip_faces.contains(&(path.clone(), face_index)) {
                 continue;
             }
-            let face_index = matched.face_index().unwrap_or(0).max(0) as u32;
             out.push(FallbackFace { path, face_index });
         }
         out
@@ -1208,8 +1227,8 @@ mod tests {
             &mut book,
         );
 
-        assert_eq!(book.ids_by_path.len(), 1);
-        let id = book.ids_by_path.values().next().unwrap();
+        assert_eq!(book.ids_by_face.len(), 1);
+        let id = book.ids_by_face.values().next().unwrap();
         assert!(defs.families[&FontFamily::Monospace].contains(id));
         assert!(defs.families[&FontFamily::Name(BOLD_FAMILY.into())].contains(id));
 
@@ -1263,7 +1282,7 @@ mod tests {
         let targets = [FontFamily::Monospace];
         register_user_fallbacks(&mut defs, &entries, Variant::Normal, &targets, &fonts, &mut book);
 
-        let id = book.ids_by_path.get(&path).expect("fallback registered");
+        let id = book.ids_by_face.get(&(path.clone(), 0)).expect("fallback registered");
         let data = &defs.font_data[id];
         assert!(
             matches!(data.font, std::borrow::Cow::Borrowed(_)),
@@ -1301,7 +1320,7 @@ mod tests {
         assert!(faces.len() <= 8);
         let mut seen = HashSet::new();
         for face in &faces {
-            assert!(!skip.contains(&face.path));
+            assert!(!skip.contains(&(face.path.clone(), face.face_index)));
             assert!(seen.insert((face.path.clone(), face.face_index)));
         }
         // On any machine with system fonts the chain must not be empty —
@@ -1328,30 +1347,33 @@ mod tests {
             &fonts,
             &mut book,
         );
-        let normal_ids: HashSet<String> = book.ids_by_path.values().cloned().collect();
+        let normal_ids: HashSet<String> = book.ids_by_face.values().cloned().collect();
+        let loaded_before = defs.font_data.len();
 
+        // A later chain that resolves to already-loaded faces (here: the same
+        // family and variant, targeting another family list) must reuse them —
+        // joining the new family list without registering duplicate font data.
         let bold_family = FontFamily::Name(BOLD_FAMILY.into());
         let bold_targets = [bold_family.clone()];
         register_fallback_faces(
             &mut defs,
             "Consolas",
-            Some("Bold"),
-            Variant::Bold,
+            None,
+            Variant::Normal,
             &bold_targets,
             &fonts,
             &mut book,
         );
 
         if fonts.db().faces().next().is_some() && !normal_ids.is_empty() {
-            // The bold chain must be able to reach faces the normal chain already
-            // loaded; on any real system at least one top coverage-adder overlaps.
+            assert_eq!(defs.font_data.len(), loaded_before);
             assert!(defs.families[&bold_family].iter().any(|id| normal_ids.contains(id)));
         }
     }
 
     #[cfg(not(unix))]
     #[test]
-    fn automatic_chain_records_every_loaded_path_in_ids_by_path() {
+    fn automatic_chain_records_every_loaded_face_in_ids_by_face() {
         let mut defs = FontDefinitions::default();
         let fonts = SystemFonts::with_cache_dir(None);
         let mut book = FallbackBook::default();
@@ -1368,8 +1390,8 @@ mod tests {
         );
 
         if fonts.db().faces().next().is_some() {
-            let ids_keys: HashSet<_> = book.ids_by_path.keys().cloned().collect();
-            assert_eq!(ids_keys, book.loaded_paths);
+            let ids_keys: HashSet<_> = book.ids_by_face.keys().cloned().collect();
+            assert_eq!(ids_keys, book.loaded_faces);
         }
     }
 
@@ -1394,7 +1416,7 @@ mod tests {
         let targets = [FontFamily::Monospace];
 
         register_user_fallbacks(&mut defs, &entries, Variant::Normal, &targets, &fonts, &mut book);
-        let user_id = book.ids_by_path.get(&path).cloned().unwrap();
+        let user_id = book.ids_by_face.get(&(path.clone(), 0)).cloned().unwrap();
         let user_index =
             defs.families[&FontFamily::Monospace].iter().position(|id| *id == user_id).unwrap();
         let before_len = defs.families[&FontFamily::Monospace].len();
@@ -1421,13 +1443,61 @@ mod tests {
     }
 
     #[test]
+    fn primary_face_keeps_its_collection_index() {
+        // A family living at a nonzero face index of a collection file must
+        // reach egui with that index — face 0 of the same file is a different
+        // family entirely (every Sarasa family shares one .ttc, for example),
+        // and rendering it gives every cell the wrong glyph and metrics.
+        let fonts = SystemFonts::with_cache_dir(None);
+        let families: Vec<String> = fonts
+            .db()
+            .faces()
+            .filter(|face| face.index > 0)
+            .filter_map(|face| face.families.first().map(|(name, _)| name.clone()))
+            .collect();
+        let Some((family, resolved)) = families.iter().find_map(|family| {
+            let resolved = resolve_face(family, None, Variant::Normal, &fonts)?;
+            (resolved.face_index > 0).then(|| (family.clone(), resolved))
+        }) else {
+            // No installed collection resolves past face 0; nothing to check.
+            return;
+        };
+
+        let config = crate::config::FontConfig {
+            normal: crate::config::FontFace { family: Some(family), style: None },
+            ..Default::default()
+        };
+        let (defs, chain) = build_font_definitions(&config, None, &fonts).expect("family resolves");
+
+        assert_eq!(defs.font_data[NORMAL_FONT_ID].index, resolved.face_index);
+        assert_eq!(chain[0].face_index, resolved.face_index);
+    }
+
+    #[test]
     fn primary_faces_are_never_tweaked() {
         // Fallback faces get a tweak that rescales them to the primary
         // face's height; the primary itself is the scale reference and must
         // never carry a tweak, or scaling would be relative to a moving target.
         let mut defs = FontDefinitions::default();
-        insert_face(&mut defs, "test_primary", b"egui parses this later; registration only maps");
+        insert_face(
+            &mut defs,
+            "test_primary",
+            b"egui parses this later; registration only maps",
+            0,
+        );
         assert_eq!(defs.font_data["test_primary"].tweak, FontTweak::default());
+    }
+
+    #[test]
+    fn variant_faces_carry_their_collection_index() {
+        // A real variant keeps its own face index; a missing variant falls
+        // back to the normal face *and* its index.
+        let mut defs = FontDefinitions::default();
+        let normal: (&'static [u8], u32) = (b"normal bytes", 3);
+        register_variant(&mut defs, BOLD_FONT_ID, BOLD_FAMILY, Some((b"bold bytes", 7)), normal);
+        register_variant(&mut defs, ITALIC_FONT_ID, ITALIC_FAMILY, None, normal);
+        assert_eq!(defs.font_data[BOLD_FONT_ID].index, 7);
+        assert_eq!(defs.font_data[ITALIC_FONT_ID].index, 3);
     }
 
     #[cfg(not(unix))]
