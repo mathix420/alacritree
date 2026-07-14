@@ -765,20 +765,25 @@ impl State {
             if pressed {
                 if is_cut_command(self.egui_input.modifiers, active_key) {
                     self.egui_input.events.push(egui::Event::Cut);
-                    return;
+                    // alacritree: fall through to the Key event as well.  These
+                    // commands ignore Shift, so Ctrl+Shift+C matches them just
+                    // like Ctrl+C; swallowing the keystroke would leave the
+                    // binding table unable to tell the copy shortcut apart from
+                    // the interrupt, and terminal apps would never see ETX/CAN.
                 } else if is_copy_command(self.egui_input.modifiers, active_key) {
                     self.egui_input.events.push(egui::Event::Copy);
-                    return;
                 } else if is_paste_command(self.egui_input.modifiers, active_key) {
-                    // alacritree: fall through to Key event when the clipboard
-                    // had no text, so terminal apps still see raw 0x16.
                     if let Some(contents) = self.clipboard.get() {
                         let contents = contents.replace("\r\n", "\n");
                         if !contents.is_empty() {
                             self.egui_input.events.push(egui::Event::Paste(contents));
-                            return;
                         }
                     }
+                    // alacritree: fall through to the Key event as well, like
+                    // cut/copy above.  This command ignores Shift, so Ctrl+V and
+                    // Ctrl+Shift+V raise the same Paste event; without the
+                    // keystroke the binding table cannot tell them apart, and
+                    // terminal apps would never see raw 0x16.
                 }
             }
 

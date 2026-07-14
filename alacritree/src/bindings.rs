@@ -87,7 +87,16 @@ pub fn parse_bindings(raw: Vec<RawBinding>) -> Vec<KeyBinding> {
             }
             continue;
         };
-        let mods = r.mods.as_deref().map_or(Modifiers::NONE, parse_mods);
+        let mods = match r.mods.as_deref() {
+            None => Modifiers::NONE,
+            Some(s) => match parse_mods(s) {
+                Some(m) => m,
+                None => {
+                    log::warn!("ignoring binding for '{}': mods '{s}' unavailable here", r.key);
+                    continue;
+                },
+            },
+        };
         let action = if let Some(chars) = r.chars {
             BindingAction::Chars(unescape(&chars).into_bytes())
         } else if let Some(action) = r.action {
@@ -409,7 +418,9 @@ fn f_key(n: u8) -> Option<Key> {
     })
 }
 
-fn parse_mods(s: &str) -> Modifiers {
+/// `None` when the chord can't be represented on this platform, so the caller
+/// drops the binding rather than letting it fire on the wrong keys.
+fn parse_mods(s: &str) -> Option<Modifiers> {
     let mut m = Modifiers::NONE;
     for token in s.split('|') {
         match token.trim() {
@@ -420,17 +431,17 @@ fn parse_mods(s: &str) -> Modifiers {
             other => log::warn!("unknown modifier '{other}'"),
         }
     }
-    // egui has no separate Super modifier: on non-mac platforms egui-winit
-    // folds the Ctrl key into `command`, so a "Command"/"Super" binding
-    // already fires on Ctrl at match time.  Canonicalize to `ctrl` so
-    // parse-time trigger comparison (default replacement) agrees with
-    // runtime matching.
+    // Off macOS there is no Super modifier to match on: egui carries no such
+    // field, and egui-winit raises `command` on every Ctrl press.  A Super
+    // chord could therefore only ever fire on the Ctrl chord instead — and for
+    // the clipboard bindings a shared alacritty.toml carries (`Super+C ->
+    // Copy`), that means eating Ctrl+C.  Drop it rather than steal the
+    // interrupt.
     #[cfg(not(target_os = "macos"))]
     if m.command {
-        m.ctrl = true;
-        m.command = false;
+        return None;
     }
-    m
+    Some(m)
 }
 
 fn parse_action(name: &str) -> BindingAction {
@@ -537,6 +548,46 @@ mod tests {
         }
     }
 
+    /// A shared alacritty.toml commonly carries macOS clipboard bindings like
+    /// `Super+C -> Copy`.  egui has no Super modifier and egui-winit raises
+    /// `command` on every Ctrl press, so honoring that binding here would let
+    /// it fire on Ctrl+C and swallow the interrupt every terminal app needs.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn super_binding_does_not_swallow_the_interrupt() {
+        let bindings = parse_bindings(vec![raw_action("c", Some("Super"), "Copy")]);
+        let ctrl = Modifiers { ctrl: true, command: true, ..Modifiers::NONE };
+        let matched = all_matches(&bindings, Key::C, ctrl);
+        assert!(matched.is_empty(), "Super+C hijacked Ctrl+C: {matched:?}");
+    }
+
+    /// Ctrl+Shift+C stays the copy shortcut.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn ctrl_shift_c_still_copies() {
+        let bindings = parse_bindings(vec![]);
+        let ctrl_shift = Modifiers { ctrl: true, shift: true, command: true, ..Modifiers::NONE };
+        let matched = all_matches(&bindings, Key::C, ctrl_shift);
+        assert!(
+            matched.iter().any(|a| matches!(a, BindingAction::Named(NamedAction::Copy))),
+            "Ctrl+Shift+C no longer copies: {matched:?}"
+        );
+    }
+
+    /// Paste is a Ctrl+Shift+V binding; Ctrl+V belongs to the PTY (SYN).
+    #[test]
+    fn ctrl_v_is_not_bound_to_paste() {
+        let bindings = parse_bindings(vec![]);
+        let matched = all_matches(&bindings, Key::V, Modifiers::CTRL);
+        assert!(matched.is_empty(), "Ctrl+V is bound: {matched:?}");
+
+        let matched = all_matches(&bindings, Key::V, Modifiers::CTRL | Modifiers::SHIFT);
+        assert!(
+            matched.iter().any(|a| matches!(a, BindingAction::Named(NamedAction::Paste))),
+            "Ctrl+Shift+V no longer pastes: {matched:?}"
+        );
+    }
+
     /// The `NamedAction`s that fire for a key press, ignoring other kinds.
     fn named_matches(bindings: &[KeyBinding], key: Key, mods: Modifiers) -> Vec<NamedAction> {
         all_matches(bindings, key, mods)
@@ -612,15 +663,6 @@ mod tests {
         let b = parse_bindings(vec![raw_action("F1", None, "FlyToTheMoon")]);
         let m = all_matches(&b, Key::F1, Modifiers::NONE);
         assert!(matches!(m.as_slice(), [BindingAction::Unsupported(n)] if n == "FlyToTheMoon"));
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn command_mods_replace_ctrl_default_on_non_mac() {
-        // "Super"/"Command" fire on Ctrl at runtime (egui folds them), so
-        // they must also replace Ctrl defaults at parse time.
-        let b = parse_bindings(vec![raw_action("T", Some("Super"), "None")]);
-        assert_eq!(named_matches(&b, Key::T, Modifiers::CTRL), vec![NamedAction::NoOp]);
     }
 
     #[test]

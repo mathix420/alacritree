@@ -118,6 +118,11 @@ fn run_create(
         send("Enabled Claude Code terminal bell");
     }
 
+    let linked = crate::doppler::mirror_scopes(&req.project_root, &target);
+    if linked > 0 {
+        send(&format!("Linked {linked} Doppler scope(s)"));
+    }
+
     Ok(target)
 }
 
@@ -363,6 +368,10 @@ pub fn delete_worktree(
     force: bool,
 ) -> Result<(), String> {
     let path_str = worktree_path.to_str().ok_or_else(|| "invalid worktree path".to_string())?;
+    // Resolve before removal: canonicalize needs the directory to still
+    // exist, and the doppler cleanup below runs after git has deleted it.
+    let scope_root =
+        std::fs::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.to_path_buf());
     let mut args: Vec<&str> = vec!["worktree", "remove"];
     if force {
         args.push("--force");
@@ -372,6 +381,10 @@ pub fn delete_worktree(
     if let Some(branch) = branch {
         // Branch may already be gone (e.g. detached HEAD) — ignore errors here.
         let _ = run_git(project_root, &["branch", "-D", branch]);
+    }
+    let cleaned = crate::doppler::forget_scopes(&scope_root);
+    if cleaned > 0 {
+        log::info!("dropped {cleaned} doppler scope(s) under {}", scope_root.display());
     }
     Ok(())
 }

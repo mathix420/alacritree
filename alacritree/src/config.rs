@@ -33,6 +33,9 @@ pub struct Config {
     pub shell: Option<ShellConfig>,
     pub selection: SelectionConfig,
     pub bindings: Vec<KeyBinding>,
+    /// Offer the IPC socket that `alacritree mcp` connects to.  Mirrors
+    /// alacritty's `[general] ipc_socket` (default on).
+    pub ipc_socket: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +200,7 @@ impl Default for Config {
             shell: None,
             selection: SelectionConfig::default(),
             bindings: Vec::new(),
+            ipc_socket: true,
         }
     }
 }
@@ -439,6 +443,17 @@ struct RawConfig {
     terminal: RawTerminal,
     selection: RawSelection,
     keyboard: RawKeyboard,
+    general: RawGeneral,
+}
+
+/// Subset of alacritty's `[general]` section that alacritree honors.  It
+/// lives in the shared `alacritty.toml`, so disabling alacritty's socket
+/// disables ours too — the two sockets are separate files, but the intent
+/// ("no IPC") is the same.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawGeneral {
+    ipc_socket: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -776,6 +791,7 @@ impl RawConfig {
             shell,
             selection,
             bindings,
+            ipc_socket: self.general.ipc_socket.unwrap_or(true),
         }
     }
 }
