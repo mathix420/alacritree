@@ -102,7 +102,7 @@ fn paint_panel_border(ctx: &Context, x: f32, y_range: egui::Rangef, color: Color
     // border bleeds through whatever modal is open.
     let layer =
         egui::LayerId::new(egui::Order::Middle, egui::Id::new(("sidebar_border", x.to_bits())));
-    ctx.layer_painter(layer).vline(x, y_range, Stroke::new(1.0, color));
+    ctx.layer_painter(layer).vline(x, y_range, Stroke::new(1.0_f32, color));
 }
 
 fn blend_toward(c: Color32, target: Color32, amount: f32) -> Color32 {
@@ -1257,7 +1257,7 @@ fn modal_frame(theme: &Theme) -> Frame {
     let pad_y = (12.0 * s).round() as i8;
     Frame::default()
         .fill(theme.sidebar_bg)
-        .stroke(Stroke::new(1.0, theme.sidebar_border))
+        .stroke(Stroke::new(1.0_f32, theme.sidebar_border))
         .inner_margin(Margin { left: pad_x, right: pad_x, top: pad_y, bottom: pad_y })
 }
 
