@@ -6,6 +6,12 @@
 //! deep-merge.  alacritree-specific options live under the `[ui]` (sidebar
 //! colors, etc.) and `[workspace]` (worktree location) tables and are only
 //! valid in `alacritree.toml`.
+//!
+//! Binding actions that only exist in alacritree (`ToggleLeftSidebar`,
+//! `SelectNextWorkspace`, `AddProject`, …) belong in `alacritree.toml` too:
+//! real alacritty warns about unknown actions if it sees them in the shared
+//! `alacritty.toml`, and the array-concatenating merge means bindings placed
+//! in `alacritree.toml` still add to (never clobber) the shared ones.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,6 +35,9 @@ pub struct Config {
     pub shell: Option<ShellConfig>,
     pub selection: SelectionConfig,
     pub bindings: Vec<KeyBinding>,
+    /// Offer the IPC socket that `alacritree mcp` connects to.  Mirrors
+    /// alacritty's `[general] ipc_socket` (default on).
+    pub ipc_socket: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +167,41 @@ pub struct Palette {
     pub draw_bold_with_bright: bool,
 }
 
+/// When the sidebar's per-session `×` asks before killing the PTY.
+/// Confirmations otherwise exist only at worktree/app level, so the
+/// default keeps session close immediate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConfirmSessionClose {
+    #[default]
+    Never,
+    /// Prompt only when the session looks busy (agent glyph or spinner title).
+    Busy,
+    Always,
+}
+
+impl ConfirmSessionClose {
+    pub fn requires_prompt(self, busy: bool) -> bool {
+        match self {
+            Self::Never => false,
+            Self::Busy => busy,
+            Self::Always => true,
+        }
+    }
+}
+
+fn parse_confirm_session_close(raw: Option<&str>) -> ConfirmSessionClose {
+    match raw {
+        None => ConfirmSessionClose::default(),
+        Some("never") => ConfirmSessionClose::Never,
+        Some("busy") => ConfirmSessionClose::Busy,
+        Some("always") => ConfirmSessionClose::Always,
+        Some(other) => {
+            log::warn!("unknown ui.confirm_session_close value {other:?}, using \"never\"");
+            ConfirmSessionClose::default()
+        },
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UiTheme {
     pub sidebar_background: Option<Color32>,
@@ -166,6 +210,8 @@ pub struct UiTheme {
     pub sidebar_accent: Option<Color32>,
     /// Fire a desktop notification when a non-visible session needs attention.
     pub notifications: bool,
+    /// Ask before the sidebar's per-session `×` kills the PTY.
+    pub confirm_session_close: ConfirmSessionClose,
 }
 
 impl Default for UiTheme {
@@ -176,6 +222,7 @@ impl Default for UiTheme {
             sidebar_border: None,
             sidebar_accent: None,
             notifications: true,
+            confirm_session_close: ConfirmSessionClose::Never,
         }
     }
 }
@@ -231,6 +278,7 @@ impl Default for Config {
             shell: None,
             selection: SelectionConfig::default(),
             bindings: Vec::new(),
+            ipc_socket: true,
         }
     }
 }
@@ -474,6 +522,17 @@ struct RawConfig {
     terminal: RawTerminal,
     selection: RawSelection,
     keyboard: RawKeyboard,
+    general: RawGeneral,
+}
+
+/// Subset of alacritty's `[general]` section that alacritree honors.  It
+/// lives in the shared `alacritty.toml`, so disabling alacritty's socket
+/// disables ours too — the two sockets are separate files, but the intent
+/// ("no IPC") is the same.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawGeneral {
+    ipc_socket: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -640,6 +699,9 @@ struct RawUi {
     sidebar_border: Option<RgbStr>,
     sidebar_accent: Option<RgbStr>,
     notifications: Option<bool>,
+    /// When the sidebar × on a session row asks before killing the PTY:
+    /// "never" (default) | "busy" | "always".
+    confirm_session_close: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -752,6 +814,9 @@ impl RawConfig {
             sidebar_border: self.ui.sidebar_border.map(|v| rgb_to_color32(v.0)),
             sidebar_accent: self.ui.sidebar_accent.map(|v| rgb_to_color32(v.0)),
             notifications: self.ui.notifications.unwrap_or(true),
+            confirm_session_close: parse_confirm_session_close(
+                self.ui.confirm_session_close.as_deref(),
+            ),
         };
 
         // ---- Font ----
@@ -866,6 +931,7 @@ impl RawConfig {
             shell,
             selection,
             bindings,
+            ipc_socket: self.general.ipc_socket.unwrap_or(true),
         }
     }
 }
@@ -910,6 +976,51 @@ fn rgb_to_color32(r: Rgb) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ui_from_toml(input: &str) -> UiTheme {
+        let value: toml::Value = toml::from_str(input).expect("valid toml");
+        let raw: RawConfig = value.try_into().expect("valid config");
+        raw.into_config().ui
+    }
+
+    #[test]
+    fn confirm_session_close_defaults_to_never() {
+        let ui = ui_from_toml("");
+        assert_eq!(ui.confirm_session_close, ConfirmSessionClose::Never);
+    }
+
+    #[test]
+    fn confirm_session_close_parses_all_values() {
+        for (raw, expected) in [
+            ("never", ConfirmSessionClose::Never),
+            ("busy", ConfirmSessionClose::Busy),
+            ("always", ConfirmSessionClose::Always),
+        ] {
+            let ui = ui_from_toml(&format!("[ui]\nconfirm_session_close = \"{raw}\""));
+            assert_eq!(ui.confirm_session_close, expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn confirm_session_close_invalid_falls_back_to_never() {
+        let ui = ui_from_toml("[ui]\nconfirm_session_close = \"sometimes\"");
+        assert_eq!(ui.confirm_session_close, ConfirmSessionClose::Never);
+    }
+
+    #[test]
+    fn requires_prompt_covers_policy_matrix() {
+        use ConfirmSessionClose::*;
+        for (policy, busy, expected) in [
+            (Never, false, false),
+            (Never, true, false),
+            (Busy, false, false),
+            (Busy, true, true),
+            (Always, false, true),
+            (Always, true, true),
+        ] {
+            assert_eq!(policy.requires_prompt(busy), expected, "{policy:?} busy={busy}");
+        }
+    }
 
     fn abs(tail: &str) -> String {
         if cfg!(windows) { format!("C:\\{tail}") } else { format!("/{tail}") }

@@ -45,6 +45,14 @@ pub enum NamedAction {
     /// 1-indexed.
     SelectTab(u8),
     SelectLastTab,
+    ToggleLeftSidebar,
+    ToggleRightSidebar,
+    SelectNextWorkspace,
+    SelectPreviousWorkspace,
+    AddProject,
+    ToggleSidebarFocus,
+    FocusProjectsSidebar,
+    FocusTerminal,
     Quit,
     /// Used to unbind a key — consumes the press without acting on it.
     NoOp,
@@ -82,7 +90,16 @@ pub fn parse_bindings(raw: Vec<RawBinding>) -> Vec<KeyBinding> {
             }
             continue;
         };
-        let mods = r.mods.as_deref().map_or(Modifiers::NONE, parse_mods);
+        let mods = match r.mods.as_deref() {
+            None => Modifiers::NONE,
+            Some(s) => match parse_mods(s) {
+                Some(m) => m,
+                None => {
+                    log::warn!("ignoring binding for '{}': mods '{s}' unavailable here", r.key);
+                    continue;
+                },
+            },
+        };
         let action = if let Some(chars) = r.chars {
             BindingAction::Chars(unescape(&chars).into_bytes())
         } else if let Some(action) = r.action {
@@ -94,9 +111,16 @@ pub fn parse_bindings(raw: Vec<RawBinding>) -> Vec<KeyBinding> {
         };
         out.push(KeyBinding { key, mods, action });
     }
-    // Append alacritty's hardcoded defaults at the end so user-supplied bindings
-    // (parsed first) take precedence — `matches` returns the first hit.
-    out.extend(default_bindings());
+    // Alacritty replaces a default binding when a user binding has the same
+    // trigger — key + mods (`Binding::triggers_match` in
+    // `alacritty/src/config/bindings.rs`; modes don't apply here because
+    // mode-bindings are dropped above).  Without the filter, a rebound key
+    // would run both the user action and the default one, and a key freed
+    // via `ReceiveChar` would still trigger the default.
+    let user_triggers: Vec<_> = out.iter().map(|b| (b.key, b.mods)).collect();
+    let defaults =
+        default_bindings().into_iter().filter(|d| !user_triggers.contains(&(d.key, d.mods)));
+    out.extend(defaults);
     out
 }
 
@@ -109,9 +133,9 @@ fn default_bindings() -> Vec<KeyBinding> {
     let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
     let ctrl = Modifiers::CTRL;
     let shift = Modifiers::SHIFT;
+    let alt = Modifiers::ALT;
     let alt_shift = Modifiers::ALT | Modifiers::SHIFT;
 
-    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut b = vec![
         KeyBinding { key: Key::V, mods: ctrl_shift, action: BindingAction::Named(Paste) },
         KeyBinding { key: Key::C, mods: ctrl_shift, action: BindingAction::Named(Copy) },
@@ -137,6 +161,39 @@ fn default_bindings() -> Vec<KeyBinding> {
             action: BindingAction::Chars(b"\x1b\x1b[Z".to_vec()),
         },
     ];
+
+    // App-level (alacritree) shortcuts: sidebars, session/workspace cycling,
+    // project management.  Each can be rebound, or freed for the PTY with a
+    // user binding on the same key+mods (`ReceiveChar` forwards the key,
+    // `None` swallows it).
+    b.extend([
+        KeyBinding { key: Key::B, mods: ctrl, action: BindingAction::Named(ToggleLeftSidebar) },
+        KeyBinding { key: Key::G, mods: ctrl, action: BindingAction::Named(ToggleRightSidebar) },
+        KeyBinding { key: Key::Tab, mods: ctrl, action: BindingAction::Named(SelectNextTab) },
+        KeyBinding {
+            key: Key::Tab,
+            mods: ctrl_shift,
+            action: BindingAction::Named(SelectPreviousTab),
+        },
+        KeyBinding {
+            key: Key::ArrowRight,
+            mods: alt,
+            action: BindingAction::Named(SelectNextWorkspace),
+        },
+        KeyBinding {
+            key: Key::ArrowLeft,
+            mods: alt,
+            action: BindingAction::Named(SelectPreviousWorkspace),
+        },
+        KeyBinding { key: Key::O, mods: ctrl_shift, action: BindingAction::Named(AddProject) },
+        KeyBinding {
+            key: Key::B,
+            mods: ctrl_shift,
+            action: BindingAction::Named(ToggleSidebarFocus),
+        },
+        KeyBinding { key: Key::T, mods: ctrl, action: BindingAction::Named(SpawnNewInstance) },
+        KeyBinding { key: Key::Q, mods: ctrl, action: BindingAction::Named(Quit) },
+    ]);
 
     // macOS uses Cmd instead of Ctrl+Shift for clipboard / window actions.
     #[cfg(target_os = "macos")]
@@ -369,7 +426,9 @@ fn f_key(n: u8) -> Option<Key> {
     })
 }
 
-fn parse_mods(s: &str) -> Modifiers {
+/// `None` when the chord can't be represented on this platform, so the caller
+/// drops the binding rather than letting it fire on the wrong keys.
+fn parse_mods(s: &str) -> Option<Modifiers> {
     let mut m = Modifiers::NONE;
     for token in s.split('|') {
         match token.trim() {
@@ -380,7 +439,17 @@ fn parse_mods(s: &str) -> Modifiers {
             other => log::warn!("unknown modifier '{other}'"),
         }
     }
-    m
+    // Off macOS there is no Super modifier to match on: egui carries no such
+    // field, and egui-winit raises `command` on every Ctrl press.  A Super
+    // chord could therefore only ever fire on the Ctrl chord instead — and for
+    // the clipboard bindings a shared alacritty.toml carries (`Super+C ->
+    // Copy`), that means eating Ctrl+C.  Drop it rather than steal the
+    // interrupt.
+    #[cfg(not(target_os = "macos"))]
+    if m.command {
+        return None;
+    }
+    Some(m)
 }
 
 fn parse_action(name: &str) -> BindingAction {
@@ -420,6 +489,14 @@ fn parse_action(name: &str) -> BindingAction {
         "SelectTab8" => BindingAction::Named(SelectTab(8)),
         "SelectTab9" => BindingAction::Named(SelectTab(9)),
         "SelectLastTab" => BindingAction::Named(SelectLastTab),
+        "ToggleLeftSidebar" => BindingAction::Named(ToggleLeftSidebar),
+        "ToggleRightSidebar" => BindingAction::Named(ToggleRightSidebar),
+        "SelectNextWorkspace" => BindingAction::Named(SelectNextWorkspace),
+        "SelectPreviousWorkspace" => BindingAction::Named(SelectPreviousWorkspace),
+        "AddProject" => BindingAction::Named(AddProject),
+        "ToggleSidebarFocus" => BindingAction::Named(ToggleSidebarFocus),
+        "FocusProjectsSidebar" => BindingAction::Named(FocusProjectsSidebar),
+        "FocusTerminal" => BindingAction::Named(FocusTerminal),
         "Quit" => BindingAction::Named(Quit),
         "None" => BindingAction::Named(NoOp),
         "ReceiveChar" => BindingAction::Named(ReceiveChar),
@@ -465,4 +542,195 @@ fn unescape(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw_action(key: &str, mods: Option<&str>, action: &str) -> RawBinding {
+        RawBinding {
+            key: key.into(),
+            mods: mods.map(Into::into),
+            mode: None,
+            chars: None,
+            action: Some(action.into()),
+            command: None,
+        }
+    }
+
+    /// A shared alacritty.toml commonly carries macOS clipboard bindings like
+    /// `Super+C -> Copy`.  egui has no Super modifier and egui-winit raises
+    /// `command` on every Ctrl press, so honoring that binding here would let
+    /// it fire on Ctrl+C and swallow the interrupt every terminal app needs.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn super_binding_does_not_swallow_the_interrupt() {
+        let bindings = parse_bindings(vec![raw_action("c", Some("Super"), "Copy")]);
+        let ctrl = Modifiers { ctrl: true, command: true, ..Modifiers::NONE };
+        let matched = all_matches(&bindings, Key::C, ctrl);
+        assert!(matched.is_empty(), "Super+C hijacked Ctrl+C: {matched:?}");
+    }
+
+    /// Ctrl+Shift+C stays the copy shortcut.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn ctrl_shift_c_still_copies() {
+        let bindings = parse_bindings(vec![]);
+        let ctrl_shift = Modifiers { ctrl: true, shift: true, command: true, ..Modifiers::NONE };
+        let matched = all_matches(&bindings, Key::C, ctrl_shift);
+        assert!(
+            matched.iter().any(|a| matches!(a, BindingAction::Named(NamedAction::Copy))),
+            "Ctrl+Shift+C no longer copies: {matched:?}"
+        );
+    }
+
+    /// Paste is a Ctrl+Shift+V binding; Ctrl+V belongs to the PTY (SYN).
+    #[test]
+    fn ctrl_v_is_not_bound_to_paste() {
+        let bindings = parse_bindings(vec![]);
+        let matched = all_matches(&bindings, Key::V, Modifiers::CTRL);
+        assert!(matched.is_empty(), "Ctrl+V is bound: {matched:?}");
+
+        let matched = all_matches(&bindings, Key::V, Modifiers::CTRL | Modifiers::SHIFT);
+        assert!(
+            matched.iter().any(|a| matches!(a, BindingAction::Named(NamedAction::Paste))),
+            "Ctrl+Shift+V no longer pastes: {matched:?}"
+        );
+    }
+
+    /// The `NamedAction`s that fire for a key press, ignoring other kinds.
+    fn named_matches(bindings: &[KeyBinding], key: Key, mods: Modifiers) -> Vec<NamedAction> {
+        all_matches(bindings, key, mods)
+            .into_iter()
+            .filter_map(|a| match a {
+                BindingAction::Named(n) => Some(*n),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn raw_chars(key: &str, mods: Option<&str>, chars: &str) -> RawBinding {
+        RawBinding {
+            key: key.into(),
+            mods: mods.map(Into::into),
+            mode: None,
+            chars: Some(chars.into()),
+            action: None,
+            command: None,
+        }
+    }
+
+    #[test]
+    fn user_binding_replaces_same_trigger_default() {
+        // `ReceiveChar` on Ctrl+B frees the tmux prefix: the default
+        // ToggleLeftSidebar must be gone, not merely outvoted.
+        let b = parse_bindings(vec![raw_action("B", Some("Control"), "ReceiveChar")]);
+        assert_eq!(named_matches(&b, Key::B, Modifiers::CTRL), vec![NamedAction::ReceiveChar]);
+    }
+
+    #[test]
+    fn replacement_requires_exact_mods() {
+        let b = parse_bindings(vec![raw_action("Tab", Some("Control|Shift"), "SelectLastTab")]);
+        assert_eq!(
+            named_matches(&b, Key::Tab, Modifiers::CTRL),
+            vec![NamedAction::SelectNextTab],
+            "Ctrl+Tab default must survive a Ctrl+Shift+Tab user binding"
+        );
+        assert_eq!(
+            named_matches(&b, Key::Tab, Modifiers::CTRL | Modifiers::SHIFT),
+            vec![NamedAction::SelectLastTab]
+        );
+    }
+
+    #[test]
+    fn user_rebind_suppresses_default_action() {
+        // Regression guard: a rebound Ctrl+Shift+V must not also run the
+        // default Paste.
+        let b = parse_bindings(vec![raw_chars("V", Some("Control|Shift"), "x")]);
+        let m = all_matches(&b, Key::V, Modifiers::CTRL | Modifiers::SHIFT);
+        assert!(
+            matches!(m.as_slice(), [BindingAction::Chars(c)] if c == b"x"),
+            "expected only the user Chars binding, got {m:?}"
+        );
+    }
+
+    #[test]
+    fn new_action_names_parse() {
+        for (name, expected) in [
+            ("ToggleLeftSidebar", NamedAction::ToggleLeftSidebar),
+            ("ToggleRightSidebar", NamedAction::ToggleRightSidebar),
+            ("SelectNextWorkspace", NamedAction::SelectNextWorkspace),
+            ("SelectPreviousWorkspace", NamedAction::SelectPreviousWorkspace),
+            ("AddProject", NamedAction::AddProject),
+            ("ToggleSidebarFocus", NamedAction::ToggleSidebarFocus),
+            ("FocusProjectsSidebar", NamedAction::FocusProjectsSidebar),
+            ("FocusTerminal", NamedAction::FocusTerminal),
+        ] {
+            let b = parse_bindings(vec![raw_action("F1", None, name)]);
+            assert_eq!(named_matches(&b, Key::F1, Modifiers::NONE), vec![expected], "{name}");
+        }
+    }
+
+    #[test]
+    fn user_binding_replaces_sidebar_focus_default() {
+        let b = parse_bindings(vec![raw_action("B", Some("Control|Shift"), "ReceiveChar")]);
+        assert_eq!(
+            named_matches(&b, Key::B, Modifiers::CTRL | Modifiers::SHIFT),
+            vec![NamedAction::ReceiveChar]
+        );
+    }
+
+    #[test]
+    fn unknown_action_is_unsupported() {
+        let b = parse_bindings(vec![raw_action("F1", None, "FlyToTheMoon")]);
+        let m = all_matches(&b, Key::F1, Modifiers::NONE);
+        assert!(matches!(m.as_slice(), [BindingAction::Unsupported(n)] if n == "FlyToTheMoon"));
+    }
+
+    #[test]
+    fn stacked_user_bindings_all_run() {
+        let b = parse_bindings(vec![
+            raw_action("L", Some("Control"), "ClearHistory"),
+            raw_chars("L", Some("Control"), "\\x0c"),
+        ]);
+        let m = all_matches(&b, Key::L, Modifiers::CTRL);
+        assert_eq!(m.len(), 2);
+        assert!(matches!(m[0], BindingAction::Named(NamedAction::ClearHistory)));
+        assert!(matches!(m[1], BindingAction::Chars(c) if c == b"\x0c"));
+    }
+
+    #[test]
+    fn mode_binding_does_not_replace_default() {
+        let mut r = raw_action("B", Some("Control"), "ToggleViMode");
+        r.mode = Some("Vi".into());
+        let b = parse_bindings(vec![r]);
+        assert_eq!(
+            named_matches(&b, Key::B, Modifiers::CTRL),
+            vec![NamedAction::ToggleLeftSidebar]
+        );
+    }
+
+    #[test]
+    fn default_app_shortcuts_present_without_user_config() {
+        use NamedAction::*;
+        let ctrl = Modifiers::CTRL;
+        let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+        let alt = Modifiers::ALT;
+        let b = parse_bindings(Vec::new());
+        for (key, mods, expected) in [
+            (Key::B, ctrl, ToggleLeftSidebar),
+            (Key::G, ctrl, ToggleRightSidebar),
+            (Key::Tab, ctrl, SelectNextTab),
+            (Key::Tab, ctrl_shift, SelectPreviousTab),
+            (Key::ArrowRight, alt, SelectNextWorkspace),
+            (Key::ArrowLeft, alt, SelectPreviousWorkspace),
+            (Key::O, ctrl_shift, AddProject),
+            (Key::T, ctrl, SpawnNewInstance),
+            (Key::Q, ctrl, Quit),
+            (Key::B, ctrl_shift, ToggleSidebarFocus),
+        ] {
+            assert_eq!(named_matches(&b, key, mods), vec![expected], "{key:?}+{mods:?}");
+        }
+    }
 }
