@@ -528,4 +528,18 @@ mod tests {
             "Ctrl+Shift+C no longer copies: {matched:?}"
         );
     }
+
+    /// Paste is a Ctrl+Shift+V binding; Ctrl+V belongs to the PTY (SYN).
+    #[test]
+    fn ctrl_v_is_not_bound_to_paste() {
+        let bindings = parse_bindings(vec![]);
+        let matched = all_matches(&bindings, Key::V, Modifiers::CTRL);
+        assert!(matched.is_empty(), "Ctrl+V is bound: {matched:?}");
+
+        let matched = all_matches(&bindings, Key::V, Modifiers::CTRL | Modifiers::SHIFT);
+        assert!(
+            matched.iter().any(|a| matches!(a, BindingAction::Named(NamedAction::Paste))),
+            "Ctrl+Shift+V no longer pastes: {matched:?}"
+        );
+    }
 }

@@ -1,11 +1,20 @@
+use alacritty_terminal::term::TermMode;
 use egui::{Event, Key, Modifiers};
 
-pub fn event_to_bytes(event: &Event) -> Option<Vec<u8>> {
+pub fn event_to_bytes(event: &Event, mode: TermMode) -> Option<Vec<u8>> {
     match event {
         // OS-composed text — already accounts for Shift and dead-key composition.
-        Event::Text(text) if !text.is_empty() => Some(text.as_bytes().to_vec()),
+        // When the app asked for every key as an escape sequence, the Key event
+        // already encodes the press; passing the text too would double the input.
+        Event::Text(text) if !text.is_empty() => {
+            if mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) {
+                None
+            } else {
+                Some(text.as_bytes().to_vec())
+            }
+        },
         Event::Key { key, pressed: true, modifiers, repeat: _, .. } => {
-            key_to_bytes(*key, *modifiers)
+            key_to_bytes(*key, *modifiers, mode)
         },
         // `Event::Paste` is handled by the caller via `paste::paste` so it
         // gets bracketed-paste wrapping and newline normalization.  `Copy` and
@@ -15,7 +24,13 @@ pub fn event_to_bytes(event: &Event) -> Option<Vec<u8>> {
     }
 }
 
-fn key_to_bytes(key: Key, mods: Modifiers) -> Option<Vec<u8>> {
+fn key_to_bytes(key: Key, mods: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
+    if should_build_kitty(key, mods, mode)
+        && let Some(bytes) = kitty_sequence(key, mods)
+    {
+        return Some(bytes);
+    }
+
     // Named keys never produce composed text, so every modifier combination
     // is safe to encode.
     if let Some(bytes) = named_key_bytes(key, mods) {
@@ -59,6 +74,57 @@ fn key_to_bytes(key: Key, mods: Modifiers) -> Option<Vec<u8>> {
 fn csi_modifier(mods: Modifiers) -> Option<u8> {
     let m = (mods.shift as u8) | ((mods.alt as u8) << 1) | ((mods.ctrl as u8) << 2);
     (m != 0).then_some(b'1' + m)
+}
+
+/// Kitty modifier bits (Shift=1, Alt=2, Ctrl=4, Super=8), before the
+/// protocol's +1 offset.
+fn kitty_mods(mods: Modifiers) -> u8 {
+    (mods.shift as u8)
+        | ((mods.alt as u8) << 1)
+        | ((mods.ctrl as u8) << 2)
+        | ((mods.mac_cmd as u8) << 3)
+}
+
+/// Mirror of alacritty's `should_build_sequence`, reduced to what egui can
+/// observe (no key location, so numpad disambiguation is unavailable).
+fn should_build_kitty(key: Key, mods: Modifiers, mode: TermMode) -> bool {
+    if mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) {
+        return true;
+    }
+    if !mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
+        return false;
+    }
+    let m = kitty_mods(mods);
+    key == Key::Escape
+        || (m != 0 && (m != 1 || matches!(key, Key::Tab | Key::Enter | Key::Backspace)))
+}
+
+/// CSI-u encoding for the keys whose legacy bytes are ambiguous: the C0
+/// control keys plus modified printables.  Arrows, F-keys and the editing
+/// block keep their legacy CSI encodings even under the kitty protocol, so
+/// they fall through to `named_key_bytes`.
+fn kitty_sequence(key: Key, mods: Modifiers) -> Option<Vec<u8>> {
+    let code: u32 = match key {
+        Key::Tab => 9,
+        Key::Enter => 13,
+        Key::Escape => 27,
+        Key::Backspace => 127,
+        _ => {
+            // winit reports AltGr as Ctrl+Alt; the composed character arrives
+            // via Event::Text, same as on the legacy path.
+            if mods.ctrl && mods.alt {
+                return None;
+            }
+            // Kitty wants the unshifted key code, with Shift reported in the
+            // modifier field.  Shifted punctuation arrives as its own logical
+            // key in egui and carries no layout info, so it is used as-is —
+            // upstream resolves it via winit's key_without_modifiers.
+            u32::from(key_char(key, false)?)
+        },
+    };
+    let m = kitty_mods(mods);
+    let seq = if m == 0 { format!("\x1b[{code}u") } else { format!("\x1b[{code};{}u", m + 1) };
+    Some(seq.into_bytes())
 }
 
 /// Encoding for keys that never produce composed text.  Because no
@@ -231,6 +297,107 @@ mod tests {
         Modifiers { ctrl: true, shift: true, ..M::NONE }
     }
 
+    /// Legacy-mode shorthand; kitty-protocol tests call `super::key_to_bytes`
+    /// with an explicit mode instead.
+    fn key_to_bytes(key: Key, mods: Modifiers) -> Option<Vec<u8>> {
+        super::key_to_bytes(key, mods, TermMode::empty())
+    }
+
+    const DISAMBIGUATE: TermMode = TermMode::DISAMBIGUATE_ESC_CODES;
+    const REPORT_ALL: TermMode = TermMode::REPORT_ALL_KEYS_AS_ESC;
+
+    #[test]
+    fn kitty_disambiguate_encodes_modified_enter() {
+        assert_eq!(
+            super::key_to_bytes(Key::Enter, M::SHIFT, DISAMBIGUATE),
+            Some(b"\x1b[13;2u".to_vec())
+        );
+        assert_eq!(
+            super::key_to_bytes(Key::Enter, M::ALT, DISAMBIGUATE),
+            Some(b"\x1b[13;3u".to_vec())
+        );
+        assert_eq!(
+            super::key_to_bytes(Key::Enter, M::CTRL, DISAMBIGUATE),
+            Some(b"\x1b[13;5u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_disambiguate_encodes_shifted_tab_and_backspace() {
+        assert_eq!(
+            super::key_to_bytes(Key::Tab, M::SHIFT, DISAMBIGUATE),
+            Some(b"\x1b[9;2u".to_vec())
+        );
+        assert_eq!(
+            super::key_to_bytes(Key::Backspace, M::SHIFT, DISAMBIGUATE),
+            Some(b"\x1b[127;2u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_disambiguate_keeps_plain_keys_legacy() {
+        assert_eq!(super::key_to_bytes(Key::Enter, M::NONE, DISAMBIGUATE), Some(b"\r".to_vec()));
+        assert_eq!(super::key_to_bytes(Key::Tab, M::NONE, DISAMBIGUATE), Some(b"\t".to_vec()));
+        assert_eq!(
+            super::key_to_bytes(Key::Backspace, M::NONE, DISAMBIGUATE),
+            Some(b"\x7f".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_disambiguate_always_escapes_escape() {
+        assert_eq!(
+            super::key_to_bytes(Key::Escape, M::NONE, DISAMBIGUATE),
+            Some(b"\x1b[27u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_disambiguate_encodes_ctrl_printables_unshifted() {
+        assert_eq!(
+            super::key_to_bytes(Key::A, M::CTRL, DISAMBIGUATE),
+            Some(b"\x1b[97;5u".to_vec())
+        );
+        assert_eq!(
+            super::key_to_bytes(Key::Space, M::CTRL, DISAMBIGUATE),
+            Some(b"\x1b[32;5u".to_vec())
+        );
+        // Shift is reported in the modifier field, not in the key code.
+        assert_eq!(
+            super::key_to_bytes(Key::C, ctrl_shift(), DISAMBIGUATE),
+            Some(b"\x1b[99;6u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_disambiguate_leaves_shift_only_printables_to_text() {
+        assert_eq!(super::key_to_bytes(Key::A, M::SHIFT, DISAMBIGUATE), None);
+    }
+
+    #[test]
+    fn kitty_disambiguate_keeps_legacy_csi_for_modified_arrows() {
+        assert_eq!(
+            super::key_to_bytes(Key::ArrowUp, M::CTRL, DISAMBIGUATE),
+            Some(b"\x1b[1;5A".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_disambiguate_altgr_printables_stay_silent() {
+        let ctrl_alt = Modifiers { ctrl: true, alt: true, ..Modifiers::NONE };
+        assert_eq!(super::key_to_bytes(Key::Q, ctrl_alt, DISAMBIGUATE), None);
+    }
+
+    #[test]
+    fn kitty_report_all_encodes_plain_keys_and_mutes_text() {
+        assert_eq!(
+            super::key_to_bytes(Key::Enter, M::NONE, REPORT_ALL),
+            Some(b"\x1b[13u".to_vec())
+        );
+        assert_eq!(super::key_to_bytes(Key::A, M::NONE, REPORT_ALL), Some(b"\x1b[97u".to_vec()));
+        assert_eq!(event_to_bytes(&Event::Text("a".to_string()), REPORT_ALL), None);
+    }
+
     #[test]
     fn ctrl_slash_sends_unit_separator() {
         assert_eq!(key_to_bytes(Key::Slash, M::CTRL), Some(vec![0x1f]));
@@ -275,7 +442,7 @@ mod tests {
     #[test]
     fn text_event_passes_through() {
         let ev = Event::Text("é".to_string());
-        assert_eq!(event_to_bytes(&ev), Some("é".as_bytes().to_vec()));
+        assert_eq!(event_to_bytes(&ev, TermMode::empty()), Some("é".as_bytes().to_vec()));
     }
 
     #[test]
@@ -354,8 +521,8 @@ mod tests {
     /// and is what the binding table and the encoder act on.
     #[test]
     fn synthetic_clipboard_events_send_nothing() {
-        assert_eq!(event_to_bytes(&Event::Copy), None);
-        assert_eq!(event_to_bytes(&Event::Cut), None);
+        assert_eq!(event_to_bytes(&Event::Copy, TermMode::empty()), None);
+        assert_eq!(event_to_bytes(&Event::Cut, TermMode::empty()), None);
     }
 
     /// The interrupt still has to reach the PTY off the Key event.
@@ -369,6 +536,36 @@ mod tests {
             repeat: false,
             modifiers: ctrl,
         };
-        assert_eq!(event_to_bytes(&event), Some(vec![0x03]));
+        assert_eq!(event_to_bytes(&event, TermMode::empty()), Some(vec![0x03]));
+    }
+
+    /// The kitty encodings above only ever run if the terminal negotiates the
+    /// protocol, and `Term` ignores an app's request for it unless
+    /// `TermConfig::kitty_keyboard` is set.  Drives the enable sequence a real
+    /// app sends through a terminal built from alacritree's own config, so the
+    /// negotiation and the encoding are covered as one path rather than the
+    /// mode being assumed.
+    #[test]
+    fn shift_enter_is_kitty_encoded_once_an_app_enables_the_protocol() {
+        use alacritty_terminal::Term;
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+        use crate::config::Config;
+        use crate::session::{TermSize, term_config};
+
+        let size = TermSize::new(80, 24);
+        let mut term = Term::new(term_config(&Config::default()), &size, VoidListener);
+
+        // `CSI > 1 u`: push a keyboard mode with the disambiguate flag, which
+        // is what Claude Code and neovim send on startup.
+        Processor::<StdSyncHandler>::new().advance(&mut term, b"\x1b[>1u");
+
+        let mode = *term.mode();
+        assert!(
+            mode.contains(TermMode::DISAMBIGUATE_ESC_CODES),
+            "terminal ignored the kitty enable sequence; mode is {mode:?}"
+        );
+        assert_eq!(super::key_to_bytes(Key::Enter, M::SHIFT, mode), Some(b"\x1b[13;2u".to_vec()));
     }
 }

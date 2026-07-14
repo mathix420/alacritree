@@ -18,6 +18,7 @@ use crate::config::Config;
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
 use crate::input::event_to_bytes;
 use crate::links::{self, Link};
+use crate::mouse;
 use crate::paste;
 use crate::session::{EventProxy, Session, TermSize};
 
@@ -83,19 +84,28 @@ pub fn show(
     if hovered_link.is_some() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
-    handle_selection(
-        ui,
-        &response,
-        session,
-        config,
-        rect,
-        cell_w,
-        cell_h,
-        cols,
-        rows,
-        hovered_link.as_ref(),
-    );
-    handle_wheel_scroll(ui, &response, session, config, cell_w, cell_h);
+    // Apps that negotiate mouse tracking want the raw button/motion stream, not
+    // local selection — matching alacritty, Shift is the escape hatch that still
+    // selects text while the app is in mouse mode.
+    let mouse_mode = session.term.lock().mode().intersects(TermMode::MOUSE_MODE);
+    let report_mouse = mouse_mode && !ui.input(|i| i.modifiers.shift);
+    if report_mouse {
+        handle_mouse_reporting(ui, session, rect, cell_w, cell_h, cols, rows);
+    } else {
+        handle_selection(
+            ui,
+            &response,
+            session,
+            config,
+            rect,
+            cell_w,
+            cell_h,
+            cols,
+            rows,
+            hovered_link.as_ref(),
+        );
+    }
+    handle_wheel_scroll(ui, &response, session, config, rect, cell_w, cell_h, cols, rows);
     // Built-in renderer expects the *unadjusted* pixel cell size so it can
     // re-apply `font.offset` itself — passing `cell_w * ppp` (which already
     // includes the offset) would double-add it.  Descent is zero here: the
@@ -131,13 +141,18 @@ pub fn show(
         .and_then(|p| paint_preedit(&painter, rect, session, config, &font_id, cell_w, cell_h, &p));
 
     if allow_focus && response.has_focus() {
+        // Kitty-protocol and mouse modes negotiated by the running app decide
+        // how events encode, so the encoder needs the live terminal mode.
+        let mode = *session.term.lock().mode();
         let consumed: Vec<ConsumedEvent> = ui.input(|i| {
             i.events
                 .iter()
                 .filter_map(|e| match e {
                     Event::Ime(ev) => Some(ConsumedEvent::Ime(ev.clone())),
-                    Event::Paste(s) => Some(ConsumedEvent::Paste(s.clone())),
-                    _ => event_to_bytes(e).map(ConsumedEvent::Bytes),
+                    // `Event::Paste` is dropped (see `consumed_event`): keyboard
+                    // paste runs through the binding table's `Paste` action, not
+                    // the synthetic event egui-winit raises on every command+V.
+                    _ => consumed_event(e, mode),
                 })
                 .collect()
         });
@@ -167,7 +182,6 @@ pub fn show(
                     paste::on_terminal_input_start(session);
                     session.write(bytes);
                 },
-                ConsumedEvent::Paste(text) => paste::paste(session, &text, true),
             }
         }
         // Setting `PlatformOutput::ime` is what makes egui-winit call
@@ -365,16 +379,126 @@ fn handle_selection(
     }
 }
 
+/// Forward raw button and motion events to a mouse-tracking app, mirroring
+/// alacritty's `on_mouse_press` / `on_mouse_release` / `mouse_moved`.  Presses
+/// and releases report the clicked cell; motion reports only when the pointer
+/// crosses into a new cell and the app opted into motion (any-motion) or drag
+/// tracking.  Events outside the grid are ignored so sidebar clicks don't leak.
+#[allow(clippy::too_many_arguments)]
+fn handle_mouse_reporting(
+    ui: &Ui,
+    session: &mut Session,
+    rect: Rect,
+    cell_w: f32,
+    cell_h: f32,
+    cols: usize,
+    rows: usize,
+) {
+    let mode = *session.term.lock().mode();
+    let motion_tracked = mode.intersects(TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG);
+
+    enum Raw {
+        Button { pos: Pos2, code: u8, pressed: bool, modifiers: Modifiers },
+        Motion { pos: Pos2, modifiers: Modifiers },
+    }
+
+    let (raws, held) = ui.input(|i| {
+        let held = if i.pointer.primary_down() {
+            Some(mouse::BUTTON_LEFT)
+        } else if i.pointer.middle_down() {
+            Some(mouse::BUTTON_MIDDLE)
+        } else if i.pointer.secondary_down() {
+            Some(mouse::BUTTON_RIGHT)
+        } else {
+            None
+        };
+        let motion_mods = i.modifiers;
+        let raws: Vec<Raw> = i
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::PointerButton { pos, button, pressed, modifiers } => button_code(*button)
+                    .map(|code| Raw::Button {
+                        pos: *pos,
+                        code,
+                        pressed: *pressed,
+                        modifiers: *modifiers,
+                    }),
+                Event::PointerMoved(pos) if motion_tracked => {
+                    Some(Raw::Motion { pos: *pos, modifiers: motion_mods })
+                },
+                _ => None,
+            })
+            .collect();
+        (raws, held)
+    });
+
+    if raws.is_empty() {
+        return;
+    }
+
+    let display_offset = session.term.lock().grid().display_offset() as i32;
+    let mut bytes = Vec::new();
+    for raw in raws {
+        match raw {
+            Raw::Button { pos, code, pressed, modifiers } => {
+                if !rect.contains(pos) {
+                    continue;
+                }
+                let (point, _) = cell_at_pos(pos, rect, cell_w, cell_h, cols, rows, display_offset);
+                session.last_report_cell = Some(point);
+                if let Some(report) = mouse::mouse_report(mode, point, code, pressed, modifiers) {
+                    bytes.extend_from_slice(&report);
+                }
+            },
+            Raw::Motion { pos, modifiers } => {
+                if !rect.contains(pos) {
+                    continue;
+                }
+                let (point, _) = cell_at_pos(pos, rect, cell_w, cell_h, cols, rows, display_offset);
+                if session.last_report_cell == Some(point) {
+                    continue;
+                }
+                session.last_report_cell = Some(point);
+                let base = match held {
+                    Some(button) => button + mouse::MOTION_OFFSET,
+                    None if mode.contains(TermMode::MOUSE_MOTION) => mouse::MOTION_NONE,
+                    None => continue,
+                };
+                if let Some(report) = mouse::mouse_report(mode, point, base, true, modifiers) {
+                    bytes.extend_from_slice(&report);
+                }
+            },
+        }
+    }
+    if !bytes.is_empty() {
+        session.write(bytes);
+    }
+}
+
+fn button_code(button: PointerButton) -> Option<u8> {
+    match button {
+        PointerButton::Primary => Some(mouse::BUTTON_LEFT),
+        PointerButton::Middle => Some(mouse::BUTTON_MIDDLE),
+        PointerButton::Secondary => Some(mouse::BUTTON_RIGHT),
+        _ => None,
+    }
+}
+
 /// Mouse-wheel scrolling.  Mirrors alacritty's `scroll_terminal`: accumulate
 /// pixel deltas across frames, divide by cell height for whole-line steps,
 /// and route to the PTY or scrollback depending on terminal mode.
+#[allow(clippy::too_many_arguments)]
 fn handle_wheel_scroll(
     ui: &Ui,
     response: &Response,
     session: &mut Session,
     config: &Config,
+    rect: Rect,
     cell_w: f32,
     cell_h: f32,
+    cols: usize,
+    rows: usize,
 ) {
     if !response.hovered() {
         return;
@@ -391,6 +515,11 @@ fn handle_wheel_scroll(
     if wheels.is_empty() {
         return;
     }
+    // Mouse-tracking apps receive wheel reports addressed to the hovered cell.
+    let pointer_cell = ui.input(|i| i.pointer.hover_pos()).map(|pos| {
+        let display_offset = session.term.lock().grid().display_offset() as i32;
+        cell_at_pos(pos, rect, cell_w, cell_h, cols, rows, display_offset).0
+    });
     let cell_w_pt = cell_w as f64;
     let cell_h_pt = cell_h as f64;
     for (unit, delta, modifiers) in wheels {
@@ -402,10 +531,11 @@ fn handle_wheel_scroll(
                 delta.y as f64 * session.size.screen_lines as f64 * cell_h_pt,
             ),
         };
-        apply_scroll(session, config, dx_pt, dy_pt, cell_w_pt, cell_h_pt, modifiers);
+        apply_scroll(session, config, dx_pt, dy_pt, cell_w_pt, cell_h_pt, modifiers, pointer_cell);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_scroll(
     session: &mut Session,
     config: &Config,
@@ -414,6 +544,7 @@ fn apply_scroll(
     cell_w_pt: f64,
     cell_h_pt: f64,
     modifiers: Modifiers,
+    pointer_cell: Option<Point>,
 ) {
     let mode = *session.term.lock().mode();
     let mouse_mode = mode.intersects(TermMode::MOUSE_MODE);
@@ -431,9 +562,26 @@ fn apply_scroll(
     let is_up = dy_pt > 0.0;
 
     if mouse_mode {
-        // CSI mouse-wheel reports (codes 64/65) aren't wired up yet; until they
-        // are we leave the wheel alone in mouse-tracking mode so apps that
-        // requested raw mouse input aren't fed garbled scrollback events.
+        // One button report per accumulated line/column tick, addressed to the
+        // hovered cell — alacritty's `scroll_terminal` in mouse mode.
+        if let Some(point) = pointer_cell {
+            let mut bytes = Vec::new();
+            let line_btn = if is_up { mouse::WHEEL_UP } else { mouse::WHEEL_DOWN };
+            for _ in 0..lines {
+                if let Some(report) = mouse::wheel_report(mode, point, line_btn, modifiers) {
+                    bytes.extend_from_slice(&report);
+                }
+            }
+            let column_btn = if dx_pt > 0.0 { mouse::WHEEL_LEFT } else { mouse::WHEEL_RIGHT };
+            for _ in 0..columns {
+                if let Some(report) = mouse::wheel_report(mode, point, column_btn, modifiers) {
+                    bytes.extend_from_slice(&report);
+                }
+            }
+            if !bytes.is_empty() {
+                session.write(bytes);
+            }
+        }
     } else if alt_alt_scroll && !modifiers.shift {
         // Alt-screen apps (vim/less/man) opted into ALTERNATE_SCROLL ask for
         // arrow keys instead of touching the scrollback (which doesn't exist
@@ -510,8 +658,22 @@ fn cell_at_pos(
 
 enum ConsumedEvent {
     Bytes(Vec<u8>),
-    Paste(String),
     Ime(ImeEvent),
+}
+
+/// Classify an input event for the focused terminal.
+///
+/// `Event::Paste` is dropped rather than pasted: egui-winit synthesizes it for
+/// every `command+V` press, Shift included, so acting on it would paste on
+/// Ctrl+V regardless of the binding table and leave the shortcut impossible to
+/// rebind or unbind.  Keyboard paste runs through `NamedAction::Paste`, which
+/// reads the clipboard itself.  Text widgets outside the terminal still consume
+/// the event normally.  `Event::Ime` is handled separately by the caller.
+fn consumed_event(event: &Event, mode: TermMode) -> Option<ConsumedEvent> {
+    match event {
+        Event::Paste(_) => None,
+        _ => event_to_bytes(event, mode).map(ConsumedEvent::Bytes),
+    }
 }
 
 /// Viewport rect of the terminal cursor's cell; `None` while the cursor is
@@ -949,6 +1111,7 @@ fn paint_builtin_glyph(
 mod tests {
     use alacritty_terminal::term::Config as TermConfig;
     use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+    use egui::Key;
 
     use super::*;
 
@@ -986,5 +1149,29 @@ mod tests {
         let term = term_running(b"$ ");
 
         assert_ne!(cursor_shape(&term), CursorShape::Hidden);
+    }
+
+    /// egui-winit raises `Event::Paste` for every `command+V` press, Shift
+    /// included, so honoring it here would paste on Ctrl+V no matter what the
+    /// binding table says — and leave the shortcut impossible to rebind.
+    #[test]
+    fn paste_event_does_not_reach_the_terminal() {
+        assert!(consumed_event(&Event::Paste("hi".into()), TermMode::empty()).is_none());
+    }
+
+    /// Alacritty sends SYN on Ctrl+V; paste is a Ctrl+Shift+V binding.
+    #[test]
+    fn ctrl_v_sends_the_control_byte() {
+        let press = Event::Key {
+            key: Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::CTRL,
+        };
+        assert!(
+            matches!(consumed_event(&press, TermMode::empty()), Some(ConsumedEvent::Bytes(ref b)) if b == &vec![0x16]),
+            "Ctrl+V must reach the PTY as 0x16"
+        );
     }
 }
