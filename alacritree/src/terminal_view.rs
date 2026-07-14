@@ -5,19 +5,21 @@ use alacritty_terminal::term::Term;
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::search::Match;
-use alacritty_terminal::vte::ansi::Color as AnsiColor;
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape};
 use egui::{
-    Color32, CursorIcon, Event, FontFamily, FontId, Modifiers, MouseWheelUnit, PointerButton, Pos2,
-    Rect, Response, Sense, Stroke, Ui, Vec2,
+    Color32, CursorIcon, Event, FontFamily, FontId, ImeEvent, Modifiers, MouseWheelUnit,
+    PointerButton, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2,
 };
 
 use crate::builtin_font::{BuiltinGlyphCache, Metrics, is_builtin_glyph};
 use crate::clipboard::{self, Target};
+use crate::color_glyph::{CachedColorGlyph, ColorGlyphCache};
 use crate::colors::{background, foreground, resolve, rgb_to_color32};
 use crate::config::Config;
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
 use crate::input::event_to_bytes;
 use crate::links::{self, Link};
+use crate::mouse;
 use crate::paste;
 use crate::session::{EventProxy, Session, TermSize};
 
@@ -27,6 +29,8 @@ pub fn show(
     config: &Config,
     allow_focus: bool,
     builtin_glyphs: &mut BuiltinGlyphCache,
+    ime: &mut crate::ime::Ime,
+    color_glyphs: &mut ColorGlyphCache,
 ) -> Response {
     let font_id = FontId::monospace(config.font.egui_size());
     let (cell_w_pt, cell_h_pt) = ui.ctx().fonts(|f| {
@@ -74,6 +78,7 @@ pub fn show(
     if allow_focus && !response.has_focus() {
         response.request_focus();
     }
+    ime.retarget(session.id);
 
     let painter = ui.painter_at(rect);
 
@@ -81,19 +86,28 @@ pub fn show(
     if hovered_link.is_some() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
-    handle_selection(
-        ui,
-        &response,
-        session,
-        config,
-        rect,
-        cell_w,
-        cell_h,
-        cols,
-        rows,
-        hovered_link.as_ref(),
-    );
-    handle_wheel_scroll(ui, &response, session, config, cell_w, cell_h);
+    // Apps that negotiate mouse tracking want the raw button/motion stream, not
+    // local selection — matching alacritty, Shift is the escape hatch that still
+    // selects text while the app is in mouse mode.
+    let mouse_mode = session.term.lock().mode().intersects(TermMode::MOUSE_MODE);
+    let report_mouse = mouse_mode && !ui.input(|i| i.modifiers.shift);
+    if report_mouse {
+        handle_mouse_reporting(ui, session, rect, cell_w, cell_h, cols, rows);
+    } else {
+        handle_selection(
+            ui,
+            &response,
+            session,
+            config,
+            rect,
+            cell_w,
+            cell_h,
+            cols,
+            rows,
+            hovered_link.as_ref(),
+        );
+    }
+    handle_wheel_scroll(ui, &response, session, config, rect, cell_w, cell_h, cols, rows);
     // Built-in renderer expects the *unadjusted* pixel cell size so it can
     // re-apply `font.offset` itself — passing `cell_w * ppp` (which already
     // includes the offset) would double-add it.  Descent is zero here: the
@@ -116,31 +130,105 @@ pub fn show(
         ppp,
         &metrics,
         builtin_glyphs,
+        color_glyphs,
         ui.ctx(),
         hovered_link.as_ref().map(|l| &l.bounds),
+        // The preedit overlay replaces the cursor while composing
+        // (alacritty hides it the same way, display/content.rs).
+        ime.preedit().is_some(),
     );
 
+    let preedit_caret = ime
+        .preedit()
+        .map(|p| p.to_owned())
+        .and_then(|p| paint_preedit(&painter, rect, session, config, &font_id, cell_w, cell_h, &p));
+
     if allow_focus && response.has_focus() {
+        // Kitty-protocol and mouse modes negotiated by the running app decide
+        // how events encode, so the encoder needs the live terminal mode.
+        let mode = *session.term.lock().mode();
         let consumed: Vec<ConsumedEvent> = ui.input(|i| {
             i.events
                 .iter()
                 .filter_map(|e| match e {
-                    Event::Paste(s) => Some(ConsumedEvent::Paste(s.clone())),
-                    _ => event_to_bytes(e).map(ConsumedEvent::Bytes),
+                    Event::Ime(ev) => Some(ConsumedEvent::Ime(ev.clone())),
+                    // `Event::Paste` is dropped (see `consumed_event`): keyboard
+                    // paste runs through the binding table's `Paste` action, not
+                    // the synthetic event egui-winit raises on every command+V.
+                    _ => consumed_event(e, mode),
                 })
                 .collect()
         });
-        if !consumed.is_empty() {
-            // Typing drops the selection and snaps back to the prompt so the
-            // user sees their input — matches alacritty's on_terminal_input_start.
-            paste::on_terminal_input_start(session);
-        }
         for event in consumed {
             match event {
-                ConsumedEvent::Bytes(bytes) => session.write(bytes),
-                ConsumedEvent::Paste(text) => paste::paste(session, &text, true),
+                ConsumedEvent::Ime(ev) => {
+                    if let Some(text) = ime.process(&ev) {
+                        // Mirrors alacritty: single-char commits skip
+                        // bracketed paste (event.rs "Don't use bracketed
+                        // paste for single char input").
+                        paste::paste(session, &text, text.chars().count() > 1);
+                    }
+                },
+                // While composing, candidate-window navigation
+                // (Space/Enter/arrows/Backspace/Escape) arrives as ordinary
+                // key events; none of it may reach the PTY.  Mirrors
+                // alacritty's early return in `key_input`. That early return
+                // also runs before alacritty dispatches keyboard-triggered
+                // clipboard paste, so a keyboard paste shortcut is likewise
+                // dropped while composing (alacritty/src/input/keyboard.rs,
+                // alacritty/src/input/mod.rs `key_input`).
+                _ if ime.preedit().is_some() => {},
+                ConsumedEvent::Bytes(bytes) => {
+                    // Typing drops the selection and snaps back to the prompt
+                    // so the user sees their input — matches alacritty's
+                    // on_terminal_input_start.
+                    paste::on_terminal_input_start(session);
+                    session.write(bytes);
+                },
             }
         }
+        // Setting `PlatformOutput::ime` is what makes egui-winit call
+        // `set_ime_allowed(true)` — without it the OS IME never engages.
+        // The rect drives `set_ime_cursor_area`, so the candidate window
+        // follows the caret like alacritty's `update_ime_position`
+        // (TextEdit passes its whole widget rect there, which for a
+        // fullscreen terminal would pin the popup to the window corner).
+        let caret = preedit_caret
+            .or_else(|| cursor_cell_rect(session, rect, cell_w, cell_h))
+            .unwrap_or(rect);
+        ui.ctx().output_mut(|o| {
+            o.ime = Some(egui::output::IMEOutput { rect: caret, cursor_rect: caret });
+        });
+    } else {
+        // IMEs commonly auto-commit an in-progress composition when focus
+        // moves away (winit pairs the `Commit` with an immediate
+        // `Disabled`, both landing in the same event batch as the focus
+        // loss). If a composition was in progress, drain Ime events one
+        // more time so that commit still reaches the PTY instead of being
+        // silently discarded. An unfocused terminal with no composition in
+        // flight must never consume Ime events — they belong to whatever
+        // widget (e.g. a modal dialog's text field) is focused instead.
+        if ime.preedit().is_some() {
+            let events: Vec<ImeEvent> = ui.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|e| match e {
+                        Event::Ime(ev) => Some(ev.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            });
+            for ev in events {
+                if let Some(text) = ime.process(&ev) {
+                    paste::paste(session, &text, text.chars().count() > 1);
+                }
+            }
+        }
+        // The IME's `Disabled` event arrives only while input is still
+        // drained; a composition abandoned without any terminal Ime event
+        // (e.g. the OS cancels it outright) never sends one, so this is the
+        // backstop that drops the painted preedit either way.
+        ime.clear();
     }
 
     response
@@ -294,16 +382,126 @@ fn handle_selection(
     }
 }
 
+/// Forward raw button and motion events to a mouse-tracking app, mirroring
+/// alacritty's `on_mouse_press` / `on_mouse_release` / `mouse_moved`.  Presses
+/// and releases report the clicked cell; motion reports only when the pointer
+/// crosses into a new cell and the app opted into motion (any-motion) or drag
+/// tracking.  Events outside the grid are ignored so sidebar clicks don't leak.
+#[allow(clippy::too_many_arguments)]
+fn handle_mouse_reporting(
+    ui: &Ui,
+    session: &mut Session,
+    rect: Rect,
+    cell_w: f32,
+    cell_h: f32,
+    cols: usize,
+    rows: usize,
+) {
+    let mode = *session.term.lock().mode();
+    let motion_tracked = mode.intersects(TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG);
+
+    enum Raw {
+        Button { pos: Pos2, code: u8, pressed: bool, modifiers: Modifiers },
+        Motion { pos: Pos2, modifiers: Modifiers },
+    }
+
+    let (raws, held) = ui.input(|i| {
+        let held = if i.pointer.primary_down() {
+            Some(mouse::BUTTON_LEFT)
+        } else if i.pointer.middle_down() {
+            Some(mouse::BUTTON_MIDDLE)
+        } else if i.pointer.secondary_down() {
+            Some(mouse::BUTTON_RIGHT)
+        } else {
+            None
+        };
+        let motion_mods = i.modifiers;
+        let raws: Vec<Raw> = i
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::PointerButton { pos, button, pressed, modifiers } => button_code(*button)
+                    .map(|code| Raw::Button {
+                        pos: *pos,
+                        code,
+                        pressed: *pressed,
+                        modifiers: *modifiers,
+                    }),
+                Event::PointerMoved(pos) if motion_tracked => {
+                    Some(Raw::Motion { pos: *pos, modifiers: motion_mods })
+                },
+                _ => None,
+            })
+            .collect();
+        (raws, held)
+    });
+
+    if raws.is_empty() {
+        return;
+    }
+
+    let display_offset = session.term.lock().grid().display_offset() as i32;
+    let mut bytes = Vec::new();
+    for raw in raws {
+        match raw {
+            Raw::Button { pos, code, pressed, modifiers } => {
+                if !rect.contains(pos) {
+                    continue;
+                }
+                let (point, _) = cell_at_pos(pos, rect, cell_w, cell_h, cols, rows, display_offset);
+                session.last_report_cell = Some(point);
+                if let Some(report) = mouse::mouse_report(mode, point, code, pressed, modifiers) {
+                    bytes.extend_from_slice(&report);
+                }
+            },
+            Raw::Motion { pos, modifiers } => {
+                if !rect.contains(pos) {
+                    continue;
+                }
+                let (point, _) = cell_at_pos(pos, rect, cell_w, cell_h, cols, rows, display_offset);
+                if session.last_report_cell == Some(point) {
+                    continue;
+                }
+                session.last_report_cell = Some(point);
+                let base = match held {
+                    Some(button) => button + mouse::MOTION_OFFSET,
+                    None if mode.contains(TermMode::MOUSE_MOTION) => mouse::MOTION_NONE,
+                    None => continue,
+                };
+                if let Some(report) = mouse::mouse_report(mode, point, base, true, modifiers) {
+                    bytes.extend_from_slice(&report);
+                }
+            },
+        }
+    }
+    if !bytes.is_empty() {
+        session.write(bytes);
+    }
+}
+
+fn button_code(button: PointerButton) -> Option<u8> {
+    match button {
+        PointerButton::Primary => Some(mouse::BUTTON_LEFT),
+        PointerButton::Middle => Some(mouse::BUTTON_MIDDLE),
+        PointerButton::Secondary => Some(mouse::BUTTON_RIGHT),
+        _ => None,
+    }
+}
+
 /// Mouse-wheel scrolling.  Mirrors alacritty's `scroll_terminal`: accumulate
 /// pixel deltas across frames, divide by cell height for whole-line steps,
 /// and route to the PTY or scrollback depending on terminal mode.
+#[allow(clippy::too_many_arguments)]
 fn handle_wheel_scroll(
     ui: &Ui,
     response: &Response,
     session: &mut Session,
     config: &Config,
+    rect: Rect,
     cell_w: f32,
     cell_h: f32,
+    cols: usize,
+    rows: usize,
 ) {
     if !response.hovered() {
         return;
@@ -320,6 +518,11 @@ fn handle_wheel_scroll(
     if wheels.is_empty() {
         return;
     }
+    // Mouse-tracking apps receive wheel reports addressed to the hovered cell.
+    let pointer_cell = ui.input(|i| i.pointer.hover_pos()).map(|pos| {
+        let display_offset = session.term.lock().grid().display_offset() as i32;
+        cell_at_pos(pos, rect, cell_w, cell_h, cols, rows, display_offset).0
+    });
     let cell_w_pt = cell_w as f64;
     let cell_h_pt = cell_h as f64;
     for (unit, delta, modifiers) in wheels {
@@ -331,10 +534,11 @@ fn handle_wheel_scroll(
                 delta.y as f64 * session.size.screen_lines as f64 * cell_h_pt,
             ),
         };
-        apply_scroll(session, config, dx_pt, dy_pt, cell_w_pt, cell_h_pt, modifiers);
+        apply_scroll(session, config, dx_pt, dy_pt, cell_w_pt, cell_h_pt, modifiers, pointer_cell);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_scroll(
     session: &mut Session,
     config: &Config,
@@ -343,6 +547,7 @@ fn apply_scroll(
     cell_w_pt: f64,
     cell_h_pt: f64,
     modifiers: Modifiers,
+    pointer_cell: Option<Point>,
 ) {
     let mode = *session.term.lock().mode();
     let mouse_mode = mode.intersects(TermMode::MOUSE_MODE);
@@ -360,9 +565,26 @@ fn apply_scroll(
     let is_up = dy_pt > 0.0;
 
     if mouse_mode {
-        // CSI mouse-wheel reports (codes 64/65) aren't wired up yet; until they
-        // are we leave the wheel alone in mouse-tracking mode so apps that
-        // requested raw mouse input aren't fed garbled scrollback events.
+        // One button report per accumulated line/column tick, addressed to the
+        // hovered cell — alacritty's `scroll_terminal` in mouse mode.
+        if let Some(point) = pointer_cell {
+            let mut bytes = Vec::new();
+            let line_btn = if is_up { mouse::WHEEL_UP } else { mouse::WHEEL_DOWN };
+            for _ in 0..lines {
+                if let Some(report) = mouse::wheel_report(mode, point, line_btn, modifiers) {
+                    bytes.extend_from_slice(&report);
+                }
+            }
+            let column_btn = if dx_pt > 0.0 { mouse::WHEEL_LEFT } else { mouse::WHEEL_RIGHT };
+            for _ in 0..columns {
+                if let Some(report) = mouse::wheel_report(mode, point, column_btn, modifiers) {
+                    bytes.extend_from_slice(&report);
+                }
+            }
+            if !bytes.is_empty() {
+                session.write(bytes);
+            }
+        }
     } else if alt_alt_scroll && !modifiers.shift {
         // Alt-screen apps (vim/less/man) opted into ALTERNATE_SCROLL ask for
         // arrow keys instead of touching the scrollback (which doesn't exist
@@ -439,7 +661,38 @@ fn cell_at_pos(
 
 enum ConsumedEvent {
     Bytes(Vec<u8>),
-    Paste(String),
+    Ime(ImeEvent),
+}
+
+/// Classify an input event for the focused terminal.
+///
+/// `Event::Paste` is dropped rather than pasted: egui-winit synthesizes it for
+/// every `command+V` press, Shift included, so acting on it would paste on
+/// Ctrl+V regardless of the binding table and leave the shortcut impossible to
+/// rebind or unbind.  Keyboard paste runs through `NamedAction::Paste`, which
+/// reads the clipboard itself.  Text widgets outside the terminal still consume
+/// the event normally.  `Event::Ime` is handled separately by the caller.
+fn consumed_event(event: &Event, mode: TermMode) -> Option<ConsumedEvent> {
+    match event {
+        Event::Paste(_) => None,
+        _ => event_to_bytes(event, mode).map(ConsumedEvent::Bytes),
+    }
+}
+
+/// Viewport rect of the terminal cursor's cell; `None` while the cursor is
+/// scrolled out of view.
+fn cursor_cell_rect(session: &Session, rect: Rect, cell_w: f32, cell_h: f32) -> Option<Rect> {
+    let term = session.term.lock();
+    let grid = term.grid();
+    let cursor = grid.cursor.point;
+    let line = cursor.line.0 + grid.display_offset() as i32;
+    if line < 0 || line >= grid.screen_lines() as i32 {
+        return None;
+    }
+    Some(Rect::from_min_size(
+        Pos2::new(rect.min.x + cursor.column.0 as f32 * cell_w, rect.min.y + line as f32 * cell_h),
+        Vec2::new(cell_w, cell_h),
+    ))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -471,8 +724,10 @@ fn paint_grid(
     ppp: f32,
     metrics: &Metrics,
     builtin_glyphs: &mut BuiltinGlyphCache,
+    color_glyphs: &mut ColorGlyphCache,
     ctx: &egui::Context,
     link_bounds: Option<&Match>,
+    cursor_hidden: bool,
 ) {
     let term = session.term.lock();
     let runtime_palette = term.colors();
@@ -536,13 +791,14 @@ fn paint_grid(
                 ppp,
                 metrics,
                 builtin_glyphs,
+                color_glyphs,
                 ctx,
             );
         }
     }
 
-    if cursor_visible_line >= 0 && cursor_visible_line < screen_lines {
-        let cursor_shape = term.cursor_style().shape;
+    if !cursor_hidden && cursor_visible_line >= 0 && cursor_visible_line < screen_lines {
+        let cursor_shape = cursor_shape(&term);
         paint_cursor(
             painter,
             rect,
@@ -555,6 +811,20 @@ fn paint_grid(
             font_id,
             cursor_shape,
         );
+    }
+}
+
+/// The cursor shape the terminal wants drawn, mirroring alacritty's
+/// `RenderableCursor::new`.  `cursor_style()` reports the configured shape and
+/// never `Hidden`, so DECTCEM has to be read off the mode: full-screen apps
+/// hide the cursor while they repaint and leave it parked wherever their last
+/// write landed, and drawing it regardless puts a block in an arbitrary spot
+/// on top of their UI.
+fn cursor_shape(term: &Term<EventProxy>) -> CursorShape {
+    if term.mode().contains(TermMode::SHOW_CURSOR) {
+        term.cursor_style().shape
+    } else {
+        CursorShape::Hidden
     }
 }
 
@@ -592,6 +862,7 @@ fn paint_run(
     ppp: f32,
     metrics: &Metrics,
     builtin_glyphs: &mut BuiltinGlyphCache,
+    color_glyphs: &mut ColorGlyphCache,
     ctx: &egui::Context,
 ) {
     if run.is_empty() {
@@ -663,6 +934,15 @@ fn paint_run(
                 )
             {
                 paint_builtin_glyph(painter, cached, cell_x, y, cell_h, ppp, fg);
+                continue;
+            }
+            // Emoji are resolved against the normal chain whatever the cell's
+            // style: colour fonts ship one set of artwork, and a bold or italic
+            // variant of it would be synthesized rather than drawn.
+            if config.font.color_glyphs
+                && let Some(cached) = color_glyphs.get(ctx, ch, metrics, char_cells(ch))
+            {
+                paint_color_glyph(painter, cached, cell_x, y, ppp);
                 continue;
             }
             painter.text(
@@ -758,6 +1038,94 @@ fn paint_cursor(
     }
 }
 
+/// Draw the in-progress IME composition at the cursor, mirroring alacritty's
+/// `draw_ime_preview`: default foreground on default background, underlined,
+/// with a beam caret after the last char (egui-winit drops the preedit
+/// cursor offset, so the caret can only sit at the end).  Returns the caret
+/// cell rect so the candidate window can follow it.
+#[allow(clippy::too_many_arguments)]
+fn paint_preedit(
+    painter: &egui::Painter,
+    rect: Rect,
+    session: &Session,
+    config: &Config,
+    font_id: &FontId,
+    cell_w: f32,
+    cell_h: f32,
+    preedit: &str,
+) -> Option<Rect> {
+    let (cursor_col, line, cols) = {
+        let term = session.term.lock();
+        let grid = term.grid();
+        let line = grid.cursor.point.line.0 + grid.display_offset() as i32;
+        if line < 0 || line >= grid.screen_lines() as i32 {
+            return None;
+        }
+        (grid.cursor.point.column.0, line, grid.columns())
+    };
+
+    let layout = crate::ime::preedit_layout(preedit, cursor_col, cols);
+    let fg = foreground(&config.palette);
+    let bg = background(&config.palette);
+    let y = rect.min.y + line as f32 * cell_h;
+    let x = rect.min.x + layout.start_col as f32 * cell_w;
+    let width_pt = layout.width as f32 * cell_w;
+
+    painter.rect_filled(Rect::from_min_size(Pos2::new(x, y), Vec2::new(width_pt, cell_h)), 0.0, bg);
+
+    let mut col = layout.start_col;
+    let mut buf = [0u8; 4];
+    for ch in layout.visible.chars() {
+        painter.text(
+            Pos2::new(rect.min.x + col as f32 * cell_w, y),
+            egui::Align2::LEFT_TOP,
+            ch.encode_utf8(&mut buf).to_string(),
+            font_id.clone(),
+            fg,
+        );
+        col += crate::ime::char_cells(ch);
+    }
+
+    let uy = y + cell_h - 1.5;
+    painter.line_segment([Pos2::new(x, uy), Pos2::new(x + width_pt, uy)], Stroke::new(1.0_f32, fg));
+
+    // Beam caret on the cell the next char lands in, clamped to the grid.
+    let caret_col = (layout.start_col + layout.width).min(cols.saturating_sub(1));
+    let caret_x = rect.min.x + caret_col as f32 * cell_w;
+    painter.rect_filled(
+        Rect::from_min_size(Pos2::new(caret_x, y), Vec2::new(2.0, cell_h)),
+        0.0,
+        fg,
+    );
+    Some(Rect::from_min_size(Pos2::new(caret_x, y), Vec2::new(cell_w, cell_h)))
+}
+
+/// How many cells a character occupies, so a double-width emoji is fitted to
+/// both of them rather than squeezed into the first.
+fn char_cells(c: char) -> u32 {
+    use unicode_width::UnicodeWidthChar;
+    c.width().unwrap_or(1).max(1) as u32
+}
+
+/// Blit a colour glyph into its cell.  Unlike the built-in glyphs, this carries
+/// its own colours, so it is tinted white (a no-op multiply) rather than with
+/// the cell's foreground.  Placement is already centred within the cell box by
+/// the cache, so the offsets only need converting from pixels to points.
+fn paint_color_glyph(
+    painter: &egui::Painter,
+    cached: &CachedColorGlyph,
+    cell_x: f32,
+    cell_y: f32,
+    ppp: f32,
+) {
+    let rect = Rect::from_min_size(
+        Pos2::new(cell_x + cached.left as f32 / ppp, cell_y + cached.top as f32 / ppp),
+        Vec2::new(cached.width as f32 / ppp, cached.height as f32 / ppp),
+    );
+    let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+    painter.image(cached.texture.id(), rect, uv, Color32::WHITE);
+}
+
 /// Place the cached pixel-space glyph into the cell.  alacritty positions
 /// glyphs as `screen_y_top = baseline - top` with `baseline = cell_bottom`;
 /// because we pass `descent = 0` to the renderer, that simplifies to
@@ -780,4 +1148,73 @@ fn paint_builtin_glyph(
         Rect::from_min_size(Pos2::new(cell_x + dx_pt, cell_y + dy_pt), Vec2::new(w_pt, h_pt));
     let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
     painter.image(cached.texture.id(), glyph_rect, uv, fg);
+}
+
+#[cfg(test)]
+mod tests {
+    use alacritty_terminal::term::Config as TermConfig;
+    use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+    use egui::Key;
+
+    use super::*;
+
+    fn term_running(output: &[u8]) -> Term<EventProxy> {
+        let (proxy, _events) = EventProxy::new(egui::Context::default());
+        let mut term = Term::new(TermConfig::default(), &TermSize::new(80, 24), proxy);
+        Processor::<StdSyncHandler>::new().advance(&mut term, output);
+        term
+    }
+
+    /// Full-screen apps hide the cursor with DECTCEM while they repaint, then
+    /// leave it parked wherever their last write landed.  Drawing it anyway
+    /// drops a block into an arbitrary spot on top of their UI.
+    #[test]
+    fn a_cursor_the_app_hid_is_not_drawn() {
+        let term = term_running(b"\x1b[?25l\x1b[10;40Hrepainting");
+
+        assert_eq!(
+            cursor_shape(&term),
+            CursorShape::Hidden,
+            "the app asked for the cursor to be hidden, but it is still painted at {:?}",
+            term.grid().cursor.point,
+        );
+    }
+
+    #[test]
+    fn a_cursor_the_app_unhid_is_drawn_again() {
+        let term = term_running(b"\x1b[?25l\x1b[?25h");
+
+        assert_ne!(cursor_shape(&term), CursorShape::Hidden);
+    }
+
+    #[test]
+    fn a_cursor_no_app_touched_is_drawn() {
+        let term = term_running(b"$ ");
+
+        assert_ne!(cursor_shape(&term), CursorShape::Hidden);
+    }
+
+    /// egui-winit raises `Event::Paste` for every `command+V` press, Shift
+    /// included, so honoring it here would paste on Ctrl+V no matter what the
+    /// binding table says — and leave the shortcut impossible to rebind.
+    #[test]
+    fn paste_event_does_not_reach_the_terminal() {
+        assert!(consumed_event(&Event::Paste("hi".into()), TermMode::empty()).is_none());
+    }
+
+    /// Alacritty sends SYN on Ctrl+V; paste is a Ctrl+Shift+V binding.
+    #[test]
+    fn ctrl_v_sends_the_control_byte() {
+        let press = Event::Key {
+            key: Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::CTRL,
+        };
+        assert!(
+            matches!(consumed_event(&press, TermMode::empty()), Some(ConsumedEvent::Bytes(ref b)) if b == &vec![0x16]),
+            "Ctrl+V must reach the PTY as 0x16"
+        );
+    }
 }

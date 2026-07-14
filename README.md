@@ -120,9 +120,11 @@ Alacritty's: arrays concatenate (so `[[keyboard.bindings]]` in
 `alacritree.toml` *adds to* the upstream bindings rather than replacing
 them), tables merge recursively, primitives replace.
 
-Alacritree-only options live under `[ui]` in `alacritree.toml` — sidebar
-colours, panel visibility, etc. See `alacritree/src/config.rs` for the
-current schema.
+Alacritree-only options live in `alacritree.toml`: `[ui]` for sidebar
+colours, panel visibility, etc., and `[workspace]` for where new git
+worktrees are created (`worktree_dir`, plus per-project
+`[[workspace.overrides]]`). See `alacritree/src/config.rs` for the current
+schema.
 
 ## MCP server
 
@@ -140,10 +142,61 @@ claude mcp add alacritree -- alacritree mcp
 An agent running *inside* an Alacritree session automatically targets its host
 instance (advertised via the `ALACRITREE_SOCKET` env var); other clients can
 pass `alacritree mcp --socket <path>`. The transport mirrors Alacritty's IPC
-design and is unix-only — disable it with `ipc_socket = false` under
-`[general]`. See
+design — disable it with `ipc_socket = false` under `[general]`. See
 [`docs/alacritree.md`](docs/alacritree.md#mcp-server--drive-alacritree-from-an-llm)
 for the full tool list.
+
+## Command line
+
+The same surface is available as a CLI, for agents that shell out rather than
+speak MCP — and for setting Alacritree up without the folder picker:
+
+```sh
+alacritree project add ~/Git/myrepo     # also: list, remove, refresh
+alacritree worktree create ~/Git/myrepo my-feature
+alacritree git-status ~/Git/myrepo
+
+alacritree session create --workspace ~/Git/myrepo   # prints the new session id
+alacritree session send-text 3 'cargo test' --enter
+alacritree session read-screen 3
+```
+
+`send-text` types the text; `--enter` submits it. (A shell passes arguments
+through verbatim, so a trailing `\r` in the text would arrive as a backslash and
+an `r`.)
+
+Commands print a short human summary; `--json` prints the raw reply instead,
+which is what a script or an agent wants.
+
+Anything that needs a window — sessions, workspace selection — requires a
+running Alacritree. The rest do not: with no instance listening, projects, git
+status, and worktree creation are served straight from `state.toml` and git, so
+an agent can set Alacritree up before anyone has opened it.
+
+`alacritree completions <shell>` writes a completion script to stdout.
+
+### Diagnosing a setup
+
+```sh
+alacritree doctor          # --json for the machine-readable form
+```
+
+Alacritree degrades quietly on purpose: a missing `gh` falls back to the repo's
+default branch, a missing `doppler` skips scope mirroring, a malformed
+`alacritty.toml` loads defaults, and a corrupt `state.toml` opens an empty
+sidebar. Each is the right call on its own — none should stop a terminal from
+opening — but together they mean a broken setup looks much like a working one.
+
+`doctor` reports the external tools it found (with versions and paths), which
+config files were loaded and whether they actually parse, whether the persisted
+projects still exist on disk, and whether a running instance is reachable. It
+needs no running window — "nothing happens when I run it" is exactly when it
+gets used.
+
+It exits non-zero only when something is genuinely broken. A missing optional
+tool is a warning, and a tool driving a feature you have never opted into (an
+absent `doppler` on a machine with no Doppler config) is not even that — a report
+that always carries a warning is a report nobody reads.
 
 ## Documentation
 
