@@ -396,7 +396,7 @@ fn socket_path() -> PathBuf {
 /// `$XDG_RUNTIME_DIR/alacritree` with a tmpdir fallback, mirroring alacritty's
 /// `socket_dir` (which also falls back to tmp on macOS).
 #[cfg(unix)]
-fn socket_dir() -> PathBuf {
+pub fn socket_dir() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(|dir| PathBuf::from(dir).join("alacritree"))
         .and_then(|path| std::fs::create_dir_all(&path).ok().map(|_| path))
@@ -406,7 +406,7 @@ fn socket_dir() -> PathBuf {
 /// The named-pipe filesystem, which is also a directory: listing it is how a
 /// client that did not inherit `ALACRITREE_SOCKET` finds a running instance.
 #[cfg(windows)]
-fn socket_dir() -> PathBuf {
+pub fn socket_dir() -> PathBuf {
     PathBuf::from(r"\\.\pipe\")
 }
 

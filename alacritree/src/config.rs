@@ -339,24 +339,10 @@ fn installed_config(stem: &str, suffix: &str) -> Option<PathBuf> {
 }
 
 pub fn load() -> Config {
-    let alacritty_path = installed_config("alacritty", "toml");
-    let alacritree_path = installed_config("alacritree", "toml");
-
-    let empty = || toml::Value::Table(toml::value::Table::new());
-    let mut merged = match alacritty_path.as_deref().map(read_toml_value) {
-        Some(Ok(Some(v))) => v,
-        Some(Err(e)) => {
-            log::warn!("failed to load {}: {e}", alacritty_path.as_deref().unwrap().display());
-            empty()
-        },
-        _ => empty(),
-    };
-
-    if let Some(path) = alacritree_path.as_deref() {
-        match read_toml_value(path) {
-            Ok(Some(over)) => merged = merge(merged, over),
-            Ok(None) => {},
-            Err(e) => log::warn!("failed to load {}: {e}", path.display()),
+    let (files, merged) = assemble();
+    for file in &files {
+        if let (Some(path), Some(e)) = (&file.path, &file.error) {
+            log::warn!("failed to load {}: {e}", path.display());
         }
     }
 
@@ -369,6 +355,56 @@ pub fn load() -> Config {
     };
 
     raw.into_config()
+}
+
+/// One of the two config files alacritree reads.
+#[derive(Debug, Clone)]
+pub struct ConfigFile {
+    pub stem: &'static str,
+    /// Where it was found, or `None` if nothing on the search path matched.
+    pub path: Option<PathBuf>,
+    /// Why its settings are being ignored, if they are.
+    pub error: Option<String>,
+}
+
+/// What [`load`] papers over.
+///
+/// A broken config must never stop a terminal from opening, so `load` logs the
+/// problem and carries on with defaults.  The cost is that an ignored file looks
+/// exactly like an absent one; this reports what `load` swallowed.
+#[derive(Debug, Clone)]
+pub struct ConfigDiagnosis {
+    pub files: Vec<ConfigFile>,
+    /// Set when the merged config does not fit alacritree's schema, in which
+    /// case *every* setting in *both* files is dropped in favour of defaults.
+    pub schema_error: Option<String>,
+}
+
+pub fn diagnose() -> ConfigDiagnosis {
+    let (files, merged) = assemble();
+    let schema_error = merged.try_into::<RawConfig>().err().map(|e| e.to_string());
+    ConfigDiagnosis { files, schema_error }
+}
+
+/// Read both config files off the search path and merge them, alacritree over
+/// alacritty.  A file that fails to parse contributes nothing and is reported
+/// through its [`ConfigFile::error`].
+fn assemble() -> (Vec<ConfigFile>, toml::Value) {
+    let mut merged = toml::Value::Table(toml::value::Table::new());
+    let mut files = Vec::new();
+
+    for stem in ["alacritty", "alacritree"] {
+        let path = installed_config(stem, "toml");
+        let mut error = None;
+        match path.as_deref().map(read_toml_value) {
+            Some(Ok(Some(value))) => merged = merge(merged, value),
+            Some(Err(e)) => error = Some(e.to_string()),
+            _ => {},
+        }
+        files.push(ConfigFile { stem, path, error });
+    }
+
+    (files, merged)
 }
 
 fn read_toml_value(path: &std::path::Path) -> std::io::Result<Option<toml::Value>> {

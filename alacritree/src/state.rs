@@ -94,6 +94,17 @@ pub fn load_from(path: &Path) -> PersistedState {
     }
 }
 
+/// Why [`load_from`] would fall back to an empty state, if it would.
+///
+/// A corrupt file is never allowed to stop alacritree from starting, so
+/// `load_from` logs it and hands back the default — which makes a lost project
+/// list indistinguishable from a fresh install.  A file that isn't there yet is
+/// a fresh install, and reports no error.
+pub fn parse_error(path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    toml::from_str::<PersistedState>(&contents).err().map(|e| e.to_string())
+}
+
 pub fn mutate_at(path: &Path, change: impl FnOnce(&mut PersistedState)) {
     let mut state = load_from(path);
     change(&mut state);

@@ -9,6 +9,7 @@
 //! `state.toml` and git directly.  Commands that are meaningless without a
 //! window (anything about sessions) fail there rather than pretending.
 
+mod doctor;
 mod offline;
 mod render;
 
@@ -69,6 +70,9 @@ enum Command {
         #[command(subcommand)]
         command: WorktreeCommand,
     },
+
+    /// Check the external tools, config and state alacritree depends on.
+    Doctor,
 
     /// Write a shell completion script to stdout.
     Completions { shell: Shell },
@@ -148,6 +152,9 @@ pub fn run(cli: Cli) -> Option<i32> {
             crate::mcp::run(cli.socket);
             return Some(0);
         },
+        // Diagnosing the machine is not something a running instance can answer:
+        // the report has to be truthful when there is nothing to ask.
+        Command::Doctor => return Some(doctor::run(cli.json, cli.socket.as_deref())),
         other => to_request(other),
     };
 
@@ -228,8 +235,10 @@ fn to_request(command: Command) -> IpcRequest {
                 IpcRequest::CreateWorktree { project_root: absolute(project_root), branch }
             },
         },
-        // Neither reaches an alacritree, so neither has a request to build.
-        Command::Completions { .. } | Command::Mcp => unreachable!("handled before dispatch"),
+        // None of these reach an alacritree, so none has a request to build.
+        Command::Completions { .. } | Command::Mcp | Command::Doctor => {
+            unreachable!("handled before dispatch")
+        },
     }
 }
 
