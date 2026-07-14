@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
@@ -7,15 +7,20 @@ use alacritty_terminal::tty::Shell;
 use eframe::CreationContext;
 use egui::{Color32, Context, Frame, Margin, RichText, ScrollArea, SidePanel, Stroke};
 
+use serde_json::{Value, json};
+
 use crate::bindings::{BindingAction, NamedAction};
 use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::config::Config;
+use crate::doppler;
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, StatusCache};
+use crate::ipc;
 use crate::paste;
 use crate::pr_status::PrCache;
 use crate::projects::{Project, Worktree};
 use crate::session::{Session, SessionId, SessionKind, TermSize};
+use crate::sidebar_nav::{self, SidebarRow};
 use crate::state::{self, PersistedProject, PersistedState};
 use crate::terminal_view;
 use crate::worktree::{self as wt, CreateRequest, Progress};
@@ -113,9 +118,25 @@ fn blend_toward(c: Color32, target: Color32, amount: f32) -> Color32 {
     Color32::from_rgb(mix(c.r(), target.r()), mix(c.g(), target.g()), mix(c.b(), target.b()))
 }
 
+/// Which pane owns keyboard input.  The terminal re-requests egui focus
+/// every frame while it owns this; anything else holding focus (modals
+/// aside) must win here first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaneFocus {
+    Terminal,
+    ProjectsSidebar,
+}
+
 pub struct AlacritreeApp {
     show_left_sidebar: bool,
     show_right_sidebar: bool,
+    focus: PaneFocus,
+    sidebar_cursor: Option<SidebarRow>,
+    /// The focus toggle opened a hidden sidebar; returning focus closes it
+    /// again so a keyboard round trip leaves the layout untouched.
+    sidebar_auto_shown: bool,
+    /// One-shot: scroll the cursor row into view on the next sidebar paint.
+    sidebar_cursor_moved: bool,
     sessions: Vec<Session>,
     current_workspace: WorkspaceKey,
     active_session: HashMap<WorkspaceKey, SessionId>,
@@ -128,9 +149,19 @@ pub struct AlacritreeApp {
     quit_dialog_open: bool,
     pending_delete: Option<DeleteRequest>,
     pending_create: Option<CreateState>,
+    /// Worktrees already given a Doppler scope pass this app run, so opening
+    /// more shells there doesn't re-invoke the doppler CLI.
+    doppler_synced: HashSet<PathBuf>,
+    pending_session_close: Option<SessionId>,
     notify_rx: Receiver<WorkspaceKey>,
+    /// Requests from IPC connection threads, drained once per frame.
+    ipc_rx: Option<Receiver<ipc::AppCall>>,
+    /// Held for its Drop: unlinks the socket file on shutdown.
+    _ipc_socket: Option<ipc::SocketHandle>,
     /// Shared across sessions; auto-invalidated when cell size changes.
     builtin_glyphs: crate::builtin_font::BuiltinGlyphCache,
+    ime: crate::ime::Ime,
+    color_glyphs: crate::color_glyph::ColorGlyphCache,
     /// In-flight background re-discoveries, keyed by project root.  WSL
     /// discovery shells out to wsl.exe and must never block paint; results
     /// are adopted in `poll_project_refreshes`.
@@ -143,6 +174,11 @@ struct DeleteRequest {
     worktree_name: String,
     branch: Option<String>,
     dirty: DirtyCounts,
+    /// The checkout dir is already gone; confirm prunes metadata instead of
+    /// removing a directory.
+    prunable: bool,
+    /// Checkbox state for the prune dialog's "also delete branch".
+    delete_branch: bool,
 }
 
 enum CreateState {
@@ -185,13 +221,8 @@ impl AlacritreeApp {
     pub fn new(cc: &CreationContext<'_>, config: Config) -> Self {
         let theme = Theme::from_config(&config);
 
-        crate::fonts::install_terminal_fonts(
-            &cc.egui_ctx,
-            &config.font.normal,
-            &config.font.bold,
-            &config.font.italic,
-            &config.font.bold_italic,
-        );
+        let font_chain = crate::fonts::install_terminal_fonts(&cc.egui_ctx, &config.font);
+        let color_glyph_budget_mb = config.font.color_glyph_cache_mb;
 
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = theme.terminal_bg;
@@ -234,7 +265,28 @@ impl AlacritreeApp {
         }
         cc.egui_ctx.set_style(style);
 
+        // Terminal IME hint — matches alacritty's set_ime_purpose.
+        cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::IMEPurpose(
+            egui::viewport::IMEPurpose::Terminal,
+        ));
+
         alacritty_terminal::tty::setup_env();
+
+        // Before the first PTY spawn so children inherit ALACRITREE_SOCKET.
+        let (ipc_socket, ipc_rx) = if config.ipc_socket {
+            match ipc::spawn_listener(cc.egui_ctx.clone()) {
+                Ok((handle, rx)) => {
+                    log::info!("IPC socket: {}", handle.path().display());
+                    (Some(handle), Some(rx))
+                },
+                Err(e) => {
+                    log::warn!("failed to create IPC socket: {e}");
+                    (None, None)
+                },
+            }
+        } else {
+            (None, None)
+        };
 
         let persisted = state::load();
         let projects: Vec<Project> = persisted
@@ -267,6 +319,10 @@ impl AlacritreeApp {
         let mut app = Self {
             show_left_sidebar: persisted.show_left_sidebar,
             show_right_sidebar: persisted.show_right_sidebar,
+            focus: PaneFocus::Terminal,
+            sidebar_cursor: None,
+            sidebar_auto_shown: false,
+            sidebar_cursor_moved: false,
             sessions: Vec::new(),
             current_workspace: None,
             active_session: HashMap::new(),
@@ -279,8 +335,17 @@ impl AlacritreeApp {
             quit_dialog_open: false,
             pending_delete: None,
             pending_create: None,
+            doppler_synced: HashSet::new(),
+            pending_session_close: None,
             notify_rx,
+            ipc_rx,
+            _ipc_socket: ipc_socket,
             builtin_glyphs: crate::builtin_font::BuiltinGlyphCache::new(),
+            ime: crate::ime::Ime::default(),
+            color_glyphs: crate::color_glyph::ColorGlyphCache::new(
+                font_chain,
+                color_glyph_budget_mb,
+            ),
             pending_project_refresh: HashMap::new(),
         };
 
@@ -313,7 +378,10 @@ impl AlacritreeApp {
                     shell: p.shell_override.as_ref().map(|c| c.to_state_string()),
                 })
                 .collect(),
-            show_left_sidebar: self.show_left_sidebar,
+            // Don't persist a sidebar the user never opened — an auto-shown
+            // sidebar (e.g. from Ctrl+Shift+B while it was hidden) should not
+            // reappear on next launch.
+            show_left_sidebar: self.show_left_sidebar && !self.sidebar_auto_shown,
             show_right_sidebar: self.show_right_sidebar,
         };
         state::save(&state);
@@ -364,6 +432,11 @@ impl AlacritreeApp {
         ctx: &Context,
         working_directory: WorkspaceKey,
     ) -> std::io::Result<SessionId> {
+        // Before the PTY exists, so the shell can't race `doppler run`
+        // against the scope write.
+        if let Some(dir) = &working_directory {
+            self.sync_doppler_scopes(dir.clone());
+        }
         let shell = self.resolve_shell(&working_directory);
         let session = Session::spawn(
             ctx.clone(),
@@ -377,6 +450,30 @@ impl AlacritreeApp {
         self.sessions.push(session);
         self.active_session.insert(working_directory, id);
         Ok(id)
+    }
+
+    /// Mirror Doppler scopes into a worktree the first time a shell opens
+    /// there.  The create-time hook in `worktree.rs` covers worktrees we
+    /// make; this lazy pass covers ones created outside alacritree, which
+    /// otherwise hit "Doppler Error: You must specify a project".
+    fn sync_doppler_scopes(&mut self, worktree: PathBuf) {
+        if !self.doppler_synced.insert(worktree.clone()) {
+            return;
+        }
+        let main_checkout = self.projects.iter().find_map(|p| {
+            let owns = p.worktrees.iter().any(|wt| !wt.is_main && wt.path == worktree);
+            if !owns {
+                return None;
+            }
+            p.worktrees.iter().find(|wt| wt.is_main).map(|wt| wt.path.clone())
+        });
+        let Some(main_checkout) = main_checkout else {
+            return;
+        };
+        let linked = doppler::mirror_scopes(&main_checkout, &worktree);
+        if linked > 0 {
+            log::info!("linked {linked} doppler scope(s) into {}", worktree.display());
+        }
     }
 
     /// Shell for a workspace: the owning project's override wins, then a WSL
@@ -406,6 +503,19 @@ impl AlacritreeApp {
     }
 
     fn activate_worktree(&mut self, ctx: &Context, path: &Path) {
+        // The dir can vanish between discovery marking the row live and the
+        // click. Switching first would strand the user on a dead workspace
+        // with a failed spawn — stay put and let the sidebar re-mark the row.
+        if !path.is_dir() {
+            self.last_error =
+                Some("worktree directory is missing — prune it from the sidebar".to_string());
+            if let Some(idx) =
+                self.projects.iter().position(|p| p.worktrees.iter().any(|w| w.path == path))
+            {
+                self.projects[idx].refresh();
+            }
+            return;
+        }
         self.current_workspace = Some(path.to_path_buf());
         self.ensure_active_session(ctx);
     }
@@ -448,6 +558,17 @@ impl AlacritreeApp {
                     self.active_session.remove(&workspace);
                 },
             }
+        }
+    }
+
+    fn request_close_session(&mut self, id: SessionId) {
+        let Some(session) = self.sessions.iter().find(|s| s.id == id) else {
+            return;
+        };
+        if self.config.ui.confirm_session_close.requires_prompt(session.is_busy()) {
+            self.pending_session_close = Some(id);
+        } else {
+            self.close_session(id);
         }
     }
 
@@ -507,7 +628,11 @@ impl AlacritreeApp {
         let mut order: Vec<WorkspaceKey> = vec![None];
         for project in &self.projects {
             for wt in &project.worktrees {
-                order.push(Some(wt.path.clone()));
+                // Prunable rows can't host a shell; cycling into one would
+                // just bounce off the activate guard on every keypress.
+                if !wt.prunable {
+                    order.push(Some(wt.path.clone()));
+                }
             }
         }
         order
@@ -531,80 +656,38 @@ impl AlacritreeApp {
     }
 
     fn is_modal_open(&self) -> bool {
-        self.quit_dialog_open || self.pending_delete.is_some() || self.pending_create.is_some()
+        self.quit_dialog_open
+            || self.pending_delete.is_some()
+            || self.pending_create.is_some()
+            || self.pending_session_close.is_some()
     }
 
-    fn handle_shortcuts(&mut self, ctx: &Context) {
-        let mut sidebars_changed = false;
-        let mut cycle_tabs_delta: Option<i32> = None;
-        let mut cycle_ws_delta: Option<i32> = None;
-        let mut quit_requested = false;
-        let mut add_project_requested = false;
-        ctx.input_mut(|i| {
-            if consume_exact(i, egui::Modifiers::CTRL, egui::Key::B) {
-                self.show_left_sidebar = !self.show_left_sidebar;
-                sidebars_changed = true;
-            }
-            if consume_exact(i, egui::Modifiers::CTRL, egui::Key::G) {
-                self.show_right_sidebar = !self.show_right_sidebar;
-                sidebars_changed = true;
-            }
-            // Ctrl+Shift+Tab must be checked before Ctrl+Tab — even with exact
-            // matching, leaving them in the opposite order works, but ordering
-            // forward→backward keeps the "modifier-richer wins" intent obvious.
-            if consume_exact(i, egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Tab) {
-                cycle_tabs_delta = Some(-1);
-            }
-            if consume_exact(i, egui::Modifiers::CTRL, egui::Key::Tab) {
-                cycle_tabs_delta = Some(1);
-            }
-            if consume_exact(i, egui::Modifiers::ALT, egui::Key::ArrowRight) {
-                cycle_ws_delta = Some(1);
-            }
-            if consume_exact(i, egui::Modifiers::ALT, egui::Key::ArrowLeft) {
-                cycle_ws_delta = Some(-1);
-            }
-            if consume_exact(i, egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::O) {
-                add_project_requested = true;
-            }
-            if consume_exact(i, egui::Modifiers::CTRL, egui::Key::Q) {
-                quit_requested = true;
-            }
-        });
-
-        // Split out so spawn_session can take &mut self without tripping the borrow.
-        let ctrl_t = ctx.input_mut(|i| consume_exact(i, egui::Modifiers::CTRL, egui::Key::T));
-        if ctrl_t {
-            let ws = self.current_workspace.clone();
-            if let Err(e) = self.spawn_session(ctx, ws) {
-                self.last_error = Some(format!("failed to spawn shell: {e}"));
-            }
-        }
-        if add_project_requested {
-            self.add_project_via_dialog(ctx);
-        }
-        if let Some(d) = cycle_tabs_delta {
-            self.cycle_tabs(d);
-        }
-        if let Some(d) = cycle_ws_delta {
-            self.cycle_workspaces(ctx, d);
-        }
-        if quit_requested {
-            self.quit_dialog_open = true;
-        }
-        if sidebars_changed {
+    fn focus_sidebar(&mut self) {
+        if !self.show_left_sidebar {
+            self.show_left_sidebar = true;
+            self.sidebar_auto_shown = true;
             self.persist();
         }
-
-        // After built-in shortcuts (so we don't shadow them) but before the
-        // terminal sees raw events (so a binding wins over plain text input).
-        self.dispatch_user_bindings(ctx);
+        self.focus = PaneFocus::ProjectsSidebar;
+        self.sidebar_cursor =
+            Some(sidebar_nav::seed(&self.projects, self.current_workspace.as_deref()));
+        self.sidebar_cursor_moved = true;
     }
 
-    fn dispatch_user_bindings(&mut self, ctx: &Context) {
-        if self.config.bindings.is_empty() {
-            return;
+    fn focus_terminal(&mut self) {
+        self.focus = PaneFocus::Terminal;
+        if self.sidebar_auto_shown {
+            self.show_left_sidebar = false;
+            self.sidebar_auto_shown = false;
+            self.persist();
         }
+    }
+
+    /// Match key events against the binding table (user bindings + defaults)
+    /// before the terminal sees raw events, so a binding wins over plain
+    /// text input.  Matched events are consumed unless every matched action
+    /// is `ReceiveChar` (alacritty's pass-through marker).
+    fn handle_shortcuts(&mut self, ctx: &Context) {
         let actions: Vec<BindingAction> = ctx.input_mut(|i| {
             let mut actions = Vec::new();
             i.events.retain(|ev| {
@@ -627,6 +710,96 @@ impl AlacritreeApp {
         });
         for action in actions {
             self.dispatch_action(ctx, action);
+        }
+    }
+
+    /// Arrow/Enter/Escape navigation while the projects sidebar owns
+    /// keyboard focus.  Consumes only unmodified keys, so modifier-bound
+    /// app shortcuts still match in `handle_shortcuts` afterwards.
+    fn handle_sidebar_nav(&mut self, ctx: &Context) {
+        use egui::Key;
+        let keys: Vec<Key> = ctx.input_mut(|i| {
+            let mut pressed = Vec::new();
+            i.events.retain(|ev| {
+                if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
+                    if modifiers.is_none() && is_sidebar_nav_key(*key) {
+                        pressed.push(*key);
+                        return false;
+                    }
+                }
+                true
+            });
+            pressed
+        });
+        for key in keys {
+            self.apply_sidebar_nav(ctx, key);
+        }
+    }
+
+    fn apply_sidebar_nav(&mut self, ctx: &Context, key: egui::Key) {
+        use egui::Key;
+        let rows = sidebar_nav::visible_rows(&self.projects);
+        let cursor = match self.sidebar_cursor.clone() {
+            Some(c) if rows.contains(&c) => c,
+            // Stale or unseeded cursor (worktree removed, project collapsed
+            // by mouse): land on Home and let the next press act from there.
+            _ => {
+                self.set_sidebar_cursor(SidebarRow::Home);
+                return;
+            },
+        };
+        match key {
+            Key::ArrowUp => self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, -1)),
+            Key::ArrowDown => self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, 1)),
+            Key::ArrowRight => {
+                if let SidebarRow::Project(root) = &cursor {
+                    self.set_project_expanded(root, true);
+                }
+            },
+            Key::ArrowLeft => match &cursor {
+                SidebarRow::Project(root) => self.set_project_expanded(root, false),
+                SidebarRow::Worktree(_) => {
+                    if let Some(target) = sidebar_nav::left_target(&rows, &cursor) {
+                        self.set_sidebar_cursor(target);
+                    }
+                },
+                SidebarRow::Home => {},
+            },
+            Key::Enter => match &cursor {
+                SidebarRow::Home => {
+                    self.activate_home(ctx);
+                    self.focus_terminal();
+                },
+                SidebarRow::Worktree(path) => {
+                    let path = path.clone();
+                    self.activate_worktree(ctx, &path);
+                    self.focus_terminal();
+                },
+                SidebarRow::Project(root) => {
+                    let root = root.clone();
+                    let expanded =
+                        self.projects.iter().find(|p| p.root == root).is_some_and(|p| p.expanded);
+                    self.set_project_expanded(&root, !expanded);
+                },
+            },
+            Key::Escape => self.focus_terminal(),
+            _ => {},
+        }
+    }
+
+    fn set_sidebar_cursor(&mut self, row: SidebarRow) {
+        if self.sidebar_cursor.as_ref() != Some(&row) {
+            self.sidebar_cursor = Some(row);
+            self.sidebar_cursor_moved = true;
+        }
+    }
+
+    fn set_project_expanded(&mut self, root: &Path, expanded: bool) {
+        if let Some(p) = self.projects.iter_mut().find(|p| p.root == *root) {
+            if p.expanded != expanded {
+                p.expanded = expanded;
+                self.persist();
+            }
         }
     }
 
@@ -694,6 +867,37 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::SelectLastTab) => self.select_last_tab(),
             BindingAction::Named(NamedAction::NoOp) => {},
             BindingAction::Named(NamedAction::ReceiveChar) => {},
+            BindingAction::Named(NamedAction::ToggleLeftSidebar) => {
+                self.show_left_sidebar = !self.show_left_sidebar;
+                // A deliberate visibility change opts out of the auto-shown
+                // round trip, and a hidden sidebar cannot keep keyboard focus.
+                self.sidebar_auto_shown = false;
+                if !self.show_left_sidebar && self.focus == PaneFocus::ProjectsSidebar {
+                    self.focus = PaneFocus::Terminal;
+                }
+                self.persist();
+            },
+            BindingAction::Named(NamedAction::ToggleRightSidebar) => {
+                self.show_right_sidebar = !self.show_right_sidebar;
+                self.persist();
+            },
+            BindingAction::Named(NamedAction::SelectNextWorkspace) => {
+                self.cycle_workspaces(ctx, 1);
+            },
+            BindingAction::Named(NamedAction::SelectPreviousWorkspace) => {
+                self.cycle_workspaces(ctx, -1);
+            },
+            BindingAction::Named(NamedAction::AddProject) => self.add_project_via_dialog(ctx),
+            BindingAction::Named(NamedAction::ToggleSidebarFocus) => match self.focus {
+                PaneFocus::Terminal => self.focus_sidebar(),
+                PaneFocus::ProjectsSidebar => self.focus_terminal(),
+            },
+            BindingAction::Named(NamedAction::FocusProjectsSidebar) => {
+                if self.focus != PaneFocus::ProjectsSidebar {
+                    self.focus_sidebar();
+                }
+            },
+            BindingAction::Named(NamedAction::FocusTerminal) => self.focus_terminal(),
             BindingAction::Named(other) => {
                 self.dispatch_scroll_or_other(other);
             },
@@ -807,37 +1011,91 @@ impl AlacritreeApp {
         let activate_request: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
         let delete_request: std::cell::Cell<Option<DeleteRequest>> = std::cell::Cell::new(None);
         let create_request: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
+        let spawn_shell_request: std::cell::Cell<Option<WorkspaceKey>> = std::cell::Cell::new(None);
+        let activate_session_request: std::cell::Cell<Option<(WorkspaceKey, SessionId)>> =
+            std::cell::Cell::new(None);
+        let close_session_request: std::cell::Cell<Option<SessionId>> = std::cell::Cell::new(None);
         let mut add_project_clicked = false;
         let mut refresh_idx: Option<usize> = None;
         let mut remove_idx: Option<usize> = None;
         let mut expand_toggled = false;
         let mut home_clicked = false;
         let theme = self.theme;
+        let cursor_row = if self.focus == PaneFocus::ProjectsSidebar {
+            self.sidebar_cursor.clone()
+        } else {
+            None
+        };
+        let cursor_moved = std::mem::take(&mut self.sidebar_cursor_moved);
 
         // Snapshot attention + agent-glyph state up-front so the `iter_mut`
         // over projects below isn't blocked from calling back into `&self`
         // helpers.
-        let home_attention = self.workspace_needs_attention(&None);
-        let home_agent_glyph = self.workspace_agent_glyph(&None);
-        let project_attention: Vec<bool> =
-            self.projects.iter().map(|p| self.project_needs_attention(p)).collect();
-        let worktree_attention: Vec<Vec<bool>> = self
+        let home_session_rows = self.workspace_session_rows(&None);
+        let worktree_session_rows: Vec<Vec<Vec<SessionRowData>>> = self
             .projects
             .iter()
             .map(|p| {
                 p.worktrees
                     .iter()
-                    .map(|wt| self.workspace_needs_attention(&Some(wt.path.clone())))
+                    .map(|wt| self.workspace_session_rows(&Some(wt.path.clone())))
+                    .collect()
+            })
+            .collect();
+
+        let worktree_listed: Vec<Vec<bool>> = worktree_session_rows
+            .iter()
+            .map(|v| v.iter().map(|rows| !rows.is_empty()).collect())
+            .collect();
+
+        // A rendered session list carries its own per-session dots and
+        // glyphs; repeating them on the parent row reads as noise — the same
+        // rule the project row applies when expanded.  Aggregates therefore
+        // apply only while the list is hidden (fewer than two sessions).
+        let home_attention = home_session_rows.is_empty() && self.workspace_needs_attention(&None);
+        let home_agent_glyph =
+            if home_session_rows.is_empty() { self.workspace_agent_glyph(&None) } else { None };
+        let project_attention: Vec<bool> =
+            self.projects.iter().map(|p| self.project_needs_attention(p)).collect();
+        let worktree_attention: Vec<Vec<bool>> = self
+            .projects
+            .iter()
+            .enumerate()
+            .map(|(p_idx, p)| {
+                p.worktrees
+                    .iter()
+                    .enumerate()
+                    .map(|(w_idx, wt)| {
+                        let listed = worktree_listed
+                            .get(p_idx)
+                            .and_then(|v| v.get(w_idx))
+                            .copied()
+                            .unwrap_or(false);
+                        !listed && self.workspace_needs_attention(&Some(wt.path.clone()))
+                    })
                     .collect()
             })
             .collect();
         let worktree_agent: Vec<Vec<Option<char>>> = self
             .projects
             .iter()
-            .map(|p| {
+            .enumerate()
+            .map(|(p_idx, p)| {
                 p.worktrees
                     .iter()
-                    .map(|wt| self.workspace_agent_glyph(&Some(wt.path.clone())))
+                    .enumerate()
+                    .map(|(w_idx, wt)| {
+                        let listed = worktree_listed
+                            .get(p_idx)
+                            .and_then(|v| v.get(w_idx))
+                            .copied()
+                            .unwrap_or(false);
+                        if listed {
+                            None
+                        } else {
+                            self.workspace_agent_glyph(&Some(wt.path.clone()))
+                        }
+                    })
                     .collect()
             })
             .collect();
@@ -864,16 +1122,29 @@ impl AlacritreeApp {
                 ui.separator();
 
                 ScrollArea::vertical().show(ui, |ui| {
-                    if home_row(
+                    let home_action = home_row(
                         ui,
                         self.current_workspace.is_none(),
+                        matches!(&cursor_row, Some(SidebarRow::Home)),
+                        cursor_moved,
                         home_attention,
                         home_agent_glyph,
                         &theme,
-                    )
-                    .clicked()
-                    {
+                    );
+                    if home_action.activate {
                         home_clicked = true;
+                    }
+                    if home_action.spawn {
+                        spawn_shell_request.set(Some(None));
+                    }
+                    for row in &home_session_rows {
+                        let act = session_row(ui, row, &theme);
+                        if act.activate {
+                            activate_session_request.set(Some((None, row.id)));
+                        }
+                        if act.close {
+                            close_session_request.set(Some(row.id));
+                        }
                     }
                     ui.add_space(2.0);
 
@@ -895,7 +1166,7 @@ impl AlacritreeApp {
                         // on the parent reads as noise.
                         let show_proj_dot = proj_attention && !project.expanded;
                         let mut name_resp: Option<egui::Response> = None;
-                        row_with_trailing(
+                        let row_rect = row_with_trailing(
                             ui,
                             |ui| {
                                 let arrow = if project.expanded { "▾" } else { "▸" };
@@ -941,6 +1212,17 @@ impl AlacritreeApp {
                                 }
                             },
                         );
+                        if matches!(&cursor_row, Some(SidebarRow::Project(r)) if *r == project.root)
+                        {
+                            let rect = egui::Rect::from_x_y_ranges(
+                                ui.max_rect().x_range(),
+                                row_rect.y_range(),
+                            );
+                            paint_cursor_outline(ui, rect, &theme);
+                            if cursor_moved {
+                                ui.scroll_to_rect(rect, None);
+                            }
+                        }
 
                         // Right-click: choose which shell this project's
                         // sessions use. Hidden entirely when no distros are
@@ -1007,19 +1289,62 @@ impl AlacritreeApp {
                                     .and_then(|v| v.get(wt_idx))
                                     .copied()
                                     .unwrap_or(None);
-                                let action =
-                                    worktree_row(ui, wt, is_active, wt_attention, wt_glyph, &theme);
+                                let is_cursor = matches!(
+                                    &cursor_row,
+                                    Some(SidebarRow::Worktree(p)) if *p == wt.path
+                                );
+                                let action = worktree_row(
+                                    ui,
+                                    wt,
+                                    is_active,
+                                    is_cursor,
+                                    cursor_moved,
+                                    wt_attention,
+                                    wt_glyph,
+                                    &theme,
+                                );
                                 if action.activate {
                                     activate_request.set(Some(wt.path.clone()));
                                 }
                                 if action.delete {
+                                    // Discovery marking can be stale; a dir
+                                    // deleted since the last refresh should
+                                    // still get the prune flow, not a doomed
+                                    // `git worktree remove`.
+                                    let prunable = wt.prunable || !wt.path.is_dir();
                                     delete_request.set(Some(DeleteRequest {
                                         project_idx: idx,
                                         worktree_path: wt.path.clone(),
                                         worktree_name: wt.name.clone(),
                                         branch: wt.branch.clone(),
-                                        dirty: git_status::dirty_counts(&wt.path),
+                                        // A missing dir has nothing to be dirty;
+                                        // skip the status probe.
+                                        dirty: if prunable {
+                                            DirtyCounts::default()
+                                        } else {
+                                            git_status::dirty_counts(&wt.path)
+                                        },
+                                        prunable,
+                                        delete_branch: true,
                                     }));
+                                }
+                                if action.spawn {
+                                    spawn_shell_request.set(Some(Some(wt.path.clone())));
+                                }
+                                let session_rows = worktree_session_rows
+                                    .get(idx)
+                                    .and_then(|v| v.get(wt_idx))
+                                    .map(Vec::as_slice)
+                                    .unwrap_or(&[]);
+                                for row in session_rows {
+                                    let act = session_row(ui, row, &theme);
+                                    if act.activate {
+                                        activate_session_request
+                                            .set(Some((Some(wt.path.clone()), row.id)));
+                                    }
+                                    if act.close {
+                                        close_session_request.set(Some(row.id));
+                                    }
                                 }
                             }
                             ui.add_space(4.0);
@@ -1056,6 +1381,24 @@ impl AlacritreeApp {
         if let Some(idx) = create_request.take() {
             self.pending_create =
                 Some(CreateState::Prompt { project_idx: idx, branch: String::new(), error: None });
+        }
+        if let Some((ws, id)) = activate_session_request.take() {
+            // A stale id (session reaped this frame) self-heals next frame:
+            // active_session_index() misses and ensure_active_session picks
+            // an existing shell or spawns one.
+            self.current_workspace = ws.clone();
+            self.active_session.insert(ws, id);
+        }
+        if let Some(id) = close_session_request.take() {
+            self.request_close_session(id);
+        }
+        if let Some(ws) = spawn_shell_request.take() {
+            // Spawning activates the workspace and the new session, matching
+            // Ctrl+T and worktree-creation's open-on-done.
+            self.current_workspace = ws.clone();
+            if let Err(e) = self.spawn_session(ctx, ws) {
+                self.last_error = Some(format!("failed to spawn shell: {e}"));
+            }
         }
         panel_resp.response.rect
     }
@@ -1418,24 +1761,6 @@ fn modal_frame(theme: &Theme) -> Frame {
         .inner_margin(Margin { left: pad_x, right: pad_x, top: pad_y, bottom: pad_y })
 }
 
-/// `InputState::consume_shortcut` matches modifiers as a *subset*: `Ctrl+G`
-/// fires on `Ctrl+Shift+G`, `Ctrl+Tab` fires on `Ctrl+Shift+Tab`, and the
-/// stronger binding never gets a chance to consume the event.  Use exact
-/// modifier matching so each shortcut only triggers on its own combination.
-fn consume_exact(input: &mut egui::InputState, mods: egui::Modifiers, key: egui::Key) -> bool {
-    let mut hit = false;
-    input.events.retain(|ev| {
-        if let egui::Event::Key { key: k, pressed: true, modifiers, .. } = ev {
-            if *k == key && modifiers.matches_exact(mods) {
-                hit = true;
-                return false;
-            }
-        }
-        true
-    });
-    hit
-}
-
 fn consume_modal_keys(ctx: &Context) -> (bool, bool) {
     ctx.input_mut(|i| {
         (
@@ -1703,7 +2028,7 @@ fn icon_button(ui: &mut egui::Ui, glyph: &str, color: Color32, theme: &Theme) ->
     resp
 }
 
-fn row_with_trailing<L, T>(ui: &mut egui::Ui, leading: L, trailing: T)
+fn row_with_trailing<L, T>(ui: &mut egui::Ui, leading: L, trailing: T) -> egui::Rect
 where
     L: FnOnce(&mut egui::Ui),
     T: FnOnce(&mut egui::Ui),
@@ -1721,34 +2046,96 @@ where
             egui::Layout::left_to_right(egui::Align::Center),
             leading,
         );
-    });
+    })
+    .response
+    .rect
+}
+
+/// Keyboard-cursor indicator: an outline rather than a fill so it stays
+/// legible on top of the active row's lightened background.
+fn paint_cursor_outline(ui: &egui::Ui, rect: egui::Rect, theme: &Theme) {
+    ui.painter().rect_stroke(
+        rect,
+        0.0,
+        egui::Stroke::new(1.0, theme.accent),
+        egui::StrokeKind::Inside,
+    );
+}
+
+fn is_sidebar_nav_key(key: egui::Key) -> bool {
+    use egui::Key;
+    matches!(
+        key,
+        Key::ArrowUp
+            | Key::ArrowDown
+            | Key::ArrowLeft
+            | Key::ArrowRight
+            | Key::Enter
+            // egui synthesizes a click on the natively focused widget from
+            // Space (like Enter); consuming it here stops keyboard clicks on
+            // widgets the cursor model doesn't govern while the sidebar owns
+            // focus.
+            | Key::Space
+            | Key::Escape
+    )
+}
+
+struct HomeAction {
+    activate: bool,
+    spawn: bool,
 }
 
 fn home_row(
     ui: &mut egui::Ui,
     is_active: bool,
+    is_cursor: bool,
+    scroll_into_view: bool,
     attention: bool,
     agent_glyph: Option<char>,
     theme: &Theme,
-) -> egui::Response {
+) -> HomeAction {
     // Reserve a slot *before* the labels so the hover bg paints beneath them.
     let bg_idx = ui.painter().add(egui::Shape::Noop);
     let panel_x = ui.max_rect().x_range();
 
-    let frame = Frame::default().inner_margin(Margin { left: 6, right: 6, top: 3, bottom: 3 });
-    let inner_resp = frame.show(ui, |ui| {
-        ui.horizontal(|ui| {
-            paint_row_status_icon(ui, theme, attention, agent_glyph, "⌂", is_active);
-            ui.label(
-                RichText::new("Home")
-                    .color(if is_active { theme.text } else { theme.text_dim })
-                    .strong()
-                    .small(),
+    let mut spawn_clicked = false;
+    let mut spawn_rect: Option<egui::Rect> = None;
+    let frame = Frame::default().inner_margin(Margin { left: 6, right: 0, top: 3, bottom: 3 });
+    let resp = frame
+        .show(ui, |ui| {
+            row_with_trailing(
+                ui,
+                |ui| {
+                    paint_row_status_icon(ui, theme, attention, agent_glyph, "⌂", is_active);
+                    ui.label(
+                        RichText::new("Home")
+                            .color(if is_active { theme.text } else { theme.text_dim })
+                            .strong()
+                            .small(),
+                    );
+                },
+                |ui| {
+                    let btn =
+                        icon_button(ui, "+", theme.text_muted, theme).on_hover_text("new shell");
+                    spawn_rect = Some(btn.rect);
+                    if btn.clicked() {
+                        spawn_clicked = true;
+                    }
+                },
             );
-        });
-    });
-    let hit_rect = egui::Rect::from_x_y_ranges(panel_x, inner_resp.response.rect.y_range());
-    let resp = ui.interact(hit_rect, inner_resp.response.id, egui::Sense::click());
+        })
+        .response
+        .interact(egui::Sense::click());
+
+    // Same z-order recovery as worktree_row: the retroactive frame interact
+    // shadows the inner button, so route clicks inside its rect to spawn.
+    if resp.clicked() && !spawn_clicked {
+        if let (Some(rect), Some(pos)) = (spawn_rect, resp.interact_pointer_pos()) {
+            if rect.contains(pos) {
+                spawn_clicked = true;
+            }
+        }
+    }
 
     let bg = if is_active {
         theme.row_active_bg
@@ -1758,20 +2145,71 @@ fn home_row(
         Color32::TRANSPARENT
     };
     if bg != Color32::TRANSPARENT {
-        ui.painter().set(bg_idx, egui::Shape::rect_filled(hit_rect, 0.0, bg));
+        let rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
+        ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
     }
-    resp
+    if is_cursor {
+        let full_rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
+        paint_cursor_outline(ui, full_rect, theme);
+        if scroll_into_view {
+            ui.scroll_to_rect(full_rect, None);
+        }
+    }
+    HomeAction { activate: resp.clicked() && !spawn_clicked, spawn: spawn_clicked }
 }
 
 struct WorktreeAction {
     activate: bool,
     delete: bool,
+    spawn: bool,
+}
+
+/// Everything a sidebar session row needs, snapshotted before the panel
+/// closure so rendering doesn't borrow `self.sessions`.
+struct SessionRowData {
+    id: SessionId,
+    title: String,
+    needs_attention: bool,
+    agent_glyph: Option<char>,
+    /// This workspace's remembered active session (accent icon).
+    is_active: bool,
+    /// Active *and* the workspace is current — the session on screen
+    /// (row background highlight).
+    is_displayed: bool,
+}
+
+/// Spawn-ordered ids of the sessions in `ws`, or empty below the two-session
+/// list threshold — a single-session workspace row keeps its compact form,
+/// mirroring the tab strip. Pure over (workspace, id) pairs so the grouping
+/// rule is testable without spawning PTYs.
+fn sidebar_session_ids(pairs: &[(WorkspaceKey, SessionId)], ws: &WorkspaceKey) -> Vec<SessionId> {
+    let ids: Vec<SessionId> = pairs.iter().filter(|(w, _)| w == ws).map(|(_, id)| *id).collect();
+    if ids.len() < 2 { Vec::new() } else { ids }
+}
+
+/// Agent glyphs usually come from the title's own leading char
+/// (`Session::agent_glyph`), and the session row paints that glyph as its
+/// status icon right next to the title — showing it in both places doubles
+/// the icon. Drop the leading glyph from the label when it's exactly what
+/// the icon paints, unless that would leave the label empty.
+fn session_row_title(title: &str, agent_glyph: Option<char>) -> String {
+    if let Some(g) = agent_glyph {
+        if let Some(rest) = title.strip_prefix(g) {
+            let rest = rest.trim_start();
+            if !rest.is_empty() {
+                return rest.to_string();
+            }
+        }
+    }
+    title.to_string()
 }
 
 fn worktree_row(
     ui: &mut egui::Ui,
     wt: &Worktree,
     is_active: bool,
+    is_cursor: bool,
+    scroll_into_view: bool,
     attention: bool,
     agent_glyph: Option<char>,
     theme: &Theme,
@@ -1782,13 +2220,21 @@ fn worktree_row(
 
     let mut delete_clicked = false;
     let mut delete_rect: Option<egui::Rect> = None;
+    let mut spawn_clicked = false;
+    let mut spawn_rect: Option<egui::Rect> = None;
     // right: 0 keeps the worktree `×` at the same x as the project row's `×`,
     // which has no frame margin and sits flush against the panel's outer padding.
     let frame = Frame::default().inner_margin(Margin { left: 16, right: 0, top: 3, bottom: 3 });
     let resp = frame
         .show(ui, |ui| {
             let default_icon = if wt.is_main { "●" } else { "○" };
-            let name_color = if is_active { theme.text } else { theme.text_dim };
+            let name_color = if wt.prunable {
+                theme.text_muted
+            } else if is_active {
+                theme.text
+            } else {
+                theme.text_dim
+            };
             row_with_trailing(
                 ui,
                 |ui| {
@@ -1807,27 +2253,45 @@ fn worktree_row(
                 },
                 |ui| {
                     if !wt.is_main {
-                        let btn = icon_button(ui, "×", theme.text_muted, theme)
-                            .on_hover_text("delete worktree and branch");
+                        let hover = if wt.prunable {
+                            "prune worktree"
+                        } else {
+                            "delete worktree and branch"
+                        };
+                        let btn =
+                            icon_button(ui, "×", theme.text_muted, theme).on_hover_text(hover);
                         delete_rect = Some(btn.rect);
                         if btn.clicked() {
                             delete_clicked = true;
                         }
+                    }
+                    let btn =
+                        icon_button(ui, "+", theme.text_muted, theme).on_hover_text("new shell");
+                    spawn_rect = Some(btn.rect);
+                    if btn.clicked() {
+                        spawn_clicked = true;
                     }
                 },
             );
         })
         .response
         .interact(egui::Sense::click());
+    let resp = if wt.prunable {
+        resp.on_hover_text("worktree directory is missing — × prunes it")
+    } else {
+        resp
+    };
 
     // Frame allocates its space at end-of-show, so its retroactive `interact`
     // registers *after* the inner button in egui's z-order — meaning clicks on
     // the × land on this row response, not the button.  Recover by routing
     // clicks whose position falls inside the button rect to delete.
-    if resp.clicked() && !delete_clicked {
-        if let (Some(rect), Some(pos)) = (delete_rect, resp.interact_pointer_pos()) {
-            if rect.contains(pos) {
+    if resp.clicked() && !delete_clicked && !spawn_clicked {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            if delete_rect.is_some_and(|r| r.contains(pos)) {
                 delete_clicked = true;
+            } else if spawn_rect.is_some_and(|r| r.contains(pos)) {
+                spawn_clicked = true;
             }
         }
     }
@@ -1839,11 +2303,94 @@ fn worktree_row(
     } else {
         Color32::TRANSPARENT
     };
+    let full_rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
+    if bg != Color32::TRANSPARENT {
+        ui.painter().set(bg_idx, egui::Shape::rect_filled(full_rect, 0.0, bg));
+    }
+    if is_cursor {
+        paint_cursor_outline(ui, full_rect, theme);
+        if scroll_into_view {
+            ui.scroll_to_rect(full_rect, None);
+        }
+    }
+    WorktreeAction {
+        activate: resp.clicked() && !delete_clicked && !spawn_clicked && !wt.prunable,
+        delete: delete_clicked,
+        spawn: spawn_clicked,
+    }
+}
+
+struct SessionRowAction {
+    activate: bool,
+    close: bool,
+}
+
+fn session_row(ui: &mut egui::Ui, row: &SessionRowData, theme: &Theme) -> SessionRowAction {
+    // Reserve a slot *before* the labels so the hover bg paints beneath them.
+    let bg_idx = ui.painter().add(egui::Shape::Noop);
+    let panel_x = ui.max_rect().x_range();
+
+    let mut close_clicked = false;
+    let mut close_rect: Option<egui::Rect> = None;
+    // One indent level deeper than worktree rows (16); right: 0 keeps the ×
+    // at the same x as the other rows' trailing icons.
+    let frame = Frame::default().inner_margin(Margin { left: 28, right: 0, top: 3, bottom: 3 });
+    let resp = frame
+        .show(ui, |ui| {
+            let title_color = if row.is_active { theme.text } else { theme.text_dim };
+            row_with_trailing(
+                ui,
+                |ui| {
+                    paint_row_status_icon(
+                        ui,
+                        theme,
+                        row.needs_attention,
+                        row.agent_glyph,
+                        "▪",
+                        row.is_active,
+                    );
+                    ui.add(
+                        egui::Label::new(RichText::new(&row.title).color(title_color).small())
+                            .truncate(),
+                    );
+                },
+                |ui| {
+                    let btn = icon_button(ui, "×", theme.text_muted, theme)
+                        .on_hover_text("close session");
+                    close_rect = Some(btn.rect);
+                    if btn.clicked() {
+                        close_clicked = true;
+                    }
+                },
+            );
+        })
+        .response
+        .interact(egui::Sense::click());
+
+    // Frame allocates its space at end-of-show, so its retroactive `interact`
+    // registers *after* the inner button in egui's z-order — meaning clicks on
+    // the × land on this row response, not the button.  Recover by routing
+    // clicks whose position falls inside the button rect to close.
+    if resp.clicked() && !close_clicked {
+        if let (Some(rect), Some(pos)) = (close_rect, resp.interact_pointer_pos()) {
+            if rect.contains(pos) {
+                close_clicked = true;
+            }
+        }
+    }
+
+    let bg = if row.is_displayed {
+        theme.row_active_bg
+    } else if resp.hovered() {
+        theme.row_hover_bg
+    } else {
+        Color32::TRANSPARENT
+    };
     if bg != Color32::TRANSPARENT {
         let rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
         ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
     }
-    WorktreeAction { activate: resp.clicked() && !delete_clicked, delete: delete_clicked }
+    SessionRowAction { activate: resp.clicked() && !close_clicked, close: close_clicked }
 }
 
 impl AlacritreeApp {
@@ -1880,7 +2427,12 @@ impl AlacritreeApp {
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
 
         for idx in 0..self.sessions.len() {
-            let outcome = self.sessions[idx].drain_events();
+            let outcome = self.sessions[idx].drain_events(&self.config.palette);
+            // Ahead of the attention early-out: a background session copying
+            // with OSC 52 still owns the clipboard.
+            for (target, text) in &outcome.clipboard {
+                clipboard::write(*target, text);
+            }
             if !outcome.attention {
                 continue;
             }
@@ -1938,16 +2490,49 @@ impl AlacritreeApp {
         active_glyph.or(other_glyph)
     }
 
+    /// Session rows for `ws`'s sidebar list, per `sidebar_session_ids`'s
+    /// two-session threshold.
+    fn workspace_session_rows(&self, ws: &WorkspaceKey) -> Vec<SessionRowData> {
+        let pairs: Vec<(WorkspaceKey, SessionId)> =
+            self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect();
+        let ids = sidebar_session_ids(&pairs, ws);
+        let active = self.active_session.get(ws).copied();
+        let is_current = self.current_workspace == *ws;
+        ids.iter()
+            .filter_map(|id| self.sessions.iter().find(|s| s.id == *id))
+            .map(|s| SessionRowData {
+                id: s.id,
+                title: session_row_title(&s.title, s.agent_glyph()),
+                needs_attention: s.needs_attention,
+                agent_glyph: s.agent_glyph(),
+                is_active: active == Some(s.id),
+                is_displayed: is_current && active == Some(s.id),
+            })
+            .collect()
+    }
+
     fn show_delete_dialog(&mut self, ctx: &Context) {
         let theme = self.theme;
         let danger = rgb_to_color32(self.config.palette.normal[1]);
-        let Some(req) = self.pending_delete.as_ref() else {
+        let Some(req) = self.pending_delete.as_mut() else {
             return;
         };
-        let title = format!("Delete worktree `{}`?", req.worktree_name);
-        let detail = match &req.branch {
-            Some(b) => format!("Removes the worktree directory and deletes branch `{b}`."),
-            None => "Removes the worktree directory.".to_string(),
+        let (title, detail, verb) = if req.prunable {
+            (
+                format!("Prune worktree `{}`?", req.worktree_name),
+                "The worktree directory is already gone; this removes git's leftover metadata."
+                    .to_string(),
+                "Prune",
+            )
+        } else {
+            (
+                format!("Delete worktree `{}`?", req.worktree_name),
+                match &req.branch {
+                    Some(b) => format!("Removes the worktree directory and deletes branch `{b}`."),
+                    None => "Removes the worktree directory.".to_string(),
+                },
+                "Delete",
+            )
         };
         let warning = dirty_warning(&req.dirty);
 
@@ -1968,17 +2553,26 @@ impl AlacritreeApp {
                 if let Some(w) = &warning {
                     ui.label(RichText::new(w).color(danger).small());
                 }
+                if req.prunable {
+                    if let Some(b) = req.branch.clone() {
+                        ui.checkbox(
+                            &mut req.delete_branch,
+                            RichText::new(format!("Also delete branch `{b}`"))
+                                .color(theme.text_muted)
+                                .small(),
+                        );
+                    }
+                }
                 ui.add_space(4.0 * s);
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("Enter to delete · Esc to cancel")
+                        RichText::new(format!("Enter to {} · Esc to cancel", verb.to_lowercase()))
                             .color(theme.text_muted)
                             .small(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let delete = ui.add(
-                            egui::Button::new(RichText::new("Delete").color(danger)).frame(false),
-                        );
+                        let delete = ui
+                            .add(egui::Button::new(RichText::new(verb).color(danger)).frame(false));
                         if delete.clicked() {
                             confirmed = true;
                         }
@@ -2004,6 +2598,73 @@ impl AlacritreeApp {
         }
     }
 
+    fn show_close_session_dialog(&mut self, ctx: &Context) {
+        let theme = self.theme;
+        let danger = rgb_to_color32(self.config.palette.normal[1]);
+        let Some(id) = self.pending_session_close else {
+            return;
+        };
+        let Some(session) = self.sessions.iter().find(|s| s.id == id) else {
+            // Exited between the click and this frame — nothing left to close.
+            self.pending_session_close = None;
+            return;
+        };
+        let title = format!("Close session `{}`?", session.title);
+        let busy = session.is_busy();
+
+        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let frame = modal_frame(&theme);
+        let mut confirmed = false;
+        let mut cancelled = false;
+
+        let s = theme.ui_scale;
+        let modal = egui::Modal::new(egui::Id::new("alacritree_close_session_dialog"))
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.set_width(320.0 * s);
+                ui.spacing_mut().item_spacing.y = 6.0 * s;
+                ui.label(RichText::new(title).color(theme.text).strong());
+                if busy {
+                    ui.label(
+                        RichText::new("A process appears to be running.").color(danger).small(),
+                    );
+                }
+                ui.add_space(4.0 * s);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Enter to close · Esc to cancel")
+                            .color(theme.text_muted)
+                            .small(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let close_btn = ui.add(
+                            egui::Button::new(RichText::new("Close").color(danger)).frame(false),
+                        );
+                        if close_btn.clicked() {
+                            confirmed = true;
+                        }
+                        let cancel = ui.add(
+                            egui::Button::new(RichText::new("Cancel").color(theme.text_dim))
+                                .frame(false),
+                        );
+                        if cancel.clicked() {
+                            cancelled = true;
+                        }
+                        focus_default(ui.ctx(), close_btn.id);
+                    });
+                });
+            });
+
+        if confirm_via_key || confirmed {
+            self.pending_session_close = None;
+            self.close_session(id);
+            return;
+        }
+        if cancel_via_key || cancelled || modal.should_close() {
+            self.pending_session_close = None;
+        }
+    }
+
     fn run_pending_delete(&mut self, ctx: &Context) {
         let Some(req) = self.pending_delete.take() else {
             return;
@@ -2019,10 +2680,19 @@ impl AlacritreeApp {
         self.active_session.remove(&Some(req.worktree_path.clone()));
 
         let force = req.dirty.is_dirty();
-        if let Err(e) =
+        let result = if req.prunable {
+            wt::prune_worktree(
+                &project_root,
+                &req.worktree_name,
+                req.branch.as_deref(),
+                req.delete_branch,
+            )
+        } else {
             wt::delete_worktree(&project_root, &req.worktree_path, req.branch.as_deref(), force)
-        {
-            self.last_error = Some(format!("delete failed: {e}"));
+        };
+        if let Err(e) = result {
+            let action = if req.prunable { "prune" } else { "delete" };
+            self.last_error = Some(format!("{action} failed: {e}"));
         }
         self.refresh_project(ctx, req.project_idx);
     }
@@ -2156,7 +2826,9 @@ impl AlacritreeApp {
                 error = Some(msg);
                 return Some(CreateState::Prompt { project_idx, branch, error });
             }
-            let req = CreateRequest { project_root, default_branch, branch: canonical.clone() };
+            let base_dir = self.config.workspace.base_dir_for(&project_root);
+            let req =
+                CreateRequest { project_root, default_branch, branch: canonical.clone(), base_dir };
             let rx = wt::spawn_create(req, ctx.clone());
             return Some(CreateState::Running {
                 project_idx,
@@ -2328,6 +3000,159 @@ impl AlacritreeApp {
     }
 }
 
+/// IPC request handling.  Runs on the UI thread inside `update` so every
+/// request sees (and mutates) app state the same way user input does; the
+/// connection thread blocks on `reply_tx` meanwhile.
+impl AlacritreeApp {
+    fn process_ipc_calls(&mut self, ctx: &Context) {
+        let Some(rx) = &self.ipc_rx else { return };
+        let calls: Vec<ipc::AppCall> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        for call in calls {
+            let result = self.handle_ipc_request(ctx, call.request);
+            // A send error means the client gave up waiting — nothing to do.
+            let _ = call.reply_tx.send(result);
+        }
+    }
+
+    fn handle_ipc_request(&mut self, ctx: &Context, request: ipc::IpcRequest) -> ipc::IpcResult {
+        use ipc::IpcRequest as Req;
+        match request {
+            Req::ListProjects => Ok(json!({
+                "current_workspace": self.current_workspace,
+                "projects": self.projects.iter().map(project_json).collect::<Vec<_>>(),
+            })),
+            Req::ListSessions => {
+                let sessions: Vec<Value> = self
+                    .sessions
+                    .iter()
+                    .map(|s| {
+                        let active =
+                            self.active_session.get(&s.working_directory).copied() == Some(s.id);
+                        session_json(s, active)
+                    })
+                    .collect();
+                Ok(json!({ "current_workspace": self.current_workspace, "sessions": sessions }))
+            },
+            Req::SelectWorkspace { path } => match path {
+                None => {
+                    self.activate_home(ctx);
+                    Ok(json!({ "workspace": Value::Null }))
+                },
+                Some(p) => {
+                    let known = self.known_worktree_path(&p).ok_or_else(|| unknown_worktree(&p))?;
+                    self.activate_worktree(ctx, &known);
+                    Ok(json!({ "workspace": known }))
+                },
+            },
+            Req::CreateSession { workspace } => {
+                let workspace = match workspace {
+                    None => None,
+                    Some(p) => {
+                        Some(self.known_worktree_path(&p).ok_or_else(|| unknown_worktree(&p))?)
+                    },
+                };
+                let id = self
+                    .spawn_session(ctx, workspace)
+                    .map_err(|e| format!("failed to spawn shell: {e}"))?;
+                Ok(json!({ "session_id": id }))
+            },
+            Req::CloseSession { session_id } => {
+                if !self.sessions.iter().any(|s| s.id == session_id) {
+                    return Err(format!("no session with id {session_id}"));
+                }
+                self.close_session(session_id);
+                Ok(json!({ "closed": session_id }))
+            },
+            Req::SendText { session_id, text } => {
+                let session = self
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == session_id)
+                    .ok_or_else(|| format!("no session with id {session_id}"))?;
+                paste::on_terminal_input_start(session);
+                let bytes = text.into_bytes();
+                let written = bytes.len();
+                session.write(bytes);
+                Ok(json!({ "bytes_written": written }))
+            },
+            Req::ReadScreen { session_id, scrollback_lines } => {
+                let session = self
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == session_id)
+                    .ok_or_else(|| format!("no session with id {session_id}"))?;
+                let snapshot = session.screen_snapshot(scrollback_lines);
+                Ok(json!({
+                    "title": session.title,
+                    "lines": snapshot.lines,
+                    "cursor": { "line": snapshot.cursor_line, "column": snapshot.cursor_column },
+                    "scrollback_available": snapshot.history_size,
+                }))
+            },
+            Req::RefreshProject { root } => {
+                let project =
+                    self.projects.iter_mut().find(|p| p.root == root).ok_or_else(|| {
+                        format!("{} is not a project in the sidebar", root.display())
+                    })?;
+                project.refresh();
+                Ok(project_json(project))
+            },
+            // Dispatched on the IPC connection thread; never forwarded here.
+            Req::GitStatus { .. } | Req::CreateWorktree { .. } => {
+                Err("request is handled off the UI thread".to_string())
+            },
+        }
+    }
+
+    /// Resolve `path` to a sidebar worktree, tolerating symlinks and trailing
+    /// slashes via canonicalization.
+    fn known_worktree_path(&self, path: &Path) -> Option<PathBuf> {
+        let canonical = path.canonicalize().ok();
+        self.projects.iter().flat_map(|p| &p.worktrees).find_map(|wt| {
+            (wt.path == path || canonical.as_deref() == Some(wt.path.as_path()))
+                .then(|| wt.path.clone())
+        })
+    }
+}
+
+fn unknown_worktree(path: &Path) -> String {
+    format!("{} is not a worktree in the sidebar — see list_projects", path.display())
+}
+
+fn project_json(project: &Project) -> Value {
+    json!({
+        "name": project.name,
+        "root": project.root,
+        "default_branch": project.default_branch,
+        "worktrees": project
+            .worktrees
+            .iter()
+            .map(|wt| json!({
+                "name": wt.name,
+                "path": wt.path,
+                "branch": wt.branch,
+                "is_main": wt.is_main,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn session_json(session: &Session, is_active_tab: bool) -> Value {
+    json!({
+        "id": session.id,
+        "title": session.title,
+        "workspace": session.working_directory,
+        "kind": match &session.kind {
+            SessionKind::Shell => "shell",
+            SessionKind::Diff { .. } => "diff",
+        },
+        "columns": session.size.columns,
+        "lines": session.size.screen_lines,
+        "is_active_tab": is_active_tab,
+        "needs_attention": session.needs_attention,
+    })
+}
+
 impl eframe::App for AlacritreeApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         let bg = self.theme.terminal_bg;
@@ -2338,10 +3163,17 @@ impl eframe::App for AlacritreeApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.poll_project_refreshes();
         let modal_open = self.is_modal_open();
-        if !modal_open {
+        // Keys pressed mid-composition drive the IME's candidate window,
+        // not the app — alacritty's key_input returns early the same way,
+        // above binding dispatch.
+        if !modal_open && self.ime.preedit().is_none() {
+            if self.focus == PaneFocus::ProjectsSidebar {
+                self.handle_sidebar_nav(ctx);
+            }
             self.handle_shortcuts(ctx);
         }
         self.process_notification_actions(ctx);
+        self.process_ipc_calls(ctx);
         self.process_session_events(ctx);
         let theme = self.theme;
         // GL clear is the sole source of the bg when opacity < 1; painting any
@@ -2368,6 +3200,10 @@ impl eframe::App for AlacritreeApp {
                 self.show_tab_strip(ui);
 
                 if let Some(err) = self.last_error.as_deref() {
+                    // A preedit can only be finalized or cancelled by the terminal
+                    // view's event drain, so without a session view to run it the
+                    // preedit would go stale and keep shortcuts suppressed forever.
+                    self.ime.clear();
                     ui.label(
                         RichText::new(err)
                             .color(rgb_to_color32(self.config.palette.normal[1]))
@@ -2381,19 +3217,33 @@ impl eframe::App for AlacritreeApp {
                 }
 
                 let Some(idx) = self.active_session_index() else {
+                    // Same rationale as the last_error branch above: without an
+                    // active session view, no code path can advance the preedit.
+                    self.ime.clear();
                     ui.label(
                         RichText::new("no session — Ctrl+T to open one").color(theme.text_dim),
                     );
                     return;
                 };
                 let session = &mut self.sessions[idx];
-                let _ = terminal_view::show(
+                let ime = &mut self.ime;
+                let response = terminal_view::show(
                     ui,
                     session,
                     &self.config,
-                    !modal_open,
+                    !modal_open && self.focus == PaneFocus::Terminal,
                     &mut self.builtin_glyphs,
+                    ime,
+                    &mut self.color_glyphs,
                 );
+                // egui fake-clicks the natively focused widget on Space/Enter,
+                // and the terminal keeps native focus while the sidebar owns
+                // app focus — so keyboard "clicks" must not steal it back.
+                if response.clicked_by(egui::PointerButton::Primary)
+                    && self.focus != PaneFocus::Terminal
+                {
+                    self.focus_terminal();
+                }
             });
 
         if self.pending_create.is_some() {
@@ -2401,6 +3251,9 @@ impl eframe::App for AlacritreeApp {
         }
         if self.pending_delete.is_some() {
             self.show_delete_dialog(ctx);
+        }
+        if self.pending_session_close.is_some() {
+            self.show_close_session_dialog(ctx);
         }
         if self.quit_dialog_open {
             self.show_quit_dialog(ctx);
@@ -2474,6 +3327,48 @@ fn notify_worker(body: String, _key: WorkspaceKey, _ctx: egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ws(p: &str) -> WorkspaceKey {
+        Some(PathBuf::from(p))
+    }
+
+    #[test]
+    fn session_ids_filter_by_workspace_and_keep_spawn_order() {
+        let pairs = vec![(None, 1), (ws("/a"), 2), (None, 3), (ws("/b"), 4), (ws("/a"), 5)];
+        assert_eq!(sidebar_session_ids(&pairs, &None), vec![1, 3]);
+        assert_eq!(sidebar_session_ids(&pairs, &ws("/a")), vec![2, 5]);
+        // /b has a single session, below the two-session list threshold.
+        assert!(sidebar_session_ids(&pairs, &ws("/b")).is_empty());
+    }
+
+    #[test]
+    fn session_ids_empty_for_unknown_workspace() {
+        let pairs = vec![(None, 1)];
+        assert!(sidebar_session_ids(&pairs, &ws("/missing")).is_empty());
+    }
+
+    #[test]
+    fn session_row_title_drops_glyph_the_icon_already_shows() {
+        assert_eq!(session_row_title("✳ claude", Some('✳')), "claude");
+        // Attention/plain rows keep the title untouched.
+        assert_eq!(session_row_title("✳ claude", None), "✳ claude");
+        // A static process glyph absent from the title strips nothing.
+        assert_eq!(session_row_title("node build", Some('◇')), "node build");
+        // Never strip down to an empty label.
+        assert_eq!(session_row_title("✳ ", Some('✳')), "✳ ");
+    }
+
+    #[test]
+    fn session_ids_apply_two_session_threshold() {
+        let no_match: Vec<(WorkspaceKey, SessionId)> = vec![(ws("/other"), 1)];
+        assert!(sidebar_session_ids(&no_match, &ws("/a")).is_empty());
+
+        let one_match = vec![(ws("/a"), 1), (ws("/other"), 2)];
+        assert!(sidebar_session_ids(&one_match, &ws("/a")).is_empty());
+
+        let two_match = vec![(ws("/a"), 1), (ws("/other"), 2), (ws("/a"), 3)];
+        assert_eq!(sidebar_session_ids(&two_match, &ws("/a")), vec![1, 3]);
+    }
 
     fn req(file: &str, source: DiffSource) -> DiffRequest {
         DiffRequest { file: file.to_string(), source }
