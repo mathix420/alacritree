@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
@@ -6,15 +6,20 @@ use std::sync::{Mutex, OnceLock};
 use eframe::CreationContext;
 use egui::{Color32, Context, Frame, Margin, RichText, ScrollArea, SidePanel, Stroke};
 
+use serde_json::{Value, json};
+
 use crate::bindings::{BindingAction, NamedAction};
 use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::config::Config;
+use crate::doppler;
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, StatusCache};
+use crate::ipc;
 use crate::paste;
 use crate::pr_status::PrCache;
 use crate::projects::{Project, Worktree};
 use crate::session::{Session, SessionId, SessionKind, TermSize};
+use crate::sidebar_nav::{self, SidebarRow};
 use crate::state::{self, PersistedProject, PersistedState};
 use crate::terminal_view;
 use crate::worktree::{self as wt, CreateRequest, Progress};
@@ -111,9 +116,25 @@ fn blend_toward(c: Color32, target: Color32, amount: f32) -> Color32 {
     Color32::from_rgb(mix(c.r(), target.r()), mix(c.g(), target.g()), mix(c.b(), target.b()))
 }
 
+/// Which pane owns keyboard input.  The terminal re-requests egui focus
+/// every frame while it owns this; anything else holding focus (modals
+/// aside) must win here first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaneFocus {
+    Terminal,
+    ProjectsSidebar,
+}
+
 pub struct AlacritreeApp {
     show_left_sidebar: bool,
     show_right_sidebar: bool,
+    focus: PaneFocus,
+    sidebar_cursor: Option<SidebarRow>,
+    /// The focus toggle opened a hidden sidebar; returning focus closes it
+    /// again so a keyboard round trip leaves the layout untouched.
+    sidebar_auto_shown: bool,
+    /// One-shot: scroll the cursor row into view on the next sidebar paint.
+    sidebar_cursor_moved: bool,
     sessions: Vec<Session>,
     current_workspace: WorkspaceKey,
     active_session: HashMap<WorkspaceKey, SessionId>,
@@ -126,10 +147,18 @@ pub struct AlacritreeApp {
     quit_dialog_open: bool,
     pending_delete: Option<DeleteRequest>,
     pending_create: Option<CreateState>,
+    /// Worktrees already given a Doppler scope pass this app run, so opening
+    /// more shells there doesn't re-invoke the doppler CLI.
+    doppler_synced: HashSet<PathBuf>,
     pending_session_close: Option<SessionId>,
     notify_rx: Receiver<WorkspaceKey>,
+    /// Requests from IPC connection threads, drained once per frame.
+    ipc_rx: Option<Receiver<ipc::AppCall>>,
+    /// Held for its Drop: unlinks the socket file on shutdown.
+    _ipc_socket: Option<ipc::SocketHandle>,
     /// Shared across sessions; auto-invalidated when cell size changes.
     builtin_glyphs: crate::builtin_font::BuiltinGlyphCache,
+    ime: crate::ime::Ime,
 }
 
 struct DeleteRequest {
@@ -229,7 +258,28 @@ impl AlacritreeApp {
         }
         cc.egui_ctx.set_style(style);
 
+        // Terminal IME hint — matches alacritty's set_ime_purpose.
+        cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::IMEPurpose(
+            egui::viewport::IMEPurpose::Terminal,
+        ));
+
         alacritty_terminal::tty::setup_env();
+
+        // Before the first PTY spawn so children inherit ALACRITREE_SOCKET.
+        let (ipc_socket, ipc_rx) = if config.ipc_socket {
+            match ipc::spawn_listener(cc.egui_ctx.clone()) {
+                Ok((handle, rx)) => {
+                    log::info!("IPC socket: {}", handle.path().display());
+                    (Some(handle), Some(rx))
+                },
+                Err(e) => {
+                    log::warn!("failed to create IPC socket: {e}");
+                    (None, None)
+                },
+            }
+        } else {
+            (None, None)
+        };
 
         let persisted = state::load();
         let projects = persisted
@@ -252,6 +302,10 @@ impl AlacritreeApp {
         let mut app = Self {
             show_left_sidebar: persisted.show_left_sidebar,
             show_right_sidebar: persisted.show_right_sidebar,
+            focus: PaneFocus::Terminal,
+            sidebar_cursor: None,
+            sidebar_auto_shown: false,
+            sidebar_cursor_moved: false,
             sessions: Vec::new(),
             current_workspace: None,
             active_session: HashMap::new(),
@@ -264,9 +318,13 @@ impl AlacritreeApp {
             quit_dialog_open: false,
             pending_delete: None,
             pending_create: None,
+            doppler_synced: HashSet::new(),
             pending_session_close: None,
             notify_rx,
+            ipc_rx,
+            _ipc_socket: ipc_socket,
             builtin_glyphs: crate::builtin_font::BuiltinGlyphCache::new(),
+            ime: crate::ime::Ime::default(),
         };
 
         if let Err(e) = app.spawn_session(&cc.egui_ctx, None) {
@@ -283,7 +341,10 @@ impl AlacritreeApp {
                 .iter()
                 .map(|p| PersistedProject { root: p.root.clone(), expanded: p.expanded })
                 .collect(),
-            show_left_sidebar: self.show_left_sidebar,
+            // Don't persist a sidebar the user never opened — an auto-shown
+            // sidebar (e.g. from Ctrl+Shift+B while it was hidden) should not
+            // reappear on next launch.
+            show_left_sidebar: self.show_left_sidebar && !self.sidebar_auto_shown,
             show_right_sidebar: self.show_right_sidebar,
         };
         state::save(&state);
@@ -294,6 +355,11 @@ impl AlacritreeApp {
         ctx: &Context,
         working_directory: WorkspaceKey,
     ) -> std::io::Result<SessionId> {
+        // Before the PTY exists, so the shell can't race `doppler run`
+        // against the scope write.
+        if let Some(dir) = &working_directory {
+            self.sync_doppler_scopes(dir.clone());
+        }
         let session = Session::spawn(
             ctx.clone(),
             &self.config,
@@ -305,6 +371,30 @@ impl AlacritreeApp {
         self.sessions.push(session);
         self.active_session.insert(working_directory, id);
         Ok(id)
+    }
+
+    /// Mirror Doppler scopes into a worktree the first time a shell opens
+    /// there.  The create-time hook in `worktree.rs` covers worktrees we
+    /// make; this lazy pass covers ones created outside alacritree, which
+    /// otherwise hit "Doppler Error: You must specify a project".
+    fn sync_doppler_scopes(&mut self, worktree: PathBuf) {
+        if !self.doppler_synced.insert(worktree.clone()) {
+            return;
+        }
+        let main_checkout = self.projects.iter().find_map(|p| {
+            let owns = p.worktrees.iter().any(|wt| !wt.is_main && wt.path == worktree);
+            if !owns {
+                return None;
+            }
+            p.worktrees.iter().find(|wt| wt.is_main).map(|wt| wt.path.clone())
+        });
+        let Some(main_checkout) = main_checkout else {
+            return;
+        };
+        let linked = doppler::mirror_scopes(&main_checkout, &worktree);
+        if linked > 0 {
+            log::info!("linked {linked} doppler scope(s) into {}", worktree.display());
+        }
     }
 
     fn activate_worktree(&mut self, ctx: &Context, path: &Path) {
@@ -442,77 +532,32 @@ impl AlacritreeApp {
             || self.pending_session_close.is_some()
     }
 
-    fn handle_shortcuts(&mut self, ctx: &Context) {
-        let mut sidebars_changed = false;
-        let mut cycle_tabs_delta: Option<i32> = None;
-        let mut cycle_ws_delta: Option<i32> = None;
-        let mut quit_requested = false;
-        let mut add_project_requested = false;
-        ctx.input_mut(|i| {
-            if consume_exact(i, egui::Modifiers::CTRL, egui::Key::B) {
-                self.show_left_sidebar = !self.show_left_sidebar;
-                sidebars_changed = true;
-            }
-            if consume_exact(i, egui::Modifiers::CTRL, egui::Key::G) {
-                self.show_right_sidebar = !self.show_right_sidebar;
-                sidebars_changed = true;
-            }
-            // Ctrl+Shift+Tab must be checked before Ctrl+Tab — even with exact
-            // matching, leaving them in the opposite order works, but ordering
-            // forward→backward keeps the "modifier-richer wins" intent obvious.
-            if consume_exact(i, egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Tab) {
-                cycle_tabs_delta = Some(-1);
-            }
-            if consume_exact(i, egui::Modifiers::CTRL, egui::Key::Tab) {
-                cycle_tabs_delta = Some(1);
-            }
-            if consume_exact(i, egui::Modifiers::ALT, egui::Key::ArrowRight) {
-                cycle_ws_delta = Some(1);
-            }
-            if consume_exact(i, egui::Modifiers::ALT, egui::Key::ArrowLeft) {
-                cycle_ws_delta = Some(-1);
-            }
-            if consume_exact(i, egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::O) {
-                add_project_requested = true;
-            }
-            if consume_exact(i, egui::Modifiers::CTRL, egui::Key::Q) {
-                quit_requested = true;
-            }
-        });
-
-        // Split out so spawn_session can take &mut self without tripping the borrow.
-        let ctrl_t = ctx.input_mut(|i| consume_exact(i, egui::Modifiers::CTRL, egui::Key::T));
-        if ctrl_t {
-            let ws = self.current_workspace.clone();
-            if let Err(e) = self.spawn_session(ctx, ws) {
-                self.last_error = Some(format!("failed to spawn shell: {e}"));
-            }
-        }
-        if add_project_requested {
-            self.add_project_via_dialog();
-        }
-        if let Some(d) = cycle_tabs_delta {
-            self.cycle_tabs(d);
-        }
-        if let Some(d) = cycle_ws_delta {
-            self.cycle_workspaces(ctx, d);
-        }
-        if quit_requested {
-            self.quit_dialog_open = true;
-        }
-        if sidebars_changed {
+    fn focus_sidebar(&mut self) {
+        if !self.show_left_sidebar {
+            self.show_left_sidebar = true;
+            self.sidebar_auto_shown = true;
             self.persist();
         }
-
-        // After built-in shortcuts (so we don't shadow them) but before the
-        // terminal sees raw events (so a binding wins over plain text input).
-        self.dispatch_user_bindings(ctx);
+        self.focus = PaneFocus::ProjectsSidebar;
+        self.sidebar_cursor =
+            Some(sidebar_nav::seed(&self.projects, self.current_workspace.as_deref()));
+        self.sidebar_cursor_moved = true;
     }
 
-    fn dispatch_user_bindings(&mut self, ctx: &Context) {
-        if self.config.bindings.is_empty() {
-            return;
+    fn focus_terminal(&mut self) {
+        self.focus = PaneFocus::Terminal;
+        if self.sidebar_auto_shown {
+            self.show_left_sidebar = false;
+            self.sidebar_auto_shown = false;
+            self.persist();
         }
+    }
+
+    /// Match key events against the binding table (user bindings + defaults)
+    /// before the terminal sees raw events, so a binding wins over plain
+    /// text input.  Matched events are consumed unless every matched action
+    /// is `ReceiveChar` (alacritty's pass-through marker).
+    fn handle_shortcuts(&mut self, ctx: &Context) {
         let actions: Vec<BindingAction> = ctx.input_mut(|i| {
             let mut actions = Vec::new();
             i.events.retain(|ev| {
@@ -535,6 +580,96 @@ impl AlacritreeApp {
         });
         for action in actions {
             self.dispatch_action(ctx, action);
+        }
+    }
+
+    /// Arrow/Enter/Escape navigation while the projects sidebar owns
+    /// keyboard focus.  Consumes only unmodified keys, so modifier-bound
+    /// app shortcuts still match in `handle_shortcuts` afterwards.
+    fn handle_sidebar_nav(&mut self, ctx: &Context) {
+        use egui::Key;
+        let keys: Vec<Key> = ctx.input_mut(|i| {
+            let mut pressed = Vec::new();
+            i.events.retain(|ev| {
+                if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
+                    if modifiers.is_none() && is_sidebar_nav_key(*key) {
+                        pressed.push(*key);
+                        return false;
+                    }
+                }
+                true
+            });
+            pressed
+        });
+        for key in keys {
+            self.apply_sidebar_nav(ctx, key);
+        }
+    }
+
+    fn apply_sidebar_nav(&mut self, ctx: &Context, key: egui::Key) {
+        use egui::Key;
+        let rows = sidebar_nav::visible_rows(&self.projects);
+        let cursor = match self.sidebar_cursor.clone() {
+            Some(c) if rows.contains(&c) => c,
+            // Stale or unseeded cursor (worktree removed, project collapsed
+            // by mouse): land on Home and let the next press act from there.
+            _ => {
+                self.set_sidebar_cursor(SidebarRow::Home);
+                return;
+            },
+        };
+        match key {
+            Key::ArrowUp => self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, -1)),
+            Key::ArrowDown => self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, 1)),
+            Key::ArrowRight => {
+                if let SidebarRow::Project(root) = &cursor {
+                    self.set_project_expanded(root, true);
+                }
+            },
+            Key::ArrowLeft => match &cursor {
+                SidebarRow::Project(root) => self.set_project_expanded(root, false),
+                SidebarRow::Worktree(_) => {
+                    if let Some(target) = sidebar_nav::left_target(&rows, &cursor) {
+                        self.set_sidebar_cursor(target);
+                    }
+                },
+                SidebarRow::Home => {},
+            },
+            Key::Enter => match &cursor {
+                SidebarRow::Home => {
+                    self.activate_home(ctx);
+                    self.focus_terminal();
+                },
+                SidebarRow::Worktree(path) => {
+                    let path = path.clone();
+                    self.activate_worktree(ctx, &path);
+                    self.focus_terminal();
+                },
+                SidebarRow::Project(root) => {
+                    let root = root.clone();
+                    let expanded =
+                        self.projects.iter().find(|p| p.root == root).is_some_and(|p| p.expanded);
+                    self.set_project_expanded(&root, !expanded);
+                },
+            },
+            Key::Escape => self.focus_terminal(),
+            _ => {},
+        }
+    }
+
+    fn set_sidebar_cursor(&mut self, row: SidebarRow) {
+        if self.sidebar_cursor.as_ref() != Some(&row) {
+            self.sidebar_cursor = Some(row);
+            self.sidebar_cursor_moved = true;
+        }
+    }
+
+    fn set_project_expanded(&mut self, root: &Path, expanded: bool) {
+        if let Some(p) = self.projects.iter_mut().find(|p| p.root == *root) {
+            if p.expanded != expanded {
+                p.expanded = expanded;
+                self.persist();
+            }
         }
     }
 
@@ -602,6 +737,37 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::SelectLastTab) => self.select_last_tab(),
             BindingAction::Named(NamedAction::NoOp) => {},
             BindingAction::Named(NamedAction::ReceiveChar) => {},
+            BindingAction::Named(NamedAction::ToggleLeftSidebar) => {
+                self.show_left_sidebar = !self.show_left_sidebar;
+                // A deliberate visibility change opts out of the auto-shown
+                // round trip, and a hidden sidebar cannot keep keyboard focus.
+                self.sidebar_auto_shown = false;
+                if !self.show_left_sidebar && self.focus == PaneFocus::ProjectsSidebar {
+                    self.focus = PaneFocus::Terminal;
+                }
+                self.persist();
+            },
+            BindingAction::Named(NamedAction::ToggleRightSidebar) => {
+                self.show_right_sidebar = !self.show_right_sidebar;
+                self.persist();
+            },
+            BindingAction::Named(NamedAction::SelectNextWorkspace) => {
+                self.cycle_workspaces(ctx, 1);
+            },
+            BindingAction::Named(NamedAction::SelectPreviousWorkspace) => {
+                self.cycle_workspaces(ctx, -1);
+            },
+            BindingAction::Named(NamedAction::AddProject) => self.add_project_via_dialog(),
+            BindingAction::Named(NamedAction::ToggleSidebarFocus) => match self.focus {
+                PaneFocus::Terminal => self.focus_sidebar(),
+                PaneFocus::ProjectsSidebar => self.focus_terminal(),
+            },
+            BindingAction::Named(NamedAction::FocusProjectsSidebar) => {
+                if self.focus != PaneFocus::ProjectsSidebar {
+                    self.focus_sidebar();
+                }
+            },
+            BindingAction::Named(NamedAction::FocusTerminal) => self.focus_terminal(),
             BindingAction::Named(other) => {
                 self.dispatch_scroll_or_other(other);
             },
@@ -725,6 +891,12 @@ impl AlacritreeApp {
         let mut expand_toggled = false;
         let mut home_clicked = false;
         let theme = self.theme;
+        let cursor_row = if self.focus == PaneFocus::ProjectsSidebar {
+            self.sidebar_cursor.clone()
+        } else {
+            None
+        };
+        let cursor_moved = std::mem::take(&mut self.sidebar_cursor_moved);
 
         // Snapshot attention + agent-glyph state up-front so the `iter_mut`
         // over projects below isn't blocked from calling back into `&self`
@@ -821,6 +993,8 @@ impl AlacritreeApp {
                     let home_action = home_row(
                         ui,
                         self.current_workspace.is_none(),
+                        matches!(&cursor_row, Some(SidebarRow::Home)),
+                        cursor_moved,
                         home_attention,
                         home_agent_glyph,
                         &theme,
@@ -859,7 +1033,7 @@ impl AlacritreeApp {
                         // worktree rows already show the dot, and doubling it
                         // on the parent reads as noise.
                         let show_proj_dot = proj_attention && !project.expanded;
-                        row_with_trailing(
+                        let row_rect = row_with_trailing(
                             ui,
                             |ui| {
                                 let arrow = if project.expanded { "▾" } else { "▸" };
@@ -902,6 +1076,17 @@ impl AlacritreeApp {
                                 }
                             },
                         );
+                        if matches!(&cursor_row, Some(SidebarRow::Project(r)) if *r == project.root)
+                        {
+                            let rect = egui::Rect::from_x_y_ranges(
+                                ui.max_rect().x_range(),
+                                row_rect.y_range(),
+                            );
+                            paint_cursor_outline(ui, rect, &theme);
+                            if cursor_moved {
+                                ui.scroll_to_rect(rect, None);
+                            }
+                        }
 
                         if project.expanded {
                             for (wt_idx, wt) in project.worktrees.iter().enumerate() {
@@ -916,8 +1101,20 @@ impl AlacritreeApp {
                                     .and_then(|v| v.get(wt_idx))
                                     .copied()
                                     .unwrap_or(None);
-                                let action =
-                                    worktree_row(ui, wt, is_active, wt_attention, wt_glyph, &theme);
+                                let is_cursor = matches!(
+                                    &cursor_row,
+                                    Some(SidebarRow::Worktree(p)) if *p == wt.path
+                                );
+                                let action = worktree_row(
+                                    ui,
+                                    wt,
+                                    is_active,
+                                    is_cursor,
+                                    cursor_moved,
+                                    wt_attention,
+                                    wt_glyph,
+                                    &theme,
+                                );
                                 if action.activate {
                                     activate_request.set(Some(wt.path.clone()));
                                 }
@@ -1313,24 +1510,6 @@ fn modal_frame(theme: &Theme) -> Frame {
         .inner_margin(Margin { left: pad_x, right: pad_x, top: pad_y, bottom: pad_y })
 }
 
-/// `InputState::consume_shortcut` matches modifiers as a *subset*: `Ctrl+G`
-/// fires on `Ctrl+Shift+G`, `Ctrl+Tab` fires on `Ctrl+Shift+Tab`, and the
-/// stronger binding never gets a chance to consume the event.  Use exact
-/// modifier matching so each shortcut only triggers on its own combination.
-fn consume_exact(input: &mut egui::InputState, mods: egui::Modifiers, key: egui::Key) -> bool {
-    let mut hit = false;
-    input.events.retain(|ev| {
-        if let egui::Event::Key { key: k, pressed: true, modifiers, .. } = ev {
-            if *k == key && modifiers.matches_exact(mods) {
-                hit = true;
-                return false;
-            }
-        }
-        true
-    });
-    hit
-}
-
 fn consume_modal_keys(ctx: &Context) -> (bool, bool) {
     ctx.input_mut(|i| {
         (
@@ -1598,7 +1777,7 @@ fn icon_button(ui: &mut egui::Ui, glyph: &str, color: Color32, theme: &Theme) ->
     resp
 }
 
-fn row_with_trailing<L, T>(ui: &mut egui::Ui, leading: L, trailing: T)
+fn row_with_trailing<L, T>(ui: &mut egui::Ui, leading: L, trailing: T) -> egui::Rect
 where
     L: FnOnce(&mut egui::Ui),
     T: FnOnce(&mut egui::Ui),
@@ -1616,7 +1795,38 @@ where
             egui::Layout::left_to_right(egui::Align::Center),
             leading,
         );
-    });
+    })
+    .response
+    .rect
+}
+
+/// Keyboard-cursor indicator: an outline rather than a fill so it stays
+/// legible on top of the active row's lightened background.
+fn paint_cursor_outline(ui: &egui::Ui, rect: egui::Rect, theme: &Theme) {
+    ui.painter().rect_stroke(
+        rect,
+        0.0,
+        egui::Stroke::new(1.0, theme.accent),
+        egui::StrokeKind::Inside,
+    );
+}
+
+fn is_sidebar_nav_key(key: egui::Key) -> bool {
+    use egui::Key;
+    matches!(
+        key,
+        Key::ArrowUp
+            | Key::ArrowDown
+            | Key::ArrowLeft
+            | Key::ArrowRight
+            | Key::Enter
+            // egui synthesizes a click on the natively focused widget from
+            // Space (like Enter); consuming it here stops keyboard clicks on
+            // widgets the cursor model doesn't govern while the sidebar owns
+            // focus.
+            | Key::Space
+            | Key::Escape
+    )
 }
 
 struct HomeAction {
@@ -1627,6 +1837,8 @@ struct HomeAction {
 fn home_row(
     ui: &mut egui::Ui,
     is_active: bool,
+    is_cursor: bool,
+    scroll_into_view: bool,
     attention: bool,
     agent_glyph: Option<char>,
     theme: &Theme,
@@ -1685,6 +1897,13 @@ fn home_row(
         let rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
         ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
     }
+    if is_cursor {
+        let full_rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
+        paint_cursor_outline(ui, full_rect, theme);
+        if scroll_into_view {
+            ui.scroll_to_rect(full_rect, None);
+        }
+    }
     HomeAction { activate: resp.clicked() && !spawn_clicked, spawn: spawn_clicked }
 }
 
@@ -1738,6 +1957,8 @@ fn worktree_row(
     ui: &mut egui::Ui,
     wt: &Worktree,
     is_active: bool,
+    is_cursor: bool,
+    scroll_into_view: bool,
     attention: bool,
     agent_glyph: Option<char>,
     theme: &Theme,
@@ -1815,9 +2036,15 @@ fn worktree_row(
     } else {
         Color32::TRANSPARENT
     };
+    let full_rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
     if bg != Color32::TRANSPARENT {
-        let rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
-        ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
+        ui.painter().set(bg_idx, egui::Shape::rect_filled(full_rect, 0.0, bg));
+    }
+    if is_cursor {
+        paint_cursor_outline(ui, full_rect, theme);
+        if scroll_into_view {
+            ui.scroll_to_rect(full_rect, None);
+        }
     }
     WorktreeAction {
         activate: resp.clicked() && !delete_clicked && !spawn_clicked,
@@ -1933,7 +2160,12 @@ impl AlacritreeApp {
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
 
         for idx in 0..self.sessions.len() {
-            let outcome = self.sessions[idx].drain_events();
+            let outcome = self.sessions[idx].drain_events(&self.config.palette);
+            // Ahead of the attention early-out: a background session copying
+            // with OSC 52 still owns the clipboard.
+            for (target, text) in &outcome.clipboard {
+                clipboard::write(*target, text);
+            }
             if !outcome.attention {
                 continue;
             }
@@ -2469,6 +2701,159 @@ impl AlacritreeApp {
     }
 }
 
+/// IPC request handling.  Runs on the UI thread inside `update` so every
+/// request sees (and mutates) app state the same way user input does; the
+/// connection thread blocks on `reply_tx` meanwhile.
+impl AlacritreeApp {
+    fn process_ipc_calls(&mut self, ctx: &Context) {
+        let Some(rx) = &self.ipc_rx else { return };
+        let calls: Vec<ipc::AppCall> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        for call in calls {
+            let result = self.handle_ipc_request(ctx, call.request);
+            // A send error means the client gave up waiting — nothing to do.
+            let _ = call.reply_tx.send(result);
+        }
+    }
+
+    fn handle_ipc_request(&mut self, ctx: &Context, request: ipc::IpcRequest) -> ipc::IpcResult {
+        use ipc::IpcRequest as Req;
+        match request {
+            Req::ListProjects => Ok(json!({
+                "current_workspace": self.current_workspace,
+                "projects": self.projects.iter().map(project_json).collect::<Vec<_>>(),
+            })),
+            Req::ListSessions => {
+                let sessions: Vec<Value> = self
+                    .sessions
+                    .iter()
+                    .map(|s| {
+                        let active =
+                            self.active_session.get(&s.working_directory).copied() == Some(s.id);
+                        session_json(s, active)
+                    })
+                    .collect();
+                Ok(json!({ "current_workspace": self.current_workspace, "sessions": sessions }))
+            },
+            Req::SelectWorkspace { path } => match path {
+                None => {
+                    self.activate_home(ctx);
+                    Ok(json!({ "workspace": Value::Null }))
+                },
+                Some(p) => {
+                    let known = self.known_worktree_path(&p).ok_or_else(|| unknown_worktree(&p))?;
+                    self.activate_worktree(ctx, &known);
+                    Ok(json!({ "workspace": known }))
+                },
+            },
+            Req::CreateSession { workspace } => {
+                let workspace = match workspace {
+                    None => None,
+                    Some(p) => {
+                        Some(self.known_worktree_path(&p).ok_or_else(|| unknown_worktree(&p))?)
+                    },
+                };
+                let id = self
+                    .spawn_session(ctx, workspace)
+                    .map_err(|e| format!("failed to spawn shell: {e}"))?;
+                Ok(json!({ "session_id": id }))
+            },
+            Req::CloseSession { session_id } => {
+                if !self.sessions.iter().any(|s| s.id == session_id) {
+                    return Err(format!("no session with id {session_id}"));
+                }
+                self.close_session(session_id);
+                Ok(json!({ "closed": session_id }))
+            },
+            Req::SendText { session_id, text } => {
+                let session = self
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == session_id)
+                    .ok_or_else(|| format!("no session with id {session_id}"))?;
+                paste::on_terminal_input_start(session);
+                let bytes = text.into_bytes();
+                let written = bytes.len();
+                session.write(bytes);
+                Ok(json!({ "bytes_written": written }))
+            },
+            Req::ReadScreen { session_id, scrollback_lines } => {
+                let session = self
+                    .sessions
+                    .iter()
+                    .find(|s| s.id == session_id)
+                    .ok_or_else(|| format!("no session with id {session_id}"))?;
+                let snapshot = session.screen_snapshot(scrollback_lines);
+                Ok(json!({
+                    "title": session.title,
+                    "lines": snapshot.lines,
+                    "cursor": { "line": snapshot.cursor_line, "column": snapshot.cursor_column },
+                    "scrollback_available": snapshot.history_size,
+                }))
+            },
+            Req::RefreshProject { root } => {
+                let project =
+                    self.projects.iter_mut().find(|p| p.root == root).ok_or_else(|| {
+                        format!("{} is not a project in the sidebar", root.display())
+                    })?;
+                project.refresh();
+                Ok(project_json(project))
+            },
+            // Dispatched on the IPC connection thread; never forwarded here.
+            Req::GitStatus { .. } | Req::CreateWorktree { .. } => {
+                Err("request is handled off the UI thread".to_string())
+            },
+        }
+    }
+
+    /// Resolve `path` to a sidebar worktree, tolerating symlinks and trailing
+    /// slashes via canonicalization.
+    fn known_worktree_path(&self, path: &Path) -> Option<PathBuf> {
+        let canonical = path.canonicalize().ok();
+        self.projects.iter().flat_map(|p| &p.worktrees).find_map(|wt| {
+            (wt.path == path || canonical.as_deref() == Some(wt.path.as_path()))
+                .then(|| wt.path.clone())
+        })
+    }
+}
+
+fn unknown_worktree(path: &Path) -> String {
+    format!("{} is not a worktree in the sidebar — see list_projects", path.display())
+}
+
+fn project_json(project: &Project) -> Value {
+    json!({
+        "name": project.name,
+        "root": project.root,
+        "default_branch": project.default_branch,
+        "worktrees": project
+            .worktrees
+            .iter()
+            .map(|wt| json!({
+                "name": wt.name,
+                "path": wt.path,
+                "branch": wt.branch,
+                "is_main": wt.is_main,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn session_json(session: &Session, is_active_tab: bool) -> Value {
+    json!({
+        "id": session.id,
+        "title": session.title,
+        "workspace": session.working_directory,
+        "kind": match &session.kind {
+            SessionKind::Shell => "shell",
+            SessionKind::Diff { .. } => "diff",
+        },
+        "columns": session.size.columns,
+        "lines": session.size.screen_lines,
+        "is_active_tab": is_active_tab,
+        "needs_attention": session.needs_attention,
+    })
+}
+
 impl eframe::App for AlacritreeApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         let bg = self.theme.terminal_bg;
@@ -2478,10 +2863,17 @@ impl eframe::App for AlacritreeApp {
 
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         let modal_open = self.is_modal_open();
-        if !modal_open {
+        // Keys pressed mid-composition drive the IME's candidate window,
+        // not the app — alacritty's key_input returns early the same way,
+        // above binding dispatch.
+        if !modal_open && self.ime.preedit().is_none() {
+            if self.focus == PaneFocus::ProjectsSidebar {
+                self.handle_sidebar_nav(ctx);
+            }
             self.handle_shortcuts(ctx);
         }
         self.process_notification_actions(ctx);
+        self.process_ipc_calls(ctx);
         self.process_session_events(ctx);
         let theme = self.theme;
         // GL clear is the sole source of the bg when opacity < 1; painting any
@@ -2508,6 +2900,10 @@ impl eframe::App for AlacritreeApp {
                 self.show_tab_strip(ui);
 
                 if let Some(err) = self.last_error.as_deref() {
+                    // A preedit can only be finalized or cancelled by the terminal
+                    // view's event drain, so without a session view to run it the
+                    // preedit would go stale and keep shortcuts suppressed forever.
+                    self.ime.clear();
                     ui.label(
                         RichText::new(err)
                             .color(rgb_to_color32(self.config.palette.normal[1]))
@@ -2521,19 +2917,32 @@ impl eframe::App for AlacritreeApp {
                 }
 
                 let Some(idx) = self.active_session_index() else {
+                    // Same rationale as the last_error branch above: without an
+                    // active session view, no code path can advance the preedit.
+                    self.ime.clear();
                     ui.label(
                         RichText::new("no session — Ctrl+T to open one").color(theme.text_dim),
                     );
                     return;
                 };
                 let session = &mut self.sessions[idx];
-                let _ = terminal_view::show(
+                let ime = &mut self.ime;
+                let response = terminal_view::show(
                     ui,
                     session,
                     &self.config,
-                    !modal_open,
+                    !modal_open && self.focus == PaneFocus::Terminal,
                     &mut self.builtin_glyphs,
+                    ime,
                 );
+                // egui fake-clicks the natively focused widget on Space/Enter,
+                // and the terminal keeps native focus while the sidebar owns
+                // app focus — so keyboard "clicks" must not steal it back.
+                if response.clicked_by(egui::PointerButton::Primary)
+                    && self.focus != PaneFocus::Terminal
+                {
+                    self.focus_terminal();
+                }
             });
 
         if self.pending_create.is_some() {

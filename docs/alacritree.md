@@ -233,6 +233,42 @@ No telemetry, no analytics, no background network traffic.
 goes through the same modal so a stray Cmd-W doesn't kill live sessions.
 Modal Enter/Escape are intercepted before the terminal sees them.
 
+## MCP server — drive Alacritree from an LLM
+
+Alacritree exposes its features to LLM agents through the
+[Model Context Protocol](https://modelcontextprotocol.io). `alacritree mcp`
+runs a stdio MCP server that talks to the running app, so an agent can browse
+your projects and worktrees, open shells in them, type into terminals, read
+their output, and inspect git state. Register it with your MCP client, e.g.:
+
+```sh
+claude mcp add alacritree -- alacritree mcp
+```
+
+Tools:
+
+| Tool | What it does |
+| --- | --- |
+| `list_projects` | Sidebar projects with their worktrees, branches, and default branch |
+| `list_sessions` | All sessions: id, title, workspace, kind, size, active tab, attention flag |
+| `select_workspace` | Focus a workspace, like clicking it in the sidebar |
+| `create_session` | Open a new shell session in a workspace |
+| `close_session` | Close a session |
+| `send_text` | Type into a session's terminal (control chars pass through; `\r` submits) |
+| `read_screen` | Read a session's screen text, cursor position, and optional scrollback |
+| `git_status` | Staged/unstaged files and per-file +/- vs the default branch |
+| `create_worktree` | Create a worktree + branch, same flow as the sidebar's `+` button |
+| `refresh_project` | Re-scan a project's worktrees |
+
+Under the hood this mirrors Alacritty's IPC design (unix only): the app
+listens on `$XDG_RUNTIME_DIR/alacritree/alacritree-<pid>.sock` and advertises
+the path to child PTYs via `ALACRITREE_SOCKET` — so an agent running *inside*
+an Alacritree session automatically targets the instance hosting it. Other
+clients fall back to scanning the socket directory, or can pass
+`alacritree mcp --socket <path>` explicitly. Set `ipc_socket = false` under
+`[general]` (shared with Alacritty's option of the same name) to disable the
+socket entirely.
+
 ---
 
 ## Why Alacritree beats every competitor in this space
