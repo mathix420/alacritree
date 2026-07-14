@@ -124,14 +124,36 @@ Alacritree-only options live under `[ui]` in `alacritree.toml` — sidebar
 colours, panel visibility, etc. See `alacritree/src/config.rs` for the
 current schema.
 
+## MCP server
+
+Alacritree can be driven by an LLM agent over the
+[Model Context Protocol](https://modelcontextprotocol.io). `alacritree mcp`
+starts a stdio MCP server that talks to the running app — an agent can list
+your projects and worktrees, open shells in them, type into terminals, read
+their output, inspect git status, and create worktrees. Register it with any
+MCP client:
+
+```sh
+claude mcp add alacritree -- alacritree mcp
+```
+
+An agent running *inside* an Alacritree session automatically targets its host
+instance (advertised via the `ALACRITREE_SOCKET` env var); other clients can
+pass `alacritree mcp --socket <path>`. The transport mirrors Alacritty's IPC
+design and is unix-only — disable it with `ipc_socket = false` under
+`[general]`. See
+[`docs/alacritree.md`](docs/alacritree.md#mcp-server--drive-alacritree-from-an-llm)
+for the full tool list.
+
 ## Documentation
 
 - [`docs/alacritree.md`](docs/alacritree.md) — full feature reference for the
   fork: workspaces and sessions, the project/worktree sidebar (create/delete
   flows, AI-config copy, branch validation), the git-status panel, the
   terminal grid (built-in box-drawing, OSC 8 + regex links, OSC 52 clipboard),
-  the two-file config model, and how Alacritree compares against worktree
-  CLIs, AI-agent orchestrators, and other native terminals in the space.
+  the two-file config model, the built-in MCP/IPC server, and how Alacritree
+  compares against worktree CLIs, AI-agent orchestrators, and other native
+  terminals in the space.
 - [`docs/keyboard-shortcuts.md`](docs/keyboard-shortcuts.md) — every key
   binding the app understands, split between hard-coded app shortcuts
   (sidebar toggles, workspace and session switching, modals) and the
