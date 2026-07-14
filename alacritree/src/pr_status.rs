@@ -17,6 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::command_ext::CommandExt;
+use crate::wsl;
 
 /// Re-query at most this often.  PR base branches rarely change, and a stale
 /// answer just falls back to the previous diff target — not worth hammering
@@ -121,9 +122,22 @@ fn spawn_lookup(
 /// answer is tied to that specific branch rather than whatever ref happens
 /// to be checked out in the worktree.
 fn query_gh(path: &Path, branch: &str) -> Option<PrInfo> {
-    let output = Command::new("gh")
-        .hide_console()
-        .current_dir(path)
+    let mut cmd = match wsl::classify(path) {
+        wsl::Location::Windows(p) => {
+            let mut c = Command::new("gh");
+            c.hide_console().current_dir(p);
+            c
+        },
+        // `gh` must be installed and authenticated *inside* the distro; any
+        // failure falls back to the default branch, same as a missing
+        // Windows gh.  `--cd` accepts the UNC path natively.
+        wsl::Location::Wsl { distro, .. } => {
+            let mut c = wsl::command(&distro, Some(path));
+            c.arg("gh");
+            c
+        },
+    };
+    let output = cmd
         .args(["pr", "view", branch, "--json", "number,baseRefName,url"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

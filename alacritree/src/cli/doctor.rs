@@ -601,8 +601,10 @@ mod tests {
 
     fn state_with(dir: &TempDir, roots: &[PathBuf]) -> PathBuf {
         let path = dir.path().join("state.toml");
-        let projects =
-            roots.iter().map(|r| PersistedProject { root: r.clone(), expanded: true }).collect();
+        let projects = roots
+            .iter()
+            .map(|r| PersistedProject { root: r.clone(), expanded: true, shell: None })
+            .collect();
         state::save_to(&path, &PersistedState { projects, ..PersistedState::default() });
         path
     }

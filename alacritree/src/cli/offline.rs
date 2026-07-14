@@ -68,7 +68,7 @@ fn add(state_path: &Path, path: &Path) -> Project {
     let root = path.to_path_buf();
     state::mutate_at(state_path, |s| {
         if !s.projects.iter().any(|p| p.root == root) {
-            s.projects.push(PersistedProject { root, expanded: true });
+            s.projects.push(PersistedProject { root, expanded: true, shell: None });
         }
     });
     Project::discover(path.to_path_buf())
@@ -102,7 +102,7 @@ fn discover_all(state_path: &Path) -> Vec<Project> {
 /// from git anyway.
 fn create_worktree(project_root: PathBuf, branch: String) -> IpcResult {
     wt::validate_branch_name(&branch)?;
-    let request = CreateRequest { project_root, default_branch: None, branch };
+    let request = CreateRequest { project_root, default_branch: None, branch, base_dir: None };
     let mut steps = Vec::new();
     let path = wt::create(&request, |step| steps.push(step.to_string()))?;
     Ok(json!({ "path": path, "steps": steps }))

@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::event::{Event as TermEvent, EventListener, Notify, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, Notifier};
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::Point;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{ClipboardType, Config as TermConfig, Term};
@@ -93,13 +94,16 @@ pub struct Session {
     /// trackpad pixel-deltas accumulate into whole-line scrolls instead of
     /// being dropped when each frame's delta is smaller than a cell.
     pub accumulated_scroll: (f64, f64),
+    /// Last grid cell reported to a mouse-tracking app, so pointer motion emits
+    /// at most one report per cell crossed instead of one per pixel.
+    pub last_report_cell: Option<Point>,
     /// Shell pid spawned for this PTY.  Used to walk to the foreground
     /// process group when identifying which agent is running.  None on
-    /// platforms where we don't yet capture it (Windows).
+    /// platforms where we don't yet capture it.
     shell_pid: Option<u32>,
     /// Cached result of the last foreground-process probe — refreshed on a
-    /// timer instead of polling `/proc` every frame.  `Cell` is enough since
-    /// `Session` isn't `Sync` and the values are `Copy`.
+    /// timer instead of polling the process table every frame.  `Cell` is
+    /// enough since `Session` isn't `Sync` and the values are `Copy`.
     agent_cache: Cell<AgentCache>,
     notifier: Notifier,
     sender: EventLoopSender,
@@ -115,9 +119,10 @@ struct AgentCache {
 
 const AGENT_CACHE_TTL: Duration = Duration::from_millis(1000);
 
-/// Map a foreground process name (from `/proc/<pid>/comm`) to its static
-/// sidebar glyph.  `comm` is kernel-truncated to 15 bytes, so we compare with
-/// `starts_with` — `cursor-agent` would otherwise miss.
+/// Map a foreground process name (`/proc/<pid>/comm` on Linux, image name
+/// on Windows) to its static sidebar glyph.  Compared with `starts_with`:
+/// Linux `comm` is kernel-truncated to 15 bytes (`cursor-agent` would
+/// otherwise miss) and Windows names carry an `.exe` suffix.
 const AGENT_PROCESS_GLYPHS: &[(&str, char)] = &[
     ("claude", '✳'),
     ("codex", '◇'),
@@ -137,6 +142,50 @@ pub struct ScreenSnapshot {
     pub cursor_column: usize,
     /// Total scrollback rows available above the visible screen.
     pub history_size: usize,
+}
+
+/// Pids in the tree rooted at `root` (inclusive), from a `(pid, parent)`
+/// snapshot.  Root-inclusive so a session whose spawned program *is* the
+/// agent still matches.  Parent links in a snapshot can be stale or cyclic
+/// (pid reuse), so the walk tracks visited pids.
+#[cfg(any(test, windows))]
+fn process_tree_pids(procs: &[(u32, Option<u32>)], root: u32) -> Vec<u32> {
+    use std::collections::HashSet;
+    let mut tree = vec![root];
+    let mut visited: HashSet<u32> = tree.iter().copied().collect();
+    let mut cursor = 0;
+    while cursor < tree.len() {
+        let parent = tree[cursor];
+        cursor += 1;
+        for &(pid, ppid) in procs {
+            if ppid == Some(parent) && visited.insert(pid) {
+                tree.push(pid);
+            }
+        }
+    }
+    tree
+}
+
+/// Match process names against the agent map.  Lowercased `starts_with`,
+/// mirroring the Linux `comm` match while tolerating Windows' `.exe`
+/// suffix and case-insensitive filenames.
+#[cfg(any(test, windows))]
+fn agent_glyph_by_name(names: impl IntoIterator<Item = impl AsRef<str>>) -> Option<char> {
+    names.into_iter().find_map(|n| {
+        let n = n.as_ref().to_ascii_lowercase();
+        AGENT_PROCESS_GLYPHS.iter().find(|(name, _)| n.starts_with(name)).map(|(_, g)| *g)
+    })
+}
+
+/// Match full command lines against the agent map — picks up
+/// `node ...\claude-code\cli.js`-style wrappers that hide behind their
+/// runtime's name, same as the Linux cmdline pass.
+#[cfg(any(test, windows))]
+fn agent_glyph_by_cmdline(cmds: impl IntoIterator<Item = impl AsRef<str>>) -> Option<char> {
+    cmds.into_iter().find_map(|c| {
+        let c = c.as_ref().to_ascii_lowercase();
+        AGENT_PROCESS_GLYPHS.iter().find(|(name, _)| c.contains(name)).map(|(_, g)| *g)
+    })
 }
 
 #[derive(Default)]
@@ -186,6 +235,13 @@ fn is_spinner_title(title: &str) -> bool {
     })
 }
 
+/// A session "looks busy" when its foreground process is a recognized
+/// agent or its title is in a spinner state — the signal the sidebar's
+/// close-confirmation policy keys on.
+fn looks_busy(agent_glyph: Option<char>, title: &str) -> bool {
+    agent_glyph.is_some() || is_spinner_title(title)
+}
+
 /// `<glyph> <text>` titles are the universal agent-CLI shape: a non-ASCII
 /// leading glyph followed by whitespace.  Plain titles (`~/foo`, `bash`)
 /// fail both checks.
@@ -207,7 +263,14 @@ fn pty_shell_pid(pty: &alacritty_terminal::tty::Pty) -> Option<u32> {
     Some(pty.child().id())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn pty_shell_pid(pty: &alacritty_terminal::tty::Pty) -> Option<u32> {
+    // Under ConPTY the PTY child *is* the shell; everything the user runs
+    // is spawned beneath it.
+    pty.child_watcher().pid().map(std::num::NonZeroU32::get)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn pty_shell_pid(_pty: &alacritty_terminal::tty::Pty) -> Option<u32> {
     None
 }
@@ -265,11 +328,112 @@ fn read_tpgid(shell_pid: u32) -> Option<i32> {
     after.split_whitespace().nth(5)?.parse::<i32>().ok()
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Windows has no foreground process group, so "foreground" is approximated
+/// as *any* recognized agent in the shell's descendant tree.  This is what
+/// the glyph means to the user — "an agent is running here" — and it stays
+/// stable while agents run their own subprocesses, where a deepest-leaf
+/// heuristic would flicker.
+#[cfg(windows)]
+fn foreground_process_glyph(shell_pid: u32) -> Option<char> {
+    windows_process_probe::agent_glyph_under(shell_pid)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn foreground_process_glyph(_shell_pid: u32) -> Option<char> {
     // macOS would use `libproc::proc_pidfdinfo` / `tcgetpgrp` on the master
-    // FD; Windows is its own world.  Not wired up yet.
+    // FD.  Not wired up yet.
     None
+}
+
+/// Terminal options derived from the user config.
+pub fn term_config(config: &Config) -> TermConfig {
+    TermConfig {
+        scrolling_history: config.scrolling.history,
+        default_cursor_style: config.cursor_style(),
+        semantic_escape_chars: config.selection.semantic_escape_chars.clone(),
+        // `Term` drops every kitty keyboard request — push, pop, and the
+        // support query — unless this is set, so without it an app never gets
+        // to enable the protocol and modified keys stay legacy.  alacritty
+        // enables it unconditionally too (config/ui_config.rs `term_options`).
+        kitty_keyboard: true,
+        ..TermConfig::default()
+    }
+}
+
+/// A vanished cwd would otherwise surface as the PTY backend's raw error
+/// (`os error 267`, "The directory name is invalid", on Windows) — reject it
+/// up front with a message the error toast can show as-is.
+fn ensure_working_directory(dir: Option<&Path>) -> std::io::Result<()> {
+    match dir {
+        Some(d) if !d.is_dir() => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("working directory no longer exists: {}", d.display()),
+        )),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(windows)]
+mod windows_process_probe {
+    //! Shared, throttled process-table snapshot.  Every session probes at
+    //! its own `AGENT_CACHE_TTL` cadence; keeping one global `System` means
+    //! N sessions cost one enumeration per tick, not N.  Two-phase refresh:
+    //! names + parent pids for the whole table (one cheap system call
+    //! class), command lines only for the shell's descendants and only when
+    //! no name matched.
+    use std::sync::{Mutex, PoisonError};
+    use std::time::{Duration, Instant};
+
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    use super::{agent_glyph_by_cmdline, agent_glyph_by_name, process_tree_pids};
+
+    /// Slightly under `AGENT_CACHE_TTL` so the first session to tick
+    /// refreshes and the rest reuse the same table.
+    const SNAPSHOT_TTL: Duration = Duration::from_millis(900);
+
+    static SNAPSHOT: Mutex<Option<(Instant, System)>> = Mutex::new(None);
+
+    pub(super) fn agent_glyph_under(shell_pid: u32) -> Option<char> {
+        let mut guard = SNAPSHOT.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.as_ref().is_none_or(|(at, _)| at.elapsed() >= SNAPSHOT_TTL) {
+            let mut sys = guard.take().map(|(_, sys)| sys).unwrap_or_default();
+            sys.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                ProcessRefreshKind::nothing(),
+            );
+            *guard = Some((Instant::now(), sys));
+        }
+        let (_, sys) = guard.as_mut().expect("snapshot populated above");
+
+        let table: Vec<(u32, Option<u32>)> = sys
+            .processes()
+            .iter()
+            .map(|(pid, p)| (pid.as_u32(), p.parent().map(|pp| pp.as_u32())))
+            .collect();
+        let tree = process_tree_pids(&table, shell_pid);
+        let tree: Vec<Pid> = tree.into_iter().map(Pid::from_u32).collect();
+
+        let names =
+            tree.iter().filter_map(|pid| sys.process(*pid)).map(|p| p.name().to_string_lossy());
+        if let Some(glyph) = agent_glyph_by_name(names) {
+            return Some(glyph);
+        }
+
+        // Names missed: fetch command lines for just the tree to catch
+        // agents launched through node/python shims.
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&tree),
+            false,
+            ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+        );
+        let cmds = tree
+            .iter()
+            .filter_map(|pid| sys.process(*pid))
+            .map(|p| p.cmd().iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "));
+        agent_glyph_by_cmdline(cmds)
+    }
 }
 
 impl Session {
@@ -279,8 +443,15 @@ impl Session {
         working_directory: Option<PathBuf>,
         size: TermSize,
         cell_size: (f32, f32),
+        shell_override: Option<Shell>,
     ) -> std::io::Result<Self> {
-        let shell = config.shell.as_ref().map(|s| Shell::new(s.program.clone(), s.args.clone()));
+        // Overrides are argv built in code (`wsl.exe -d <distro> --cd <dir>`),
+        // so their args need Windows quoting like diff-pane argv; config
+        // shells stay raw to match upstream alacritty.
+        let escape_args = shell_override.is_some();
+        let shell = shell_override.or_else(|| {
+            config.shell.as_ref().map(|s| Shell::new(s.program.clone(), s.args.clone()))
+        });
         let title = working_directory
             .as_ref()
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
@@ -294,6 +465,7 @@ impl Session {
             shell,
             title,
             SessionKind::Shell,
+            escape_args,
         )
     }
 
@@ -320,6 +492,7 @@ impl Session {
             Some(Shell::new(program, args)),
             title,
             kind,
+            true,
         )
     }
 
@@ -332,18 +505,14 @@ impl Session {
         shell: Option<Shell>,
         title: String,
         kind: SessionKind,
+        escape_args: bool,
     ) -> std::io::Result<Self> {
+        ensure_working_directory(working_directory.as_deref())?;
         let window_size = window_size(size, cell_size);
 
         let (proxy, events) = EventProxy::new(ctx);
 
-        let term_config = TermConfig {
-            scrolling_history: config.scrolling.history,
-            default_cursor_style: config.cursor_style(),
-            semantic_escape_chars: config.selection.semantic_escape_chars.clone(),
-            ..TermConfig::default()
-        };
-        let term = Term::new(term_config, &size, proxy.clone());
+        let term = Term::new(term_config(config), &size, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
 
         let mut env = config.env.clone();
@@ -356,6 +525,8 @@ impl Session {
             env.entry("LESS".to_string()).or_insert_with(|| "RX".to_string());
         }
 
+        #[cfg(not(windows))]
+        let _ = escape_args;
         let pty_options = PtyOptions {
             shell,
             working_directory: working_directory.clone(),
@@ -363,12 +534,12 @@ impl Session {
             env,
             // Windows has no argv: alacritty_terminal joins these args into a
             // single CreateProcess command line, quoting them only when this
-            // is set.  Diff panes pass argv built in code, where an arg with a
-            // space (delta's pager spec, file paths) must survive as one
-            // argument; shell args from alacritty.toml stay raw to match
-            // upstream alacritty.
+            // is set.  True for argv built in code (diff panes, WSL shells),
+            // where an arg with a space (delta's pager spec, UNC paths) must
+            // survive as one argument; shell args from alacritty.toml stay
+            // raw to match upstream alacritty.
             #[cfg(windows)]
-            escape_args: matches!(kind, SessionKind::Diff { .. }),
+            escape_args,
         };
 
         // alacritty routes OSC 7 / signals by this id, so each session needs its own.
@@ -391,6 +562,7 @@ impl Session {
             events,
             needs_attention: false,
             accumulated_scroll: (0.0, 0.0),
+            last_report_cell: None,
             shell_pid,
             agent_cache: Cell::new(AgentCache::default()),
             notifier: Notifier(sender.clone()),
@@ -477,6 +649,13 @@ impl Session {
             return title_glyph.or(proc_glyph);
         }
         title_glyph
+    }
+
+    /// A session "looks busy" when its foreground process is a recognized
+    /// agent or its title is in a spinner state — the signal the sidebar's
+    /// close-confirmation policy keys on.
+    pub fn is_busy(&self) -> bool {
+        looks_busy(self.agent_glyph(), &self.title)
     }
 
     fn process_agent_glyph(&self) -> Option<char> {
@@ -765,5 +944,85 @@ mod tests {
     #[test]
     fn an_unset_cursor_color_is_left_unanswered() {
         assert_eq!(reply_to(b"\x1b]12;?\x07", &Palette::default()), None);
+    }
+
+    #[test]
+    fn busy_when_agent_glyph_present() {
+        assert!(looks_busy(Some('✳'), "plain title"));
+    }
+
+    #[test]
+    fn busy_when_title_is_spinner() {
+        assert!(looks_busy(None, "⠋ Thinking…"));
+    }
+
+    #[test]
+    fn idle_when_no_glyph_and_plain_title() {
+        assert!(!looks_busy(None, "~/projects/alacritree"));
+        assert!(!looks_busy(None, ""));
+    }
+
+    #[test]
+    fn missing_dir_is_a_readable_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("gone");
+        let err = ensure_working_directory(Some(&gone)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(err.to_string().contains("no longer exists"));
+    }
+
+    #[test]
+    fn none_and_existing_dirs_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(ensure_working_directory(None).is_ok());
+        assert!(ensure_working_directory(Some(tmp.path())).is_ok());
+    }
+
+    #[test]
+    fn tree_walk_collects_root_and_descendants_only() {
+        // 1 → {10 → {20 → 30}, 40 → 50}; rooting at 10 must exclude 40's branch.
+        let procs = [
+            (1, None),
+            (10, Some(1)),
+            (20, Some(10)),
+            (30, Some(20)),
+            (40, Some(1)),
+            (50, Some(40)),
+        ];
+        let mut tree = process_tree_pids(&procs, 10);
+        tree.sort_unstable();
+        assert_eq!(tree, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn tree_walk_includes_root_even_without_children() {
+        // A session can be spawned with the agent as the shell program itself.
+        assert_eq!(process_tree_pids(&[(7, None)], 7), vec![7]);
+    }
+
+    #[test]
+    fn tree_walk_survives_cyclic_parent_links() {
+        // Snapshot parent data can be stale (pid reuse) and form cycles.
+        let procs = [(10, Some(20)), (20, Some(10))];
+        let mut tree = process_tree_pids(&procs, 10);
+        tree.sort_unstable();
+        assert_eq!(tree, vec![10, 20]);
+    }
+
+    #[test]
+    fn name_match_handles_exe_suffix_and_case() {
+        assert_eq!(agent_glyph_by_name(["pwsh.exe", "Claude.exe"]), Some('✳'));
+        assert_eq!(agent_glyph_by_name(["cursor-agent.exe"]), Some('❖'));
+        assert_eq!(agent_glyph_by_name(["pwsh.exe", "git.exe"]), None);
+        assert_eq!(agent_glyph_by_name(["not-claude.exe"]), None);
+        assert_eq!(agent_glyph_by_name(std::iter::empty::<&str>()), None);
+    }
+
+    #[test]
+    fn cmdline_match_catches_runtime_wrappers() {
+        let cmd =
+            r"node C:\Users\lev\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js";
+        assert_eq!(agent_glyph_by_cmdline([cmd]), Some('✳'));
+        assert_eq!(agent_glyph_by_cmdline([r"pwsh.exe -NoLogo"]), None);
     }
 }

@@ -20,8 +20,19 @@ serde_json = "1"
 toml = { workspace = true }
 xdg = "3.0.0"
 home = "0.5.5"
+unicode-width = "0.2.0"
 fontdb = { version = "0.23", default-features = false, features = ["fontconfig", "memmap"] }
+# Reads cmap tables to build coverage sets for the Windows fallback chain.
+# Same major as the ttf-parser fontdb already pulls in, so no duplicate build.
+ttf-parser = "0.25"
+# Font faces reach egui as mappings, not buffers.  Same version fontdb already
+# links, so no duplicate build.
+memmap2 = "0.9"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+# Rasterizes COLR/CBDT/sbix/SVG emoji, which egui's outline-only glyph pipeline
+# cannot draw.  ttf-parser could cover COLRv0 with no new dependency, but the
+# COLRv1 gradient painting that Noto Color Emoji needs is not worth hand-rolling.
+swash = "0.2"
 png = "0.17"
 # Desktop notifications when a background session rings the bell.
 notify-rust = "4"
@@ -30,7 +41,7 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 
 [dev-dependencies]
-# Throwaway state files, so the persistence tests don't touch the real one.
+# Throwaway repos and state files for worktree, prune, and persistence tests.
 tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
@@ -49,6 +60,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Console",
     "Win32_System_LibraryLoader",
 ] }
+# Foreground-agent detection: walks the shell's descendant process tree.
+# Linux reads /proc directly, so the dependency is Windows-only.
+sysinfo = { version = "0.36", default-features = false, features = ["system"] }
+# Distro enumeration reads HKCU\...\Lxss directly (Windows Terminal's
+# approach) — no process spawn at startup, and it identifies the default.
+winreg = "0.55"
 
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3.0.2"

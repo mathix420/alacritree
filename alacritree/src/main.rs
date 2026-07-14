@@ -5,23 +5,30 @@ mod bindings;
 mod builtin_font;
 mod cli;
 mod clipboard;
+mod color_glyph;
 mod colors;
 mod command_ext;
 mod config;
 mod doppler;
 mod fonts;
 mod git_status;
+mod ime;
 mod input;
 mod ipc;
 mod links;
 mod mcp;
+mod mouse;
 mod paste;
 mod pr_status;
 mod projects;
 mod session;
+mod sidebar_nav;
 mod state;
 mod terminal_view;
+#[cfg(test)]
+mod test_util;
 mod worktree;
+mod wsl;
 
 use app::AlacritreeApp;
 use clap::Parser;
@@ -73,6 +80,7 @@ fn main() -> eframe::Result<()> {
     }
 
     let config = config::load();
+    wsl::set_automount_root(config.wsl_automount_root.clone());
     let translucent = config.window.opacity < 1.0;
 
     let mut viewport = egui::ViewportBuilder::default()

@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use git2::{Delta, DiffOptions, Repository, Status, StatusOptions};
 
+use crate::wsl;
+
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Clone)]
@@ -63,6 +65,13 @@ impl DirtyCounts {
 /// that `compute` does, since we only need to know whether `git worktree
 /// remove` will refuse the path.
 pub fn dirty_counts(path: &Path) -> DirtyCounts {
+    match wsl::classify(path) {
+        wsl::Location::Wsl { distro, linux_path } => dirty_counts_wsl(&distro, &linux_path),
+        wsl::Location::Windows(_) => dirty_counts_git2(path),
+    }
+}
+
+fn dirty_counts_git2(path: &Path) -> DirtyCounts {
     let Ok(repo) = Repository::open(path) else {
         return DirtyCounts::default();
     };
@@ -92,6 +101,25 @@ pub fn dirty_counts(path: &Path) -> DirtyCounts {
         }
     }
     counts
+}
+
+/// Counts from one porcelain-v2 round trip.  Called synchronously when the
+/// delete modal opens — a warm wsl.exe call (~400 ms) is a tolerable
+/// one-shot stall for an explicit destructive action.
+fn dirty_counts_wsl(distro: &str, linux_path: &str) -> DirtyCounts {
+    let Ok(stdout) = wsl::run_batch(
+        distro,
+        r#"git -C "$1" status --porcelain=v2 -z 2>/dev/null"#,
+        &[linux_path],
+    ) else {
+        return DirtyCounts::default();
+    };
+    let (staged, unstaged) = parse_status_v2_z(&stdout);
+    DirtyCounts {
+        staged: staged.len(),
+        modified: unstaged.iter().filter(|c| c.kind != ChangeKind::Untracked).count(),
+        untracked: unstaged.iter().filter(|c| c.kind == ChangeKind::Untracked).count(),
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -186,9 +214,14 @@ fn spawn_compute(path: PathBuf, hint: Option<String>, ctx: egui::Context) -> Pen
 }
 
 pub fn compute(path: &Path, default_branch_hint: Option<&str>) -> GitStatus {
-    match compute_inner(path, default_branch_hint) {
-        Ok(s) => s,
-        Err(e) => GitStatus { error: Some(e.to_string()), ..Default::default() },
+    match wsl::classify(path) {
+        wsl::Location::Wsl { distro, linux_path } => {
+            compute_wsl(&distro, &linux_path, default_branch_hint)
+        },
+        wsl::Location::Windows(_) => match compute_inner(path, default_branch_hint) {
+            Ok(s) => s,
+            Err(e) => GitStatus { error: Some(e.to_string()), ..Default::default() },
+        },
     }
 }
 
@@ -383,6 +416,83 @@ fn diff_against_branch(
     Ok((accum.into_inner().stats, resolved))
 }
 
+/// Sections: 0 current branch (short OID when detached), 1 porcelain-v2
+/// status, 2 effective default branch (the hint, or detection replicating
+/// `detect_default_branch`), 3 the resolved base ref (origin-first, like
+/// `resolve_base_commit`), 4 numstat against the merge base (`...` = git's
+/// merge-base triple-dot, preserving `diff_against_branch` semantics).
+const STATUS_SCRIPT: &str = r#"
+p="$1"; hint="$2"
+sep() { printf '\n@@ALACRITREE@@\n'; }
+git -C "$p" symbolic-ref --short HEAD 2>/dev/null || git -C "$p" rev-parse --short=7 HEAD 2>/dev/null
+sep
+git -C "$p" status --porcelain=v2 -z 2>/dev/null
+sep
+if [ -z "$hint" ]; then
+  h=$(git -C "$p" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null)
+  h="${h#refs/remotes/origin/}"
+  if [ -z "$h" ]; then
+    for c in main master trunk develop; do
+      if git -C "$p" rev-parse --verify --quiet "refs/heads/$c" >/dev/null 2>&1; then h="$c"; break; fi
+    done
+  fi
+  if [ -z "$h" ]; then
+    c=$(git -C "$p" config init.defaultBranch 2>/dev/null)
+    if [ -n "$c" ] && git -C "$p" rev-parse --verify --quiet "refs/heads/$c" >/dev/null 2>&1; then h="$c"; fi
+  fi
+  hint="$h"
+fi
+printf '%s' "$hint"
+sep
+base=""
+if [ -n "$hint" ]; then
+  for ref in "refs/remotes/origin/$hint" "refs/heads/$hint"; do
+    if git -C "$p" rev-parse --verify --quiet "$ref" >/dev/null 2>&1; then base="$ref"; break; fi
+  done
+fi
+printf '%s' "$base"
+sep
+if [ -n "$base" ]; then git -C "$p" diff --numstat -z "$base...HEAD" 2>/dev/null; fi
+"#;
+
+/// One wsl.exe round trip per refresh tick.  Runs on `spawn_compute`'s
+/// worker thread, so the ~400 ms round trip never blocks paint.
+fn compute_wsl(distro: &str, linux_path: &str, hint: Option<&str>) -> GitStatus {
+    let stdout = match wsl::run_batch(distro, STATUS_SCRIPT, &[linux_path, hint.unwrap_or("")]) {
+        Ok(s) => s,
+        Err(e) => return GitStatus { error: Some(e), ..Default::default() },
+    };
+    let sections = wsl::split_sections(&stdout);
+    let text = |i: usize| {
+        sections.get(i).map(|s| String::from_utf8_lossy(s).trim().to_string()).unwrap_or_default()
+    };
+
+    let branch = Some(text(0)).filter(|s| !s.is_empty());
+    if branch.is_none() {
+        return GitStatus {
+            error: Some(format!("could not open repository at {linux_path}")),
+            ..Default::default()
+        };
+    }
+    let (staged, unstaged) = parse_status_v2_z(sections.get(1).copied().unwrap_or_default());
+    let default_branch = Some(text(2)).filter(|s| !s.is_empty());
+    let default_branch_resolved = Some(text(3)).filter(|s| !s.is_empty());
+    let branch_diff = if default_branch_resolved.is_some() {
+        parse_numstat_z(sections.get(4).copied().unwrap_or_default())
+    } else {
+        Vec::new()
+    };
+    GitStatus {
+        branch,
+        default_branch,
+        default_branch_resolved,
+        staged,
+        unstaged,
+        branch_diff,
+        error: None,
+    }
+}
+
 fn resolve_base_commit<'a>(
     repo: &'a Repository,
     branch: &str,
@@ -396,4 +506,181 @@ fn resolve_base_commit<'a>(
         }
     }
     Err(git2::Error::from_str(&format!("default branch '{branch}' not found")))
+}
+
+/// Map porcelain-v2 `XY` state chars to the sidebar's kinds.  X is the
+/// index-vs-HEAD (staged) side, Y the worktree-vs-index (unstaged) side;
+/// `.` means unchanged on that side.  Mirrors `staged_kind`/`unstaged_kind`.
+fn staged_kind_v2(x: char) -> Option<ChangeKind> {
+    match x {
+        'A' => Some(ChangeKind::Added),
+        'D' => Some(ChangeKind::Deleted),
+        'R' | 'C' => Some(ChangeKind::Renamed),
+        'M' | 'T' => Some(ChangeKind::Modified),
+        _ => None,
+    }
+}
+
+fn unstaged_kind_v2(y: char) -> Option<ChangeKind> {
+    match y {
+        'D' => Some(ChangeKind::Deleted),
+        'R' | 'C' => Some(ChangeKind::Renamed),
+        'M' | 'T' | 'A' => Some(ChangeKind::Modified),
+        _ => None,
+    }
+}
+
+/// Parse `git status --porcelain=v2 -z` into the same (staged, unstaged)
+/// split the git2 arm produces.  Records are NUL-terminated; rename records
+/// (`2 …`) are followed by an extra NUL-separated token holding the rename
+/// source, which the sidebar doesn't show.
+fn parse_status_v2_z(bytes: &[u8]) -> (Vec<FileChange>, Vec<FileChange>) {
+    let mut staged = Vec::new();
+    let mut unstaged = Vec::new();
+    let mut tokens = bytes.split(|&b| b == 0);
+    while let Some(token) = tokens.next() {
+        if token.is_empty() {
+            continue;
+        }
+        let line = String::from_utf8_lossy(token);
+        let Some((kind, rest)) = line.split_once(' ') else { continue };
+        match kind {
+            // `1 XY sub mH mI mW hH hI path` — path is the 8th field and may
+            // contain spaces, so bound the split.
+            "1" => {
+                let mut fields = rest.splitn(8, ' ');
+                let xy = fields.next().unwrap_or("..");
+                if let Some(path) = fields.nth(6) {
+                    push_xy(xy, path.to_string(), &mut staged, &mut unstaged);
+                }
+            },
+            // `2 XY sub mH mI mW hH hI Xscore path` + NUL + origPath.
+            "2" => {
+                let mut fields = rest.splitn(9, ' ');
+                let xy = fields.next().unwrap_or("..");
+                let path = fields.nth(7).map(str::to_string);
+                let _orig = tokens.next();
+                if let Some(path) = path {
+                    push_xy(xy, path, &mut staged, &mut unstaged);
+                }
+            },
+            // `u XY sub m1 m2 m3 mW h1 h2 h3 path` — conflicts land in the
+            // staged list, matching the git2 arm.
+            "u" => {
+                if let Some(path) = rest.splitn(10, ' ').nth(9) {
+                    staged
+                        .push(FileChange { path: path.to_string(), kind: ChangeKind::Conflicted });
+                }
+            },
+            "?" => {
+                unstaged.push(FileChange { path: rest.to_string(), kind: ChangeKind::Untracked })
+            },
+            _ => {},
+        }
+    }
+    (staged, unstaged)
+}
+
+fn push_xy(xy: &str, path: String, staged: &mut Vec<FileChange>, unstaged: &mut Vec<FileChange>) {
+    let mut chars = xy.chars();
+    let x = chars.next().unwrap_or('.');
+    let y = chars.next().unwrap_or('.');
+    if let Some(kind) = staged_kind_v2(x) {
+        staged.push(FileChange { path: path.clone(), kind });
+    }
+    if let Some(kind) = unstaged_kind_v2(y) {
+        unstaged.push(FileChange { path, kind });
+    }
+}
+
+/// Parse `git diff --numstat -z`: `added TAB deleted TAB path NUL`, except
+/// renames, where the path field is empty and `src NUL dst NUL` follow.
+/// Binary files report `-` counts, mapped to 0 (matching the git2 arm,
+/// which never sees text lines for them either).
+fn parse_numstat_z(bytes: &[u8]) -> Vec<DiffStat> {
+    let mut stats = Vec::new();
+    let mut tokens = bytes.split(|&b| b == 0);
+    while let Some(token) = tokens.next() {
+        if token.is_empty() {
+            continue;
+        }
+        let line = String::from_utf8_lossy(token);
+        let mut fields = line.splitn(3, '\t');
+        let (Some(added), Some(deleted), Some(path)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let additions = added.parse().unwrap_or(0);
+        let deletions = deleted.parse().unwrap_or(0);
+        let path = if path.is_empty() {
+            let _src = tokens.next();
+            match tokens.next() {
+                Some(dst) => String::from_utf8_lossy(dst).into_owned(),
+                None => continue,
+            }
+        } else {
+            path.to_string()
+        };
+        stats.push(DiffStat { path, additions, deletions });
+    }
+    stats
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_porcelain_v2_z() {
+        let bytes = b"1 .M N... 100644 100644 100644 aaaa bbbb src/main.rs\0\
+1 A. N... 000000 100644 100644 0000 1111 new.rs\0\
+2 R. N... 100644 100644 100644 cccc dddd R100 renamed.rs\0old-name.rs\0\
+u UU N... 100644 100644 100644 100644 e1 e2 e3 conflicted.rs\0\
+? untracked with space.txt\0";
+        let (staged, unstaged) = parse_status_v2_z(bytes);
+
+        let staged_pairs: Vec<(&str, ChangeKind)> =
+            staged.iter().map(|c| (c.path.as_str(), c.kind)).collect();
+        assert_eq!(
+            staged_pairs,
+            vec![
+                ("new.rs", ChangeKind::Added),
+                ("renamed.rs", ChangeKind::Renamed),
+                ("conflicted.rs", ChangeKind::Conflicted),
+            ]
+        );
+
+        let unstaged_pairs: Vec<(&str, ChangeKind)> =
+            unstaged.iter().map(|c| (c.path.as_str(), c.kind)).collect();
+        assert_eq!(
+            unstaged_pairs,
+            vec![
+                ("src/main.rs", ChangeKind::Modified),
+                ("untracked with space.txt", ChangeKind::Untracked),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_numstat_z() {
+        // Ordinary, rename (empty path + src/dst tokens), binary (- counts).
+        let bytes = b"3\t1\tsrc/lib.rs\0\
+2\t0\t\0old.rs\0new.rs\0\
+-\t-\tassets/icon.png\0";
+        let stats = parse_numstat_z(bytes);
+        assert_eq!(stats.len(), 3);
+        assert_eq!(
+            (stats[0].path.as_str(), stats[0].additions, stats[0].deletions),
+            ("src/lib.rs", 3, 1)
+        );
+        assert_eq!(
+            (stats[1].path.as_str(), stats[1].additions, stats[1].deletions),
+            ("new.rs", 2, 0)
+        );
+        assert_eq!(
+            (stats[2].path.as_str(), stats[2].additions, stats[2].deletions),
+            ("assets/icon.png", 0, 0)
+        );
+    }
 }

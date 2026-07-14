@@ -209,7 +209,9 @@ fn call_app(request: IpcRequest, app_tx: &Sender<AppCall>, ctx: &egui::Context) 
 
 /// Runs the same background flow as the sidebar's "+" button, blocking
 /// this connection until git finishes.  `default_branch: None` makes the
-/// worker resolve the base from `origin/HEAD` itself.
+/// worker resolve the base from `origin/HEAD` itself.  `base_dir: None` uses
+/// the built-in default location: the connection thread has no `Config`, so it
+/// can't honor the `[workspace]` override the UI path applies.
 fn create_worktree(
     project_root: PathBuf,
     branch: String,
@@ -217,7 +219,12 @@ fn create_worktree(
     ctx: &egui::Context,
 ) -> IpcResult {
     wt::validate_branch_name(&branch)?;
-    let req = CreateRequest { project_root: project_root.clone(), default_branch: None, branch };
+    let req = CreateRequest {
+        project_root: project_root.clone(),
+        default_branch: None,
+        branch,
+        base_dir: None,
+    };
     let rx = wt::spawn_create(req, ctx.clone());
     let mut steps = Vec::new();
     loop {

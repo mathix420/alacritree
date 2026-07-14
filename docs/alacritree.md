@@ -70,10 +70,14 @@ background thread and streams progress steps back to the UI:
    the terminal — every other key in the file is preserved.
 
 Worktrees are created under
-`~/.alacritree/worktrees/<project>-<hash>/<branch>` so they never clutter the
-repo's parent directory and stay grouped per app. The `<hash>` disambiguates
-same-named repos in different locations. `/` in branch names is rewritten to
-`-`, and a numeric suffix is appended if the target already exists.
+`<base>/<project>-<hash>/<branch>`, where `<base>` defaults to
+`~/.alacritree/worktrees` so they never clutter the repo's parent directory
+and stay grouped per app. The base is configurable per `[workspace]` in
+`alacritree.toml` (see Configuration below); changing it never moves existing
+worktrees — discovery goes through `git worktree list`. The `<hash>`
+disambiguates same-named repos in different locations. `/` in branch names is
+rewritten to `-`, and a numeric suffix is appended if the target already
+exists.
 
 ### Deleting a worktree
 
@@ -198,8 +202,8 @@ Search path (matches Alacritty exactly):
 Then the same locations for `alacritree.toml`. The two-file split keeps
 shared options (palette, cursor, scrolling, shell, key bindings) in
 `alacritty.toml` — usable by both the upstream alacritty terminal and
-Alacritree — while Alacritree-specific UI options live in `alacritree.toml`
-under `[ui]`:
+Alacritree — while Alacritree-specific options live in `alacritree.toml`
+under `[ui]` and `[workspace]`:
 
 ```toml
 [ui]
@@ -209,12 +213,48 @@ sidebar_border     = "#2a2a2a"
 sidebar_accent     = "#6a9fb5"
 notifications      = true   # desktop notification when a hidden session bells
 
+[workspace]
+worktree_dir = "~/dev/worktrees"   # base dir for new worktrees (default ~/.alacritree/worktrees)
+
+[[workspace.overrides]]            # optional per-project override
+project = "~/Git/github/alacritree"
+worktree_dir = "D:/wt"
+
 [window]
 opacity = 0.92   # restart required — transparency is a ViewportBuilder flag
 ```
 
 Everything Alacritty's TOML accepts for palette, cursor, scrolling, window
 padding, shell, env, and bindings is parsed by the same `Raw*` structs.
+
+### Shell launch profiles
+
+Named launch profiles live in `alacritree.toml`:
+
+```toml
+[ui]
+default_profile = "ubuntu"       # what plain new-session (Ctrl+T) uses
+
+[[ui.profiles]]
+name = "ubuntu"
+program = "wsl.exe"
+args = ["-d", "ubuntu"]
+
+[[ui.profiles]]
+name = "pwsh"
+program = "pwsh"
+args = ["-NoLogo"]
+```
+
+Launch a profile from the small **+** segment at the right end of the
+session tab strip (left-click: default new session; right-click: pick a
+profile), bind one to a key with the `SpawnProfile1`…`SpawnProfile9`
+actions (1-indexed into the `[[ui.profiles]]` order), or right-click a
+project row and pin a profile as that project's shell override.
+
+Shell selection precedence for a plain new session: per-project override →
+WSL auto-selection by project location → `default_profile` →
+`[terminal.shell]` / OS default.
 
 ## Persistence
 
