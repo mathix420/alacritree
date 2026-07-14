@@ -81,6 +81,7 @@ mod tests {
         Project {
             root: PathBuf::from(root),
             name: root.to_string(),
+            label: None,
             default_branch: None,
             worktrees: worktrees
                 .iter()

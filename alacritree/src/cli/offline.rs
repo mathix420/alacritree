@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::ipc::{IpcRequest, IpcResult};
-use crate::projects::{Project, project_json};
+use crate::projects::{self, Project, project_json};
 use crate::state::{self, PersistedProject, PersistedState};
 use crate::worktree::{self as wt, CreateRequest};
 use crate::{git_status, ipc};
@@ -38,6 +38,14 @@ fn handle_at(state_path: &Path, request: &IpcRequest) -> IpcResult {
         IpcRequest::RemoveProject { root } => {
             remove(state_path, root)?;
             Ok(json!({ "removed": root }))
+        },
+        IpcRequest::RenameProject { root, label } => {
+            rename(state_path, root, label.clone())?;
+            let renamed = discover_all(state_path)
+                .into_iter()
+                .find(|p| p.root == *root)
+                .ok_or_else(|| not_a_project(root))?;
+            Ok(project_json(&renamed))
         },
         // Nothing is cached without an app, so a refresh is just a fresh look —
         // but it still has to fail on a root the sidebar does not have, or it
@@ -68,7 +76,7 @@ fn add(state_path: &Path, path: &Path) -> Project {
     let root = path.to_path_buf();
     state::mutate_at(state_path, |s| {
         if !s.projects.iter().any(|p| p.root == root) {
-            s.projects.push(PersistedProject { root, expanded: true, shell: None });
+            s.projects.push(PersistedProject { root, expanded: true, shell: None, label: None });
         }
     });
     Project::discover(path.to_path_buf())
@@ -85,6 +93,22 @@ fn remove(state_path: &Path, root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn rename(state_path: &Path, root: &Path, label: Option<String>) -> Result<(), String> {
+    // Same shape as `remove`: the existence check happens against the file
+    // because the mutation closure cannot fail.
+    if !state::load_from(state_path).projects.iter().any(|p| p.root == root) {
+        return Err(not_a_project(root));
+    }
+    let label = projects::normalize_label(label);
+    let root = root.to_path_buf();
+    state::mutate_at(state_path, move |s| {
+        if let Some(p) = s.projects.iter_mut().find(|p| p.root == root) {
+            p.label = label;
+        }
+    });
+    Ok(())
+}
+
 fn discover_all(state_path: &Path) -> Vec<Project> {
     let PersistedState { projects, .. } = state::load_from(state_path);
     projects
@@ -92,6 +116,7 @@ fn discover_all(state_path: &Path) -> Vec<Project> {
         .map(|p| {
             let mut project = Project::discover(p.root);
             project.expanded = p.expanded;
+            project.label = p.label;
             project
         })
         .collect()
@@ -179,6 +204,74 @@ mod tests {
         handle_at(&state, &IpcRequest::RemoveProject { root: project.clone() }).expect("remove");
 
         assert!(roots(&list_projects(&state)).is_empty());
+    }
+
+    fn rename_project(state_path: &Path, root: &Path, label: Option<&str>) -> IpcResult {
+        handle_at(
+            state_path,
+            &IpcRequest::RenameProject {
+                root: root.to_path_buf(),
+                label: label.map(str::to_string),
+            },
+        )
+    }
+
+    /// The label is display state in `state.toml`, so it must stick — and
+    /// persist — without a window.
+    #[test]
+    fn renaming_a_project_changes_its_listed_name() {
+        let dir = TempDir::new().unwrap();
+        let state = state_file(&dir);
+        let project = dir.path().join("repo");
+        std::fs::create_dir(&project).unwrap();
+        add_project(&state, &project).expect("add");
+
+        let renamed = rename_project(&state, &project, Some("Work")).expect("rename");
+        assert_eq!(renamed["name"], "Work");
+
+        assert_eq!(list_projects(&state)["projects"][0]["name"], "Work");
+    }
+
+    /// No label means back to the directory name — the same request clears,
+    /// so no second verb is needed anywhere on the surface.
+    #[test]
+    fn renaming_without_a_label_restores_the_directory_name() {
+        let dir = TempDir::new().unwrap();
+        let state = state_file(&dir);
+        let project = dir.path().join("repo");
+        std::fs::create_dir(&project).unwrap();
+        add_project(&state, &project).expect("add");
+        rename_project(&state, &project, Some("Work")).expect("rename");
+
+        let cleared = rename_project(&state, &project, None).expect("clear");
+
+        assert_eq!(cleared["name"], "repo");
+        assert_eq!(cleared["label"], Value::Null);
+    }
+
+    /// Whitespace is not a name; a blank label behaves like no label at all.
+    #[test]
+    fn a_blank_label_falls_back_to_the_directory_name() {
+        let dir = TempDir::new().unwrap();
+        let state = state_file(&dir);
+        let project = dir.path().join("repo");
+        std::fs::create_dir(&project).unwrap();
+        add_project(&state, &project).expect("add");
+
+        let renamed = rename_project(&state, &project, Some("   ")).expect("rename");
+
+        assert_eq!(renamed["name"], "repo");
+        assert_eq!(renamed["label"], Value::Null);
+    }
+
+    #[test]
+    fn renaming_an_unknown_project_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let state = state_file(&dir);
+
+        let result = rename_project(&state, &PathBuf::from("/nowhere"), Some("Work"));
+
+        assert!(result.is_err(), "renaming a project that was never added reported success");
     }
 
     /// A typo'd path must not report success; the caller has to learn the

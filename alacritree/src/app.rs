@@ -149,6 +149,7 @@ pub struct AlacritreeApp {
     quit_dialog_open: bool,
     pending_delete: Option<DeleteRequest>,
     pending_create: Option<CreateState>,
+    pending_rename: Option<RenameState>,
     /// Worktrees already given a Doppler scope pass this app run, so opening
     /// more shells there doesn't re-invoke the doppler CLI.
     doppler_synced: HashSet<PathBuf>,
@@ -185,6 +186,14 @@ enum CreateState {
     Prompt { project_idx: usize, branch: String, error: Option<String> },
     Running { project_idx: usize, branch: String, steps: Vec<String>, rx: Receiver<Progress> },
     Done { project_idx: usize, steps: Vec<String>, result: Result<PathBuf, String> },
+}
+
+/// The rename dialog, keyed by root rather than index: an IPC `remove_project`
+/// can reorder `projects` while the modal is open.
+struct RenameState {
+    root: PathBuf,
+    /// Text being edited; seeded with the current display name.
+    label: String,
 }
 
 /// Which `git diff` flavor a sidebar click should open in delta.
@@ -305,6 +314,7 @@ impl AlacritreeApp {
                 };
                 project.expanded = p.expanded;
                 project.shell_override = p.shell.as_deref().and_then(wsl::ShellChoice::parse);
+                project.label = p.label.clone();
                 project
             })
             .collect();
@@ -335,6 +345,7 @@ impl AlacritreeApp {
             quit_dialog_open: false,
             pending_delete: None,
             pending_create: None,
+            pending_rename: None,
             doppler_synced: HashSet::new(),
             pending_session_close: None,
             notify_rx,
@@ -385,17 +396,40 @@ impl AlacritreeApp {
         let Some(p) = self.projects.iter().find(|p| &p.root == root) else {
             return;
         };
-        let (expanded, shell) =
-            (p.expanded, p.shell_override.as_ref().map(|c| c.to_state_string()));
+        let (expanded, shell, label) =
+            (p.expanded, p.shell_override.as_ref().map(|c| c.to_state_string()), p.label.clone());
         let root = root.to_path_buf();
         state::mutate(move |s| {
             if let Some(ps) = s.projects.iter_mut().find(|ps| ps.root == root) {
                 ps.expanded = expanded;
                 ps.shell = shell;
             } else {
-                s.projects.push(PersistedProject { root, expanded, shell });
+                s.projects.push(PersistedProject { root, expanded, shell, label });
             }
         });
+    }
+
+    fn persist_project_label(&self, root: &Path) {
+        let label = self.projects.iter().find(|p| p.root == *root).and_then(|p| p.label.clone());
+        let root = root.to_path_buf();
+        state::mutate(move |s| {
+            if let Some(p) = s.projects.iter_mut().find(|p| p.root == root) {
+                p.label = label;
+            }
+        });
+    }
+
+    /// Set or clear a project's display label and persist it.  Returns the
+    /// project's index so IPC can reply with its JSON.
+    fn rename_project(&mut self, root: &Path, label: Option<String>) -> Result<usize, String> {
+        let idx = self
+            .projects
+            .iter()
+            .position(|p| p.root == *root)
+            .ok_or_else(|| format!("{} is not a project in the sidebar", root.display()))?;
+        self.projects[idx].label = crate::projects::normalize_label(label);
+        self.persist_project_label(root);
+        Ok(idx)
     }
 
     /// Windows projects re-discover synchronously (git2, fast).  WSL
@@ -421,8 +455,9 @@ impl AlacritreeApp {
     }
 
     /// Adopt completed background discoveries.  Only worktrees and the
-    /// default branch are copied — `expanded` and the shell override are
-    /// user state that survives refreshes (mirrors `Project::refresh`).
+    /// default branch are copied — `expanded`, the shell override, and the
+    /// label are user state that survives refreshes (mirrors
+    /// `Project::refresh`).
     fn poll_project_refreshes(&mut self) {
         let projects = &mut self.projects;
         self.pending_project_refresh.retain(|root, rx| match rx.try_recv() {
@@ -728,6 +763,7 @@ impl AlacritreeApp {
             || self.pending_delete.is_some()
             || self.pending_create.is_some()
             || self.pending_session_close.is_some()
+            || self.pending_rename.is_some()
     }
 
     fn focus_sidebar(&mut self) {
@@ -1235,6 +1271,8 @@ impl AlacritreeApp {
         let profile_names: Vec<String> =
             self.config.profiles.iter().map(|p| p.name.clone()).collect();
         let mut shell_override_changed: Option<PathBuf> = None;
+        let mut label_cleared: Option<PathBuf> = None;
+        let mut rename_request: Option<RenameState> = None;
 
         let panel_resp = SidePanel::left("left_sidebar")
             .resizable(true)
@@ -1311,7 +1349,7 @@ impl AlacritreeApp {
                                 name_resp = Some(
                                     ui.add(
                                         egui::Label::new(
-                                            RichText::new(&project.name)
+                                            RichText::new(project.display_name())
                                                 .color(theme.text)
                                                 .strong()
                                                 .small(),
@@ -1358,13 +1396,27 @@ impl AlacritreeApp {
                             }
                         }
 
-                        // Right-click: choose which shell this project's
-                        // sessions use. Hidden entirely when there is nothing
-                        // to choose (no distros, no profiles) so minimal
-                        // setups see zero new UI.
-                        if !distros.is_empty() || !profile_names.is_empty() {
-                            if let Some(resp) = name_resp {
-                                resp.context_menu(|ui| {
+                        // Right-click: rename the project, and choose which
+                        // shell its sessions use.
+                        if let Some(resp) = name_resp {
+                            resp.context_menu(|ui| {
+                                if ui.button("Rename…").clicked() {
+                                    rename_request = Some(RenameState {
+                                        root: project.root.clone(),
+                                        label: project.display_name().to_string(),
+                                    });
+                                    ui.close_menu();
+                                }
+                                if project.label.is_some() && ui.button("Reset name").clicked() {
+                                    project.label = None;
+                                    label_cleared = Some(project.root.clone());
+                                    ui.close_menu();
+                                }
+                                // The shell picker is hidden when there is
+                                // nothing to choose (no distros, no profiles)
+                                // so minimal setups see only the rename.
+                                if !distros.is_empty() || !profile_names.is_empty() {
+                                    ui.separator();
                                     ui.label(
                                         RichText::new("Open in…").color(theme.text_muted).small(),
                                     );
@@ -1422,8 +1474,8 @@ impl AlacritreeApp {
                                             ui.close_menu();
                                         }
                                     }
-                                });
-                            }
+                                }
+                            });
                         }
 
                         if project.expanded {
@@ -1521,6 +1573,12 @@ impl AlacritreeApp {
         }
         if let Some(root) = shell_override_changed {
             self.persist_project(&root);
+        }
+        if let Some(root) = label_cleared {
+            self.persist_project_label(&root);
+        }
+        if rename_request.is_some() {
+            self.pending_rename = rename_request;
         }
         if home_clicked {
             self.activate_home(ctx);
@@ -2895,6 +2953,85 @@ impl AlacritreeApp {
         self.refresh_project(ctx, req.project_idx);
     }
 
+    fn show_rename_dialog(&mut self, ctx: &Context) {
+        let Some(RenameState { root, mut label }) = self.pending_rename.take() else {
+            return;
+        };
+        // The project can vanish under the modal (IPC remove_project);
+        // nothing is left to rename then.
+        let Some(dir_name) = self.projects.iter().find(|p| p.root == root).map(|p| p.name.clone())
+        else {
+            return;
+        };
+        let theme = self.theme;
+        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let frame = modal_frame(&theme);
+        let mut rename_clicked = false;
+        let mut cancelled = false;
+
+        let s = theme.ui_scale;
+        let modal = egui::Modal::new(egui::Id::new("alacritree_rename_dialog")).frame(frame).show(
+            ctx,
+            |ui| {
+                ui.set_width(380.0 * s);
+                ui.spacing_mut().item_spacing.y = 6.0 * s;
+                ui.label(RichText::new(format!("Rename `{dir_name}`")).color(theme.text).strong());
+                ui.label(
+                    RichText::new("Sidebar name only — the directory is untouched.")
+                        .color(theme.text_muted)
+                        .small(),
+                );
+                let input_id = egui::Id::new("alacritree_rename_input");
+                let edit = egui::TextEdit::singleline(&mut label)
+                    .id(input_id)
+                    .hint_text(dir_name.as_str())
+                    .desired_width(f32::INFINITY);
+                let resp = ui.add(edit);
+                focus_default(ui.ctx(), input_id);
+                if resp.lost_focus() && resp.ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    rename_clicked = true;
+                }
+                ui.add_space(4.0 * s);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Enter to rename · Esc to cancel")
+                            .color(theme.text_muted)
+                            .small(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("Rename").color(theme.accent))
+                                    .frame(false),
+                            )
+                            .clicked()
+                        {
+                            rename_clicked = true;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("Cancel").color(theme.text_dim))
+                                    .frame(false),
+                            )
+                            .clicked()
+                        {
+                            cancelled = true;
+                        }
+                    });
+                });
+            },
+        );
+
+        if cancel_via_key || cancelled || modal.should_close() {
+            return;
+        }
+        if confirm_via_key || rename_clicked {
+            let _ = self.rename_project(&root, Some(label));
+            return;
+        }
+        self.pending_rename = Some(RenameState { root, label });
+    }
+
     fn show_create_dialog(&mut self, ctx: &Context) {
         let Some(state) = self.pending_create.take() else {
             return;
@@ -2942,7 +3079,7 @@ impl AlacritreeApp {
     ) -> Option<CreateState> {
         let theme = self.theme;
         let danger = rgb_to_color32(self.config.palette.normal[1]);
-        let project_name = self.projects[project_idx].name.clone();
+        let project_name = self.projects[project_idx].display_name().to_string();
         let default_branch = self.projects[project_idx].default_branch.clone();
         let project_root = self.projects[project_idx].root.clone();
 
@@ -3046,7 +3183,7 @@ impl AlacritreeApp {
         steps: &[String],
     ) {
         let theme = self.theme;
-        let project_name = self.projects[project_idx].name.clone();
+        let project_name = self.projects[project_idx].display_name().to_string();
         let frame = modal_frame(&theme);
         let s = theme.ui_scale;
         let _ = egui::Modal::new(egui::Id::new("alacritree_create_dialog")).frame(frame).show(
@@ -3086,7 +3223,7 @@ impl AlacritreeApp {
         let theme = self.theme;
         let danger = rgb_to_color32(self.config.palette.normal[1]);
         let ok = rgb_to_color32(self.config.palette.normal[2]);
-        let project_name = self.projects[project_idx].name.clone();
+        let project_name = self.projects[project_idx].display_name().to_string();
         let frame = modal_frame(&theme);
         let mut close = false;
         let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
@@ -3303,6 +3440,10 @@ impl AlacritreeApp {
                     })?;
                 Ok(json!({ "removed": self.remove_project(idx) }))
             },
+            Req::RenameProject { root, label } => {
+                let idx = self.rename_project(&root, label)?;
+                Ok(project_json(&self.projects[idx]))
+            },
             // Dispatched on the IPC connection thread; never forwarded here.
             Req::GitStatus { .. } | Req::CreateWorktree { .. } => {
                 Err("request is handled off the UI thread".to_string())
@@ -3442,6 +3583,9 @@ impl eframe::App for AlacritreeApp {
         }
         if self.pending_session_close.is_some() {
             self.show_close_session_dialog(ctx);
+        }
+        if self.pending_rename.is_some() {
+            self.show_rename_dialog(ctx);
         }
         if self.quit_dialog_open {
             self.show_quit_dialog(ctx);

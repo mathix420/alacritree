@@ -234,6 +234,18 @@ fn tool_definitions() -> Value {
             },
         },
         {
+            "name": "rename_project",
+            "description": "Set a project's display label in alacritree's sidebar. Display only — the directory on disk is untouched. Omit label (or pass an empty string) to restore the directory name.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "root": { "type": "string", "description": "Project root path from list_projects." },
+                    "label": { "type": "string", "description": "New sidebar name; omit to restore the directory name." },
+                },
+                "required": ["root"],
+            },
+        },
+        {
             "name": "remove_project",
             "description": "Remove a project from alacritree's sidebar. Only the sidebar entry is removed — no files, worktrees, or branches are touched. Sessions already open in its worktrees keep running.",
             "inputSchema": {
@@ -272,6 +284,7 @@ mod tests {
             IpcRequest::RefreshProject { root: repo() },
             IpcRequest::AddProject { path: repo() },
             IpcRequest::RemoveProject { root: repo() },
+            IpcRequest::RenameProject { root: repo(), label: None },
         ]
     }
 
@@ -289,6 +302,7 @@ mod tests {
             IpcRequest::RefreshProject { .. } => "refresh_project",
             IpcRequest::AddProject { .. } => "add_project",
             IpcRequest::RemoveProject { .. } => "remove_project",
+            IpcRequest::RenameProject { .. } => "rename_project",
         }
     }
 

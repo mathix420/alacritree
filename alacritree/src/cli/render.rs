@@ -11,7 +11,9 @@ use crate::ipc::IpcRequest;
 pub fn human(request: &IpcRequest, value: &Value) {
     match request {
         IpcRequest::ListProjects => projects(value),
-        IpcRequest::AddProject { .. } | IpcRequest::RefreshProject { .. } => project(value),
+        IpcRequest::AddProject { .. }
+        | IpcRequest::RefreshProject { .. }
+        | IpcRequest::RenameProject { .. } => project(value),
         IpcRequest::RemoveProject { .. } => {
             println!("removed {}", text(&value["removed"]));
         },

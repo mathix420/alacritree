@@ -10,7 +10,12 @@ use crate::wsl;
 #[derive(Debug, Clone)]
 pub struct Project {
     pub root: PathBuf,
+    /// Derived from the root's directory name; never stored.
     pub name: String,
+    /// User-set display label, shown instead of `name` when present.  Like
+    /// `expanded` and `shell_override`, this is user state: discovery never
+    /// sets it, and refreshes must not lose it.
+    pub label: Option<String>,
     pub default_branch: Option<String>,
     pub worktrees: Vec<Worktree>,
     pub expanded: bool,
@@ -60,6 +65,7 @@ impl Project {
             }],
             root,
             name,
+            label: None,
             default_branch: None,
             expanded: true,
             shell_override: None,
@@ -115,6 +121,7 @@ impl Project {
             worktrees,
             root,
             name,
+            label: None,
             expanded: true,
             shell_override: None,
         }
@@ -159,9 +166,16 @@ impl Project {
             worktrees,
             root,
             name,
+            label: None,
             expanded: true,
             shell_override: None,
         }
+    }
+
+    /// The sidebar name: the user's label when set, the directory name
+    /// otherwise.
+    pub fn display_name(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.name)
     }
 
     pub fn refresh(&mut self) {
@@ -175,7 +189,8 @@ impl Project {
 /// app-less path so a client cannot tell which one answered it.
 pub fn project_json(project: &Project) -> Value {
     json!({
-        "name": project.name,
+        "name": project.display_name(),
+        "label": project.label,
         "root": project.root,
         "default_branch": project.default_branch,
         "worktrees": project
@@ -247,6 +262,12 @@ fn detect_default_branch(repo: &Repository) -> Option<String> {
     }
 
     None
+}
+
+/// A label is user text: trimmed, with an empty result meaning "no label", so
+/// clearing the rename field falls back to the directory name.
+pub fn normalize_label(label: Option<String>) -> Option<String> {
+    label.map(|l| l.trim().to_string()).filter(|l| !l.is_empty())
 }
 
 fn display_name(root: &std::path::Path) -> String {
@@ -381,6 +402,30 @@ mod tests {
         let project = Project::discover(repo_dir);
         assert!(project.worktrees[0].is_main);
         assert!(!project.worktrees[0].prunable);
+    }
+
+    #[test]
+    fn the_label_overrides_the_directory_name_for_display() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        init_repo(&repo_dir);
+
+        let mut project = Project::discover(repo_dir);
+        assert_eq!(project.display_name(), "repo");
+
+        project.label = Some("Work".to_string());
+        assert_eq!(project.display_name(), "Work");
+        let encoded = project_json(&project);
+        assert_eq!(encoded["name"], "Work");
+        assert_eq!(encoded["label"], "Work");
+    }
+
+    #[test]
+    fn a_blank_label_normalizes_to_none() {
+        assert_eq!(normalize_label(Some("  ".to_string())), None);
+        assert_eq!(normalize_label(Some(String::new())), None);
+        assert_eq!(normalize_label(Some(" Work ".to_string())), Some("Work".to_string()));
+        assert_eq!(normalize_label(None), None);
     }
 
     #[test]

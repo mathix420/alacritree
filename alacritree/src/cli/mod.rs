@@ -88,6 +88,17 @@ enum ProjectCommand {
     Remove { root: PathBuf },
     /// Re-scan a project's worktrees and default branch.
     Refresh { root: PathBuf },
+    /// Set a project's display label.  Display only — the directory on disk
+    /// is untouched.
+    Rename {
+        root: PathBuf,
+        /// The new sidebar name.
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        label: Option<String>,
+        /// Drop the label and show the directory name again.
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -209,6 +220,9 @@ fn to_request(command: Command) -> IpcRequest {
             ProjectCommand::Add { path } => IpcRequest::AddProject { path: absolute(path) },
             ProjectCommand::Remove { root } => IpcRequest::RemoveProject { root: absolute(root) },
             ProjectCommand::Refresh { root } => IpcRequest::RefreshProject { root: absolute(root) },
+            ProjectCommand::Rename { root, label, .. } => {
+                IpcRequest::RenameProject { root: absolute(root), label }
+            },
         },
         Command::Session { command } => match command {
             SessionCommand::List => IpcRequest::ListSessions,
@@ -296,6 +310,25 @@ mod tests {
             request_for(&["alacritree", "worktree", "create", ".", "topic"]),
             IpcRequest::CreateWorktree { branch, .. } if branch == "topic"
         ));
+        assert!(matches!(
+            request_for(&["alacritree", "project", "rename", ".", "Work"]),
+            IpcRequest::RenameProject { label: Some(label), .. } if label == "Work"
+        ));
+    }
+
+    /// Dropping a label takes an explicit `--clear`: a rename with no new name
+    /// is more likely a slip than a request, so it must not clear silently.
+    #[test]
+    fn rename_requires_a_label_or_an_explicit_clear() {
+        assert!(matches!(
+            request_for(&["alacritree", "project", "rename", ".", "--clear"]),
+            IpcRequest::RenameProject { label: None, .. }
+        ));
+        assert!(Cli::try_parse_from(["alacritree", "project", "rename", "."]).is_err());
+        assert!(
+            Cli::try_parse_from(["alacritree", "project", "rename", ".", "Work", "--clear"])
+                .is_err()
+        );
     }
 
     /// The shell hands us argv verbatim, so a user who writes `'ls\r'` sends a

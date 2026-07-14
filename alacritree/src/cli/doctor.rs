@@ -644,7 +644,7 @@ mod tests {
         let path = dir.path().join("state.toml");
         let projects = roots
             .iter()
-            .map(|r| PersistedProject { root: r.clone(), expanded: true, shell: None })
+            .map(|r| PersistedProject { root: r.clone(), expanded: true, shell: None, label: None })
             .collect();
         state::save_to(&path, &PersistedState { projects, ..PersistedState::default() });
         path
@@ -658,6 +658,7 @@ mod tests {
             root: dir.path().join("repo"),
             expanded: true,
             shell: Some(shell.to_string()),
+            label: None,
         };
         let state = PersistedState { projects: vec![project], ..PersistedState::default() };
         state::save_to(&path, &state);

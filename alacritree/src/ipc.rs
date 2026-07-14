@@ -79,6 +79,11 @@ pub enum IpcRequest {
     RemoveProject {
         root: PathBuf,
     },
+    RenameProject {
+        root: PathBuf,
+        #[serde(default)]
+        label: Option<String>,
+    },
     GitStatus {
         path: PathBuf,
     },
