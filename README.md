@@ -120,9 +120,11 @@ Alacritty's: arrays concatenate (so `[[keyboard.bindings]]` in
 `alacritree.toml` *adds to* the upstream bindings rather than replacing
 them), tables merge recursively, primitives replace.
 
-Alacritree-only options live under `[ui]` in `alacritree.toml` — sidebar
-colours, panel visibility, etc. See `alacritree/src/config.rs` for the
-current schema.
+Alacritree-only options live in `alacritree.toml`: `[ui]` for sidebar
+colours, panel visibility, etc., and `[workspace]` for where new git
+worktrees are created (`worktree_dir`, plus per-project
+`[[workspace.overrides]]`). See `alacritree/src/config.rs` for the current
+schema.
 
 ## MCP server
 

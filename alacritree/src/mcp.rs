@@ -3,7 +3,9 @@
 //! Bridges MCP tool calls to a running alacritree instance through the IPC
 //! socket (see `ipc.rs`), so an LLM can inspect projects/worktrees, drive
 //! terminal sessions, and read their output.  Register it with e.g.
-//! `claude mcp add alacritree -- alacritree mcp`.
+//! `claude mcp add alacritree -- alacritree mcp`.  An MCP client launches this
+//! outside any session, so it usually has no `ALACRITREE_SOCKET` to inherit and
+//! finds the running instance by scanning the socket directory.
 //!
 //! The MCP stdio transport is newline-delimited JSON-RPC 2.0.  The handful
 //! of methods a tools-only server needs is small enough that speaking the

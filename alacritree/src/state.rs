@@ -33,6 +33,10 @@ pub struct PersistedProject {
     pub root: PathBuf,
     #[serde(default = "default_true")]
     pub expanded: bool,
+    /// Shell override: `"windows"`, `"wsl:<distro>"`, or `"profile:<name>"`.
+    /// Absent = auto by project location.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -136,7 +140,7 @@ mod tests {
     use super::*;
 
     fn project(root: &str) -> PersistedProject {
-        PersistedProject { root: PathBuf::from(root), expanded: true }
+        PersistedProject { root: PathBuf::from(root), expanded: true, shell: None }
     }
 
     fn state_file(dir: &TempDir) -> PathBuf {
@@ -251,5 +255,25 @@ mod tests {
             .filter(|n| n != "state.toml")
             .collect();
         assert!(leftovers.is_empty(), "save left {leftovers:?} behind");
+    }
+
+    #[test]
+    fn shell_field_is_optional_and_round_trips() {
+        // Old state files (no `shell`) still parse.
+        let old = "[[projects]]\nroot = 'C:/x'\n";
+        let state: PersistedState = toml::from_str(old).unwrap();
+        assert_eq!(state.projects[0].shell, None);
+
+        let state = PersistedState {
+            projects: vec![PersistedProject {
+                root: PathBuf::from("C:/x"),
+                expanded: true,
+                shell: Some("wsl:kali-linux".to_string()),
+            }],
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&state).unwrap();
+        let back: PersistedState = toml::from_str(&text).unwrap();
+        assert_eq!(back.projects[0].shell.as_deref(), Some("wsl:kali-linux"));
     }
 }
