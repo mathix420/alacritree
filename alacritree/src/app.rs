@@ -146,8 +146,15 @@ pub struct AlacritreeApp {
     config: Config,
     theme: Theme,
     last_error: Option<String>,
+    /// A modal popup carrying a failure message the user must dismiss —
+    /// louder than `last_error`, used when a background action (e.g. a
+    /// worktree delete) fails after its dialog already closed.
+    error_dialog: Option<String>,
     quit_dialog_open: bool,
     pending_delete: Option<DeleteRequest>,
+    /// Confirmed deletes whose git removal is running off-thread; polled and
+    /// adopted in `poll_pending_deletes`.
+    pending_deletes: Vec<DeleteTask>,
     pending_create: Option<CreateState>,
     pending_rename: Option<RenameState>,
     /// Worktrees already given a Doppler scope pass this app run, so opening
@@ -180,6 +187,16 @@ struct DeleteRequest {
     prunable: bool,
     /// Checkbox state for the prune dialog's "also delete branch".
     delete_branch: bool,
+}
+
+/// An in-flight background delete/prune awaiting its git result.
+struct DeleteTask {
+    project_idx: usize,
+    /// Marks the matching sidebar row with a spinner while the removal runs.
+    worktree_path: PathBuf,
+    /// Distinguishes the "prune" vs "delete" wording in a failure message.
+    prunable: bool,
+    result_rx: Receiver<Result<(), String>>,
 }
 
 enum CreateState {
@@ -342,8 +359,10 @@ impl AlacritreeApp {
             config,
             theme,
             last_error: None,
+            error_dialog: None,
             quit_dialog_open: false,
             pending_delete: None,
+            pending_deletes: Vec::new(),
             pending_create: None,
             pending_rename: None,
             doppler_synced: HashSet::new(),
@@ -764,6 +783,7 @@ impl AlacritreeApp {
             || self.pending_create.is_some()
             || self.pending_session_close.is_some()
             || self.pending_rename.is_some()
+            || self.error_dialog.is_some()
     }
 
     fn focus_sidebar(&mut self) {
@@ -1267,6 +1287,10 @@ impl AlacritreeApp {
                     .collect()
             })
             .collect();
+        // Worktrees whose background removal is still running: their rows show
+        // a spinner instead of the delete/new-shell controls.
+        let deleting_paths: HashSet<PathBuf> =
+            self.pending_deletes.iter().map(|t| t.worktree_path.clone()).collect();
         let distros = wsl::distros();
         let profile_names: Vec<String> =
             self.config.profiles.iter().map(|p| p.name.clone()).collect();
@@ -1495,6 +1519,7 @@ impl AlacritreeApp {
                                     &cursor_row,
                                     Some(SidebarRow::Worktree(p)) if *p == wt.path
                                 );
+                                let is_deleting = deleting_paths.contains(&wt.path);
                                 let action = worktree_row(
                                     ui,
                                     wt,
@@ -1503,6 +1528,7 @@ impl AlacritreeApp {
                                     cursor_moved,
                                     wt_attention,
                                     wt_glyph,
+                                    is_deleting,
                                     &theme,
                                 );
                                 if action.activate {
@@ -2468,6 +2494,7 @@ fn worktree_row(
     scroll_into_view: bool,
     attention: bool,
     agent_glyph: Option<char>,
+    deleting: bool,
     theme: &Theme,
 ) -> WorktreeAction {
     // Reserve a slot *before* the labels so the hover bg paints beneath them.
@@ -2484,7 +2511,7 @@ fn worktree_row(
     let resp = frame
         .show(ui, |ui| {
             let default_icon = if wt.is_main { "●" } else { "○" };
-            let name_color = if wt.prunable {
+            let name_color = if wt.prunable || deleting {
                 theme.text_muted
             } else if is_active {
                 theme.text
@@ -2508,6 +2535,16 @@ fn worktree_row(
                     );
                 },
                 |ui| {
+                    // Mid-removal the row is inert: swap its controls for a
+                    // spinner so the user sees the delete is in flight.
+                    if deleting {
+                        ui.add(
+                            egui::Spinner::new()
+                                .size(12.0 * theme.ui_scale)
+                                .color(theme.text_muted),
+                        );
+                        return;
+                    }
                     if !wt.is_main {
                         let hover = if wt.prunable {
                             "prune worktree"
@@ -2570,7 +2607,7 @@ fn worktree_row(
         }
     }
     WorktreeAction {
-        activate: resp.clicked() && !delete_clicked && !spawn_clicked && !wt.prunable,
+        activate: !deleting && resp.clicked() && !delete_clicked && !spawn_clicked && !wt.prunable,
         delete: delete_clicked,
         spawn: spawn_clicked,
     }
@@ -2921,6 +2958,49 @@ impl AlacritreeApp {
         }
     }
 
+    fn show_error_dialog(&mut self, ctx: &Context) {
+        let theme = self.theme;
+        let danger = rgb_to_color32(self.config.palette.normal[1]);
+        let Some(message) = self.error_dialog.clone() else {
+            return;
+        };
+
+        // Enter and Esc both just dismiss — there's nothing to confirm.
+        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let frame = modal_frame(&theme);
+        let mut dismissed = false;
+
+        let s = theme.ui_scale;
+        let modal = egui::Modal::new(egui::Id::new("alacritree_error_dialog")).frame(frame).show(
+            ctx,
+            |ui| {
+                ui.set_width(360.0 * s);
+                ui.spacing_mut().item_spacing.y = 6.0 * s;
+                ui.label(RichText::new("Something went wrong").color(danger).strong());
+                ui.label(RichText::new(&message).color(theme.text_muted).small());
+                ui.add_space(4.0 * s);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Enter or Esc to dismiss").color(theme.text_muted).small(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let ok = ui.add(
+                            egui::Button::new(RichText::new("OK").color(theme.text)).frame(false),
+                        );
+                        if ok.clicked() {
+                            dismissed = true;
+                        }
+                        focus_default(ui.ctx(), ok.id);
+                    });
+                });
+            },
+        );
+
+        if confirm_via_key || cancel_via_key || dismissed || modal.should_close() {
+            self.error_dialog = None;
+        }
+    }
+
     fn run_pending_delete(&mut self, ctx: &Context) {
         let Some(req) = self.pending_delete.take() else {
             return;
@@ -2935,22 +3015,53 @@ impl AlacritreeApp {
         }
         self.active_session.remove(&Some(req.worktree_path.clone()));
 
-        let force = req.dirty.is_dirty();
-        let result = if req.prunable {
-            wt::prune_worktree(
-                &project_root,
-                &req.worktree_name,
-                req.branch.as_deref(),
-                req.delete_branch,
-            )
+        // The git removal (shellouts, branch delete, doppler cleanup) is slow
+        // enough to stutter paint, so run it off-thread and adopt the result in
+        // `poll_pending_deletes`; the dialog closes immediately either way and
+        // the sidebar row shows a spinner meanwhile.
+        let worktree_path = req.worktree_path.clone();
+        let job = if req.prunable {
+            wt::DeleteJob::Prune {
+                worktree_name: req.worktree_name,
+                branch: req.branch,
+                delete_branch: req.delete_branch,
+            }
         } else {
-            wt::delete_worktree(&project_root, &req.worktree_path, req.branch.as_deref(), force)
+            wt::DeleteJob::Remove {
+                worktree_path: req.worktree_path,
+                branch: req.branch,
+                force: req.dirty.is_dirty(),
+            }
         };
-        if let Err(e) = result {
-            let action = if req.prunable { "prune" } else { "delete" };
-            self.last_error = Some(format!("{action} failed: {e}"));
+        let result_rx = wt::spawn_delete(project_root, job, ctx.clone());
+        self.pending_deletes.push(DeleteTask {
+            project_idx: req.project_idx,
+            worktree_path,
+            prunable: req.prunable,
+            result_rx,
+        });
+    }
+
+    /// Adopt finished background deletes: pop up any failure and refresh the
+    /// affected project so the removed worktree (or its spinner) drops out of
+    /// the sidebar.
+    fn poll_pending_deletes(&mut self, ctx: &Context) {
+        let mut finished: Vec<(usize, bool, Result<(), String>)> = Vec::new();
+        self.pending_deletes.retain(|task| match task.result_rx.try_recv() {
+            Ok(result) => {
+                finished.push((task.project_idx, task.prunable, result));
+                false
+            },
+            Err(mpsc::TryRecvError::Empty) => true,
+            Err(mpsc::TryRecvError::Disconnected) => false,
+        });
+        for (project_idx, prunable, result) in finished {
+            if let Err(e) = result {
+                let action = if prunable { "Prune" } else { "Delete" };
+                self.error_dialog = Some(format!("{action} failed.\n\n{e}"));
+            }
+            self.refresh_project(ctx, project_idx);
         }
-        self.refresh_project(ctx, req.project_idx);
     }
 
     fn show_rename_dialog(&mut self, ctx: &Context) {
@@ -3491,6 +3602,7 @@ impl eframe::App for AlacritreeApp {
 
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.poll_project_refreshes();
+        self.poll_pending_deletes(ctx);
         let modal_open = self.is_modal_open();
         // Keys pressed mid-composition drive the IME's candidate window,
         // not the app — alacritty's key_input returns early the same way,
@@ -3586,6 +3698,9 @@ impl eframe::App for AlacritreeApp {
         }
         if self.pending_rename.is_some() {
             self.show_rename_dialog(ctx);
+        }
+        if self.error_dialog.is_some() {
+            self.show_error_dialog(ctx);
         }
         if self.quit_dialog_open {
             self.show_quit_dialog(ctx);

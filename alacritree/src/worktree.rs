@@ -455,6 +455,39 @@ pub fn delete_worktree(
     Ok(())
 }
 
+/// A worktree removal to run on a background thread: either delete a live
+/// checkout ([`delete_worktree`]) or prune the leftover metadata of one whose
+/// directory is already gone ([`prune_worktree`]).
+pub enum DeleteJob {
+    Remove { worktree_path: PathBuf, branch: Option<String>, force: bool },
+    Prune { worktree_name: String, branch: Option<String>, delete_branch: bool },
+}
+
+/// Run a [`DeleteJob`] off the UI thread, waking the window when it finishes.
+/// The git shellouts and doppler cleanup are slow enough to stutter paint, so
+/// the caller confirms the dialog, hands the work here, and adopts the result
+/// (an error to surface, or nothing) from the returned channel.
+pub fn spawn_delete(
+    project_root: PathBuf,
+    job: DeleteJob,
+    ctx: egui::Context,
+) -> Receiver<Result<(), String>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = match job {
+            DeleteJob::Remove { worktree_path, branch, force } => {
+                delete_worktree(&project_root, &worktree_path, branch.as_deref(), force)
+            },
+            DeleteJob::Prune { worktree_name, branch, delete_branch } => {
+                prune_worktree(&project_root, &worktree_name, branch.as_deref(), delete_branch)
+            },
+        };
+        let _ = tx.send(result);
+        ctx.request_repaint();
+    });
+    rx
+}
+
 /// Remove the git metadata of a worktree whose checkout directory is gone
 /// (git calls these *prunable*). Uses git2's per-worktree prune rather than
 /// shelling out to `git worktree prune`, which would sweep every stale
@@ -510,6 +543,27 @@ mod tests {
         let dir = project_worktree_dir(Path::new("repo"), None).unwrap();
         let expected = home::home_dir().unwrap().join(".alacritree").join("worktrees");
         assert!(dir.starts_with(&expected), "{} not under {}", dir.display(), expected.display());
+    }
+
+    #[test]
+    fn spawn_delete_removes_a_live_worktree_off_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let repo = init_repo(&repo_dir);
+        let wt_path = add_worktree(&repo, "feature");
+        assert!(wt_path.is_dir());
+
+        let job = DeleteJob::Remove {
+            worktree_path: wt_path.clone(),
+            branch: Some("feature".to_string()),
+            force: false,
+        };
+        let result = spawn_delete(repo_dir, job, egui::Context::default()).recv().unwrap();
+
+        assert!(result.is_ok(), "delete failed: {result:?}");
+        assert!(!wt_path.exists(), "worktree directory should be gone");
+        assert!(repo.find_worktree("feature").is_err());
+        assert!(repo.find_branch("feature", git2::BranchType::Local).is_err());
     }
 
     #[test]
