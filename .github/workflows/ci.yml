@@ -32,5 +32,10 @@ jobs:
       - name: Test
         run: cargo test -p alacritree --locked
 
+      # --no-deps keeps clippy on our own crate. The vendored alacritty_terminal
+      # is #![deny(clippy::all)], so a newer toolchain that adds a lint (e.g.
+      # question_mark) turns it into a hard error we can't fix without editing a
+      # read-only dependency. Linting the fork's code, not upstream's, is what we
+      # want anyway.
       - name: Clippy
-        run: cargo clippy -p alacritree --all-targets --locked
+        run: cargo clippy -p alacritree --all-targets --locked --no-deps
