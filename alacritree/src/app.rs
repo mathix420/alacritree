@@ -2076,6 +2076,13 @@ fn build_diff_command(req: &DiffRequest) -> (String, Vec<String>) {
 /// default system PATH; a missing delta prints in the pane, same failure
 /// surface as Windows).  Diff arguments travel as positional parameters, so
 /// no file name is shell-parsed.
+///
+/// The `LESS=R` the diff pane puts in the child's environment stays on the
+/// Windows side of the wsl.exe boundary (only `WSLENV`-listed variables
+/// cross), so git in the distro would hand its pager `LESS=FRX` and `F`
+/// (quit-if-one-screen) would reap short diffs on open.  The script exports
+/// `LESS` itself where git runs; one sourced by the profile wins, mirroring
+/// the `[env]` precedence on the Windows side.
 fn build_wsl_diff_command(
     distro: &str,
     workspace: &Path,
@@ -2089,7 +2096,8 @@ fn build_wsl_diff_command(
         "--exec".to_string(),
         "sh".to_string(),
         "-lc".to_string(),
-        r#"exec git -c "core.pager=delta --paging=always" "$@""#.to_string(),
+        r#"export LESS="${LESS-R}"; exec git -c "core.pager=delta --paging=always" "$@""#
+            .to_string(),
         "sh".to_string(),
     ];
     args.extend(diff_args(req));
@@ -4233,7 +4241,7 @@ mod tests {
                 "--exec",
                 "sh",
                 "-lc",
-                r#"exec git -c "core.pager=delta --paging=always" "$@""#,
+                r#"export LESS="${LESS-R}"; exec git -c "core.pager=delta --paging=always" "$@""#,
             ]
         );
         assert_eq!(args[8], "sh");
