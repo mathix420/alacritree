@@ -124,11 +124,72 @@ fn blend_toward(c: Color32, target: Color32, amount: f32) -> Color32 {
 /// Which pane owns keyboard input.  The terminal re-requests egui focus
 /// every frame while it owns this; anything else holding focus (modals
 /// aside) must win here first.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaneFocus {
     Terminal,
     ProjectsSidebar,
     GitSidebar,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusDir {
+    Left,
+    Right,
+}
+
+/// What a FocusLeft/FocusRight press does, decided by [`focus_move`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusMove {
+    /// The TUI inside the terminal can still move that way — forward the
+    /// Ctrl+Arrow to the PTY instead of switching panels.
+    Passthrough,
+    Focus(PaneFocus),
+    Nothing,
+}
+
+/// Whether the program inside the terminal should receive the directional key
+/// instead of alacritree switching panels.  Cooperating setups publish edge
+/// state through the terminal title: tmux as `tmux:<edges>`, where a letter
+/// (L/R/U/D) marks a wall its active pane — with any nvim split edges folded
+/// in — cannot move past.  An absent letter means the inner stack still has
+/// somewhere to go.  A title that looks like bare (n)vim always wins: vim
+/// publishes no edge state, so alacritree can never tell when it is done.
+fn inner_handles(title: &str, dir: FocusDir) -> bool {
+    if let Some(rest) = title.strip_prefix("tmux:") {
+        let letter = match dir {
+            FocusDir::Left => 'L',
+            FocusDir::Right => 'R',
+        };
+        return !rest.chars().take_while(char::is_ascii_uppercase).any(|c| c == letter);
+    }
+    title.starts_with("nvim") || title.starts_with("vim")
+}
+
+/// Panel-focus decision for FocusLeft/FocusRight.  Panels sit in a fixed
+/// `ProjectsSidebar ↔ Terminal ↔ GitSidebar` row; movement toward a hidden
+/// panel is dropped (focus never opens a panel), and from the terminal the
+/// inner TUI gets first refusal via [`inner_handles`].
+fn focus_move(
+    focus: PaneFocus,
+    dir: FocusDir,
+    left_open: bool,
+    right_open: bool,
+    title: &str,
+) -> FocusMove {
+    if focus == PaneFocus::Terminal && inner_handles(title, dir) {
+        return FocusMove::Passthrough;
+    }
+    let target = match (focus, dir) {
+        (PaneFocus::Terminal, FocusDir::Left) => left_open.then_some(PaneFocus::ProjectsSidebar),
+        (PaneFocus::Terminal, FocusDir::Right) => right_open.then_some(PaneFocus::GitSidebar),
+        (PaneFocus::ProjectsSidebar, FocusDir::Right) => Some(PaneFocus::Terminal),
+        (PaneFocus::GitSidebar, FocusDir::Left) => Some(PaneFocus::Terminal),
+        _ => None,
+    };
+    match target {
+        Some(t) => FocusMove::Focus(t),
+        None => FocusMove::Nothing,
+    }
 }
 
 pub struct AlacritreeApp {
@@ -5402,6 +5463,95 @@ mod tests {
         // The main itself and unknown paths have no fallback target.
         assert_eq!(project_main_for(&projects, Path::new("/repo")), None);
         assert_eq!(project_main_for(&projects, Path::new("/elsewhere")), None);
+    }
+
+    /// `focus_move` with both panels open.
+    fn mv(focus: PaneFocus, dir: FocusDir, title: &str) -> FocusMove {
+        focus_move(focus, dir, true, true, title)
+    }
+
+    #[test]
+    fn focus_moves_between_open_panels() {
+        assert_eq!(
+            mv(PaneFocus::Terminal, FocusDir::Left, ""),
+            FocusMove::Focus(PaneFocus::ProjectsSidebar)
+        );
+        assert_eq!(
+            mv(PaneFocus::Terminal, FocusDir::Right, ""),
+            FocusMove::Focus(PaneFocus::GitSidebar)
+        );
+        assert_eq!(
+            mv(PaneFocus::ProjectsSidebar, FocusDir::Right, ""),
+            FocusMove::Focus(PaneFocus::Terminal)
+        );
+        assert_eq!(
+            mv(PaneFocus::GitSidebar, FocusDir::Left, ""),
+            FocusMove::Focus(PaneFocus::Terminal)
+        );
+    }
+
+    #[test]
+    fn focus_stops_at_the_outer_edges() {
+        assert_eq!(mv(PaneFocus::ProjectsSidebar, FocusDir::Left, ""), FocusMove::Nothing);
+        assert_eq!(mv(PaneFocus::GitSidebar, FocusDir::Right, ""), FocusMove::Nothing);
+    }
+
+    #[test]
+    fn focus_never_moves_toward_a_closed_panel() {
+        assert_eq!(
+            focus_move(PaneFocus::Terminal, FocusDir::Left, false, true, ""),
+            FocusMove::Nothing
+        );
+        assert_eq!(
+            focus_move(PaneFocus::Terminal, FocusDir::Right, true, false, ""),
+            FocusMove::Nothing
+        );
+    }
+
+    #[test]
+    fn tmux_edges_gate_passthrough() {
+        // No letter for the direction: the inner stack can still move.
+        assert_eq!(
+            mv(PaneFocus::Terminal, FocusDir::Left, "tmux:R /home/lev"),
+            FocusMove::Passthrough
+        );
+        // Against that wall: alacritree takes over.
+        assert_eq!(
+            mv(PaneFocus::Terminal, FocusDir::Left, "tmux:LU /home/lev"),
+            FocusMove::Focus(PaneFocus::ProjectsSidebar)
+        );
+        // Bare prefix publishes no blocked edges at all.
+        assert_eq!(mv(PaneFocus::Terminal, FocusDir::Right, "tmux:"), FocusMove::Passthrough);
+    }
+
+    #[test]
+    fn tmux_at_edge_with_closed_panel_does_nothing() {
+        assert_eq!(
+            focus_move(PaneFocus::Terminal, FocusDir::Left, false, true, "tmux:L x"),
+            FocusMove::Nothing
+        );
+    }
+
+    #[test]
+    fn nvim_titles_always_pass_through() {
+        assert_eq!(
+            mv(PaneFocus::Terminal, FocusDir::Left, "nvim ~/notes.md"),
+            FocusMove::Passthrough
+        );
+        assert_eq!(mv(PaneFocus::Terminal, FocusDir::Right, "vim"), FocusMove::Passthrough);
+        // A shell whose title merely mentions vim is not vim.
+        assert_eq!(
+            mv(PaneFocus::Terminal, FocusDir::Left, "pwsh — nvim docs"),
+            FocusMove::Focus(PaneFocus::ProjectsSidebar)
+        );
+    }
+
+    #[test]
+    fn sidebars_never_pass_through() {
+        assert_eq!(
+            mv(PaneFocus::ProjectsSidebar, FocusDir::Right, "tmux: x"),
+            FocusMove::Focus(PaneFocus::Terminal)
+        );
     }
 
     fn req(file: &str, source: DiffSource) -> DiffRequest {
