@@ -1070,6 +1070,33 @@ impl AlacritreeApp {
         }
     }
 
+    fn move_focus(&mut self, dir: FocusDir) {
+        let idx = self.active_session_index();
+        let title = idx.map(|i| self.sessions[i].title.as_str()).unwrap_or("");
+        let decision =
+            focus_move(self.focus, dir, self.show_left_sidebar, self.show_right_sidebar, title);
+        match decision {
+            FocusMove::Passthrough => {
+                let Some(i) = idx else { return };
+                let key = match dir {
+                    FocusDir::Left => egui::Key::ArrowLeft,
+                    FocusDir::Right => egui::Key::ArrowRight,
+                };
+                let mode = *self.sessions[i].term.lock().mode();
+                // The binding consumed the key press before the terminal view
+                // saw it, so the Ctrl+Arrow the inner TUI listens for is
+                // re-synthesized with the terminal's own encoding.
+                if let Some(bytes) = crate::input::key_to_bytes(key, egui::Modifiers::CTRL, mode) {
+                    self.sessions[i].write(bytes);
+                }
+            },
+            FocusMove::Focus(PaneFocus::ProjectsSidebar) => self.focus_sidebar(),
+            FocusMove::Focus(PaneFocus::Terminal) => self.focus_terminal(),
+            FocusMove::Focus(PaneFocus::GitSidebar) => self.focus = PaneFocus::GitSidebar,
+            FocusMove::Nothing => {},
+        }
+    }
+
     /// Match key events against the binding table (user bindings + defaults)
     /// before the terminal sees raw events, so a binding wins over plain
     /// text input.  Matched events are consumed unless every matched action
@@ -1718,6 +1745,8 @@ impl AlacritreeApp {
                 }
             },
             BindingAction::Named(NamedAction::FocusTerminal) => self.focus_terminal(),
+            BindingAction::Named(NamedAction::FocusLeft) => self.move_focus(FocusDir::Left),
+            BindingAction::Named(NamedAction::FocusRight) => self.move_focus(FocusDir::Right),
             BindingAction::Named(other) => {
                 self.dispatch_scroll_or_other(other);
             },

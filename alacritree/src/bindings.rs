@@ -73,6 +73,10 @@ pub enum NamedAction {
     /// us) but suppress_chars stays off so the key still reaches the PTY.
     /// Mirrors `Action::ReceiveChar` in `alacritty/src/input/keyboard.rs`.
     ReceiveChar,
+    /// Directional panel focus with TUI passthrough (see `focus_move` in
+    /// `app.rs`).
+    FocusLeft,
+    FocusRight,
 }
 
 impl NamedAction {
@@ -148,6 +152,8 @@ impl NamedAction {
             Self::ShowShortcuts => "Show this shortcuts window".into(),
             Self::ToggleSessionRows => "Toggle single-session sidebar rows".into(),
             Self::ToggleSessionTabs => "Toggle single-session tab segments".into(),
+            Self::FocusLeft => "Move panel focus left (TUIs get the key first)".into(),
+            Self::FocusRight => "Move panel focus right (TUIs get the key first)".into(),
             Self::NoOp | Self::ReceiveChar => String::new(),
         }
     }
@@ -637,6 +643,8 @@ fn parse_action(name: &str) -> BindingAction {
         "Quit" => BindingAction::Named(Quit),
         "None" => BindingAction::Named(NoOp),
         "ReceiveChar" => BindingAction::Named(ReceiveChar),
+        "FocusLeft" => BindingAction::Named(FocusLeft),
+        "FocusRight" => BindingAction::Named(FocusRight),
         other => BindingAction::Unsupported(other.to_string()),
     }
 }
@@ -831,6 +839,8 @@ mod tests {
             ("FocusGitSidebar", NamedAction::FocusGitSidebar),
             ("ToggleSessionRows", NamedAction::ToggleSessionRows),
             ("ToggleSessionTabs", NamedAction::ToggleSessionTabs),
+            ("FocusLeft", NamedAction::FocusLeft),
+            ("FocusRight", NamedAction::FocusRight),
         ] {
             let b = parse_bindings(vec![raw_action("F1", None, name)]);
             assert_eq!(named_matches(&b, Key::F1, Modifiers::NONE), vec![expected], "{name}");

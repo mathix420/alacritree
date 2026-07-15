@@ -24,7 +24,7 @@ pub fn event_to_bytes(event: &Event, mode: TermMode) -> Option<Vec<u8>> {
     }
 }
 
-fn key_to_bytes(key: Key, mods: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
+pub fn key_to_bytes(key: Key, mods: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
     if should_build_kitty(key, mods, mode)
         && let Some(bytes) = kitty_sequence(key, mods)
     {
