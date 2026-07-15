@@ -100,6 +100,8 @@ fn report(socket: Option<&Path>) -> Vec<Check> {
     checks.extend(config_checks(&config::diagnose()));
     checks.extend(persisted_state_checks(&config));
     checks.extend(ipc_checks(socket, config.ipc_socket));
+    #[cfg(windows)]
+    checks.extend(process_checks(&running_alacritree_processes()));
     checks
 }
 
@@ -311,6 +313,67 @@ fn ipc_checks(socket: Option<&Path>, enabled: bool) -> Vec<Check> {
         },
     });
     checks
+}
+
+/// A live process running one of our binaries, and therefore pinning it.
+#[cfg(windows)]
+struct AlacritreeProcess {
+    pid: u32,
+    exe: Option<PathBuf>,
+    bridge: bool,
+}
+
+/// Running processes pin their exe images.  Builds and installs rename a
+/// pinned exe aside rather than fail, so a pin is not a fault and the rows
+/// are informational — but when a rename does fail (antivirus, a read-only
+/// volume), this section turns "Access is denied (os error 5)" into a pid
+/// worth closing.
+#[cfg(windows)]
+fn process_checks(processes: &[AlacritreeProcess]) -> Vec<Check> {
+    if processes.is_empty() {
+        let detail = "no running alacritree pins a binary";
+        return vec![check("processes", "images", Status::Ok, detail)];
+    }
+    processes
+        .iter()
+        .map(|p| {
+            let role = if p.bridge { "mcp bridge" } else { "window" };
+            let image = match &p.exe {
+                Some(exe) => exe.display().to_string(),
+                None => "an unreadable image path".to_string(),
+            };
+            let detail = format!("pid {} holds {image}", p.pid);
+            check("processes", role, Status::Ok, detail)
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn running_alacritree_processes() -> Vec<AlacritreeProcess> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_exe(UpdateKind::Always).with_cmd(UpdateKind::Always),
+    );
+    let me = std::process::id();
+    let mut processes: Vec<AlacritreeProcess> = sys
+        .processes()
+        .iter()
+        // This doctor run is itself an alacritree process, but it exits with
+        // the report and pins nothing worth mentioning.
+        .filter(|(pid, _)| pid.as_u32() != me)
+        .filter(|(_, p)| p.name().to_string_lossy().to_lowercase().starts_with("alacritree"))
+        .map(|(pid, p)| AlacritreeProcess {
+            pid: pid.as_u32(),
+            exe: p.exe().map(Path::to_path_buf),
+            bridge: p.cmd().iter().any(|arg| arg == "mcp"),
+        })
+        .collect();
+    processes.sort_by_key(|p| p.pid);
+    processes
 }
 
 /// Resolve `program` the way the OS would: an explicit path as itself, a bare
@@ -827,5 +890,54 @@ mod tests {
 
         assert_eq!(to_json(&bad)["ok"], false);
         assert_eq!(to_json(&[check("a", "x", Status::Warn, "")])["ok"], true);
+    }
+
+    #[cfg(windows)]
+    fn alacritree_process(pid: u32, bridge: bool) -> AlacritreeProcess {
+        AlacritreeProcess {
+            pid,
+            exe: Some(PathBuf::from(r"C:\target\release\alacritree.exe")),
+            bridge,
+        }
+    }
+
+    /// A bridge lives as long as its MCP client, not as long as the window —
+    /// telling them apart tells the user which program to close.
+    #[cfg(windows)]
+    #[test]
+    fn a_bridge_and_a_window_are_told_apart() {
+        let checks = process_checks(&[alacritree_process(7, true), alacritree_process(8, false)]);
+
+        assert_eq!(names(&checks), vec!["mcp bridge", "window"]);
+    }
+
+    /// The row has to name the pid and the file, or the reader knows neither
+    /// what to close nor which file is pinned.  It stays `ok`, not `warn`:
+    /// builds and installs rename a pinned exe aside rather than fail, so a
+    /// running process is the normal state of a working machine — and a
+    /// report that always has a warning in it stops being read.
+    #[cfg(windows)]
+    #[test]
+    fn a_pinning_process_is_an_ok_row_naming_its_pid_and_image() {
+        let checks = process_checks(&[alacritree_process(4242, true)]);
+
+        assert_eq!(checks[0].status, Status::Ok);
+        assert!(checks[0].detail.contains("4242"), "{:?} lacks the pid", checks[0].detail);
+        assert!(
+            checks[0].detail.contains(r"release\alacritree.exe"),
+            "{:?} lacks the image",
+            checks[0].detail
+        );
+    }
+
+    /// Most doctor runs happen with nothing running; that is a clean bill of
+    /// health worth stating, not a section to omit.
+    #[cfg(windows)]
+    #[test]
+    fn no_processes_is_a_clean_ok_row() {
+        let checks = process_checks(&[]);
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, Status::Ok);
     }
 }
