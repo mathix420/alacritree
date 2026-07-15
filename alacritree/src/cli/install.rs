@@ -14,8 +14,9 @@ use std::path::{Path, PathBuf};
 use crate::stale_exe;
 
 pub fn run(dest: Option<PathBuf>, as_json: bool) -> i32 {
-    let installed = destination(dest).and_then(|dir| {
-        install_file(&std::env::current_exe()?, &dir)
+    let installed = std::env::current_exe().and_then(|source| {
+        let dir = destination(dest)?;
+        install_file(&source, &dir)
             .map_err(|e| io::Error::other(format!("installing into {}: {e}", dir.display())))
     });
     match installed {
@@ -56,9 +57,17 @@ fn install_file(source: &Path, dir: &Path) -> io::Result<Installed> {
     fs::create_dir_all(dir)?;
     stale_exe::sweep_stale(dir);
     let target = dir.join(format!("alacritree{}", std::env::consts::EXE_SUFFIX));
-    let renamed_aside = stale_exe::rename_aside_if_locked(&target)?;
+    // The source may be the target itself — a self-install from the installed
+    // binary — so the copy must land before the target's name is freed.
     let temp = dir.join(format!("alacritree{}{}", stale_exe::TEMP_MARKER, std::process::id()));
     fs::copy(source, &temp)?;
+    let renamed_aside = match stale_exe::rename_aside_if_locked(&target) {
+        Ok(moved) => moved,
+        Err(e) => {
+            let _ = fs::remove_file(&temp);
+            return Err(e);
+        },
+    };
     if let Err(e) = fs::rename(&temp, &target) {
         let _ = fs::remove_file(&temp);
         return Err(e);
@@ -169,5 +178,25 @@ mod tests {
         let dest = destination(None).unwrap();
 
         assert!(dest.ends_with(Path::new(".local").join("bin")), "{}", dest.display());
+    }
+
+    /// `alacritree install` run from the installed binary itself: the source
+    /// IS the target, and the process holds it.  The copy must land in the
+    /// temp file before the target's name is freed, or a self-install deletes
+    /// the very binary it is installing.
+    #[cfg(windows)]
+    #[test]
+    fn a_self_install_survives_the_source_being_the_target() {
+        let dir = TempDir::new().unwrap();
+        let dest = dir.path().join("bin");
+        fs::create_dir_all(&dest).unwrap();
+        let target = target_in(&dest);
+        fs::write(&target, "v1").unwrap();
+        let _running = crate::test_util::hold_like_a_running_image(&target);
+
+        let installed = install_file(&target, &dest).unwrap();
+
+        assert_eq!(fs::read_to_string(&installed.target).unwrap(), "v1");
+        assert!(installed.renamed_aside.is_some(), "the held image was moved aside");
     }
 }
