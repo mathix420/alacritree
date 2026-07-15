@@ -132,6 +132,10 @@ pub struct AlacritreeApp {
     show_right_sidebar: bool,
     focus: PaneFocus,
     sidebar_cursor: Option<SidebarRow>,
+    /// Reveals the project rows' drag grips.  A transient mode, not persisted:
+    /// reordering is a rare, deliberate act, and a grip on every row the rest
+    /// of the time is noise.
+    reorder_mode: bool,
     /// The focus toggle opened a hidden sidebar; returning focus closes it
     /// again so a keyboard round trip leaves the layout untouched.
     sidebar_auto_shown: bool,
@@ -157,6 +161,7 @@ pub struct AlacritreeApp {
     pending_deletes: Vec<DeleteTask>,
     pending_create: Option<CreateState>,
     pending_rename: Option<RenameState>,
+    pending_project_remove: Option<ProjectRemoveState>,
     /// Worktrees already given a Doppler scope pass this app run, so opening
     /// more shells there doesn't re-invoke the doppler CLI.
     doppler_synced: HashSet<PathBuf>,
@@ -212,6 +217,20 @@ struct RenameState {
     /// Text being edited; seeded with the current display name.
     label: String,
 }
+
+/// The "remove project" confirmation modal.  Keyed by root, like the rename
+/// dialog, so a reorder or IPC removal under the modal can't retarget it.
+struct ProjectRemoveState {
+    root: PathBuf,
+    /// Display name, kept for the prompt after `projects` may have shifted.
+    name: String,
+}
+
+/// Drag-and-drop payload for reordering the project list.  Carries the dragged
+/// project's root rather than its index so a background refresh that shifts the
+/// list mid-drag can't drop onto the wrong project.
+#[derive(Clone)]
+struct DraggedProject(PathBuf);
 
 /// Which `git diff` flavor a sidebar click should open in delta.
 enum DiffSource {
@@ -348,6 +367,7 @@ impl AlacritreeApp {
             show_right_sidebar: persisted.show_right_sidebar,
             focus: PaneFocus::Terminal,
             sidebar_cursor: None,
+            reorder_mode: false,
             sidebar_auto_shown: false,
             sidebar_cursor_moved: false,
             sessions: Vec::new(),
@@ -365,6 +385,7 @@ impl AlacritreeApp {
             pending_deletes: Vec::new(),
             pending_create: None,
             pending_rename: None,
+            pending_project_remove: None,
             doppler_synced: HashSet::new(),
             pending_session_close: None,
             notify_rx,
@@ -777,12 +798,36 @@ impl AlacritreeApp {
         root
     }
 
+    /// Move a project so it sits before display index `insert_before`, keyed by
+    /// root so a drag that started before a background refresh still targets the
+    /// right project.  `insert_before` counts positions in the pre-move list.
+    fn move_project(&mut self, from_root: &Path, insert_before: usize) {
+        let Some(from) = self.projects.iter().position(|p| p.root == *from_root) else {
+            return;
+        };
+        let Some(to) = move_target(self.projects.len(), from, insert_before) else {
+            return;
+        };
+        let project = self.projects.remove(from);
+        self.projects.insert(to, project);
+        self.persist_project_order();
+    }
+
+    /// Rewrite the persisted project order to match the in-memory list.  Roots
+    /// only on disk (added by another window) keep their relative order at the
+    /// end, so reordering here never drops a project this window can't see.
+    fn persist_project_order(&self) {
+        let order: Vec<PathBuf> = self.projects.iter().map(|p| p.root.clone()).collect();
+        state::mutate(move |s| state::reorder_projects(s, &order));
+    }
+
     fn is_modal_open(&self) -> bool {
         self.quit_dialog_open
             || self.pending_delete.is_some()
             || self.pending_create.is_some()
             || self.pending_session_close.is_some()
             || self.pending_rename.is_some()
+            || self.pending_project_remove.is_some()
             || self.error_dialog.is_some()
     }
 
@@ -1203,12 +1248,16 @@ impl AlacritreeApp {
         let activate_session_request: std::cell::Cell<Option<(WorkspaceKey, SessionId)>> =
             std::cell::Cell::new(None);
         let close_session_request: std::cell::Cell<Option<SessionId>> = std::cell::Cell::new(None);
+        // Drag-to-reorder: (dragged root, insert-before display index).
+        let reorder_request: std::cell::Cell<Option<(PathBuf, usize)>> = std::cell::Cell::new(None);
         let mut add_project_clicked = false;
+        let mut reorder_toggled = false;
         let mut refresh_idx: Option<usize> = None;
-        let mut remove_idx: Option<usize> = None;
+        let mut remove_request: Option<ProjectRemoveState> = None;
         let mut expand_toggled: Option<(PathBuf, bool)> = None;
         let mut home_clicked = false;
         let theme = self.theme;
+        let reorder_mode = self.reorder_mode;
         let cursor_row = if self.focus == PaneFocus::ProjectsSidebar {
             self.sidebar_cursor.clone()
         } else {
@@ -1313,6 +1362,16 @@ impl AlacritreeApp {
                         {
                             add_project_clicked = true;
                         }
+                        // Lit while active: the mode is only visible as grips
+                        // on the rows, so the button has to say it's on.
+                        let (color, hint) = if reorder_mode {
+                            (theme.accent, "done reordering")
+                        } else {
+                            (theme.text_dim, "reorder projects")
+                        };
+                        if icon_button(ui, "⇅", color, &theme).on_hover_text(hint).clicked() {
+                            reorder_toggled = true;
+                        }
                     });
                 });
                 ui.separator();
@@ -1361,10 +1420,19 @@ impl AlacritreeApp {
                         // worktree rows already show the dot, and doubling it
                         // on the parent reads as noise.
                         let show_proj_dot = proj_attention && !project.expanded;
+                        // Cloned out before the row closures borrow `project`
+                        // mutably: the trailing closure needs them for the
+                        // remove-confirmation prompt.
+                        let project_root = project.root.clone();
+                        let project_name = project.display_name().to_string();
                         let mut name_resp: Option<egui::Response> = None;
                         let row_rect = row_with_trailing(
                             ui,
                             |ui| {
+                                if reorder_mode {
+                                    drag_handle(ui, &theme)
+                                        .dnd_set_drag_payload(DraggedProject(project.root.clone()));
+                                }
                                 let arrow = if project.expanded { "▾" } else { "▸" };
                                 if icon_button(ui, arrow, theme.text_dim, &theme).clicked() {
                                     project.expanded = !project.expanded;
@@ -1389,7 +1457,10 @@ impl AlacritreeApp {
                                     .on_hover_text("remove from sidebar")
                                     .clicked()
                                 {
-                                    remove_idx = Some(idx);
+                                    remove_request = Some(ProjectRemoveState {
+                                        root: project_root.clone(),
+                                        name: project_name.clone(),
+                                    });
                                 }
                                 if icon_button(ui, "↻", theme.text_muted, &theme)
                                     .on_hover_text("refresh worktrees")
@@ -1417,6 +1488,32 @@ impl AlacritreeApp {
                             paint_cursor_outline(ui, rect, &theme);
                             if cursor_moved {
                                 ui.scroll_to_rect(rect, None);
+                            }
+                        }
+
+                        // Drop target for a reorder drag.  Detected against the
+                        // raw payload rather than a `dnd_drop_zone` widget so no
+                        // extra hover-sensing rect steals the row buttons' own
+                        // hover highlight.
+                        if let Some(dragged) =
+                            egui::DragAndDrop::payload::<DraggedProject>(ui.ctx())
+                        {
+                            let pointer = ui.input(|i| i.pointer.interact_pos());
+                            if let Some(pointer) = pointer
+                                .filter(|p| row_rect.contains(*p) && dragged.0 != project.root)
+                            {
+                                let before = pointer.y < row_rect.center().y;
+                                let y = if before { row_rect.top() } else { row_rect.bottom() };
+                                ui.painter().hline(
+                                    row_rect.x_range(),
+                                    y,
+                                    Stroke::new(2.0 * theme.ui_scale, theme.accent),
+                                );
+                                if ui.input(|i| i.pointer.any_released()) {
+                                    let insert_before = if before { idx } else { idx + 1 };
+                                    reorder_request.set(Some((dragged.0.clone(), insert_before)));
+                                    egui::DragAndDrop::clear_payload(ui.ctx());
+                                }
                             }
                         }
 
@@ -1584,11 +1681,17 @@ impl AlacritreeApp {
         if add_project_clicked {
             self.add_project_via_dialog(ctx);
         }
+        if reorder_toggled {
+            self.reorder_mode = !self.reorder_mode;
+        }
         if let Some(idx) = refresh_idx {
             self.refresh_project(ctx, idx);
         }
-        if let Some(idx) = remove_idx {
-            self.remove_project(idx);
+        if let Some(req) = remove_request {
+            self.pending_project_remove = Some(req);
+        }
+        if let Some((root, insert_before)) = reorder_request.take() {
+            self.move_project(&root, insert_before);
         }
         if let Some((root, expanded)) = expand_toggled {
             state::mutate(|s| {
@@ -2310,6 +2413,38 @@ fn icon_button(ui: &mut egui::Ui, glyph: &str, color: Color32, theme: &Theme) ->
     resp
 }
 
+/// Destination index for moving the item at `from` so it lands before display
+/// slot `insert_before` (counted in the pre-move list), or `None` for a no-op.
+/// Removing `from` before inserting shifts every later slot down by one — the
+/// off-by-one this isolates so it can be tested without an app.
+fn move_target(len: usize, from: usize, insert_before: usize) -> Option<usize> {
+    if from >= len {
+        return None;
+    }
+    let mut to = insert_before.min(len);
+    if to > from {
+        to -= 1;
+    }
+    (to != from).then_some(to)
+}
+
+/// A grip that a project row can be dragged by to reorder it.  Drag-sensing
+/// only, so a plain click still falls through to the row's other controls.
+fn drag_handle(ui: &mut egui::Ui, theme: &Theme) -> egui::Response {
+    let s = theme.ui_scale;
+    let size = egui::vec2(12.0 * s, 16.0 * s);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::drag());
+    let color = if resp.hovered() || resp.dragged() { theme.text_dim } else { theme.text_muted };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "⠿",
+        egui::FontId::proportional(12.0 * s),
+        color,
+    );
+    resp.on_hover_cursor(egui::CursorIcon::Grab)
+}
+
 fn row_with_trailing<L, T>(ui: &mut egui::Ui, leading: L, trailing: T) -> egui::Rect
 where
     L: FnOnce(&mut egui::Ui),
@@ -2955,6 +3090,72 @@ impl AlacritreeApp {
         }
         if cancel_via_key || cancelled || modal.should_close() {
             self.pending_session_close = None;
+        }
+    }
+
+    fn show_remove_project_dialog(&mut self, ctx: &Context) {
+        let theme = self.theme;
+        let danger = rgb_to_color32(self.config.palette.normal[1]);
+        let Some(state) = self.pending_project_remove.as_ref() else {
+            return;
+        };
+        let title = format!("Remove `{}` from the sidebar?", state.name);
+
+        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let frame = modal_frame(&theme);
+        let mut confirmed = false;
+        let mut cancelled = false;
+
+        let s = theme.ui_scale;
+        let modal = egui::Modal::new(egui::Id::new("alacritree_remove_project_dialog"))
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.set_width(340.0 * s);
+                ui.spacing_mut().item_spacing.y = 6.0 * s;
+                ui.label(RichText::new(title).color(theme.text).strong());
+                ui.label(
+                    RichText::new("Nothing on disk is touched; open sessions keep running.")
+                        .color(theme.text_muted)
+                        .small(),
+                );
+                ui.add_space(4.0 * s);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Enter to remove · Esc to cancel")
+                            .color(theme.text_muted)
+                            .small(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let remove = ui.add(
+                            egui::Button::new(RichText::new("Remove").color(danger)).frame(false),
+                        );
+                        if remove.clicked() {
+                            confirmed = true;
+                        }
+                        let cancel = ui.add(
+                            egui::Button::new(RichText::new("Cancel").color(theme.text_dim))
+                                .frame(false),
+                        );
+                        if cancel.clicked() {
+                            cancelled = true;
+                        }
+                        focus_default(ui.ctx(), remove.id);
+                    });
+                });
+            });
+
+        if confirm_via_key || confirmed {
+            // Re-resolve by root: the list may have shifted (reorder, IPC) while
+            // the modal was up.
+            if let Some(state) = self.pending_project_remove.take() {
+                if let Some(idx) = self.projects.iter().position(|p| p.root == state.root) {
+                    self.remove_project(idx);
+                }
+            }
+            return;
+        }
+        if cancel_via_key || cancelled || modal.should_close() {
+            self.pending_project_remove = None;
         }
     }
 
@@ -3699,6 +3900,9 @@ impl eframe::App for AlacritreeApp {
         if self.pending_rename.is_some() {
             self.show_rename_dialog(ctx);
         }
+        if self.pending_project_remove.is_some() {
+            self.show_remove_project_dialog(ctx);
+        }
         if self.error_dialog.is_some() {
             self.show_error_dialog(ctx);
         }
@@ -3777,6 +3981,38 @@ mod tests {
 
     fn ws(p: &str) -> WorkspaceKey {
         Some(PathBuf::from(p))
+    }
+
+    /// Apply `move_target` to a concrete list so the drag semantics (drop
+    /// above/below a row, no-op on self and neighbors) are legible.
+    fn moved(items: &[&str], from: usize, insert_before: usize) -> Vec<String> {
+        let mut v: Vec<String> = items.iter().map(|s| s.to_string()).collect();
+        if let Some(to) = move_target(v.len(), from, insert_before) {
+            let it = v.remove(from);
+            v.insert(to, it);
+        }
+        v
+    }
+
+    #[test]
+    fn move_target_reorders_forward_and_back() {
+        // Drag "a" to the end (drop below the last row, index len).
+        assert_eq!(moved(&["a", "b", "c"], 0, 3), vec!["b", "c", "a"]);
+        // Drag "c" to the front (drop above row 0).
+        assert_eq!(moved(&["a", "b", "c"], 2, 0), vec!["c", "a", "b"]);
+        // Drag "a" to sit before "c" (drop above row 2).
+        assert_eq!(moved(&["a", "b", "c"], 0, 2), vec!["b", "a", "c"]);
+    }
+
+    #[test]
+    fn move_target_is_a_no_op_when_position_is_unchanged() {
+        // Dropping above your own row, or just below it, changes nothing.
+        assert_eq!(move_target(3, 1, 1), None);
+        assert_eq!(move_target(3, 1, 2), None);
+        // Dropping onto yourself.
+        assert_eq!(move_target(3, 0, 0), None);
+        // A stale source index (list shrank mid-drag) is ignored.
+        assert_eq!(move_target(2, 5, 0), None);
     }
 
     #[test]

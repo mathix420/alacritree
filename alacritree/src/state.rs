@@ -70,6 +70,14 @@ fn config_dir() -> Option<PathBuf> {
         .or_else(home::home_dir)
 }
 
+/// Reorder `state.projects` to follow `order` (a list of roots).  Roots absent
+/// from `order` — a project another window added that this one never loaded —
+/// keep their existing relative order at the end, so a reorder here never drops
+/// them.  Stable, so equal keys (all the disk-only roots) hold their order.
+pub fn reorder_projects(state: &mut PersistedState, order: &[PathBuf]) {
+    state.projects.sort_by_key(|p| order.iter().position(|r| *r == p.root).unwrap_or(usize::MAX));
+}
+
 pub fn load() -> PersistedState {
     let Some(path) = config_path() else {
         return PersistedState::default();
@@ -270,6 +278,43 @@ mod tests {
             .filter(|n| n != "state.toml")
             .collect();
         assert!(leftovers.is_empty(), "save left {leftovers:?} behind");
+    }
+
+    #[test]
+    fn reorder_follows_the_given_root_order() {
+        let mut state = PersistedState {
+            projects: vec![project("/a"), project("/b"), project("/c")],
+            ..Default::default()
+        };
+        let order = vec![PathBuf::from("/c"), PathBuf::from("/a"), PathBuf::from("/b")];
+        reorder_projects(&mut state, &order);
+        assert_eq!(
+            roots(&state),
+            vec![PathBuf::from("/c"), PathBuf::from("/a"), PathBuf::from("/b")]
+        );
+    }
+
+    /// A project another window added but this one never loaded is not in the
+    /// reorder's `order` list; it must survive at the end rather than vanish.
+    #[test]
+    fn reorder_keeps_disk_only_projects_at_the_end() {
+        let mut state = PersistedState {
+            projects: vec![project("/theirs1"), project("/a"), project("/theirs2"), project("/b")],
+            ..Default::default()
+        };
+        // This window only knows /b and /a, in that order.
+        let order = vec![PathBuf::from("/b"), PathBuf::from("/a")];
+        reorder_projects(&mut state, &order);
+        assert_eq!(
+            roots(&state),
+            vec![
+                PathBuf::from("/b"),
+                PathBuf::from("/a"),
+                PathBuf::from("/theirs1"),
+                PathBuf::from("/theirs2"),
+            ],
+            "known projects lead in the new order; disk-only ones trail in their old order",
+        );
     }
 
     #[test]
