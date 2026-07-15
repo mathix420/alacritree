@@ -1001,7 +1001,15 @@ impl AlacritreeApp {
             Outcome::FilterChanged => self.after_filter_changed(),
             Outcome::Consumed => {},
             Outcome::MoveCursor(delta) => self.move_sidebar_cursor(delta),
-            Outcome::Activate => self.activate_sidebar_cursor(ctx),
+            // Enter clears the query before yielding Activate, so the filtered
+            // row set is already gone; activate the cursor the preceding
+            // MoveCursor/FilterChanged handling maintained against it, rather
+            // than re-deriving rows and rejecting a now-hidden worktree.
+            Outcome::Activate => {
+                if let Some(cursor) = self.sidebar_cursor.clone() {
+                    self.activate_sidebar_row(ctx, &cursor);
+                }
+            },
             Outcome::LeavePanel => self.focus_terminal(),
         }
     }
@@ -1029,15 +1037,6 @@ impl AlacritreeApp {
             },
         };
         self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, delta));
-    }
-
-    fn activate_sidebar_cursor(&mut self, ctx: &Context) {
-        let rows = self.current_project_rows();
-        let cursor = match self.sidebar_cursor.clone() {
-            Some(c) if rows.contains(&c) => c,
-            _ => return,
-        };
-        self.activate_sidebar_row(ctx, &cursor);
     }
 
     /// Rows the sidebar cursor steps over this frame: the fuzzy/toggle-filtered
