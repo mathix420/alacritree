@@ -14,8 +14,8 @@ use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::config::Config;
 use crate::doppler;
-use crate::git_nav::{self, GitSection};
-use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, StatusCache};
+use crate::git_nav::{self, GitSection, SectionCount};
+use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
 use crate::ipc;
 use crate::panel_filter::{self, PanelFilter};
 use crate::paste;
@@ -147,6 +147,9 @@ pub struct AlacritreeApp {
     /// Fuzzy-search query and `s`/`a` toggle state for the projects panel.
     /// Transient: never persisted, never touches the `expanded` flag.
     project_filter: PanelFilter,
+    /// Fuzzy-search query and `m`/`d`/`u` change-kind toggle state for the git
+    /// panel.  Transient: never persisted.
+    git_filter: PanelFilter,
     /// Git-panel cursor, identified by `(section, path)`.  Rebuilt every render
     /// pass from `git_rows`, so it survives the 1.5 s status refresh.
     git_cursor: Option<git_nav::GitRow>,
@@ -422,6 +425,7 @@ impl AlacritreeApp {
             sidebar_auto_shown: false,
             sidebar_cursor_moved: false,
             project_filter: PanelFilter::new(&['s', 'a']),
+            git_filter: PanelFilter::new(&['m', 'd', 'u']),
             git_cursor: None,
             git_cursor_moved: false,
             git_rows: Vec::new(),
@@ -1164,23 +1168,130 @@ impl AlacritreeApp {
     /// unmodified nav keys, leaving modifier-bound shortcuts for
     /// `handle_shortcuts`.
     fn handle_git_sidebar_nav(&mut self, ctx: &Context) {
-        use egui::Key;
-        let keys: Vec<Key> = ctx.input_mut(|i| {
-            let mut pressed = Vec::new();
-            i.events.retain(|ev| {
-                if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
-                    if modifiers.is_none() && is_sidebar_nav_key(*key) {
-                        pressed.push(*key);
+        let filter = &mut self.git_filter;
+        let steps: Vec<SidebarNavStep> = ctx.input_mut(|i| {
+            let mut steps = Vec::new();
+            i.events.retain(|ev| match ev {
+                egui::Event::Text(text) => match filter.on_text(text) {
+                    Some(outcome) => {
+                        steps.push(SidebarNavStep::Filter(outcome));
+                        false
+                    },
+                    None => true,
+                },
+                egui::Event::Key { key, pressed: true, modifiers, .. } if modifiers.is_none() => {
+                    if let Some(outcome) = filter.on_key(*key) {
+                        steps.push(SidebarNavStep::Filter(outcome));
                         return false;
                     }
-                }
-                true
+                    if is_sidebar_nav_key(*key) {
+                        steps.push(SidebarNavStep::Nav(*key));
+                        return false;
+                    }
+                    true
+                },
+                _ => true,
             });
-            pressed
+            steps
         });
-        for key in keys {
-            self.apply_git_sidebar_nav(ctx, key);
+        for step in steps {
+            match step {
+                SidebarNavStep::Filter(outcome) => self.apply_git_filter_outcome(ctx, outcome),
+                SidebarNavStep::Nav(key) => self.apply_git_sidebar_nav(ctx, key),
+            }
         }
+    }
+
+    fn apply_git_filter_outcome(&mut self, ctx: &Context, outcome: panel_filter::Outcome) {
+        use panel_filter::Outcome;
+        match outcome {
+            Outcome::FilterChanged => self.after_git_filter_changed(),
+            Outcome::Consumed => {},
+            Outcome::MoveCursor(delta) => self.move_git_cursor(delta),
+            // Enter clears the query before yielding Activate, so act on the
+            // cursor the preceding movement maintained against the filtered
+            // rows rather than re-deriving a now-widened set.  Focus stays on
+            // the panel so the next file is one keystroke away.
+            Outcome::Activate => {
+                if let Some(cursor) = self.git_cursor.clone() {
+                    if let Some(req) =
+                        git_row_diff_request(&cursor, self.git_branch_base.as_deref())
+                    {
+                        self.open_diff(ctx, req);
+                    }
+                }
+            },
+            Outcome::LeavePanel => self.focus_terminal(),
+        }
+    }
+
+    /// Repair the git cursor after the row set narrows or widens: recompute the
+    /// filtered rows from the cached status so the next key event acts on them,
+    /// then keep the cursor where it is when still visible, else fall to the
+    /// first surviving row.
+    fn after_git_filter_changed(&mut self) {
+        self.recompute_git_rows();
+        let next = git_nav::ensure_cursor(&self.git_rows, self.git_cursor.as_ref());
+        if next.as_ref() != self.git_cursor.as_ref() {
+            self.git_cursor = next;
+            self.git_cursor_moved = true;
+        }
+    }
+
+    fn move_git_cursor(&mut self, delta: i32) {
+        let cursor = match self.git_cursor.clone() {
+            Some(c) if self.git_rows.contains(&c) => c,
+            _ => {
+                if let Some(first) = self.git_rows.first().cloned() {
+                    self.set_git_cursor(first);
+                }
+                return;
+            },
+        };
+        if let Some(row) = git_nav::step(&self.git_rows, &cursor, delta) {
+            self.set_git_cursor(row);
+        }
+    }
+
+    /// Rebuild `git_rows` from the cached status under the active filter,
+    /// without polling.  The render pass recomputes the same way from a fresh
+    /// poll; this keeps the row set current between frames so a filter change
+    /// and a following key event in the same batch agree on the rows.
+    fn recompute_git_rows(&mut self) {
+        let Some(path) = self.active_session_path() else {
+            self.git_rows.clear();
+            return;
+        };
+        let Some(status) = self.git_status.get(&path).map(|c| c.last().clone()) else {
+            self.git_rows.clear();
+            return;
+        };
+        self.git_rows = self.filtered_git_rows(&status).rows;
+    }
+
+    /// Apply the git panel's kind toggles and fuzzy query to a status snapshot.
+    /// With no kind toggle active every kind passes; otherwise the active
+    /// toggles union (`m`: Modified/Renamed, `d`: Deleted, `u`: Untracked/Added).
+    /// Conflicted rows and the branch-diff section are handled by `visible_rows`.
+    fn filtered_git_rows(&mut self, status: &GitStatus) -> git_nav::GitRows {
+        let m = self.git_filter.is_toggled('m');
+        let d = self.git_filter.is_toggled('d');
+        let u = self.git_filter.is_toggled('u');
+        let any = m || d || u;
+        let kind_pass = move |k: ChangeKind| {
+            !any || (m && matches!(k, ChangeKind::Modified | ChangeKind::Renamed))
+                || (d && k == ChangeKind::Deleted)
+                || (u && matches!(k, ChangeKind::Untracked | ChangeKind::Added))
+        };
+        let filter = &mut self.git_filter;
+        let mut query_pass = |path: &str| filter.matches(path);
+        git_nav::visible_rows(
+            &status.staged,
+            &status.unstaged,
+            &status.branch_diff,
+            &kind_pass,
+            &mut query_pass,
+        )
     }
 
     fn apply_git_sidebar_nav(&mut self, ctx: &Context, key: egui::Key) {
@@ -2091,7 +2202,7 @@ impl AlacritreeApp {
             .frame(panel_frame)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Git").color(theme.text).strong());
+                    panel_header_filter_ui(ui, "Git", &self.git_filter, &theme);
                 });
                 ui.separator();
 
@@ -2145,14 +2256,23 @@ impl AlacritreeApp {
                     .default_branch_resolved
                     .clone()
                     .or_else(|| status.default_branch.clone());
-                self.git_rows = git_nav::visible_rows(
-                    &status.staged,
-                    &status.unstaged,
-                    &status.branch_diff,
-                    &|_| true,
-                    &mut |_| true,
-                )
-                .rows;
+                let filtering = self.git_filter.is_filtering();
+                let filtered = self.filtered_git_rows(&status);
+                let staged_count = filtered.staged;
+                let unstaged_count = filtered.unstaged;
+                let branch_count = filtered.branch;
+                self.git_rows = filtered.rows;
+                let mut staged_visible: HashSet<String> = HashSet::new();
+                let mut unstaged_visible: HashSet<String> = HashSet::new();
+                let mut branch_visible: HashSet<String> = HashSet::new();
+                for row in &self.git_rows {
+                    match row.section {
+                        GitSection::Staged => &mut staged_visible,
+                        GitSection::Unstaged => &mut unstaged_visible,
+                        GitSection::Branch => &mut branch_visible,
+                    }
+                    .insert(row.path.clone());
+                }
                 self.git_branch_base = git_branch_base.clone();
                 if self.focus == PaneFocus::GitSidebar {
                     let mut repaired =
@@ -2234,8 +2354,11 @@ impl AlacritreeApp {
                     }
                     ui.add_space(10.0);
 
-                    section(ui, &theme, "Staged", status.staged.len(), |ui| {
+                    section(ui, &theme, "Staged", staged_count, filtering, |ui| {
                         for f in &status.staged {
+                            if !staged_visible.contains(&f.path) {
+                                continue;
+                            }
                             let req =
                                 DiffRequest { file: f.path.clone(), source: DiffSource::Staged };
                             let is_active = active_diff_key.as_deref() == Some(&diff_key(&req));
@@ -2255,8 +2378,11 @@ impl AlacritreeApp {
                         }
                     });
 
-                    section(ui, &theme, "Unstaged", status.unstaged.len(), |ui| {
+                    section(ui, &theme, "Unstaged", unstaged_count, filtering, |ui| {
                         for f in &status.unstaged {
+                            if !unstaged_visible.contains(&f.path) {
+                                continue;
+                            }
                             let source = if f.kind == ChangeKind::Untracked {
                                 DiffSource::Untracked
                             } else {
@@ -2286,7 +2412,7 @@ impl AlacritreeApp {
                             None => "Changes vs default".to_string(),
                         };
                         let base = git_branch_base.clone();
-                        let count = status.branch_diff.len();
+                        let count_label = section_count_label(&branch_count, filtering);
 
                         // Open-coded section header so the PR number can be a
                         // hyperlink while the rest stays plain text.
@@ -2302,12 +2428,13 @@ impl AlacritreeApp {
                                     &pr.url,
                                 );
                             }
-                            ui.label(
-                                RichText::new(format!("{count}")).color(theme.text_muted).small(),
-                            );
+                            ui.label(RichText::new(count_label).color(theme.text_muted).small());
                         });
                         ui.add_space(2.0);
                         for stat in &status.branch_diff {
+                            if !branch_visible.contains(&stat.path) {
+                                continue;
+                            }
                             let Some(base) = base.clone() else {
                                 let resp = branch_diff_row(ui, stat, &theme, &palette, false);
                                 paint_git_row_cursor(
@@ -2585,19 +2712,31 @@ fn focus_default(ctx: &Context, id: egui::Id) {
 /// Empty sections are skipped entirely — a placeholder glyph for "no files
 /// here" added visual noise without communicating anything the count badge
 /// didn't already say.
+/// Section header count: `visible of total` while a filter narrows the panel,
+/// the plain total otherwise.
+fn section_count_label(count: &SectionCount, filtering: bool) -> String {
+    if filtering {
+        format!("{} of {}", count.visible, count.total)
+    } else {
+        format!("{}", count.total)
+    }
+}
+
 fn section<R>(
     ui: &mut egui::Ui,
     theme: &Theme,
     title: &str,
-    count: usize,
+    count: SectionCount,
+    filtering: bool,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) {
-    if count == 0 {
+    if count.total == 0 {
         return;
     }
+    let label = section_count_label(&count, filtering);
     ui.horizontal(|ui| {
         ui.label(RichText::new(title).color(theme.text).strong().small());
-        ui.label(RichText::new(format!("{count}")).color(theme.text_muted).small());
+        ui.label(RichText::new(label).color(theme.text_muted).small());
     });
     ui.add_space(2.0);
     add_contents(ui);
@@ -2941,7 +3080,7 @@ fn paint_git_row_cursor(
     }
 }
 
-/// One drained event's effect on the projects panel: either a filter outcome
+/// One drained event's effect on a sidebar panel: either a filter outcome
 /// (search/toggle) or a plain browsing nav key.
 enum SidebarNavStep {
     Filter(panel_filter::Outcome),
