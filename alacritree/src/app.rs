@@ -156,6 +156,9 @@ pub struct AlacritreeApp {
     /// adopted in `poll_pending_deletes`.
     pending_deletes: Vec<DeleteTask>,
     pending_create: Option<CreateState>,
+    /// Creations the user minimized off the running modal; they keep streaming
+    /// off-thread and are adopted in `poll_pending_creates`.
+    pending_creates: Vec<BackgroundCreate>,
     pending_rename: Option<RenameState>,
     /// Worktrees already given a Doppler scope pass this app run, so opening
     /// more shells there doesn't re-invoke the doppler CLI.
@@ -203,6 +206,17 @@ enum CreateState {
     Prompt { project_idx: usize, branch: String, error: Option<String> },
     Running { project_idx: usize, branch: String, steps: Vec<String>, rx: Receiver<Progress> },
     Done { project_idx: usize, steps: Vec<String>, result: Result<PathBuf, String> },
+}
+
+/// A worktree creation the user minimized from the running modal: it keeps
+/// running off-thread while they work, and its result is adopted in
+/// `poll_pending_creates`.
+struct BackgroundCreate {
+    project_idx: usize,
+    /// Shown on the sidebar placeholder row until the finished worktree
+    /// replaces it on refresh.
+    branch: String,
+    rx: Receiver<Progress>,
 }
 
 /// The rename dialog, keyed by root rather than index: an IPC `remove_project`
@@ -364,6 +378,7 @@ impl AlacritreeApp {
             pending_delete: None,
             pending_deletes: Vec::new(),
             pending_create: None,
+            pending_creates: Vec::new(),
             pending_rename: None,
             doppler_synced: HashSet::new(),
             pending_session_close: None,
@@ -1291,6 +1306,10 @@ impl AlacritreeApp {
         // a spinner instead of the delete/new-shell controls.
         let deleting_paths: HashSet<PathBuf> =
             self.pending_deletes.iter().map(|t| t.worktree_path.clone()).collect();
+        // Minimized creations, keyed by project index, rendered as spinner
+        // placeholder rows until the finished worktree shows up on refresh.
+        let creating: Vec<(usize, String)> =
+            self.pending_creates.iter().map(|c| (c.project_idx, c.branch.clone())).collect();
         let distros = wsl::distros();
         let profile_names: Vec<String> =
             self.config.profiles.iter().map(|p| p.name.clone()).collect();
@@ -1574,6 +1593,9 @@ impl AlacritreeApp {
                                         close_session_request.set(Some(row.id));
                                     }
                                 }
+                            }
+                            for (_, branch) in creating.iter().filter(|(pi, _)| *pi == idx) {
+                                creating_row(ui, branch, &theme);
                             }
                             ui.add_space(4.0);
                         }
@@ -2486,6 +2508,30 @@ fn session_row_title(title: &str, agent_glyph: Option<char>) -> String {
     title.to_string()
 }
 
+/// Sidebar placeholder for a worktree whose creation the user minimized: a
+/// spinner stands in until `poll_pending_creates` refreshes the project and the
+/// real worktree row takes its place.  Indentation and the leading glyph match
+/// `worktree_row` so it lines up with its future sibling.
+fn creating_row(ui: &mut egui::Ui, branch: &str, theme: &Theme) {
+    let s = theme.ui_scale;
+    let frame = Frame::default().inner_margin(Margin { left: 16, right: 0, top: 3, bottom: 3 });
+    frame.show(ui, |ui| {
+        row_with_trailing(
+            ui,
+            |ui| {
+                ui.label(RichText::new("○").color(theme.text_muted).size(10.0 * s));
+                ui.add(
+                    egui::Label::new(RichText::new(branch).color(theme.text_muted).small())
+                        .truncate(),
+                );
+            },
+            |ui| {
+                ui.add(egui::Spinner::new().size(12.0 * s).color(theme.text_muted));
+            },
+        );
+    });
+}
+
 fn worktree_row(
     ui: &mut egui::Ui,
     wt: &Worktree,
@@ -3064,6 +3110,34 @@ impl AlacritreeApp {
         }
     }
 
+    /// Adopt minimized creates once their worker finishes: pop up any failure
+    /// (its modal is long gone) and refresh the project so the new worktree
+    /// replaces its sidebar placeholder.  A successful create is deliberately
+    /// not activated: the user minimized to work elsewhere, so don't yank them
+    /// into the new worktree.
+    fn poll_pending_creates(&mut self, ctx: &Context) {
+        let mut finished: Vec<(usize, Result<PathBuf, String>)> = Vec::new();
+        self.pending_creates.retain_mut(|task| {
+            loop {
+                match task.rx.try_recv() {
+                    Ok(Progress::Step(_)) => {},
+                    Ok(Progress::Done(result)) => {
+                        finished.push((task.project_idx, result));
+                        break false;
+                    },
+                    Err(mpsc::TryRecvError::Empty) => break true,
+                    Err(mpsc::TryRecvError::Disconnected) => break false,
+                }
+            }
+        });
+        for (project_idx, result) in finished {
+            if let Err(e) = result {
+                self.error_dialog = Some(format!("Worktree creation failed.\n\n{e}"));
+            }
+            self.refresh_project(ctx, project_idx);
+        }
+    }
+
     fn show_rename_dialog(&mut self, ctx: &Context) {
         let Some(RenameState { root, mut label }) = self.pending_rename.take() else {
             return;
@@ -3159,9 +3233,17 @@ impl AlacritreeApp {
                         Progress::Done(r) => done = Some(r),
                     }
                 }
-                self.show_create_running(ctx, project_idx, &branch, &steps);
+                let minimized = self.show_create_running(ctx, project_idx, &branch, &steps);
                 match done {
+                    // A finished job goes to its result even if a minimize press
+                    // lands on the same frame, so the outcome is never lost.
                     Some(result) => Some(CreateState::Done { project_idx, steps, result }),
+                    // Minimized: hand the still-running create off to
+                    // `poll_pending_creates` and dismiss the modal.
+                    None if minimized => {
+                        self.pending_creates.push(BackgroundCreate { project_idx, branch, rx });
+                        None
+                    },
                     None => Some(CreateState::Running { project_idx, branch, steps, rx }),
                 }
             },
@@ -3286,18 +3368,23 @@ impl AlacritreeApp {
         Some(CreateState::Prompt { project_idx, branch, error })
     }
 
+    /// Renders the live progress view and returns `true` when the user asks to
+    /// minimize (Enter, Escape, or a click outside), sending the create to the
+    /// background so they can keep working.  The git operation can't be
+    /// cancelled mid-flight, so every dismiss path minimizes rather than aborts.
     fn show_create_running(
         &self,
         ctx: &Context,
         project_idx: usize,
         branch: &str,
         steps: &[String],
-    ) {
+    ) -> bool {
         let theme = self.theme;
         let project_name = self.projects[project_idx].display_name().to_string();
         let frame = modal_frame(&theme);
         let s = theme.ui_scale;
-        let _ = egui::Modal::new(egui::Id::new("alacritree_create_dialog")).frame(frame).show(
+        let (minimize_via_esc, minimize_via_enter) = consume_modal_keys(ctx);
+        let modal = egui::Modal::new(egui::Id::new("alacritree_create_dialog")).frame(frame).show(
             ctx,
             |ui| {
                 ui.set_width(380.0 * s);
@@ -3320,8 +3407,15 @@ impl AlacritreeApp {
                 if steps.is_empty() {
                     ui.label(RichText::new("Starting…").color(theme.text_muted).small());
                 }
+                ui.add_space(4.0 * s);
+                ui.label(
+                    RichText::new("Enter to keep working while it finishes in the background")
+                        .color(theme.text_muted)
+                        .small(),
+                );
             },
         );
+        minimize_via_esc || minimize_via_enter || modal.should_close()
     }
 
     fn show_create_done(
@@ -3603,6 +3697,7 @@ impl eframe::App for AlacritreeApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.poll_project_refreshes();
         self.poll_pending_deletes(ctx);
+        self.poll_pending_creates(ctx);
         let modal_open = self.is_modal_open();
         // Keys pressed mid-composition drive the IME's candidate window,
         // not the app — alacritty's key_input returns early the same way,
