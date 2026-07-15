@@ -17,6 +17,7 @@ use crate::doppler;
 use crate::git_nav::{self, GitSection};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, StatusCache};
 use crate::ipc;
+use crate::panel_filter::{self, PanelFilter};
 use crate::paste;
 use crate::pr_status::PrCache;
 use crate::projects::{Project, Worktree, project_json};
@@ -143,6 +144,9 @@ pub struct AlacritreeApp {
     sidebar_auto_shown: bool,
     /// One-shot: scroll the cursor row into view on the next sidebar paint.
     sidebar_cursor_moved: bool,
+    /// Fuzzy-search query and `s`/`a` toggle state for the projects panel.
+    /// Transient: never persisted, never touches the `expanded` flag.
+    project_filter: PanelFilter,
     /// Git-panel cursor, identified by `(section, path)`.  Rebuilt every render
     /// pass from `git_rows`, so it survives the 1.5 s status refresh.
     git_cursor: Option<git_nav::GitRow>,
@@ -417,6 +421,7 @@ impl AlacritreeApp {
             reorder_mode: false,
             sidebar_auto_shown: false,
             sidebar_cursor_moved: false,
+            project_filter: PanelFilter::new(&['s', 'a']),
             git_cursor: None,
             git_cursor_moved: false,
             git_rows: Vec::new(),
@@ -956,28 +961,144 @@ impl AlacritreeApp {
     /// keyboard focus.  Consumes only unmodified keys, so modifier-bound
     /// app shortcuts still match in `handle_shortcuts` afterwards.
     fn handle_sidebar_nav(&mut self, ctx: &Context) {
-        use egui::Key;
-        let keys: Vec<Key> = ctx.input_mut(|i| {
-            let mut pressed = Vec::new();
-            i.events.retain(|ev| {
-                if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
-                    if modifiers.is_none() && is_sidebar_nav_key(*key) {
-                        pressed.push(*key);
+        let filter = &mut self.project_filter;
+        let steps: Vec<SidebarNavStep> = ctx.input_mut(|i| {
+            let mut steps = Vec::new();
+            i.events.retain(|ev| match ev {
+                egui::Event::Text(text) => match filter.on_text(text) {
+                    Some(outcome) => {
+                        steps.push(SidebarNavStep::Filter(outcome));
+                        false
+                    },
+                    None => true,
+                },
+                egui::Event::Key { key, pressed: true, modifiers, .. } if modifiers.is_none() => {
+                    if let Some(outcome) = filter.on_key(*key) {
+                        steps.push(SidebarNavStep::Filter(outcome));
                         return false;
                     }
-                }
-                true
+                    if is_sidebar_nav_key(*key) {
+                        steps.push(SidebarNavStep::Nav(*key));
+                        return false;
+                    }
+                    true
+                },
+                _ => true,
             });
-            pressed
+            steps
         });
-        for key in keys {
-            self.apply_sidebar_nav(ctx, key);
+        for step in steps {
+            match step {
+                SidebarNavStep::Filter(outcome) => self.apply_filter_outcome(ctx, outcome),
+                SidebarNavStep::Nav(key) => self.apply_sidebar_nav(ctx, key),
+            }
         }
+    }
+
+    fn apply_filter_outcome(&mut self, ctx: &Context, outcome: panel_filter::Outcome) {
+        use panel_filter::Outcome;
+        match outcome {
+            Outcome::FilterChanged => self.after_filter_changed(),
+            Outcome::Consumed => {},
+            Outcome::MoveCursor(delta) => self.move_sidebar_cursor(delta),
+            Outcome::Activate => self.activate_sidebar_cursor(ctx),
+            Outcome::LeavePanel => self.focus_terminal(),
+        }
+    }
+
+    /// Repair the cursor after the row set narrows or widens: keep it where it
+    /// is when still visible, otherwise fall to the first surviving row.
+    fn after_filter_changed(&mut self) {
+        let rows = self.current_project_rows();
+        let next = sidebar_nav::ensure_cursor(&rows, self.sidebar_cursor.as_ref());
+        if next != self.sidebar_cursor {
+            self.sidebar_cursor = next;
+            self.sidebar_cursor_moved = true;
+        }
+    }
+
+    fn move_sidebar_cursor(&mut self, delta: i32) {
+        let rows = self.current_project_rows();
+        let cursor = match self.sidebar_cursor.clone() {
+            Some(c) if rows.contains(&c) => c,
+            _ => {
+                if let Some(first) = rows.first() {
+                    self.set_sidebar_cursor(first.clone());
+                }
+                return;
+            },
+        };
+        self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, delta));
+    }
+
+    fn activate_sidebar_cursor(&mut self, ctx: &Context) {
+        let rows = self.current_project_rows();
+        let cursor = match self.sidebar_cursor.clone() {
+            Some(c) if rows.contains(&c) => c,
+            _ => return,
+        };
+        self.activate_sidebar_row(ctx, &cursor);
+    }
+
+    /// Rows the sidebar cursor steps over this frame: the fuzzy/toggle-filtered
+    /// set while a filter is active, the full visible set otherwise.
+    fn current_project_rows(&mut self) -> Vec<SidebarRow> {
+        if !self.project_filter.is_filtering() {
+            return sidebar_nav::visible_rows(&self.projects);
+        }
+
+        let toggle_sessions = self.project_filter.is_toggled('s');
+        let toggle_attention = self.project_filter.is_toggled('a');
+        let any_toggle = toggle_sessions || toggle_attention;
+
+        // Precompute every fuzzy result before building the closures: the
+        // matcher needs `&mut self.project_filter`, and releasing that borrow
+        // up-front lets the predicates read the rest of `&self` freely.
+        let home_matches = self.project_filter.matches("Home");
+        let project_matches: HashMap<PathBuf, bool> = {
+            let filter = &mut self.project_filter;
+            self.projects
+                .iter()
+                .map(|p| (p.root.clone(), filter.matches(p.display_name())))
+                .collect()
+        };
+        let worktree_matches: HashMap<PathBuf, bool> = {
+            let filter = &mut self.project_filter;
+            self.projects
+                .iter()
+                .flat_map(|p| p.worktrees.iter())
+                .map(|wt| (wt.path.clone(), filter.matches(&wt.name)))
+                .collect()
+        };
+
+        let toggles_pass = |key: &WorkspaceKey| {
+            (!toggle_sessions || self.workspace_has_sessions(key))
+                && (!toggle_attention || self.workspace_needs_attention(key))
+        };
+        let home = home_matches && toggles_pass(&None);
+        let project_self =
+            |p: &Project| !any_toggle && project_matches.get(&p.root).copied().unwrap_or(false);
+        let mut worktree = |_p: &Project, wt: &Worktree| {
+            worktree_matches.get(&wt.path).copied().unwrap_or(false)
+                && toggles_pass(&Some(wt.path.clone()))
+        };
+        sidebar_nav::filtered_rows(
+            &self.projects,
+            sidebar_nav::RowPredicates {
+                home,
+                project_self: &project_self,
+                worktree: &mut worktree,
+            },
+        )
+    }
+
+    fn workspace_has_sessions(&self, key: &WorkspaceKey) -> bool {
+        self.sessions.iter().any(|s| s.working_directory == *key)
     }
 
     fn apply_sidebar_nav(&mut self, ctx: &Context, key: egui::Key) {
         use egui::Key;
-        let rows = sidebar_nav::visible_rows(&self.projects);
+        let rows = self.current_project_rows();
         let cursor = match self.sidebar_cursor.clone() {
             Some(c) if rows.contains(&c) => c,
             // Stale or unseeded cursor (worktree removed, project collapsed
@@ -1004,25 +1125,31 @@ impl AlacritreeApp {
                 },
                 SidebarRow::Home => {},
             },
-            Key::Enter => match &cursor {
-                SidebarRow::Home => {
-                    self.activate_home(ctx);
-                    self.focus_terminal();
-                },
-                SidebarRow::Worktree(path) => {
-                    let path = path.clone();
-                    self.activate_worktree(ctx, &path);
-                    self.focus_terminal();
-                },
-                SidebarRow::Project(root) => {
-                    let root = root.clone();
-                    let expanded =
-                        self.projects.iter().find(|p| p.root == root).is_some_and(|p| p.expanded);
-                    self.set_project_expanded(&root, !expanded);
-                },
-            },
+            Key::Enter => self.activate_sidebar_row(ctx, &cursor),
             Key::Escape => self.focus_terminal(),
             _ => {},
+        }
+    }
+
+    /// Enter on a cursor row: open Home/worktree sessions and return focus to
+    /// the terminal, or toggle a project header's expansion in place.
+    fn activate_sidebar_row(&mut self, ctx: &Context, cursor: &SidebarRow) {
+        match cursor {
+            SidebarRow::Home => {
+                self.activate_home(ctx);
+                self.focus_terminal();
+            },
+            SidebarRow::Worktree(path) => {
+                let path = path.clone();
+                self.activate_worktree(ctx, &path);
+                self.focus_terminal();
+            },
+            SidebarRow::Project(root) => {
+                let root = root.clone();
+                let expanded =
+                    self.projects.iter().find(|p| p.root == root).is_some_and(|p| p.expanded);
+                self.set_project_expanded(&root, !expanded);
+            },
         }
     }
 
@@ -1416,6 +1543,33 @@ impl AlacritreeApp {
         };
         let cursor_moved = std::mem::take(&mut self.sidebar_cursor_moved);
 
+        // Membership for the active filter, resolved once so paint can skip
+        // non-surviving rows.  While filtering, matched projects render their
+        // matched worktrees regardless of `expanded` (display-only — the flag
+        // is never written).
+        let filtering = self.project_filter.is_filtering();
+        let mut home_visible = true;
+        let mut visible_projects: HashSet<PathBuf> = HashSet::new();
+        let mut visible_worktrees: HashSet<PathBuf> = HashSet::new();
+        if filtering {
+            home_visible = false;
+            for row in self.current_project_rows() {
+                match row {
+                    SidebarRow::Home => home_visible = true,
+                    SidebarRow::Project(root) => {
+                        visible_projects.insert(root);
+                    },
+                    SidebarRow::Worktree(path) => {
+                        visible_worktrees.insert(path);
+                    },
+                }
+            }
+        }
+        let filtered_empty = filtering
+            && !home_visible
+            && visible_projects.is_empty()
+            && visible_worktrees.is_empty();
+
         // Snapshot attention + agent-glyph state up-front so the `iter_mut`
         // over projects below isn't blocked from calling back into `&self`
         // helpers.
@@ -1509,7 +1663,7 @@ impl AlacritreeApp {
             .frame(panel_frame)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Projects").color(theme.text).strong());
+                    panel_header_filter_ui(ui, "Projects", &self.project_filter, &theme);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icon_button(ui, "+", theme.text_dim, &theme)
                             .on_hover_text("add project")
@@ -1532,31 +1686,33 @@ impl AlacritreeApp {
                 ui.separator();
 
                 ScrollArea::vertical().show(ui, |ui| {
-                    let home_action = home_row(
-                        ui,
-                        self.current_workspace.is_none(),
-                        matches!(&cursor_row, Some(SidebarRow::Home)),
-                        cursor_moved,
-                        home_attention,
-                        home_agent_glyph,
-                        &theme,
-                    );
-                    if home_action.activate {
-                        home_clicked = true;
-                    }
-                    if home_action.spawn {
-                        spawn_shell_request.set(Some(None));
-                    }
-                    for row in &home_session_rows {
-                        let act = session_row(ui, row, &theme);
-                        if act.activate {
-                            activate_session_request.set(Some((None, row.id)));
+                    if !filtering || home_visible {
+                        let home_action = home_row(
+                            ui,
+                            self.current_workspace.is_none(),
+                            matches!(&cursor_row, Some(SidebarRow::Home)),
+                            cursor_moved,
+                            home_attention,
+                            home_agent_glyph,
+                            &theme,
+                        );
+                        if home_action.activate {
+                            home_clicked = true;
                         }
-                        if act.close {
-                            close_session_request.set(Some(row.id));
+                        if home_action.spawn {
+                            spawn_shell_request.set(Some(None));
                         }
+                        for row in &home_session_rows {
+                            let act = session_row(ui, row, &theme);
+                            if act.activate {
+                                activate_session_request.set(Some((None, row.id)));
+                            }
+                            if act.close {
+                                close_session_request.set(Some(row.id));
+                            }
+                        }
+                        ui.add_space(2.0);
                     }
-                    ui.add_space(2.0);
 
                     if self.projects.is_empty() {
                         ui.label(
@@ -1566,9 +1722,14 @@ impl AlacritreeApp {
                         );
                         ui.add_space(4.0);
                         ui.label(RichText::new("Ctrl+B to toggle").small().color(theme.text_muted));
+                    } else if filtered_empty {
+                        ui.label(RichText::new("no matches").color(theme.text_dim).small());
                     }
 
                     for (idx, project) in self.projects.iter_mut().enumerate() {
+                        if filtering && !visible_projects.contains(&project.root) {
+                            continue;
+                        }
                         let proj_attention = project_attention.get(idx).copied().unwrap_or(false);
                         // Bubble attention up to the project row only when the
                         // project is collapsed — once expanded, the actual
@@ -1754,8 +1915,11 @@ impl AlacritreeApp {
                             });
                         }
 
-                        if project.expanded {
+                        if project.expanded || filtering {
                             for (wt_idx, wt) in project.worktrees.iter().enumerate() {
+                                if filtering && !visible_worktrees.contains(&wt.path) {
+                                    continue;
+                                }
                                 let is_active = self.current_workspace.as_deref() == Some(&wt.path);
                                 let wt_attention = worktree_attention
                                     .get(idx)
@@ -2775,6 +2939,28 @@ fn paint_git_row_cursor(
     paint_cursor_outline(ui, rect, theme);
     if scroll_into_view {
         ui.scroll_to_rect(rect, None);
+    }
+}
+
+/// One drained event's effect on the projects panel: either a filter outcome
+/// (search/toggle) or a plain browsing nav key.
+enum SidebarNavStep {
+    Filter(panel_filter::Outcome),
+    Nav(egui::Key),
+}
+
+/// Panel title plus its filter chrome, shared by both sidebars: the heading,
+/// then `[s]`-style chips for each active toggle, then a `/query▌` prompt while
+/// searching.  Renders only the title when the filter is idle.
+fn panel_header_filter_ui(ui: &mut egui::Ui, title: &str, filter: &PanelFilter, theme: &Theme) {
+    ui.label(RichText::new(title).color(theme.text).strong());
+    for key in filter.active_toggles() {
+        ui.label(RichText::new(format!("[{key}]")).color(theme.accent).monospace().small());
+    }
+    if filter.mode() == panel_filter::Mode::Search || !filter.query().is_empty() {
+        ui.label(
+            RichText::new(format!("/{}▌", filter.query())).color(theme.text).monospace().small(),
+        );
     }
 }
 
