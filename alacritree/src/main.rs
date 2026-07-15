@@ -11,6 +11,7 @@ mod command_ext;
 mod config;
 mod doppler;
 mod fonts;
+mod git_nav;
 mod git_status;
 mod ime;
 mod input;
