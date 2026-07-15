@@ -27,3 +27,21 @@ pub fn add_worktree(repo: &Repository, name: &str) -> PathBuf {
     repo.worktree(name, &path, None).unwrap();
     path
 }
+
+/// Hold `path` the way the loader holds a running exe image: write sharing
+/// denied (overwrites fail with access denied), delete/rename sharing allowed.
+/// One divergence from a real image: this file *can* be deleted while held,
+/// a mapped image cannot — so tests may rely on rename behaviour, never on
+/// delete behaviour.
+#[cfg(windows)]
+pub fn hold_like_a_running_image(path: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .open(path)
+        .unwrap()
+}

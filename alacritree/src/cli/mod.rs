@@ -10,6 +10,7 @@
 //! window (anything about sessions) fail there rather than pretending.
 
 mod doctor;
+mod install;
 mod offline;
 mod render;
 
@@ -73,6 +74,17 @@ enum Command {
 
     /// Check the external tools, config and state alacritree depends on.
     Doctor,
+
+    /// Copy this binary into a bin directory (default: ~/.local/bin).
+    ///
+    /// A window or MCP bridge still running from the destination does not
+    /// block the install: its binary is renamed aside, kept until that
+    /// process exits, and cleaned up by a later install.
+    Install {
+        /// Directory to install into.
+        #[arg(long, value_name = "DIR")]
+        dest: Option<PathBuf>,
+    },
 
     /// Write a shell completion script to stdout.
     Completions { shell: Shell },
@@ -166,6 +178,7 @@ pub fn run(cli: Cli) -> Option<i32> {
         // Diagnosing the machine is not something a running instance can answer:
         // the report has to be truthful when there is nothing to ask.
         Command::Doctor => return Some(doctor::run(cli.json, cli.socket.as_deref())),
+        Command::Install { dest } => return Some(install::run(dest, cli.json)),
         other => to_request(other),
     };
 
@@ -250,7 +263,7 @@ fn to_request(command: Command) -> IpcRequest {
             },
         },
         // None of these reach an alacritree, so none has a request to build.
-        Command::Completions { .. } | Command::Mcp | Command::Doctor => {
+        Command::Completions { .. } | Command::Mcp | Command::Doctor | Command::Install { .. } => {
             unreachable!("handled before dispatch")
         },
     }

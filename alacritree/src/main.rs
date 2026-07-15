@@ -23,6 +23,7 @@ mod pr_status;
 mod projects;
 mod session;
 mod sidebar_nav;
+mod stale_exe;
 mod state;
 mod terminal_view;
 #[cfg(test)]

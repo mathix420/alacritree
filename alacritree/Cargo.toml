@@ -67,6 +67,11 @@ sysinfo = { version = "0.36", default-features = false, features = ["system"] }
 # approach) — no process spawn at startup, and it identifies the default.
 winreg = "0.55"
 
+[target.'cfg(windows)'.dev-dependencies]
+# Share-mode constants for tests that hold a file the way the loader holds a
+# running exe image: writes denied, rename allowed.
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3.0.2"
 
