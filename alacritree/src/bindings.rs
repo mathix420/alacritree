@@ -52,6 +52,7 @@ pub enum NamedAction {
     AddProject,
     ToggleSidebarFocus,
     FocusProjectsSidebar,
+    FocusGitSidebar,
     FocusTerminal,
     /// 1-indexed into the `[[ui.profiles]]` order.
     SpawnProfile(u8),
@@ -193,6 +194,7 @@ fn default_bindings() -> Vec<KeyBinding> {
             mods: ctrl_shift,
             action: BindingAction::Named(ToggleSidebarFocus),
         },
+        KeyBinding { key: Key::G, mods: ctrl_shift, action: BindingAction::Named(FocusGitSidebar) },
         KeyBinding { key: Key::T, mods: ctrl, action: BindingAction::Named(SpawnNewInstance) },
         KeyBinding { key: Key::Q, mods: ctrl, action: BindingAction::Named(Quit) },
     ]);
@@ -498,6 +500,7 @@ fn parse_action(name: &str) -> BindingAction {
         "AddProject" => BindingAction::Named(AddProject),
         "ToggleSidebarFocus" => BindingAction::Named(ToggleSidebarFocus),
         "FocusProjectsSidebar" => BindingAction::Named(FocusProjectsSidebar),
+        "FocusGitSidebar" => BindingAction::Named(FocusGitSidebar),
         "FocusTerminal" => BindingAction::Named(FocusTerminal),
         "SpawnProfile1" => BindingAction::Named(SpawnProfile(1)),
         "SpawnProfile2" => BindingAction::Named(SpawnProfile(2)),
@@ -703,6 +706,7 @@ mod tests {
             ("ToggleSidebarFocus", NamedAction::ToggleSidebarFocus),
             ("FocusProjectsSidebar", NamedAction::FocusProjectsSidebar),
             ("FocusTerminal", NamedAction::FocusTerminal),
+            ("FocusGitSidebar", NamedAction::FocusGitSidebar),
         ] {
             let b = parse_bindings(vec![raw_action("F1", None, name)]);
             assert_eq!(named_matches(&b, Key::F1, Modifiers::NONE), vec![expected], "{name}");
@@ -766,6 +770,7 @@ mod tests {
             (Key::T, ctrl, SpawnNewInstance),
             (Key::Q, ctrl, Quit),
             (Key::B, ctrl_shift, ToggleSidebarFocus),
+            (Key::G, ctrl_shift, FocusGitSidebar),
         ] {
             assert_eq!(named_matches(&b, key, mods), vec![expected], "{key:?}+{mods:?}");
         }
