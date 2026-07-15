@@ -902,6 +902,11 @@ impl AlacritreeApp {
         self.focus = PaneFocus::ProjectsSidebar;
         self.sidebar_cursor =
             Some(sidebar_nav::seed(&self.projects, self.current_workspace.as_deref()));
+        // Seeding reads the unfiltered tree, so a lingering filter from a prior
+        // focus round-trip can leave the seeded row outside the current rows;
+        // repair it immediately rather than waiting for the first key press.
+        let rows = self.current_project_rows();
+        self.sidebar_cursor = sidebar_nav::ensure_cursor(&rows, self.sidebar_cursor.as_ref());
         self.sidebar_cursor_moved = true;
     }
 
@@ -1105,9 +1110,13 @@ impl AlacritreeApp {
         let cursor = match self.sidebar_cursor.clone() {
             Some(c) if rows.contains(&c) => c,
             // Stale or unseeded cursor (worktree removed, project collapsed
-            // by mouse): land on Home and let the next press act from there.
+            // by mouse, or a filter toggle narrowing the rows out from under
+            // it): land on the first row and let the next press act from
+            // there. Unfiltered `rows` always leads with Home.
             _ => {
-                self.set_sidebar_cursor(SidebarRow::Home);
+                if let Some(first) = rows.first() {
+                    self.set_sidebar_cursor(first.clone());
+                }
                 return;
             },
         };
