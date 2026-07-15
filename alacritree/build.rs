@@ -27,8 +27,9 @@ fn main() {
     }
 }
 
-/// The linker writes `deps/alacritree-<hash>.exe` and cargo hardlinks
-/// `alacritree.exe` to it, so both names must be free before a relink.
+/// The linker writes `deps/alacritree-<hash>.exe` and cargo publishes it as
+/// `alacritree.exe` (a hardlink or a copy), so both names must be free
+/// before a relink.
 /// Best-effort throughout: a failed rename leaves the build to fail at link
 /// exactly as it would have anyway, plus a warning naming the culprit.
 #[cfg(windows)]
