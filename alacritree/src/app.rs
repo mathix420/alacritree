@@ -1448,6 +1448,7 @@ impl AlacritreeApp {
                         let row_rect = row_with_trailing(
                             ui,
                             |ui| {
+                                ui.spacing_mut().item_spacing.x = ICON_CLUSTER_SPACING;
                                 if reorder_mode {
                                     drag_handle(ui, &theme)
                                         .dnd_set_drag_payload(DraggedProject(project.root.clone()));
@@ -1471,7 +1472,6 @@ impl AlacritreeApp {
                                 );
                             },
                             |ui| {
-                                ui.spacing_mut().item_spacing.x = 2.0;
                                 if icon_button(ui, "×", theme.text_muted, &theme)
                                     .on_hover_text("remove from sidebar")
                                     .clicked()
@@ -2427,6 +2427,11 @@ fn paint_row_status_icon(
     ui.label(RichText::new(glyph).color(color).size(10.0 * s));
 }
 
+/// Gap between adjacent `icon_button`s. They already pad their own glyph, so
+/// the default item spacing on top of that reads as a hole in the cluster.
+/// Deliberately unscaled: the padding it supplements grows with `ui_scale`.
+const ICON_CLUSTER_SPACING: f32 = 2.0;
+
 fn icon_button(ui: &mut egui::Ui, glyph: &str, color: Color32, theme: &Theme) -> egui::Response {
     let s = theme.ui_scale;
     let size = egui::vec2(16.0 * s, 16.0 * s);
@@ -2489,7 +2494,12 @@ where
 {
     let row_size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
     ui.allocate_ui_with_layout(row_size, egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let outer_spacing = ui.spacing().item_spacing.x;
+        ui.spacing_mut().item_spacing.x = ICON_CLUSTER_SPACING;
         trailing(ui);
+        // Restore before the leading group so only the icons cluster; the
+        // labels next to them keep the panel's normal spacing.
+        ui.spacing_mut().item_spacing.x = outer_spacing;
         let remaining = ui.available_width();
         if remaining <= 0.0 {
             return;
