@@ -2380,26 +2380,18 @@ fn paint_row_bg(
     ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
 }
 
-/// Lay out a row whose `trailing` widgets pin to the right edge while `leading`
-/// fills the remaining width — so a `Label::truncate()` inside `leading` knows
-/// exactly how much space it has and ellipsizes cleanly when the panel is narrow.
-///
-/// The row is pre-sized to `interact_size.y` (mirroring `Ui::horizontal`'s own
-/// internals) so it doesn't claim the parent's full remaining height when nested
-/// in a vertical layout — without this, `Align::Center` would push the row's
-/// content to the middle of the column and leave a giant gap before the next row.
-/// Frameless, fixed-footprint icon button. Painter-drawn rather than a
-/// `Button` because `Button` lays text out from the top-left of its rect, so
-/// glyphs of different intrinsic heights (e.g. `+` vs `↻`) end up on different
-/// baselines. `painter.text` with `CENTER_CENTER` centers the galley in the
-/// rect, giving real grid alignment.
+/// Footprint every leading row marker claims, whichever glyph it ends up
+/// drawing. Markers vary wildly in intrinsic width (`·` vs `✳`), so sizing the
+/// slot to the glyph would start each row's label at a different x.
+fn row_status_icon_size(theme: &Theme) -> egui::Vec2 {
+    egui::vec2(10.0, 14.0) * theme.ui_scale
+}
+
 /// Painted (rather than `RichText("●")`) so its size is independent of font
 /// metrics — `RichText("●")` renders inconsistently across fallback fonts.
 fn attention_dot(ui: &mut egui::Ui, theme: &Theme) {
-    let s = theme.ui_scale;
-    let size = egui::vec2(10.0 * s, 14.0 * s);
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-    let radius = 3.0 * s;
+    let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
+    let radius = 3.0 * theme.ui_scale;
     ui.painter().circle_filled(rect.center(), radius, theme.attention);
 }
 
@@ -2424,7 +2416,16 @@ fn paint_row_status_icon(
             (default_glyph.to_string(), if is_active { theme.accent } else { theme.text_muted })
         },
     };
-    ui.label(RichText::new(glyph).color(color).size(10.0 * s));
+    // Centered into the fixed slot, like `icon_button`: laying the glyph out as
+    // text would size the slot to its advance width and shift the label with it.
+    let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        egui::FontId::proportional(10.0 * s),
+        color,
+    );
 }
 
 /// Gap between adjacent `icon_button`s. They already pad their own glyph, so
@@ -2432,6 +2433,11 @@ fn paint_row_status_icon(
 /// Deliberately unscaled: the padding it supplements grows with `ui_scale`.
 const ICON_CLUSTER_SPACING: f32 = 2.0;
 
+/// Frameless, fixed-footprint icon button. Painter-drawn rather than a
+/// `Button` because `Button` lays text out from the top-left of its rect, so
+/// glyphs of different intrinsic heights (e.g. `+` vs `↻`) end up on different
+/// baselines. `painter.text` with `CENTER_CENTER` centers the galley in the
+/// rect, giving real grid alignment.
 fn icon_button(ui: &mut egui::Ui, glyph: &str, color: Color32, theme: &Theme) -> egui::Response {
     let s = theme.ui_scale;
     let size = egui::vec2(16.0 * s, 16.0 * s);
@@ -2487,6 +2493,14 @@ fn drag_handle(ui: &mut egui::Ui, theme: &Theme) -> egui::Response {
     resp.on_hover_cursor(egui::CursorIcon::Grab)
 }
 
+/// Lay out a row whose `trailing` widgets pin to the right edge while `leading`
+/// fills the remaining width — so a `Label::truncate()` inside `leading` knows
+/// exactly how much space it has and ellipsizes cleanly when the panel is narrow.
+///
+/// The row is pre-sized to `interact_size.y` (mirroring `Ui::horizontal`'s own
+/// internals) so it doesn't claim the parent's full remaining height when nested
+/// in a vertical layout — without this, `Align::Center` would push the row's
+/// content to the middle of the column and leave a giant gap before the next row.
 fn row_with_trailing<L, T>(ui: &mut egui::Ui, leading: L, trailing: T) -> egui::Rect
 where
     L: FnOnce(&mut egui::Ui),
