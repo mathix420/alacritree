@@ -21,7 +21,7 @@ use crate::input::event_to_bytes;
 use crate::links::{self, Link};
 use crate::mouse;
 use crate::paste;
-use crate::session::{EventProxy, Session, TermSize};
+use crate::session::{EventProxy, Session, SessionKind, TermSize};
 
 pub fn show(
     ui: &mut Ui,
@@ -551,7 +551,13 @@ fn apply_scroll(
 ) {
     let mode = *session.term.lock().mode();
     let mouse_mode = mode.intersects(TermMode::MOUSE_MODE);
-    let alt_alt_scroll = mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL);
+    // ConPTY interprets a pager's alternate-screen switch itself and repaints
+    // onto the primary screen, so ALT_SCREEN never reaches this Term on
+    // Windows.  A diff pane runs `delta --paging=always` by construction —
+    // route its wheel to arrow keys as if the alt screen were visible.
+    let on_alt_screen = mode.contains(TermMode::ALT_SCREEN)
+        || (cfg!(windows) && matches!(session.kind, SessionKind::Diff { .. }));
+    let alt_alt_scroll = on_alt_screen && mode.contains(TermMode::ALTERNATE_SCROLL);
 
     // alacritty: the user's `scrolling.multiplier` only applies when *we* are
     // consuming the wheel — when the app is reading raw mouse events it gets
@@ -1192,6 +1198,88 @@ mod tests {
         let term = term_running(b"$ ");
 
         assert_ne!(cursor_shape(&term), CursorShape::Hidden);
+    }
+
+    /// Text of the topmost visible grid line, as the painter would render it.
+    #[cfg(windows)]
+    fn top_screen_line(session: &Session) -> String {
+        let term = session.term.lock();
+        let grid = term.grid();
+        (0..grid.columns())
+            .map(|col| {
+                let cell = &grid[Line(0)][Column(col)];
+                if cell.c == '\0' { ' ' } else { cell.c }
+            })
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    #[cfg(windows)]
+    fn wait_for_top_line(session: &Session, wanted: &str) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let top = top_screen_line(session);
+            if top.starts_with(wanted) {
+                return Ok(());
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(top);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// A wheel tick over the diff pane must page its pager.  ConPTY repaints
+    /// the pager's alternate screen onto the primary one, so gating the
+    /// arrow-key route on ALT_SCREEN alone sends the wheel into the pane's
+    /// (empty) scrollback instead — the pager never moves.  Drives a real
+    /// `less` under a real ConPTY through `apply_scroll`.
+    #[cfg(windows)]
+    #[test]
+    fn a_wheel_tick_scrolls_the_diff_panes_pager() {
+        use std::io::Write as _;
+
+        crate::harden_dll_search_path();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body.txt");
+        let mut file = std::fs::File::create(&path).unwrap();
+        for i in 1..=200 {
+            writeln!(file, "line {i} content").unwrap();
+        }
+        drop(file);
+
+        let mut session = match Session::spawn_command(
+            egui::Context::default(),
+            &Config::default(),
+            Some(dir.path().to_path_buf()),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            "less".to_string(),
+            vec![path.to_string_lossy().into_owned()],
+            "diff: body.txt".to_string(),
+            SessionKind::Diff { key: "probe".to_string() },
+        ) {
+            Ok(session) => session,
+            // No `less` on this machine (it ships with Git for Windows, which
+            // the diff pane's delta pipeline needs anyway) — nothing to test.
+            Err(e) => {
+                eprintln!("skipping: could not spawn less: {e}");
+                return;
+            },
+        };
+
+        wait_for_top_line(&session, "line 1 ")
+            .unwrap_or_else(|top| panic!("less never drew the file; top line: {top:?}"));
+
+        // One wheel notch down: a cell height of pixels.  The default
+        // `scrolling.multiplier` of 3 turns it into three pager lines.
+        let config = Config::default();
+        apply_scroll(&mut session, &config, 0.0, -16.0, 8.0, 16.0, Modifiers::default(), None);
+
+        wait_for_top_line(&session, "line 4 ").unwrap_or_else(|top| {
+            panic!("the wheel tick did not scroll the pager; top line: {top:?}")
+        });
     }
 
     /// egui-winit raises `Event::Paste` for every `command+V` press, Shift
