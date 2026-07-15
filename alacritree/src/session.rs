@@ -517,12 +517,15 @@ impl Session {
 
         let mut env = config.env.clone();
         if matches!(kind, SessionKind::Diff { .. }) {
-            // git hands its pager `LESS=FRX`; the `F` (quit-if-one-screen) makes
-            // delta's `less` exit the instant a diff fits the pane, so the tab is
-            // reaped before it can be read. Keep git's other defaults but drop
-            // `F` so the pager waits for `q` regardless of diff length. A `LESS`
-            // set by the user (via `[env]`) wins.
-            env.entry("LESS".to_string()).or_insert_with(|| "RX".to_string());
+            // git hands its pager `LESS=FRX`; both of those defaults hurt a diff
+            // tab. `F` (quit-if-one-screen) makes delta's `less` exit the instant
+            // a diff fits the pane, so the tab is reaped before it can be read.
+            // `X` (no-init) keeps `less` off the alternate screen, and without
+            // `ALT_SCREEN` the wheel loses its alternate-scroll arrow keys
+            // (`terminal_view::apply_scroll`) and falls back to a scrollback that
+            // `-X` repaints over instead of filling, leaving the pane unscrollable.
+            // A `LESS` set by the user (via `[env]`) wins.
+            env.entry("LESS".to_string()).or_insert_with(|| "R".to_string());
         }
 
         #[cfg(not(windows))]
@@ -814,6 +817,51 @@ mod tests {
         apply_term_event(event, &mut title, &mut exited, &mut outcome);
 
         assert_eq!(outcome.clipboard, vec![(Target::Clipboard, "hello".to_owned())]);
+    }
+
+    /// The wheel scrolls a diff pane only because its pager sits on the alternate
+    /// screen: `terminal_view::apply_scroll` emits arrow keys for `ALT_SCREEN |
+    /// ALTERNATE_SCROLL` and otherwise falls back to a scrollback the pager
+    /// repaints over rather than fills.  git hands its pager `LESS=FRX`, whose `X`
+    /// (`--no-init`) suppresses that screen, so a diff pane's `LESS` must not carry
+    /// it.  Drives a real pager through a real PTY and reads the negotiated mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_diff_panes_pager_runs_on_the_alternate_screen() {
+        use alacritty_terminal::term::TermMode;
+
+        let page =
+            std::env::temp_dir().join(format!("alacritree-pager-probe-{}.txt", std::process::id()));
+        // Longer than the pane, so the pager has a reason to stay up and page.
+        let lines: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&page, lines).unwrap();
+
+        let session = Session::spawn_command(
+            egui::Context::default(),
+            &Config::default(),
+            std::env::current_dir().ok(),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            "less".to_string(),
+            vec![page.to_string_lossy().into_owned()],
+            "probe".to_string(),
+            SessionKind::Diff { key: "probe".to_string() },
+        )
+        .unwrap();
+
+        let start = Instant::now();
+        while !session.term.lock().mode().contains(TermMode::ALT_SCREEN) {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the pager never entered the alternate screen, so the wheel has nothing to \
+                 scroll: check that a diff pane's LESS does not carry `X` (--no-init)"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Paired with ALT_SCREEN this is what `apply_scroll` keys off; it is on by
+        // default, so a pager resetting it would silently break the wheel too.
+        assert!(session.term.lock().mode().contains(TermMode::ALTERNATE_SCROLL));
     }
 
     /// A pane must not wait on the console host's startup handshake.
