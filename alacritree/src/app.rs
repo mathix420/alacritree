@@ -135,6 +135,10 @@ pub struct AlacritreeApp {
     show_left_sidebar: bool,
     show_right_sidebar: bool,
     focus: PaneFocus,
+    /// Runtime copies of `[ui.session_display]`.  The config is only the
+    /// startup default; toggles flip these and are never persisted.
+    session_rows_always: bool,
+    session_tabs_always: bool,
     sidebar_cursor: Option<SidebarRow>,
     /// Reveals the project rows' drag grips.  A transient mode, not persisted:
     /// reordering is a rare, deliberate act, and a grip on every row the rest
@@ -435,6 +439,8 @@ impl AlacritreeApp {
             show_left_sidebar: persisted.show_left_sidebar,
             show_right_sidebar: persisted.show_right_sidebar,
             focus: PaneFocus::Terminal,
+            session_rows_always: config.ui.session_display.sidebar_always,
+            session_tabs_always: config.ui.session_display.tabs_always,
             sidebar_cursor: None,
             reorder_mode: false,
             sidebar_auto_shown: false,
@@ -1717,10 +1723,11 @@ impl AlacritreeApp {
             ui.allocate_exact_size(egui::vec2(avail, strip_height + 2.0), egui::Sense::hover());
 
         let mut activate: Option<SessionId> = None;
-        // Session segments only when there is a choice to make, but the
-        // trailing + segment always renders alongside them once the strip
-        // itself renders (i.e. at least one session exists).
-        if indices.len() >= 2 {
+        // Session segments only when there is a choice to make (or the user
+        // forces them via session_display), but the trailing + segment always
+        // renders alongside them once the strip itself renders (i.e. at least
+        // one session exists).
+        if indices.len() >= 2 || self.session_tabs_always {
             let seg_avail = avail - plus_width - gap;
             let segment_width =
                 ((seg_avail - gap * (indices.len() as f32 - 1.0)) / indices.len() as f32).max(1.0);
@@ -3553,13 +3560,19 @@ struct SessionRowData {
     is_displayed: bool,
 }
 
-/// Spawn-ordered ids of the sessions in `ws`, or empty below the two-session
-/// list threshold — a single-session workspace row keeps its compact form,
-/// mirroring the tab strip. Pure over (workspace, id) pairs so the grouping
-/// rule is testable without spawning PTYs.
-fn sidebar_session_ids(pairs: &[(WorkspaceKey, SessionId)], ws: &WorkspaceKey) -> Vec<SessionId> {
+/// Spawn-ordered ids of the sessions in `ws`, or empty below the list
+/// threshold.  The threshold is normally two — a single-session workspace row
+/// keeps its compact form, mirroring the tab strip — and `always` lowers it
+/// to one.  Pure over (workspace, id) pairs so the grouping rule is testable
+/// without spawning PTYs.
+fn sidebar_session_ids(
+    pairs: &[(WorkspaceKey, SessionId)],
+    ws: &WorkspaceKey,
+    always: bool,
+) -> Vec<SessionId> {
     let ids: Vec<SessionId> = pairs.iter().filter(|(w, _)| w == ws).map(|(_, id)| *id).collect();
-    if ids.len() < 2 { Vec::new() } else { ids }
+    let threshold = if always { 1 } else { 2 };
+    if ids.len() < threshold { Vec::new() } else { ids }
 }
 
 /// Where the view goes after a session's removal.
@@ -3963,7 +3976,7 @@ impl AlacritreeApp {
         let mut listed = sidebar_nav::ListedSessions::new();
         for (ws, _) in &pairs {
             if !listed.contains_key(ws) {
-                let ids = sidebar_session_ids(&pairs, ws);
+                let ids = sidebar_session_ids(&pairs, ws, self.session_rows_always);
                 if !ids.is_empty() {
                     listed.insert(ws.clone(), ids);
                 }
@@ -3973,11 +3986,11 @@ impl AlacritreeApp {
     }
 
     /// Session rows for `ws`'s sidebar list, per `sidebar_session_ids`'s
-    /// two-session threshold.
+    /// list threshold.
     fn workspace_session_rows(&self, ws: &WorkspaceKey) -> Vec<SessionRowData> {
         let pairs: Vec<(WorkspaceKey, SessionId)> =
             self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect();
-        let ids = sidebar_session_ids(&pairs, ws);
+        let ids = sidebar_session_ids(&pairs, ws, self.session_rows_always);
         let active = self.active_session.get(ws).copied();
         let is_current = self.current_workspace == *ws;
         ids.iter()
@@ -5242,16 +5255,16 @@ mod tests {
     #[test]
     fn session_ids_filter_by_workspace_and_keep_spawn_order() {
         let pairs = vec![(None, 1), (ws("/a"), 2), (None, 3), (ws("/b"), 4), (ws("/a"), 5)];
-        assert_eq!(sidebar_session_ids(&pairs, &None), vec![1, 3]);
-        assert_eq!(sidebar_session_ids(&pairs, &ws("/a")), vec![2, 5]);
+        assert_eq!(sidebar_session_ids(&pairs, &None, false), vec![1, 3]);
+        assert_eq!(sidebar_session_ids(&pairs, &ws("/a"), false), vec![2, 5]);
         // /b has a single session, below the two-session list threshold.
-        assert!(sidebar_session_ids(&pairs, &ws("/b")).is_empty());
+        assert!(sidebar_session_ids(&pairs, &ws("/b"), false).is_empty());
     }
 
     #[test]
     fn session_ids_empty_for_unknown_workspace() {
         let pairs = vec![(None, 1)];
-        assert!(sidebar_session_ids(&pairs, &ws("/missing")).is_empty());
+        assert!(sidebar_session_ids(&pairs, &ws("/missing"), false).is_empty());
     }
 
     #[test]
@@ -5268,13 +5281,23 @@ mod tests {
     #[test]
     fn session_ids_apply_two_session_threshold() {
         let no_match: Vec<(WorkspaceKey, SessionId)> = vec![(ws("/other"), 1)];
-        assert!(sidebar_session_ids(&no_match, &ws("/a")).is_empty());
+        assert!(sidebar_session_ids(&no_match, &ws("/a"), false).is_empty());
 
         let one_match = vec![(ws("/a"), 1), (ws("/other"), 2)];
-        assert!(sidebar_session_ids(&one_match, &ws("/a")).is_empty());
+        assert!(sidebar_session_ids(&one_match, &ws("/a"), false).is_empty());
 
         let two_match = vec![(ws("/a"), 1), (ws("/other"), 2), (ws("/a"), 3)];
-        assert_eq!(sidebar_session_ids(&two_match, &ws("/a")), vec![1, 3]);
+        assert_eq!(sidebar_session_ids(&two_match, &ws("/a"), false), vec![1, 3]);
+    }
+
+    #[test]
+    fn session_ids_always_flag_lists_single_sessions() {
+        let one_match = vec![(ws("/a"), 1), (ws("/other"), 2)];
+        assert_eq!(sidebar_session_ids(&one_match, &ws("/a"), true), vec![1]);
+
+        // Zero sessions stays empty even with the flag on.
+        let no_match: Vec<(WorkspaceKey, SessionId)> = vec![(ws("/other"), 2)];
+        assert!(sidebar_session_ids(&no_match, &ws("/a"), true).is_empty());
     }
 
     use crate::projects::{Project, Worktree};
