@@ -836,9 +836,17 @@ mod tests {
         let lines: String = (0..500).map(|i| format!("line {i}\n")).collect();
         std::fs::write(&page, lines).unwrap();
 
+        // The app exports a capable TERM before any session can spawn
+        // (`tty::setup_env` in `AlacritreeApp::new`), but this test spawns
+        // without the app, so a bare runner's unset or `dumb` TERM would reach
+        // the pager and `less` would never leave the primary screen. Inject
+        // the fallback `setup_env` guarantees.
+        let mut config = Config::default();
+        config.env.insert("TERM".to_string(), "xterm-256color".to_string());
+
         let session = Session::spawn_command(
             egui::Context::default(),
-            &Config::default(),
+            &config,
             std::env::current_dir().ok(),
             TermSize::new(80, 24),
             (8.0, 16.0),
