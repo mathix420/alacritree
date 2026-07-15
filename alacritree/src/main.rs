@@ -18,6 +18,7 @@ mod ipc;
 mod links;
 mod mcp;
 mod mouse;
+mod panel_filter;
 mod paste;
 mod pr_status;
 mod projects;

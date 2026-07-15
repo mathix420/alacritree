@@ -39,6 +39,7 @@ notify-rust = "4"
 interprocess = { version = "2.4.2", default-features = false }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
+nucleo-matcher = "0.3"
 
 [dev-dependencies]
 # Throwaway repos and state files for worktree, prune, and persistence tests.
