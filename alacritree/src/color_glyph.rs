@@ -311,13 +311,21 @@ mod tests {
     }
 
     /// Build the real chain the app would install, with whichever colour emoji
-    /// fonts the machine actually has.  `None` when none are installed — the one
-    /// case these tests have nothing to say about.
+    /// fonts the machine actually has.  `None` when none carry emoji artwork the
+    /// renderer can rasterize — the one case these tests have nothing to say about.
     ///
-    /// Presence is decided by reading the faces' colour tables directly, never
-    /// by asking the renderer under test.  A guard that called `get` would skip
-    /// silently the moment the renderer broke, which is precisely when it needs
-    /// to fail.
+    /// Renderability is decided by reading the claiming face's colour tables
+    /// directly, never by asking the renderer under test: a guard that called
+    /// `get` would skip silently the moment the renderer broke, which is exactly
+    /// when it needs to fail.  But `COLOR_SOURCES` only rasterizes bitmap strikes
+    /// (CBDT/sbix) and COLR *version 0* layers; it has no COLRv1 paint-graph or
+    /// SVG path, so a face whose only artwork for the glyph is COLRv1 (what modern
+    /// Noto Color Emoji ships) or SVG produces nothing.  Counting those as
+    /// renderable is what wedged CI on runners that carry a COLRv1 emoji font.
+    ///
+    /// Only the first face that claims U+1F600 is inspected, because that is the
+    /// one face the renderer resolves the glyph to (see `claiming_index`); a
+    /// renderable face further down the chain would never be consulted.
     fn chain_with_color_fonts(ctx: &Context) -> Option<Vec<ChainFace>> {
         let font = FontConfig {
             fallback: [
@@ -333,22 +341,17 @@ mod tests {
         };
         let chain = crate::fonts::install_terminal_fonts(ctx, &font);
 
-        let has_color_table = chain.iter().any(|face| {
-            let Ok(data) = std::fs::read(&face.path) else {
-                return false;
-            };
-            let Ok(parsed) = ttf_parser::Face::parse(&data, face.face_index) else {
-                return false;
-            };
+        let renders_emoji = chain.iter().find_map(|face| {
+            let data = std::fs::read(&face.path).ok()?;
+            let parsed = ttf_parser::Face::parse(&data, face.face_index).ok()?;
+            let glyph = parsed.glyph_index('😀')?;
             let tables = parsed.tables();
-            let colored = tables.colr.is_some()
-                || tables.cbdt.is_some()
-                || tables.sbix.is_some()
-                || tables.svg.is_some();
-            colored && parsed.glyph_index('😀').is_some()
+            let bitmap = tables.cbdt.is_some() || tables.sbix.is_some();
+            let colr_v0 = tables.colr.is_some_and(|colr| colr.is_simple() && colr.contains(glyph));
+            Some(bitmap || colr_v0)
         });
 
-        has_color_table.then_some(chain)
+        renders_emoji.unwrap_or(false).then_some(chain)
     }
 
     /// The defect this module exists for: a face may not claim a codepoint it
