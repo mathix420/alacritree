@@ -2707,11 +2707,6 @@ fn focus_default(ctx: &Context, id: egui::Id) {
     }
 }
 
-/// Render a collapsed-when-empty git section.
-///
-/// Empty sections are skipped entirely — a placeholder glyph for "no files
-/// here" added visual noise without communicating anything the count badge
-/// didn't already say.
 /// Section header count: `visible of total` while a filter narrows the panel,
 /// the plain total otherwise.
 fn section_count_label(count: &SectionCount, filtering: bool) -> String {
@@ -2722,6 +2717,11 @@ fn section_count_label(count: &SectionCount, filtering: bool) -> String {
     }
 }
 
+/// Render a collapsed-when-empty git section.
+///
+/// Empty sections are skipped entirely — a placeholder glyph for "no files
+/// here" added visual noise without communicating anything the count badge
+/// didn't already say.
 fn section<R>(
     ui: &mut egui::Ui,
     theme: &Theme,
