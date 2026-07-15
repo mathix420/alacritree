@@ -1726,26 +1726,41 @@ impl AlacritreeApp {
                         .truncate(),
                     );
                     if let Some(branch) = &status.branch {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("on").color(theme.text_muted).small());
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(branch).color(theme.accent).small().strong(),
-                                )
-                                .truncate(),
-                            );
-                            if let Some(default) = &status.default_branch {
-                                if Some(branch) != Some(default) {
-                                    ui.label(RichText::new("vs").color(theme.text_muted).small());
+                        // A greedy `truncate()` label in a plain `horizontal` row
+                        // consumes all the width, shoving any trailing widgets past
+                        // the panel edge. Since the right sidebar's `ScrollArea`
+                        // grows to fit its content, that overflow ratchets the whole
+                        // panel wider every frame until the full branch name fits.
+                        // Pin `vs <default>` to the right and let the current branch
+                        // truncate in the space that's left, so the row can't overflow.
+                        let default = status
+                            .default_branch
+                            .as_deref()
+                            .filter(|default| *default != branch.as_str());
+                        row_with_trailing(
+                            ui,
+                            |ui| {
+                                ui.label(RichText::new("on").color(theme.text_muted).small());
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(branch).color(theme.accent).small().strong(),
+                                    )
+                                    .truncate(),
+                                );
+                            },
+                            |ui| {
+                                if let Some(default) = default {
+                                    // right_to_left: default sits rightmost, `vs` to its left.
                                     ui.add(
                                         egui::Label::new(
                                             RichText::new(default).color(theme.text_dim).small(),
                                         )
                                         .truncate(),
                                     );
+                                    ui.label(RichText::new("vs").color(theme.text_muted).small());
                                 }
-                            }
-                        });
+                            },
+                        );
                     }
                     ui.add_space(10.0);
 
