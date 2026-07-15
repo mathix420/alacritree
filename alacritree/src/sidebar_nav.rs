@@ -276,6 +276,24 @@ mod tests {
     }
 
     #[test]
+    fn filtered_rows_drops_projects_matching_neither_self_nor_worktrees() {
+        let projects = vec![project("/a", true, &["/a/wt1"]), project("/b", true, &["/b/wt1"])];
+        let preds = RowPredicates {
+            home: true,
+            project_self: &|p| p.root == PathBuf::from("/a"),
+            worktree: &mut |p, _wt| p.root == PathBuf::from("/a"),
+        };
+        assert_eq!(
+            filtered_rows(&projects, preds),
+            vec![
+                SidebarRow::Home,
+                SidebarRow::Project(PathBuf::from("/a")),
+                SidebarRow::Worktree(PathBuf::from("/a/wt1")),
+            ]
+        );
+    }
+
+    #[test]
     fn ensure_cursor_keeps_a_visible_row_and_falls_back_to_first() {
         let rows = vec![SidebarRow::Home, SidebarRow::Project(PathBuf::from("/a"))];
         // Still visible: unchanged.
