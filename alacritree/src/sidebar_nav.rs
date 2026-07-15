@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::projects::Project;
+use crate::projects::{Project, Worktree};
 
 /// A row the sidebar cursor can rest on, in render order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +70,46 @@ pub fn seed(projects: &[Project], current_workspace: Option<&Path>) -> SidebarRo
         }
     }
     SidebarRow::Home
+}
+
+/// The three predicates that decide whether a row survives an active filter.
+/// `worktree` is `FnMut` because the fuzzy matcher it wraps needs `&mut self`.
+pub struct RowPredicates<'a> {
+    pub home: bool,
+    pub project_self: &'a dyn Fn(&Project) -> bool,
+    pub worktree: &'a mut dyn FnMut(&Project, &Worktree) -> bool,
+}
+
+/// Render-order rows under an active filter. Projects are force-expanded (a
+/// filter that hides its own results is useless); a header survives when it
+/// matches itself or keeps at least one visible worktree.
+pub fn filtered_rows(projects: &[Project], preds: RowPredicates<'_>) -> Vec<SidebarRow> {
+    let mut rows = Vec::new();
+    if preds.home {
+        rows.push(SidebarRow::Home);
+    }
+    for p in projects {
+        let self_matches = (preds.project_self)(p);
+        let visible_worktrees: Vec<SidebarRow> = p
+            .worktrees
+            .iter()
+            .filter(|wt| (preds.worktree)(p, wt))
+            .map(|wt| SidebarRow::Worktree(wt.path.clone()))
+            .collect();
+        if self_matches || !visible_worktrees.is_empty() {
+            rows.push(SidebarRow::Project(p.root.clone()));
+            rows.extend(visible_worktrees);
+        }
+    }
+    rows
+}
+
+/// Cursor fallback: unchanged when still visible, else the first row.
+pub fn ensure_cursor(rows: &[SidebarRow], cursor: Option<&SidebarRow>) -> Option<SidebarRow> {
+    match cursor {
+        Some(c) if rows.contains(c) => Some(c.clone()),
+        _ => rows.first().cloned(),
+    }
 }
 
 #[cfg(test)]
@@ -184,5 +224,71 @@ mod tests {
         // Home workspace and unknown paths both land on Home.
         assert_eq!(seed(&projects, None), SidebarRow::Home);
         assert_eq!(seed(&projects, Some(Path::new("/nowhere"))), SidebarRow::Home);
+    }
+
+    #[test]
+    fn filtered_rows_keeps_projects_with_matching_worktrees_and_forces_expansion() {
+        let projects = vec![project("/a", false, &["/a/wt1", "/a/wt2"])];
+        let preds = RowPredicates {
+            home: true,
+            project_self: &|_p| false,
+            worktree: &mut |_p, wt| wt.path == PathBuf::from("/a/wt1"),
+        };
+        assert_eq!(
+            filtered_rows(&projects, preds),
+            vec![
+                SidebarRow::Home,
+                SidebarRow::Project(PathBuf::from("/a")),
+                SidebarRow::Worktree(PathBuf::from("/a/wt1")),
+            ]
+        );
+    }
+
+    #[test]
+    fn filtered_rows_keeps_a_self_matching_header_without_its_worktrees() {
+        let projects = vec![project("/a", true, &["/a/wt1"])];
+        let preds = RowPredicates {
+            home: true,
+            project_self: &|p| p.root == PathBuf::from("/a"),
+            worktree: &mut |_p, _wt| false,
+        };
+        assert_eq!(
+            filtered_rows(&projects, preds),
+            vec![SidebarRow::Home, SidebarRow::Project(PathBuf::from("/a"))]
+        );
+    }
+
+    #[test]
+    fn filtered_rows_drops_home_when_it_fails_the_predicate() {
+        let projects = vec![project("/a", true, &["/a/wt1"])];
+        let preds = RowPredicates {
+            home: false,
+            project_self: &|p| p.root == PathBuf::from("/a"),
+            worktree: &mut |_p, _wt| true,
+        };
+        assert_eq!(
+            filtered_rows(&projects, preds),
+            vec![
+                SidebarRow::Project(PathBuf::from("/a")),
+                SidebarRow::Worktree(PathBuf::from("/a/wt1"))
+            ]
+        );
+    }
+
+    #[test]
+    fn ensure_cursor_keeps_a_visible_row_and_falls_back_to_first() {
+        let rows = vec![SidebarRow::Home, SidebarRow::Project(PathBuf::from("/a"))];
+        // Still visible: unchanged.
+        assert_eq!(
+            ensure_cursor(&rows, Some(&SidebarRow::Project(PathBuf::from("/a")))),
+            Some(SidebarRow::Project(PathBuf::from("/a")))
+        );
+        // Vanished cursor and no cursor both fall back to the first row.
+        let gone = SidebarRow::Worktree(PathBuf::from("/gone"));
+        assert_eq!(ensure_cursor(&rows, Some(&gone)), Some(SidebarRow::Home));
+        assert_eq!(ensure_cursor(&rows, None), Some(SidebarRow::Home));
+        // Empty rows always fall back to None.
+        assert_eq!(ensure_cursor(&[], Some(&SidebarRow::Home)), None);
+        assert_eq!(ensure_cursor(&[], None), None);
     }
 }
