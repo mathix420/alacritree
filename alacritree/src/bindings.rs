@@ -60,6 +60,10 @@ pub enum NamedAction {
     FocusProjectsSidebar,
     FocusGitSidebar,
     FocusTerminal,
+    /// Flip the runtime `session_display.sidebar_always` value.
+    ToggleSessionRows,
+    /// Flip the runtime `session_display.tabs_always` value.
+    ToggleSessionTabs,
     /// 1-indexed into the `[[ui.profiles]]` order.
     SpawnProfile(u8),
     Quit,
@@ -142,6 +146,8 @@ impl NamedAction {
             Self::SpawnProfile(n) => format!("Open a session with shell profile {n}"),
             Self::Quit => "Open the quit confirmation dialog".into(),
             Self::ShowShortcuts => "Show this shortcuts window".into(),
+            Self::ToggleSessionRows => "Toggle single-session sidebar rows".into(),
+            Self::ToggleSessionTabs => "Toggle single-session tab segments".into(),
             Self::NoOp | Self::ReceiveChar => String::new(),
         }
     }
@@ -616,6 +622,8 @@ fn parse_action(name: &str) -> BindingAction {
         "FocusProjectsSidebar" => BindingAction::Named(FocusProjectsSidebar),
         "FocusGitSidebar" => BindingAction::Named(FocusGitSidebar),
         "FocusTerminal" => BindingAction::Named(FocusTerminal),
+        "ToggleSessionRows" => BindingAction::Named(ToggleSessionRows),
+        "ToggleSessionTabs" => BindingAction::Named(ToggleSessionTabs),
         "SpawnProfile1" => BindingAction::Named(SpawnProfile(1)),
         "SpawnProfile2" => BindingAction::Named(SpawnProfile(2)),
         "SpawnProfile3" => BindingAction::Named(SpawnProfile(3)),
@@ -821,6 +829,8 @@ mod tests {
             ("FocusProjectsSidebar", NamedAction::FocusProjectsSidebar),
             ("FocusTerminal", NamedAction::FocusTerminal),
             ("FocusGitSidebar", NamedAction::FocusGitSidebar),
+            ("ToggleSessionRows", NamedAction::ToggleSessionRows),
+            ("ToggleSessionTabs", NamedAction::ToggleSessionTabs),
         ] {
             let b = parse_bindings(vec![raw_action("F1", None, name)]);
             assert_eq!(named_matches(&b, Key::F1, Modifiers::NONE), vec![expected], "{name}");

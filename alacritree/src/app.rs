@@ -1594,6 +1594,12 @@ impl AlacritreeApp {
                 }
                 self.persist_sidebars();
             },
+            BindingAction::Named(NamedAction::ToggleSessionRows) => {
+                self.session_rows_always = !self.session_rows_always;
+            },
+            BindingAction::Named(NamedAction::ToggleSessionTabs) => {
+                self.session_tabs_always = !self.session_tabs_always;
+            },
             BindingAction::Named(NamedAction::SelectNextWorkspace) => {
                 self.cycle_workspaces(ctx, 1);
             },
