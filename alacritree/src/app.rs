@@ -14,6 +14,7 @@ use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::config::Config;
 use crate::doppler;
+use crate::git_nav::{self, GitSection};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, StatusCache};
 use crate::ipc;
 use crate::paste;
@@ -125,6 +126,7 @@ fn blend_toward(c: Color32, target: Color32, amount: f32) -> Color32 {
 enum PaneFocus {
     Terminal,
     ProjectsSidebar,
+    GitSidebar,
 }
 
 pub struct AlacritreeApp {
@@ -141,6 +143,19 @@ pub struct AlacritreeApp {
     sidebar_auto_shown: bool,
     /// One-shot: scroll the cursor row into view on the next sidebar paint.
     sidebar_cursor_moved: bool,
+    /// Git-panel cursor, identified by `(section, path)`.  Rebuilt every render
+    /// pass from `git_rows`, so it survives the 1.5 s status refresh.
+    git_cursor: Option<git_nav::GitRow>,
+    /// One-shot: scroll the git cursor row into view on the next paint.
+    git_cursor_moved: bool,
+    /// Render-order git rows the cursor steps over, refreshed by the render pass.
+    git_rows: Vec<git_nav::GitRow>,
+    /// Resolved default-branch ref backing the git panel's branch-diff rows,
+    /// refreshed by the render pass so Enter opens the same diff a click would.
+    git_branch_base: Option<String>,
+    /// The focus toggle opened a hidden git sidebar; returning focus closes it
+    /// again so a keyboard round trip leaves the layout untouched.
+    git_sidebar_auto_shown: bool,
     sessions: Vec<Session>,
     current_workspace: WorkspaceKey,
     active_session: HashMap<WorkspaceKey, SessionId>,
@@ -276,6 +291,24 @@ fn diff_key(req: &DiffRequest) -> String {
     format!("{tag}:{}", req.file)
 }
 
+/// The diff a git-panel cursor row would open, mirroring the render pass's
+/// per-section click mapping.  `None` for a branch-diff row with no resolved
+/// base, matching the render pass's unclickable base-less rows.
+fn git_row_diff_request(row: &git_nav::GitRow, base: Option<&str>) -> Option<DiffRequest> {
+    let source = match row.section {
+        GitSection::Staged => DiffSource::Staged,
+        GitSection::Unstaged => {
+            if row.kind == Some(ChangeKind::Untracked) {
+                DiffSource::Untracked
+            } else {
+                DiffSource::Worktree
+            }
+        },
+        GitSection::Branch => DiffSource::Branch { base: base?.to_string() },
+    };
+    Some(DiffRequest { file: row.path.clone(), source })
+}
+
 impl AlacritreeApp {
     pub fn new(cc: &CreationContext<'_>, config: Config) -> Self {
         let theme = Theme::from_config(&config);
@@ -384,6 +417,11 @@ impl AlacritreeApp {
             reorder_mode: false,
             sidebar_auto_shown: false,
             sidebar_cursor_moved: false,
+            git_cursor: None,
+            git_cursor_moved: false,
+            git_rows: Vec::new(),
+            git_branch_base: None,
+            git_sidebar_auto_shown: false,
             sessions: Vec::new(),
             current_workspace: None,
             active_session: HashMap::new(),
@@ -438,7 +476,7 @@ impl AlacritreeApp {
         // sidebar (e.g. from Ctrl+Shift+B while it was hidden) should not
         // reappear on next launch.
         let left = self.show_left_sidebar && !self.sidebar_auto_shown;
-        let right = self.show_right_sidebar;
+        let right = self.show_right_sidebar && !self.git_sidebar_auto_shown;
         state::mutate(|s| {
             s.show_left_sidebar = left;
             s.show_right_sidebar = right;
@@ -858,11 +896,28 @@ impl AlacritreeApp {
         self.sidebar_cursor_moved = true;
     }
 
+    fn focus_git_sidebar(&mut self) {
+        if !self.show_right_sidebar {
+            self.show_right_sidebar = true;
+            self.git_sidebar_auto_shown = true;
+            self.persist_sidebars();
+        }
+        self.focus = PaneFocus::GitSidebar;
+        // Rows come from the render pass, so seeding waits for it — leave the
+        // cursor as-is and let the render pass repair it.
+        self.git_cursor_moved = true;
+    }
+
     fn focus_terminal(&mut self) {
         self.focus = PaneFocus::Terminal;
         if self.sidebar_auto_shown {
             self.show_left_sidebar = false;
             self.sidebar_auto_shown = false;
+            self.persist_sidebars();
+        }
+        if self.git_sidebar_auto_shown {
+            self.show_right_sidebar = false;
+            self.git_sidebar_auto_shown = false;
             self.persist_sidebars();
         }
     }
@@ -978,6 +1033,71 @@ impl AlacritreeApp {
         }
     }
 
+    /// Arrow/Enter/Escape navigation while the git sidebar owns keyboard
+    /// focus.  Same event-drain shape as `handle_sidebar_nav`: consumes only
+    /// unmodified nav keys, leaving modifier-bound shortcuts for
+    /// `handle_shortcuts`.
+    fn handle_git_sidebar_nav(&mut self, ctx: &Context) {
+        use egui::Key;
+        let keys: Vec<Key> = ctx.input_mut(|i| {
+            let mut pressed = Vec::new();
+            i.events.retain(|ev| {
+                if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
+                    if modifiers.is_none() && is_sidebar_nav_key(*key) {
+                        pressed.push(*key);
+                        return false;
+                    }
+                }
+                true
+            });
+            pressed
+        });
+        for key in keys {
+            self.apply_git_sidebar_nav(ctx, key);
+        }
+    }
+
+    fn apply_git_sidebar_nav(&mut self, ctx: &Context, key: egui::Key) {
+        use egui::Key;
+        let cursor = match self.git_cursor.clone() {
+            Some(c) if self.git_rows.contains(&c) => c,
+            // Stale or unseeded cursor (status refreshed the row out from under
+            // it): land on the first row and let the next press act from there.
+            _ => {
+                if let Some(first) = self.git_rows.first().cloned() {
+                    self.set_git_cursor(first);
+                }
+                return;
+            },
+        };
+        match key {
+            Key::ArrowUp => {
+                if let Some(row) = git_nav::step(&self.git_rows, &cursor, -1) {
+                    self.set_git_cursor(row);
+                }
+            },
+            Key::ArrowDown => {
+                if let Some(row) = git_nav::step(&self.git_rows, &cursor, 1) {
+                    self.set_git_cursor(row);
+                }
+            },
+            Key::Enter => {
+                if let Some(req) = git_row_diff_request(&cursor, self.git_branch_base.as_deref()) {
+                    self.open_diff(ctx, req);
+                }
+            },
+            Key::Escape => self.focus_terminal(),
+            _ => {},
+        }
+    }
+
+    fn set_git_cursor(&mut self, row: git_nav::GitRow) {
+        if self.git_cursor.as_ref() != Some(&row) {
+            self.git_cursor = Some(row);
+            self.git_cursor_moved = true;
+        }
+    }
+
     fn set_project_expanded(&mut self, root: &Path, expanded: bool) {
         if let Some(p) = self.projects.iter_mut().find(|p| p.root == *root) {
             if p.expanded != expanded {
@@ -1075,6 +1195,12 @@ impl AlacritreeApp {
             },
             BindingAction::Named(NamedAction::ToggleRightSidebar) => {
                 self.show_right_sidebar = !self.show_right_sidebar;
+                // A deliberate visibility change opts out of the auto-shown
+                // round trip, and a hidden sidebar cannot keep keyboard focus.
+                self.git_sidebar_auto_shown = false;
+                if !self.show_right_sidebar && self.focus == PaneFocus::GitSidebar {
+                    self.focus = PaneFocus::Terminal;
+                }
                 self.persist_sidebars();
             },
             BindingAction::Named(NamedAction::SelectNextWorkspace) => {
@@ -1087,10 +1213,20 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::ToggleSidebarFocus) => match self.focus {
                 PaneFocus::Terminal => self.focus_sidebar(),
                 PaneFocus::ProjectsSidebar => self.focus_terminal(),
+                // Toggle stays "left ↔ terminal"; from the right panel it hops
+                // to the left one rather than doing nothing.
+                PaneFocus::GitSidebar => self.focus_sidebar(),
             },
             BindingAction::Named(NamedAction::FocusProjectsSidebar) => {
                 if self.focus != PaneFocus::ProjectsSidebar {
                     self.focus_sidebar();
+                }
+            },
+            BindingAction::Named(NamedAction::FocusGitSidebar) => {
+                if self.focus != PaneFocus::GitSidebar {
+                    self.focus_git_sidebar()
+                } else {
+                    self.focus_terminal()
                 }
             },
             BindingAction::Named(NamedAction::FocusTerminal) => self.focus_terminal(),
@@ -1799,6 +1935,10 @@ impl AlacritreeApp {
                 let path = match self.active_session_path() {
                     Some(p) => p,
                     None => {
+                        // No workspace, no rows: keep the cursor model from
+                        // acting on stale rows left by a previous workspace.
+                        self.git_rows.clear();
+                        self.git_branch_base = None;
                         ScrollArea::vertical().show(ui, |ui| {
                             ui.label(
                                 RichText::new("Open a worktree from the left sidebar.")
@@ -1831,8 +1971,50 @@ impl AlacritreeApp {
                     pr_info.as_ref().map(|p| p.base_branch.clone()).or(project_default);
                 // Single non-blocking poll: returns the last known status and
                 // kicks off a background refresh if stale or if the hint
-                // changed since the last completed compute.
-                let status = cache.poll(effective_default.as_deref(), ctx);
+                // changed since the last completed compute.  Cloned so the
+                // `self.git_status` borrow ends before the cursor repair below
+                // mutates other `self` fields.
+                let status = cache.poll(effective_default.as_deref(), ctx).clone();
+
+                // Prefer the resolved ref (e.g. `refs/remotes/origin/main`) so
+                // the cursor's Enter-to-diff matches the branch section's rows.
+                let git_branch_base = status
+                    .default_branch_resolved
+                    .clone()
+                    .or_else(|| status.default_branch.clone());
+                self.git_rows = git_nav::visible_rows(
+                    &status.staged,
+                    &status.unstaged,
+                    &status.branch_diff,
+                    &|_| true,
+                    &mut |_| true,
+                )
+                .rows;
+                self.git_branch_base = git_branch_base.clone();
+                if self.focus == PaneFocus::GitSidebar {
+                    let mut repaired =
+                        git_nav::ensure_cursor(&self.git_rows, self.git_cursor.as_ref());
+                    // An unseeded cursor lands on the row backing the open diff
+                    // when there is one, so focusing the panel points at what
+                    // the user is already looking at.
+                    if self.git_cursor.is_none() {
+                        if let Some(active) = active_diff_key.as_deref() {
+                            if let Some(row) = self.git_rows.iter().find(|r| {
+                                git_row_diff_request(r, git_branch_base.as_deref())
+                                    .is_some_and(|req| diff_key(&req) == active)
+                            }) {
+                                repaired = Some(row.clone());
+                            }
+                        }
+                    }
+                    self.git_cursor = repaired;
+                }
+                let cursor_row = if self.focus == PaneFocus::GitSidebar {
+                    self.git_cursor.clone()
+                } else {
+                    None
+                };
+                let cursor_moved = std::mem::take(&mut self.git_cursor_moved);
 
                 ScrollArea::vertical().show(ui, |ui| {
                     if let Some(err) = &status.error {
@@ -1894,9 +2076,19 @@ impl AlacritreeApp {
                             let req =
                                 DiffRequest { file: f.path.clone(), source: DiffSource::Staged };
                             let is_active = active_diff_key.as_deref() == Some(&diff_key(&req));
-                            if file_row(ui, f, &theme, &palette, is_active).clicked() {
+                            let resp = file_row(ui, f, &theme, &palette, is_active);
+                            if resp.clicked() {
                                 diff_request.set(Some(req));
                             }
+                            paint_git_row_cursor(
+                                ui,
+                                &resp,
+                                &cursor_row,
+                                GitSection::Staged,
+                                &f.path,
+                                cursor_moved,
+                                &theme,
+                            );
                         }
                     });
 
@@ -1909,9 +2101,19 @@ impl AlacritreeApp {
                             };
                             let req = DiffRequest { file: f.path.clone(), source };
                             let is_active = active_diff_key.as_deref() == Some(&diff_key(&req));
-                            if file_row(ui, f, &theme, &palette, is_active).clicked() {
+                            let resp = file_row(ui, f, &theme, &palette, is_active);
+                            if resp.clicked() {
                                 diff_request.set(Some(req));
                             }
+                            paint_git_row_cursor(
+                                ui,
+                                &resp,
+                                &cursor_row,
+                                GitSection::Unstaged,
+                                &f.path,
+                                cursor_moved,
+                                &theme,
+                            );
                         }
                     });
 
@@ -1920,12 +2122,7 @@ impl AlacritreeApp {
                             Some(b) => format!("Changes vs {b}"),
                             None => "Changes vs default".to_string(),
                         };
-                        // Prefer the resolved ref (e.g. `refs/remotes/origin/main`) so the
-                        // sidebar's merge-base diff matches what delta will show.
-                        let base = status
-                            .default_branch_resolved
-                            .clone()
-                            .or_else(|| status.default_branch.clone());
+                        let base = git_branch_base.clone();
                         let count = status.branch_diff.len();
 
                         // Open-coded section header so the PR number can be a
@@ -1949,7 +2146,16 @@ impl AlacritreeApp {
                         ui.add_space(2.0);
                         for stat in &status.branch_diff {
                             let Some(base) = base.clone() else {
-                                branch_diff_row(ui, stat, &theme, &palette, false);
+                                let resp = branch_diff_row(ui, stat, &theme, &palette, false);
+                                paint_git_row_cursor(
+                                    ui,
+                                    &resp,
+                                    &cursor_row,
+                                    GitSection::Branch,
+                                    &stat.path,
+                                    cursor_moved,
+                                    &theme,
+                                );
                                 continue;
                             };
                             let req = DiffRequest {
@@ -1957,9 +2163,19 @@ impl AlacritreeApp {
                                 source: DiffSource::Branch { base },
                             };
                             let is_active = active_diff_key.as_deref() == Some(&diff_key(&req));
-                            if branch_diff_row(ui, stat, &theme, &palette, is_active).clicked() {
+                            let resp = branch_diff_row(ui, stat, &theme, &palette, is_active);
+                            if resp.clicked() {
                                 diff_request.set(Some(req));
                             }
+                            paint_git_row_cursor(
+                                ui,
+                                &resp,
+                                &cursor_row,
+                                GitSection::Branch,
+                                &stat.path,
+                                cursor_moved,
+                                &theme,
+                            );
                         }
                         ui.add_space(10.0);
                     }
@@ -2538,6 +2754,28 @@ fn paint_cursor_outline(ui: &egui::Ui, rect: egui::Rect, theme: &Theme) {
         egui::Stroke::new(1.0_f32, theme.accent),
         egui::StrokeKind::Inside,
     );
+}
+
+/// Outline the git row the keyboard cursor rests on, matched by section+path so
+/// it survives the status refresh.  Full-width rect from the panel plus the
+/// row's `y_range`, mirroring the project rows.
+fn paint_git_row_cursor(
+    ui: &egui::Ui,
+    resp: &egui::Response,
+    cursor: &Option<git_nav::GitRow>,
+    section: GitSection,
+    path: &str,
+    scroll_into_view: bool,
+    theme: &Theme,
+) {
+    if !matches!(cursor, Some(c) if c.section == section && c.path == path) {
+        return;
+    }
+    let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), resp.rect.y_range());
+    paint_cursor_outline(ui, rect, theme);
+    if scroll_into_view {
+        ui.scroll_to_rect(rect, None);
+    }
 }
 
 fn is_sidebar_nav_key(key: egui::Key) -> bool {
@@ -3943,8 +4181,10 @@ impl eframe::App for AlacritreeApp {
         // not the app — alacritty's key_input returns early the same way,
         // above binding dispatch.
         if !modal_open && self.ime.preedit().is_none() {
-            if self.focus == PaneFocus::ProjectsSidebar {
-                self.handle_sidebar_nav(ctx);
+            match self.focus {
+                PaneFocus::ProjectsSidebar => self.handle_sidebar_nav(ctx),
+                PaneFocus::GitSidebar => self.handle_git_sidebar_nav(ctx),
+                PaneFocus::Terminal => {},
             }
             self.handle_shortcuts(ctx);
         }
