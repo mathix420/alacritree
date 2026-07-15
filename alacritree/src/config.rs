@@ -279,6 +279,16 @@ fn parse_last_session_close(raw: Option<&str>) -> LastSessionClose {
     }
 }
 
+/// Whether per-session UI (sidebar session rows, tab-strip segments) renders
+/// for a single-session workspace instead of waiting for the two-session
+/// threshold.  These are startup defaults only: the app copies them into
+/// runtime state that key bindings can toggle, and nothing is persisted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionDisplay {
+    pub sidebar_always: bool,
+    pub tabs_always: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct UiTheme {
     pub sidebar_background: Option<Color32>,
@@ -291,6 +301,8 @@ pub struct UiTheme {
     pub confirm_session_close: ConfirmSessionClose,
     /// What closing the last session in the on-screen workspace does.
     pub last_session_close: LastSessionClose,
+    /// Show single-session sidebar rows / tab segments ([`SessionDisplay`]).
+    pub session_display: SessionDisplay,
     pub icons: UiIcons,
 }
 
@@ -304,6 +316,7 @@ impl Default for UiTheme {
             notifications: true,
             confirm_session_close: ConfirmSessionClose::Never,
             last_session_close: LastSessionClose::Respawn,
+            session_display: SessionDisplay::default(),
             icons: UiIcons::default(),
         }
     }
@@ -847,6 +860,15 @@ struct RawUiWsl {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
+struct RawSessionDisplay {
+    /// Show a workspace's sidebar session row even with a single session.
+    sidebar_always: Option<bool>,
+    /// Draw a tab-strip segment even with a single session.
+    tabs_always: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 struct RawUi {
     sidebar_background: Option<RgbStr>,
     sidebar_foreground: Option<RgbStr>,
@@ -859,6 +881,7 @@ struct RawUi {
     /// What closing the on-screen workspace's last session does:
     /// "respawn" (default) | "navigate".
     last_session_close: Option<String>,
+    session_display: RawSessionDisplay,
     delta_path: Option<String>,
     icons: RawUiIcons,
     wsl: RawUiWsl,
@@ -990,6 +1013,10 @@ impl RawConfig {
                 self.ui.confirm_session_close.as_deref(),
             ),
             last_session_close: parse_last_session_close(self.ui.last_session_close.as_deref()),
+            session_display: SessionDisplay {
+                sidebar_always: self.ui.session_display.sidebar_always.unwrap_or(false),
+                tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
+            },
             icons: UiIcons {
                 search: self.ui.icons.search.unwrap_or_else(|| DEFAULT_SEARCH_ICON.into()),
             },
@@ -1469,5 +1496,39 @@ program = "second"
         let config = raw.into_config();
         assert!(config.profiles.is_empty());
         assert_eq!(config.default_profile, None);
+    }
+
+    #[test]
+    fn session_display_defaults_to_hidden() {
+        let ui = ui_from_toml("");
+        assert!(!ui.session_display.sidebar_always);
+        assert!(!ui.session_display.tabs_always);
+    }
+
+    #[test]
+    fn session_display_parses_both_flags() {
+        let ui = ui_from_toml("[ui.session_display]\nsidebar_always = true\ntabs_always = true");
+        assert!(ui.session_display.sidebar_always);
+        assert!(ui.session_display.tabs_always);
+    }
+
+    #[test]
+    fn session_display_partial_table_leaves_the_other_flag_off() {
+        let ui = ui_from_toml("[ui.session_display]\nsidebar_always = true");
+        assert!(ui.session_display.sidebar_always);
+        assert!(!ui.session_display.tabs_always);
+    }
+
+    /// alacritree.toml merges over alacritty.toml key-by-key, so setting one
+    /// flag per file must yield both.
+    #[test]
+    fn session_display_merges_key_by_key() {
+        let base: toml::Value =
+            toml::from_str("[ui.session_display]\nsidebar_always = true").unwrap();
+        let over: toml::Value = toml::from_str("[ui.session_display]\ntabs_always = true").unwrap();
+        let raw: RawConfig = merge(base, over).try_into().unwrap();
+        let sd = raw.into_config().ui.session_display;
+        assert!(sd.sidebar_always);
+        assert!(sd.tabs_always);
     }
 }
