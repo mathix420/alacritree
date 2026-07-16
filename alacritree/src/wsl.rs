@@ -324,6 +324,31 @@ pub fn run_batch(distro: &str, script: &str, args: &[&str]) -> Result<Vec<u8>, S
     Ok(output.stdout)
 }
 
+/// Resolve `delta`'s absolute path inside `distro`, as the user's login shell
+/// sees it.  `wsl.exe --exec sh` only inherits the default system PATH, which
+/// omits per-user install dirs like `~/.cargo/bin`; sourcing the login shell
+/// (`getent passwd` → the user's shell, run with `-lc`) picks up the profile
+/// that puts delta on PATH.  One wsl.exe round trip — call off the UI thread.
+/// Returns `None` when delta isn't found; callers must not cache that, so an
+/// install mid-session is picked up on the next attempt.
+pub fn discover_delta(distro: &str) -> Option<String> {
+    let script = r#"s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=${SHELL:-/bin/sh}; exec "$s" -lc 'command -v delta'"#;
+    let output = command(distro, None)
+        .arg("sh")
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() { None } else { Some(path) }
+}
+
 /// Split batched stdout on `SECTION_SEP`.  Always returns at least one
 /// section; a script with N separators yields N+1.
 pub fn split_sections(stdout: &[u8]) -> Vec<&[u8]> {

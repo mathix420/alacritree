@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Mutex, OnceLock};
 
 use alacritty_terminal::tty::Shell;
@@ -182,6 +182,14 @@ pub struct AlacritreeApp {
     /// discovery shells out to wsl.exe and must never block paint; results
     /// are adopted in `poll_project_refreshes`.
     pending_project_refresh: HashMap<PathBuf, Receiver<Project>>,
+    /// Resolved absolute path of `delta` inside each WSL distro, so diff panes
+    /// stop re-sourcing a login profile on every open.  Successes only: a miss
+    /// is never stored, so installing delta mid-session is picked up later.
+    wsl_delta_paths: HashMap<String, String>,
+    /// In-flight delta discoveries, keyed by distro, mirroring
+    /// `pending_project_refresh` — resolved off the UI thread, adopted in
+    /// `wsl_delta_path`.
+    pending_delta: HashMap<String, Receiver<Option<String>>>,
 }
 
 struct DeleteRequest {
@@ -413,6 +421,8 @@ impl AlacritreeApp {
                 color_glyph_budget_mb,
             ),
             pending_project_refresh: HashMap::new(),
+            wsl_delta_paths: HashMap::new(),
+            pending_delta: HashMap::new(),
         };
 
         let wsl_indices: Vec<usize> = app
@@ -1998,9 +2008,18 @@ impl AlacritreeApp {
             return;
         }
 
+        let delta_override = self.config.delta_path.clone();
         let (program, args) = match wsl::classify(&workspace) {
-            wsl::Location::Wsl { distro, .. } => build_wsl_diff_command(&distro, &workspace, &req),
-            wsl::Location::Windows(_) => build_diff_command(&req),
+            wsl::Location::Wsl { distro, .. } => match delta_override {
+                Some(delta) => build_wsl_diff_command_direct(&distro, &workspace, &req, &delta),
+                None => match self.wsl_delta_path(&distro, ctx) {
+                    Some(delta) => build_wsl_diff_command_direct(&distro, &workspace, &req, &delta),
+                    None => build_wsl_diff_command_login(&distro, &workspace, &req),
+                },
+            },
+            wsl::Location::Windows(_) => {
+                build_diff_command(delta_override.as_deref().unwrap_or("delta"), &req)
+            },
         };
         let title = format!("diff: {}", req.file);
         match Session::spawn_command(
@@ -2023,6 +2042,42 @@ impl AlacritreeApp {
                 self.last_error = Some(format!("failed to open diff: {e}"));
             },
         }
+    }
+
+    /// Cached absolute path of `delta` inside `distro`, if known.  Adopts a
+    /// finished background discovery, then spawns one when the path is neither
+    /// cached nor already in flight.  Returns `None` until the first discovery
+    /// lands — callers fall back to the login-shell command meanwhile.  A miss
+    /// is never cached, so the discovery re-runs and a mid-session install is
+    /// picked up on a later open.
+    fn wsl_delta_path(&mut self, distro: &str, ctx: &Context) -> Option<String> {
+        match self.pending_delta.get(distro).map(Receiver::try_recv) {
+            Some(Ok(Some(path))) => {
+                self.pending_delta.remove(distro);
+                self.wsl_delta_paths.insert(distro.to_string(), path);
+            },
+            Some(Ok(None)) | Some(Err(TryRecvError::Disconnected)) => {
+                self.pending_delta.remove(distro);
+            },
+            _ => {},
+        }
+
+        if let Some(path) = self.wsl_delta_paths.get(distro) {
+            return Some(path.clone());
+        }
+
+        if !self.pending_delta.contains_key(distro) {
+            let (tx, rx) = mpsc::channel();
+            let distro_owned = distro.to_string();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let found = wsl::discover_delta(&distro_owned);
+                let _ = tx.send(found);
+                ctx.request_repaint();
+            });
+            self.pending_delta.insert(distro.to_string(), rx);
+        }
+        None
     }
 
     /// Key of the diff currently displayed in this workspace, if any.  Used by
@@ -2061,33 +2116,36 @@ fn diff_args(req: &DiffRequest) -> Vec<String> {
     args
 }
 
-/// Show the clicked file's `git diff` in delta, wired in as git's pager so git
-/// drives the pipe itself.  This drops the POSIX-`sh` dependency the old
+/// Show the clicked file's `git diff` in `delta`, wired in as git's pager so
+/// git drives the pipe itself.  This drops the POSIX-`sh` dependency the old
 /// `sh -c '… | delta'` had — which had no equivalent on Windows, so diffs never
 /// opened there.  Paths/branches stay in argv, so no file name is shell-parsed.
-fn build_diff_command(req: &DiffRequest) -> (String, Vec<String>) {
-    let mut args = vec!["-c".to_string(), "core.pager=delta --paging=always".to_string()];
+/// `delta` is the resolved program (bare `delta` from PATH, or a user override).
+fn build_diff_command(delta: &str, req: &DiffRequest) -> (String, Vec<String>) {
+    let mut args = vec!["-c".to_string(), format!("core.pager={delta} --paging=always")];
     args.extend(diff_args(req));
     ("git".to_string(), args)
 }
 
-/// The same diff run inside the repo's distro.  `sh -l` sources the user's
-/// profile so `delta` resolves from their PATH (`--exec` alone only sees the
-/// default system PATH; a missing delta prints in the pane, same failure
-/// surface as Windows).  Diff arguments travel as positional parameters, so
-/// no file name is shell-parsed.
+/// The distro-side diff when `delta`'s absolute path is known (autodiscovered
+/// or a user override): a plain `sh` finds it without sourcing a login profile,
+/// so this avoids the per-open profile cost of the login fallback.
 ///
 /// The `LESS=R` the diff pane puts in the child's environment stays on the
 /// Windows side of the wsl.exe boundary (only `WSLENV`-listed variables
 /// cross), so git in the distro would hand its pager `LESS=FRX` and `F`
 /// (quit-if-one-screen) would reap short diffs on open.  The script exports
-/// `LESS` itself where git runs; one sourced by the profile wins, mirroring
-/// the `[env]` precedence on the Windows side.
-fn build_wsl_diff_command(
+/// `LESS` itself where git runs.  Diff arguments travel as positional
+/// parameters, so no file name is shell-parsed.
+fn build_wsl_diff_command_direct(
     distro: &str,
     workspace: &Path,
     req: &DiffRequest,
+    delta: &str,
 ) -> (String, Vec<String>) {
+    let script = format!(
+        r#"export LESS="${{LESS-R}}"; exec git -c "core.pager={delta} --paging=always" "$@""#
+    );
     let mut args = vec![
         "-d".to_string(),
         distro.to_string(),
@@ -2095,9 +2153,37 @@ fn build_wsl_diff_command(
         workspace.to_string_lossy().into_owned(),
         "--exec".to_string(),
         "sh".to_string(),
-        "-lc".to_string(),
-        r#"export LESS="${LESS-R}"; exec git -c "core.pager=delta --paging=always" "$@""#
-            .to_string(),
+        "-c".to_string(),
+        script,
+        "sh".to_string(),
+    ];
+    args.extend(diff_args(req));
+    ("wsl.exe".to_string(), args)
+}
+
+/// The distro-side diff before `delta`'s path is known: resolve the user's
+/// login shell (`getent passwd`) and re-exec through it so `delta` resolves
+/// from their real PATH — `--exec sh` alone only sees the default system PATH,
+/// which omits per-user install dirs like `~/.cargo/bin`.  The `LESS` export
+/// happens inside the login shell's script, after the profile is sourced, so
+/// a profile-set `LESS` wins — mirroring the `[env]` precedence on the
+/// Windows side.  Diff arguments travel as positional parameters through both
+/// shells, so no file name is shell-parsed.
+fn build_wsl_diff_command_login(
+    distro: &str,
+    workspace: &Path,
+    req: &DiffRequest,
+) -> (String, Vec<String>) {
+    let script = r#"s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=${SHELL:-/bin/sh}; exec "$s" -lc 'export LESS="${LESS-R}"; exec git -c "core.pager=delta --paging=always" "$@"' "$s" "$@""#;
+    let mut args = vec![
+        "-d".to_string(),
+        distro.to_string(),
+        "--cd".to_string(),
+        workspace.to_string_lossy().into_owned(),
+        "--exec".to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        script.to_string(),
         "sh".to_string(),
     ];
     args.extend(diff_args(req));
@@ -4224,11 +4310,28 @@ mod tests {
     }
 
     #[test]
-    fn wsl_diff_command_wraps_diff_args_in_login_shell() {
-        let (program, args) = build_wsl_diff_command(
+    fn diff_command_uses_given_delta_program() {
+        let (program, args) = build_diff_command("delta", &req("a.rs", DiffSource::Staged));
+        assert_eq!(program, "git");
+        assert_eq!(args[0], "-c");
+        assert_eq!(args[1], "core.pager=delta --paging=always");
+        assert_eq!(&args[2..], diff_args(&req("a.rs", DiffSource::Staged)).as_slice());
+    }
+
+    #[test]
+    fn diff_command_honors_delta_override_path() {
+        let (_, args) =
+            build_diff_command(r"C:\tools\delta.exe", &req("a.rs", DiffSource::Worktree));
+        assert_eq!(args[1], r"core.pager=C:\tools\delta.exe --paging=always");
+    }
+
+    #[test]
+    fn wsl_diff_direct_uses_resolved_delta_and_keeps_pager_open() {
+        let (program, args) = build_wsl_diff_command_direct(
             "kali-linux",
             Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj"),
             &req("a.rs", DiffSource::Staged),
+            "/home/lev/.cargo/bin/delta",
         );
         assert_eq!(program, "wsl.exe");
         assert_eq!(
@@ -4240,9 +4343,43 @@ mod tests {
                 r"\\wsl.localhost\kali-linux\home\lev\proj",
                 "--exec",
                 "sh",
-                "-lc",
-                r#"export LESS="${LESS-R}"; exec git -c "core.pager=delta --paging=always" "$@""#,
+                "-c",
+                r#"export LESS="${LESS-R}"; exec git -c "core.pager=/home/lev/.cargo/bin/delta --paging=always" "$@""#,
             ]
+        );
+        assert_eq!(args[8], "sh");
+        assert_eq!(&args[9..], diff_args(&req("a.rs", DiffSource::Staged)).as_slice());
+    }
+
+    #[test]
+    fn wsl_diff_login_resolves_shell_and_keeps_pager_open() {
+        let (program, args) = build_wsl_diff_command_login(
+            "kali-linux",
+            Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj"),
+            &req("a.rs", DiffSource::Staged),
+        );
+        assert_eq!(program, "wsl.exe");
+        assert_eq!(
+            args[..7],
+            [
+                "-d",
+                "kali-linux",
+                "--cd",
+                r"\\wsl.localhost\kali-linux\home\lev\proj",
+                "--exec",
+                "sh",
+                "-c"
+            ]
+        );
+        let script = &args[7];
+        assert!(script.contains("getent passwd"), "resolves login shell: {script}");
+        // The LESS export lives inside the login shell's script so a LESS
+        // sourced from the profile still wins.
+        assert!(
+            script.contains(
+                r#"-lc 'export LESS="${LESS-R}"; exec git -c "core.pager=delta --paging=always" "$@"'"#
+            ),
+            "keeps pager open after profile sourcing: {script}"
         );
         assert_eq!(args[8], "sh");
         assert_eq!(&args[9..], diff_args(&req("a.rs", DiffSource::Staged)).as_slice());
