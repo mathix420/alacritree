@@ -24,11 +24,22 @@ use crate::wsl;
 /// `gh` on every status refresh.
 const TTL: Duration = Duration::from_secs(300);
 
+/// GitHub's PR lifecycle, folded to what the sidebar paints.  `gh` reports
+/// draftness as a separate boolean, so OPEN splits into Open/Draft here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrState {
+    Open,
+    Draft,
+    Merged,
+    Closed,
+}
+
 #[derive(Debug, Clone)]
 pub struct PrInfo {
     pub number: u64,
     pub base_branch: String,
     pub url: String,
+    pub state: PrState,
 }
 
 #[derive(Default)]
@@ -116,6 +127,17 @@ fn spawn_lookup(
     rx
 }
 
+fn pr_state(state: &str, is_draft: bool) -> PrState {
+    match state {
+        "MERGED" => PrState::Merged,
+        "CLOSED" => PrState::Closed,
+        "OPEN" if is_draft => PrState::Draft,
+        // Unknown states paint as open rather than vanishing; gh's enum is
+        // stable, so this is a forward-compatibility hedge, not a real case.
+        _ => PrState::Open,
+    }
+}
+
 /// Ask `gh` for the PR associated with `branch` in `path`.  Returns `None`
 /// on any failure mode (no `gh`, not authenticated, no PR, non-GitHub
 /// remote, ...).  The branch is passed as a positional selector so the
@@ -138,7 +160,7 @@ fn query_gh(path: &Path, branch: &str) -> Option<PrInfo> {
         },
     };
     let output = cmd
-        .args(["pr", "view", branch, "--json", "number,baseRefName,url"])
+        .args(["pr", "view", branch, "--json", "number,baseRefName,url,state,isDraft"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .stdin(Stdio::null())
@@ -155,7 +177,9 @@ fn parse_gh_output(stdout: &[u8]) -> Option<PrInfo> {
     let number = value.get("number")?.as_u64()?;
     let base = value.get("baseRefName")?.as_str()?.to_string();
     let url = value.get("url")?.as_str()?.to_string();
-    Some(PrInfo { number, base_branch: base, url })
+    let state = value.get("state").and_then(|v| v.as_str()).unwrap_or("OPEN");
+    let is_draft = value.get("isDraft").and_then(|v| v.as_bool()).unwrap_or(false);
+    Some(PrInfo { number, base_branch: base, url, state: pr_state(state, is_draft) })
 }
 
 #[cfg(test)]
@@ -175,5 +199,30 @@ mod tests {
     #[test]
     fn rejects_empty_output() {
         assert!(parse_gh_output(b"").is_none());
+    }
+
+    #[test]
+    fn parses_pr_states() {
+        for (json_state, is_draft, expected) in [
+            ("OPEN", false, PrState::Open),
+            ("OPEN", true, PrState::Draft),
+            ("MERGED", false, PrState::Merged),
+            ("CLOSED", false, PrState::Closed),
+            ("SOMETHING_NEW", false, PrState::Open),
+        ] {
+            let stdout = format!(
+                r#"{{"baseRefName":"main","number":1,"url":"https://github.com/o/r/pull/1","state":"{json_state}","isDraft":{is_draft}}}"#
+            );
+            let info = parse_gh_output(stdout.as_bytes()).unwrap();
+            assert_eq!(info.state, expected, "state={json_state} draft={is_draft}");
+        }
+    }
+
+    #[test]
+    fn missing_state_fields_default_to_open() {
+        // Old gh versions may omit fields we didn't ask for; degrade, don't drop.
+        let stdout =
+            br#"{"baseRefName":"main","number":42,"url":"https://github.com/o/r/pull/42"}"#;
+        assert_eq!(parse_gh_output(stdout).unwrap().state, PrState::Open);
     }
 }
