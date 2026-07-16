@@ -3138,17 +3138,29 @@ enum SidebarNavStep {
 }
 
 /// Panel title plus its filter chrome, shared by both sidebars: the heading,
-/// then `[s]`-style chips for each active toggle, then a `/query▌` prompt while
-/// searching.  Renders only the title when the filter is idle.
+/// then `[s]`-style chips for each active toggle, then a bordered `🔍 query▌`
+/// input box while searching.  Renders only the title when the filter is idle.
 fn panel_header_filter_ui(ui: &mut egui::Ui, title: &str, filter: &PanelFilter, theme: &Theme) {
     ui.label(RichText::new(title).color(theme.text).strong());
     for key in filter.active_toggles() {
         ui.label(RichText::new(format!("[{key}]")).color(theme.accent).monospace().small());
     }
     if filter.mode() == panel_filter::Mode::Search || !filter.query().is_empty() {
-        ui.label(
-            RichText::new(format!("/{}▌", filter.query())).color(theme.text).monospace().small(),
-        );
+        let s = theme.ui_scale;
+        Frame::default()
+            .stroke(Stroke::new(1.0_f32, theme.text_muted))
+            .corner_radius((3.0 * s).round() as u8)
+            .inner_margin(Margin::symmetric((4.0 * s).round() as i8, (1.0 * s).round() as i8))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 3.0 * s;
+                ui.label(RichText::new("🔍").color(theme.text_dim).small());
+                ui.label(
+                    RichText::new(format!("{}▌", filter.query()))
+                        .color(theme.text)
+                        .monospace()
+                        .small(),
+                );
+            });
     }
 }
 
