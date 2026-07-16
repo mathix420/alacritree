@@ -170,6 +170,13 @@ impl StatusCache {
         self.last.branch.as_deref()
     }
 
+    /// The most recent known status without triggering a refresh, for callers
+    /// that need to re-derive rows between polls (e.g. re-filtering on a
+    /// keystroke).
+    pub fn last(&self) -> &GitStatus {
+        &self.last
+    }
+
     /// Returns the most recent known status, kicking off a background refresh
     /// when stale or when the default-branch hint changed since the last
     /// completed compute.  Never blocks the caller.

@@ -14,8 +14,10 @@ use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::config::Config;
 use crate::doppler;
-use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, StatusCache};
+use crate::git_nav::{self, GitSection, SectionCount};
+use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
 use crate::ipc;
+use crate::panel_filter::{self, PanelFilter};
 use crate::paste;
 use crate::pr_status::PrCache;
 use crate::projects::{Project, Worktree, project_json};
@@ -27,7 +29,7 @@ use crate::worktree::{self as wt, CreateRequest, Progress};
 use crate::wsl::{self, ShellChoice};
 
 /// `None` is the home workspace (sessions inherit `$PWD`); `Some` is a worktree path.
-type WorkspaceKey = Option<PathBuf>;
+pub type WorkspaceKey = Option<PathBuf>;
 
 /// Channel from notification-worker threads back to the app.  Set once by
 /// `AlacritreeApp::new`; each worker reads it to deliver the workspace the
@@ -125,6 +127,7 @@ fn blend_toward(c: Color32, target: Color32, amount: f32) -> Color32 {
 enum PaneFocus {
     Terminal,
     ProjectsSidebar,
+    GitSidebar,
 }
 
 pub struct AlacritreeApp {
@@ -141,6 +144,25 @@ pub struct AlacritreeApp {
     sidebar_auto_shown: bool,
     /// One-shot: scroll the cursor row into view on the next sidebar paint.
     sidebar_cursor_moved: bool,
+    /// Fuzzy-search query and `s`/`a` toggle state for the projects panel.
+    /// Transient: never persisted, never touches the `expanded` flag.
+    project_filter: PanelFilter,
+    /// Fuzzy-search query and `m`/`d`/`u` change-kind toggle state for the git
+    /// panel.  Transient: never persisted.
+    git_filter: PanelFilter,
+    /// Git-panel cursor, identified by `(section, path)`.  Rebuilt every render
+    /// pass from `git_rows`, so it survives the 1.5 s status refresh.
+    git_cursor: Option<git_nav::GitRow>,
+    /// One-shot: scroll the git cursor row into view on the next paint.
+    git_cursor_moved: bool,
+    /// Render-order git rows the cursor steps over, refreshed by the render pass.
+    git_rows: Vec<git_nav::GitRow>,
+    /// Resolved default-branch ref backing the git panel's branch-diff rows,
+    /// refreshed by the render pass so Enter opens the same diff a click would.
+    git_branch_base: Option<String>,
+    /// The focus toggle opened a hidden git sidebar; returning focus closes it
+    /// again so a keyboard round trip leaves the layout untouched.
+    git_sidebar_auto_shown: bool,
     sessions: Vec<Session>,
     current_workspace: WorkspaceKey,
     active_session: HashMap<WorkspaceKey, SessionId>,
@@ -284,6 +306,24 @@ fn diff_key(req: &DiffRequest) -> String {
     format!("{tag}:{}", req.file)
 }
 
+/// The diff a git-panel cursor row would open, mirroring the render pass's
+/// per-section click mapping.  `None` for a branch-diff row with no resolved
+/// base, matching the render pass's unclickable base-less rows.
+fn git_row_diff_request(row: &git_nav::GitRow, base: Option<&str>) -> Option<DiffRequest> {
+    let source = match row.section {
+        GitSection::Staged => DiffSource::Staged,
+        GitSection::Unstaged => {
+            if row.kind == Some(ChangeKind::Untracked) {
+                DiffSource::Untracked
+            } else {
+                DiffSource::Worktree
+            }
+        },
+        GitSection::Branch => DiffSource::Branch { base: base?.to_string() },
+    };
+    Some(DiffRequest { file: row.path.clone(), source })
+}
+
 impl AlacritreeApp {
     pub fn new(cc: &CreationContext<'_>, config: Config) -> Self {
         let theme = Theme::from_config(&config);
@@ -392,6 +432,13 @@ impl AlacritreeApp {
             reorder_mode: false,
             sidebar_auto_shown: false,
             sidebar_cursor_moved: false,
+            project_filter: PanelFilter::new(&['s', 'a']),
+            git_filter: PanelFilter::new(&['m', 'd', 'u']),
+            git_cursor: None,
+            git_cursor_moved: false,
+            git_rows: Vec::new(),
+            git_branch_base: None,
+            git_sidebar_auto_shown: false,
             sessions: Vec::new(),
             current_workspace: None,
             active_session: HashMap::new(),
@@ -448,7 +495,7 @@ impl AlacritreeApp {
         // sidebar (e.g. from Ctrl+Shift+B while it was hidden) should not
         // reappear on next launch.
         let left = self.show_left_sidebar && !self.sidebar_auto_shown;
-        let right = self.show_right_sidebar;
+        let right = self.show_right_sidebar && !self.git_sidebar_auto_shown;
         state::mutate(|s| {
             s.show_left_sidebar = left;
             s.show_right_sidebar = right;
@@ -863,9 +910,30 @@ impl AlacritreeApp {
             self.persist_sidebars();
         }
         self.focus = PaneFocus::ProjectsSidebar;
-        self.sidebar_cursor =
-            Some(sidebar_nav::seed(&self.projects, self.current_workspace.as_deref()));
+        self.sidebar_cursor = Some(sidebar_nav::seed(
+            &self.projects,
+            self.current_workspace.as_deref(),
+            &self.listed_session_ids(),
+            self.active_session.get(&self.current_workspace).copied(),
+        ));
+        // Seeding reads the unfiltered tree, so a lingering filter from a prior
+        // focus round-trip can leave the seeded row outside the current rows;
+        // repair it immediately rather than waiting for the first key press.
+        let rows = self.current_project_rows();
+        self.sidebar_cursor = sidebar_nav::ensure_cursor(&rows, self.sidebar_cursor.as_ref());
         self.sidebar_cursor_moved = true;
+    }
+
+    fn focus_git_sidebar(&mut self) {
+        if !self.show_right_sidebar {
+            self.show_right_sidebar = true;
+            self.git_sidebar_auto_shown = true;
+            self.persist_sidebars();
+        }
+        self.focus = PaneFocus::GitSidebar;
+        // Rows come from the render pass, so seeding waits for it — leave the
+        // cursor as-is and let the render pass repair it.
+        self.git_cursor_moved = true;
     }
 
     fn focus_terminal(&mut self) {
@@ -873,6 +941,11 @@ impl AlacritreeApp {
         if self.sidebar_auto_shown {
             self.show_left_sidebar = false;
             self.sidebar_auto_shown = false;
+            self.persist_sidebars();
+        }
+        if self.git_sidebar_auto_shown {
+            self.show_right_sidebar = false;
+            self.git_sidebar_auto_shown = false;
             self.persist_sidebars();
         }
     }
@@ -911,80 +984,404 @@ impl AlacritreeApp {
     /// keyboard focus.  Consumes only unmodified keys, so modifier-bound
     /// app shortcuts still match in `handle_shortcuts` afterwards.
     fn handle_sidebar_nav(&mut self, ctx: &Context) {
-        use egui::Key;
-        let keys: Vec<Key> = ctx.input_mut(|i| {
-            let mut pressed = Vec::new();
-            i.events.retain(|ev| {
-                if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
-                    if modifiers.is_none() && is_sidebar_nav_key(*key) {
-                        pressed.push(*key);
+        let filter = &mut self.project_filter;
+        let steps: Vec<SidebarNavStep> = ctx.input_mut(|i| {
+            let mut steps = Vec::new();
+            i.events.retain(|ev| match ev {
+                egui::Event::Text(text) => match filter.on_text(text) {
+                    Some(outcome) => {
+                        steps.push(SidebarNavStep::Filter(outcome));
+                        false
+                    },
+                    None => true,
+                },
+                egui::Event::Key { key, pressed: true, modifiers, .. } if modifiers.is_none() => {
+                    if let Some(outcome) = filter.on_key(*key) {
+                        steps.push(SidebarNavStep::Filter(outcome));
                         return false;
                     }
-                }
-                true
+                    if is_sidebar_nav_key(*key) {
+                        steps.push(SidebarNavStep::Nav(*key));
+                        return false;
+                    }
+                    true
+                },
+                _ => true,
             });
-            pressed
+            steps
         });
-        for key in keys {
-            self.apply_sidebar_nav(ctx, key);
+        for step in steps {
+            match step {
+                SidebarNavStep::Filter(outcome) => self.apply_filter_outcome(ctx, outcome),
+                SidebarNavStep::Nav(key) => self.apply_sidebar_nav(ctx, key),
+            }
         }
+    }
+
+    fn apply_filter_outcome(&mut self, ctx: &Context, outcome: panel_filter::Outcome) {
+        use panel_filter::Outcome;
+        match outcome {
+            Outcome::FilterChanged => self.after_filter_changed(),
+            Outcome::Consumed => {},
+            Outcome::MoveCursor(delta) => self.move_sidebar_cursor(delta),
+            // Enter clears the query before yielding Activate, so the filtered
+            // row set is already gone; activate the cursor the preceding
+            // MoveCursor/FilterChanged handling maintained against it, rather
+            // than re-deriving rows and rejecting a now-hidden worktree.
+            Outcome::Activate => {
+                if let Some(cursor) = self.sidebar_cursor.clone() {
+                    self.activate_sidebar_row(ctx, &cursor);
+                }
+            },
+            Outcome::LeavePanel => self.focus_terminal(),
+        }
+    }
+
+    /// Repair the cursor after the row set narrows or widens: keep it where it
+    /// is when still visible, otherwise fall to the first surviving row.
+    fn after_filter_changed(&mut self) {
+        let rows = self.current_project_rows();
+        let next = sidebar_nav::ensure_cursor(&rows, self.sidebar_cursor.as_ref());
+        if next != self.sidebar_cursor {
+            self.sidebar_cursor = next;
+            self.sidebar_cursor_moved = true;
+        }
+    }
+
+    fn move_sidebar_cursor(&mut self, delta: i32) {
+        let rows = self.current_project_rows();
+        let cursor = match self.sidebar_cursor.clone() {
+            Some(c) if rows.contains(&c) => c,
+            _ => {
+                if let Some(first) = rows.first() {
+                    self.set_sidebar_cursor(first.clone());
+                }
+                return;
+            },
+        };
+        self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, delta));
+    }
+
+    /// Rows the sidebar cursor steps over this frame: the fuzzy/toggle-filtered
+    /// set while a filter is active, the full visible set otherwise.
+    fn current_project_rows(&mut self) -> Vec<SidebarRow> {
+        let listed_sessions = self.listed_session_ids();
+        if !self.project_filter.is_filtering() {
+            return sidebar_nav::visible_rows(&self.projects, &listed_sessions);
+        }
+
+        let toggle_sessions = self.project_filter.is_toggled('s');
+        let toggle_attention = self.project_filter.is_toggled('a');
+        let any_toggle = toggle_sessions || toggle_attention;
+
+        // Precompute every fuzzy result before building the closures: the
+        // matcher needs `&mut self.project_filter`, and releasing that borrow
+        // up-front lets the predicates read the rest of `&self` freely.
+        let home_matches = self.project_filter.matches("Home");
+        let project_matches: HashMap<PathBuf, bool> = {
+            let filter = &mut self.project_filter;
+            self.projects
+                .iter()
+                .map(|p| (p.root.clone(), filter.matches(p.display_name())))
+                .collect()
+        };
+        let worktree_matches: HashMap<PathBuf, bool> = {
+            let filter = &mut self.project_filter;
+            self.projects
+                .iter()
+                .flat_map(|p| p.worktrees.iter())
+                .map(|wt| (wt.path.clone(), filter.matches(&wt.name)))
+                .collect()
+        };
+
+        let toggles_pass = |key: &WorkspaceKey| {
+            (!toggle_sessions || self.workspace_has_sessions(key))
+                && (!toggle_attention || self.workspace_needs_attention(key))
+        };
+        let home = home_matches && toggles_pass(&None);
+        let project_self =
+            |p: &Project| !any_toggle && project_matches.get(&p.root).copied().unwrap_or(false);
+        let mut worktree = |_p: &Project, wt: &Worktree| {
+            worktree_matches.get(&wt.path).copied().unwrap_or(false)
+                && toggles_pass(&Some(wt.path.clone()))
+        };
+        sidebar_nav::filtered_rows(
+            &self.projects,
+            &listed_sessions,
+            sidebar_nav::RowPredicates {
+                home,
+                project_self: &project_self,
+                worktree: &mut worktree,
+            },
+        )
+    }
+
+    fn workspace_has_sessions(&self, key: &WorkspaceKey) -> bool {
+        self.sessions.iter().any(|s| s.working_directory == *key)
     }
 
     fn apply_sidebar_nav(&mut self, ctx: &Context, key: egui::Key) {
         use egui::Key;
-        let rows = sidebar_nav::visible_rows(&self.projects);
+        let rows = self.current_project_rows();
         let cursor = match self.sidebar_cursor.clone() {
             Some(c) if rows.contains(&c) => c,
             // Stale or unseeded cursor (worktree removed, project collapsed
-            // by mouse): land on Home and let the next press act from there.
+            // by mouse, or a filter toggle narrowing the rows out from under
+            // it): land on the first row and let the next press act from
+            // there. Unfiltered `rows` always leads with Home.
             _ => {
-                self.set_sidebar_cursor(SidebarRow::Home);
+                if let Some(first) = rows.first() {
+                    self.set_sidebar_cursor(first.clone());
+                }
                 return;
             },
         };
         match key {
             Key::ArrowUp => self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, -1)),
             Key::ArrowDown => self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, 1)),
-            Key::ArrowRight => {
-                if let SidebarRow::Project(root) = &cursor {
-                    self.set_project_expanded(root, true);
-                }
+            Key::ArrowRight => match &cursor {
+                SidebarRow::Project(root) => {
+                    let root = root.clone();
+                    self.set_project_expanded(&root, true);
+                },
+                SidebarRow::Session(id) => {
+                    let id = *id;
+                    self.activate_session_by_id(id);
+                    self.focus_terminal();
+                },
+                _ => {},
             },
             Key::ArrowLeft => match &cursor {
                 SidebarRow::Project(root) => self.set_project_expanded(root, false),
-                SidebarRow::Worktree(_) => {
+                SidebarRow::Worktree(_) | SidebarRow::Session(_) => {
                     if let Some(target) = sidebar_nav::left_target(&rows, &cursor) {
                         self.set_sidebar_cursor(target);
                     }
                 },
                 SidebarRow::Home => {},
             },
-            Key::Enter => match &cursor {
-                SidebarRow::Home => {
-                    self.activate_home(ctx);
-                    self.focus_terminal();
-                },
-                SidebarRow::Worktree(path) => {
-                    let path = path.clone();
-                    self.activate_worktree(ctx, &path);
-                    self.focus_terminal();
-                },
-                SidebarRow::Project(root) => {
-                    let root = root.clone();
-                    let expanded =
-                        self.projects.iter().find(|p| p.root == root).is_some_and(|p| p.expanded);
-                    self.set_project_expanded(&root, !expanded);
-                },
-            },
+            Key::Enter => self.activate_sidebar_row(ctx, &cursor),
             Key::Escape => self.focus_terminal(),
             _ => {},
         }
+    }
+
+    /// Enter on a cursor row: open Home/worktree sessions and return focus to
+    /// the terminal, or toggle a project header's expansion in place.
+    fn activate_sidebar_row(&mut self, ctx: &Context, cursor: &SidebarRow) {
+        match cursor {
+            SidebarRow::Home => {
+                self.activate_home(ctx);
+                self.focus_terminal();
+            },
+            SidebarRow::Worktree(path) => {
+                let path = path.clone();
+                self.activate_worktree(ctx, &path);
+                self.focus_terminal();
+            },
+            SidebarRow::Session(id) => {
+                let id = *id;
+                self.activate_session_by_id(id);
+                self.focus_terminal();
+            },
+            SidebarRow::Project(root) => {
+                let root = root.clone();
+                let expanded =
+                    self.projects.iter().find(|p| p.root == root).is_some_and(|p| p.expanded);
+                self.set_project_expanded(&root, !expanded);
+            },
+        }
+    }
+
+    /// Switch to the session's workspace and mark it active — the keyboard
+    /// equivalent of clicking its sidebar row.  A stale id (session reaped
+    /// this frame) self-heals next frame via `ensure_active_session`.
+    fn activate_session_by_id(&mut self, id: SessionId) {
+        let Some(ws) =
+            self.sessions.iter().find(|s| s.id == id).map(|s| s.working_directory.clone())
+        else {
+            return;
+        };
+        self.current_workspace = ws.clone();
+        self.active_session.insert(ws, id);
     }
 
     fn set_sidebar_cursor(&mut self, row: SidebarRow) {
         if self.sidebar_cursor.as_ref() != Some(&row) {
             self.sidebar_cursor = Some(row);
             self.sidebar_cursor_moved = true;
+        }
+    }
+
+    /// Arrow/Enter/Escape navigation while the git sidebar owns keyboard
+    /// focus.  Same event-drain shape as `handle_sidebar_nav`: consumes only
+    /// unmodified nav keys, leaving modifier-bound shortcuts for
+    /// `handle_shortcuts`.
+    fn handle_git_sidebar_nav(&mut self, ctx: &Context) {
+        let filter = &mut self.git_filter;
+        let steps: Vec<SidebarNavStep> = ctx.input_mut(|i| {
+            let mut steps = Vec::new();
+            i.events.retain(|ev| match ev {
+                egui::Event::Text(text) => match filter.on_text(text) {
+                    Some(outcome) => {
+                        steps.push(SidebarNavStep::Filter(outcome));
+                        false
+                    },
+                    None => true,
+                },
+                egui::Event::Key { key, pressed: true, modifiers, .. } if modifiers.is_none() => {
+                    if let Some(outcome) = filter.on_key(*key) {
+                        steps.push(SidebarNavStep::Filter(outcome));
+                        return false;
+                    }
+                    if is_sidebar_nav_key(*key) {
+                        steps.push(SidebarNavStep::Nav(*key));
+                        return false;
+                    }
+                    true
+                },
+                _ => true,
+            });
+            steps
+        });
+        for step in steps {
+            match step {
+                SidebarNavStep::Filter(outcome) => self.apply_git_filter_outcome(ctx, outcome),
+                SidebarNavStep::Nav(key) => self.apply_git_sidebar_nav(ctx, key),
+            }
+        }
+    }
+
+    fn apply_git_filter_outcome(&mut self, ctx: &Context, outcome: panel_filter::Outcome) {
+        use panel_filter::Outcome;
+        match outcome {
+            Outcome::FilterChanged => self.after_git_filter_changed(),
+            Outcome::Consumed => {},
+            Outcome::MoveCursor(delta) => self.move_git_cursor(delta),
+            // Enter clears the query before yielding Activate, so act on the
+            // cursor the preceding movement maintained against the filtered
+            // rows rather than re-deriving a now-widened set.  Focus stays on
+            // the panel so the next file is one keystroke away.
+            Outcome::Activate => {
+                if let Some(cursor) = self.git_cursor.clone() {
+                    if let Some(req) =
+                        git_row_diff_request(&cursor, self.git_branch_base.as_deref())
+                    {
+                        self.open_diff(ctx, req);
+                    }
+                }
+            },
+            Outcome::LeavePanel => self.focus_terminal(),
+        }
+    }
+
+    /// Repair the git cursor after the row set narrows or widens: recompute the
+    /// filtered rows from the cached status so the next key event acts on them,
+    /// then keep the cursor where it is when still visible, else fall to the
+    /// first surviving row.
+    fn after_git_filter_changed(&mut self) {
+        self.recompute_git_rows();
+        let next = git_nav::ensure_cursor(&self.git_rows, self.git_cursor.as_ref());
+        if next.as_ref() != self.git_cursor.as_ref() {
+            self.git_cursor = next;
+            self.git_cursor_moved = true;
+        }
+    }
+
+    fn move_git_cursor(&mut self, delta: i32) {
+        let cursor = match self.git_cursor.clone() {
+            Some(c) if self.git_rows.contains(&c) => c,
+            _ => {
+                if let Some(first) = self.git_rows.first().cloned() {
+                    self.set_git_cursor(first);
+                }
+                return;
+            },
+        };
+        if let Some(row) = git_nav::step(&self.git_rows, &cursor, delta) {
+            self.set_git_cursor(row);
+        }
+    }
+
+    /// Rebuild `git_rows` from the cached status under the active filter,
+    /// without polling.  The render pass recomputes the same way from a fresh
+    /// poll; this keeps the row set current between frames so a filter change
+    /// and a following key event in the same batch agree on the rows.
+    fn recompute_git_rows(&mut self) {
+        let Some(path) = self.active_session_path() else {
+            self.git_rows.clear();
+            return;
+        };
+        let Some(status) = self.git_status.get(&path).map(|c| c.last().clone()) else {
+            self.git_rows.clear();
+            return;
+        };
+        self.git_rows = self.filtered_git_rows(&status).rows;
+    }
+
+    /// Apply the git panel's kind toggles and fuzzy query to a status snapshot.
+    /// With no kind toggle active every kind passes; otherwise the active
+    /// toggles union (`m`: Modified/Renamed, `d`: Deleted, `u`: Untracked/Added).
+    /// Conflicted rows and the branch-diff section are handled by `visible_rows`.
+    fn filtered_git_rows(&mut self, status: &GitStatus) -> git_nav::GitRows {
+        let m = self.git_filter.is_toggled('m');
+        let d = self.git_filter.is_toggled('d');
+        let u = self.git_filter.is_toggled('u');
+        let any = m || d || u;
+        let kind_pass = move |k: ChangeKind| {
+            !any || (m && matches!(k, ChangeKind::Modified | ChangeKind::Renamed))
+                || (d && k == ChangeKind::Deleted)
+                || (u && matches!(k, ChangeKind::Untracked | ChangeKind::Added))
+        };
+        let filter = &mut self.git_filter;
+        let mut query_pass = |path: &str| filter.matches(path);
+        git_nav::visible_rows(
+            &status.staged,
+            &status.unstaged,
+            &status.branch_diff,
+            &kind_pass,
+            &mut query_pass,
+        )
+    }
+
+    fn apply_git_sidebar_nav(&mut self, ctx: &Context, key: egui::Key) {
+        use egui::Key;
+        let cursor = match self.git_cursor.clone() {
+            Some(c) if self.git_rows.contains(&c) => c,
+            // Stale or unseeded cursor (status refreshed the row out from under
+            // it): land on the first row and let the next press act from there.
+            _ => {
+                if let Some(first) = self.git_rows.first().cloned() {
+                    self.set_git_cursor(first);
+                }
+                return;
+            },
+        };
+        match key {
+            Key::ArrowUp => {
+                if let Some(row) = git_nav::step(&self.git_rows, &cursor, -1) {
+                    self.set_git_cursor(row);
+                }
+            },
+            Key::ArrowDown => {
+                if let Some(row) = git_nav::step(&self.git_rows, &cursor, 1) {
+                    self.set_git_cursor(row);
+                }
+            },
+            Key::Enter => {
+                if let Some(req) = git_row_diff_request(&cursor, self.git_branch_base.as_deref()) {
+                    self.open_diff(ctx, req);
+                }
+            },
+            Key::Escape => self.focus_terminal(),
+            _ => {},
+        }
+    }
+
+    fn set_git_cursor(&mut self, row: git_nav::GitRow) {
+        if self.git_cursor.as_ref() != Some(&row) {
+            self.git_cursor = Some(row);
+            self.git_cursor_moved = true;
         }
     }
 
@@ -1085,6 +1482,12 @@ impl AlacritreeApp {
             },
             BindingAction::Named(NamedAction::ToggleRightSidebar) => {
                 self.show_right_sidebar = !self.show_right_sidebar;
+                // A deliberate visibility change opts out of the auto-shown
+                // round trip, and a hidden sidebar cannot keep keyboard focus.
+                self.git_sidebar_auto_shown = false;
+                if !self.show_right_sidebar && self.focus == PaneFocus::GitSidebar {
+                    self.focus = PaneFocus::Terminal;
+                }
                 self.persist_sidebars();
             },
             BindingAction::Named(NamedAction::SelectNextWorkspace) => {
@@ -1097,10 +1500,20 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::ToggleSidebarFocus) => match self.focus {
                 PaneFocus::Terminal => self.focus_sidebar(),
                 PaneFocus::ProjectsSidebar => self.focus_terminal(),
+                // Toggle stays "left ↔ terminal"; from the right panel it hops
+                // to the left one rather than doing nothing.
+                PaneFocus::GitSidebar => self.focus_sidebar(),
             },
             BindingAction::Named(NamedAction::FocusProjectsSidebar) => {
                 if self.focus != PaneFocus::ProjectsSidebar {
                     self.focus_sidebar();
+                }
+            },
+            BindingAction::Named(NamedAction::FocusGitSidebar) => {
+                if self.focus != PaneFocus::GitSidebar {
+                    self.focus_git_sidebar()
+                } else {
+                    self.focus_terminal()
                 }
             },
             BindingAction::Named(NamedAction::FocusTerminal) => self.focus_terminal(),
@@ -1290,6 +1703,35 @@ impl AlacritreeApp {
         };
         let cursor_moved = std::mem::take(&mut self.sidebar_cursor_moved);
 
+        // Membership for the active filter, resolved once so paint can skip
+        // non-surviving rows.  While filtering, matched projects render their
+        // matched worktrees regardless of `expanded` (display-only — the flag
+        // is never written).
+        let filtering = self.project_filter.is_filtering();
+        let mut home_visible = true;
+        let mut visible_projects: HashSet<PathBuf> = HashSet::new();
+        let mut visible_worktrees: HashSet<PathBuf> = HashSet::new();
+        if filtering {
+            home_visible = false;
+            for row in self.current_project_rows() {
+                match row {
+                    SidebarRow::Home => home_visible = true,
+                    SidebarRow::Project(root) => {
+                        visible_projects.insert(root);
+                    },
+                    SidebarRow::Worktree(path) => {
+                        visible_worktrees.insert(path);
+                    },
+                    // Session rows follow their workspace row's visibility.
+                    SidebarRow::Session(_) => {},
+                }
+            }
+        }
+        let filtered_empty = filtering
+            && !home_visible
+            && visible_projects.is_empty()
+            && visible_worktrees.is_empty();
+
         // Snapshot attention + agent-glyph state up-front so the `iter_mut`
         // over projects below isn't blocked from calling back into `&self`
         // helpers.
@@ -1382,8 +1824,17 @@ impl AlacritreeApp {
             .min_width(180.0 * theme.ui_scale)
             .frame(panel_frame)
             .show(ctx, |ui| {
+                // Sidebar rows are click targets, not selectable prose; the
+                // default I-beam-and-select on labels is the wrong affordance.
+                ui.style_mut().interaction.selectable_labels = false;
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Projects").color(theme.text).strong());
+                    panel_header_filter_ui(
+                        ui,
+                        "Projects",
+                        &self.project_filter,
+                        &self.config.ui.icons.search,
+                        &theme,
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icon_button(ui, "+", theme.text_dim, &theme)
                             .on_hover_text("add project")
@@ -1406,31 +1857,37 @@ impl AlacritreeApp {
                 ui.separator();
 
                 ScrollArea::vertical().show(ui, |ui| {
-                    let home_action = home_row(
-                        ui,
-                        self.current_workspace.is_none(),
-                        matches!(&cursor_row, Some(SidebarRow::Home)),
-                        cursor_moved,
-                        home_attention,
-                        home_agent_glyph,
-                        &theme,
-                    );
-                    if home_action.activate {
-                        home_clicked = true;
-                    }
-                    if home_action.spawn {
-                        spawn_shell_request.set(Some(None));
-                    }
-                    for row in &home_session_rows {
-                        let act = session_row(ui, row, &theme);
-                        if act.activate {
-                            activate_session_request.set(Some((None, row.id)));
+                    if !filtering || home_visible {
+                        let home_action = home_row(
+                            ui,
+                            self.current_workspace.is_none(),
+                            matches!(&cursor_row, Some(SidebarRow::Home)),
+                            cursor_moved,
+                            home_attention,
+                            home_agent_glyph,
+                            &theme,
+                        );
+                        if home_action.activate {
+                            home_clicked = true;
                         }
-                        if act.close {
-                            close_session_request.set(Some(row.id));
+                        if home_action.spawn {
+                            spawn_shell_request.set(Some(None));
                         }
+                        for row in &home_session_rows {
+                            let is_cursor = matches!(
+                                &cursor_row,
+                                Some(SidebarRow::Session(id)) if *id == row.id
+                            );
+                            let act = session_row(ui, row, is_cursor, cursor_moved, &theme);
+                            if act.activate {
+                                activate_session_request.set(Some((None, row.id)));
+                            }
+                            if act.close {
+                                close_session_request.set(Some(row.id));
+                            }
+                        }
+                        ui.add_space(2.0);
                     }
-                    ui.add_space(2.0);
 
                     if self.projects.is_empty() {
                         ui.label(
@@ -1440,9 +1897,14 @@ impl AlacritreeApp {
                         );
                         ui.add_space(4.0);
                         ui.label(RichText::new("Ctrl+B to toggle").small().color(theme.text_muted));
+                    } else if filtered_empty {
+                        ui.label(RichText::new("no matches").color(theme.text_dim).small());
                     }
 
                     for (idx, project) in self.projects.iter_mut().enumerate() {
+                        if filtering && !visible_projects.contains(&project.root) {
+                            continue;
+                        }
                         let proj_attention = project_attention.get(idx).copied().unwrap_or(false);
                         // Bubble attention up to the project row only when the
                         // project is collapsed — once expanded, the actual
@@ -1628,8 +2090,11 @@ impl AlacritreeApp {
                             });
                         }
 
-                        if project.expanded {
+                        if project.expanded || filtering {
                             for (wt_idx, wt) in project.worktrees.iter().enumerate() {
+                                if filtering && !visible_worktrees.contains(&wt.path) {
+                                    continue;
+                                }
                                 let is_active = self.current_workspace.as_deref() == Some(&wt.path);
                                 let wt_attention = worktree_attention
                                     .get(idx)
@@ -1691,7 +2156,11 @@ impl AlacritreeApp {
                                     .map(Vec::as_slice)
                                     .unwrap_or(&[]);
                                 for row in session_rows {
-                                    let act = session_row(ui, row, &theme);
+                                    let is_cursor = matches!(
+                                        &cursor_row,
+                                        Some(SidebarRow::Session(id)) if *id == row.id
+                                    );
+                                    let act = session_row(ui, row, is_cursor, cursor_moved, &theme);
                                     if act.activate {
                                         activate_session_request
                                             .set(Some((Some(wt.path.clone()), row.id)));
@@ -1801,14 +2270,27 @@ impl AlacritreeApp {
             .min_width(220.0 * theme.ui_scale)
             .frame(panel_frame)
             .show(ctx, |ui| {
+                // Sidebar rows are click targets, not selectable prose; the
+                // default I-beam-and-select on labels is the wrong affordance.
+                ui.style_mut().interaction.selectable_labels = false;
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Git").color(theme.text).strong());
+                    panel_header_filter_ui(
+                        ui,
+                        "Git",
+                        &self.git_filter,
+                        &self.config.ui.icons.search,
+                        &theme,
+                    );
                 });
                 ui.separator();
 
                 let path = match self.active_session_path() {
                     Some(p) => p,
                     None => {
+                        // No workspace, no rows: keep the cursor model from
+                        // acting on stale rows left by a previous workspace.
+                        self.git_rows.clear();
+                        self.git_branch_base = None;
                         ScrollArea::vertical().show(ui, |ui| {
                             ui.label(
                                 RichText::new("Open a worktree from the left sidebar.")
@@ -1841,8 +2323,59 @@ impl AlacritreeApp {
                     pr_info.as_ref().map(|p| p.base_branch.clone()).or(project_default);
                 // Single non-blocking poll: returns the last known status and
                 // kicks off a background refresh if stale or if the hint
-                // changed since the last completed compute.
-                let status = cache.poll(effective_default.as_deref(), ctx);
+                // changed since the last completed compute.  Cloned so the
+                // `self.git_status` borrow ends before the cursor repair below
+                // mutates other `self` fields.
+                let status = cache.poll(effective_default.as_deref(), ctx).clone();
+
+                // Prefer the resolved ref (e.g. `refs/remotes/origin/main`) so
+                // the cursor's Enter-to-diff matches the branch section's rows.
+                let git_branch_base = status
+                    .default_branch_resolved
+                    .clone()
+                    .or_else(|| status.default_branch.clone());
+                let filtering = self.git_filter.is_filtering();
+                let filtered = self.filtered_git_rows(&status);
+                let staged_count = filtered.staged;
+                let unstaged_count = filtered.unstaged;
+                let branch_count = filtered.branch;
+                self.git_rows = filtered.rows;
+                let mut staged_visible: HashSet<String> = HashSet::new();
+                let mut unstaged_visible: HashSet<String> = HashSet::new();
+                let mut branch_visible: HashSet<String> = HashSet::new();
+                for row in &self.git_rows {
+                    match row.section {
+                        GitSection::Staged => &mut staged_visible,
+                        GitSection::Unstaged => &mut unstaged_visible,
+                        GitSection::Branch => &mut branch_visible,
+                    }
+                    .insert(row.path.clone());
+                }
+                self.git_branch_base = git_branch_base.clone();
+                if self.focus == PaneFocus::GitSidebar {
+                    let mut repaired =
+                        git_nav::ensure_cursor(&self.git_rows, self.git_cursor.as_ref());
+                    // An unseeded cursor lands on the row backing the open diff
+                    // when there is one, so focusing the panel points at what
+                    // the user is already looking at.
+                    if self.git_cursor.is_none() {
+                        if let Some(active) = active_diff_key.as_deref() {
+                            if let Some(row) = self.git_rows.iter().find(|r| {
+                                git_row_diff_request(r, git_branch_base.as_deref())
+                                    .is_some_and(|req| diff_key(&req) == active)
+                            }) {
+                                repaired = Some(row.clone());
+                            }
+                        }
+                    }
+                    self.git_cursor = repaired;
+                }
+                let cursor_row = if self.focus == PaneFocus::GitSidebar {
+                    self.git_cursor.clone()
+                } else {
+                    None
+                };
+                let cursor_moved = std::mem::take(&mut self.git_cursor_moved);
 
                 ScrollArea::vertical().show(ui, |ui| {
                     if let Some(err) = &status.error {
@@ -1899,19 +2432,35 @@ impl AlacritreeApp {
                     }
                     ui.add_space(10.0);
 
-                    section(ui, &theme, "Staged", status.staged.len(), |ui| {
+                    section(ui, &theme, "Staged", staged_count, filtering, |ui| {
                         for f in &status.staged {
+                            if !staged_visible.contains(&f.path) {
+                                continue;
+                            }
                             let req =
                                 DiffRequest { file: f.path.clone(), source: DiffSource::Staged };
                             let is_active = active_diff_key.as_deref() == Some(&diff_key(&req));
-                            if file_row(ui, f, &theme, &palette, is_active).clicked() {
+                            let resp = file_row(ui, f, &theme, &palette, is_active);
+                            if resp.clicked() {
                                 diff_request.set(Some(req));
                             }
+                            paint_git_row_cursor(
+                                ui,
+                                &resp,
+                                &cursor_row,
+                                GitSection::Staged,
+                                &f.path,
+                                cursor_moved,
+                                &theme,
+                            );
                         }
                     });
 
-                    section(ui, &theme, "Unstaged", status.unstaged.len(), |ui| {
+                    section(ui, &theme, "Unstaged", unstaged_count, filtering, |ui| {
                         for f in &status.unstaged {
+                            if !unstaged_visible.contains(&f.path) {
+                                continue;
+                            }
                             let source = if f.kind == ChangeKind::Untracked {
                                 DiffSource::Untracked
                             } else {
@@ -1919,9 +2468,19 @@ impl AlacritreeApp {
                             };
                             let req = DiffRequest { file: f.path.clone(), source };
                             let is_active = active_diff_key.as_deref() == Some(&diff_key(&req));
-                            if file_row(ui, f, &theme, &palette, is_active).clicked() {
+                            let resp = file_row(ui, f, &theme, &palette, is_active);
+                            if resp.clicked() {
                                 diff_request.set(Some(req));
                             }
+                            paint_git_row_cursor(
+                                ui,
+                                &resp,
+                                &cursor_row,
+                                GitSection::Unstaged,
+                                &f.path,
+                                cursor_moved,
+                                &theme,
+                            );
                         }
                     });
 
@@ -1930,13 +2489,8 @@ impl AlacritreeApp {
                             Some(b) => format!("Changes vs {b}"),
                             None => "Changes vs default".to_string(),
                         };
-                        // Prefer the resolved ref (e.g. `refs/remotes/origin/main`) so the
-                        // sidebar's merge-base diff matches what delta will show.
-                        let base = status
-                            .default_branch_resolved
-                            .clone()
-                            .or_else(|| status.default_branch.clone());
-                        let count = status.branch_diff.len();
+                        let base = git_branch_base.clone();
+                        let count_label = section_count_label(&branch_count, filtering);
 
                         // Open-coded section header so the PR number can be a
                         // hyperlink while the rest stays plain text.
@@ -1952,14 +2506,24 @@ impl AlacritreeApp {
                                     &pr.url,
                                 );
                             }
-                            ui.label(
-                                RichText::new(format!("{count}")).color(theme.text_muted).small(),
-                            );
+                            ui.label(RichText::new(count_label).color(theme.text_muted).small());
                         });
                         ui.add_space(2.0);
                         for stat in &status.branch_diff {
+                            if !branch_visible.contains(&stat.path) {
+                                continue;
+                            }
                             let Some(base) = base.clone() else {
-                                branch_diff_row(ui, stat, &theme, &palette, false);
+                                let resp = branch_diff_row(ui, stat, &theme, &palette, false);
+                                paint_git_row_cursor(
+                                    ui,
+                                    &resp,
+                                    &cursor_row,
+                                    GitSection::Branch,
+                                    &stat.path,
+                                    cursor_moved,
+                                    &theme,
+                                );
                                 continue;
                             };
                             let req = DiffRequest {
@@ -1967,9 +2531,19 @@ impl AlacritreeApp {
                                 source: DiffSource::Branch { base },
                             };
                             let is_active = active_diff_key.as_deref() == Some(&diff_key(&req));
-                            if branch_diff_row(ui, stat, &theme, &palette, is_active).clicked() {
+                            let resp = branch_diff_row(ui, stat, &theme, &palette, is_active);
+                            if resp.clicked() {
                                 diff_request.set(Some(req));
                             }
+                            paint_git_row_cursor(
+                                ui,
+                                &resp,
+                                &cursor_row,
+                                GitSection::Branch,
+                                &stat.path,
+                                cursor_moved,
+                                &theme,
+                            );
                         }
                         ui.add_space(10.0);
                     }
@@ -2295,6 +2869,39 @@ fn focus_default(ctx: &Context, id: egui::Id) {
     }
 }
 
+/// A modal action button.  Framed and filled so it reads as clickable —
+/// frameless text buttons looked like captions and users reached for the
+/// keyboard hint instead of the mouse.
+fn modal_button(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    label: &str,
+    text_color: Color32,
+) -> egui::Response {
+    let s = theme.ui_scale;
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = egui::vec2(10.0 * s, 3.0 * s);
+        let widgets = &mut ui.visuals_mut().widgets;
+        widgets.inactive.weak_bg_fill = theme.row_hover_bg;
+        widgets.inactive.bg_stroke = Stroke::new(1.0_f32, theme.sidebar_border);
+        widgets.hovered.weak_bg_fill = theme.row_active_bg;
+        widgets.hovered.bg_stroke = Stroke::new(1.0_f32, theme.sidebar_border);
+        widgets.active.weak_bg_fill = theme.row_active_bg;
+        ui.add(egui::Button::new(RichText::new(label).color(text_color)))
+    })
+    .inner
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+
+/// Section header count: `visible of total` while a filter narrows the panel,
+/// the plain total otherwise.
+fn section_count_label(count: &SectionCount, filtering: bool) -> String {
+    if filtering {
+        format!("{} of {}", count.visible, count.total)
+    } else {
+        format!("{}", count.total)
+    }
+}
+
 /// Render a collapsed-when-empty git section.
 ///
 /// Empty sections are skipped entirely — a placeholder glyph for "no files
@@ -2304,15 +2911,17 @@ fn section<R>(
     ui: &mut egui::Ui,
     theme: &Theme,
     title: &str,
-    count: usize,
+    count: SectionCount,
+    filtering: bool,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) {
-    if count == 0 {
+    if count.total == 0 {
         return;
     }
+    let label = section_count_label(&count, filtering);
     ui.horizontal(|ui| {
         ui.label(RichText::new(title).color(theme.text).strong().small());
-        ui.label(RichText::new(format!("{count}")).color(theme.text_muted).small());
+        ui.label(RichText::new(label).color(theme.text_muted).small());
     });
     ui.add_space(2.0);
     add_contents(ui);
@@ -2634,6 +3243,69 @@ fn paint_cursor_outline(ui: &egui::Ui, rect: egui::Rect, theme: &Theme) {
     );
 }
 
+/// Outline the git row the keyboard cursor rests on, matched by section+path so
+/// it survives the status refresh.  Full-width rect from the panel plus the
+/// row's `y_range`, mirroring the project rows.
+fn paint_git_row_cursor(
+    ui: &egui::Ui,
+    resp: &egui::Response,
+    cursor: &Option<git_nav::GitRow>,
+    section: GitSection,
+    path: &str,
+    scroll_into_view: bool,
+    theme: &Theme,
+) {
+    if !matches!(cursor, Some(c) if c.section == section && c.path == path) {
+        return;
+    }
+    let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), resp.rect.y_range());
+    paint_cursor_outline(ui, rect, theme);
+    if scroll_into_view {
+        ui.scroll_to_rect(rect, None);
+    }
+}
+
+/// One drained event's effect on a sidebar panel: either a filter outcome
+/// (search/toggle) or a plain browsing nav key.
+enum SidebarNavStep {
+    Filter(panel_filter::Outcome),
+    Nav(egui::Key),
+}
+
+/// Panel title plus its filter chrome, shared by both sidebars: the heading,
+/// then `[s]`-style chips for each active toggle, then a bordered
+/// `<icon> query▌` input box while searching (`search_icon` comes from
+/// `[ui] search_icon`).  Renders only the title when the filter is idle.
+fn panel_header_filter_ui(
+    ui: &mut egui::Ui,
+    title: &str,
+    filter: &PanelFilter,
+    search_icon: &str,
+    theme: &Theme,
+) {
+    ui.label(RichText::new(title).color(theme.text).strong());
+    for key in filter.active_toggles() {
+        ui.label(RichText::new(format!("[{key}]")).color(theme.accent).monospace().small());
+    }
+    if filter.mode() == panel_filter::Mode::Search || !filter.query().is_empty() {
+        let s = theme.ui_scale;
+        Frame::default()
+            .stroke(Stroke::new(1.0_f32, theme.text_muted))
+            .corner_radius((3.0 * s).round() as u8)
+            .inner_margin(Margin::symmetric((4.0 * s).round() as i8, (1.0 * s).round() as i8))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 3.0 * s;
+                ui.label(RichText::new(search_icon).color(theme.text_dim).small());
+                ui.label(
+                    RichText::new(format!("{}▌", filter.query()))
+                        .color(theme.text)
+                        .monospace()
+                        .small(),
+                );
+            });
+    }
+}
+
 fn is_sidebar_nav_key(key: egui::Key) -> bool {
     use egui::Key;
     matches!(
@@ -2932,7 +3604,13 @@ struct SessionRowAction {
     close: bool,
 }
 
-fn session_row(ui: &mut egui::Ui, row: &SessionRowData, theme: &Theme) -> SessionRowAction {
+fn session_row(
+    ui: &mut egui::Ui,
+    row: &SessionRowData,
+    is_cursor: bool,
+    scroll_into_view: bool,
+    theme: &Theme,
+) -> SessionRowAction {
     // Reserve a slot *before* the labels so the hover bg paints beneath them.
     let bg_idx = ui.painter().add(egui::Shape::Noop);
     let panel_x = ui.max_rect().x_range();
@@ -2993,9 +3671,15 @@ fn session_row(ui: &mut egui::Ui, row: &SessionRowData, theme: &Theme) -> Sessio
     } else {
         Color32::TRANSPARENT
     };
+    let full_rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
     if bg != Color32::TRANSPARENT {
-        let rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
-        ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
+        ui.painter().set(bg_idx, egui::Shape::rect_filled(full_rect, 0.0, bg));
+    }
+    if is_cursor {
+        paint_cursor_outline(ui, full_rect, theme);
+        if scroll_into_view {
+            ui.scroll_to_rect(full_rect, None);
+        }
     }
     SessionRowAction { activate: resp.clicked() && !close_clicked, close: close_clicked }
 }
@@ -3097,6 +3781,24 @@ impl AlacritreeApp {
         active_glyph.or(other_glyph)
     }
 
+    /// The session rows every workspace currently lists, for the keyboard
+    /// cursor model.  Built from the same `sidebar_session_ids` rule the
+    /// paint pass uses, so cursor rows and painted rows cannot drift.
+    fn listed_session_ids(&self) -> sidebar_nav::ListedSessions {
+        let pairs: Vec<(WorkspaceKey, SessionId)> =
+            self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect();
+        let mut listed = sidebar_nav::ListedSessions::new();
+        for (ws, _) in &pairs {
+            if !listed.contains_key(ws) {
+                let ids = sidebar_session_ids(&pairs, ws);
+                if !ids.is_empty() {
+                    listed.insert(ws.clone(), ids);
+                }
+            }
+        }
+        listed
+    }
+
     /// Session rows for `ws`'s sidebar list, per `sidebar_session_ids`'s
     /// two-session threshold.
     fn workspace_session_rows(&self, ws: &WorkspaceKey) -> Vec<SessionRowData> {
@@ -3178,16 +3880,11 @@ impl AlacritreeApp {
                             .small(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let delete = ui
-                            .add(egui::Button::new(RichText::new(verb).color(danger)).frame(false));
+                        let delete = modal_button(ui, &theme, verb, danger);
                         if delete.clicked() {
                             confirmed = true;
                         }
-                        let cancel = ui.add(
-                            egui::Button::new(RichText::new("Cancel").color(theme.text_dim))
-                                .frame(false),
-                        );
-                        if cancel.clicked() {
+                        if modal_button(ui, &theme, "Cancel", theme.text_dim).clicked() {
                             cancelled = true;
                         }
                         focus_default(ui.ctx(), delete.id);
@@ -3244,17 +3941,11 @@ impl AlacritreeApp {
                             .small(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let close_btn = ui.add(
-                            egui::Button::new(RichText::new("Close").color(danger)).frame(false),
-                        );
+                        let close_btn = modal_button(ui, &theme, "Close", danger);
                         if close_btn.clicked() {
                             confirmed = true;
                         }
-                        let cancel = ui.add(
-                            egui::Button::new(RichText::new("Cancel").color(theme.text_dim))
-                                .frame(false),
-                        );
-                        if cancel.clicked() {
+                        if modal_button(ui, &theme, "Cancel", theme.text_dim).clicked() {
                             cancelled = true;
                         }
                         focus_default(ui.ctx(), close_btn.id);
@@ -3518,22 +4209,10 @@ impl AlacritreeApp {
                             .small(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new("Rename").color(theme.accent))
-                                    .frame(false),
-                            )
-                            .clicked()
-                        {
+                        if modal_button(ui, &theme, "Rename", theme.accent).clicked() {
                             rename_clicked = true;
                         }
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new("Cancel").color(theme.text_dim))
-                                    .frame(false),
-                            )
-                            .clicked()
-                        {
+                        if modal_button(ui, &theme, "Cancel", theme.text_dim).clicked() {
                             cancelled = true;
                         }
                     });
@@ -3655,22 +4334,10 @@ impl AlacritreeApp {
                             .small(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new("Create").color(theme.accent))
-                                    .frame(false),
-                            )
-                            .clicked()
-                        {
+                        if modal_button(ui, &theme, "Create", theme.accent).clicked() {
                             create_clicked = true;
                         }
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new("Cancel").color(theme.text_dim))
-                                    .frame(false),
-                            )
-                            .clicked()
-                        {
+                        if modal_button(ui, &theme, "Cancel", theme.text_dim).clicked() {
                             cancelled = true;
                         }
                     });
@@ -3795,9 +4462,7 @@ impl AlacritreeApp {
                 ui.add_space(4.0 * s);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let label = if result.is_ok() { "Open" } else { "Close" };
-                    let btn = ui.add(
-                        egui::Button::new(RichText::new(label).color(theme.accent)).frame(false),
-                    );
+                    let btn = modal_button(ui, &theme, label, theme.accent);
                     if btn.clicked() {
                         close = true;
                     }
@@ -3843,23 +4508,14 @@ impl AlacritreeApp {
                             .small(),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let quit_id = egui::Id::new("alacritree_quit_btn");
-                        let quit = ui.add(
-                            egui::Button::new(RichText::new("Quit").color(danger)).frame(false),
-                        );
+                        let quit = modal_button(ui, &theme, "Quit", danger);
                         if quit.clicked() {
                             quit_clicked = true;
                         }
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new("Cancel").color(theme.text_dim))
-                                    .frame(false),
-                            )
-                            .clicked()
-                        {
+                        if modal_button(ui, &theme, "Cancel", theme.text_dim).clicked() {
                             cancel_clicked = true;
                         }
-                        focus_default(ui.ctx(), quit_id);
+                        focus_default(ui.ctx(), quit.id);
                     });
                 });
             },
@@ -4037,8 +4693,10 @@ impl eframe::App for AlacritreeApp {
         // not the app — alacritty's key_input returns early the same way,
         // above binding dispatch.
         if !modal_open && self.ime.preedit().is_none() {
-            if self.focus == PaneFocus::ProjectsSidebar {
-                self.handle_sidebar_nav(ctx);
+            match self.focus {
+                PaneFocus::ProjectsSidebar => self.handle_sidebar_nav(ctx),
+                PaneFocus::GitSidebar => self.handle_git_sidebar_nav(ctx),
+                PaneFocus::Terminal => {},
             }
             self.handle_shortcuts(ctx);
         }
