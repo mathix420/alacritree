@@ -5,8 +5,8 @@
 //! fallback may itself contain variables, so `${branch:$name}` reads "the
 //! branch, or the worktree name when detached").  Any error — parse failure,
 //! unknown variable — falls back to the plain name with one warning per
-//! template string, so a typo'd config degrades to today's sidebar rather
-//! than blank rows.
+//! config key, so a typo'd config degrades to today's sidebar rather than
+//! blank rows.
 
 use std::collections::{HashMap, HashSet};
 
