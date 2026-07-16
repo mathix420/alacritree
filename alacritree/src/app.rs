@@ -39,6 +39,14 @@ pub type WorkspaceKey = Option<PathBuf>;
 static NOTIFY_TX: OnceLock<Mutex<Sender<WorkspaceKey>>> = OnceLock::new();
 
 #[derive(Clone, Copy)]
+struct FocusOutlineTheme {
+    sidebar: bool,
+    terminal: bool,
+    color: Color32,
+    thickness: f32,
+}
+
+#[derive(Clone, Copy)]
 struct Theme {
     terminal_bg: Color32,
     sidebar_bg: Color32,
@@ -69,6 +77,7 @@ struct Theme {
     /// historical 11.25-logical-pixel baseline so unmodified config keeps the
     /// existing layout proportions.
     ui_scale: f32,
+    focus_outline: FocusOutlineTheme,
 }
 
 /// Logical-pixel (normal, heading) sizes for UI text.  `[ui.font] size`
@@ -115,6 +124,12 @@ impl Theme {
             font_heading,
             font_normal,
             ui_scale: font_normal / 11.25,
+            focus_outline: FocusOutlineTheme {
+                sidebar: config.ui.focus_outline.sidebar,
+                terminal: config.ui.focus_outline.terminal,
+                color: config.ui.focus_outline.color.unwrap_or(accent),
+                thickness: config.ui.focus_outline.thickness,
+            },
         }
     }
 }
@@ -135,6 +150,20 @@ fn paint_panel_border(ctx: &Context, x: f32, y_range: egui::Rangef, color: Color
     let layer =
         egui::LayerId::new(egui::Order::Middle, egui::Id::new(("sidebar_border", x.to_bits())));
     ctx.layer_painter(layer).vline(x, y_range, Stroke::new(1.0_f32, color));
+}
+
+fn paint_focus_outline(ctx: &Context, rect: egui::Rect, theme: &Theme) {
+    let fo = theme.focus_outline;
+    let layer = egui::LayerId::new(
+        egui::Order::Middle,
+        egui::Id::new(("focus_outline", rect.min.x.to_bits())),
+    );
+    ctx.layer_painter(layer).rect_stroke(
+        rect,
+        0.0,
+        Stroke::new(fo.thickness, fo.color),
+        egui::StrokeKind::Inside,
+    );
 }
 
 fn blend_toward(c: Color32, target: Color32, amount: f32) -> Color32 {
@@ -5278,6 +5307,12 @@ impl eframe::App for AlacritreeApp {
         if self.show_left_sidebar {
             let r = self.show_project_sidebar(ctx, panel_frame.clone());
             paint_panel_border(ctx, r.right(), r.y_range(), theme.sidebar_border);
+            if theme.focus_outline.sidebar
+                && !modal_open
+                && self.focus == PaneFocus::ProjectsSidebar
+            {
+                paint_focus_outline(ctx, r, &theme);
+            }
         }
 
         if self.show_right_sidebar {
@@ -5285,7 +5320,7 @@ impl eframe::App for AlacritreeApp {
             paint_panel_border(ctx, r.left(), r.y_range(), theme.sidebar_border);
         }
 
-        egui::CentralPanel::default()
+        let central = egui::CentralPanel::default()
             .frame(Frame::default().fill(central_fill).inner_margin(Margin::same(0)))
             .show(ctx, |ui| {
                 self.show_tab_strip(ui);
@@ -5336,6 +5371,9 @@ impl eframe::App for AlacritreeApp {
                     self.focus_terminal();
                 }
             });
+        if theme.focus_outline.terminal && !modal_open && self.focus == PaneFocus::Terminal {
+            paint_focus_outline(ctx, central.response.rect, &theme);
+        }
 
         if self.pending_create.is_some() {
             self.show_create_dialog(ctx);

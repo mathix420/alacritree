@@ -306,6 +306,26 @@ pub struct Icons {
     pub pr_closed: String,
 }
 
+/// `[ui.focus_outline]`: stroke a border around a panel while it owns
+/// keyboard focus.  Per-panel toggles, shared color/thickness; both toggles
+/// default off so unmodified config keeps today's look.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FocusOutline {
+    pub sidebar: bool,
+    pub terminal: bool,
+    /// `None` falls back to the theme accent at resolution time.
+    pub color: Option<Color32>,
+    /// Absolute logical pixels (deliberately not ui_scale-multiplied);
+    /// clamped to ≥ 0.5.
+    pub thickness: f32,
+}
+
+impl Default for FocusOutline {
+    fn default() -> Self {
+        Self { sidebar: false, terminal: false, color: None, thickness: 1.0 }
+    }
+}
+
 impl Default for Icons {
     fn default() -> Self {
         Self {
@@ -343,6 +363,7 @@ pub struct UiTheme {
     /// no auth, or no PR silently paints nothing.
     pub pr_status: bool,
     pub icons: Icons,
+    pub focus_outline: FocusOutline,
 }
 
 impl Default for UiTheme {
@@ -358,6 +379,7 @@ impl Default for UiTheme {
             session_display: SessionDisplay::default(),
             pr_status: true,
             icons: Icons::default(),
+            focus_outline: FocusOutline::default(),
         }
     }
 }
@@ -950,6 +972,15 @@ struct RawUiFont {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
+struct RawFocusOutline {
+    sidebar: Option<bool>,
+    terminal: Option<bool>,
+    color: Option<RgbStr>,
+    thickness: Option<f32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 struct RawUi {
     sidebar_background: Option<RgbStr>,
     sidebar_foreground: Option<RgbStr>,
@@ -970,6 +1001,7 @@ struct RawUi {
     wsl: RawUiWsl,
     profiles: Vec<RawProfile>,
     default_profile: Option<String>,
+    focus_outline: RawFocusOutline,
 }
 
 /// One `[[ui.profiles]]` entry.  Fields are optional so a malformed entry
@@ -1102,6 +1134,12 @@ impl RawConfig {
             },
             pr_status: self.ui.pr_status.unwrap_or(true),
             icons: build_icons(self.ui.icons),
+            focus_outline: FocusOutline {
+                sidebar: self.ui.focus_outline.sidebar.unwrap_or(false),
+                terminal: self.ui.focus_outline.terminal.unwrap_or(false),
+                color: self.ui.focus_outline.color.map(|v| rgb_to_color32(v.0)),
+                thickness: self.ui.focus_outline.thickness.map_or(1.0, |t| t.max(0.5)),
+            },
         };
 
         // ---- Font ----
@@ -1677,5 +1715,32 @@ program = "second"
     fn pr_status_defaults_on_and_parses_off() {
         assert!(ui_from_toml("").pr_status);
         assert!(!ui_from_toml("[ui]\npr_status = false").pr_status);
+    }
+
+    #[test]
+    fn focus_outline_defaults_off() {
+        let fo = ui_from_toml("").focus_outline;
+        assert!(!fo.sidebar);
+        assert!(!fo.terminal);
+        assert_eq!(fo.color, None);
+        assert_eq!(fo.thickness, 1.0);
+    }
+
+    #[test]
+    fn focus_outline_parses_all_fields() {
+        let fo = ui_from_toml(
+            "[ui.focus_outline]\nsidebar = true\nterminal = true\ncolor = \"#89b4fa\"\nthickness = 2.5",
+        )
+        .focus_outline;
+        assert!(fo.sidebar);
+        assert!(fo.terminal);
+        assert_eq!(fo.color, Some(Color32::from_rgb(0x89, 0xb4, 0xfa)));
+        assert_eq!(fo.thickness, 2.5);
+    }
+
+    #[test]
+    fn focus_outline_thickness_clamps() {
+        let fo = ui_from_toml("[ui.focus_outline]\nthickness = 0.1").focus_outline;
+        assert_eq!(fo.thickness, 0.5);
     }
 }
