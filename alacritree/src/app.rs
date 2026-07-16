@@ -29,7 +29,7 @@ use crate::worktree::{self as wt, CreateRequest, Progress};
 use crate::wsl::{self, ShellChoice};
 
 /// `None` is the home workspace (sessions inherit `$PWD`); `Some` is a worktree path.
-type WorkspaceKey = Option<PathBuf>;
+pub type WorkspaceKey = Option<PathBuf>;
 
 /// Channel from notification-worker threads back to the app.  Set once by
 /// `AlacritreeApp::new`; each worker reads it to deliver the workspace the
@@ -900,8 +900,12 @@ impl AlacritreeApp {
             self.persist_sidebars();
         }
         self.focus = PaneFocus::ProjectsSidebar;
-        self.sidebar_cursor =
-            Some(sidebar_nav::seed(&self.projects, self.current_workspace.as_deref()));
+        self.sidebar_cursor = Some(sidebar_nav::seed(
+            &self.projects,
+            self.current_workspace.as_deref(),
+            &self.listed_session_ids(),
+            self.active_session.get(&self.current_workspace).copied(),
+        ));
         // Seeding reads the unfiltered tree, so a lingering filter from a prior
         // focus round-trip can leave the seeded row outside the current rows;
         // repair it immediately rather than waiting for the first key press.
@@ -1051,8 +1055,9 @@ impl AlacritreeApp {
     /// Rows the sidebar cursor steps over this frame: the fuzzy/toggle-filtered
     /// set while a filter is active, the full visible set otherwise.
     fn current_project_rows(&mut self) -> Vec<SidebarRow> {
+        let listed_sessions = self.listed_session_ids();
         if !self.project_filter.is_filtering() {
-            return sidebar_nav::visible_rows(&self.projects);
+            return sidebar_nav::visible_rows(&self.projects, &listed_sessions);
         }
 
         let toggle_sessions = self.project_filter.is_toggled('s');
@@ -1092,6 +1097,7 @@ impl AlacritreeApp {
         };
         sidebar_nav::filtered_rows(
             &self.projects,
+            &listed_sessions,
             sidebar_nav::RowPredicates {
                 home,
                 project_self: &project_self,
@@ -1123,14 +1129,21 @@ impl AlacritreeApp {
         match key {
             Key::ArrowUp => self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, -1)),
             Key::ArrowDown => self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, 1)),
-            Key::ArrowRight => {
-                if let SidebarRow::Project(root) = &cursor {
-                    self.set_project_expanded(root, true);
-                }
+            Key::ArrowRight => match &cursor {
+                SidebarRow::Project(root) => {
+                    let root = root.clone();
+                    self.set_project_expanded(&root, true);
+                },
+                SidebarRow::Session(id) => {
+                    let id = *id;
+                    self.activate_session_by_id(id);
+                    self.focus_terminal();
+                },
+                _ => {},
             },
             Key::ArrowLeft => match &cursor {
                 SidebarRow::Project(root) => self.set_project_expanded(root, false),
-                SidebarRow::Worktree(_) => {
+                SidebarRow::Worktree(_) | SidebarRow::Session(_) => {
                     if let Some(target) = sidebar_nav::left_target(&rows, &cursor) {
                         self.set_sidebar_cursor(target);
                     }
@@ -1156,6 +1169,11 @@ impl AlacritreeApp {
                 self.activate_worktree(ctx, &path);
                 self.focus_terminal();
             },
+            SidebarRow::Session(id) => {
+                let id = *id;
+                self.activate_session_by_id(id);
+                self.focus_terminal();
+            },
             SidebarRow::Project(root) => {
                 let root = root.clone();
                 let expanded =
@@ -1163,6 +1181,19 @@ impl AlacritreeApp {
                 self.set_project_expanded(&root, !expanded);
             },
         }
+    }
+
+    /// Switch to the session's workspace and mark it active — the keyboard
+    /// equivalent of clicking its sidebar row.  A stale id (session reaped
+    /// this frame) self-heals next frame via `ensure_active_session`.
+    fn activate_session_by_id(&mut self, id: SessionId) {
+        let Some(ws) =
+            self.sessions.iter().find(|s| s.id == id).map(|s| s.working_directory.clone())
+        else {
+            return;
+        };
+        self.current_workspace = ws.clone();
+        self.active_session.insert(ws, id);
     }
 
     fn set_sidebar_cursor(&mut self, row: SidebarRow) {
@@ -1681,6 +1712,8 @@ impl AlacritreeApp {
                     SidebarRow::Worktree(path) => {
                         visible_worktrees.insert(path);
                     },
+                    // Session rows follow their workspace row's visibility.
+                    SidebarRow::Session(_) => {},
                 }
             }
         }
@@ -1822,7 +1855,11 @@ impl AlacritreeApp {
                             spawn_shell_request.set(Some(None));
                         }
                         for row in &home_session_rows {
-                            let act = session_row(ui, row, &theme);
+                            let is_cursor = matches!(
+                                &cursor_row,
+                                Some(SidebarRow::Session(id)) if *id == row.id
+                            );
+                            let act = session_row(ui, row, is_cursor, cursor_moved, &theme);
                             if act.activate {
                                 activate_session_request.set(Some((None, row.id)));
                             }
@@ -2100,7 +2137,11 @@ impl AlacritreeApp {
                                     .map(Vec::as_slice)
                                     .unwrap_or(&[]);
                                 for row in session_rows {
-                                    let act = session_row(ui, row, &theme);
+                                    let is_cursor = matches!(
+                                        &cursor_row,
+                                        Some(SidebarRow::Session(id)) if *id == row.id
+                                    );
+                                    let act = session_row(ui, row, is_cursor, cursor_moved, &theme);
                                     if act.activate {
                                         activate_session_request
                                             .set(Some((Some(wt.path.clone()), row.id)));
@@ -3409,7 +3450,13 @@ struct SessionRowAction {
     close: bool,
 }
 
-fn session_row(ui: &mut egui::Ui, row: &SessionRowData, theme: &Theme) -> SessionRowAction {
+fn session_row(
+    ui: &mut egui::Ui,
+    row: &SessionRowData,
+    is_cursor: bool,
+    scroll_into_view: bool,
+    theme: &Theme,
+) -> SessionRowAction {
     // Reserve a slot *before* the labels so the hover bg paints beneath them.
     let bg_idx = ui.painter().add(egui::Shape::Noop);
     let panel_x = ui.max_rect().x_range();
@@ -3470,9 +3517,15 @@ fn session_row(ui: &mut egui::Ui, row: &SessionRowData, theme: &Theme) -> Sessio
     } else {
         Color32::TRANSPARENT
     };
+    let full_rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
     if bg != Color32::TRANSPARENT {
-        let rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
-        ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
+        ui.painter().set(bg_idx, egui::Shape::rect_filled(full_rect, 0.0, bg));
+    }
+    if is_cursor {
+        paint_cursor_outline(ui, full_rect, theme);
+        if scroll_into_view {
+            ui.scroll_to_rect(full_rect, None);
+        }
     }
     SessionRowAction { activate: resp.clicked() && !close_clicked, close: close_clicked }
 }
@@ -3572,6 +3625,24 @@ impl AlacritreeApp {
             }
         }
         active_glyph.or(other_glyph)
+    }
+
+    /// The session rows every workspace currently lists, for the keyboard
+    /// cursor model.  Built from the same `sidebar_session_ids` rule the
+    /// paint pass uses, so cursor rows and painted rows cannot drift.
+    fn listed_session_ids(&self) -> sidebar_nav::ListedSessions {
+        let pairs: Vec<(WorkspaceKey, SessionId)> =
+            self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect();
+        let mut listed = sidebar_nav::ListedSessions::new();
+        for (ws, _) in &pairs {
+            if !listed.contains_key(ws) {
+                let ids = sidebar_session_ids(&pairs, ws);
+                if !ids.is_empty() {
+                    listed.insert(ws.clone(), ids);
+                }
+            }
+        }
+        listed
     }
 
     /// Session rows for `ws`'s sidebar list, per `sidebar_session_ids`'s
