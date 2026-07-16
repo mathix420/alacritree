@@ -2126,19 +2126,28 @@ impl AlacritreeApp {
             let mut rows = Vec::with_capacity(project.worktrees.len());
             for wt in &project.worktrees {
                 let info = if pr_enabled && project.expanded {
-                    // The right sidebar polls the same path's PR cache using
-                    // the live `StatusCache` branch (recomputed every ~1.5s),
-                    // while this snapshot is only refreshed at discover/refresh
-                    // time. Two pollers of one path must agree on a branch or
-                    // each drain flips `entry.branch` and they invalidate each
-                    // other's lookups forever after an in-terminal checkout —
-                    // so prefer the live cache here too, falling back to the
-                    // snapshot only where no cache exists yet.
-                    let branch = self
-                        .git_status
-                        .get(&wt.path)
-                        .and_then(|cache| cache.current_branch())
-                        .or(wt.branch.as_deref());
+                    // The right sidebar polls only the active workspace's PR
+                    // cache, using the live `StatusCache` branch (recomputed
+                    // every ~1.5s). Two pollers of the same path must agree on
+                    // a branch or each drain flips `entry.branch` and they
+                    // invalidate each other's lookups forever after an
+                    // in-terminal checkout — so share the live cache there.
+                    // For every other worktree there is only one poller (this
+                    // one), and its cache is created once a workspace goes
+                    // active but never re-polled or pruned after it goes
+                    // inactive again: reading it here would freeze the branch
+                    // at whatever it was on last visit and shadow later
+                    // `refresh_project` updates to `wt.branch`. Use the
+                    // refresh-responsive snapshot instead.
+                    let is_active = self.current_workspace.as_deref() == Some(&wt.path);
+                    let branch = if is_active {
+                        self.git_status
+                            .get(&wt.path)
+                            .and_then(|cache| cache.current_branch())
+                            .or(wt.branch.as_deref())
+                    } else {
+                        wt.branch.as_deref()
+                    };
                     self.pr_cache.poll(&wt.path, branch, ctx)
                 } else {
                     None
