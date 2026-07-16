@@ -1815,7 +1815,13 @@ impl AlacritreeApp {
             .frame(panel_frame)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    panel_header_filter_ui(ui, "Projects", &self.project_filter, &theme);
+                    panel_header_filter_ui(
+                        ui,
+                        "Projects",
+                        &self.project_filter,
+                        &self.config.ui.icons.search,
+                        &theme,
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icon_button(ui, "+", theme.text_dim, &theme)
                             .on_hover_text("add project")
@@ -2252,7 +2258,13 @@ impl AlacritreeApp {
             .frame(panel_frame)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    panel_header_filter_ui(ui, "Git", &self.git_filter, &theme);
+                    panel_header_filter_ui(
+                        ui,
+                        "Git",
+                        &self.git_filter,
+                        &self.config.ui.icons.search,
+                        &theme,
+                    );
                 });
                 ui.separator();
 
@@ -3138,9 +3150,16 @@ enum SidebarNavStep {
 }
 
 /// Panel title plus its filter chrome, shared by both sidebars: the heading,
-/// then `[s]`-style chips for each active toggle, then a bordered `🔍 query▌`
-/// input box while searching.  Renders only the title when the filter is idle.
-fn panel_header_filter_ui(ui: &mut egui::Ui, title: &str, filter: &PanelFilter, theme: &Theme) {
+/// then `[s]`-style chips for each active toggle, then a bordered
+/// `<icon> query▌` input box while searching (`search_icon` comes from
+/// `[ui] search_icon`).  Renders only the title when the filter is idle.
+fn panel_header_filter_ui(
+    ui: &mut egui::Ui,
+    title: &str,
+    filter: &PanelFilter,
+    search_icon: &str,
+    theme: &Theme,
+) {
     ui.label(RichText::new(title).color(theme.text).strong());
     for key in filter.active_toggles() {
         ui.label(RichText::new(format!("[{key}]")).color(theme.accent).monospace().small());
@@ -3153,7 +3172,7 @@ fn panel_header_filter_ui(ui: &mut egui::Ui, title: &str, filter: &PanelFilter, 
             .inner_margin(Margin::symmetric((4.0 * s).round() as i8, (1.0 * s).round() as i8))
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.x = 3.0 * s;
-                ui.label(RichText::new("🔍").color(theme.text_dim).small());
+                ui.label(RichText::new(search_icon).color(theme.text_dim).small());
                 ui.label(
                     RichText::new(format!("{}▌", filter.query()))
                         .color(theme.text)

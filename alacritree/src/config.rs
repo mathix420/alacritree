@@ -231,6 +231,24 @@ fn parse_confirm_session_close(raw: Option<&str>) -> ConfirmSessionClose {
     }
 }
 
+/// Text-presentation magnifier (U+2315).  Not in egui's bundled fonts; it
+/// resolves through the system fallback chain `fonts.rs` registers.
+const DEFAULT_SEARCH_ICON: &str = "⌕";
+
+/// Sidebar glyphs overridable via `[ui.icons]`, for users whose fonts carry
+/// nicer symbols (Nerd Fonts etc.).
+#[derive(Debug, Clone)]
+pub struct UiIcons {
+    /// Glyph prefixing the sidebar search prompt.
+    pub search: String,
+}
+
+impl Default for UiIcons {
+    fn default() -> Self {
+        Self { search: DEFAULT_SEARCH_ICON.into() }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UiTheme {
     pub sidebar_background: Option<Color32>,
@@ -241,6 +259,7 @@ pub struct UiTheme {
     pub notifications: bool,
     /// Ask before the sidebar's per-session `×` kills the PTY.
     pub confirm_session_close: ConfirmSessionClose,
+    pub icons: UiIcons,
 }
 
 impl Default for UiTheme {
@@ -252,6 +271,7 @@ impl Default for UiTheme {
             sidebar_accent: None,
             notifications: true,
             confirm_session_close: ConfirmSessionClose::Never,
+            icons: UiIcons::default(),
         }
     }
 }
@@ -772,6 +792,15 @@ struct RawIndexed {
     color: RgbStr,
 }
 
+/// `[ui.icons]`: sidebar glyph overrides.  Any string works, so Nerd Font
+/// users can substitute their own icons.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawUiIcons {
+    /// Glyph prefixing the sidebar search prompt.
+    search: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawUiWsl {
@@ -793,6 +822,7 @@ struct RawUi {
     /// When the sidebar × on a session row asks before killing the PTY:
     /// "never" (default) | "busy" | "always".
     confirm_session_close: Option<String>,
+    icons: RawUiIcons,
     wsl: RawUiWsl,
     profiles: Vec<RawProfile>,
     default_profile: Option<String>,
@@ -921,6 +951,9 @@ impl RawConfig {
             confirm_session_close: parse_confirm_session_close(
                 self.ui.confirm_session_close.as_deref(),
             ),
+            icons: UiIcons {
+                search: self.ui.icons.search.unwrap_or_else(|| DEFAULT_SEARCH_ICON.into()),
+            },
         };
 
         // ---- Font ----
@@ -1178,6 +1211,12 @@ mod tests {
     fn confirm_session_close_invalid_falls_back_to_never() {
         let ui = ui_from_toml("[ui]\nconfirm_session_close = \"sometimes\"");
         assert_eq!(ui.confirm_session_close, ConfirmSessionClose::Never);
+    }
+
+    #[test]
+    fn search_icon_defaults_and_overrides() {
+        assert_eq!(ui_from_toml("").icons.search, DEFAULT_SEARCH_ICON);
+        assert_eq!(ui_from_toml("[ui.icons]\nsearch = \"\u{f002}\"").icons.search, "\u{f002}");
     }
 
     #[test]
