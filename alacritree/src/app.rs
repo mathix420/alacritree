@@ -2126,7 +2126,20 @@ impl AlacritreeApp {
             let mut rows = Vec::with_capacity(project.worktrees.len());
             for wt in &project.worktrees {
                 let info = if pr_enabled && project.expanded {
-                    self.pr_cache.poll(&wt.path, wt.branch.as_deref(), ctx)
+                    // The right sidebar polls the same path's PR cache using
+                    // the live `StatusCache` branch (recomputed every ~1.5s),
+                    // while this snapshot is only refreshed at discover/refresh
+                    // time. Two pollers of one path must agree on a branch or
+                    // each drain flips `entry.branch` and they invalidate each
+                    // other's lookups forever after an in-terminal checkout —
+                    // so prefer the live cache here too, falling back to the
+                    // snapshot only where no cache exists yet.
+                    let branch = self
+                        .git_status
+                        .get(&wt.path)
+                        .and_then(|cache| cache.current_branch())
+                        .or(wt.branch.as_deref());
+                    self.pr_cache.poll(&wt.path, branch, ctx)
                 } else {
                     None
                 };
