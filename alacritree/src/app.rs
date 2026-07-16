@@ -19,7 +19,7 @@ use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, St
 use crate::ipc;
 use crate::panel_filter::{self, PanelFilter};
 use crate::paste;
-use crate::pr_status::PrCache;
+use crate::pr_status::{PrCache, PrInfo, PrState};
 use crate::projects::{Project, Worktree, project_json};
 use crate::session::{Session, SessionId, SessionKind, TermSize};
 use crate::shortcuts_window;
@@ -52,6 +52,11 @@ struct Theme {
     /// "Needs attention" highlight.  Distinct from `accent` ("active
     /// workspace") so the two signals don't read as the same thing.
     attention: Color32,
+    /// PR badge colors, mapped to GitHub's conventions from the ANSI palette.
+    pr_open: Color32,
+    pr_draft: Color32,
+    pr_merged: Color32,
+    pr_closed: Color32,
     /// Logical-pixel size for headings (titles like "Projects", "Git").
     /// `FontConfig::UI_HEADING_RATIO` of the terminal font size.
     font_heading: f32,
@@ -90,6 +95,7 @@ impl Theme {
         let accent =
             config.ui.sidebar_accent.unwrap_or_else(|| rgb_to_color32(config.palette.normal[4])); // ANSI blue
         let border = config.ui.sidebar_border.unwrap_or_else(|| lighten(sidebar_bg, 0.10));
+        let text_muted = blend_toward(text, sidebar_bg, 0.55);
         let (font_normal, font_heading) = ui_text_px(&config.font, &config.ui_font);
         Self {
             terminal_bg,
@@ -99,9 +105,13 @@ impl Theme {
             row_active_bg: lighten(sidebar_bg, 0.10),
             text,
             text_dim: blend_toward(text, sidebar_bg, 0.35),
-            text_muted: blend_toward(text, sidebar_bg, 0.55),
+            text_muted,
             accent,
             attention: rgb_to_color32(config.palette.normal[3]), // ANSI yellow
+            pr_open: rgb_to_color32(config.palette.normal[2]),   // green
+            pr_draft: text_muted,
+            pr_merged: rgb_to_color32(config.palette.normal[5]), // magenta
+            pr_closed: rgb_to_color32(config.palette.normal[1]), // red
             font_heading,
             font_normal,
             ui_scale: font_normal / 11.25,
@@ -2078,6 +2088,23 @@ impl AlacritreeApp {
         let mut shell_override_changed: Option<PathBuf> = None;
         let mut label_cleared: Option<PathBuf> = None;
         let mut rename_request: Option<RenameState> = None;
+        // Polled up front, expanded projects only: collapsed projects cost no gh
+        // processes, and the panel closure borrows `projects` mutably so the cache
+        // cannot be polled from inside it.
+        let pr_enabled = self.config.ui.pr_status;
+        let mut pr_infos: Vec<Vec<Option<PrInfo>>> = Vec::with_capacity(self.projects.len());
+        for project in &self.projects {
+            let mut rows = Vec::with_capacity(project.worktrees.len());
+            for wt in &project.worktrees {
+                let info = if pr_enabled && project.expanded {
+                    self.pr_cache.poll(&wt.path, wt.branch.as_deref(), ctx)
+                } else {
+                    None
+                };
+                rows.push(info);
+            }
+            pr_infos.push(rows);
+        }
 
         let panel_resp = SidePanel::left("left_sidebar")
             .resizable(true)
@@ -2380,6 +2407,10 @@ impl AlacritreeApp {
                                 let action = worktree_row(
                                     ui,
                                     wt,
+                                    pr_infos
+                                        .get(idx)
+                                        .and_then(|v| v.get(wt_idx))
+                                        .and_then(Option::as_ref),
                                     is_active,
                                     is_cursor,
                                     cursor_moved,
@@ -3805,9 +3836,24 @@ fn creating_row(ui: &mut egui::Ui, branch: &str, icons: &Icons, theme: &Theme) {
     });
 }
 
+/// Badge glyph, color, and tooltip word for a PR state.
+fn pr_badge<'a>(
+    icons: &'a Icons,
+    theme: &Theme,
+    state: PrState,
+) -> (&'a str, Color32, &'static str) {
+    match state {
+        PrState::Open => (&icons.pr_open, theme.pr_open, "open"),
+        PrState::Draft => (&icons.pr_draft, theme.pr_draft, "draft"),
+        PrState::Merged => (&icons.pr_merged, theme.pr_merged, "merged"),
+        PrState::Closed => (&icons.pr_closed, theme.pr_closed, "closed"),
+    }
+}
+
 fn worktree_row(
     ui: &mut egui::Ui,
     wt: &Worktree,
+    pr: Option<&PrInfo>,
     is_active: bool,
     is_cursor: bool,
     scroll_into_view: bool,
@@ -3883,6 +3929,19 @@ fn worktree_row(
                     spawn_rect = Some(btn.rect);
                     if btn.clicked() {
                         spawn_clicked = true;
+                    }
+                    if let Some(info) = pr {
+                        let (glyph, color, word) = pr_badge(icons, theme, info.state);
+                        let (rect, resp) = ui
+                            .allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            glyph,
+                            egui::FontId::proportional(10.0 * theme.ui_scale),
+                            color,
+                        );
+                        resp.on_hover_text(format!("PR #{} — {word}", info.number));
                     }
                 },
             );

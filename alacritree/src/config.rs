@@ -338,6 +338,10 @@ pub struct UiTheme {
     pub last_session_close: LastSessionClose,
     /// Show single-session sidebar rows / tab segments ([`SessionDisplay`]).
     pub session_display: SessionDisplay,
+    /// Paint PR-status badges on worktree rows (and poll `gh` for expanded
+    /// projects' worktrees).  Best-effort like the diff-base lookup: no `gh`,
+    /// no auth, or no PR silently paints nothing.
+    pub pr_status: bool,
     pub icons: Icons,
 }
 
@@ -352,6 +356,7 @@ impl Default for UiTheme {
             confirm_session_close: ConfirmSessionClose::Never,
             last_session_close: LastSessionClose::Respawn,
             session_display: SessionDisplay::default(),
+            pr_status: true,
             icons: Icons::default(),
         }
     }
@@ -960,6 +965,7 @@ struct RawUi {
     session_display: RawSessionDisplay,
     delta_path: Option<String>,
     icons: RawIcons,
+    pr_status: Option<bool>,
     font: RawUiFont,
     wsl: RawUiWsl,
     profiles: Vec<RawProfile>,
@@ -1094,6 +1100,7 @@ impl RawConfig {
                 sidebar_always: self.ui.session_display.sidebar_always.unwrap_or(false),
                 tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
             },
+            pr_status: self.ui.pr_status.unwrap_or(true),
             icons: build_icons(self.ui.icons),
         };
 
@@ -1664,5 +1671,11 @@ program = "second"
         let ui = ui_from_toml("[ui.icons]\nworktree_main = \"   \"\nsession = \"\"");
         assert_eq!(ui.icons.worktree_main, "●");
         assert_eq!(ui.icons.session, "▪");
+    }
+
+    #[test]
+    fn pr_status_defaults_on_and_parses_off() {
+        assert!(ui_from_toml("").pr_status);
+        assert!(!ui_from_toml("[ui]\npr_status = false").pr_status);
     }
 }
