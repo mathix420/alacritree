@@ -8,7 +8,9 @@
 //! template string, so a typo'd config degrades to today's sidebar rather
 //! than blank rows.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use crate::projects::{Project, Worktree};
 
 /// Substitute `vars` into `template`.  `None` on any subst error or when the
 /// trimmed result is empty — the caller falls back to the plain name either
@@ -19,12 +21,100 @@ pub fn render_label(template: &str, vars: &HashMap<String, String>) -> Option<St
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// The configured templates plus warn-once bookkeeping.  Config strings are
+/// static per run, so one warning per template string covers every row that
+/// hits the same mistake without flooding the log every frame.
+pub struct LabelTemplates {
+    worktree: Option<String>,
+    project: Option<String>,
+    warned: HashSet<String>,
+}
+
+impl LabelTemplates {
+    pub fn new(worktree: Option<String>, project: Option<String>) -> Self {
+        Self { worktree, project, warned: HashSet::new() }
+    }
+
+    /// Display name for a worktree row.  Variables: `$name` (worktree name),
+    /// `$branch` (absent when detached, so `${branch:...}` falls back),
+    /// `$path` (full worktree path).
+    pub fn worktree_label(&mut self, wt: &Worktree) -> String {
+        let Some(template) = self.worktree.clone() else {
+            return wt.name.clone();
+        };
+        let mut vars = HashMap::new();
+        vars.insert("name".to_string(), wt.name.clone());
+        if let Some(branch) = &wt.branch {
+            vars.insert("branch".to_string(), branch.clone());
+        }
+        vars.insert("path".to_string(), wt.path.display().to_string());
+        self.render_or_fallback(&template, &vars, &wt.name)
+    }
+
+    /// Display name for a project row.  A manual rename always wins — the
+    /// template only shapes the *default* name.  Variables: `$name`
+    /// (directory name), `$path` (full project root).
+    pub fn project_label(&mut self, project: &Project) -> String {
+        if let Some(label) = &project.label {
+            return label.clone();
+        }
+        let Some(template) = self.project.clone() else {
+            return project.name.clone();
+        };
+        let mut vars = HashMap::new();
+        vars.insert("name".to_string(), project.name.clone());
+        vars.insert("path".to_string(), project.root.display().to_string());
+        self.render_or_fallback(&template, &vars, &project.name)
+    }
+
+    fn render_or_fallback(
+        &mut self,
+        template: &str,
+        vars: &HashMap<String, String>,
+        fallback: &str,
+    ) -> String {
+        match render_label(template, vars) {
+            Some(rendered) => rendered,
+            None => {
+                if self.warned.insert(template.to_string()) {
+                    log::warn!("label template {template:?} failed to render; using plain name");
+                }
+                fallback.to_string()
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::projects::{Project, Worktree};
+    use std::path::PathBuf;
 
     fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    fn wt(name: &str, branch: Option<&str>) -> Worktree {
+        Worktree {
+            name: name.to_string(),
+            path: PathBuf::from("/tmp/wt").join(name),
+            branch: branch.map(str::to_string),
+            is_main: false,
+            prunable: false,
+        }
+    }
+
+    fn project(name: &str, label: Option<&str>) -> Project {
+        Project {
+            root: PathBuf::from("/tmp/projects").join(name),
+            name: name.to_string(),
+            label: label.map(str::to_string),
+            default_branch: None,
+            worktrees: Vec::new(),
+            expanded: false,
+            shell_override: None,
+        }
     }
 
     #[test]
@@ -61,5 +151,42 @@ mod tests {
     fn empty_render_is_an_error() {
         assert_eq!(render_label("  ", &vars(&[])), None);
         assert_eq!(render_label("$name", &vars(&[("name", " ")])), None);
+    }
+
+    #[test]
+    fn no_template_returns_plain_names() {
+        let mut t = LabelTemplates::new(None, None);
+        assert_eq!(t.worktree_label(&wt("alpha", Some("feat/a"))), "alpha");
+        assert_eq!(t.project_label(&project("proj", None)), "proj");
+    }
+
+    #[test]
+    fn worktree_template_renders_branch_with_name_fallback() {
+        let mut t = LabelTemplates::new(Some("${branch:$name}".into()), None);
+        assert_eq!(t.worktree_label(&wt("alpha", Some("feat/a"))), "feat/a");
+        assert_eq!(t.worktree_label(&wt("detached", None)), "detached");
+    }
+
+    #[test]
+    fn project_template_renders_but_manual_label_wins() {
+        let mut t = LabelTemplates::new(None, Some("[$name]".into()));
+        assert_eq!(t.project_label(&project("proj", None)), "[proj]");
+        assert_eq!(t.project_label(&project("proj", Some("Renamed"))), "Renamed");
+    }
+
+    #[test]
+    fn bad_template_falls_back_to_plain_name() {
+        let mut t = LabelTemplates::new(Some("$typo".into()), Some("$typo".into()));
+        assert_eq!(t.worktree_label(&wt("alpha", None)), "alpha");
+        assert_eq!(t.project_label(&project("proj", None)), "proj");
+    }
+
+    #[test]
+    fn path_variable_is_available() {
+        let mut t = LabelTemplates::new(Some("$path".into()), Some("$path".into()));
+        let w = wt("alpha", None);
+        assert_eq!(t.worktree_label(&w), w.path.display().to_string());
+        let p = project("proj", None);
+        assert_eq!(t.project_label(&p), p.root.display().to_string());
     }
 }
