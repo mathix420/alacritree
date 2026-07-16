@@ -23,6 +23,7 @@ mod panel_filter;
 mod paste;
 mod pr_status;
 mod projects;
+mod row_label;
 mod session;
 mod shortcuts_window;
 mod sidebar_nav;
