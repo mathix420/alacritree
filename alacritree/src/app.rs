@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::bindings::{BindingAction, NamedAction};
 use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
-use crate::config::{Config, FontConfig, LastSessionClose, UiFont};
+use crate::config::{Config, FontConfig, Icons, LastSessionClose, UiFont};
 use crate::doppler;
 use crate::git_nav::{self, GitSection, SectionCount};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
@@ -2072,6 +2072,7 @@ impl AlacritreeApp {
         let creating: Vec<(usize, String)> =
             self.pending_creates.iter().map(|c| (c.project_idx, c.branch.clone())).collect();
         let distros = wsl::distros();
+        let icons = self.config.ui.icons.clone();
         let profile_names: Vec<String> =
             self.config.profiles.iter().map(|p| p.name.clone()).collect();
         let mut shell_override_changed: Option<PathBuf> = None;
@@ -2125,6 +2126,7 @@ impl AlacritreeApp {
                             cursor_moved,
                             home_attention,
                             home_agent_glyph,
+                            &icons,
                             &theme,
                         );
                         if home_action.activate {
@@ -2138,7 +2140,7 @@ impl AlacritreeApp {
                                 &cursor_row,
                                 Some(SidebarRow::Session(id)) if *id == row.id
                             );
-                            let act = session_row(ui, row, is_cursor, cursor_moved, &theme);
+                            let act = session_row(ui, row, is_cursor, cursor_moved, &icons, &theme);
                             if act.activate {
                                 activate_session_request.set(Some((None, row.id)));
                             }
@@ -2185,7 +2187,11 @@ impl AlacritreeApp {
                                     drag_handle(ui, &theme)
                                         .dnd_set_drag_payload(DraggedProject(project.root.clone()));
                                 }
-                                let arrow = if project.expanded { "▾" } else { "▸" };
+                                let arrow = if project.expanded {
+                                    icons.project_expanded.as_str()
+                                } else {
+                                    icons.project_collapsed.as_str()
+                                };
                                 if icon_button(ui, arrow, theme.text_dim, &theme).clicked() {
                                     project.expanded = !project.expanded;
                                     expand_toggled = Some((project.root.clone(), project.expanded));
@@ -2380,6 +2386,7 @@ impl AlacritreeApp {
                                     wt_attention,
                                     wt_glyph,
                                     is_deleting,
+                                    &icons,
                                     &theme,
                                 );
                                 if action.activate {
@@ -2420,7 +2427,14 @@ impl AlacritreeApp {
                                         &cursor_row,
                                         Some(SidebarRow::Session(id)) if *id == row.id
                                     );
-                                    let act = session_row(ui, row, is_cursor, cursor_moved, &theme);
+                                    let act = session_row(
+                                        ui,
+                                        row,
+                                        is_cursor,
+                                        cursor_moved,
+                                        &icons,
+                                        &theme,
+                                    );
                                     if act.activate {
                                         activate_session_request
                                             .set(Some((Some(wt.path.clone()), row.id)));
@@ -2431,7 +2445,7 @@ impl AlacritreeApp {
                                 }
                             }
                             for (_, branch) in creating.iter().filter(|(pi, _)| *pi == idx) {
-                                creating_row(ui, branch, &theme);
+                                creating_row(ui, branch, &icons, &theme);
                             }
                             ui.add_space(4.0);
                         }
@@ -3599,6 +3613,7 @@ fn home_row(
     scroll_into_view: bool,
     attention: bool,
     agent_glyph: Option<char>,
+    icons: &Icons,
     theme: &Theme,
 ) -> HomeAction {
     // Reserve a slot *before* the labels so the hover bg paints beneath them.
@@ -3613,7 +3628,14 @@ fn home_row(
             row_with_trailing(
                 ui,
                 |ui| {
-                    paint_row_status_icon(ui, theme, attention, agent_glyph, "⌂", is_active);
+                    paint_row_status_icon(
+                        ui,
+                        theme,
+                        attention,
+                        agent_glyph,
+                        &icons.home,
+                        is_active,
+                    );
                     ui.label(
                         RichText::new("Home")
                             .color(if is_active { theme.text } else { theme.text_dim })
@@ -3763,14 +3785,14 @@ fn session_row_title(title: &str, agent_glyph: Option<char>) -> String {
 /// spinner stands in until `poll_pending_creates` refreshes the project and the
 /// real worktree row takes its place.  Indentation and the leading glyph match
 /// `worktree_row` so it lines up with its future sibling.
-fn creating_row(ui: &mut egui::Ui, branch: &str, theme: &Theme) {
+fn creating_row(ui: &mut egui::Ui, branch: &str, icons: &Icons, theme: &Theme) {
     let s = theme.ui_scale;
     let frame = Frame::default().inner_margin(Margin { left: 16, right: 0, top: 3, bottom: 3 });
     frame.show(ui, |ui| {
         row_with_trailing(
             ui,
             |ui| {
-                ui.label(RichText::new("○").color(theme.text_muted).size(10.0 * s));
+                ui.label(RichText::new(&icons.worktree).color(theme.text_muted).size(10.0 * s));
                 ui.add(
                     egui::Label::new(RichText::new(branch).color(theme.text_muted).small())
                         .truncate(),
@@ -3792,6 +3814,7 @@ fn worktree_row(
     attention: bool,
     agent_glyph: Option<char>,
     deleting: bool,
+    icons: &Icons,
     theme: &Theme,
 ) -> WorktreeAction {
     // Reserve a slot *before* the labels so the hover bg paints beneath them.
@@ -3807,7 +3830,7 @@ fn worktree_row(
     let frame = Frame::default().inner_margin(Margin { left: 16, right: 0, top: 3, bottom: 3 });
     let resp = frame
         .show(ui, |ui| {
-            let default_icon = if wt.is_main { "●" } else { "○" };
+            let default_icon = if wt.is_main { &icons.worktree_main } else { &icons.worktree };
             let name_color = if wt.prunable || deleting {
                 theme.text_muted
             } else if is_active {
@@ -3920,6 +3943,7 @@ fn session_row(
     row: &SessionRowData,
     is_cursor: bool,
     scroll_into_view: bool,
+    icons: &Icons,
     theme: &Theme,
 ) -> SessionRowAction {
     // Reserve a slot *before* the labels so the hover bg paints beneath them.
@@ -3942,7 +3966,7 @@ fn session_row(
                         theme,
                         row.needs_attention,
                         row.agent_glyph,
-                        "▪",
+                        &icons.session,
                         row.is_active,
                     );
                     ui.add(

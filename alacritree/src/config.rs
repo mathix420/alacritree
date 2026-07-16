@@ -242,20 +242,6 @@ fn parse_confirm_session_close(raw: Option<&str>) -> ConfirmSessionClose {
 /// resolves through the system fallback chain `fonts.rs` registers.
 const DEFAULT_SEARCH_ICON: &str = "⌕";
 
-/// Sidebar glyphs overridable via `[ui.icons]`, for users whose fonts carry
-/// nicer symbols (Nerd Fonts etc.).
-#[derive(Debug, Clone)]
-pub struct UiIcons {
-    /// Glyph prefixing the sidebar search prompt.
-    pub search: String,
-}
-
-impl Default for UiIcons {
-    fn default() -> Self {
-        Self { search: DEFAULT_SEARCH_ICON.into() }
-    }
-}
-
 /// What happens when the on-screen workspace's last session closes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LastSessionClose {
@@ -300,6 +286,44 @@ pub struct UiFont {
     pub size: Option<f32>,
 }
 
+/// Sidebar status glyphs, each independently overridable from `[ui.icons]`.
+/// Overrides are trimmed and a blank value falls back to the default, so a
+/// row marker can never be rendered empty.  Action buttons (×, +, ↻, ⇅) are
+/// controls, not status, and stay fixed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Icons {
+    /// Glyph prefixing the sidebar search prompt.
+    pub search: String,
+    pub worktree_main: String,
+    pub worktree: String,
+    pub session: String,
+    pub home: String,
+    pub project_expanded: String,
+    pub project_collapsed: String,
+    pub pr_open: String,
+    pub pr_draft: String,
+    pub pr_merged: String,
+    pub pr_closed: String,
+}
+
+impl Default for Icons {
+    fn default() -> Self {
+        Self {
+            search: DEFAULT_SEARCH_ICON.into(),
+            worktree_main: "●".into(),
+            worktree: "○".into(),
+            session: "▪".into(),
+            home: "⌂".into(),
+            project_expanded: "▾".into(),
+            project_collapsed: "▸".into(),
+            pr_open: "⬤".into(),
+            pr_draft: "◯".into(),
+            pr_merged: "⬤".into(),
+            pr_closed: "⬤".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UiTheme {
     pub sidebar_background: Option<Color32>,
@@ -314,7 +338,7 @@ pub struct UiTheme {
     pub last_session_close: LastSessionClose,
     /// Show single-session sidebar rows / tab segments ([`SessionDisplay`]).
     pub session_display: SessionDisplay,
-    pub icons: UiIcons,
+    pub icons: Icons,
 }
 
 impl Default for UiTheme {
@@ -328,7 +352,7 @@ impl Default for UiTheme {
             confirm_session_close: ConfirmSessionClose::Never,
             last_session_close: LastSessionClose::Respawn,
             session_display: SessionDisplay::default(),
-            icons: UiIcons::default(),
+            icons: Icons::default(),
         }
     }
 }
@@ -851,15 +875,6 @@ struct RawIndexed {
     color: RgbStr,
 }
 
-/// `[ui.icons]`: sidebar glyph overrides.  Any string works, so Nerd Font
-/// users can substitute their own icons.
-#[derive(Debug, Default, Deserialize)]
-#[serde(default)]
-struct RawUiIcons {
-    /// Glyph prefixing the sidebar search prompt.
-    search: Option<String>,
-}
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawUiWsl {
@@ -868,6 +883,48 @@ struct RawUiWsl {
     /// from inside a distro); `wsl.exe --cd` translates with the distro's
     /// real mount table regardless of this value.
     automount_root: Option<String>,
+}
+
+/// `[ui.icons]`: sidebar glyph overrides.  Any string works, so Nerd Font
+/// users can substitute their own icons.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawIcons {
+    search: Option<String>,
+    worktree_main: Option<String>,
+    worktree: Option<String>,
+    session: Option<String>,
+    home: Option<String>,
+    project_expanded: Option<String>,
+    project_collapsed: Option<String>,
+    pr_open: Option<String>,
+    pr_draft: Option<String>,
+    pr_merged: Option<String>,
+    pr_closed: Option<String>,
+}
+
+/// A trimmed, non-blank override — or the default.
+fn icon_or(raw: Option<String>, default: &str) -> String {
+    raw.map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+fn build_icons(raw: RawIcons) -> Icons {
+    let d = Icons::default();
+    Icons {
+        search: icon_or(raw.search, &d.search),
+        worktree_main: icon_or(raw.worktree_main, &d.worktree_main),
+        worktree: icon_or(raw.worktree, &d.worktree),
+        session: icon_or(raw.session, &d.session),
+        home: icon_or(raw.home, &d.home),
+        project_expanded: icon_or(raw.project_expanded, &d.project_expanded),
+        project_collapsed: icon_or(raw.project_collapsed, &d.project_collapsed),
+        pr_open: icon_or(raw.pr_open, &d.pr_open),
+        pr_draft: icon_or(raw.pr_draft, &d.pr_draft),
+        pr_merged: icon_or(raw.pr_merged, &d.pr_merged),
+        pr_closed: icon_or(raw.pr_closed, &d.pr_closed),
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -902,7 +959,7 @@ struct RawUi {
     last_session_close: Option<String>,
     session_display: RawSessionDisplay,
     delta_path: Option<String>,
-    icons: RawUiIcons,
+    icons: RawIcons,
     font: RawUiFont,
     wsl: RawUiWsl,
     profiles: Vec<RawProfile>,
@@ -1037,9 +1094,7 @@ impl RawConfig {
                 sidebar_always: self.ui.session_display.sidebar_always.unwrap_or(false),
                 tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
             },
-            icons: UiIcons {
-                search: self.ui.icons.search.unwrap_or_else(|| DEFAULT_SEARCH_ICON.into()),
-            },
+            icons: build_icons(self.ui.icons),
         };
 
         // ---- Font ----
@@ -1582,5 +1637,32 @@ program = "second"
     fn blank_ui_font_family_is_ignored() {
         let config = parse("[ui.font]\nfamily = \"  \"");
         assert_eq!(config.ui_font.family, None);
+    }
+
+    #[test]
+    fn icons_default_to_todays_glyphs() {
+        let ui = ui_from_toml("");
+        assert_eq!(ui.icons, Icons::default());
+        assert_eq!(ui.icons.worktree_main, "●");
+        assert_eq!(ui.icons.worktree, "○");
+        assert_eq!(ui.icons.session, "▪");
+        assert_eq!(ui.icons.home, "⌂");
+        assert_eq!(ui.icons.project_expanded, "▾");
+        assert_eq!(ui.icons.project_collapsed, "▸");
+    }
+
+    #[test]
+    fn icon_overrides_apply_and_trim() {
+        let ui = ui_from_toml("[ui.icons]\nworktree = \" W \"\nhome = \"H\"");
+        assert_eq!(ui.icons.worktree, "W");
+        assert_eq!(ui.icons.home, "H");
+        assert_eq!(ui.icons.worktree_main, "●", "untouched fields keep defaults");
+    }
+
+    #[test]
+    fn blank_icon_override_falls_back() {
+        let ui = ui_from_toml("[ui.icons]\nworktree_main = \"   \"\nsession = \"\"");
+        assert_eq!(ui.icons.worktree_main, "●");
+        assert_eq!(ui.icons.session, "▪");
     }
 }
