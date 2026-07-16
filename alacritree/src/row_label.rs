@@ -22,12 +22,14 @@ pub fn render_label(template: &str, vars: &HashMap<String, String>) -> Option<St
 }
 
 /// The configured templates plus warn-once bookkeeping.  Config strings are
-/// static per run, so one warning per template string covers every row that
-/// hits the same mistake without flooding the log every frame.
+/// static per run, so one warning per config key + template covers every row
+/// that hits the same mistake without flooding the log every frame — keying
+/// on the template alone would let a second, independently broken config key
+/// hide behind the first one's warning just because the text matched.
 pub struct LabelTemplates {
     worktree: Option<String>,
     project: Option<String>,
-    warned: HashSet<String>,
+    warned: HashSet<(String, String)>,
 }
 
 impl LabelTemplates {
@@ -48,7 +50,7 @@ impl LabelTemplates {
             vars.insert("branch".to_string(), branch.clone());
         }
         vars.insert("path".to_string(), wt.path.display().to_string());
-        self.render_or_fallback(&template, &vars, &wt.name)
+        self.render_or_fallback("worktree_name", &template, &vars, &wt.name)
     }
 
     /// Display name for a project row.  A manual rename always wins — the
@@ -64,11 +66,12 @@ impl LabelTemplates {
         let mut vars = HashMap::new();
         vars.insert("name".to_string(), project.name.clone());
         vars.insert("path".to_string(), project.root.display().to_string());
-        self.render_or_fallback(&template, &vars, &project.name)
+        self.render_or_fallback("project_name", &template, &vars, &project.name)
     }
 
     fn render_or_fallback(
         &mut self,
+        slot: &str,
         template: &str,
         vars: &HashMap<String, String>,
         fallback: &str,
@@ -76,8 +79,10 @@ impl LabelTemplates {
         match render_label(template, vars) {
             Some(rendered) => rendered,
             None => {
-                if self.warned.insert(template.to_string()) {
-                    log::warn!("label template {template:?} failed to render; using plain name");
+                if self.warned.insert((slot.to_string(), template.to_string())) {
+                    log::warn!(
+                        "[ui] {slot} template {template:?} failed to render; using plain name"
+                    );
                 }
                 fallback.to_string()
             },
@@ -88,7 +93,6 @@ impl LabelTemplates {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::projects::{Project, Worktree};
     use std::path::PathBuf;
 
     fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -179,6 +183,16 @@ mod tests {
         let mut t = LabelTemplates::new(Some("$typo".into()), Some("$typo".into()));
         assert_eq!(t.worktree_label(&wt("alpha", None)), "alpha");
         assert_eq!(t.project_label(&project("proj", None)), "proj");
+    }
+
+    #[test]
+    fn warn_once_per_config_key_not_per_template() {
+        let mut t = LabelTemplates::new(Some("$typo".into()), Some("$typo".into()));
+        assert_eq!(t.worktree_label(&wt("alpha", None)), "alpha");
+        assert_eq!(t.worktree_label(&wt("alpha", None)), "alpha");
+        assert_eq!(t.project_label(&project("proj", None)), "proj");
+        assert_eq!(t.project_label(&project("proj", None)), "proj");
+        assert_eq!(t.warned.len(), 2);
     }
 
     #[test]
