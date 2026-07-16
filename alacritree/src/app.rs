@@ -415,7 +415,11 @@ impl AlacritreeApp {
     pub fn new(cc: &CreationContext<'_>, config: Config) -> Self {
         let theme = Theme::from_config(&config);
 
-        let font_chain = crate::fonts::install_terminal_fonts(&cc.egui_ctx, &config.font);
+        let font_chain = crate::fonts::install_terminal_fonts(
+            &cc.egui_ctx,
+            &config.font,
+            config.ui_font.family.as_deref(),
+        );
         let color_glyph_budget_mb = config.font.color_glyph_cache_mb;
 
         let mut visuals = egui::Visuals::dark();

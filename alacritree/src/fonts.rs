@@ -36,6 +36,11 @@ const BOLD_FONT_ID: &str = "alacritree_terminal_bold";
 const ITALIC_FONT_ID: &str = "alacritree_terminal_italic";
 const BOLD_ITALIC_FONT_ID: &str = "alacritree_terminal_bold_italic";
 
+const UI_FONT_ID: &str = "alacritree_ui_normal";
+/// Temporary family the UI chain is assembled under before being spliced to
+/// the head of `Proportional`; removed again so it never leaks to egui.
+const UI_FAMILY: &str = "alacritree_ui";
+
 #[derive(Clone, Copy)]
 enum Variant {
     Normal,
@@ -574,10 +579,62 @@ fn fallback_tweak(primary_ratio: Option<f32>, data: &[u8], index: u32) -> FontTw
     FontTweak { scale, ..FontTweak::default() }
 }
 
+/// Put the `[ui.font]` family — and its own fallback chain — ahead of the
+/// terminal font in egui's `Proportional` family, so all chrome text prefers
+/// it.  `Monospace` (the grid) is untouched.  Returns `false` and leaves the
+/// definitions unchanged when the family cannot be resolved or read, in which
+/// case the chrome keeps using the terminal font.
+fn install_ui_font(defs: &mut FontDefinitions, family_or_path: &str, fonts: &SystemFonts) -> bool {
+    let Some(resolved) = resolve_face(family_or_path, None, Variant::Normal, fonts) else {
+        log::warn!("could not resolve ui font '{family_or_path}'; keeping the terminal font");
+        return false;
+    };
+    let bytes = match map_font_file(&resolved.path) {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("could not read ui font file {}: {e}", resolved.path.display());
+            return false;
+        },
+    };
+    insert_face(defs, UI_FONT_ID, bytes);
+    let ui_family = FontFamily::Name(UI_FAMILY.into());
+    defs.families.insert(ui_family.clone(), vec![UI_FONT_ID.to_string()]);
+
+    // Its own book: the UI chain must not leak into the terminal's normal
+    // chain (which feeds the colour-glyph renderer), and fallback height
+    // normalization must anchor to the UI face, not the terminal face.
+    let mut book = FallbackBook::default();
+    book.loaded_paths.insert(resolved.path.clone());
+    book.primary_height_ratio = face_height_ratio(bytes, resolved.face_index);
+    let targets = [ui_family.clone()];
+    register_fallback_faces(
+        defs,
+        family_or_path,
+        None,
+        Variant::Normal,
+        &targets,
+        fonts,
+        &mut book,
+    );
+
+    // Splice the assembled UI chain ahead of everything already in
+    // `Proportional` (terminal font + its fallbacks).
+    let ui_ids = defs.families.remove(&ui_family).unwrap_or_default();
+    let prop = defs.families.entry(FontFamily::Proportional).or_default();
+    for id in ui_ids.into_iter().rev() {
+        prop.insert(0, id);
+    }
+    true
+}
+
 /// Register the terminal faces with egui and return the normal-variant
 /// fallback chain, in the order egui consults it, for the colour glyph
 /// renderer to resolve against.
-pub fn install_terminal_fonts(ctx: &Context, font: &FontConfig) -> Vec<ChainFace> {
+pub fn install_terminal_fonts(
+    ctx: &Context,
+    font: &FontConfig,
+    ui_family: Option<&str>,
+) -> Vec<ChainFace> {
     let (normal, bold, italic, bold_italic) =
         (&font.normal, &font.bold, &font.italic, &font.bold_italic);
     let family = normal.family.as_deref().unwrap_or(DEFAULT_FAMILY);
@@ -671,6 +728,10 @@ pub fn install_terminal_fonts(ctx: &Context, font: &FontConfig) -> Vec<ChainFace
     for (family, style, variant, targets) in seeds {
         register_user_fallbacks(&mut defs, &font.fallback, variant, targets, &fonts, &mut book);
         register_fallback_faces(&mut defs, family, style, variant, targets, &fonts, &mut book);
+    }
+
+    if let Some(ui_family) = ui_family {
+        install_ui_font(&mut defs, ui_family, &fonts);
     }
 
     ctx.set_fonts(defs);
@@ -1122,6 +1183,38 @@ mod tests {
         assert!(defs.families[&FontFamily::Name(BOLD_FAMILY.into())].contains(id));
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn ui_font_heads_the_proportional_family() {
+        let path = std::env::temp_dir().join("alacritree_test_ui_font.ttf");
+        std::fs::write(&path, b"registration only maps bytes").unwrap();
+
+        let mut defs = FontDefinitions::default();
+        let fonts = SystemFonts::with_cache_dir(None);
+        let mono_before = defs.families[&FontFamily::Monospace].clone();
+
+        assert!(install_ui_font(&mut defs, path.to_string_lossy().as_ref(), &fonts));
+
+        let prop = &defs.families[&FontFamily::Proportional];
+        assert_eq!(prop.first().map(String::as_str), Some(UI_FONT_ID));
+        // The grid's family is untouched.
+        assert_eq!(defs.families[&FontFamily::Monospace], mono_before);
+        // The temporary splice family does not leak into the definitions.
+        assert!(!defs.families.contains_key(&FontFamily::Name(UI_FAMILY.into())));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn unresolvable_ui_font_changes_nothing() {
+        let mut defs = FontDefinitions::default();
+        let fonts = SystemFonts::with_cache_dir(None);
+        let before = defs.families[&FontFamily::Proportional].clone();
+
+        assert!(!install_ui_font(&mut defs, "alacritree-no-such-ui-family-9f3a", &fonts));
+
+        assert_eq!(defs.families[&FontFamily::Proportional], before);
     }
 
     // epaint clones the whole buffer of every `Cow::Owned` face it parses, so

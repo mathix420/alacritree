@@ -339,7 +339,7 @@ mod tests {
             .collect(),
             ..FontConfig::default()
         };
-        let chain = crate::fonts::install_terminal_fonts(ctx, &font);
+        let chain = crate::fonts::install_terminal_fonts(ctx, &font, None);
 
         let renders_emoji = chain.iter().find_map(|face| {
             let data = std::fs::read(&face.path).ok()?;
@@ -432,7 +432,7 @@ mod tests {
     #[test]
     fn plain_text_is_left_to_egui() {
         let ctx = Context::default();
-        let chain = crate::fonts::install_terminal_fonts(&ctx, &FontConfig::default());
+        let chain = crate::fonts::install_terminal_fonts(&ctx, &FontConfig::default(), None);
         let mut cache = ColorGlyphCache::new(chain, 10);
         for c in ['A', 'z', '0', '─', '│'] {
             assert!(cache.get(&ctx, c, &metrics(), 1).is_none(), "{c} took the colour path");
