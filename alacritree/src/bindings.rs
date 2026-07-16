@@ -51,6 +51,7 @@ pub enum NamedAction {
     SelectPreviousWorkspace,
     AddProject,
     ToggleSidebarFocus,
+    CloseSession,
     FocusProjectsSidebar,
     FocusGitSidebar,
     FocusTerminal,
@@ -195,6 +196,7 @@ fn default_bindings() -> Vec<KeyBinding> {
             action: BindingAction::Named(ToggleSidebarFocus),
         },
         KeyBinding { key: Key::G, mods: ctrl_shift, action: BindingAction::Named(FocusGitSidebar) },
+        KeyBinding { key: Key::W, mods: ctrl_shift, action: BindingAction::Named(CloseSession) },
         KeyBinding { key: Key::T, mods: ctrl, action: BindingAction::Named(SpawnNewInstance) },
         KeyBinding { key: Key::Q, mods: ctrl, action: BindingAction::Named(Quit) },
     ]);
@@ -499,6 +501,7 @@ fn parse_action(name: &str) -> BindingAction {
         "SelectPreviousWorkspace" => BindingAction::Named(SelectPreviousWorkspace),
         "AddProject" => BindingAction::Named(AddProject),
         "ToggleSidebarFocus" => BindingAction::Named(ToggleSidebarFocus),
+        "CloseSession" => BindingAction::Named(CloseSession),
         "FocusProjectsSidebar" => BindingAction::Named(FocusProjectsSidebar),
         "FocusGitSidebar" => BindingAction::Named(FocusGitSidebar),
         "FocusTerminal" => BindingAction::Named(FocusTerminal),
@@ -785,5 +788,22 @@ mod tests {
                 "{name} parsed to {action:?}"
             );
         }
+    }
+
+    #[test]
+    fn close_session_is_a_default_ctrl_shift_w_binding() {
+        let b = parse_bindings(vec![]);
+        assert_eq!(
+            named_matches(&b, Key::W, Modifiers::CTRL | Modifiers::SHIFT),
+            vec![NamedAction::CloseSession]
+        );
+    }
+
+    #[test]
+    fn close_session_parses_from_config_name() {
+        assert!(matches!(
+            parse_action("CloseSession"),
+            BindingAction::Named(NamedAction::CloseSession)
+        ));
     }
 }

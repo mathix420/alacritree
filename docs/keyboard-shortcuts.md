@@ -57,6 +57,7 @@ and your TOML entries are checked first — so your config overrides any default
 | `Shift+Tab`          | Send `CSI Z` (reverse tab — readline/vim)             |
 | `Alt+Shift+Tab`      | Send `ESC` + `CSI Z`                                  |
 | `Ctrl+Shift+B`       | Toggle keyboard focus between terminal and sidebar    |
+| `Ctrl+Shift+W`       | Close the active session in the current workspace     |
 
 ### Additional defaults on macOS
 
@@ -119,6 +120,9 @@ entry. Names match alacritty's own action names, so existing configs port over.
 - `SelectTab1` … `SelectTab9` — select the Nth session in the current
   workspace. Out-of-range indices are ignored.
 - `SelectLastTab` — select the last session in the current workspace.
+- `CloseSession` — close the active session in the current workspace.
+  Honors the `confirm_session_close` policy (may open a confirmation
+  dialog).
 - `SpawnProfile1` … `SpawnProfile9` — spawn the Nth `[[ui.profiles]]` entry
   in the current workspace. Out-of-range indices show an error toast.
   Example binding:

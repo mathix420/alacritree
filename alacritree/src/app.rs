@@ -1504,6 +1504,12 @@ impl AlacritreeApp {
                 // to the left one rather than doing nothing.
                 PaneFocus::GitSidebar => self.focus_sidebar(),
             },
+            BindingAction::Named(NamedAction::CloseSession) => {
+                if let Some(idx) = self.active_session_index() {
+                    let id = self.sessions[idx].id;
+                    self.request_close_session(id);
+                }
+            },
             BindingAction::Named(NamedAction::FocusProjectsSidebar) => {
                 if self.focus != PaneFocus::ProjectsSidebar {
                     self.focus_sidebar();
