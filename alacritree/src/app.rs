@@ -772,8 +772,14 @@ impl AlacritreeApp {
                 // adopts rather than spawns.
                 self.current_workspace = Some(main);
                 self.ensure_active_session(ctx);
+                // Adopting an existing session produces no PTY events, so
+                // nothing else would wake the next paint.
+                ctx.request_repaint();
             },
-            CloseFallback::Home => self.activate_home(ctx),
+            CloseFallback::Home => {
+                self.activate_home(ctx);
+                ctx.request_repaint();
+            },
         }
     }
 
@@ -2600,19 +2606,21 @@ impl AlacritreeApp {
             return;
         };
         let new_key = diff_key(&req);
-        let already_showing = self.sessions.iter().any(|s| {
+        let existing = self.sessions.iter().find(|s| {
             s.working_directory.as_deref() == Some(&workspace)
-                && matches!(&s.kind, SessionKind::Diff { key } if key == &new_key)
+                && matches!(&s.kind, SessionKind::Diff { .. })
         });
-        self.sessions.retain(|s| {
-            !(matches!(s.kind, SessionKind::Diff { .. })
-                && s.working_directory.as_deref() == Some(&workspace))
-        });
-        if already_showing {
-            // Active-session fallback to the workspace's shell happens next
-            // frame: `active_session_index()` returns None for the stale id, and
-            // `ensure_active_session` picks up an existing shell or spawns one.
-            return;
+        if let Some(session) = existing {
+            let id = session.id;
+            if matches!(&session.kind, SessionKind::Diff { key } if key == &new_key) {
+                // Routing through close_session applies the same
+                // sibling-promotion and fallback navigation as any other
+                // close, so toggling off the diff pane never strands the
+                // workspace on an empty view.
+                self.close_session(ctx, id);
+                return;
+            }
+            self.sessions.retain(|s| s.id != id);
         }
 
         let delta_override = self.config.delta_path.clone();
@@ -4157,10 +4165,13 @@ impl AlacritreeApp {
         // Drop sessions whose cwd is the worktree before deleting it; the PTY
         // would otherwise block the directory removal on some filesystems.
         self.sessions.retain(|s| s.working_directory.as_deref() != Some(&req.worktree_path));
-        if self.current_workspace.as_deref() == Some(&req.worktree_path) {
-            self.current_workspace = None;
-        }
         self.active_session.remove(&Some(req.worktree_path.clone()));
+        if self.current_workspace.as_deref() == Some(&req.worktree_path) {
+            // Deleting the on-screen worktree is an explicit user action, so
+            // home should greet with a live shell rather than the "no
+            // session" placeholder.
+            self.activate_home(ctx);
+        }
 
         // The git removal (shellouts, branch delete, doppler cleanup) is slow
         // enough to stutter paint, so run it off-thread and adopt the result in
