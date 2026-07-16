@@ -1694,6 +1694,10 @@ program = "second"
         assert_eq!(ui.icons.home, "⌂");
         assert_eq!(ui.icons.project_expanded, "▾");
         assert_eq!(ui.icons.project_collapsed, "▸");
+        assert_eq!(ui.icons.pr_open, "⬤");
+        assert_eq!(ui.icons.pr_draft, "◯");
+        assert_eq!(ui.icons.pr_merged, "⬤");
+        assert_eq!(ui.icons.pr_closed, "⬤");
     }
 
     #[test]

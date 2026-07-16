@@ -58,7 +58,7 @@ struct Entry {
 }
 
 struct LookupResult {
-    branch: Option<String>,
+    branch: String,
     info: Option<PrInfo>,
 }
 
@@ -88,39 +88,51 @@ impl PrCache {
         // refresh — a result that just arrived shouldn't be ignored.
         if let Some(rx) = entry.pending.as_ref() {
             if let Ok(result) = rx.try_recv() {
-                entry.branch = result.branch;
+                entry.branch = Some(result.branch);
                 entry.info = result.info;
                 entry.queried_at = Some(Instant::now());
                 entry.pending = None;
             }
         }
 
-        let branch_matches = entry.branch.as_deref() == branch;
-        let fresh = entry.queried_at.map_or(false, |when| when.elapsed() < TTL);
-        let needs_refresh = !branch_matches || !fresh;
+        // A `None` poll (the git-status compute hasn't produced a branch
+        // yet, or never will) carries no information about the current
+        // branch, so it must not evict or refresh a lookup keyed to a real
+        // one from another caller — just read whatever is cached.
+        let Some(branch) = branch else {
+            return entry.info.clone();
+        };
 
-        if needs_refresh && entry.pending.is_none() {
+        let invalidate = should_invalidate(entry.branch.as_deref(), Some(branch));
+        let fresh = entry.queried_at.map_or(false, |when| when.elapsed() < TTL);
+
+        if (invalidate || !fresh) && entry.pending.is_none() {
             // Clear stale data immediately on branch switch so we don't show
             // a PR base that belongs to a different branch.
-            if !branch_matches {
+            if invalidate {
                 entry.info = None;
             }
-            entry.pending =
-                Some(spawn_lookup(path.to_path_buf(), branch.map(str::to_string), ctx.clone()));
+            entry.pending = Some(spawn_lookup(path.to_path_buf(), branch.to_string(), ctx.clone()));
         }
 
         entry.info.clone()
     }
 }
 
-fn spawn_lookup(
-    path: PathBuf,
-    branch: Option<String>,
-    ctx: egui::Context,
-) -> Receiver<LookupResult> {
+/// A `None` incoming branch never invalidates — the caller has nothing to
+/// compare against. A `Some` branch that disagrees with the cached one means
+/// a real branch switch and must invalidate.
+fn should_invalidate(cached_branch: Option<&str>, incoming_branch: Option<&str>) -> bool {
+    match incoming_branch {
+        None => false,
+        Some(_) => cached_branch != incoming_branch,
+    }
+}
+
+fn spawn_lookup(path: PathBuf, branch: String, ctx: egui::Context) -> Receiver<LookupResult> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let info = branch.as_deref().and_then(|b| query_gh(&path, b));
+        let info = query_gh(&path, &branch);
         let _ = tx.send(LookupResult { branch, info });
         ctx.request_repaint();
     });
@@ -224,5 +236,53 @@ mod tests {
         let stdout =
             br#"{"baseRefName":"main","number":42,"url":"https://github.com/o/r/pull/42"}"#;
         assert_eq!(parse_gh_output(stdout).unwrap().state, PrState::Open);
+    }
+
+    fn sample_info() -> PrInfo {
+        PrInfo {
+            number: 7,
+            base_branch: "main".to_string(),
+            url: "https://github.com/o/r/pull/7".to_string(),
+            state: PrState::Open,
+        }
+    }
+
+    #[test]
+    fn none_branch_does_not_invalidate_a_cached_branch() {
+        assert!(!should_invalidate(Some("b"), None));
+    }
+
+    #[test]
+    fn mismatched_branch_invalidates() {
+        assert!(should_invalidate(Some("b"), Some("a")));
+    }
+
+    #[test]
+    fn matching_branch_does_not_invalidate() {
+        assert!(!should_invalidate(Some("b"), Some("b")));
+    }
+
+    #[test]
+    fn polling_with_none_retains_info_from_a_completed_some_branch_lookup() {
+        let mut cache = PrCache::new();
+        let path = PathBuf::from("/repo");
+        cache.entries.insert(
+            path.clone(),
+            Entry {
+                branch: Some("b".to_string()),
+                info: Some(sample_info()),
+                queried_at: Some(Instant::now()),
+                pending: None,
+            },
+        );
+
+        let ctx = egui::Context::default();
+        let result = cache.poll(&path, None, &ctx);
+
+        assert_eq!(result.map(|info| info.number), Some(7));
+        let entry = cache.entries.get(&path).unwrap();
+        assert_eq!(entry.branch.as_deref(), Some("b"));
+        assert!(entry.info.is_some(), "None poll must not clear the cached info");
+        assert!(entry.pending.is_none(), "None poll must not spawn a competing lookup");
     }
 }
