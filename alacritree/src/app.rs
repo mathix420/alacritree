@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::bindings::{BindingAction, NamedAction};
 use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
-use crate::config::Config;
+use crate::config::{Config, LastSessionClose};
 use crate::doppler;
 use crate::git_nav::{self, GitSection, SectionCount};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
@@ -760,12 +760,22 @@ impl AlacritreeApp {
         }
 
         // Closing the on-screen workspace's last session must not strand the
-        // view on an empty pane, and respawning in place would make the last
-        // session unclosable — fall back to the project main, then home.
+        // view on an empty pane. What happens instead is policy: `respawn`
+        // recycles a shell in place (the last session is by design
+        // unclosable), `navigate` falls back to the project main, then home.
         let remaining: Vec<(WorkspaceKey, SessionId)> =
             self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect();
         let main = workspace.as_deref().and_then(|p| project_main_for(&self.projects, p));
-        match close_fallback(&workspace, &self.current_workspace, &remaining, main) {
+        let verdict = close_fallback(&workspace, &self.current_workspace, &remaining, main);
+        if verdict != CloseFallback::Stay
+            && self.config.ui.last_session_close == LastSessionClose::Respawn
+        {
+            if let Err(e) = self.spawn_session(ctx, workspace) {
+                self.last_error = Some(format!("failed to spawn shell: {e}"));
+            }
+            return;
+        }
+        match verdict {
             CloseFallback::Stay => {},
             CloseFallback::Activate(main) => {
                 // The fallback verified a session exists there, so this

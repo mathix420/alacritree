@@ -208,7 +208,8 @@ pub struct Palette {
 pub enum ConfirmSessionClose {
     #[default]
     Never,
-    /// Prompt only when the session looks busy (agent glyph or spinner title).
+    /// Prompt only when the session looks busy (running process, agent
+    /// glyph, or spinner title).
     Busy,
     Always,
 }
@@ -254,6 +255,30 @@ impl Default for UiIcons {
     }
 }
 
+/// What happens when the on-screen workspace's last session closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LastSessionClose {
+    /// Recycle a shell in place — the workspace always has a live session,
+    /// so the last session is by design unclosable.
+    #[default]
+    Respawn,
+    /// Move to the project's main checkout when it has a live session,
+    /// otherwise home (which spawns a shell only if it has none).
+    Navigate,
+}
+
+fn parse_last_session_close(raw: Option<&str>) -> LastSessionClose {
+    match raw {
+        None => LastSessionClose::default(),
+        Some("respawn") => LastSessionClose::Respawn,
+        Some("navigate") => LastSessionClose::Navigate,
+        Some(other) => {
+            log::warn!("unknown ui.last_session_close value {other:?}, using \"respawn\"");
+            LastSessionClose::default()
+        },
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UiTheme {
     pub sidebar_background: Option<Color32>,
@@ -264,6 +289,8 @@ pub struct UiTheme {
     pub notifications: bool,
     /// Ask before the sidebar's per-session `×` kills the PTY.
     pub confirm_session_close: ConfirmSessionClose,
+    /// What closing the last session in the on-screen workspace does.
+    pub last_session_close: LastSessionClose,
     pub icons: UiIcons,
 }
 
@@ -276,6 +303,7 @@ impl Default for UiTheme {
             sidebar_accent: None,
             notifications: true,
             confirm_session_close: ConfirmSessionClose::Never,
+            last_session_close: LastSessionClose::Respawn,
             icons: UiIcons::default(),
         }
     }
@@ -828,6 +856,9 @@ struct RawUi {
     /// When the sidebar × on a session row asks before killing the PTY:
     /// "never" (default) | "busy" | "always".
     confirm_session_close: Option<String>,
+    /// What closing the on-screen workspace's last session does:
+    /// "respawn" (default) | "navigate".
+    last_session_close: Option<String>,
     delta_path: Option<String>,
     icons: RawUiIcons,
     wsl: RawUiWsl,
@@ -958,6 +989,7 @@ impl RawConfig {
             confirm_session_close: parse_confirm_session_close(
                 self.ui.confirm_session_close.as_deref(),
             ),
+            last_session_close: parse_last_session_close(self.ui.last_session_close.as_deref()),
             icons: UiIcons {
                 search: self.ui.icons.search.unwrap_or_else(|| DEFAULT_SEARCH_ICON.into()),
             },
@@ -1238,6 +1270,28 @@ mod tests {
     fn search_icon_defaults_and_overrides() {
         assert_eq!(ui_from_toml("").icons.search, DEFAULT_SEARCH_ICON);
         assert_eq!(ui_from_toml("[ui.icons]\nsearch = \"\u{f002}\"").icons.search, "\u{f002}");
+    }
+
+    #[test]
+    fn last_session_close_defaults_to_respawn() {
+        let ui = ui_from_toml("");
+        assert_eq!(ui.last_session_close, LastSessionClose::Respawn);
+    }
+
+    #[test]
+    fn last_session_close_parses_all_values() {
+        for (raw, expected) in
+            [("respawn", LastSessionClose::Respawn), ("navigate", LastSessionClose::Navigate)]
+        {
+            let ui = ui_from_toml(&format!("[ui]\nlast_session_close = \"{raw}\""));
+            assert_eq!(ui.last_session_close, expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn last_session_close_invalid_falls_back_to_respawn() {
+        let ui = ui_from_toml("[ui]\nlast_session_close = \"panic\"");
+        assert_eq!(ui.last_session_close, LastSessionClose::Respawn);
     }
 
     #[test]

@@ -122,7 +122,10 @@ entry. Names match alacritty's own action names, so existing configs port over.
 - `SelectLastTab` — select the last session in the current workspace.
 - `CloseSession` — close the active session in the current workspace.
   Honors the `confirm_session_close` policy (may open a confirmation
-  dialog).
+  dialog; `"busy"` prompts only while a process is running). When the
+  workspace's last session closes, `ui.last_session_close` decides what
+  follows: `"respawn"` (default) recycles a shell in place, `"navigate"`
+  moves to the project's main checkout or home.
 - `SpawnProfile1` … `SpawnProfile9` — spawn the Nth `[[ui.profiles]]` entry
   in the current workspace. Out-of-range indices show an error toast.
   Example binding:

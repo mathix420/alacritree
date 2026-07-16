@@ -115,6 +115,8 @@ struct AgentCache {
     polled_at: Option<Instant>,
     /// Static glyph for the foreground process if it's a recognized agent.
     process_glyph: Option<char>,
+    /// Whether anything is running in the terminal beyond the shell itself.
+    foreground_job: bool,
 }
 
 const AGENT_CACHE_TTL: Duration = Duration::from_millis(1000);
@@ -319,13 +321,46 @@ fn read_cmdline(pid: u32) -> Option<String> {
 /// `/proc/<pid>/stat` is `pid (comm) state ppid pgrp session tty_nr tpgid …`.
 /// `comm` may contain spaces and unmatched parens, so split on the *last* `)`
 /// before tokenizing the rest.
-#[cfg(target_os = "linux")]
-fn read_tpgid(shell_pid: u32) -> Option<i32> {
-    let stat = std::fs::read_to_string(format!("/proc/{shell_pid}/stat")).ok()?;
+#[cfg(any(target_os = "linux", test))]
+fn stat_pgrp_tpgid(stat: &str) -> Option<(i32, i32)> {
     let close = stat.rfind(')')?;
     let after = &stat[close + 1..];
     // After `comm`: state(0) ppid(1) pgrp(2) session(3) tty_nr(4) tpgid(5).
-    after.split_whitespace().nth(5)?.parse::<i32>().ok()
+    let mut fields = after.split_whitespace();
+    let pgrp = fields.nth(2)?.parse::<i32>().ok()?;
+    let tpgid = fields.nth(2)?.parse::<i32>().ok()?;
+    Some((pgrp, tpgid))
+}
+
+#[cfg(target_os = "linux")]
+fn read_tpgid(shell_pid: u32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{shell_pid}/stat")).ok()?;
+    stat_pgrp_tpgid(&stat).map(|(_, tpgid)| tpgid)
+}
+
+/// The shell is its own foreground process group when idle; the terminal's
+/// foreground group differing from the shell's own group means a job owns
+/// the terminal right now.
+#[cfg(target_os = "linux")]
+fn shell_has_foreground_job(shell_pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{shell_pid}/stat")) else {
+        return false;
+    };
+    stat_pgrp_tpgid(&stat).is_some_and(|(pgrp, tpgid)| tpgid > 0 && tpgid != pgrp)
+}
+
+/// Windows has no foreground process group, so "a job is running" is
+/// approximated as the shell having any descendant process — the same
+/// approximation the agent glyph uses.
+#[cfg(windows)]
+fn shell_has_foreground_job(shell_pid: u32) -> bool {
+    windows_process_probe::probe(shell_pid).1
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn shell_has_foreground_job(_shell_pid: u32) -> bool {
+    // No probe wired (macOS would need `tcgetpgrp` on the PTY master).
+    false
 }
 
 /// Windows has no foreground process group, so "foreground" is approximated
@@ -335,7 +370,7 @@ fn read_tpgid(shell_pid: u32) -> Option<i32> {
 /// heuristic would flicker.
 #[cfg(windows)]
 fn foreground_process_glyph(shell_pid: u32) -> Option<char> {
-    windows_process_probe::agent_glyph_under(shell_pid)
+    windows_process_probe::probe(shell_pid).0
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
@@ -394,7 +429,9 @@ mod windows_process_probe {
 
     static SNAPSHOT: Mutex<Option<(Instant, System)>> = Mutex::new(None);
 
-    pub(super) fn agent_glyph_under(shell_pid: u32) -> Option<char> {
+    /// Agent glyph found in the shell's descendant tree, plus whether the
+    /// shell has any descendants at all.
+    pub(super) fn probe(shell_pid: u32) -> (Option<char>, bool) {
         let mut guard = SNAPSHOT.lock().unwrap_or_else(PoisonError::into_inner);
         if guard.as_ref().is_none_or(|(at, _)| at.elapsed() >= SNAPSHOT_TTL) {
             let mut sys = guard.take().map(|(_, sys)| sys).unwrap_or_default();
@@ -413,12 +450,13 @@ mod windows_process_probe {
             .map(|(pid, p)| (pid.as_u32(), p.parent().map(|pp| pp.as_u32())))
             .collect();
         let tree = process_tree_pids(&table, shell_pid);
+        let has_children = tree.len() > 1;
         let tree: Vec<Pid> = tree.into_iter().map(Pid::from_u32).collect();
 
         let names =
             tree.iter().filter_map(|pid| sys.process(*pid)).map(|p| p.name().to_string_lossy());
         if let Some(glyph) = agent_glyph_by_name(names) {
-            return Some(glyph);
+            return (Some(glyph), has_children);
         }
 
         // Names missed: fetch command lines for just the tree to catch
@@ -432,7 +470,7 @@ mod windows_process_probe {
             .iter()
             .filter_map(|pid| sys.process(*pid))
             .map(|p| p.cmd().iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "));
-        agent_glyph_by_cmdline(cmds)
+        (agent_glyph_by_cmdline(cmds), has_children)
     }
 }
 
@@ -654,22 +692,32 @@ impl Session {
         title_glyph
     }
 
-    /// A session "looks busy" when its foreground process is a recognized
-    /// agent or its title is in a spinner state — the signal the sidebar's
-    /// close-confirmation policy keys on.
+    /// A session "looks busy" when a process is running in the terminal
+    /// (a foreground job on Linux, any descendant of the shell on Windows),
+    /// its foreground process is a recognized agent, or its title is in a
+    /// spinner state — the signal the close-confirmation policy keys on.
     pub fn is_busy(&self) -> bool {
-        looks_busy(self.agent_glyph(), &self.title)
+        self.process_probe().1 || looks_busy(self.agent_glyph(), &self.title)
     }
 
     fn process_agent_glyph(&self) -> Option<char> {
+        self.process_probe().0
+    }
+
+    fn process_probe(&self) -> (Option<char>, bool) {
         let cached = self.agent_cache.get();
         let fresh = cached.polled_at.is_some_and(|t| t.elapsed() < AGENT_CACHE_TTL);
         if fresh {
-            return cached.process_glyph;
+            return (cached.process_glyph, cached.foreground_job);
         }
         let glyph = self.shell_pid.and_then(foreground_process_glyph);
-        self.agent_cache.set(AgentCache { polled_at: Some(Instant::now()), process_glyph: glyph });
-        glyph
+        let foreground_job = self.shell_pid.is_some_and(shell_has_foreground_job);
+        self.agent_cache.set(AgentCache {
+            polled_at: Some(Instant::now()),
+            process_glyph: glyph,
+            foreground_job,
+        });
+        (glyph, foreground_job)
     }
 
     /// Text dump of the visible screen plus up to `scrollback_lines` of
@@ -1016,6 +1064,18 @@ mod tests {
     fn idle_when_no_glyph_and_plain_title() {
         assert!(!looks_busy(None, "~/projects/alacritree"));
         assert!(!looks_busy(None, ""));
+    }
+
+    #[test]
+    fn stat_parse_extracts_pgrp_and_tpgid_past_a_parenthesized_comm() {
+        let stat = "1234 (my (weird) shell) S 1 1234 1234 34816 5678 0 42";
+        assert_eq!(stat_pgrp_tpgid(stat), Some((1234, 5678)));
+    }
+
+    #[test]
+    fn stat_parse_rejects_truncated_or_malformed_lines() {
+        assert_eq!(stat_pgrp_tpgid("garbage with no paren"), None);
+        assert_eq!(stat_pgrp_tpgid("1 (sh) S 1 2"), None);
     }
 
     #[test]
