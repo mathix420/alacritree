@@ -1814,6 +1814,9 @@ impl AlacritreeApp {
             .min_width(180.0 * theme.ui_scale)
             .frame(panel_frame)
             .show(ctx, |ui| {
+                // Sidebar rows are click targets, not selectable prose; the
+                // default I-beam-and-select on labels is the wrong affordance.
+                ui.style_mut().interaction.selectable_labels = false;
                 ui.horizontal(|ui| {
                     panel_header_filter_ui(
                         ui,
@@ -2257,6 +2260,9 @@ impl AlacritreeApp {
             .min_width(220.0 * theme.ui_scale)
             .frame(panel_frame)
             .show(ctx, |ui| {
+                // Sidebar rows are click targets, not selectable prose; the
+                // default I-beam-and-select on labels is the wrong affordance.
+                ui.style_mut().interaction.selectable_labels = false;
                 ui.horizontal(|ui| {
                     panel_header_filter_ui(
                         ui,
