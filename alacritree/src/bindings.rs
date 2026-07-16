@@ -576,7 +576,7 @@ fn parse_mods(s: &str) -> Option<Modifiers> {
     Some(m)
 }
 
-fn parse_action(name: &str) -> BindingAction {
+pub fn parse_action(name: &str) -> BindingAction {
     use NamedAction::*;
     match name {
         "Paste" => BindingAction::Named(Paste),

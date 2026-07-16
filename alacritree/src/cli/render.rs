@@ -34,6 +34,9 @@ pub fn human(request: &IpcRequest, value: &Value) {
         IpcRequest::CreateWorktree { .. } => {
             println!("{}", text(&value["path"]));
         },
+        IpcRequest::RunAction { .. } => {
+            println!("ran {}", text(&value["action"]));
+        },
     }
 }
 

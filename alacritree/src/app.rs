@@ -137,6 +137,18 @@ enum FocusDir {
     Right,
 }
 
+/// Where a dispatched binding action came from.  A keyboard action consumed
+/// a real key press, so FocusLeft/FocusRight may re-synthesize it into the
+/// PTY when the inner TUI should handle it.  An IPC action has no key press
+/// to forward — the caller is typically that inner program declaring it has
+/// no window in the requested direction, and passthrough would bounce the
+/// key straight back to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionOrigin {
+    Keyboard,
+    Ipc,
+}
+
 /// What a FocusLeft/FocusRight press does, decided by [`focus_move`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FocusMove {
@@ -167,16 +179,19 @@ fn inner_handles(title: &str, dir: FocusDir) -> bool {
 
 /// Panel-focus decision for FocusLeft/FocusRight.  Panels sit in a fixed
 /// `ProjectsSidebar ↔ Terminal ↔ GitSidebar` row; movement toward a hidden
-/// panel is dropped (focus never opens a panel), and from the terminal the
-/// inner TUI gets first refusal via [`inner_handles`].
+/// panel is dropped (focus never opens a panel), and from the terminal a
+/// keyboard-originated move gives the inner TUI first refusal via
+/// [`inner_handles`].  IPC moves never pass through (see [`ActionOrigin`]).
 fn focus_move(
     focus: PaneFocus,
     dir: FocusDir,
     left_open: bool,
     right_open: bool,
+    origin: ActionOrigin,
     title: &str,
 ) -> FocusMove {
-    if focus == PaneFocus::Terminal && inner_handles(title, dir) {
+    if origin == ActionOrigin::Keyboard && focus == PaneFocus::Terminal && inner_handles(title, dir)
+    {
         return FocusMove::Passthrough;
     }
     let target = match (focus, dir) {
@@ -1070,11 +1085,17 @@ impl AlacritreeApp {
         }
     }
 
-    fn move_focus(&mut self, dir: FocusDir) {
+    fn move_focus(&mut self, dir: FocusDir, origin: ActionOrigin) {
         let idx = self.active_session_index();
         let title = idx.map(|i| self.sessions[i].title.as_str()).unwrap_or("");
-        let decision =
-            focus_move(self.focus, dir, self.show_left_sidebar, self.show_right_sidebar, title);
+        let decision = focus_move(
+            self.focus,
+            dir,
+            self.show_left_sidebar,
+            self.show_right_sidebar,
+            origin,
+            title,
+        );
         match decision {
             FocusMove::Passthrough => {
                 let Some(i) = idx else { return };
@@ -1137,7 +1158,7 @@ impl AlacritreeApp {
             actions
         });
         for action in actions {
-            self.dispatch_action(ctx, action);
+            self.dispatch_action(ctx, action, ActionOrigin::Keyboard);
         }
     }
 
@@ -1586,7 +1607,7 @@ impl AlacritreeApp {
         }
     }
 
-    fn dispatch_action(&mut self, ctx: &Context, action: BindingAction) {
+    fn dispatch_action(&mut self, ctx: &Context, action: BindingAction, origin: ActionOrigin) {
         match action {
             BindingAction::Chars(bytes) => {
                 if let Some(idx) = self.active_session_index() {
@@ -1745,8 +1766,12 @@ impl AlacritreeApp {
                 }
             },
             BindingAction::Named(NamedAction::FocusTerminal) => self.focus_terminal(),
-            BindingAction::Named(NamedAction::FocusLeft) => self.move_focus(FocusDir::Left),
-            BindingAction::Named(NamedAction::FocusRight) => self.move_focus(FocusDir::Right),
+            BindingAction::Named(NamedAction::FocusLeft) => {
+                self.move_focus(FocusDir::Left, origin);
+            },
+            BindingAction::Named(NamedAction::FocusRight) => {
+                self.move_focus(FocusDir::Right, origin);
+            },
             BindingAction::Named(other) => {
                 self.dispatch_scroll_or_other(other);
             },
@@ -5079,6 +5104,13 @@ impl AlacritreeApp {
                 let idx = self.rename_project(&root, label)?;
                 Ok(project_json(&self.projects[idx]))
             },
+            Req::RunAction { action } => match crate::bindings::parse_action(&action) {
+                BindingAction::Unsupported(name) => Err(format!("unknown action `{name}`")),
+                parsed => {
+                    self.dispatch_action(ctx, parsed, ActionOrigin::Ipc);
+                    Ok(json!({ "action": action }))
+                },
+            },
             // Dispatched on the IPC connection thread; never forwarded here.
             Req::GitStatus { .. } | Req::CreateWorktree { .. } => {
                 Err("request is handled off the UI thread".to_string())
@@ -5494,9 +5526,9 @@ mod tests {
         assert_eq!(project_main_for(&projects, Path::new("/elsewhere")), None);
     }
 
-    /// `focus_move` with both panels open.
+    /// Keyboard-originated `focus_move` with both panels open.
     fn mv(focus: PaneFocus, dir: FocusDir, title: &str) -> FocusMove {
-        focus_move(focus, dir, true, true, title)
+        focus_move(focus, dir, true, true, ActionOrigin::Keyboard, title)
     }
 
     #[test]
@@ -5528,11 +5560,25 @@ mod tests {
     #[test]
     fn focus_never_moves_toward_a_closed_panel() {
         assert_eq!(
-            focus_move(PaneFocus::Terminal, FocusDir::Left, false, true, ""),
+            focus_move(
+                PaneFocus::Terminal,
+                FocusDir::Left,
+                false,
+                true,
+                ActionOrigin::Keyboard,
+                ""
+            ),
             FocusMove::Nothing
         );
         assert_eq!(
-            focus_move(PaneFocus::Terminal, FocusDir::Right, true, false, ""),
+            focus_move(
+                PaneFocus::Terminal,
+                FocusDir::Right,
+                true,
+                false,
+                ActionOrigin::Keyboard,
+                ""
+            ),
             FocusMove::Nothing
         );
     }
@@ -5556,7 +5602,14 @@ mod tests {
     #[test]
     fn tmux_at_edge_with_closed_panel_does_nothing() {
         assert_eq!(
-            focus_move(PaneFocus::Terminal, FocusDir::Left, false, true, "tmux:L x"),
+            focus_move(
+                PaneFocus::Terminal,
+                FocusDir::Left,
+                false,
+                true,
+                ActionOrigin::Keyboard,
+                "tmux:L x"
+            ),
             FocusMove::Nothing
         );
     }
@@ -5580,6 +5633,30 @@ mod tests {
         assert_eq!(
             mv(PaneFocus::ProjectsSidebar, FocusDir::Right, "tmux: x"),
             FocusMove::Focus(PaneFocus::Terminal)
+        );
+    }
+
+    /// An IPC move is the inner program saying it is out of windows —
+    /// passthrough would bounce the key straight back to it.
+    #[test]
+    fn ipc_moves_never_pass_through() {
+        for title in ["nvim ~/notes.md", "tmux:R /home/lev"] {
+            assert_eq!(
+                focus_move(
+                    PaneFocus::Terminal,
+                    FocusDir::Left,
+                    true,
+                    true,
+                    ActionOrigin::Ipc,
+                    title
+                ),
+                FocusMove::Focus(PaneFocus::ProjectsSidebar),
+                "{title}"
+            );
+        }
+        assert_eq!(
+            focus_move(PaneFocus::Terminal, FocusDir::Left, false, true, ActionOrigin::Ipc, "nvim"),
+            FocusMove::Nothing
         );
     }
 

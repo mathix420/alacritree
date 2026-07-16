@@ -91,6 +91,13 @@ pub enum IpcRequest {
         project_root: PathBuf,
         branch: String,
     },
+    /// Run a named key-binding action (`FocusLeft`, `ToggleLeftSidebar`, …)
+    /// as if its key had been pressed.  `bindings::parse_action` defines the
+    /// accepted names, so every action a key can be bound to is reachable
+    /// over the socket without a dedicated request.
+    RunAction {
+        action: String,
+    },
 }
 
 pub type IpcResult = Result<Value, String>;

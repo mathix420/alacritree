@@ -256,6 +256,17 @@ fn tool_definitions() -> Value {
                 "required": ["root"],
             },
         },
+        {
+            "name": "run_action",
+            "description": "Run one of alacritree's named key-binding actions by name, as if its key had been pressed — e.g. FocusLeft, FocusRight, ToggleLeftSidebar, SelectNextWorkspace, ScrollPageDown. Any action accepted in [[keyboard.bindings]] works; unknown names return an error. FocusLeft/FocusRight switch panel focus directly, without the key passthrough a real key press can trigger.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "description": "Action name as accepted in [[keyboard.bindings]]." },
+                },
+                "required": ["action"],
+            },
+        },
     ])
 }
 
@@ -285,6 +296,7 @@ mod tests {
             IpcRequest::AddProject { path: repo() },
             IpcRequest::RemoveProject { root: repo() },
             IpcRequest::RenameProject { root: repo(), label: None },
+            IpcRequest::RunAction { action: "FocusLeft".into() },
         ]
     }
 
@@ -303,6 +315,7 @@ mod tests {
             IpcRequest::AddProject { .. } => "add_project",
             IpcRequest::RemoveProject { .. } => "remove_project",
             IpcRequest::RenameProject { .. } => "rename_project",
+            IpcRequest::RunAction { .. } => "run_action",
         }
     }
 

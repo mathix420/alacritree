@@ -72,6 +72,13 @@ enum Command {
         command: WorktreeCommand,
     },
 
+    /// Run a named key-binding action in the running window, as if its key
+    /// had been pressed.  Needs a running alacritree.
+    Action {
+        /// Action name as accepted in `[[keyboard.bindings]]`, e.g. FocusLeft.
+        name: String,
+    },
+
     /// Check the external tools, config and state alacritree depends on.
     Doctor,
 
@@ -257,6 +264,7 @@ fn to_request(command: Command) -> IpcRequest {
             },
         },
         Command::GitStatus { path } => IpcRequest::GitStatus { path: absolute(path) },
+        Command::Action { name } => IpcRequest::RunAction { action: name },
         Command::Worktree { command } => match command {
             WorktreeCommand::Create { project_root, branch } => {
                 IpcRequest::CreateWorktree { project_root: absolute(project_root), branch }
@@ -326,6 +334,10 @@ mod tests {
         assert!(matches!(
             request_for(&["alacritree", "project", "rename", ".", "Work"]),
             IpcRequest::RenameProject { label: Some(label), .. } if label == "Work"
+        ));
+        assert!(matches!(
+            request_for(&["alacritree", "action", "FocusLeft"]),
+            IpcRequest::RunAction { action } if action == "FocusLeft"
         ));
     }
 
