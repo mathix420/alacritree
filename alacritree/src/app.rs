@@ -2891,6 +2891,7 @@ fn modal_button(
     })
     .inner
     .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
 
 /// Section header count: `visible of total` while a filter narrows the panel,
 /// the plain total otherwise.
