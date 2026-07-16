@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::bindings::{BindingAction, NamedAction};
 use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
-use crate::config::{Config, LastSessionClose};
+use crate::config::{Config, FontConfig, LastSessionClose, UiFont};
 use crate::doppler;
 use crate::git_nav::{self, GitSection, SectionCount};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
@@ -66,6 +66,21 @@ struct Theme {
     ui_scale: f32,
 }
 
+/// Logical-pixel (normal, heading) sizes for UI text.  `[ui.font] size`
+/// overrides the normal size directly (same pt→px conversion as
+/// `FontConfig::egui_size`); the heading keeps its existing ratio to normal
+/// text.  Unset, both fall back to the `[font]`-derived values unchanged.
+fn ui_text_px(font: &FontConfig, ui_font: &UiFont) -> (f32, f32) {
+    match ui_font.size {
+        Some(pt) => {
+            let normal = pt * 96.0 / 72.0;
+            let heading = normal * (FontConfig::UI_HEADING_RATIO / FontConfig::UI_NORMAL_RATIO);
+            (normal, heading)
+        },
+        None => (font.ui_normal_px(), font.ui_heading_px()),
+    }
+}
+
 impl Theme {
     fn from_config(config: &Config) -> Self {
         let terminal_bg = rgb_to_color32(config.palette.bg);
@@ -75,6 +90,7 @@ impl Theme {
         let accent =
             config.ui.sidebar_accent.unwrap_or_else(|| rgb_to_color32(config.palette.normal[4])); // ANSI blue
         let border = config.ui.sidebar_border.unwrap_or_else(|| lighten(sidebar_bg, 0.10));
+        let (font_normal, font_heading) = ui_text_px(&config.font, &config.ui_font);
         Self {
             terminal_bg,
             sidebar_bg,
@@ -86,9 +102,9 @@ impl Theme {
             text_muted: blend_toward(text, sidebar_bg, 0.55),
             accent,
             attention: rgb_to_color32(config.palette.normal[3]), // ANSI yellow
-            font_heading: config.font.ui_heading_px(),
-            font_normal: config.font.ui_normal_px(),
-            ui_scale: config.font.ui_normal_px() / 11.25,
+            font_heading,
+            font_normal,
+            ui_scale: font_normal / 11.25,
         }
     }
 }
@@ -5796,5 +5812,26 @@ mod tests {
             Some("pwsh"),
         );
         assert_eq!(d, ShellDecision::Profile("pwsh".into()));
+    }
+
+    #[test]
+    fn ui_text_px_defaults_to_terminal_derivation() {
+        let font = crate::config::FontConfig::default();
+        let (normal, heading) = ui_text_px(&font, &crate::config::UiFont::default());
+        assert_eq!(normal, font.ui_normal_px());
+        assert_eq!(heading, font.ui_heading_px());
+    }
+
+    #[test]
+    fn ui_text_px_overrides_from_ui_font_size() {
+        let font = crate::config::FontConfig::default();
+        let ui = crate::config::UiFont { family: None, size: Some(12.0) };
+        let (normal, heading) = ui_text_px(&font, &ui);
+        assert_eq!(normal, 16.0); // 12 pt × 96/72
+        assert_eq!(
+            heading,
+            16.0 * (crate::config::FontConfig::UI_HEADING_RATIO
+                / crate::config::FontConfig::UI_NORMAL_RATIO)
+        );
     }
 }

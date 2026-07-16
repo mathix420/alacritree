@@ -26,6 +26,7 @@ use crate::bindings::{self, KeyBinding};
 pub struct Config {
     pub palette: Palette,
     pub ui: UiTheme,
+    pub ui_font: UiFont,
     pub workspace: WorkspaceConfig,
     pub font: FontConfig,
     pub cursor: CursorConfig,
@@ -289,6 +290,16 @@ pub struct SessionDisplay {
     pub tabs_always: bool,
 }
 
+/// alacritree-only `[ui.font]`: font family/size for the chrome (sidebars,
+/// modals — everything that isn't the terminal grid).  Both fields default
+/// to deriving from `[font]`, so an absent table changes nothing.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UiFont {
+    pub family: Option<String>,
+    /// Typographic points, same unit as `[font] size`; clamped to ≥ 1.0.
+    pub size: Option<f32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct UiTheme {
     pub sidebar_background: Option<Color32>,
@@ -364,6 +375,7 @@ impl Default for Config {
         Self {
             palette: Palette::default(),
             ui: UiTheme::default(),
+            ui_font: UiFont::default(),
             workspace: WorkspaceConfig::default(),
             font: FontConfig::default(),
             cursor: CursorConfig::default(),
@@ -869,6 +881,13 @@ struct RawSessionDisplay {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
+struct RawUiFont {
+    family: Option<String>,
+    size: Option<f32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 struct RawUi {
     sidebar_background: Option<RgbStr>,
     sidebar_foreground: Option<RgbStr>,
@@ -884,6 +903,7 @@ struct RawUi {
     session_display: RawSessionDisplay,
     delta_path: Option<String>,
     icons: RawUiIcons,
+    font: RawUiFont,
     wsl: RawUiWsl,
     profiles: Vec<RawProfile>,
     default_profile: Option<String>,
@@ -1138,6 +1158,12 @@ impl RawConfig {
             .filter(|r| r.starts_with('/') && r.len() > 1)
             .unwrap_or_else(|| "/mnt".to_string());
 
+        // ---- UI Font ----
+        let ui_font = UiFont {
+            family: self.ui.font.family.clone().filter(|f| !f.trim().is_empty()),
+            size: self.ui.font.size.map(|s| s.max(1.0)),
+        };
+
         // ---- Profiles ----
         let profiles = build_profiles(self.ui.profiles);
         let default_profile = self.ui.default_profile.filter(|n| {
@@ -1151,6 +1177,7 @@ impl RawConfig {
         Config {
             palette,
             ui,
+            ui_font,
             workspace,
             font,
             cursor,
@@ -1530,5 +1557,30 @@ program = "second"
         let sd = raw.into_config().ui.session_display;
         assert!(sd.sidebar_always);
         assert!(sd.tabs_always);
+    }
+
+    #[test]
+    fn ui_font_defaults_to_none() {
+        let config = parse("");
+        assert_eq!(config.ui_font, UiFont::default());
+    }
+
+    #[test]
+    fn ui_font_parses_family_and_size() {
+        let config = parse("[ui.font]\nfamily = \"Inter\"\nsize = 12.5");
+        assert_eq!(config.ui_font.family.as_deref(), Some("Inter"));
+        assert_eq!(config.ui_font.size, Some(12.5));
+    }
+
+    #[test]
+    fn ui_font_size_clamps_to_one() {
+        let config = parse("[ui.font]\nsize = 0.1");
+        assert_eq!(config.ui_font.size, Some(1.0));
+    }
+
+    #[test]
+    fn blank_ui_font_family_is_ignored() {
+        let config = parse("[ui.font]\nfamily = \"  \"");
+        assert_eq!(config.ui_font.family, None);
     }
 }
