@@ -366,6 +366,13 @@ pub struct UiTheme {
     pub pr_status: bool,
     pub icons: Icons,
     pub focus_outline: FocusOutline,
+    /// `[ui] worktree_name`: template for worktree row labels (subst syntax:
+    /// `$name`, `$branch`, `$path`, `${var:fallback}`).  `None` keeps the plain
+    /// worktree name.
+    pub worktree_name: Option<String>,
+    /// `[ui] project_name`: template for project row labels (`$name`, `$path`).
+    /// A manual rename (`Project.label`) always wins over the template.
+    pub project_name: Option<String>,
 }
 
 impl Default for UiTheme {
@@ -382,6 +389,8 @@ impl Default for UiTheme {
             pr_status: false,
             icons: Icons::default(),
             focus_outline: FocusOutline::default(),
+            worktree_name: None,
+            project_name: None,
         }
     }
 }
@@ -1000,6 +1009,8 @@ struct RawUi {
     icons: RawIcons,
     pr_status: Option<bool>,
     font: RawUiFont,
+    worktree_name: Option<String>,
+    project_name: Option<String>,
     wsl: RawUiWsl,
     profiles: Vec<RawProfile>,
     default_profile: Option<String>,
@@ -1142,6 +1153,8 @@ impl RawConfig {
                 color: self.ui.focus_outline.color.map(|v| rgb_to_color32(v.0)),
                 thickness: self.ui.focus_outline.thickness.map_or(1.0, |t| t.max(0.5)),
             },
+            worktree_name: self.ui.worktree_name.clone().filter(|t| !t.trim().is_empty()),
+            project_name: self.ui.project_name.clone().filter(|t| !t.trim().is_empty()),
         };
 
         // ---- Font ----
@@ -1748,5 +1761,26 @@ program = "second"
     fn focus_outline_thickness_clamps() {
         let fo = ui_from_toml("[ui.focus_outline]\nthickness = 0.1").focus_outline;
         assert_eq!(fo.thickness, 0.5);
+    }
+
+    #[test]
+    fn name_templates_default_to_none() {
+        let ui = ui_from_toml("");
+        assert_eq!(ui.worktree_name, None);
+        assert_eq!(ui.project_name, None);
+    }
+
+    #[test]
+    fn name_templates_parse() {
+        let ui =
+            ui_from_toml("[ui]\nworktree_name = \"${branch:$name}\"\nproject_name = \"[$name]\"");
+        assert_eq!(ui.worktree_name.as_deref(), Some("${branch:$name}"));
+        assert_eq!(ui.project_name.as_deref(), Some("[$name]"));
+    }
+
+    #[test]
+    fn blank_name_templates_are_dropped() {
+        let ui = ui_from_toml("[ui]\nworktree_name = \"  \"");
+        assert_eq!(ui.worktree_name, None);
     }
 }
