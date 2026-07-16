@@ -295,6 +295,8 @@ pub struct AlacritreeApp {
     projects: Vec<Project>,
     git_status: HashMap<PathBuf, StatusCache>,
     pr_cache: PrCache,
+    /// Renders `[ui] worktree_name` / `project_name` templates at paint time.
+    row_labels: crate::row_label::LabelTemplates,
     config: Config,
     theme: Theme,
     last_error: Option<String>,
@@ -554,6 +556,11 @@ impl AlacritreeApp {
         // ever spawn one app per process, ignoring the error is fine.
         let _ = NOTIFY_TX.set(Mutex::new(notify_tx));
 
+        let row_labels = crate::row_label::LabelTemplates::new(
+            config.ui.worktree_name.clone(),
+            config.ui.project_name.clone(),
+        );
+
         let mut app = Self {
             show_left_sidebar: persisted.show_left_sidebar,
             show_right_sidebar: persisted.show_right_sidebar,
@@ -580,6 +587,7 @@ impl AlacritreeApp {
             projects,
             git_status: HashMap::new(),
             pr_cache: PrCache::new(),
+            row_labels,
             config,
             theme,
             last_error: None,
@@ -2114,6 +2122,18 @@ impl AlacritreeApp {
         let icons = self.config.ui.icons.clone();
         let profile_names: Vec<String> =
             self.config.profiles.iter().map(|p| p.name.clone()).collect();
+        // Rendered up front: the panel closure borrows `projects` mutably, and
+        // substitution over short strings is microseconds, so no cache is kept.
+        let mut project_labels: Vec<String> = Vec::with_capacity(self.projects.len());
+        let mut worktree_labels: Vec<Vec<String>> = Vec::with_capacity(self.projects.len());
+        for project in &self.projects {
+            project_labels.push(self.row_labels.project_label(project));
+            let mut rows = Vec::with_capacity(project.worktrees.len());
+            for wt in &project.worktrees {
+                rows.push(self.row_labels.worktree_label(wt));
+            }
+            worktree_labels.push(rows);
+        }
         let mut shell_override_changed: Option<PathBuf> = None;
         let mut label_cleared: Option<PathBuf> = None;
         let mut rename_request: Option<RenameState> = None;
@@ -2277,10 +2297,15 @@ impl AlacritreeApp {
                                 name_resp = Some(
                                     ui.add(
                                         egui::Label::new(
-                                            RichText::new(project.display_name())
-                                                .color(theme.text)
-                                                .strong()
-                                                .small(),
+                                            RichText::new(
+                                                project_labels
+                                                    .get(idx)
+                                                    .map(String::as_str)
+                                                    .unwrap_or(project.display_name()),
+                                            )
+                                            .color(theme.text)
+                                            .strong()
+                                            .small(),
                                         )
                                         .truncate()
                                         .sense(egui::Sense::click()),
@@ -2458,6 +2483,11 @@ impl AlacritreeApp {
                                 let action = worktree_row(
                                     ui,
                                     wt,
+                                    worktree_labels
+                                        .get(idx)
+                                        .and_then(|v| v.get(wt_idx))
+                                        .map(String::as_str)
+                                        .unwrap_or(&wt.name),
                                     pr_infos
                                         .get(idx)
                                         .and_then(|v| v.get(wt_idx))
@@ -3904,6 +3934,7 @@ fn pr_badge<'a>(
 fn worktree_row(
     ui: &mut egui::Ui,
     wt: &Worktree,
+    display_name: &str,
     pr: Option<&PrInfo>,
     is_active: bool,
     is_cursor: bool,
@@ -3947,7 +3978,7 @@ fn worktree_row(
                         is_active,
                     );
                     ui.add(
-                        egui::Label::new(RichText::new(&wt.name).color(name_color).small())
+                        egui::Label::new(RichText::new(display_name).color(name_color).small())
                             .truncate(),
                     );
                 },
