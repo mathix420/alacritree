@@ -96,11 +96,22 @@ impl FrameReader {
                     String::from_utf8_lossy(&self.buf[..newline])
                 ));
             };
-            let frame_end = newline + 1 + len;
+            let Some(payload_start) = newline.checked_add(1) else {
+                return Err(format!(
+                    "malformed helper frame header: {:?}",
+                    String::from_utf8_lossy(&self.buf[..newline])
+                ));
+            };
+            let Some(frame_end) = payload_start.checked_add(len) else {
+                return Err(format!(
+                    "malformed helper frame header: {:?}",
+                    String::from_utf8_lossy(&self.buf[..newline])
+                ));
+            };
             if self.buf.len() < frame_end {
                 return Ok(frames);
             }
-            frames.push(Frame { id, exit, payload: self.buf[newline + 1..frame_end].to_vec() });
+            frames.push(Frame { id, exit, payload: self.buf[payload_start..frame_end].to_vec() });
             self.buf.drain(..frame_end);
         }
     }
@@ -699,6 +710,12 @@ mod tests {
     fn malformed_header_is_a_protocol_error() {
         assert!(FrameReader::default().push(b"not a header\n").is_err());
         assert!(FrameReader::default().push(b"1\t0\n").is_err());
+    }
+
+    #[test]
+    fn oversized_length_field_is_a_protocol_error_not_a_panic() {
+        let header = format!("1\t0\t{}\n", usize::MAX);
+        assert!(FrameReader::default().push(header.as_bytes()).is_err());
     }
 
     use std::path::Path;
