@@ -34,6 +34,7 @@ mod terminal_view;
 mod test_util;
 mod worktree;
 mod wsl;
+mod wsl_helper;
 
 use app::AlacritreeApp;
 use clap::Parser;
