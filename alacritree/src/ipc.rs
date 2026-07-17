@@ -135,7 +135,30 @@ pub fn spawn_listener(ctx: egui::Context) -> std::io::Result<(SocketHandle, Rece
     // no other thread is reading the environment concurrently.
     unsafe { std::env::set_var(SOCKET_ENV, listener.0.path()) };
 
+    // Only WSLENV-listed variables cross the wsl.exe boundary — in either
+    // direction.  Listing the socket lets programs in a distro find this
+    // instance, whether they read the variable themselves or exec the
+    // Windows CLI through interop (which inherits the distro's view).  No
+    // conversion flag: a pipe name is not a path WSL should translate.
+    #[cfg(windows)]
+    unsafe {
+        std::env::set_var("WSLENV", wslenv_with_socket(std::env::var("WSLENV").ok().as_deref()))
+    };
+
     Ok(listener)
+}
+
+/// `WSLENV` extended with [`SOCKET_ENV`], preserving whatever the user
+/// already shares across the boundary.
+#[cfg(any(test, windows))]
+fn wslenv_with_socket(current: Option<&str>) -> String {
+    match current {
+        None | Some("") => SOCKET_ENV.to_string(),
+        Some(v) if v.split(':').any(|entry| entry.split('/').next() == Some(SOCKET_ENV)) => {
+            v.to_string()
+        },
+        Some(v) => format!("{v}:{SOCKET_ENV}"),
+    }
 }
 
 /// Listen on a caller-chosen path, without advertising it.
@@ -441,6 +464,17 @@ pub fn listen_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wslenv_gains_the_socket_exactly_once() {
+        assert_eq!(wslenv_with_socket(None), SOCKET_ENV);
+        assert_eq!(wslenv_with_socket(Some("")), SOCKET_ENV);
+        assert_eq!(wslenv_with_socket(Some("LESS:FOO/p")), format!("LESS:FOO/p:{SOCKET_ENV}"));
+        // Already listed — with or without conversion flags — stays as-is.
+        assert_eq!(wslenv_with_socket(Some(SOCKET_ENV)), SOCKET_ENV);
+        let flagged = format!("{SOCKET_ENV}/u:LESS");
+        assert_eq!(wslenv_with_socket(Some(&flagged)), flagged);
+    }
 
     /// The client/server round trip over whatever transport the platform uses:
     /// framing, dispatch to the app thread, and the reply.  Discovery by

@@ -194,6 +194,16 @@ fn is_nav_tui_name(name: &str) -> bool {
     n.starts_with("nvim") || n.starts_with("vim") || n.starts_with("tmux")
 }
 
+/// `wsl.exe` (and its `wslhost`/`wslrelay` helpers) mark a session whose
+/// real process tree lives on the Linux side, where this probe cannot see.
+/// Assume the inside cooperates like a nav TUI: the key is forwarded, and
+/// programs in the distro hand focus back by exec'ing the Windows CLI
+/// (`alacritree.exe action Focus…`) through WSL interop.
+#[cfg(any(test, windows))]
+fn is_wsl_boundary_name(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with("wsl")
+}
+
 /// Match full command lines against the agent map — picks up
 /// `node ...\claude-code\cli.js`-style wrappers that hide behind their
 /// runtime's name, same as the Linux cmdline pass.
@@ -464,7 +474,10 @@ mod windows_process_probe {
 
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
-    use super::{agent_glyph_by_cmdline, agent_glyph_by_name, is_nav_tui_name, process_tree_pids};
+    use super::{
+        agent_glyph_by_cmdline, agent_glyph_by_name, is_nav_tui_name, is_wsl_boundary_name,
+        process_tree_pids,
+    };
 
     /// Slightly under `AGENT_CACHE_TTL` so the first session to tick
     /// refreshes and the rest reuse the same table.
@@ -501,7 +514,7 @@ mod windows_process_probe {
             .filter_map(|pid| sys.process(*pid))
             .map(|p| p.name().to_string_lossy().into_owned())
             .collect();
-        let nav_tui = names.iter().any(|n| is_nav_tui_name(n));
+        let nav_tui = names.iter().any(|n| is_nav_tui_name(n) || is_wsl_boundary_name(n));
         if let Some(glyph) = agent_glyph_by_name(&names) {
             return (Some(glyph), has_children, nav_tui);
         }
@@ -1207,6 +1220,14 @@ mod tests {
         assert!(!is_nav_tui_name("gvim.exe"));
         assert!(!is_nav_tui_name("chezmoi.exe"));
         assert!(!is_nav_tui_name("pwsh.exe"));
+    }
+
+    #[test]
+    fn wsl_boundary_match_covers_the_helper_processes() {
+        assert!(is_wsl_boundary_name("wsl.exe"));
+        assert!(is_wsl_boundary_name("wslhost.exe"));
+        assert!(is_wsl_boundary_name("WSLRELAY.EXE"));
+        assert!(!is_wsl_boundary_name("pwsh.exe"));
     }
 
     #[test]
