@@ -116,6 +116,168 @@ fn parse_header(line: &[u8]) -> Option<(u64, i32, usize)> {
     fields.next().is_none().then_some((id, exit, len))
 }
 
+use std::path::Path;
+
+/// The distro-side helper, passed verbatim as the single argument of
+/// `wsl.exe --exec sh -c`.  POSIX sh only — dash and busybox ash both run
+/// it.  Shape: capability hello, dead-pidfile GC, a background writer that
+/// owns stdout, then the request dispatcher on stdin.  Responses all leave
+/// through the writer, whose FIFO completion lines are far under PIPE_BUF,
+/// so concurrent jobs never interleave frames.  Commentary lives here, not
+/// in the script, so every byte shipped into the distro earns its keep.
+///
+/// Empty request fields arrive as `-` (see `encode_field`); decoded args
+/// lose trailing newlines to command substitution, which no current caller
+/// passes.  Stdin EOF ends the dispatcher; the EXIT trap removes the temp
+/// dir and `kill 0` takes the writer and any in-flight jobs down with the
+/// process group, so a job can never deadlock on the deleted FIFO.
+pub(crate) const HELPER_SCRIPT: &str = r##"
+set -u
+b64() { printf %s "$1" | base64 | tr -d '\n'; }
+s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)
+[ -x "$s" ] || s=${SHELL:-/bin/sh}
+caps=$("$s" -lc 'command -v git || echo; command -v delta || echo; command -v gh || echo' 2>/dev/null)
+rt=${XDG_RUNTIME_DIR:-/tmp}/alacritree
+printf 'hello\t1\t%s\t%s\t%s\t%s\n' \
+  "$(b64 "$(printf %s "$caps" | sed -n 1p)")" \
+  "$(b64 "$(printf %s "$caps" | sed -n 2p)")" \
+  "$(b64 "$(printf %s "$caps" | sed -n 3p)")" \
+  "$(b64 "$rt")"
+mkdir -p "$rt" 2>/dev/null
+for f in "$rt"/session-*.pid; do
+  [ -e "$f" ] || continue
+  p=$(cat "$f" 2>/dev/null)
+  case $p in ''|*[!0-9]*) rm -f "$f"; continue;; esac
+  [ -d "/proc/$p" ] || rm -f "$f"
+done
+t=$(mktemp -d) || exit 1
+mkfifo "$t/done" || exit 1
+trap 'rm -rf "$t"; kill 0 2>/dev/null' EXIT
+(
+  exec 3<>"$t/done"
+  while read -r id code <&3; do
+    out="$t/$id.out"
+    n=$(wc -c < "$out" 2>/dev/null) || n=0
+    printf '%s\t%s\t%s\n' "$id" "$code" "${n:-0}"
+    cat "$out" 2>/dev/null
+    rm -f "$out"
+  done
+) &
+TAB=$(printf '\t')
+while IFS=$TAB read -r id kind rest; do
+  case $kind in
+  RUN)
+    (
+      script=
+      set --
+      first=1
+      line=$rest
+      while [ -n "$line" ]; do
+        case $line in
+        *"$TAB"*) field=${line%%"$TAB"*}; line=${line#*"$TAB"} ;;
+        *) field=$line; line= ;;
+        esac
+        if [ "$field" = - ]; then dec=; else dec=$(printf %s "$field" | base64 -d 2>/dev/null); fi
+        if [ "$first" = 1 ]; then script=$dec; first=0; else set -- "$@" "$dec"; fi
+      done
+      sh -c "$script" sh "$@" > "$t/$id.out" 2>/dev/null
+      printf '%s %s\n' "$id" "$?" >> "$t/done"
+    ) &
+    ;;
+  PROBE)
+    comm=
+    p=$(cat "$rt/session-$rest.pid" 2>/dev/null)
+    case $p in ''|*[!0-9]*) p= ;; esac
+    if [ -n "$p" ] && [ -d "/proc/$p" ]; then
+      stat=$(cat "/proc/$p/stat" 2>/dev/null)
+      after=${stat##*')'}
+      set -- $after
+      tpgid=${6:-}
+      case $tpgid in ''|*[!0-9]*) tpgid= ;; esac
+      [ -n "$tpgid" ] && comm=$(cat "/proc/$tpgid/comm" 2>/dev/null)
+    fi
+    printf %s "$comm" > "$t/$id.out"
+    printf '%s 0\n' "$id" >> "$t/done"
+    ;;
+  esac
+done
+"##;
+
+/// Login-shell shim for shimmed WSL sessions: publish the shell's PID under
+/// the probe key, then become the user's login shell.  `exec` makes the
+/// pidfile PID *be* the shell, so the helper's tpgid walk starts from the
+/// right place.  wsl.exe's own no-`--exec` launch would start the login
+/// shell too but gives no way to learn its PID; re-resolving through
+/// `getent` is the documented divergence, with `/bin/sh` only as a last
+/// resort.  Single line: it travels through ConPTY command-line quoting.
+pub(crate) const SHIM_SCRIPT: &str = r##"d=${XDG_RUNTIME_DIR:-/tmp}/alacritree; mkdir -p "$d" 2>/dev/null && printf %s $$ > "$d/session-$1.pid"; s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=/bin/sh; exec "$s" -l"##;
+
+/// argv for a session alacritree constructs itself (`ShellChoice::Wsl`,
+/// auto-by-location): the shim with the probe key as `$1`.
+pub fn shim_invocation(distro: &str, workdir: &Path, probe_key: &str) -> (String, Vec<String>) {
+    (
+        "wsl.exe".to_string(),
+        vec![
+            "-d".to_string(),
+            distro.to_string(),
+            "--cd".to_string(),
+            workdir.to_string_lossy().into_owned(),
+            "--exec".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            SHIM_SCRIPT.to_string(),
+            "sh".to_string(),
+            probe_key.to_string(),
+        ],
+    )
+}
+
+/// Probe-key shim for a `[[ui.profiles]]` entry that launches wsl.exe.
+/// Only argv this parser fully understands is wrapped: any mix of
+/// `-d`/`--distribution <distro>` and `--cd <dir>`, nothing else.  An
+/// unknown flag or a positional command may not be a plain login shell —
+/// it runs unmodified and simply probes as unknown.  Returns the rewritten
+/// argv plus the explicit distro (`None` = the default distro; the caller
+/// resolves it, since only `wsl::distros` knows which that is).
+pub fn wrap_profile_argv(
+    program: &str,
+    args: &[String],
+    probe_key: &str,
+) -> Option<(Vec<String>, Option<String>)> {
+    let stem = Path::new(program).file_stem()?.to_str()?;
+    if !stem.eq_ignore_ascii_case("wsl") {
+        return None;
+    }
+    let mut distro = None;
+    let mut wrapped = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "-d" | "--distribution" => {
+                let name = it.next()?;
+                distro = Some(name.clone());
+                wrapped.push(arg.clone());
+                wrapped.push(name.clone());
+            },
+            "--cd" => {
+                let dir = it.next()?;
+                wrapped.push(arg.clone());
+                wrapped.push(dir.clone());
+            },
+            _ => return None,
+        }
+    }
+    wrapped.extend([
+        "--exec".to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        SHIM_SCRIPT.to_string(),
+        "sh".to_string(),
+        probe_key.to_string(),
+    ]);
+    Some((wrapped, distro))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +361,72 @@ mod tests {
     fn malformed_header_is_a_protocol_error() {
         assert!(FrameReader::default().push(b"not a header\n").is_err());
         assert!(FrameReader::default().push(b"1\t0\n").is_err());
+    }
+
+    use std::path::Path;
+
+    #[test]
+    fn shim_invocation_builds_expected_argv() {
+        let (program, args) = shim_invocation("kali-linux", Path::new(r"C:\proj"), "1234-1");
+        assert_eq!(program, "wsl.exe");
+        assert_eq!(
+            args,
+            vec![
+                "-d",
+                "kali-linux",
+                "--cd",
+                r"C:\proj",
+                "--exec",
+                "sh",
+                "-c",
+                SHIM_SCRIPT,
+                "sh",
+                "1234-1",
+            ]
+        );
+    }
+
+    #[test]
+    fn wraps_bare_wsl_profile_for_default_distro() {
+        let (args, distro) = wrap_profile_argv("wsl.exe", &[], "1234-2").unwrap();
+        assert_eq!(distro, None);
+        assert_eq!(args, vec!["--exec", "sh", "-c", SHIM_SCRIPT, "sh", "1234-2"]);
+    }
+
+    #[test]
+    fn wraps_distro_and_cd_flags() {
+        let profile_args: Vec<String> =
+            ["-d", "kali-linux", "--cd", "/home"].iter().map(|s| s.to_string()).collect();
+        let (args, distro) =
+            wrap_profile_argv(r"C:\Windows\System32\wsl.exe", &profile_args, "9-9").unwrap();
+        assert_eq!(distro.as_deref(), Some("kali-linux"));
+        assert_eq!(
+            args,
+            vec![
+                "-d",
+                "kali-linux",
+                "--cd",
+                "/home",
+                "--exec",
+                "sh",
+                "-c",
+                SHIM_SCRIPT,
+                "sh",
+                "9-9"
+            ]
+        );
+    }
+
+    #[test]
+    fn refuses_unparseable_profiles() {
+        let to_vec = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // A positional command, an unknown flag, or a dangling value-flag may
+        // not be a plain login shell — leave it alone (probes as unknown).
+        assert!(wrap_profile_argv("wsl.exe", &to_vec(&["bash"]), "k").is_none());
+        assert!(wrap_profile_argv("wsl.exe", &to_vec(&["-d", "kali", "htop"]), "k").is_none());
+        assert!(wrap_profile_argv("wsl.exe", &to_vec(&["--exec", "sh"]), "k").is_none());
+        assert!(wrap_profile_argv("wsl.exe", &to_vec(&["-d"]), "k").is_none());
+        assert!(wrap_profile_argv("pwsh.exe", &[], "k").is_none());
+        assert!(wrap_profile_argv("wslhost.exe", &[], "k").is_none());
     }
 }
