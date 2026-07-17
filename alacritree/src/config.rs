@@ -40,6 +40,7 @@ pub struct Config {
     /// alacritty's `[general] ipc_socket` (default on).
     pub ipc_socket: bool,
     pub wsl_automount_root: String,
+    pub wsl_resident_helper: bool,
     /// Explicit `delta` program for the diff pane, from `[ui] delta_path`.
     /// When set it is used verbatim in git's `core.pager` on every platform
     /// and skips WSL delta autodiscovery; when unset, native diffs run bare
@@ -451,6 +452,7 @@ impl Default for Config {
             bindings: Vec::new(),
             ipc_socket: true,
             wsl_automount_root: "/mnt".to_string(),
+            wsl_resident_helper: true,
             delta_path: None,
             profiles: Vec::new(),
             default_profile: None,
@@ -737,6 +739,7 @@ struct RawConfig {
     selection: RawSelection,
     keyboard: RawKeyboard,
     general: RawGeneral,
+    wsl: RawWsl,
 }
 
 /// Subset of alacritty's `[general]` section that alacritree honors.  It
@@ -915,9 +918,17 @@ struct RawIndexed {
     color: RgbStr,
 }
 
+/// Top-level `[wsl]`: platform-integration options.  Lives outside `[ui]`
+/// because nothing here is presentation — it governs how the app talks to
+/// distros.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-struct RawUiWsl {
+struct RawWsl {
+    /// Keep a resident helper process per distro for foreground probes,
+    /// batched git queries, and tool discovery.  `false` restores one-shot
+    /// wsl.exe spawns everywhere; WSL sessions then always report "no
+    /// TUI", so FocusLeft/FocusRight always move panel focus.
+    resident_helper: Option<bool>,
     /// Distro-side mount point for Windows drives, mirroring wsl.conf's
     /// `[automount] root`.  Only used for paths *we* translate (git output
     /// from inside a distro); `wsl.exe --cd` translates with the distro's
@@ -965,6 +976,14 @@ fn build_icons(raw: RawIcons) -> Icons {
         pr_merged: icon_or(raw.pr_merged, &d.pr_merged),
         pr_closed: icon_or(raw.pr_closed, &d.pr_closed),
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawUiWsl {
+    /// Deprecated location: `[wsl] automount_root` supersedes this and wins
+    /// when both are set; kept so existing configs keep working.
+    automount_root: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1267,13 +1286,15 @@ impl RawConfig {
         };
 
         // ---- WSL ----
+        // `[wsl]` supersedes the deprecated `[ui.wsl]` location.
         let wsl_automount_root = self
-            .ui
             .wsl
             .automount_root
+            .or(self.ui.wsl.automount_root)
             .map(|r| r.trim_end_matches('/').to_string())
             .filter(|r| r.starts_with('/') && r.len() > 1)
             .unwrap_or_else(|| "/mnt".to_string());
+        let wsl_resident_helper = self.wsl.resident_helper.unwrap_or(true);
 
         // ---- UI Font ----
         let ui_font = UiFont {
@@ -1306,6 +1327,7 @@ impl RawConfig {
             bindings,
             ipc_socket: self.general.ipc_socket.unwrap_or(true),
             wsl_automount_root,
+            wsl_resident_helper,
             delta_path: self.ui.delta_path.filter(|s| !s.trim().is_empty()),
             profiles,
             default_profile,
@@ -1398,6 +1420,29 @@ mod tests {
         // Nonsense values fall back rather than corrupting every translation.
         let raw: RawConfig = toml::from_str("[ui.wsl]\nautomount_root = \"mnt\"").unwrap();
         assert_eq!(raw.into_config().wsl_automount_root, "/mnt");
+    }
+
+    #[test]
+    fn wsl_section_wins_over_deprecated_ui_location() {
+        let raw: RawConfig = toml::from_str("[wsl]\nautomount_root = \"/drives\"").unwrap();
+        assert_eq!(raw.into_config().wsl_automount_root, "/drives");
+
+        let both = "[wsl]\nautomount_root = \"/new\"\n[ui.wsl]\nautomount_root = \"/old\"";
+        let raw: RawConfig = toml::from_str(both).unwrap();
+        assert_eq!(raw.into_config().wsl_automount_root, "/new");
+
+        // Existing configs keep working through the deprecated location.
+        let raw: RawConfig = toml::from_str("[ui.wsl]\nautomount_root = \"/old\"").unwrap();
+        assert_eq!(raw.into_config().wsl_automount_root, "/old");
+    }
+
+    #[test]
+    fn resident_helper_defaults_on() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        assert!(raw.into_config().wsl_resident_helper);
+
+        let raw: RawConfig = toml::from_str("[wsl]\nresident_helper = false").unwrap();
+        assert!(!raw.into_config().wsl_resident_helper);
     }
 
     #[test]
