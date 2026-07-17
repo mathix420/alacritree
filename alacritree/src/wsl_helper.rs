@@ -838,12 +838,17 @@ mod tests {
 
         use std::process::{Command, Stdio};
 
+        use crate::command_ext::CommandExt;
+
         // The shim publishes its pid, then execs the login shell; piped stdin
         // (held open) keeps that shell alive for the duration of the test.
+        // Without hide_console the spawn pops a visible terminal window when
+        // the test runs from a hidden console.
         let key = new_probe_key();
         let (program, args) = shim_invocation(&distro.name, Path::new(r"C:\"), &key);
         let mut child = Command::new(program)
             .args(&args)
+            .hide_console()
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
