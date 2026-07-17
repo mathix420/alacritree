@@ -5340,6 +5340,9 @@ impl eframe::App for AlacritreeApp {
         if self.show_right_sidebar {
             let r = self.show_git_sidebar(ctx, panel_frame);
             paint_panel_border(ctx, r.left(), r.y_range(), theme.sidebar_border);
+            if theme.focus_outline.sidebar && !modal_open && self.focus == PaneFocus::GitSidebar {
+                paint_focus_outline(ctx, r, &theme);
+            }
         }
 
         let central = egui::CentralPanel::default()

@@ -307,8 +307,9 @@ pub struct Icons {
 }
 
 /// `[ui.focus_outline]`: stroke a border around a panel while it owns
-/// keyboard focus.  Per-panel toggles, shared color/thickness; both toggles
-/// default off so unmodified config keeps today's look.
+/// keyboard focus.  Per-panel toggles (`sidebar` covers both side panels),
+/// shared color/thickness; both toggles default off so unmodified config
+/// keeps today's look.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FocusOutline {
     pub sidebar: bool,
