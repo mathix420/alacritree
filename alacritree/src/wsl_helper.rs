@@ -46,7 +46,9 @@ pub fn encode_probe(id: u64, key: &str) -> String {
 }
 
 pub fn parse_hello(line: &str) -> Option<Capabilities> {
-    let mut fields = line.trim_end().split('\t');
+    // Strip only line terminators — trim_end() would also eat the tab
+    // before a legitimately empty trailing field.
+    let mut fields = line.trim_end_matches(['\r', '\n']).split('\t');
     if fields.next()? != "hello" || fields.next()? != PROTOCOL_VERSION {
         return None;
     }
@@ -153,6 +155,13 @@ mod tests {
         assert!(parse_hello("hello\t2\t\t\t\t\n").is_none());
         assert!(parse_hello("goodbye\t1\t\t\t\t\n").is_none());
         assert!(parse_hello("hello\t1\t\t\n").is_none());
+    }
+
+    #[test]
+    fn hello_with_empty_trailing_field_still_parses() {
+        let caps = parse_hello("hello\t1\t\t\t\t\n").expect("empty fields are valid");
+        assert_eq!(caps.git, None);
+        assert_eq!(caps.runtime_dir, "");
     }
 
     #[test]
