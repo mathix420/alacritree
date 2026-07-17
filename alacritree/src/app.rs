@@ -159,39 +159,23 @@ enum FocusMove {
     Nothing,
 }
 
-/// Whether the program inside the terminal should receive the directional key
-/// instead of alacritree switching panels.  Cooperating setups publish edge
-/// state through the terminal title: tmux as `tmux:<edges>`, where a letter
-/// (L/R/U/D) marks a wall its active pane — with any nvim split edges folded
-/// in — cannot move past.  An absent letter means the inner stack still has
-/// somewhere to go.  A title that looks like bare (n)vim always wins: vim
-/// publishes no edge state, so alacritree can never tell when it is done.
-fn inner_handles(title: &str, dir: FocusDir) -> bool {
-    if let Some(rest) = title.strip_prefix("tmux:") {
-        let letter = match dir {
-            FocusDir::Left => 'L',
-            FocusDir::Right => 'R',
-        };
-        return !rest.chars().take_while(char::is_ascii_uppercase).any(|c| c == letter);
-    }
-    title.starts_with("nvim") || title.starts_with("vim")
-}
-
 /// Panel-focus decision for FocusLeft/FocusRight.  Panels sit in a fixed
 /// `ProjectsSidebar ↔ Terminal ↔ GitSidebar` row; movement toward a hidden
-/// panel is dropped (focus never opens a panel), and from the terminal a
-/// keyboard-originated move gives the inner TUI first refusal via
-/// [`inner_handles`].  IPC moves never pass through (see [`ActionOrigin`]).
+/// panel is dropped (focus never opens a panel).  From the terminal, a
+/// keyboard-originated move is forwarded to a running split-managing TUI
+/// (`tui_running`, see [`Session::nav_tui_running`]): the TUI walks its own
+/// splits and hands focus back with `alacritree action Focus…` once it has
+/// no window left in that direction — which is why IPC moves never pass
+/// through (see [`ActionOrigin`]).
 fn focus_move(
     focus: PaneFocus,
     dir: FocusDir,
     left_open: bool,
     right_open: bool,
     origin: ActionOrigin,
-    title: &str,
+    tui_running: bool,
 ) -> FocusMove {
-    if origin == ActionOrigin::Keyboard && focus == PaneFocus::Terminal && inner_handles(title, dir)
-    {
+    if origin == ActionOrigin::Keyboard && focus == PaneFocus::Terminal && tui_running {
         return FocusMove::Passthrough;
     }
     let target = match (focus, dir) {
@@ -1087,14 +1071,14 @@ impl AlacritreeApp {
 
     fn move_focus(&mut self, dir: FocusDir, origin: ActionOrigin) {
         let idx = self.active_session_index();
-        let title = idx.map(|i| self.sessions[i].title.as_str()).unwrap_or("");
+        let tui_running = idx.is_some_and(|i| self.sessions[i].nav_tui_running());
         let decision = focus_move(
             self.focus,
             dir,
             self.show_left_sidebar,
             self.show_right_sidebar,
             origin,
-            title,
+            tui_running,
         );
         match decision {
             FocusMove::Passthrough => {
@@ -5527,34 +5511,34 @@ mod tests {
     }
 
     /// Keyboard-originated `focus_move` with both panels open.
-    fn mv(focus: PaneFocus, dir: FocusDir, title: &str) -> FocusMove {
-        focus_move(focus, dir, true, true, ActionOrigin::Keyboard, title)
+    fn mv(focus: PaneFocus, dir: FocusDir, tui_running: bool) -> FocusMove {
+        focus_move(focus, dir, true, true, ActionOrigin::Keyboard, tui_running)
     }
 
     #[test]
     fn focus_moves_between_open_panels() {
         assert_eq!(
-            mv(PaneFocus::Terminal, FocusDir::Left, ""),
+            mv(PaneFocus::Terminal, FocusDir::Left, false),
             FocusMove::Focus(PaneFocus::ProjectsSidebar)
         );
         assert_eq!(
-            mv(PaneFocus::Terminal, FocusDir::Right, ""),
+            mv(PaneFocus::Terminal, FocusDir::Right, false),
             FocusMove::Focus(PaneFocus::GitSidebar)
         );
         assert_eq!(
-            mv(PaneFocus::ProjectsSidebar, FocusDir::Right, ""),
+            mv(PaneFocus::ProjectsSidebar, FocusDir::Right, false),
             FocusMove::Focus(PaneFocus::Terminal)
         );
         assert_eq!(
-            mv(PaneFocus::GitSidebar, FocusDir::Left, ""),
+            mv(PaneFocus::GitSidebar, FocusDir::Left, false),
             FocusMove::Focus(PaneFocus::Terminal)
         );
     }
 
     #[test]
     fn focus_stops_at_the_outer_edges() {
-        assert_eq!(mv(PaneFocus::ProjectsSidebar, FocusDir::Left, ""), FocusMove::Nothing);
-        assert_eq!(mv(PaneFocus::GitSidebar, FocusDir::Right, ""), FocusMove::Nothing);
+        assert_eq!(mv(PaneFocus::ProjectsSidebar, FocusDir::Left, false), FocusMove::Nothing);
+        assert_eq!(mv(PaneFocus::GitSidebar, FocusDir::Right, false), FocusMove::Nothing);
     }
 
     #[test]
@@ -5566,7 +5550,7 @@ mod tests {
                 false,
                 true,
                 ActionOrigin::Keyboard,
-                ""
+                false
             ),
             FocusMove::Nothing
         );
@@ -5577,61 +5561,22 @@ mod tests {
                 true,
                 false,
                 ActionOrigin::Keyboard,
-                ""
+                false
             ),
             FocusMove::Nothing
         );
     }
 
     #[test]
-    fn tmux_edges_gate_passthrough() {
-        // No letter for the direction: the inner stack can still move.
-        assert_eq!(
-            mv(PaneFocus::Terminal, FocusDir::Left, "tmux:R /home/lev"),
-            FocusMove::Passthrough
-        );
-        // Against that wall: alacritree takes over.
-        assert_eq!(
-            mv(PaneFocus::Terminal, FocusDir::Left, "tmux:LU /home/lev"),
-            FocusMove::Focus(PaneFocus::ProjectsSidebar)
-        );
-        // Bare prefix publishes no blocked edges at all.
-        assert_eq!(mv(PaneFocus::Terminal, FocusDir::Right, "tmux:"), FocusMove::Passthrough);
-    }
-
-    #[test]
-    fn tmux_at_edge_with_closed_panel_does_nothing() {
-        assert_eq!(
-            focus_move(
-                PaneFocus::Terminal,
-                FocusDir::Left,
-                false,
-                true,
-                ActionOrigin::Keyboard,
-                "tmux:L x"
-            ),
-            FocusMove::Nothing
-        );
-    }
-
-    #[test]
-    fn nvim_titles_always_pass_through() {
-        assert_eq!(
-            mv(PaneFocus::Terminal, FocusDir::Left, "nvim ~/notes.md"),
-            FocusMove::Passthrough
-        );
-        assert_eq!(mv(PaneFocus::Terminal, FocusDir::Right, "vim"), FocusMove::Passthrough);
-        // A shell whose title merely mentions vim is not vim.
-        assert_eq!(
-            mv(PaneFocus::Terminal, FocusDir::Left, "pwsh — nvim docs"),
-            FocusMove::Focus(PaneFocus::ProjectsSidebar)
-        );
+    fn running_tui_keeps_the_key() {
+        assert_eq!(mv(PaneFocus::Terminal, FocusDir::Left, true), FocusMove::Passthrough);
+        assert_eq!(mv(PaneFocus::Terminal, FocusDir::Right, true), FocusMove::Passthrough);
     }
 
     #[test]
     fn sidebars_never_pass_through() {
         assert_eq!(
-            mv(PaneFocus::ProjectsSidebar, FocusDir::Right, "tmux: x"),
+            mv(PaneFocus::ProjectsSidebar, FocusDir::Right, true),
             FocusMove::Focus(PaneFocus::Terminal)
         );
     }
@@ -5640,22 +5585,12 @@ mod tests {
     /// passthrough would bounce the key straight back to it.
     #[test]
     fn ipc_moves_never_pass_through() {
-        for title in ["nvim ~/notes.md", "tmux:R /home/lev"] {
-            assert_eq!(
-                focus_move(
-                    PaneFocus::Terminal,
-                    FocusDir::Left,
-                    true,
-                    true,
-                    ActionOrigin::Ipc,
-                    title
-                ),
-                FocusMove::Focus(PaneFocus::ProjectsSidebar),
-                "{title}"
-            );
-        }
         assert_eq!(
-            focus_move(PaneFocus::Terminal, FocusDir::Left, false, true, ActionOrigin::Ipc, "nvim"),
+            focus_move(PaneFocus::Terminal, FocusDir::Left, true, true, ActionOrigin::Ipc, true),
+            FocusMove::Focus(PaneFocus::ProjectsSidebar)
+        );
+        assert_eq!(
+            focus_move(PaneFocus::Terminal, FocusDir::Left, false, true, ActionOrigin::Ipc, true),
             FocusMove::Nothing
         );
     }

@@ -117,6 +117,9 @@ struct AgentCache {
     process_glyph: Option<char>,
     /// Whether anything is running in the terminal beyond the shell itself.
     foreground_job: bool,
+    /// Whether a split-managing TUI (vim, tmux) is running in the terminal;
+    /// see [`Session::nav_tui_running`].
+    nav_tui: bool,
 }
 
 const AGENT_CACHE_TTL: Duration = Duration::from_millis(1000);
@@ -177,6 +180,18 @@ fn agent_glyph_by_name(names: impl IntoIterator<Item = impl AsRef<str>>) -> Opti
         let n = n.as_ref().to_ascii_lowercase();
         AGENT_PROCESS_GLYPHS.iter().find(|(name, _)| n.starts_with(name)).map(|(_, g)| *g)
     })
+}
+
+/// TUIs that manage their own splits and cooperate with FocusLeft/
+/// FocusRight: the key is forwarded while one runs, and the TUI calls
+/// `alacritree action Focus…` over IPC once it has no window left in that
+/// direction.  Matches Linux `comm` values (`tmux: client`) and Windows
+/// image names (`nvim.exe`) alike; gvim stays out — it owns its own
+/// window and never runs inside the terminal.
+#[cfg(any(test, target_os = "linux", windows))]
+fn is_nav_tui_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.starts_with("nvim") || n.starts_with("vim") || n.starts_with("tmux")
 }
 
 /// Match full command lines against the agent map — picks up
@@ -380,6 +395,34 @@ fn foreground_process_glyph(_shell_pid: u32) -> Option<char> {
     None
 }
 
+/// Whether a split-managing TUI owns the terminal: the process holding the
+/// foreground group is one of the recognized names.
+#[cfg(target_os = "linux")]
+fn foreground_nav_tui(shell_pid: u32) -> bool {
+    let Some(tpgid) = read_tpgid(shell_pid) else {
+        return false;
+    };
+    if tpgid <= 0 {
+        return false;
+    }
+    std::fs::read_to_string(format!("/proc/{tpgid}/comm"))
+        .is_ok_and(|comm| is_nav_tui_name(comm.trim()))
+}
+
+/// Windows has no foreground process group, so a nav TUI anywhere in the
+/// shell's descendant tree counts — the same approximation the agent
+/// glyph uses.
+#[cfg(windows)]
+fn foreground_nav_tui(shell_pid: u32) -> bool {
+    windows_process_probe::probe(shell_pid).2
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn foreground_nav_tui(_shell_pid: u32) -> bool {
+    // Same gap as the glyph probe: macOS isn't wired up yet.
+    false
+}
+
 /// Terminal options derived from the user config.
 pub fn term_config(config: &Config) -> TermConfig {
     TermConfig {
@@ -421,7 +464,7 @@ mod windows_process_probe {
 
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
-    use super::{agent_glyph_by_cmdline, agent_glyph_by_name, process_tree_pids};
+    use super::{agent_glyph_by_cmdline, agent_glyph_by_name, is_nav_tui_name, process_tree_pids};
 
     /// Slightly under `AGENT_CACHE_TTL` so the first session to tick
     /// refreshes and the rest reuse the same table.
@@ -429,9 +472,9 @@ mod windows_process_probe {
 
     static SNAPSHOT: Mutex<Option<(Instant, System)>> = Mutex::new(None);
 
-    /// Agent glyph found in the shell's descendant tree, plus whether the
-    /// shell has any descendants at all.
-    pub(super) fn probe(shell_pid: u32) -> (Option<char>, bool) {
+    /// Agent glyph found in the shell's descendant tree, whether the shell
+    /// has any descendants at all, and whether one of them is a nav TUI.
+    pub(super) fn probe(shell_pid: u32) -> (Option<char>, bool, bool) {
         let mut guard = SNAPSHOT.lock().unwrap_or_else(PoisonError::into_inner);
         if guard.as_ref().is_none_or(|(at, _)| at.elapsed() >= SNAPSHOT_TTL) {
             let mut sys = guard.take().map(|(_, sys)| sys).unwrap_or_default();
@@ -453,10 +496,14 @@ mod windows_process_probe {
         let has_children = tree.len() > 1;
         let tree: Vec<Pid> = tree.into_iter().map(Pid::from_u32).collect();
 
-        let names =
-            tree.iter().filter_map(|pid| sys.process(*pid)).map(|p| p.name().to_string_lossy());
-        if let Some(glyph) = agent_glyph_by_name(names) {
-            return (Some(glyph), has_children);
+        let names: Vec<String> = tree
+            .iter()
+            .filter_map(|pid| sys.process(*pid))
+            .map(|p| p.name().to_string_lossy().into_owned())
+            .collect();
+        let nav_tui = names.iter().any(|n| is_nav_tui_name(n));
+        if let Some(glyph) = agent_glyph_by_name(&names) {
+            return (Some(glyph), has_children, nav_tui);
         }
 
         // Names missed: fetch command lines for just the tree to catch
@@ -470,7 +517,7 @@ mod windows_process_probe {
             .iter()
             .filter_map(|pid| sys.process(*pid))
             .map(|p| p.cmd().iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "));
-        (agent_glyph_by_cmdline(cmds), has_children)
+        (agent_glyph_by_cmdline(cmds), has_children, nav_tui)
     }
 }
 
@@ -704,20 +751,33 @@ impl Session {
         self.process_probe().0
     }
 
-    fn process_probe(&self) -> (Option<char>, bool) {
+    /// Whether a split-managing TUI (vim, tmux) is running in this terminal
+    /// — the FocusLeft/FocusRight passthrough signal.  Identity comes from
+    /// the process probe rather than the terminal title: a title-based
+    /// signal needs every cooperating program to publish a recognizable
+    /// value, and Windows' ConPTY interleaves the console title into the
+    /// stream, so a launcher touching it after vim starts clobbers vim's
+    /// own title until vim re-emits it.
+    pub fn nav_tui_running(&self) -> bool {
+        self.process_probe().2
+    }
+
+    fn process_probe(&self) -> (Option<char>, bool, bool) {
         let cached = self.agent_cache.get();
         let fresh = cached.polled_at.is_some_and(|t| t.elapsed() < AGENT_CACHE_TTL);
         if fresh {
-            return (cached.process_glyph, cached.foreground_job);
+            return (cached.process_glyph, cached.foreground_job, cached.nav_tui);
         }
         let glyph = self.shell_pid.and_then(foreground_process_glyph);
         let foreground_job = self.shell_pid.is_some_and(shell_has_foreground_job);
+        let nav_tui = self.shell_pid.is_some_and(foreground_nav_tui);
         self.agent_cache.set(AgentCache {
             polled_at: Some(Instant::now()),
             process_glyph: glyph,
             foreground_job,
+            nav_tui,
         });
-        (glyph, foreground_job)
+        (glyph, foreground_job, nav_tui)
     }
 
     /// Text dump of the visible screen plus up to `scrollback_lines` of
@@ -1132,6 +1192,21 @@ mod tests {
         assert_eq!(agent_glyph_by_name(["pwsh.exe", "git.exe"]), None);
         assert_eq!(agent_glyph_by_name(["not-claude.exe"]), None);
         assert_eq!(agent_glyph_by_name(std::iter::empty::<&str>()), None);
+    }
+
+    #[test]
+    fn nav_tui_name_match_covers_both_platforms_naming() {
+        // Windows image names.
+        assert!(is_nav_tui_name("nvim.exe"));
+        assert!(is_nav_tui_name("NVIM.EXE"));
+        assert!(is_nav_tui_name("vim.exe"));
+        // Linux comm values.
+        assert!(is_nav_tui_name("nvim"));
+        assert!(is_nav_tui_name("tmux: client"));
+        // gvim owns its own window — it never runs inside the terminal.
+        assert!(!is_nav_tui_name("gvim.exe"));
+        assert!(!is_nav_tui_name("chezmoi.exe"));
+        assert!(!is_nav_tui_name("pwsh.exe"));
     }
 
     #[test]
