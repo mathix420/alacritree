@@ -585,7 +585,7 @@ fn fallback_tweak(primary_ratio: Option<f32>, data: &[u8], index: u32) -> FontTw
 /// definitions unchanged when the family cannot be resolved or read, in which
 /// case the chrome keeps using the terminal font.
 fn install_ui_font(defs: &mut FontDefinitions, family_or_path: &str, fonts: &SystemFonts) -> bool {
-    let Some(resolved) = resolve_face(family_or_path, None, Variant::Normal, fonts) else {
+    let Some(resolved) = resolve_ui_face(family_or_path, fonts) else {
         log::warn!("could not resolve ui font '{family_or_path}'; keeping the terminal font");
         return false;
     };
@@ -988,6 +988,37 @@ fn resolve_face(
     // fontdb fallback for the case where libfontconfig isn't available; it
     // doesn't expand <alias> rules, so it's strictly second-best on Unix.
     resolve_via_fontdb(family_or_path, variant, fonts)
+}
+
+/// Strict resolution for the `[ui.font]` family.  `FcFontMatch` substitutes a
+/// default face for unknown families instead of failing, which would turn a
+/// typo'd family into a silent chrome-font change — so gate on fontdb, which
+/// matches family names literally, and only then let fontconfig pick the face
+/// (its alias and weight substitution beats fontdb's).  CSS generics skip the
+/// gate: they are aliases, not listed families.  Custom `<alias>` names lose
+/// out (fontdb can't see them), a fair trade for keeping typos on the
+/// terminal font.
+#[cfg(unix)]
+fn resolve_ui_face(family_or_path: &str, fonts: &SystemFonts) -> Option<ResolvedFace> {
+    if let Some(face) = resolve_via_path(family_or_path) {
+        return Some(face);
+    }
+    let generic = matches!(
+        family_or_path.to_ascii_lowercase().as_str(),
+        "sans-serif" | "serif" | "monospace" | "cursive" | "fantasy" | "system-ui"
+    );
+    let listed = resolve_via_fontdb(family_or_path, Variant::Normal, fonts);
+    if !generic && listed.is_none() {
+        return None;
+    }
+    fontconfig_resolve::resolve(family_or_path, None, Variant::Normal).or(listed)
+}
+
+/// fontdb already matches family names literally, so the shared path is
+/// exactly as strict as the UI font needs.
+#[cfg(not(unix))]
+fn resolve_ui_face(family_or_path: &str, fonts: &SystemFonts) -> Option<ResolvedFace> {
+    resolve_face(family_or_path, None, Variant::Normal, fonts)
 }
 
 #[cfg(not(unix))]
