@@ -2122,18 +2122,6 @@ impl AlacritreeApp {
         let icons = self.config.ui.icons.clone();
         let profile_names: Vec<String> =
             self.config.profiles.iter().map(|p| p.name.clone()).collect();
-        // Rendered up front: the panel closure borrows `projects` mutably, and
-        // substitution over short strings is microseconds, so no cache is kept.
-        let mut project_labels: Vec<String> = Vec::with_capacity(self.projects.len());
-        let mut worktree_labels: Vec<Vec<String>> = Vec::with_capacity(self.projects.len());
-        for project in &self.projects {
-            project_labels.push(self.row_labels.project_label(project));
-            let mut rows = Vec::with_capacity(project.worktrees.len());
-            for wt in &project.worktrees {
-                rows.push(self.row_labels.worktree_label(wt));
-            }
-            worktree_labels.push(rows);
-        }
         let mut shell_override_changed: Option<PathBuf> = None;
         let mut label_cleared: Option<PathBuf> = None;
         let mut rename_request: Option<RenameState> = None;
@@ -2175,6 +2163,19 @@ impl AlacritreeApp {
                 rows.push(info);
             }
             pr_infos.push(rows);
+        }
+        // Rendered up front: the panel closure borrows `projects` mutably, and
+        // substitution over short strings is microseconds, so no cache is kept.
+        // After `pr_infos` so `$pr` sees this frame's PR numbers.
+        let mut project_labels: Vec<String> = Vec::with_capacity(self.projects.len());
+        let mut worktree_labels: Vec<Vec<String>> = Vec::with_capacity(self.projects.len());
+        for (project, prs) in self.projects.iter().zip(&pr_infos) {
+            project_labels.push(self.row_labels.project_label(project));
+            let mut rows = Vec::with_capacity(project.worktrees.len());
+            for (wt, pr) in project.worktrees.iter().zip(prs) {
+                rows.push(self.row_labels.worktree_label(wt, pr.as_ref()));
+            }
+            worktree_labels.push(rows);
         }
 
         let panel_resp = SidePanel::left("left_sidebar")

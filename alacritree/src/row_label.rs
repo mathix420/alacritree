@@ -3,13 +3,17 @@
 //! Templates come from `[ui] worktree_name` / `[ui] project_name` and use
 //! subst's shell-style syntax: `$var`, `${var}`, and `${var:fallback}` (the
 //! fallback may itself contain variables, so `${branch:$name}` reads "the
-//! branch, or the worktree name when detached").  Any error — parse failure,
-//! unknown variable — falls back to the plain name with one warning per
-//! config key, so a typo'd config degrades to today's sidebar rather than
-//! blank rows.
+//! branch, or the worktree name when detached").  Variables that describe
+//! something optional — `$branch` on a detached worktree, `$pr` with no
+//! known PR — are absent rather than empty, so `${pr:}` conditionally shows
+//! the PR number while a bare `$pr` treats its absence as an error.  Any
+//! error — parse failure, unknown variable — falls back to the plain name
+//! with one warning per config key, so a typo'd config degrades to today's
+//! sidebar rather than blank rows.
 
 use std::collections::{HashMap, HashSet};
 
+use crate::pr_status::PrInfo;
 use crate::projects::{Project, Worktree};
 
 /// Substitute `vars` into `template`.  `None` on any subst error or when the
@@ -39,8 +43,10 @@ impl LabelTemplates {
 
     /// Display name for a worktree row.  Variables: `$name` (worktree name),
     /// `$branch` (absent when detached, so `${branch:...}` falls back),
-    /// `$path` (full worktree path).
-    pub fn worktree_label(&mut self, wt: &Worktree) -> String {
+    /// `$path` (full worktree path), `$pr` (the branch's PR number as
+    /// `#123`, absent when none is known — `${pr:}` shows it only when one
+    /// exists).
+    pub fn worktree_label(&mut self, wt: &Worktree, pr: Option<&PrInfo>) -> String {
         let Some(template) = self.worktree.clone() else {
             return wt.name.clone();
         };
@@ -50,6 +56,9 @@ impl LabelTemplates {
             vars.insert("branch".to_string(), branch.clone());
         }
         vars.insert("path".to_string(), wt.path.display().to_string());
+        if let Some(pr) = pr {
+            vars.insert("pr".to_string(), format!("#{}", pr.number));
+        }
         self.render_or_fallback("worktree_name", &template, &vars, &wt.name)
     }
 
@@ -160,15 +169,15 @@ mod tests {
     #[test]
     fn no_template_returns_plain_names() {
         let mut t = LabelTemplates::new(None, None);
-        assert_eq!(t.worktree_label(&wt("alpha", Some("feat/a"))), "alpha");
+        assert_eq!(t.worktree_label(&wt("alpha", Some("feat/a")), None), "alpha");
         assert_eq!(t.project_label(&project("proj", None)), "proj");
     }
 
     #[test]
     fn worktree_template_renders_branch_with_name_fallback() {
         let mut t = LabelTemplates::new(Some("${branch:$name}".into()), None);
-        assert_eq!(t.worktree_label(&wt("alpha", Some("feat/a"))), "feat/a");
-        assert_eq!(t.worktree_label(&wt("detached", None)), "detached");
+        assert_eq!(t.worktree_label(&wt("alpha", Some("feat/a")), None), "feat/a");
+        assert_eq!(t.worktree_label(&wt("detached", None), None), "detached");
     }
 
     #[test]
@@ -181,15 +190,15 @@ mod tests {
     #[test]
     fn bad_template_falls_back_to_plain_name() {
         let mut t = LabelTemplates::new(Some("$typo".into()), Some("$typo".into()));
-        assert_eq!(t.worktree_label(&wt("alpha", None)), "alpha");
+        assert_eq!(t.worktree_label(&wt("alpha", None), None), "alpha");
         assert_eq!(t.project_label(&project("proj", None)), "proj");
     }
 
     #[test]
     fn warn_once_per_config_key_not_per_template() {
         let mut t = LabelTemplates::new(Some("$typo".into()), Some("$typo".into()));
-        assert_eq!(t.worktree_label(&wt("alpha", None)), "alpha");
-        assert_eq!(t.worktree_label(&wt("alpha", None)), "alpha");
+        assert_eq!(t.worktree_label(&wt("alpha", None), None), "alpha");
+        assert_eq!(t.worktree_label(&wt("alpha", None), None), "alpha");
         assert_eq!(t.project_label(&project("proj", None)), "proj");
         assert_eq!(t.project_label(&project("proj", None)), "proj");
         assert_eq!(t.warned.len(), 2);
@@ -199,8 +208,32 @@ mod tests {
     fn path_variable_is_available() {
         let mut t = LabelTemplates::new(Some("$path".into()), Some("$path".into()));
         let w = wt("alpha", None);
-        assert_eq!(t.worktree_label(&w), w.path.display().to_string());
+        assert_eq!(t.worktree_label(&w, None), w.path.display().to_string());
         let p = project("proj", None);
         assert_eq!(t.project_label(&p), p.root.display().to_string());
+    }
+
+    fn pr(number: u64) -> PrInfo {
+        PrInfo {
+            number,
+            base_branch: "master".into(),
+            url: String::new(),
+            state: crate::pr_status::PrState::Open,
+        }
+    }
+
+    #[test]
+    fn pr_variable_shows_conditionally() {
+        let mut t = LabelTemplates::new(Some("${pr:} ${branch:$name}".into()), None);
+        assert_eq!(t.worktree_label(&wt("alpha", Some("feat/a")), Some(&pr(42))), "#42 feat/a");
+        // No PR: ${pr:} renders empty and the trim eats the stray space.
+        assert_eq!(t.worktree_label(&wt("alpha", Some("feat/a")), None), "feat/a");
+    }
+
+    #[test]
+    fn bare_pr_variable_falls_back_without_a_pr() {
+        let mut t = LabelTemplates::new(Some("$pr $name".into()), None);
+        assert_eq!(t.worktree_label(&wt("alpha", None), Some(&pr(7))), "#7 alpha");
+        assert_eq!(t.worktree_label(&wt("alpha", None), None), "alpha");
     }
 }

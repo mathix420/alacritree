@@ -367,8 +367,10 @@ pub struct UiTheme {
     pub icons: Icons,
     pub focus_outline: FocusOutline,
     /// `[ui] worktree_name`: template for worktree row labels (subst syntax:
-    /// `$name`, `$branch`, `$path`, `${var:fallback}`).  `None` keeps the plain
-    /// worktree name.
+    /// `$name`, `$branch`, `$path`, `${var:fallback}`; `$pr` is the branch's
+    /// PR number as `#123`, absent when none is known — it needs
+    /// `pr_status = true`, which is what polls `gh`).  `None` keeps the
+    /// plain worktree name.
     pub worktree_name: Option<String>,
     /// `[ui] project_name`: template for project row labels (`$name`, `$path`).
     /// A manual rename (`Project.label`) always wins over the template.
