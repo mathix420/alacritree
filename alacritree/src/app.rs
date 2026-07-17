@@ -28,6 +28,7 @@ use crate::state::{self, PersistedProject};
 use crate::terminal_view;
 use crate::worktree::{self as wt, CreateRequest, Progress};
 use crate::wsl::{self, ShellChoice};
+use crate::wsl_helper::{self, WslProbe};
 
 /// `None` is the home workspace (sessions inherit `$PWD`); `Some` is a worktree path.
 pub type WorkspaceKey = Option<PathBuf>;
@@ -738,8 +739,8 @@ impl AlacritreeApp {
         if let Some(dir) = &working_directory {
             self.sync_doppler_scopes(dir.clone());
         }
-        let shell = self.resolve_shell(&working_directory);
-        self.spawn_session_with_shell(ctx, working_directory, shell)
+        let (shell, wsl_probe) = self.resolve_shell(&working_directory);
+        self.spawn_session_with_shell(ctx, working_directory, shell, wsl_probe)
     }
 
     fn spawn_session_with_shell(
@@ -747,6 +748,7 @@ impl AlacritreeApp {
         ctx: &Context,
         working_directory: WorkspaceKey,
         shell: Option<Shell>,
+        wsl_probe: Option<WslProbe>,
     ) -> std::io::Result<SessionId> {
         let session = Session::spawn(
             ctx.clone(),
@@ -755,6 +757,7 @@ impl AlacritreeApp {
             TermSize::new(80, 24),
             (8.0, 16.0),
             shell,
+            wsl_probe,
         )?;
         let id = session.id;
         self.sessions.push(session);
@@ -795,9 +798,9 @@ impl AlacritreeApp {
             self.last_error = Some(format!("no shell profile named `{name}`"));
             return;
         };
-        let shell = Some(profile_shell(profile));
+        let (shell, wsl_probe) = profile_session_shell(profile);
         let ws = self.current_workspace.clone();
-        if let Err(e) = self.spawn_session_with_shell(ctx, ws, shell) {
+        if let Err(e) = self.spawn_session_with_shell(ctx, ws, shell, wsl_probe) {
             self.last_error = Some(format!("failed to spawn profile `{name}`: {e}"));
         }
     }
@@ -806,7 +809,7 @@ impl AlacritreeApp {
     /// falls through to alacritty's config-driven shell with its
     /// OS-guaranteed fallback.  The home tab (`None` workspace) has no
     /// project or location, so only the default profile can apply there.
-    fn resolve_shell(&self, workspace: &WorkspaceKey) -> Option<Shell> {
+    fn resolve_shell(&self, workspace: &WorkspaceKey) -> (Option<Shell>, Option<WslProbe>) {
         let path = workspace.as_deref();
         let choice = path.and_then(|p| {
             self.projects
@@ -826,11 +829,17 @@ impl AlacritreeApp {
             &self.config.profiles,
             self.config.default_profile.as_deref(),
         ) {
-            ShellDecision::ConfigShell => None,
+            ShellDecision::ConfigShell => config_session_shell(&self.config),
             // A WSL decision only arises from a workspace path (override or
             // location), never from the home tab.
-            ShellDecision::WslDistro(distro) => path.map(|p| wsl_shell(&distro, p)),
-            ShellDecision::Profile(name) => self.config.profile(&name).map(profile_shell),
+            ShellDecision::WslDistro(distro) => match path {
+                Some(p) => wsl_session_shell(&distro, p),
+                None => (None, None),
+            },
+            ShellDecision::Profile(name) => match self.config.profile(&name) {
+                Some(profile) => profile_session_shell(profile),
+                None => (None, None),
+            },
         }
     }
 
@@ -3156,6 +3165,53 @@ fn build_wsl_diff_command_login(
 fn wsl_shell(distro: &str, workdir: &Path) -> Shell {
     let (program, args) = wsl::shell_invocation(distro, workdir);
     Shell::new(program, args)
+}
+
+/// Shimmed when the resident helper is on; the plain wsl.exe login-shell
+/// launch (and an unknown probe) otherwise.
+fn wsl_session_shell(distro: &str, workdir: &Path) -> (Option<Shell>, Option<WslProbe>) {
+    if !wsl_helper::enabled() {
+        return (Some(wsl_shell(distro, workdir)), None);
+    }
+    let key = wsl_helper::new_probe_key();
+    let (program, args) = wsl_helper::shim_invocation(distro, workdir, &key);
+    (Some(Shell::new(program, args)), Some(WslProbe { distro: distro.to_string(), key }))
+}
+
+/// The probe shim for any user-supplied wsl.exe argv (profile or
+/// `[terminal.shell]`): `Some` only when the argv is fully understood and
+/// a distro name is known — the probe registry needs one, so a wrapped
+/// default-distro launch resolves it via enumeration.  Anything exotic
+/// runs unmodified and probes as unknown.
+fn shimmed_wsl_argv(program: &str, args: &[String]) -> Option<(Shell, WslProbe)> {
+    if !wsl_helper::enabled() {
+        return None;
+    }
+    let key = wsl_helper::new_probe_key();
+    let (args, distro) = wsl_helper::wrap_profile_argv(program, args, &key)?;
+    let distro =
+        distro.or_else(|| wsl::distros().into_iter().find(|d| d.is_default).map(|d| d.name))?;
+    Some((Shell::new(program.to_string(), args), WslProbe { distro, key }))
+}
+
+fn profile_session_shell(profile: &crate::config::Profile) -> (Option<Shell>, Option<WslProbe>) {
+    match shimmed_wsl_argv(&profile.program, &profile.args) {
+        Some((shell, probe)) => (Some(shell), Some(probe)),
+        None => (Some(profile_shell(profile)), None),
+    }
+}
+
+/// `[terminal.shell] program = "wsl.exe"` gets the same shim as a wsl.exe
+/// profile; any other config shell (or none) spawns unchanged through
+/// `Session::spawn`'s own config-shell default.
+fn config_session_shell(config: &crate::config::Config) -> (Option<Shell>, Option<WslProbe>) {
+    match &config.shell {
+        Some(s) => match shimmed_wsl_argv(&s.program, &s.args) {
+            Some((shell, probe)) => (Some(shell), Some(probe)),
+            None => (None, None),
+        },
+        None => (None, None),
+    }
 }
 
 /// What shell a new session should run, decided from plain data so the

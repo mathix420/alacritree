@@ -17,6 +17,7 @@ use alacritty_terminal::vte::ansi::Rgb;
 use crate::clipboard::Target;
 use crate::colors;
 use crate::config::{Config, Palette};
+use crate::wsl_helper::{self, WslProbe};
 
 #[derive(Clone)]
 pub struct EventProxy {
@@ -105,6 +106,10 @@ pub struct Session {
     /// timer instead of polling the process table every frame.  `Cell` is
     /// enough since `Session` isn't `Sync` and the values are `Copy`.
     agent_cache: Cell<AgentCache>,
+    /// Set for shimmed WSL sessions: the distro plus the probe key its
+    /// shim published, unregistered again on drop.  The Windows process
+    /// table ends at wsl.exe, so this is the only live view inside.
+    wsl_probe: Option<WslProbe>,
     notifier: Notifier,
     sender: EventLoopSender,
     exited: bool,
@@ -194,14 +199,21 @@ fn is_nav_tui_name(name: &str) -> bool {
     n.starts_with("nvim") || n.starts_with("vim") || n.starts_with("tmux")
 }
 
-/// `wsl.exe` (and its `wslhost`/`wslrelay` helpers) mark a session whose
-/// real process tree lives on the Linux side, where this probe cannot see.
-/// Assume the inside cooperates like a nav TUI: the key is forwarded, and
-/// programs in the distro hand focus back by exec'ing the Windows CLI
-/// (`alacritree.exe action Focus…`) through WSL interop.
-#[cfg(any(test, windows))]
-fn is_wsl_boundary_name(name: &str) -> bool {
-    name.to_ascii_lowercase().starts_with("wsl")
+/// FocusLeft/FocusRight passthrough decision for a shimmed WSL session: the
+/// helper's cached foreground `comm`, matched like the native Linux probe.
+/// Unknown means no TUI — the keys move panel focus.  Gated the same as
+/// `is_nav_tui_name` (plus its `not(...)` fallback below) since `Session`
+/// always carries a `wsl_probe` field, so `process_probe`'s match on it must
+/// compile everywhere, even though a shimmed session only exists on Windows.
+#[cfg(any(test, target_os = "linux", windows))]
+fn wsl_nav_tui(comm: Option<&str>) -> bool {
+    comm.is_some_and(is_nav_tui_name)
+}
+
+#[cfg(not(any(test, target_os = "linux", windows)))]
+fn wsl_nav_tui(_comm: Option<&str>) -> bool {
+    // Same gap as the glyph probe: macOS isn't wired up yet.
+    false
 }
 
 /// Match full command lines against the agent map — picks up
@@ -474,10 +486,7 @@ mod windows_process_probe {
 
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
-    use super::{
-        agent_glyph_by_cmdline, agent_glyph_by_name, is_nav_tui_name, is_wsl_boundary_name,
-        process_tree_pids,
-    };
+    use super::{agent_glyph_by_cmdline, agent_glyph_by_name, is_nav_tui_name, process_tree_pids};
 
     /// Slightly under `AGENT_CACHE_TTL` so the first session to tick
     /// refreshes and the rest reuse the same table.
@@ -514,7 +523,7 @@ mod windows_process_probe {
             .filter_map(|pid| sys.process(*pid))
             .map(|p| p.name().to_string_lossy().into_owned())
             .collect();
-        let nav_tui = names.iter().any(|n| is_nav_tui_name(n) || is_wsl_boundary_name(n));
+        let nav_tui = names.iter().any(|n| is_nav_tui_name(n));
         if let Some(glyph) = agent_glyph_by_name(&names) {
             return (Some(glyph), has_children, nav_tui);
         }
@@ -542,6 +551,7 @@ impl Session {
         size: TermSize,
         cell_size: (f32, f32),
         shell_override: Option<Shell>,
+        wsl_probe: Option<WslProbe>,
     ) -> std::io::Result<Self> {
         // Overrides are argv built in code (`wsl.exe -d <distro> --cd <dir>`),
         // so their args need Windows quoting like diff-pane argv; config
@@ -564,6 +574,7 @@ impl Session {
             title,
             SessionKind::Shell,
             escape_args,
+            wsl_probe,
         )
     }
 
@@ -591,6 +602,7 @@ impl Session {
             title,
             kind,
             true,
+            None,
         )
     }
 
@@ -604,6 +616,7 @@ impl Session {
         title: String,
         kind: SessionKind,
         escape_args: bool,
+        wsl_probe: Option<WslProbe>,
     ) -> std::io::Result<Self> {
         ensure_working_directory(working_directory.as_deref())?;
         let window_size = window_size(size, cell_size);
@@ -652,6 +665,9 @@ impl Session {
         let sender = event_loop.channel();
         event_loop.spawn();
 
+        if let Some(probe) = &wsl_probe {
+            wsl_helper::register_probe(&probe.distro, &probe.key);
+        }
         Ok(Self {
             id: next_session_id(),
             title,
@@ -666,6 +682,7 @@ impl Session {
             last_report_cell: None,
             shell_pid,
             agent_cache: Cell::new(AgentCache::default()),
+            wsl_probe,
             notifier: Notifier(sender.clone()),
             sender,
             exited: false,
@@ -783,7 +800,12 @@ impl Session {
         }
         let glyph = self.shell_pid.and_then(foreground_process_glyph);
         let foreground_job = self.shell_pid.is_some_and(shell_has_foreground_job);
-        let nav_tui = self.shell_pid.is_some_and(foreground_nav_tui);
+        let nav_tui = match &self.wsl_probe {
+            Some(probe) => {
+                wsl_nav_tui(wsl_helper::foreground_comm(&probe.distro, &probe.key).as_deref())
+            },
+            None => self.shell_pid.is_some_and(foreground_nav_tui),
+        };
         self.agent_cache.set(AgentCache {
             polled_at: Some(Instant::now()),
             process_glyph: glyph,
@@ -847,6 +869,9 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if let Some(probe) = &self.wsl_probe {
+            wsl_helper::unregister_probe(&probe.distro, &probe.key);
+        }
         self.shutdown();
     }
 }
@@ -1208,6 +1233,18 @@ mod tests {
     }
 
     #[test]
+    fn wsl_nav_tui_needs_a_known_cooperating_comm() {
+        assert!(wsl_nav_tui(Some("nvim")));
+        assert!(wsl_nav_tui(Some("vim")));
+        assert!(wsl_nav_tui(Some("tmux: client")));
+        // A shell, an agent, or an unknown probe must move panel focus —
+        // losing passthrough beats losing the keys.
+        assert!(!wsl_nav_tui(Some("bash")));
+        assert!(!wsl_nav_tui(Some("claude")));
+        assert!(!wsl_nav_tui(None));
+    }
+
+    #[test]
     fn nav_tui_name_match_covers_both_platforms_naming() {
         // Windows image names.
         assert!(is_nav_tui_name("nvim.exe"));
@@ -1220,14 +1257,12 @@ mod tests {
         assert!(!is_nav_tui_name("gvim.exe"));
         assert!(!is_nav_tui_name("chezmoi.exe"));
         assert!(!is_nav_tui_name("pwsh.exe"));
-    }
-
-    #[test]
-    fn wsl_boundary_match_covers_the_helper_processes() {
-        assert!(is_wsl_boundary_name("wsl.exe"));
-        assert!(is_wsl_boundary_name("wslhost.exe"));
-        assert!(is_wsl_boundary_name("WSLRELAY.EXE"));
-        assert!(!is_wsl_boundary_name("pwsh.exe"));
+        // A wsl.exe in the descendant tree no longer implies a cooperating
+        // TUI — the Windows process table can't see the distro side, so the
+        // resident helper's foreground probe is the only signal now.
+        assert!(!is_nav_tui_name("wsl.exe"));
+        assert!(!is_nav_tui_name("wslhost.exe"));
+        assert!(!is_nav_tui_name("WSLRELAY.EXE"));
     }
 
     #[test]
