@@ -648,10 +648,11 @@ impl Session {
             env,
             // Windows has no argv: alacritty_terminal joins these args into a
             // single CreateProcess command line, quoting them only when this
-            // is set.  True for argv built in code (diff panes, WSL shells),
-            // where an arg with a space (delta's pager spec, UNC paths) must
-            // survive as one argument; shell args from alacritty.toml stay
-            // raw to match upstream alacritty.
+            // is set.  True for argv built in code (diff panes, WSL shells,
+            // and a config shell shimmed by the resident helper), where an
+            // arg with a space (delta's pager spec, UNC paths) must survive
+            // as one argument; a config shell that isn't shimmed stays raw,
+            // matching upstream alacritty.
             #[cfg(windows)]
             escape_args,
         };
