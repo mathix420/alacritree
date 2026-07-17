@@ -539,6 +539,80 @@ pub fn capability_gh(distro: &str) -> Option<String> {
     client(distro)?.capabilities()?.gh.clone()
 }
 
+/// Identity of a shimmed WSL session for the foreground probe.
+#[derive(Debug, Clone)]
+pub struct WslProbe {
+    pub distro: String,
+    pub key: String,
+}
+
+const PROBE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Last-known foreground `comm` per registered `(distro, probe key)`.
+/// Written only by the poller thread (and tests); read from the UI thread.
+fn probe_cache() -> &'static Mutex<HashMap<(String, String), Option<String>>> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, String), Option<String>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A probe key unique across alacritree instances: the pidfile dir inside
+/// each distro is shared, so the Windows pid namespaces the per-instance
+/// counter.
+pub fn new_probe_key() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    format!("{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+pub fn register_probe(distro: &str, key: &str) {
+    lock(probe_cache()).insert((distro.to_string(), key.to_string()), None);
+    ensure_poller();
+}
+
+pub fn unregister_probe(distro: &str, key: &str) {
+    lock(probe_cache()).remove(&(distro.to_string(), key.to_string()));
+}
+
+/// Cached foreground `comm` for a shimmed WSL session — never blocks and
+/// never touches the pipe, so it is safe on the UI thread.  `None` means
+/// unknown (helper down, key unregistered, or an idle shell at the last
+/// poll); callers must treat unknown as "no TUI".
+pub fn foreground_comm(distro: &str, key: &str) -> Option<String> {
+    lock(probe_cache()).get(&(distro.to_string(), key.to_string()))?.clone()
+}
+
+#[cfg(test)]
+fn set_cached_comm(distro: &str, key: &str, comm: Option<String>) {
+    lock(probe_cache()).insert((distro.to_string(), key.to_string()), comm);
+}
+
+/// One process-wide poller refreshes every registered key at the agent
+/// cadence.  Requests leave this thread, so a slow helper delays freshness,
+/// never the UI.  Polling a distro also (re)spawns its helper through
+/// `client()`, so an open WSL session keeps nudging a cooled-down helper
+/// back up.  The key list is snapshotted before any pipe I/O so the cache
+/// lock is never held across a request.
+fn ensure_poller() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let spawned =
+            std::thread::Builder::new().name("wsl-helper-probe".to_string()).spawn(|| {
+                loop {
+                    std::thread::sleep(PROBE_POLL_INTERVAL);
+                    let keys: Vec<(String, String)> = lock(probe_cache()).keys().cloned().collect();
+                    for entry in keys {
+                        let comm = client(&entry.0).and_then(|c| c.probe(&entry.1).ok()).flatten();
+                        if let Some(slot) = lock(probe_cache()).get_mut(&entry) {
+                            *slot = comm;
+                        }
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            log::warn!("wsl probe poller failed to start: {e}");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,6 +765,31 @@ mod tests {
         assert!(wrap_profile_argv("wslhost.exe", &[], "k").is_none());
     }
 
+    #[test]
+    fn probe_cache_lifecycle() {
+        // An inert distro name: even if the poller ticks mid-test, `client()`
+        // cools down on the failed spawn instead of touching a real distro.
+        const D: &str = "no-such-distro";
+        // Unknown key: unknown comm — the caller treats that as "no TUI".
+        assert_eq!(foreground_comm(D, "test-77-1"), None);
+        register_probe(D, "test-77-1");
+        // Registered but not yet polled: still unknown, not a panic or a block.
+        assert_eq!(foreground_comm(D, "test-77-1"), None);
+        set_cached_comm(D, "test-77-1", Some("nvim".to_string()));
+        assert_eq!(foreground_comm(D, "test-77-1").as_deref(), Some("nvim"));
+        unregister_probe(D, "test-77-1");
+        assert_eq!(foreground_comm(D, "test-77-1"), None);
+    }
+
+    #[test]
+    fn probe_keys_are_pid_namespaced_and_unique() {
+        let a = new_probe_key();
+        let b = new_probe_key();
+        assert_ne!(a, b);
+        let prefix = format!("{}-", std::process::id());
+        assert!(a.starts_with(&prefix), "{a} should start with {prefix}");
+    }
+
     /// Live round trip against the default distro.  Requires WSL; run
     /// manually: `cargo test -p alacritree wsl_helper:: -- --ignored`
     #[test]
@@ -736,5 +835,41 @@ mod tests {
 
         // An unregistered probe key resolves to "no foreground comm".
         assert_eq!(client.probe("999999-999999").expect("probe"), None);
+
+        use std::process::{Command, Stdio};
+
+        // The shim publishes its pid, then execs the login shell; piped stdin
+        // (held open) keeps that shell alive for the duration of the test.
+        let key = new_probe_key();
+        let (program, args) = shim_invocation(&distro.name, Path::new(r"C:\"), &key);
+        let mut child = Command::new(program)
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn shimmed session");
+        std::thread::sleep(Duration::from_secs(3));
+
+        // The pidfile names a live, numeric pid...
+        let (exit, out) = client
+            .run(r#"cat "${XDG_RUNTIME_DIR:-/tmp}/alacritree/session-$1.pid" 2>/dev/null"#, &[&key])
+            .expect("read pidfile");
+        assert_eq!(exit, 0, "pidfile should exist for a shimmed session");
+        let pid = String::from_utf8_lossy(&out);
+        assert!(!pid.is_empty() && pid.chars().all(|c| c.is_ascii_digit()), "pid: {pid:?}");
+
+        // ...and probing it completes without a transport error.  WSL2
+        // allocates a controlling pty for every `--exec` session regardless
+        // of the Windows-side stdio redirection (confirmed via `/proc/self/stat`
+        // on this distro), so the shell is its own foreground process rather
+        // than tpgid -1; either a bare shell or "unknown" both read as "no
+        // TUI" to callers, so accept both rather than asserting the tty state
+        // this harness does not control.
+        let comm = client.probe(&key).expect("probe shimmed session");
+        assert!(comm.is_none() || comm.as_deref() == Some("bash"), "comm: {comm:?}");
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
