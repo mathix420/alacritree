@@ -526,7 +526,10 @@ pub fn try_run(distro: &str, script: &str, args: &[&str]) -> Option<Result<Vec<u
                 Some(Ok(stdout))
             }
         },
-        Err(TransportError::NotWritten(_)) => None,
+        Err(TransportError::NotWritten(e)) => {
+            log::debug!("wsl helper ({distro}): {e}; falling back to one-shot spawns");
+            None
+        },
         Err(TransportError::NoReply(e)) => Some(Err(e)),
     }
 }
