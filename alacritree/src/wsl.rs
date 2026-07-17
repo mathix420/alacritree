@@ -48,7 +48,7 @@ pub enum Location {
 }
 
 /// The distro-side directory Windows drives are mounted under.  Set once at
-/// startup from `[ui.wsl] automount_root`; `/mnt` is WSL's default.
+/// startup from `[wsl] automount_root`; `/mnt` is WSL's default.
 static AUTOMOUNT_ROOT: OnceLock<String> = OnceLock::new();
 
 pub fn set_automount_root(root: String) {
