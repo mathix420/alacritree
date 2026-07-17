@@ -278,6 +278,267 @@ pub fn wrap_profile_argv(
     Some((wrapped, distro))
 }
 
+use std::collections::HashMap;
+use std::io::{BufRead, Read, Write};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
+use std::time::{Duration, Instant};
+
+use crate::wsl;
+
+/// Batch scripts can legitimately run long (worktree add on a cold cache);
+/// probes are two `/proc` reads and only ever gate a keypress decision.
+const RUN_TIMEOUT: Duration = Duration::from_secs(60);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// A broken distro must not cause a spawn storm.
+const RESPAWN_COOLDOWN: Duration = Duration::from_secs(30);
+
+static ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub fn set_enabled(enabled: bool) {
+    ENABLED.store(enabled, Ordering::Release);
+}
+
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::Acquire)
+}
+
+/// Why a request produced no result — the distinction the fallback rule
+/// keys on.  `NotWritten` never reached the helper and is safe to re-run
+/// as a one-shot; `NoReply` was written and may have executed (batch
+/// scripts have side effects), so it must surface as an error, never a
+/// silent retry.
+#[derive(Debug)]
+pub enum TransportError {
+    NotWritten(String),
+    NoReply(String),
+}
+
+pub struct HelperClient {
+    distro: String,
+    stdin: Mutex<Option<std::process::ChildStdin>>,
+    pending: Mutex<HashMap<u64, mpsc::Sender<Frame>>>,
+    next_id: AtomicU64,
+    capabilities: OnceLock<Capabilities>,
+    down: AtomicBool,
+}
+
+fn lock<'a, T>(mutex: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl HelperClient {
+    /// Spawn the helper for `distro`.  Returns once the process launch is
+    /// attempted; readiness (the hello line) arrives asynchronously on the
+    /// reader thread.  Failures leave the client marked down so the
+    /// registry's cooldown sees them like any other death.
+    fn spawn(distro: &str) -> Arc<Self> {
+        let client = Arc::new(Self {
+            distro: distro.to_string(),
+            stdin: Mutex::new(None),
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+            capabilities: OnceLock::new(),
+            down: AtomicBool::new(false),
+        });
+        let mut child = match wsl::command(distro, None)
+            .arg("sh")
+            .arg("-c")
+            .arg(HELPER_SCRIPT)
+            .arg("sh")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                client.mark_down(&format!("failed to spawn: {e}"));
+                return client;
+            },
+        };
+        *lock(&client.stdin) = child.stdin.take();
+        let stdout = child.stdout.take().expect("stdout piped above");
+        let reader = client.clone();
+        let spawned =
+            std::thread::Builder::new().name(format!("wsl-helper-{distro}")).spawn(move || {
+                reader.read_loop(stdout);
+                // Stdin is closed by mark_down; reap so a dead helper never
+                // lingers as a zombie in the process table.
+                let _ = child.wait();
+            });
+        if let Err(e) = spawned {
+            client.mark_down(&format!("failed to start reader thread: {e}"));
+        }
+        client
+    }
+
+    fn read_loop(&self, stdout: std::process::ChildStdout) {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut hello = String::new();
+        match reader.read_line(&mut hello) {
+            Ok(n) if n > 0 => {},
+            _ => return self.mark_down("exited before hello"),
+        }
+        let Some(caps) = parse_hello(&hello) else {
+            return self.mark_down("unusable hello (unknown protocol version?)");
+        };
+        let _ = self.capabilities.set(caps);
+        let mut frames = FrameReader::default();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => return self.mark_down("closed its pipe"),
+                Err(e) => return self.mark_down(&format!("read failed: {e}")),
+                Ok(n) => match frames.push(&chunk[..n]) {
+                    Ok(done) => {
+                        for frame in done {
+                            if let Some(tx) = lock(&self.pending).remove(&frame.id) {
+                                let _ = tx.send(frame);
+                            }
+                        }
+                    },
+                    Err(e) => return self.mark_down(&e),
+                },
+            }
+        }
+    }
+
+    fn mark_down(&self, why: &str) {
+        if !self.down.swap(true, Ordering::AcqRel) {
+            log::warn!("wsl helper for {}: {why}; falling back to one-shot spawns", self.distro);
+        }
+        // Closing stdin EOFs the helper, which cleans up and exits.
+        *lock(&self.stdin) = None;
+        // Waiters whose request was already written see the hangup as a
+        // dropped sender — NoReply, never a retry.
+        lock(&self.pending).clear();
+    }
+
+    fn is_down(&self) -> bool {
+        self.down.load(Ordering::Acquire)
+    }
+
+    fn is_ready(&self) -> bool {
+        !self.is_down() && self.capabilities.get().is_some()
+    }
+
+    pub fn capabilities(&self) -> Option<&Capabilities> {
+        self.capabilities.get()
+    }
+
+    fn request(&self, id: u64, line: String, timeout: Duration) -> Result<Frame, TransportError> {
+        if !self.is_ready() {
+            return Err(TransportError::NotWritten("helper not ready".to_string()));
+        }
+        let (tx, rx) = mpsc::channel();
+        lock(&self.pending).insert(id, tx);
+        let write = {
+            let mut guard = lock(&self.stdin);
+            match guard.as_mut() {
+                None => Err("helper stdin closed".to_string()),
+                Some(stdin) => stdin
+                    .write_all(line.as_bytes())
+                    .and_then(|()| stdin.flush())
+                    .map_err(|e| e.to_string()),
+            }
+        };
+        if let Err(e) = write {
+            lock(&self.pending).remove(&id);
+            // A partial line has no terminating newline, so the dispatcher
+            // can never have run it — NotWritten is safe.
+            self.mark_down(&format!("write failed: {e}"));
+            return Err(TransportError::NotWritten(e));
+        }
+        match rx.recv_timeout(timeout) {
+            Ok(frame) => Ok(frame),
+            Err(_) => {
+                lock(&self.pending).remove(&id);
+                Err(TransportError::NoReply(format!("no reply from the {} helper", self.distro)))
+            },
+        }
+    }
+
+    pub fn run(&self, script: &str, args: &[&str]) -> Result<(i32, Vec<u8>), TransportError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let frame = self.request(id, encode_run(id, script, args), RUN_TIMEOUT)?;
+        Ok((frame.exit, frame.payload))
+    }
+
+    pub fn probe(&self, key: &str) -> Result<Option<String>, TransportError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let frame = self.request(id, encode_probe(id, key), PROBE_TIMEOUT)?;
+        let comm = String::from_utf8_lossy(&frame.payload).trim().to_string();
+        Ok((!comm.is_empty()).then_some(comm))
+    }
+}
+
+enum Slot {
+    Live(Arc<HelperClient>),
+    Cooldown(Instant),
+}
+
+fn registry() -> &'static Mutex<HashMap<String, Slot>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Slot>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The ready client for `distro`, spawning one when none exists.  `None`
+/// while disabled, still starting, or cooling down after a death — callers
+/// fall back to one-shot spawns, which pay the same cold-boot cost the
+/// helper would.  Spawning happens under the registry lock but is only a
+/// process launch; the slow part (the hello) lands on the reader thread.
+/// Never call on the UI thread — same rule as `wsl::run_batch`.
+pub fn client(distro: &str) -> Option<Arc<HelperClient>> {
+    if !enabled() || !cfg!(windows) {
+        return None;
+    }
+    let mut reg = lock(registry());
+    match reg.get(distro) {
+        Some(Slot::Live(c)) if c.is_ready() => return Some(c.clone()),
+        Some(Slot::Live(c)) if !c.is_down() => return None,
+        Some(Slot::Live(_)) => {
+            reg.insert(distro.to_string(), Slot::Cooldown(Instant::now()));
+            return None;
+        },
+        Some(Slot::Cooldown(since)) if since.elapsed() < RESPAWN_COOLDOWN => return None,
+        _ => {},
+    }
+    reg.insert(distro.to_string(), Slot::Live(HelperClient::spawn(distro)));
+    None
+}
+
+/// Resident-first transport for `wsl::run_batch`.  `None` = helper
+/// unavailable before anything was sent (fall back to a one-shot spawn);
+/// `Some(Err)` = sent but unanswered, which must not be retried;
+/// `Some(Ok)` = script stdout, one-shot-compatible.
+pub fn try_run(distro: &str, script: &str, args: &[&str]) -> Option<Result<Vec<u8>, String>> {
+    let client = client(distro)?;
+    match client.run(script, args) {
+        Ok((exit, stdout)) => {
+            // Mirror one-shot semantics: guarded scripts always emit their
+            // sections, so hard failure with silence means the script
+            // itself refused.
+            if exit != 0 && stdout.is_empty() {
+                Some(Err(format!("wsl helper script exited {exit}")))
+            } else {
+                Some(Ok(stdout))
+            }
+        },
+        Err(TransportError::NotWritten(_)) => None,
+        Err(TransportError::NoReply(e)) => Some(Err(e)),
+    }
+}
+
+pub fn capability_delta(distro: &str) -> Option<String> {
+    client(distro)?.capabilities()?.delta.clone()
+}
+
+pub fn capability_gh(distro: &str) -> Option<String> {
+    client(distro)?.capabilities()?.gh.clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,5 +689,52 @@ mod tests {
         assert!(wrap_profile_argv("wsl.exe", &to_vec(&["-d"]), "k").is_none());
         assert!(wrap_profile_argv("pwsh.exe", &[], "k").is_none());
         assert!(wrap_profile_argv("wslhost.exe", &[], "k").is_none());
+    }
+
+    /// Live round trip against the default distro.  Requires WSL; run
+    /// manually: `cargo test -p alacritree wsl_helper:: -- --ignored`
+    #[test]
+    #[ignore]
+    fn helper_round_trips() {
+        use std::time::{Duration, Instant};
+
+        let distro =
+            crate::wsl::distros().into_iter().find(|d| d.is_default).expect("a default distro");
+        // Cold VM boot can take a while; the client comes up asynchronously.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let client = loop {
+            if let Some(c) = client(&distro.name) {
+                break c;
+            }
+            assert!(Instant::now() < deadline, "helper never became ready");
+            std::thread::sleep(Duration::from_millis(200));
+        };
+
+        let caps = client.capabilities().expect("capabilities after ready");
+        assert!(caps.git.is_some(), "test distros are expected to have git");
+        assert!(caps.runtime_dir.ends_with("/alacritree"));
+
+        let (exit, out) = client.run(r#"printf '%s' "$1""#, &["hello"]).expect("run");
+        assert_eq!((exit, out.as_slice()), (0, &b"hello"[..]));
+
+        // Empty args survive the `-` field encoding.
+        let (_, out) = client.run(r#"printf '[%s][%s]' "$1" "$2""#, &["", "x"]).expect("run");
+        assert_eq!(out, b"[][x]");
+
+        // Payloads are binary-safe end to end.
+        let (_, out) = client.run(r#"printf 'a\0b'"#, &[]).expect("run");
+        assert_eq!(out, b"a\0b");
+
+        // Concurrent jobs multiplex on one pipe without cross-talk.
+        let slow = std::thread::spawn({
+            let client = client.clone();
+            move || client.run("sleep 1; printf slow", &[]).expect("slow run")
+        });
+        let (_, fast) = client.run("printf fast", &[]).expect("fast run");
+        assert_eq!(fast, b"fast");
+        assert_eq!(slow.join().unwrap().1, b"slow");
+
+        // An unregistered probe key resolves to "no foreground comm".
+        assert_eq!(client.probe("999999-999999").expect("probe"), None);
     }
 }
