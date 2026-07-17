@@ -255,7 +255,11 @@ pub fn wrap_profile_argv(
     args: &[String],
     probe_key: &str,
 ) -> Option<(Vec<String>, Option<String>)> {
-    let stem = Path::new(program).file_stem()?.to_str()?;
+    // The argv comes from a Windows host, so the program path uses Windows
+    // separators — split on them explicitly rather than via `Path`, whose
+    // separator set depends on the compilation target.
+    let file_name = program.rsplit(['\\', '/']).next().unwrap_or(program);
+    let stem = Path::new(file_name).file_stem()?.to_str()?;
     if !stem.eq_ignore_ascii_case("wsl") {
         return None;
     }
