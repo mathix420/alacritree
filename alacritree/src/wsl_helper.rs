@@ -203,9 +203,12 @@ while IFS=$TAB read -r id kind rest; do
       stat=$(cat "/proc/$p/stat" 2>/dev/null)
       after=${stat##*')'}
       set -- $after
+      pgrp=${3:-}
       tpgid=${6:-}
       case $tpgid in ''|*[!0-9]*) tpgid= ;; esac
-      [ -n "$tpgid" ] && comm=$(cat "/proc/$tpgid/comm" 2>/dev/null)
+      if [ -n "$tpgid" ] && [ "$tpgid" != "$pgrp" ]; then
+        comm=$(cat "/proc/$tpgid/comm" 2>/dev/null)
+      fi
     fi
     printf %s "$comm" > "$t/$id.out"
     printf '%s 0\n' "$id" >> "$t/done"
@@ -888,15 +891,13 @@ mod tests {
         let pid = String::from_utf8_lossy(&out);
         assert!(!pid.is_empty() && pid.chars().all(|c| c.is_ascii_digit()), "pid: {pid:?}");
 
-        // ...and probing it completes without a transport error.  WSL2
-        // allocates a controlling pty for every `--exec` session regardless
-        // of the Windows-side stdio redirection (confirmed via `/proc/self/stat`
-        // on this distro), so the shell is its own foreground process rather
-        // than tpgid -1; either a bare shell or "unknown" both read as "no
-        // TUI" to callers, so accept both rather than asserting the tty state
-        // this harness does not control.
+        // ...and probing the idle shell resolves to "no foreground comm".
+        // WSL2 allocates a controlling pty for every `--exec` session
+        // regardless of the Windows-side stdio redirection, so the shell owns
+        // the tty itself — the probe must read that as idle, not as a running
+        // job, or every idle WSL session trips the close confirmation.
         let comm = client.probe(&key).expect("probe shimmed session");
-        assert!(comm.is_none() || comm.as_deref() == Some("bash"), "comm: {comm:?}");
+        assert_eq!(comm, None, "idle shell should probe as no foreground job");
 
         let _ = child.kill();
         let _ = child.wait();

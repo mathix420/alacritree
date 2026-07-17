@@ -216,6 +216,15 @@ fn wsl_nav_tui(_comm: Option<&str>) -> bool {
     false
 }
 
+/// `(foreground_job, nav_tui)` for a shimmed WSL session, from the helper's
+/// cached foreground `comm`.  Any comm at all means a job owns the tty — the
+/// helper reports nothing for an idle shell.  The Windows descendant probe
+/// can't stand in here: wsl.exe keeps plumbing children alive for the life
+/// of the session, so it reads every idle WSL shell as busy.
+fn wsl_probe_signals(comm: Option<&str>) -> (bool, bool) {
+    (comm.is_some(), wsl_nav_tui(comm))
+}
+
 /// Match full command lines against the agent map — picks up
 /// `node ...\claude-code\cli.js`-style wrappers that hide behind their
 /// runtime's name, same as the Linux cmdline pass.
@@ -771,8 +780,9 @@ impl Session {
     }
 
     /// A session "looks busy" when a process is running in the terminal
-    /// (a foreground job on Linux, any descendant of the shell on Windows),
-    /// its foreground process is a recognized agent, or its title is in a
+    /// (a foreground job on Linux, any descendant of the shell on Windows,
+    /// the helper's foreground probe for shimmed WSL sessions), its
+    /// foreground process is a recognized agent, or its title is in a
     /// spinner state — the signal the close-confirmation policy keys on.
     pub fn is_busy(&self) -> bool {
         self.process_probe().1 || looks_busy(self.agent_glyph(), &self.title)
@@ -800,12 +810,14 @@ impl Session {
             return (cached.process_glyph, cached.foreground_job, cached.nav_tui);
         }
         let glyph = self.shell_pid.and_then(foreground_process_glyph);
-        let foreground_job = self.shell_pid.is_some_and(shell_has_foreground_job);
-        let nav_tui = match &self.wsl_probe {
+        let (foreground_job, nav_tui) = match &self.wsl_probe {
             Some(probe) => {
-                wsl_nav_tui(wsl_helper::foreground_comm(&probe.distro, &probe.key).as_deref())
+                wsl_probe_signals(wsl_helper::foreground_comm(&probe.distro, &probe.key).as_deref())
             },
-            None => self.shell_pid.is_some_and(foreground_nav_tui),
+            None => (
+                self.shell_pid.is_some_and(shell_has_foreground_job),
+                self.shell_pid.is_some_and(foreground_nav_tui),
+            ),
         };
         self.agent_cache.set(AgentCache {
             polled_at: Some(Instant::now()),
@@ -1231,6 +1243,16 @@ mod tests {
         assert_eq!(agent_glyph_by_name(["pwsh.exe", "git.exe"]), None);
         assert_eq!(agent_glyph_by_name(["not-claude.exe"]), None);
         assert_eq!(agent_glyph_by_name(std::iter::empty::<&str>()), None);
+    }
+
+    #[test]
+    fn wsl_busy_needs_a_foreground_comm() {
+        // Idle shell: the helper reports no foreground comm at all.
+        assert_eq!(wsl_probe_signals(None), (false, false));
+        // Any foreground job counts as busy, cooperating TUI or not.
+        assert_eq!(wsl_probe_signals(Some("sleep")), (true, false));
+        assert_eq!(wsl_probe_signals(Some("claude")), (true, false));
+        assert_eq!(wsl_probe_signals(Some("nvim")), (true, true));
     }
 
     #[test]
