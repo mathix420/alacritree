@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use crate::bindings::{BindingAction, NamedAction};
 use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
-use crate::config::{Config, FontConfig, Icons, LastSessionClose, UiFont};
+use crate::config::{Config, FontConfig, Icons, LastSessionClose, ScrollbarStyle, UiFont};
 use crate::doppler;
 use crate::git_nav::{self, GitSection, SectionCount};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
@@ -2002,6 +2002,7 @@ impl AlacritreeApp {
         let mut expand_toggled: Option<(PathBuf, bool)> = None;
         let mut home_clicked = false;
         let theme = self.theme;
+        let scrollbar = self.config.ui.scrollbar;
         let reorder_mode = self.reorder_mode;
         let cursor_row = if self.focus == PaneFocus::ProjectsSidebar {
             self.sidebar_cursor.clone()
@@ -2187,6 +2188,7 @@ impl AlacritreeApp {
                 // Sidebar rows are click targets, not selectable prose; the
                 // default I-beam-and-select on labels is the wrong affordance.
                 ui.style_mut().interaction.selectable_labels = false;
+                apply_scrollbar_style(ui, scrollbar);
                 ui.horizontal(|ui| {
                     panel_header_filter_ui(
                         ui,
@@ -2657,6 +2659,7 @@ impl AlacritreeApp {
 
     fn show_git_sidebar(&mut self, ctx: &Context, panel_frame: Frame) -> egui::Rect {
         let theme = self.theme;
+        let scrollbar = self.config.ui.scrollbar;
         let palette = self.config.palette.clone();
         let active_diff_key = self.active_diff_key();
         let diff_request: std::cell::Cell<Option<DiffRequest>> = std::cell::Cell::new(None);
@@ -2669,6 +2672,7 @@ impl AlacritreeApp {
                 // Sidebar rows are click targets, not selectable prose; the
                 // default I-beam-and-select on labels is the wrong affordance.
                 ui.style_mut().interaction.selectable_labels = false;
+                apply_scrollbar_style(ui, scrollbar);
                 ui.horizontal(|ui| {
                     panel_header_filter_ui(
                         ui,
@@ -3654,6 +3658,17 @@ where
     })
     .response
     .rect
+}
+
+/// Apply the configured sidebar scrollbar style to a panel's `Ui`.
+///
+/// `Solid` reserves a gutter right of the content instead of egui's floating
+/// overlay, whose hover expansion covers the icons at the right end of the
+/// rows.  Scoped to the panel so terminal-side scroll areas keep the default.
+fn apply_scrollbar_style(ui: &mut egui::Ui, scrollbar: ScrollbarStyle) {
+    if scrollbar == ScrollbarStyle::Solid {
+        ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+    }
 }
 
 /// Keyboard-cursor indicator: an outline rather than a fill so it stays

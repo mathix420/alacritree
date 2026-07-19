@@ -238,6 +238,29 @@ fn parse_confirm_session_close(raw: Option<&str>) -> ConfirmSessionClose {
     }
 }
 
+/// How the sidebar scroll areas draw their scrollbar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollbarStyle {
+    /// egui's default: a thin bar overlaying the content edge, expanding on
+    /// hover — which covers the icons at the right end of sidebar rows.
+    #[default]
+    Floating,
+    /// A reserved gutter right of the content; the bar never covers icons.
+    Solid,
+}
+
+fn parse_scrollbar(raw: Option<&str>) -> ScrollbarStyle {
+    match raw {
+        None => ScrollbarStyle::default(),
+        Some("floating") => ScrollbarStyle::Floating,
+        Some("solid") => ScrollbarStyle::Solid,
+        Some(other) => {
+            log::warn!("unknown ui.scrollbar value {other:?}, using \"floating\"");
+            ScrollbarStyle::default()
+        },
+    }
+}
+
 /// Text-presentation magnifier (U+2315).  Not in egui's bundled fonts; it
 /// resolves through the system fallback chain `fonts.rs` registers.
 const DEFAULT_SEARCH_ICON: &str = "⌕";
@@ -366,6 +389,9 @@ pub struct UiTheme {
     pub pr_status: bool,
     pub icons: Icons,
     pub focus_outline: FocusOutline,
+    /// `[ui] scrollbar`: sidebar scrollbar style, "floating" (default) or
+    /// "solid" (reserved gutter, never covers row icons).
+    pub scrollbar: ScrollbarStyle,
     /// `[ui] worktree_name`: template for worktree row labels (subst syntax:
     /// `$name`, `$branch`, `$path`, `${var:fallback}`; `$pr` is the branch's
     /// PR number as `#123`, absent when none is known — it needs
@@ -391,6 +417,7 @@ impl Default for UiTheme {
             pr_status: false,
             icons: Icons::default(),
             focus_outline: FocusOutline::default(),
+            scrollbar: ScrollbarStyle::Floating,
             worktree_name: None,
             project_name: None,
         }
@@ -1009,6 +1036,8 @@ struct RawUi {
     session_display: RawSessionDisplay,
     delta_path: Option<String>,
     icons: RawIcons,
+    /// Sidebar scrollbar style: "floating" (default) | "solid".
+    scrollbar: Option<String>,
     pr_status: Option<bool>,
     font: RawUiFont,
     worktree_name: Option<String>,
@@ -1155,6 +1184,7 @@ impl RawConfig {
                 color: self.ui.focus_outline.color.map(|v| rgb_to_color32(v.0)),
                 thickness: self.ui.focus_outline.thickness.map_or(1.0, |t| t.max(0.5)),
             },
+            scrollbar: parse_scrollbar(self.ui.scrollbar.as_deref()),
             worktree_name: self.ui.worktree_name.clone().filter(|t| !t.trim().is_empty()),
             project_name: self.ui.project_name.clone().filter(|t| !t.trim().is_empty()),
         };
@@ -1435,6 +1465,28 @@ mod tests {
     fn confirm_session_close_invalid_falls_back_to_never() {
         let ui = ui_from_toml("[ui]\nconfirm_session_close = \"sometimes\"");
         assert_eq!(ui.confirm_session_close, ConfirmSessionClose::Never);
+    }
+
+    #[test]
+    fn scrollbar_defaults_to_floating() {
+        let ui = ui_from_toml("");
+        assert_eq!(ui.scrollbar, ScrollbarStyle::Floating);
+    }
+
+    #[test]
+    fn scrollbar_parses_all_values() {
+        for (raw, expected) in
+            [("floating", ScrollbarStyle::Floating), ("solid", ScrollbarStyle::Solid)]
+        {
+            let ui = ui_from_toml(&format!("[ui]\nscrollbar = \"{raw}\""));
+            assert_eq!(ui.scrollbar, expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn scrollbar_invalid_falls_back_to_floating() {
+        let ui = ui_from_toml("[ui]\nscrollbar = \"chunky\"");
+        assert_eq!(ui.scrollbar, ScrollbarStyle::Floating);
     }
 
     #[test]
