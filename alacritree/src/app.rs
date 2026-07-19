@@ -4117,6 +4117,25 @@ fn filter_branches(branches: &[String], query: &str) -> Vec<String> {
     branches.iter().filter(|b| b.to_lowercase().contains(&query)).cloned().collect()
 }
 
+/// Where the picker cursor lands after this frame's filter changes.  Row 0 is
+/// always Auto, so reseeding a query edit to 0 would apply Auto on the primary
+/// "type a branch name, press Enter" flow.  A non-empty query instead seeds
+/// the first branch row (1), clamped to 0 when nothing matches; an empty
+/// query seeds Auto.  With no query change, the previous cursor is kept,
+/// clamped to the (possibly shrunk) filtered length.
+fn picker_cursor(
+    query_changed: bool,
+    query_empty: bool,
+    prev: usize,
+    filtered_len: usize,
+) -> usize {
+    if query_changed {
+        if query_empty { 0 } else { 1.min(filtered_len) }
+    } else {
+        prev.min(filtered_len)
+    }
+}
+
 /// Agent glyphs usually come from the title's own leading char
 /// (`Session::agent_glyph`), and the session row paints that glyph as its
 /// status icon right next to the title — showing it in both places doubles
@@ -5178,7 +5197,12 @@ impl AlacritreeApp {
                     Ok(branches) => filter_branches(branches, &picker.query),
                     Err(_) => Vec::new(),
                 };
-                picker.cursor = if query_changed { 0 } else { picker.cursor.min(filtered.len()) };
+                picker.cursor = picker_cursor(
+                    query_changed,
+                    picker.query.is_empty(),
+                    picker.cursor,
+                    filtered.len(),
+                );
 
                 let mark = |selected: bool| if selected { "• " } else { "   " };
                 egui::ScrollArea::vertical().max_height(240.0 * s).show(ui, |ui| {
@@ -5214,7 +5238,11 @@ impl AlacritreeApp {
         if down {
             picker.cursor = (picker.cursor + 1).min(filtered.len());
         }
-        if confirm_via_key {
+        // A failed branch listing leaves `filtered` empty, so cursor 0 would
+        // resolve to Auto — applying it on Enter would clear an existing
+        // override on a reflexive keypress rather than the no-op a listing
+        // failure should be. Clicks can't reach this path (no rows render).
+        if confirm_via_key && picker.branches.is_ok() {
             chosen = Some(if picker.cursor == 0 {
                 None
             } else {
@@ -6006,6 +6034,21 @@ mod tests {
         assert_eq!(filter_branches(&branches, ""), branches);
         assert_eq!(filter_branches(&branches, "DEV"), vec!["develop", "origin/develop"]);
         assert!(filter_branches(&branches, "zz").is_empty());
+    }
+
+    #[test]
+    fn picker_cursor_seeds_the_first_match_on_a_non_empty_query_change() {
+        // Typing a query that matches something jumps past Auto to the first
+        // match, so Enter applies that match instead of Auto.
+        assert_eq!(picker_cursor(true, false, 0, 3), 1);
+        // A query with no matches has nothing to land on but Auto.
+        assert_eq!(picker_cursor(true, false, 0, 0), 0);
+        // Clearing the query back to empty returns the cursor to Auto.
+        assert_eq!(picker_cursor(true, true, 5, 3), 0);
+        // No query change this frame: clamp the previous cursor to the
+        // (possibly shrunk) filtered length instead of reseeding it.
+        assert_eq!(picker_cursor(false, false, 5, 3), 3);
+        assert_eq!(picker_cursor(false, false, 2, 3), 2);
     }
 
     #[test]

@@ -92,15 +92,28 @@ pub fn reorder_projects(state: &mut PersistedState, order: &[PathBuf]) {
     state.projects.sort_by_key(|p| order.iter().position(|r| *r == p.root).unwrap_or(usize::MAX));
 }
 
-/// Set or clear one worktree's base-branch override.  Entries whose worktree
-/// no longer exists on disk are dropped in the same pass — the filesystem is
-/// the truth every window shares, so pruning here can't delete another
-/// window's live entry the way pruning against one window's project list
-/// could.
+/// Set or clear one worktree's base-branch override.  Entries are pruned in
+/// the same pass, but only when the filesystem definitively says the
+/// worktree is gone — the filesystem is the truth every window shares, so
+/// pruning here can't delete another window's live entry the way pruning
+/// against one window's project list could.  A metadata error that isn't
+/// "not found" (permission denied, an unreachable network or WSL mount with
+/// its distro asleep) is not proof the worktree is gone, so those entries
+/// are kept rather than silently dropped.
 pub fn set_base_branch(state: &mut PersistedState, worktree: &Path, branch: Option<String>) {
-    state.base_branches.retain(|b| b.worktree != worktree && b.worktree.is_dir());
+    state.base_branches.retain(|b| b.worktree != worktree && !definitely_gone(&b.worktree));
     if let Some(branch) = branch {
         state.base_branches.push(PersistedBaseBranch { worktree: worktree.to_path_buf(), branch });
+    }
+}
+
+/// True only when the filesystem gives a conclusive answer that `path` is
+/// not a live worktree directory.  Any other metadata error (permission,
+/// an unreachable mount) is inconclusive, not a "gone" verdict.
+fn definitely_gone(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(m) => !m.is_dir(),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
     }
 }
 
@@ -431,6 +444,29 @@ mod tests {
         let mut state = PersistedState {
             base_branches: vec![PersistedBaseBranch {
                 worktree: dir.path().join("gone"),
+                branch: "develop".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        set_base_branch(&mut state, &alive, Some("main".to_string()));
+
+        let worktrees: Vec<_> = state.base_branches.iter().map(|b| b.worktree.clone()).collect();
+        assert_eq!(worktrees, vec![alive]);
+    }
+
+    /// A path that exists but isn't a directory (e.g. clobbered by a file) is
+    /// just as definitively gone as a missing path.
+    #[test]
+    fn set_base_branch_prunes_entries_whose_path_is_a_file_not_a_dir() {
+        let dir = TempDir::new().unwrap();
+        let alive = dir.path().join("alive");
+        std::fs::create_dir(&alive).unwrap();
+        let file_path = dir.path().join("not_a_dir");
+        std::fs::write(&file_path, b"").unwrap();
+        let mut state = PersistedState {
+            base_branches: vec![PersistedBaseBranch {
+                worktree: file_path,
                 branch: "develop".to_string(),
             }],
             ..Default::default()
