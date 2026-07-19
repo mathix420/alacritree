@@ -64,6 +64,8 @@ pub enum NamedAction {
     ToggleSessionRows,
     /// Flip the runtime `session_display.tabs_always` value.
     ToggleSessionTabs,
+    /// Open the base-branch picker for the sidebar-cursored or current worktree.
+    SetBaseBranch,
     /// 1-indexed into the `[[ui.profiles]]` order.
     SpawnProfile(u8),
     Quit,
@@ -152,6 +154,7 @@ impl NamedAction {
             Self::ShowShortcuts => "Show this shortcuts window".into(),
             Self::ToggleSessionRows => "Toggle single-session sidebar rows".into(),
             Self::ToggleSessionTabs => "Toggle single-session tab segments".into(),
+            Self::SetBaseBranch => "Choose the branch the git panel diffs against".into(),
             Self::FocusLeft => "Move panel focus left (TUIs get the key first)".into(),
             Self::FocusRight => "Move panel focus right (TUIs get the key first)".into(),
             Self::NoOp | Self::ReceiveChar => String::new(),
@@ -652,6 +655,7 @@ pub fn parse_action(name: &str) -> BindingAction {
         "FocusTerminal" => BindingAction::Named(FocusTerminal),
         "ToggleSessionRows" => BindingAction::Named(ToggleSessionRows),
         "ToggleSessionTabs" => BindingAction::Named(ToggleSessionTabs),
+        "SetBaseBranch" => BindingAction::Named(SetBaseBranch),
         "SpawnProfile1" => BindingAction::Named(SpawnProfile(1)),
         "SpawnProfile2" => BindingAction::Named(SpawnProfile(2)),
         "SpawnProfile3" => BindingAction::Named(SpawnProfile(3)),
@@ -946,6 +950,7 @@ mod tests {
             ("ToggleSessionTabs", NamedAction::ToggleSessionTabs),
             ("FocusLeft", NamedAction::FocusLeft),
             ("FocusRight", NamedAction::FocusRight),
+            ("SetBaseBranch", NamedAction::SetBaseBranch),
         ] {
             let b = parse_bindings(vec![raw_action("F1", None, name)]);
             assert_eq!(named_matches(&b, Key::F1, Modifiers::NONE), vec![expected], "{name}");

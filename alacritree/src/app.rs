@@ -1866,6 +1866,22 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::FocusRight) => {
                 self.move_focus(FocusDir::Right, origin);
             },
+            BindingAction::Named(NamedAction::SetBaseBranch) => {
+                let target = base_branch_target(
+                    self.focus == PaneFocus::ProjectsSidebar,
+                    self.sidebar_cursor.as_ref(),
+                    |id| {
+                        self.sessions
+                            .iter()
+                            .find(|s| s.id == id)
+                            .map(|s| s.working_directory.clone())
+                    },
+                    &self.current_workspace,
+                );
+                if let Some(path) = target {
+                    self.open_base_branch_picker(path);
+                }
+            },
             BindingAction::Named(other) => {
                 self.dispatch_scroll_or_other(other);
             },
@@ -2036,6 +2052,7 @@ impl AlacritreeApp {
         let activate_session_request: std::cell::Cell<Option<(WorkspaceKey, SessionId)>> =
             std::cell::Cell::new(None);
         let close_session_request: std::cell::Cell<Option<SessionId>> = std::cell::Cell::new(None);
+        let base_picker_request: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
         // Drag-to-reorder: (dragged root, insert-before display index).
         let reorder_request: std::cell::Cell<Option<(PathBuf, usize)>> = std::cell::Cell::new(None);
         let mut add_project_clicked = false;
@@ -2584,6 +2601,9 @@ impl AlacritreeApp {
                                 if action.spawn {
                                     spawn_shell_request.set(Some(Some(wt.path.clone())));
                                 }
+                                if action.set_base {
+                                    base_picker_request.set(Some(wt.path.clone()));
+                                }
                                 let session_rows = worktree_session_rows
                                     .get(idx)
                                     .and_then(|v| v.get(wt_idx))
@@ -2656,6 +2676,9 @@ impl AlacritreeApp {
         }
         if let Some(path) = activate_request.take() {
             self.activate_worktree(ctx, &path);
+        }
+        if let Some(path) = base_picker_request.take() {
+            self.open_base_branch_picker(path);
         }
         if let Some(req) = delete_request.take() {
             self.pending_delete = Some(req);
@@ -2732,6 +2755,7 @@ impl AlacritreeApp {
         let palette = self.config.palette.clone();
         let active_diff_key = self.active_diff_key();
         let diff_request: std::cell::Cell<Option<DiffRequest>> = std::cell::Cell::new(None);
+        let open_picker: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
         let panel_resp = SidePanel::right("right_sidebar")
             .resizable(true)
             .default_width(300.0 * theme.ui_scale)
@@ -2889,12 +2913,21 @@ impl AlacritreeApp {
                             |ui| {
                                 if let Some(default) = default {
                                     // right_to_left: default sits rightmost, `vs` to its left.
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(default).color(theme.text_dim).small(),
+                                    let resp = ui
+                                        .add(
+                                            egui::Label::new(
+                                                RichText::new(default)
+                                                    .color(theme.text_dim)
+                                                    .small(),
+                                            )
+                                            .truncate()
+                                            .sense(egui::Sense::click()),
                                         )
-                                        .truncate(),
-                                    );
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .on_hover_text("Set the branch this panel diffs against");
+                                    if resp.clicked() {
+                                        open_picker.set(Some(path.clone()));
+                                    }
                                     ui.label(RichText::new("vs").color(theme.text_muted).small());
                                 }
                             },
@@ -3039,6 +3072,9 @@ impl AlacritreeApp {
             });
         if let Some(req) = diff_request.take() {
             self.open_diff(ctx, req);
+        }
+        if let Some(path) = open_picker.take() {
+            self.open_base_branch_picker(path);
         }
         panel_resp.response.rect
     }
@@ -3970,6 +4006,7 @@ struct WorktreeAction {
     activate: bool,
     delete: bool,
     spawn: bool,
+    set_base: bool,
 }
 
 /// Everything a sidebar session row needs, snapshotted before the panel
@@ -4052,6 +4089,26 @@ fn effective_base_branch(
     project_default: Option<&str>,
 ) -> Option<String> {
     override_branch.or(pr_base).or(project_default).map(str::to_string)
+}
+
+/// The worktree a SetBaseBranch press targets: the sidebar cursor's worktree
+/// while the projects sidebar owns focus (a session row resolves to its
+/// workspace), otherwise the current workspace.  Home and project-header
+/// cursors, and the home workspace, have no base branch to override.
+fn base_branch_target(
+    sidebar_focused: bool,
+    cursor: Option<&SidebarRow>,
+    session_workspace: impl Fn(SessionId) -> Option<WorkspaceKey>,
+    current: &WorkspaceKey,
+) -> Option<PathBuf> {
+    if sidebar_focused {
+        return match cursor {
+            Some(SidebarRow::Worktree(p)) => Some(p.clone()),
+            Some(SidebarRow::Session(id)) => session_workspace(*id).flatten(),
+            _ => None,
+        };
+    }
+    current.clone()
 }
 
 /// Branches whose name contains `query`, case-insensitively.
@@ -4234,6 +4291,14 @@ fn worktree_row(
         }
     }
 
+    let mut set_base_clicked = false;
+    resp.context_menu(|ui| {
+        if ui.button("Set base branch…").clicked() {
+            set_base_clicked = true;
+            ui.close_menu();
+        }
+    });
+
     let bg = if is_active {
         theme.row_active_bg
     } else if resp.hovered() {
@@ -4255,6 +4320,7 @@ fn worktree_row(
         activate: !deleting && resp.clicked() && !delete_clicked && !spawn_clicked && !wt.prunable,
         delete: delete_clicked,
         spawn: spawn_clicked,
+        set_base: set_base_clicked,
     }
 }
 
@@ -6380,5 +6446,43 @@ mod tests {
             16.0 * (crate::config::FontConfig::UI_HEADING_RATIO
                 / crate::config::FontConfig::UI_NORMAL_RATIO)
         );
+    }
+
+    #[test]
+    fn set_base_branch_targets_the_cursored_worktree_when_sidebar_focused() {
+        let wt = PathBuf::from("C:/repo/wt");
+        let none = |_id: SessionId| -> Option<WorkspaceKey> { None };
+        let cursor = SidebarRow::Worktree(wt.clone());
+        assert_eq!(
+            base_branch_target(true, Some(&cursor), none, &Some(PathBuf::from("C:/other"))),
+            Some(wt)
+        );
+    }
+
+    #[test]
+    fn set_base_branch_resolves_a_session_row_to_its_workspace() {
+        let wt = PathBuf::from("C:/repo/wt");
+        let ws = wt.clone();
+        let lookup = move |id: SessionId| (id == 7).then(|| Some(ws.clone()));
+        let cursor = SidebarRow::Session(7);
+        assert_eq!(base_branch_target(true, Some(&cursor), lookup, &None), Some(wt));
+    }
+
+    #[test]
+    fn set_base_branch_ignores_home_and_project_rows() {
+        let none = |_id: SessionId| -> Option<WorkspaceKey> { None };
+        assert_eq!(base_branch_target(true, Some(&SidebarRow::Home), none, &None), None);
+        let cursor = SidebarRow::Project(PathBuf::from("C:/repo"));
+        let none2 = |_id: SessionId| -> Option<WorkspaceKey> { None };
+        assert_eq!(base_branch_target(true, Some(&cursor), none2, &None), None);
+    }
+
+    #[test]
+    fn set_base_branch_falls_back_to_the_current_worktree() {
+        let wt = PathBuf::from("C:/repo/wt");
+        let none = |_id: SessionId| -> Option<WorkspaceKey> { None };
+        assert_eq!(base_branch_target(false, None, none, &Some(wt.clone())), Some(wt));
+        let none2 = |_id: SessionId| -> Option<WorkspaceKey> { None };
+        assert_eq!(base_branch_target(false, None, none2, &None), None, "home has no base branch");
     }
 }
