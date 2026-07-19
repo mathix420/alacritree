@@ -197,6 +197,29 @@ fn has_remote(cwd: &Path, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Branch names for the base-branch picker: locals first, then `origin/*`,
+/// short names, in git's ref order.  Shells out through [`git_command`]
+/// rather than using git2 so WSL worktrees resolve the same way everything
+/// else in this module does.
+pub fn list_branches(cwd: &Path) -> Result<Vec<String>, String> {
+    let output = git_command(cwd)
+        .args(["for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes/origin"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        // `origin/HEAD` shortens to plain `origin` — an alias, not a branch.
+        .filter(|l| !l.is_empty() && *l != "origin")
+        .map(str::to_string)
+        .collect())
+}
+
 /// Resolve the base branch dynamically.  Asks origin first via
 /// `git ls-remote --symref HEAD` — the only source that reflects the
 /// upstream's *current* default branch.  The caller's hint comes from
@@ -604,5 +627,32 @@ mod tests {
         assert!(prune_worktree(&repo_dir, "live", Some("live"), false).is_err());
         assert!(repo.find_worktree("live").is_ok());
         assert!(repo.find_branch("live", git2::BranchType::Local).is_ok());
+    }
+
+    #[test]
+    fn list_branches_returns_locals_then_origin_remotes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .status()
+                .expect("git runs");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-b", "main"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "x"]);
+        git(&["branch", "develop"]);
+
+        let branches = list_branches(dir.path()).expect("listing succeeds");
+
+        assert!(branches.contains(&"develop".to_string()), "{branches:?}");
+        assert!(branches.contains(&"main".to_string()), "{branches:?}");
+    }
+
+    #[test]
+    fn list_branches_reports_a_non_repo_as_an_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(list_branches(dir.path()).is_err());
     }
 }
