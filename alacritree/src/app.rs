@@ -5074,12 +5074,9 @@ impl AlacritreeApp {
         let s = theme.ui_scale;
 
         // Row 0 is always "Auto"; branch rows follow, narrowed by the query.
-        let filtered = match &picker.branches {
-            Ok(branches) => filter_branches(branches, &picker.query),
-            Err(_) => Vec::new(),
-        };
-        picker.cursor = picker.cursor.min(filtered.len());
-
+        // Populated inside the modal closure, after the TextEdit runs, so the
+        // rows reflect this frame's query rather than the previous one.
+        let mut filtered: Vec<String> = Vec::new();
         let mut chosen: Option<Option<String>> = None; // Some(None) = Auto
         let modal = egui::Modal::new(egui::Id::new("alacritree_base_branch_picker"))
             .frame(frame)
@@ -5104,12 +5101,18 @@ impl AlacritreeApp {
                     .id(input_id)
                     .hint_text("filter branches")
                     .desired_width(f32::INFINITY);
-                ui.add(edit);
+                let query_changed = ui.add(edit).changed();
                 focus_default(ui.ctx(), input_id);
 
                 if let Err(e) = &picker.branches {
                     ui.label(RichText::new(e).color(danger).small());
                 }
+
+                filtered = match &picker.branches {
+                    Ok(branches) => filter_branches(branches, &picker.query),
+                    Err(_) => Vec::new(),
+                };
+                picker.cursor = if query_changed { 0 } else { picker.cursor.min(filtered.len()) };
 
                 let mark = |selected: bool| if selected { "• " } else { "   " };
                 egui::ScrollArea::vertical().max_height(240.0 * s).show(ui, |ui| {
