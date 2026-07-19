@@ -634,8 +634,11 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let git = |args: &[&str]| {
             let status = std::process::Command::new("git")
+                .hide_console()
                 .current_dir(dir.path())
                 .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .status()
                 .expect("git runs");
             assert!(status.success(), "git {args:?} failed");
@@ -647,8 +650,11 @@ mod tests {
         let bare = tempfile::TempDir::new().unwrap();
         let git_bare = |args: &[&str]| {
             let status = std::process::Command::new("git")
+                .hide_console()
                 .current_dir(bare.path())
                 .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .status()
                 .expect("git runs");
             assert!(status.success(), "git {args:?} failed");
