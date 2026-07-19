@@ -102,6 +102,27 @@ so the panel stays responsive even on large repos. A faster cheap path
 (`dirty_counts`) is used by the delete modal — it skips the branch-diff work
 and just counts what `git worktree remove` would reject.
 
+### Per-worktree base branch
+
+The git panel diffs each worktree against an automatically picked base: the
+open PR's base branch if there is one, otherwise the project's default branch.
+To override it for a single worktree (e.g. a branch cut from `develop`):
+
+- right-click the worktree in the left sidebar → *Set base branch…*, or
+- click the `vs <branch>` label in the git panel, or
+- bind the `SetBaseBranch` action and press it (targets the sidebar-cursored
+  worktree when the sidebar has focus, the current worktree otherwise):
+
+  ```toml
+  [[keyboard.bindings]]
+  key = "B"
+  mods = "Control|Alt"
+  action = "SetBaseBranch"
+  ```
+
+Picking *Auto* returns to automatic detection. Overrides persist in
+`state.toml` per worktree path.
+
 ## Terminal grid
 
 Alacritree paints its grid cell-by-cell using the egui font system, with the
