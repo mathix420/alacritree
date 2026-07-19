@@ -2217,6 +2217,12 @@ impl AlacritreeApp {
                 ui.separator();
 
                 ScrollArea::vertical().show(ui, |ui| {
+                    // Inter-group spacing is emitted above the group that
+                    // follows, never after the last one: trailing padding
+                    // makes the content measure taller than the rows on
+                    // screen, which shows a scrollbar with nothing to scroll
+                    // whenever the list otherwise fits the panel.
+                    let mut group_gap = 0.0_f32;
                     if !filtering || home_visible {
                         let home_action = home_row(
                             ui,
@@ -2247,10 +2253,11 @@ impl AlacritreeApp {
                                 close_session_request.set(Some(row.id));
                             }
                         }
-                        ui.add_space(2.0);
+                        group_gap = 2.0;
                     }
 
                     if self.projects.is_empty() {
+                        ui.add_space(std::mem::take(&mut group_gap));
                         ui.label(
                             RichText::new("Click + to add a project.")
                                 .color(theme.text_dim)
@@ -2259,6 +2266,7 @@ impl AlacritreeApp {
                         ui.add_space(4.0);
                         ui.label(RichText::new("Ctrl+B to toggle").small().color(theme.text_muted));
                     } else if filtered_empty {
+                        ui.add_space(std::mem::take(&mut group_gap));
                         ui.label(RichText::new("no matches").color(theme.text_dim).small());
                     }
 
@@ -2266,6 +2274,7 @@ impl AlacritreeApp {
                         if filtering && !visible_projects.contains(&project.root) {
                             continue;
                         }
+                        ui.add_space(std::mem::take(&mut group_gap));
                         let proj_attention = project_attention.get(idx).copied().unwrap_or(false);
                         // Bubble attention up to the project row only when the
                         // project is collapsed — once expanded, the actual
@@ -2560,7 +2569,7 @@ impl AlacritreeApp {
                             for (_, branch) in creating.iter().filter(|(pi, _)| *pi == idx) {
                                 creating_row(ui, branch, &icons, &theme);
                             }
-                            ui.add_space(4.0);
+                            group_gap = 4.0;
                         }
                     }
                 });
@@ -2817,59 +2826,77 @@ impl AlacritreeApp {
                             },
                         );
                     }
-                    ui.add_space(10.0);
+                    let mut section_gap = 10.0_f32;
 
-                    section(ui, &theme, "Staged", staged_count, filtering, |ui| {
-                        for f in &status.staged {
-                            if !staged_visible.contains(&f.path) {
-                                continue;
+                    section(
+                        ui,
+                        &theme,
+                        "Staged",
+                        staged_count,
+                        filtering,
+                        &mut section_gap,
+                        |ui| {
+                            for f in &status.staged {
+                                if !staged_visible.contains(&f.path) {
+                                    continue;
+                                }
+                                let req = DiffRequest {
+                                    file: f.path.clone(),
+                                    source: DiffSource::Staged,
+                                };
+                                let is_active = active_diff_key.as_deref() == Some(&diff_key(&req));
+                                let resp = file_row(ui, f, &theme, &palette, is_active);
+                                if resp.clicked() {
+                                    diff_request.set(Some(req));
+                                }
+                                paint_git_row_cursor(
+                                    ui,
+                                    &resp,
+                                    &cursor_row,
+                                    GitSection::Staged,
+                                    &f.path,
+                                    cursor_moved,
+                                    &theme,
+                                );
                             }
-                            let req =
-                                DiffRequest { file: f.path.clone(), source: DiffSource::Staged };
-                            let is_active = active_diff_key.as_deref() == Some(&diff_key(&req));
-                            let resp = file_row(ui, f, &theme, &palette, is_active);
-                            if resp.clicked() {
-                                diff_request.set(Some(req));
-                            }
-                            paint_git_row_cursor(
-                                ui,
-                                &resp,
-                                &cursor_row,
-                                GitSection::Staged,
-                                &f.path,
-                                cursor_moved,
-                                &theme,
-                            );
-                        }
-                    });
+                        },
+                    );
 
-                    section(ui, &theme, "Unstaged", unstaged_count, filtering, |ui| {
-                        for f in &status.unstaged {
-                            if !unstaged_visible.contains(&f.path) {
-                                continue;
+                    section(
+                        ui,
+                        &theme,
+                        "Unstaged",
+                        unstaged_count,
+                        filtering,
+                        &mut section_gap,
+                        |ui| {
+                            for f in &status.unstaged {
+                                if !unstaged_visible.contains(&f.path) {
+                                    continue;
+                                }
+                                let source = if f.kind == ChangeKind::Untracked {
+                                    DiffSource::Untracked
+                                } else {
+                                    DiffSource::Worktree
+                                };
+                                let req = DiffRequest { file: f.path.clone(), source };
+                                let is_active = active_diff_key.as_deref() == Some(&diff_key(&req));
+                                let resp = file_row(ui, f, &theme, &palette, is_active);
+                                if resp.clicked() {
+                                    diff_request.set(Some(req));
+                                }
+                                paint_git_row_cursor(
+                                    ui,
+                                    &resp,
+                                    &cursor_row,
+                                    GitSection::Unstaged,
+                                    &f.path,
+                                    cursor_moved,
+                                    &theme,
+                                );
                             }
-                            let source = if f.kind == ChangeKind::Untracked {
-                                DiffSource::Untracked
-                            } else {
-                                DiffSource::Worktree
-                            };
-                            let req = DiffRequest { file: f.path.clone(), source };
-                            let is_active = active_diff_key.as_deref() == Some(&diff_key(&req));
-                            let resp = file_row(ui, f, &theme, &palette, is_active);
-                            if resp.clicked() {
-                                diff_request.set(Some(req));
-                            }
-                            paint_git_row_cursor(
-                                ui,
-                                &resp,
-                                &cursor_row,
-                                GitSection::Unstaged,
-                                &f.path,
-                                cursor_moved,
-                                &theme,
-                            );
-                        }
-                    });
+                        },
+                    );
 
                     if !status.branch_diff.is_empty() {
                         let base_label = match &status.default_branch {
@@ -2879,6 +2906,7 @@ impl AlacritreeApp {
                         let base = git_branch_base.clone();
                         let count_label = section_count_label(&branch_count, filtering);
 
+                        ui.add_space(std::mem::take(&mut section_gap));
                         // Open-coded section header so the PR number can be a
                         // hyperlink while the rest stays plain text.
                         ui.horizontal(|ui| {
@@ -2932,7 +2960,6 @@ impl AlacritreeApp {
                                 &theme,
                             );
                         }
-                        ui.add_space(10.0);
                     }
                 });
             });
@@ -3297,17 +3324,24 @@ fn section_count_label(count: &SectionCount, filtering: bool) -> String {
 /// Empty sections are skipped entirely — a placeholder glyph for "no files
 /// here" added visual noise without communicating anything the count badge
 /// didn't already say.
+///
+/// `gap` carries the inter-section spacing: consumed above a section that
+/// renders and re-armed below it, so spacing lands between sections but never
+/// after the last one — trailing padding would make the content overflow the
+/// panel and show a scrollbar with nothing to scroll.
 fn section<R>(
     ui: &mut egui::Ui,
     theme: &Theme,
     title: &str,
     count: SectionCount,
     filtering: bool,
+    gap: &mut f32,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) {
     if count.total == 0 {
         return;
     }
+    ui.add_space(std::mem::take(gap));
     let label = section_count_label(&count, filtering);
     ui.horizontal(|ui| {
         ui.label(RichText::new(title).color(theme.text).strong().small());
@@ -3315,7 +3349,7 @@ fn section<R>(
     });
     ui.add_space(2.0);
     add_contents(ui);
-    ui.add_space(10.0);
+    *gap = 10.0;
 }
 
 fn file_row(
