@@ -644,10 +644,35 @@ mod tests {
         git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "x"]);
         git(&["branch", "develop"]);
 
+        let bare = tempfile::TempDir::new().unwrap();
+        let git_bare = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(bare.path())
+                .args(args)
+                .status()
+                .expect("git runs");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git_bare(&["init", "--bare"]);
+        let bare_path = bare.path().to_str().unwrap();
+        git(&["remote", "add", "origin", bare_path]);
+        git(&["push", "origin", "main"]);
+        git(&["fetch", "origin"]);
+        git(&["remote", "set-head", "origin", "-a"]);
+
         let branches = list_branches(dir.path()).expect("listing succeeds");
 
         assert!(branches.contains(&"develop".to_string()), "{branches:?}");
         assert!(branches.contains(&"main".to_string()), "{branches:?}");
+        assert!(branches.contains(&"origin/main".to_string()), "{branches:?}");
+        assert!(!branches.contains(&"origin".to_string()), "HEAD alias leaked: {branches:?}");
+
+        let last_local = branches.iter().rposition(|b| !b.starts_with("origin/")).unwrap();
+        let first_remote = branches.iter().position(|b| b.starts_with("origin/")).unwrap();
+        assert!(
+            last_local < first_remote,
+            "local branches must all precede origin/* entries: {branches:?}"
+        );
     }
 
     #[test]
