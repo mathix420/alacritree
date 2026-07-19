@@ -298,6 +298,9 @@ pub struct AlacritreeApp {
     active_session: HashMap<WorkspaceKey, SessionId>,
     projects: Vec<Project>,
     git_status: HashMap<PathBuf, StatusCache>,
+    /// Per-worktree override of the git panel's diff base, keyed by worktree
+    /// path.  Mirrors `state.toml`; written through `state::set_base_branch`.
+    base_branch_overrides: HashMap<PathBuf, String>,
     pr_cache: PrCache,
     /// Renders `[ui] worktree_name` / `project_name` templates at paint time.
     row_labels: crate::row_label::LabelTemplates,
@@ -598,6 +601,11 @@ impl AlacritreeApp {
             active_session: HashMap::new(),
             projects,
             git_status: HashMap::new(),
+            base_branch_overrides: persisted
+                .base_branches
+                .iter()
+                .map(|b| (b.worktree.clone(), b.branch.clone()))
+                .collect(),
             pr_cache: PrCache::new(),
             row_labels,
             config,
@@ -2737,10 +2745,11 @@ impl AlacritreeApp {
                 // be `None`, which `pr_cache.poll` handles by returning early.
                 let cached_branch = cache.current_branch().map(str::to_string);
                 let pr_info = self.pr_cache.poll(&path, cached_branch.as_deref(), ctx);
-                // PR base takes precedence over the repo's default branch so
-                // the sidebar diff matches what GitHub will review.
-                let effective_default =
-                    pr_info.as_ref().map(|p| p.base_branch.clone()).or(project_default);
+                let effective_default = effective_base_branch(
+                    self.base_branch_overrides.get(&path).map(String::as_str),
+                    pr_info.as_ref().map(|p| p.base_branch.as_str()),
+                    project_default.as_deref(),
+                );
                 // Single non-blocking poll: returns the last known status and
                 // kicks off a background refresh if stale or if the hint
                 // changed since the last completed compute.  Cloned so the
@@ -3991,6 +4000,17 @@ fn project_main_for(projects: &[Project], ws: &Path) -> Option<PathBuf> {
     let project = projects.iter().find(|p| p.worktrees.iter().any(|w| w.path == ws))?;
     let main = project.worktrees.iter().find(|w| w.is_main)?;
     if main.path == ws { None } else { Some(main.path.clone()) }
+}
+
+/// The branch the git panel diffs against: the user's explicit override,
+/// else the open PR's base (what GitHub will review), else the project's
+/// detected default branch.
+fn effective_base_branch(
+    override_branch: Option<&str>,
+    pr_base: Option<&str>,
+    project_default: Option<&str>,
+) -> Option<String> {
+    override_branch.or(pr_base).or(project_default).map(str::to_string)
 }
 
 /// Agent glyphs usually come from the title's own leading char
@@ -5743,6 +5763,15 @@ mod tests {
     fn session_ids_empty_for_unknown_workspace() {
         let pairs = vec![(None, 1)];
         assert!(sidebar_session_ids(&pairs, &ws("/missing"), false).is_empty());
+    }
+
+    #[test]
+    fn base_branch_precedence_is_override_then_pr_then_default() {
+        let f = effective_base_branch;
+        assert_eq!(f(Some("develop"), Some("main"), Some("master")), Some("develop".into()));
+        assert_eq!(f(None, Some("main"), Some("master")), Some("main".into()));
+        assert_eq!(f(None, None, Some("master")), Some("master".into()));
+        assert_eq!(f(None, None, None), None);
     }
 
     #[test]
