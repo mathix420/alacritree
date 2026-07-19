@@ -17,6 +17,9 @@ pub struct PersistedState {
     pub show_left_sidebar: bool,
     #[serde(default = "default_true")]
     pub show_right_sidebar: bool,
+    /// Per-worktree override of the branch the git panel diffs against.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub base_branches: Vec<PersistedBaseBranch>,
 }
 
 /// The `default_true` attributes above only speak for a file that omits the
@@ -24,7 +27,12 @@ pub struct PersistedState {
 /// this would open alacritree with both sidebars hidden.
 impl Default for PersistedState {
     fn default() -> Self {
-        Self { projects: Vec::new(), show_left_sidebar: true, show_right_sidebar: true }
+        Self {
+            projects: Vec::new(),
+            show_left_sidebar: true,
+            show_right_sidebar: true,
+            base_branches: Vec::new(),
+        }
     }
 }
 
@@ -41,6 +49,12 @@ pub struct PersistedProject {
     /// the name from the root, as before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedBaseBranch {
+    pub worktree: PathBuf,
+    pub branch: String,
 }
 
 fn default_true() -> bool {
@@ -76,6 +90,18 @@ fn config_dir() -> Option<PathBuf> {
 /// them.  Stable, so equal keys (all the disk-only roots) hold their order.
 pub fn reorder_projects(state: &mut PersistedState, order: &[PathBuf]) {
     state.projects.sort_by_key(|p| order.iter().position(|r| *r == p.root).unwrap_or(usize::MAX));
+}
+
+/// Set or clear one worktree's base-branch override.  Entries whose worktree
+/// no longer exists on disk are dropped in the same pass — the filesystem is
+/// the truth every window shares, so pruning here can't delete another
+/// window's live entry the way pruning against one window's project list
+/// could.
+pub fn set_base_branch(state: &mut PersistedState, worktree: &Path, branch: Option<String>) {
+    state.base_branches.retain(|b| b.worktree != worktree && b.worktree.is_dir());
+    if let Some(branch) = branch {
+        state.base_branches.push(PersistedBaseBranch { worktree: worktree.to_path_buf(), branch });
+    }
 }
 
 pub fn load() -> PersistedState {
@@ -357,5 +383,62 @@ mod tests {
         let text = toml::to_string_pretty(&state).unwrap();
         let back: PersistedState = toml::from_str(&text).unwrap();
         assert_eq!(back.projects[0].label.as_deref(), Some("Work"));
+    }
+
+    #[test]
+    fn base_branch_field_is_optional_and_round_trips() {
+        // Old state files (no `base_branches`) still parse.
+        let old = "[[projects]]\nroot = 'C:/x'\n";
+        let state: PersistedState = toml::from_str(old).unwrap();
+        assert!(state.base_branches.is_empty());
+
+        let state = PersistedState {
+            base_branches: vec![PersistedBaseBranch {
+                worktree: PathBuf::from("C:/repo/wt"),
+                branch: "develop".to_string(),
+            }],
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&state).unwrap();
+        let back: PersistedState = toml::from_str(&text).unwrap();
+        assert_eq!(back.base_branches[0].branch, "develop");
+        assert_eq!(back.base_branches[0].worktree, PathBuf::from("C:/repo/wt"));
+    }
+
+    #[test]
+    fn set_base_branch_replaces_and_clears() {
+        let dir = TempDir::new().unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir(&wt).unwrap();
+        let mut state = PersistedState::default();
+
+        set_base_branch(&mut state, &wt, Some("develop".to_string()));
+        assert_eq!(state.base_branches.len(), 1);
+        set_base_branch(&mut state, &wt, Some("release".to_string()));
+        assert_eq!(state.base_branches.len(), 1, "a second set must replace, not append");
+        assert_eq!(state.base_branches[0].branch, "release");
+        set_base_branch(&mut state, &wt, None);
+        assert!(state.base_branches.is_empty(), "None clears the override");
+    }
+
+    /// Worktrees deleted on disk take their overrides with them the next time
+    /// any override is written — the filesystem is the truth every window shares.
+    #[test]
+    fn set_base_branch_prunes_entries_for_vanished_worktrees() {
+        let dir = TempDir::new().unwrap();
+        let alive = dir.path().join("alive");
+        std::fs::create_dir(&alive).unwrap();
+        let mut state = PersistedState {
+            base_branches: vec![PersistedBaseBranch {
+                worktree: dir.path().join("gone"),
+                branch: "develop".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        set_base_branch(&mut state, &alive, Some("main".to_string()));
+
+        let worktrees: Vec<_> = state.base_branches.iter().map(|b| b.worktree.clone()).collect();
+        assert_eq!(worktrees, vec![alive]);
     }
 }
