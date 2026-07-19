@@ -321,6 +321,8 @@ pub struct AlacritreeApp {
     /// off-thread and are adopted in `poll_pending_creates`.
     pending_creates: Vec<BackgroundCreate>,
     pending_rename: Option<RenameState>,
+    /// The base-branch picker modal.  Transient: never persisted.
+    pending_base_branch: Option<BaseBranchPicker>,
     pending_project_remove: Option<ProjectRemoveState>,
     /// Worktrees already given a Doppler scope pass this app run, so opening
     /// more shells there doesn't re-invoke the doppler CLI.
@@ -403,6 +405,17 @@ struct ProjectRemoveState {
     root: PathBuf,
     /// Display name, kept for the prompt after `projects` may have shifted.
     name: String,
+}
+
+/// Modal state for choosing a worktree's diff base.
+struct BaseBranchPicker {
+    worktree: PathBuf,
+    query: String,
+    /// `Err` is what git said when listing failed (not a repo, WSL down…).
+    branches: Result<Vec<String>, String>,
+    /// Auto-detected base shown on the "Auto" row.
+    detected: Option<String>,
+    cursor: usize,
 }
 
 /// Drag-and-drop payload for reordering the project list.  Carries the dragged
@@ -618,6 +631,7 @@ impl AlacritreeApp {
             pending_create: None,
             pending_creates: Vec::new(),
             pending_rename: None,
+            pending_base_branch: None,
             pending_project_remove: None,
             doppler_synced: HashSet::new(),
             pending_session_close: None,
@@ -1113,6 +1127,7 @@ impl AlacritreeApp {
             || self.pending_create.is_some()
             || self.pending_session_close.is_some()
             || self.pending_rename.is_some()
+            || self.pending_base_branch.is_some()
             || self.pending_project_remove.is_some()
             || self.error_dialog.is_some()
     }
@@ -2685,6 +2700,32 @@ impl AlacritreeApp {
         None
     }
 
+    fn open_base_branch_picker(&mut self, worktree: PathBuf) {
+        let detected = self.project_default_branch_for(&worktree);
+        let branches = crate::worktree::list_branches(&worktree);
+        self.pending_base_branch = Some(BaseBranchPicker {
+            worktree,
+            query: String::new(),
+            branches,
+            detected,
+            cursor: 0,
+        });
+    }
+
+    fn apply_base_branch(&mut self, worktree: PathBuf, branch: Option<String>) {
+        match &branch {
+            Some(b) => {
+                self.base_branch_overrides.insert(worktree.clone(), b.clone());
+            },
+            None => {
+                self.base_branch_overrides.remove(&worktree);
+            },
+        }
+        // The next `StatusCache::poll` sees the changed hint and recomputes;
+        // nothing to invalidate by hand.
+        state::mutate(|s| state::set_base_branch(s, &worktree, branch));
+    }
+
     fn show_git_sidebar(&mut self, ctx: &Context, panel_frame: Frame) -> egui::Rect {
         let theme = self.theme;
         let scrollbar = self.config.ui.scrollbar;
@@ -4013,6 +4054,12 @@ fn effective_base_branch(
     override_branch.or(pr_base).or(project_default).map(str::to_string)
 }
 
+/// Branches whose name contains `query`, case-insensitively.
+fn filter_branches(branches: &[String], query: &str) -> Vec<String> {
+    let query = query.to_lowercase();
+    branches.iter().filter(|b| b.to_lowercase().contains(&query)).cloned().collect()
+}
+
 /// Agent glyphs usually come from the title's own leading char
 /// (`Session::agent_glyph`), and the session row paints that glyph as its
 /// status icon right next to the title — showing it in both places doubles
@@ -5009,6 +5056,112 @@ impl AlacritreeApp {
         self.pending_rename = Some(RenameState { root, label });
     }
 
+    fn show_base_branch_picker(&mut self, ctx: &Context) {
+        let Some(mut picker) = self.pending_base_branch.take() else {
+            return;
+        };
+        let theme = self.theme;
+        let danger = rgb_to_color32(self.config.palette.normal[1]);
+        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (up, down) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+            )
+        });
+        let frame = modal_frame(&theme);
+        let current = self.base_branch_overrides.get(&picker.worktree).cloned();
+        let s = theme.ui_scale;
+
+        // Row 0 is always "Auto"; branch rows follow, narrowed by the query.
+        let filtered = match &picker.branches {
+            Ok(branches) => filter_branches(branches, &picker.query),
+            Err(_) => Vec::new(),
+        };
+        picker.cursor = picker.cursor.min(filtered.len());
+
+        let mut chosen: Option<Option<String>> = None; // Some(None) = Auto
+        let modal = egui::Modal::new(egui::Id::new("alacritree_base_branch_picker"))
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.set_width(380.0 * s);
+                ui.spacing_mut().item_spacing.y = 4.0 * s;
+                let name = picker
+                    .worktree
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| picker.worktree.display().to_string());
+                ui.label(
+                    RichText::new(format!("Base branch for `{name}`")).color(theme.text).strong(),
+                );
+                ui.label(
+                    RichText::new("The git panel diffs this worktree against it.")
+                        .color(theme.text_muted)
+                        .small(),
+                );
+                let input_id = egui::Id::new("alacritree_base_branch_query");
+                let edit = egui::TextEdit::singleline(&mut picker.query)
+                    .id(input_id)
+                    .hint_text("filter branches")
+                    .desired_width(f32::INFINITY);
+                ui.add(edit);
+                focus_default(ui.ctx(), input_id);
+
+                if let Err(e) = &picker.branches {
+                    ui.label(RichText::new(e).color(danger).small());
+                }
+
+                let mark = |selected: bool| if selected { "• " } else { "   " };
+                egui::ScrollArea::vertical().max_height(240.0 * s).show(ui, |ui| {
+                    let auto_label = match &picker.detected {
+                        Some(d) => format!("{}Auto ({d})", mark(current.is_none())),
+                        None => format!("{}Auto", mark(current.is_none())),
+                    };
+                    let auto = ui.selectable_label(picker.cursor == 0, auto_label);
+                    if auto.clicked() {
+                        chosen = Some(None);
+                    }
+                    for (i, branch) in filtered.iter().enumerate() {
+                        let selected = current.as_deref() == Some(branch.as_str());
+                        let resp = ui.selectable_label(
+                            picker.cursor == i + 1,
+                            format!("{}{branch}", mark(selected)),
+                        );
+                        if resp.clicked() {
+                            chosen = Some(Some(branch.clone()));
+                        }
+                    }
+                });
+                ui.label(
+                    RichText::new("↑↓ move · Enter apply · Esc cancel")
+                        .color(theme.text_muted)
+                        .small(),
+                );
+            });
+
+        if up {
+            picker.cursor = picker.cursor.saturating_sub(1);
+        }
+        if down {
+            picker.cursor = (picker.cursor + 1).min(filtered.len());
+        }
+        if confirm_via_key {
+            chosen = Some(if picker.cursor == 0 {
+                None
+            } else {
+                filtered.get(picker.cursor - 1).cloned()
+            });
+        }
+        if cancel_via_key || modal.should_close() {
+            return;
+        }
+        if let Some(branch) = chosen {
+            self.apply_base_branch(picker.worktree, branch);
+            return;
+        }
+        self.pending_base_branch = Some(picker);
+    }
+
     fn show_create_dialog(&mut self, ctx: &Context) {
         let Some(state) = self.pending_create.take() else {
             return;
@@ -5588,6 +5741,9 @@ impl eframe::App for AlacritreeApp {
         if self.pending_rename.is_some() {
             self.show_rename_dialog(ctx);
         }
+        if self.pending_base_branch.is_some() {
+            self.show_base_branch_picker(ctx);
+        }
         if self.pending_project_remove.is_some() {
             self.show_remove_project_dialog(ctx);
         }
@@ -5772,6 +5928,15 @@ mod tests {
         assert_eq!(f(None, Some("main"), Some("master")), Some("main".into()));
         assert_eq!(f(None, None, Some("master")), Some("master".into()));
         assert_eq!(f(None, None, None), None);
+    }
+
+    #[test]
+    fn picker_filter_is_a_case_insensitive_contains() {
+        let branches =
+            vec!["main".to_string(), "develop".to_string(), "origin/develop".to_string()];
+        assert_eq!(filter_branches(&branches, ""), branches);
+        assert_eq!(filter_branches(&branches, "DEV"), vec!["develop", "origin/develop"]);
+        assert!(filter_branches(&branches, "zz").is_empty());
     }
 
     #[test]
