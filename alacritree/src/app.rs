@@ -1985,6 +1985,14 @@ impl AlacritreeApp {
                 }
             },
             BindingAction::Named(NamedAction::DeleteSelected) => {
+                // While the fuzzy prompt is open a letter bound here is query
+                // input — its Text event already fed the filter — so only a
+                // browsing-mode press (or IPC) acts.  Mirrors RefreshProjects.
+                if origin != ActionOrigin::Ipc
+                    && self.project_filter.mode() != panel_filter::Mode::Browsing
+                {
+                    return;
+                }
                 match self.sidebar_cursor.clone() {
                     Some(SidebarRow::Session(id)) => self.request_close_session(ctx, id),
                     Some(SidebarRow::Worktree(path)) => self.request_worktree_delete(&path),
