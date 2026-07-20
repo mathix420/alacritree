@@ -170,6 +170,20 @@ fn paint_focus_outline(ctx: &Context, rect: egui::Rect, theme: &Theme) {
     );
 }
 
+/// A primary press landed on the panel itself: inside its rect with no
+/// floating layer (modal, window, context menu) above the press position.
+/// `layer_id_at` resolves only floating `Area` layers — `None` means the
+/// press reached the background panels — and while a modal is open egui
+/// resolves *every* position to the modal's layer, so presses never register
+/// here until the modal closes.
+fn pressed_on_panel(ctx: &Context, resp: &egui::Response) -> bool {
+    let (pressed, origin) = ctx.input(|i| (i.pointer.primary_pressed(), i.pointer.press_origin()));
+    pressed
+        && origin.is_some_and(|pos| {
+            resp.rect.contains(pos) && ctx.layer_id_at(pos).is_none_or(|l| l == resp.layer_id)
+        })
+}
+
 fn blend_toward(c: Color32, target: Color32, amount: f32) -> Color32 {
     let amount = amount.clamp(0.0, 1.0);
     let mix = |a: u8, b: u8| -> u8 {
@@ -2640,6 +2654,12 @@ impl AlacritreeApp {
                 self.last_error = Some(format!("failed to spawn shell: {e}"));
             }
         }
+        if self.config.ui.sidebar_click_focus
+            && self.focus != PaneFocus::ProjectsSidebar
+            && pressed_on_panel(ctx, &panel_resp.response)
+        {
+            self.focus_sidebar();
+        }
         panel_resp.response.rect
     }
 
@@ -2950,6 +2970,12 @@ impl AlacritreeApp {
             });
         if let Some(req) = diff_request.take() {
             self.open_diff(ctx, req);
+        }
+        if self.config.ui.sidebar_click_focus
+            && self.focus != PaneFocus::GitSidebar
+            && pressed_on_panel(ctx, &panel_resp.response)
+        {
+            self.focus_git_sidebar();
         }
         panel_resp.response.rect
     }
