@@ -1,6 +1,6 @@
 [package]
 name = "alacritree"
-version = "0.5.0"
+version = "0.5.1"
 authors = ["Arnaud Gissinger"]
 license = "Apache-2.0"
 description = "Alacritty fork with worktree-aware sidebars"
