@@ -234,6 +234,21 @@ pub fn show(
     response
 }
 
+/// Whether the grid owns the pointer at `pos`: inside `rect` with no floating
+/// layer (modal, window, context menu) above it.  `layer_id_at` resolves only
+/// floating `Area` layers, so `None` means the position reaches the background
+/// panels hosting the grid — and while a modal is open egui resolves *every*
+/// position to the modal's layer.  Raw pointer reads bypass egui's
+/// response-level layer blocking, so each one must apply this check itself.
+fn pointer_owns_grid(
+    ctx: &egui::Context,
+    grid_layer: egui::LayerId,
+    rect: Rect,
+    pos: Pos2,
+) -> bool {
+    rect.contains(pos) && ctx.layer_id_at(pos).is_none_or(|l| l == grid_layer)
+}
+
 /// Resolve the link under the mouse pointer, if any.  Returns `None` when the
 /// pointer is outside the grid, when no link covers that cell, or when the
 /// pointer is being used for an active drag (so click-to-open never fights
@@ -252,7 +267,7 @@ fn hovered_link(
         return None;
     }
     let pos = ui.input(|i| i.pointer.hover_pos())?;
-    if !rect.contains(pos) {
+    if !pointer_owns_grid(ui.ctx(), ui.layer_id(), rect, pos) {
         return None;
     }
     let term = session.term.lock();
@@ -386,7 +401,8 @@ fn handle_selection(
 /// alacritty's `on_mouse_press` / `on_mouse_release` / `mouse_moved`.  Presses
 /// and releases report the clicked cell; motion reports only when the pointer
 /// crosses into a new cell and the app opted into motion (any-motion) or drag
-/// tracking.  Events outside the grid are ignored so sidebar clicks don't leak.
+/// tracking.  Events outside the grid — or under an overlay above it — are
+/// ignored so sidebar clicks and drags inside dialogs don't leak.
 #[allow(clippy::too_many_arguments)]
 fn handle_mouse_reporting(
     ui: &Ui,
@@ -445,7 +461,7 @@ fn handle_mouse_reporting(
     for raw in raws {
         match raw {
             Raw::Button { pos, code, pressed, modifiers } => {
-                if !rect.contains(pos) {
+                if !pointer_owns_grid(ui.ctx(), ui.layer_id(), rect, pos) {
                     continue;
                 }
                 let (point, _) = cell_at_pos(pos, rect, cell_w, cell_h, cols, rows, display_offset);
@@ -455,7 +471,7 @@ fn handle_mouse_reporting(
                 }
             },
             Raw::Motion { pos, modifiers } => {
-                if !rect.contains(pos) {
+                if !pointer_owns_grid(ui.ctx(), ui.layer_id(), rect, pos) {
                     continue;
                 }
                 let (point, _) = cell_at_pos(pos, rect, cell_w, cell_h, cols, rows, display_offset);
@@ -1198,6 +1214,90 @@ mod tests {
         let term = term_running(b"$ ");
 
         assert_ne!(cursor_shape(&term), CursorShape::Hidden);
+    }
+
+    /// Two frames so egui's layer memory settles: areas register during a
+    /// frame, and the modal layer becomes queryable only after end-of-frame.
+    fn run_frames(ctx: &egui::Context, overlay: impl Fn(&egui::Context)) {
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |_| {});
+                overlay(ctx);
+            });
+        }
+    }
+
+    #[test]
+    fn bare_grid_owns_the_pointer_inside_its_rect() {
+        let ctx = egui::Context::default();
+        run_frames(&ctx, |_| {});
+        let grid = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+
+        assert!(pointer_owns_grid(
+            &ctx,
+            egui::LayerId::background(),
+            grid,
+            Pos2::new(100.0, 100.0)
+        ));
+        assert!(!pointer_owns_grid(
+            &ctx,
+            egui::LayerId::background(),
+            grid,
+            Pos2::new(900.0, 100.0)
+        ));
+    }
+
+    /// While a modal is open egui resolves *every* position to the modal's
+    /// layer — a drag that starts inside the dialog must not stream button and
+    /// motion reports to a mouse-tracking app underneath, which would visibly
+    /// drag out a selection in TUIs that track the mouse.
+    #[test]
+    fn an_open_modal_owns_every_position() {
+        let ctx = egui::Context::default();
+        run_frames(&ctx, |ctx| {
+            egui::Modal::new(egui::Id::new("dialog")).show(ctx, |ui| {
+                ui.label("rename");
+            });
+        });
+        let grid = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+
+        assert!(!pointer_owns_grid(
+            &ctx,
+            egui::LayerId::background(),
+            grid,
+            Pos2::new(100.0, 100.0)
+        ));
+    }
+
+    #[test]
+    fn a_floating_window_owns_only_its_own_rect() {
+        let ctx = egui::Context::default();
+        run_frames(&ctx, |ctx| {
+            egui::Area::new(egui::Id::new("floating")).fixed_pos(Pos2::new(100.0, 100.0)).show(
+                ctx,
+                |ui| {
+                    ui.allocate_space(Vec2::new(50.0, 50.0));
+                },
+            );
+        });
+        let grid = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+
+        assert!(!pointer_owns_grid(
+            &ctx,
+            egui::LayerId::background(),
+            grid,
+            Pos2::new(110.0, 110.0)
+        ));
+        assert!(pointer_owns_grid(
+            &ctx,
+            egui::LayerId::background(),
+            grid,
+            Pos2::new(400.0, 400.0)
+        ));
     }
 
     /// Text of the topmost visible grid line, as the painter would render it.
