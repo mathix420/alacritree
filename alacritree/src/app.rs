@@ -1011,6 +1011,43 @@ impl AlacritreeApp {
         }
     }
 
+    /// Open the delete/prune confirm dialog for the worktree at `path`.
+    /// Main checkouts have no delete affordance, and a worktree whose
+    /// removal is already running is inert.
+    fn request_worktree_delete(&mut self, path: &Path) {
+        if self.pending_deletes.iter().any(|t| t.worktree_path == *path) {
+            return;
+        }
+        let Some((project_idx, wt)) =
+            self.projects.iter().enumerate().find_map(|(idx, p)| {
+                p.worktrees.iter().find(|w| w.path == *path).map(|w| (idx, w))
+            })
+        else {
+            return;
+        };
+        if wt.is_main {
+            return;
+        }
+        // Discovery marking can be stale; a dir deleted since the last
+        // refresh should still get the prune flow, not a doomed
+        // `git worktree remove`.
+        let prunable = wt.prunable || !wt.path.is_dir();
+        self.pending_delete = Some(DeleteRequest {
+            project_idx,
+            worktree_path: wt.path.clone(),
+            worktree_name: wt.name.clone(),
+            branch: wt.branch.clone(),
+            // A missing dir has nothing to be dirty; skip the status probe.
+            dirty: if prunable {
+                DirtyCounts::default()
+            } else {
+                git_status::dirty_counts(&wt.path)
+            },
+            prunable,
+            delete_branch: true,
+        });
+    }
+
     /// Re-home `id` to `target`'s workspace.  A re-keying only: the PTY, its
     /// threads, and the scrollback are untouched — the session must survive
     /// a move the same way it survives a workspace switch.
@@ -1947,6 +1984,21 @@ impl AlacritreeApp {
                     self.refresh_all_projects(ctx);
                 }
             },
+            BindingAction::Named(NamedAction::DeleteSelected) => {
+                match self.sidebar_cursor.clone() {
+                    Some(SidebarRow::Session(id)) => self.request_close_session(ctx, id),
+                    Some(SidebarRow::Worktree(path)) => self.request_worktree_delete(&path),
+                    Some(SidebarRow::Project(root)) => {
+                        if let Some(p) = self.projects.iter().find(|p| p.root == root) {
+                            self.pending_project_remove = Some(ProjectRemoveState {
+                                name: p.display_name().to_string(),
+                                root,
+                            });
+                        }
+                    },
+                    Some(SidebarRow::Home) | None => {},
+                }
+            },
             BindingAction::Named(NamedAction::ShowShortcuts) => {
                 self.shortcuts_window_open = !self.shortcuts_window_open;
                 if self.shortcuts_window_open {
@@ -2151,7 +2203,7 @@ impl AlacritreeApp {
 
     fn show_project_sidebar(&mut self, ctx: &Context, panel_frame: Frame) -> egui::Rect {
         let activate_request: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
-        let delete_request: std::cell::Cell<Option<DeleteRequest>> = std::cell::Cell::new(None);
+        let delete_request: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
         let create_request: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
         let spawn_shell_request: std::cell::Cell<Option<WorkspaceKey>> = std::cell::Cell::new(None);
         let activate_session_request: std::cell::Cell<Option<(WorkspaceKey, SessionId)>> =
@@ -2682,26 +2734,7 @@ impl AlacritreeApp {
                                     activate_request.set(Some(wt.path.clone()));
                                 }
                                 if action.delete {
-                                    // Discovery marking can be stale; a dir
-                                    // deleted since the last refresh should
-                                    // still get the prune flow, not a doomed
-                                    // `git worktree remove`.
-                                    let prunable = wt.prunable || !wt.path.is_dir();
-                                    delete_request.set(Some(DeleteRequest {
-                                        project_idx: idx,
-                                        worktree_path: wt.path.clone(),
-                                        worktree_name: wt.name.clone(),
-                                        branch: wt.branch.clone(),
-                                        // A missing dir has nothing to be dirty;
-                                        // skip the status probe.
-                                        dirty: if prunable {
-                                            DirtyCounts::default()
-                                        } else {
-                                            git_status::dirty_counts(&wt.path)
-                                        },
-                                        prunable,
-                                        delete_branch: true,
-                                    }));
+                                    delete_request.set(Some(wt.path.clone()));
                                 }
                                 if action.spawn {
                                     spawn_shell_request.set(Some(Some(wt.path.clone())));
@@ -2785,8 +2818,8 @@ impl AlacritreeApp {
         if let Some(path) = base_picker_request.take() {
             self.open_base_branch_picker(path);
         }
-        if let Some(req) = delete_request.take() {
-            self.pending_delete = Some(req);
+        if let Some(path) = delete_request.take() {
+            self.request_worktree_delete(&path);
         }
         if let Some(idx) = create_request.take() {
             self.pending_create =

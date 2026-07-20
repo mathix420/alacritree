@@ -62,6 +62,10 @@ pub enum NamedAction {
     SidebarPreviousProject,
     /// Re-run worktree discovery for every project in the sidebar.
     RefreshProjects,
+    /// Act on the sidebar-cursored row: a session closes, a worktree gets
+    /// the delete/prune dialog, a project gets the remove-from-sidebar
+    /// prompt.
+    DeleteSelected,
     ShowShortcuts,
     FocusProjectsSidebar,
     FocusGitSidebar,
@@ -89,7 +93,7 @@ pub enum NamedAction {
 
 impl NamedAction {
     /// Actions that only make sense while the projects sidebar owns focus.
-    /// Their default keys (unmodified Home/End/PageUp/PageDown/R) are
+    /// Their default keys (unmodified Home/End/PageUp/PageDown/R/Delete) are
     /// terminal input the rest of the time, so dispatch must not consume
     /// them unless the sidebar owns focus.
     pub fn is_sidebar_scoped(&self) -> bool {
@@ -100,6 +104,7 @@ impl NamedAction {
                 | Self::SidebarNextProject
                 | Self::SidebarPreviousProject
                 | Self::RefreshProjects
+                | Self::DeleteSelected
         )
     }
 
@@ -160,6 +165,11 @@ impl NamedAction {
                 "Jump the sidebar cursor to the previous project".into()
             },
             Self::RefreshProjects => "Rescan every project's worktrees".into(),
+            Self::DeleteSelected => {
+                "Close the selected session, delete the selected worktree, or remove the selected \
+                 project"
+                    .into()
+            },
             Self::FocusProjectsSidebar => "Focus the projects sidebar".into(),
             Self::FocusGitSidebar => "Focus the git sidebar".into(),
             Self::FocusTerminal => "Focus the terminal".into(),
@@ -329,6 +339,11 @@ fn default_bindings() -> Vec<KeyBinding> {
             key: Key::R,
             mods: Modifiers::NONE,
             action: BindingAction::Named(RefreshProjects),
+        },
+        KeyBinding {
+            key: Key::Delete,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(DeleteSelected),
         },
         KeyBinding {
             key: Key::F1,
@@ -671,6 +686,7 @@ pub fn parse_action(name: &str) -> BindingAction {
         "SidebarNextProject" => BindingAction::Named(SidebarNextProject),
         "SidebarPreviousProject" => BindingAction::Named(SidebarPreviousProject),
         "RefreshProjects" => BindingAction::Named(RefreshProjects),
+        "DeleteSelected" => BindingAction::Named(DeleteSelected),
         "ShowShortcuts" => BindingAction::Named(ShowShortcuts),
         "FocusProjectsSidebar" => BindingAction::Named(FocusProjectsSidebar),
         "FocusGitSidebar" => BindingAction::Named(FocusGitSidebar),
@@ -1106,14 +1122,34 @@ mod tests {
     #[test]
     fn only_sidebar_actions_are_sidebar_scoped() {
         use NamedAction::*;
-        for a in
-            [SidebarTop, SidebarBottom, SidebarNextProject, SidebarPreviousProject, RefreshProjects]
-        {
+        for a in [
+            SidebarTop,
+            SidebarBottom,
+            SidebarNextProject,
+            SidebarPreviousProject,
+            RefreshProjects,
+            DeleteSelected,
+        ] {
             assert!(a.is_sidebar_scoped(), "{a:?}");
         }
         for a in [CloseSession, ScrollToTop, ScrollPageUp, ToggleSidebarFocus, Quit] {
             assert!(!a.is_sidebar_scoped(), "{a:?}");
         }
+    }
+
+    /// Delete is forward-delete inside a shell, so the default binding only
+    /// works because the action is sidebar-scoped.
+    #[test]
+    fn delete_selected_has_an_unmodified_delete_default_and_parses() {
+        let b = parse_bindings(vec![]);
+        assert_eq!(
+            named_matches(&b, Key::Delete, Modifiers::NONE),
+            vec![NamedAction::DeleteSelected]
+        );
+        assert!(matches!(
+            parse_action("DeleteSelected"),
+            BindingAction::Named(NamedAction::DeleteSelected)
+        ));
     }
 
     #[test]
