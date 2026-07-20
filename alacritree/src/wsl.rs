@@ -48,7 +48,7 @@ pub enum Location {
 }
 
 /// The distro-side directory Windows drives are mounted under.  Set once at
-/// startup from `[ui.wsl] automount_root`; `/mnt` is WSL's default.
+/// startup from `[wsl] automount_root`; `/mnt` is WSL's default.
 static AUTOMOUNT_ROOT: OnceLock<String> = OnceLock::new();
 
 pub fn set_automount_root(root: String) {
@@ -299,10 +299,17 @@ pub fn shell_invocation(distro: &str, workdir: &Path) -> (String, Vec<String>) {
 pub const SECTION_SEP: &[u8] = b"\n@@ALACRITREE@@\n";
 
 /// Run `script` through `sh -c` inside `distro`, with `args` bound to
-/// `$1..`.  One wsl.exe round trip (~400 ms warm on a dev machine, seconds
-/// while the VM cold-boots) — callers batch every query for a repo into a
-/// single script and must never call this on the UI thread.
+/// `$1..`.  Rides the resident helper's pipe when it is up; otherwise one
+/// wsl.exe round trip (~400 ms warm on a dev machine, seconds while the VM
+/// cold-boots) — callers batch every query for a repo into a single script
+/// and must never call this on the UI thread.
 pub fn run_batch(distro: &str, script: &str, args: &[&str]) -> Result<Vec<u8>, String> {
+    // A request the helper may have executed is never re-run as a one-shot
+    // (batch scripts have side effects); only a transport that failed
+    // before the write falls through to the spawn below.
+    if let Some(result) = crate::wsl_helper::try_run(distro, script, args) {
+        return result;
+    }
     let output = command(distro, None)
         .arg("sh")
         .arg("-c")
@@ -332,6 +339,12 @@ pub fn run_batch(distro: &str, script: &str, args: &[&str]) -> Result<Vec<u8>, S
 /// Returns `None` when delta isn't found; callers must not cache that, so an
 /// install mid-session is picked up on the next attempt.
 pub fn discover_delta(distro: &str) -> Option<String> {
+    // The helper's hello already resolved delta through the login shell; a
+    // missing capability is not a cached miss — fall through and re-check
+    // live so a mid-session install is still picked up.
+    if let Some(path) = crate::wsl_helper::capability_delta(distro) {
+        return Some(path);
+    }
     let script = r#"s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=${SHELL:-/bin/sh}; exec "$s" -lc 'command -v delta'"#;
     let output = command(distro, None)
         .arg("sh")

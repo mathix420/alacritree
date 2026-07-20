@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Rgb};
 use egui::Color32;
@@ -39,7 +40,14 @@ pub struct Config {
     /// Offer the IPC socket that `alacritree mcp` connects to.  Mirrors
     /// alacritty's `[general] ipc_socket` (default on).
     pub ipc_socket: bool,
+    /// Start dir for sessions with no explicit workspace (the home tab);
+    /// worktree tabs always use their checkout path.  Mirrors alacritty's
+    /// `[general] working_directory`, except a leading `~` expands to the
+    /// home directory (upstream only expands `~` in config imports) so one
+    /// shared config works on every platform.
+    pub working_directory: Option<PathBuf>,
     pub wsl_automount_root: String,
+    pub wsl_resident_helper: bool,
     /// Explicit `delta` program for the diff pane, from `[ui] delta_path`.
     /// When set it is used verbatim in git's `core.pager` on every platform
     /// and skips WSL delta autodiscovery; when unset, native diffs run bare
@@ -353,6 +361,9 @@ pub struct UiTheme {
     pub sidebar_accent: Option<Color32>,
     /// Fire a desktop notification when a non-visible session needs attention.
     pub notifications: bool,
+    /// How long an attention trigger must survive without the session going
+    /// back to work before it pings.  Zero pings on the trigger itself.
+    pub attention_grace: Duration,
     /// Ask before the sidebar's per-session `×` kills the PTY.
     pub confirm_session_close: ConfirmSessionClose,
     /// What closing the last session in the on-screen workspace does.
@@ -385,6 +396,7 @@ impl Default for UiTheme {
             sidebar_border: None,
             sidebar_accent: None,
             notifications: true,
+            attention_grace: Duration::ZERO,
             confirm_session_close: ConfirmSessionClose::Never,
             last_session_close: LastSessionClose::Respawn,
             session_display: SessionDisplay::default(),
@@ -450,7 +462,9 @@ impl Default for Config {
             selection: SelectionConfig::default(),
             bindings: Vec::new(),
             ipc_socket: true,
+            working_directory: None,
             wsl_automount_root: "/mnt".to_string(),
+            wsl_resident_helper: true,
             delta_path: None,
             profiles: Vec::new(),
             default_profile: None,
@@ -737,6 +751,7 @@ struct RawConfig {
     selection: RawSelection,
     keyboard: RawKeyboard,
     general: RawGeneral,
+    wsl: RawWsl,
 }
 
 /// Subset of alacritty's `[general]` section that alacritree honors.  It
@@ -747,6 +762,7 @@ struct RawConfig {
 #[serde(default)]
 struct RawGeneral {
     ipc_socket: Option<bool>,
+    working_directory: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -915,9 +931,17 @@ struct RawIndexed {
     color: RgbStr,
 }
 
+/// Top-level `[wsl]`: platform-integration options.  Lives outside `[ui]`
+/// because nothing here is presentation — it governs how the app talks to
+/// distros.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-struct RawUiWsl {
+struct RawWsl {
+    /// Keep a resident helper process per distro for foreground probes,
+    /// batched git queries, and tool discovery.  `false` restores one-shot
+    /// wsl.exe spawns everywhere; WSL sessions then always report "no
+    /// TUI", so FocusLeft/FocusRight always move panel focus.
+    resident_helper: Option<bool>,
     /// Distro-side mount point for Windows drives, mirroring wsl.conf's
     /// `[automount] root`.  Only used for paths *we* translate (git output
     /// from inside a distro); `wsl.exe --cd` translates with the distro's
@@ -969,6 +993,14 @@ fn build_icons(raw: RawIcons) -> Icons {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
+struct RawUiWsl {
+    /// Deprecated location: `[wsl] automount_root` supersedes this and wins
+    /// when both are set; kept so existing configs keep working.
+    automount_root: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 struct RawSessionDisplay {
     /// Show a workspace's sidebar session row even with a single session.
     sidebar_always: Option<bool>,
@@ -1000,6 +1032,9 @@ struct RawUi {
     sidebar_border: Option<RgbStr>,
     sidebar_accent: Option<RgbStr>,
     notifications: Option<bool>,
+    /// Grace window in milliseconds before an attention trigger pings; a
+    /// session that resumes work inside it swallows the ping.  Default 0.
+    attention_grace_ms: Option<u64>,
     /// When the sidebar × on a session row asks before killing the PTY:
     /// "never" (default) | "busy" | "always".
     confirm_session_close: Option<String>,
@@ -1139,6 +1174,7 @@ impl RawConfig {
             sidebar_border: self.ui.sidebar_border.map(|v| rgb_to_color32(v.0)),
             sidebar_accent: self.ui.sidebar_accent.map(|v| rgb_to_color32(v.0)),
             notifications: self.ui.notifications.unwrap_or(true),
+            attention_grace: Duration::from_millis(self.ui.attention_grace_ms.unwrap_or(0)),
             confirm_session_close: parse_confirm_session_close(
                 self.ui.confirm_session_close.as_deref(),
             ),
@@ -1267,13 +1303,15 @@ impl RawConfig {
         };
 
         // ---- WSL ----
+        // `[wsl]` supersedes the deprecated `[ui.wsl]` location.
         let wsl_automount_root = self
-            .ui
             .wsl
             .automount_root
+            .or(self.ui.wsl.automount_root)
             .map(|r| r.trim_end_matches('/').to_string())
             .filter(|r| r.starts_with('/') && r.len() > 1)
             .unwrap_or_else(|| "/mnt".to_string());
+        let wsl_resident_helper = self.wsl.resident_helper.unwrap_or(true);
 
         // ---- UI Font ----
         let ui_font = UiFont {
@@ -1305,7 +1343,13 @@ impl RawConfig {
             selection,
             bindings,
             ipc_socket: self.general.ipc_socket.unwrap_or(true),
+            working_directory: self
+                .general
+                .working_directory
+                .as_deref()
+                .and_then(|raw| parse_config_path(raw, "general.working_directory")),
             wsl_automount_root,
+            wsl_resident_helper,
             delta_path: self.ui.delta_path.filter(|s| !s.trim().is_empty()),
             profiles,
             default_profile,
@@ -1398,6 +1442,29 @@ mod tests {
         // Nonsense values fall back rather than corrupting every translation.
         let raw: RawConfig = toml::from_str("[ui.wsl]\nautomount_root = \"mnt\"").unwrap();
         assert_eq!(raw.into_config().wsl_automount_root, "/mnt");
+    }
+
+    #[test]
+    fn wsl_section_wins_over_deprecated_ui_location() {
+        let raw: RawConfig = toml::from_str("[wsl]\nautomount_root = \"/drives\"").unwrap();
+        assert_eq!(raw.into_config().wsl_automount_root, "/drives");
+
+        let both = "[wsl]\nautomount_root = \"/new\"\n[ui.wsl]\nautomount_root = \"/old\"";
+        let raw: RawConfig = toml::from_str(both).unwrap();
+        assert_eq!(raw.into_config().wsl_automount_root, "/new");
+
+        // Existing configs keep working through the deprecated location.
+        let raw: RawConfig = toml::from_str("[ui.wsl]\nautomount_root = \"/old\"").unwrap();
+        assert_eq!(raw.into_config().wsl_automount_root, "/old");
+    }
+
+    #[test]
+    fn resident_helper_defaults_on() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        assert!(raw.into_config().wsl_resident_helper);
+
+        let raw: RawConfig = toml::from_str("[wsl]\nresident_helper = false").unwrap();
+        assert!(!raw.into_config().wsl_resident_helper);
     }
 
     #[test]
@@ -1501,6 +1568,45 @@ mod tests {
     fn relative_and_user_tilde_paths_are_rejected() {
         assert_eq!(parse_config_path("relative/dir", "test"), None);
         assert_eq!(parse_config_path("~user/dir", "test"), None);
+    }
+
+    #[test]
+    fn general_working_directory_defaults_to_none() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        assert_eq!(raw.into_config().working_directory, None);
+    }
+
+    #[test]
+    fn general_working_directory_expands_tilde_and_forward_slashes() {
+        let home = home::home_dir().unwrap();
+        let raw: RawConfig =
+            toml::from_str("[general]\nworking_directory = \"~/projects\"").unwrap();
+        assert_eq!(raw.into_config().working_directory, Some(home.join("projects")));
+    }
+
+    #[test]
+    fn general_working_directory_accepts_absolute_paths() {
+        let toml_src = format!(
+            "[general]\nworking_directory = \"{}\"",
+            abs("somewhere").replace('\\', "\\\\")
+        );
+        let raw: RawConfig = toml::from_str(&toml_src).unwrap();
+        assert_eq!(raw.into_config().working_directory, Some(PathBuf::from(abs("somewhere"))));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn general_working_directory_accepts_forward_slash_windows_paths() {
+        let raw: RawConfig =
+            toml::from_str("[general]\nworking_directory = \"C:/somewhere\"").unwrap();
+        assert_eq!(raw.into_config().working_directory, Some(PathBuf::from("C:/somewhere")));
+    }
+
+    #[test]
+    fn general_working_directory_rejects_relative_paths() {
+        let raw: RawConfig =
+            toml::from_str("[general]\nworking_directory = \"relative/dir\"").unwrap();
+        assert_eq!(raw.into_config().working_directory, None);
     }
 
     #[test]

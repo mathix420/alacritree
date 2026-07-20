@@ -48,11 +48,12 @@ dependencies = [
 
 [[package]]
 name = "alacritree"
-version = "0.1.2"
+version = "0.4.1"
 dependencies = [
  "ab_glyph",
  "alacritty_terminal",
  "arboard",
+ "base64",
  "clap",
  "clap_complete",
  "eframe",

@@ -156,32 +156,38 @@ fn pr_state(state: &str, is_draft: bool) -> PrState {
 /// answer is tied to that specific branch rather than whatever ref happens
 /// to be checked out in the worktree.
 fn query_gh(path: &Path, branch: &str) -> Option<PrInfo> {
-    let mut cmd = match wsl::classify(path) {
+    const PR_JSON_FIELDS: &str = "number,baseRefName,url,state,isDraft";
+    match wsl::classify(path) {
         wsl::Location::Windows(p) => {
-            let mut c = Command::new("gh");
-            c.hide_console().current_dir(p);
-            c
+            let output = Command::new("gh")
+                .hide_console()
+                .current_dir(p)
+                .args(["pr", "view", branch, "--json", PR_JSON_FIELDS])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .stdin(Stdio::null())
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            parse_gh_output(&output.stdout)
         },
         // `gh` must be installed and authenticated *inside* the distro; any
         // failure falls back to the default branch, same as a missing
-        // Windows gh.  `--cd` accepts the UNC path natively.
-        wsl::Location::Wsl { distro, .. } => {
-            let mut c = wsl::command(&distro, Some(path));
-            c.arg("gh");
-            c
+        // Windows gh.  The batch script rides the resident helper when it
+        // is up (a one-shot spawn otherwise); the capability path from the
+        // helper's hello honors per-user install dirs that the default
+        // `--exec` PATH lacks.
+        wsl::Location::Wsl { distro, linux_path } => {
+            let gh = crate::wsl_helper::capability_gh(&distro).unwrap_or_else(|| "gh".to_string());
+            let script = r#"cd "$1" && exec "$2" pr view "$3" --json "$4""#;
+            let stdout =
+                wsl::run_batch(&distro, script, &[&linux_path, &gh, branch, PR_JSON_FIELDS])
+                    .ok()?;
+            parse_gh_output(&stdout)
         },
-    };
-    let output = cmd
-        .args(["pr", "view", branch, "--json", "number,baseRefName,url,state,isDraft"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
     }
-    parse_gh_output(&output.stdout)
 }
 
 fn parse_gh_output(stdout: &[u8]) -> Option<PrInfo> {

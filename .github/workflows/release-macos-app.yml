@@ -1,0 +1,49 @@
+name: Release macOS app bundle
+
+# Post-announce hook for the dist pipeline. dist only ships bare-binary
+# archives, but on macOS notifications require a bundle identifier
+# (UNUserNotificationCenter refuses to run unbundled), so releases also
+# carry an ad-hoc-signed Alacritree.app.
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: "dist plan (JSON), provided by the dist workflow"
+        required: true
+        type: string
+
+jobs:
+  app:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            triple: aarch64-apple-darwin
+          - runner: macos-15-intel
+            triple: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: brew install cmake pkg-config fontconfig freetype
+
+      - name: Build and upload Alacritree.app
+        env:
+          GH_TOKEN: ${{ secrets.ALACRITREE_BOT_TOKEN }}
+          PLAN: ${{ inputs.plan }}
+        run: |
+          set -euo pipefail
+          # Tolerate tags cut before the bundle template landed on master.
+          if [[ ! -x alacritree/extra/osx/make-app.sh ]]; then
+            echo "No alacritree/extra/osx/make-app.sh at this tag; skipping .app asset."
+            exit 0
+          fi
+          tag=$(jq -r '.announcement_tag' <<< "$PLAN")
+          # make-app.sh builds for the runner's native arch, so each matrix
+          # leg produces its own .app.
+          ./alacritree/extra/osx/make-app.sh
+          asset="Alacritree-${{ matrix.triple }}.app.tar.gz"
+          tar -C target/release/osx -czf "$asset" Alacritree.app
+          gh release upload "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --clobber

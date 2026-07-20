@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "include-component-in-tag": false,
+  "plugins": ["cargo-workspace"],
+  "packages": {
+    "alacritree": {
+      "release-type": "rust",
+      "package-name": "alacritree",
+      "bump-minor-pre-major": true
+    }
+  }
+}

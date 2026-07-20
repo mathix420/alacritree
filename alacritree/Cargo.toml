@@ -1,14 +1,22 @@
 [package]
 name = "alacritree"
-version = "0.1.2"
+version = "0.4.1"
 authors = ["Arnaud Gissinger"]
 license = "Apache-2.0"
 description = "Alacritty fork with worktree-aware sidebars"
+repository = "https://github.com/mathix420/alacritree"
 edition.workspace = true
 rust-version.workspace = true
 
+# Marking this crate dist-able opts the vendored alacritty binary *out*: dist
+# only distributes packages with an explicit `dist = true` once any package
+# sets one.
+[package.metadata.dist]
+dist = true
+
 [dependencies]
 alacritty_terminal = { path = "../alacritty_terminal" }
+base64 = "0.22"
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.31"
 log = "0.4"

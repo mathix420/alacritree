@@ -1,0 +1,29 @@
+name: Publish downstream packages
+
+# Post-announce hook for the dist pipeline. release-please publishes the
+# GitHub Release (assetless) at PR-merge time, so the `release: published`
+# event the downstream publishers listen for fires before any artifacts
+# exist and they skip. Uploading assets emits no further event, so this job
+# re-dispatches them once dist has attached everything.
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: "dist plan (JSON), provided by the dist workflow"
+        required: true
+        type: string
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-run downstream publishers
+        env:
+          GH_TOKEN: ${{ secrets.ALACRITREE_BOT_TOKEN }}
+          PLAN: ${{ inputs.plan }}
+        run: |
+          set -euo pipefail
+          tag=$(jq -r '.announcement_tag' <<< "$PLAN")
+          for workflow in aur-bin-publish.yml homebrew-update.yml scoop-update.yml; do
+            gh workflow run "$workflow" --repo "$GITHUB_REPOSITORY" -f tag="$tag"
+          done

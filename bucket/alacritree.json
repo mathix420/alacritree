@@ -26,7 +26,7 @@
     "autoupdate": {
         "architecture": {
             "64bit": {
-                "url": "https://github.com/mathix420/alacritree/releases/download/v$version/alacritree-v$version-x86_64-windows.zip"
+                "url": "https://github.com/mathix420/alacritree/releases/download/v$version/alacritree-x86_64-pc-windows-msvc.zip"
             }
         }
     }
