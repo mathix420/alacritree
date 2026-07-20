@@ -659,7 +659,10 @@ mod tests {
                 .expect("git runs");
             assert!(status.success(), "git {args:?} failed");
         };
-        git_bare(&["init", "--bare"]);
+        // Pin the bare repo's HEAD to main: `set-head -a` below asks the
+        // remote for its HEAD, which otherwise dangles on machines whose
+        // init.defaultBranch is not main (only main is pushed).
+        git_bare(&["init", "--bare", "-b", "main"]);
         let bare_path = bare.path().to_str().unwrap();
         git(&["remote", "add", "origin", bare_path]);
         git(&["push", "origin", "main"]);
