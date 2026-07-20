@@ -2028,7 +2028,11 @@ impl AlacritreeApp {
     fn show_tab_strip(&mut self, ui: &mut egui::Ui) {
         let theme = self.theme;
         let indices = self.current_session_indices();
-        if indices.is_empty() {
+        // The strip exists to switch between sessions, so it only earns its
+        // space once there's a choice to make (or the user forces it on).  With
+        // a single session this hides the trailing "+" new-session tab too,
+        // rather than leaving a lone hint above the terminal.
+        if indices.len() < 2 && !self.session_tabs_always {
             ui.add_space(2.0);
             return;
         }
@@ -2043,43 +2047,37 @@ impl AlacritreeApp {
             ui.allocate_exact_size(egui::vec2(avail, strip_height + 2.0), egui::Sense::hover());
 
         let mut activate: Option<SessionId> = None;
-        // Session segments only when there is a choice to make (or the user
-        // forces them via session_display), but the trailing + segment always
-        // renders alongside them once the strip itself renders (i.e. at least
-        // one session exists).
-        if indices.len() >= 2 || self.session_tabs_always {
-            let seg_avail = avail - plus_width - gap;
-            let segment_width =
-                ((seg_avail - gap * (indices.len() as f32 - 1.0)) / indices.len() as f32).max(1.0);
-            for (i, &session_idx) in indices.iter().enumerate() {
-                let x0 = rect.min.x + i as f32 * (segment_width + gap);
-                let seg_rect = egui::Rect::from_min_size(
-                    egui::pos2(x0, rect.min.y + 1.0),
-                    egui::vec2(segment_width, strip_height),
-                );
-                let is_active = active_idx == Some(session_idx);
-                // 2px is too small to reliably click — expand the hit zone vertically.
-                let click_rect = seg_rect.expand2(egui::vec2(0.0, 4.0));
-                let id = ui.id().with(("tab_strip", self.sessions[session_idx].id));
-                let resp = ui.interact(click_rect, id, egui::Sense::click());
-                // Attention wins over the active/inactive shading so a bell from a
-                // non-active tab pulls the eye even when another tab is selected.
-                let color = if self.sessions[session_idx].needs_attention {
-                    theme.attention
-                } else if is_active {
-                    theme.text
-                } else if resp.hovered() {
-                    theme.text_dim
-                } else {
-                    theme.text_muted
-                };
-                ui.painter().rect_filled(seg_rect, 0.0, color);
-                if resp.clicked() {
-                    activate = Some(self.sessions[session_idx].id);
-                }
-                if resp.hovered() {
-                    resp.on_hover_text(&self.sessions[session_idx].title);
-                }
+        let seg_avail = avail - plus_width - gap;
+        let segment_width =
+            ((seg_avail - gap * (indices.len() as f32 - 1.0)) / indices.len() as f32).max(1.0);
+        for (i, &session_idx) in indices.iter().enumerate() {
+            let x0 = rect.min.x + i as f32 * (segment_width + gap);
+            let seg_rect = egui::Rect::from_min_size(
+                egui::pos2(x0, rect.min.y + 1.0),
+                egui::vec2(segment_width, strip_height),
+            );
+            let is_active = active_idx == Some(session_idx);
+            // 2px is too small to reliably click — expand the hit zone vertically.
+            let click_rect = seg_rect.expand2(egui::vec2(0.0, 4.0));
+            let id = ui.id().with(("tab_strip", self.sessions[session_idx].id));
+            let resp = ui.interact(click_rect, id, egui::Sense::click());
+            // Attention wins over the active/inactive shading so a bell from a
+            // non-active tab pulls the eye even when another tab is selected.
+            let color = if self.sessions[session_idx].needs_attention {
+                theme.attention
+            } else if is_active {
+                theme.text
+            } else if resp.hovered() {
+                theme.text_dim
+            } else {
+                theme.text_muted
+            };
+            ui.painter().rect_filled(seg_rect, 0.0, color);
+            if resp.clicked() {
+                activate = Some(self.sessions[session_idx].id);
+            }
+            if resp.hovered() {
+                resp.on_hover_text(&self.sessions[session_idx].title);
             }
         }
 
