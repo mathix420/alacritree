@@ -60,7 +60,7 @@ and your TOML entries are checked first — so your config overrides any default
 | `Ctrl+Shift+W`       | Close the cursored session (sidebar) or the current shell |
 | `Home` / `End`       | Sidebar focused: cursor to the first / last row       |
 | `PageUp` / `PageDown`| Sidebar focused: jump to the previous / next project  |
-| `F1`                 | Toggle the searchable shortcuts window                |
+| `Ctrl+K`             | Open the command palette                              |
 
 ### Additional defaults on macOS
 
@@ -148,14 +148,16 @@ entry. Names match alacritty's own action names, so existing configs port over.
 All four sidebar actions act only while the projects sidebar has keyboard
 focus; anywhere else their keys pass through to the terminal untouched, so
 the unmodified defaults don't shadow Home/End/PageUp/PageDown in TUIs.
-- `ShowShortcuts` — toggle a searchable window listing every effective
-  binding, plus the actions nothing currently binds (so the full action
-  vocabulary is discoverable without the docs). Type to fuzzy-filter, `/`
-  refocuses the search box, `Escape`
-  clears the query and then closes, and `Up`/`Down`/`PageUp`/`PageDown`
-  scroll the list without leaving the search box. Clicking outside the
-  window closes it. The default `F1` shadows `F1` for terminal apps;
-  rebind or free it with `ReceiveChar` if you need it there.
+- `TogglePalette` — open (or close) the command palette: one fuzzy-searchable,
+  executable list of every keyboard action, every open session, and every
+  switchable workspace. The same fzf-style matcher the sidebars use ranks the
+  rows, so the full action vocabulary stays discoverable without the docs. Type
+  to filter, `Up`/`Down` move the selection, `Enter` runs the highlighted row
+  (dispatching an action, jumping to a session, or switching workspace),
+  `Escape` clears the query and then closes, and a click outside dismisses it.
+  The default is `Ctrl+K` (which shadows `Ctrl+K` for terminal apps; rebind or
+  free it with `ReceiveChar` if you need it there). `ShowShortcuts` is accepted
+  as an alias so older configs keep working.
 - `SpawnProfile1` … `SpawnProfile9` — spawn the Nth `[[ui.profiles]]` entry
   in the current workspace. Out-of-range indices show an error toast.
   Example binding:

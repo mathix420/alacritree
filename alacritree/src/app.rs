@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use crate::bindings::{BindingAction, NamedAction};
 use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
+use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
 use crate::config::{Config, FontConfig, Icons, LastSessionClose, ScrollbarStyle, UiFont};
 use crate::doppler;
 use crate::git_nav::{self, GitSection, SectionCount};
@@ -25,7 +26,6 @@ use crate::projects::{Project, Worktree, project_json};
 use crate::session::{
     AttentionVerdict, Session, SessionId, SessionKind, TermSize, poll_attention_debounce,
 };
-use crate::shortcuts_window;
 use crate::sidebar_nav::{self, SidebarRow};
 use crate::state::{self, PersistedProject};
 use crate::terminal_view;
@@ -301,12 +301,9 @@ pub struct AlacritreeApp {
     /// The focus toggle opened a hidden git sidebar; returning focus closes it
     /// again so a keyboard round trip leaves the layout untouched.
     git_sidebar_auto_shown: bool,
-    /// The F1 shortcuts overlay.  Transient: never persisted.
-    shortcuts_window_open: bool,
-    shortcuts_query: String,
-    /// One-shot: give the search box focus on the next window paint (set on
-    /// open and by `/`), mirroring the `*_cursor_moved` one-shots.
-    shortcuts_focus_search: bool,
+    /// The Ctrl+K command palette (query, selection, matcher). Transient:
+    /// never persisted.
+    palette: CommandPalette,
     sessions: Vec<Session>,
     current_workspace: WorkspaceKey,
     active_session: HashMap<WorkspaceKey, SessionId>,
@@ -620,9 +617,7 @@ impl AlacritreeApp {
             git_rows: Vec::new(),
             git_branch_base: None,
             git_sidebar_auto_shown: false,
-            shortcuts_window_open: false,
-            shortcuts_query: String::new(),
-            shortcuts_focus_search: false,
+            palette: CommandPalette::new(),
             sessions: Vec::new(),
             current_workspace: None,
             active_session: HashMap::new(),
@@ -1302,8 +1297,7 @@ impl AlacritreeApp {
     /// text input.  Matched events are consumed unless every matched action
     /// is `ReceiveChar` (alacritty's pass-through marker).
     fn handle_shortcuts(&mut self, ctx: &Context) {
-        let sidebar_focused =
-            self.focus == PaneFocus::ProjectsSidebar && !self.shortcuts_window_open;
+        let sidebar_focused = self.focus == PaneFocus::ProjectsSidebar && !self.palette.is_open();
         let actions: Vec<BindingAction> = ctx.input_mut(|i| {
             let mut actions = Vec::new();
             i.events.retain(|ev| {
@@ -1929,12 +1923,8 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::SidebarPreviousProject) => {
                 self.sidebar_cursor_project_jump(-1)
             },
-            BindingAction::Named(NamedAction::ShowShortcuts) => {
-                self.shortcuts_window_open = !self.shortcuts_window_open;
-                if self.shortcuts_window_open {
-                    self.shortcuts_query.clear();
-                    self.shortcuts_focus_search = true;
-                }
+            BindingAction::Named(NamedAction::TogglePalette) => {
+                self.palette.toggle();
             },
             BindingAction::Named(NamedAction::FocusProjectsSidebar) => {
                 if self.focus != PaneFocus::ProjectsSidebar {
@@ -3543,6 +3533,111 @@ fn focus_default(ctx: &Context, id: egui::Id) {
     }
 }
 
+/// A single line of text, ellipsized to `max_w` rather than wrapped — the
+/// building block for the palette's fixed columns.
+fn single_line_galley(
+    ctx: &Context,
+    text: &str,
+    family: egui::FontFamily,
+    size: f32,
+    color: Color32,
+    max_w: f32,
+) -> std::sync::Arc<egui::Galley> {
+    use egui::text::{LayoutJob, TextFormat};
+    let mut job = LayoutJob::single_section(text.to_owned(), TextFormat {
+        font_id: egui::FontId::new(size, family),
+        color,
+        ..Default::default()
+    });
+    job.wrap.max_width = max_w.max(0.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    ctx.fonts(|f| f.layout_job(job))
+}
+
+/// Paint one command-palette row: the description leads on the left (bright,
+/// the primary column), with the shortcut (accent) pinned to the far right and
+/// the action/context tag (dim) just inside it.  Every field is a one-line
+/// galley so nothing wraps, and the description claims all the width the
+/// right-hand columns leave it.  A selected row gets a soft accent wash and a
+/// crisp accent bar; a hovered one a faint fill.
+fn paint_palette_row(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    item: &PaletteItem,
+    selected: bool,
+) -> egui::Response {
+    let s = theme.ui_scale;
+    let pad = 10.0 * s;
+    let gap = 14.0 * s;
+    let row_h = (theme.font_normal + 12.0 * s).round();
+
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::click());
+    let painter = ui.painter().clone();
+    let ctx = ui.ctx();
+
+    if selected {
+        let wash =
+            Color32::from_rgba_unmultiplied(theme.accent.r(), theme.accent.g(), theme.accent.b(), 46);
+        painter.rect_filled(rect, 5.0 * s, wash);
+        let bar = egui::Rect::from_min_size(rect.left_top(), egui::vec2(2.5 * s, rect.height()));
+        painter.rect_filled(bar, 0.0, theme.accent);
+    } else if resp.hovered() {
+        painter.rect_filled(rect, 5.0 * s, theme.row_hover_bg);
+    }
+
+    let mid_y = rect.center().y;
+    let draw = |g: std::sync::Arc<egui::Galley>, x: f32| {
+        painter.galley(egui::pos2(x, mid_y - g.size().y / 2.0), g, theme.text);
+    };
+
+    // The secondary columns hug the right edge, right to left; the description
+    // then takes everything to their left, so it always leads the row.
+    let mut right = rect.right() - pad;
+    if !item.keys.is_empty() {
+        let g = single_line_galley(
+            ctx,
+            &item.keys,
+            egui::FontFamily::Monospace,
+            theme.font_normal,
+            theme.accent,
+            240.0 * s,
+        );
+        let w = g.size().x;
+        draw(g, right - w);
+        right -= w + gap;
+    }
+    if !item.secondary.is_empty() {
+        let tag_max = (rect.width() * 0.42).min(360.0 * s);
+        let g = single_line_galley(
+            ctx,
+            &item.secondary,
+            egui::FontFamily::Proportional,
+            theme.font_normal,
+            theme.text_dim,
+            tag_max,
+        );
+        let w = g.size().x;
+        draw(g, right - w);
+        right -= w + gap;
+    }
+
+    let left = rect.left() + pad;
+    let desc = single_line_galley(
+        ctx,
+        &item.primary,
+        egui::FontFamily::Proportional,
+        theme.font_normal,
+        theme.text,
+        (right - left).max(20.0 * s),
+    );
+    draw(desc, left);
+
+    resp
+}
+
 /// A modal action button.  Framed and filled so it reads as clickable —
 /// frameless text buttons looked like captions and users reached for the
 /// keyboard hint instead of the mouse.
@@ -4981,187 +5076,197 @@ impl AlacritreeApp {
         }
     }
 
-    /// The F1 shortcuts overlay: every effective app binding plus the
-    /// hardcoded sidebar keys, filtered live by the search box.  An
-    /// informational overlay, not a modal — bindings keep dispatching, which
-    /// is also how the ShowShortcuts key toggles it closed.
-    fn show_shortcuts_window(&mut self, ctx: &Context) {
+    /// The Ctrl+K command palette: one fuzzy-searchable, executable list of
+    /// every keyboard action, open session, and switchable workspace.  A real
+    /// modal — while it is up, terminal input and bindings are suppressed (see
+    /// `update`) and the palette owns its own keys.
+    fn show_command_palette(&mut self, ctx: &Context) {
         let theme = self.theme;
         let s = theme.ui_scale;
-        let list_height = 420.0 * s;
-        let mut scroll_delta = 0.0;
 
-        // Keys pressed mid-composition drive the IME's candidate window, not this
-        // window, so leave Esc and `/` in the event queue for it to see.
-        if self.ime.preedit().is_none() {
-            // The search box keeps keyboard focus, so scrolling keys are
-            // consumed here before the TextEdit swallows them; the wheel
-            // shouldn't be the only way to reach rows below the fold.
-            scroll_delta = ctx.input_mut(|i| {
-                let mut delta = 0.0;
-                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
-                    delta += 40.0 * s;
-                }
-                if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
-                    delta -= 40.0 * s;
-                }
-                if i.consume_key(egui::Modifiers::NONE, egui::Key::PageUp) {
-                    delta += list_height;
-                }
-                if i.consume_key(egui::Modifiers::NONE, egui::Key::PageDown) {
-                    delta -= list_height;
-                }
-                delta
-            });
-            // Esc narrows before it closes: drain it ahead of the TextEdit,
-            // which would otherwise only drop focus.
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-                if self.shortcuts_query.is_empty() {
-                    self.shortcuts_window_open = false;
-                    return;
-                }
-                self.shortcuts_query.clear();
+        // Drain the nav/confirm/cancel keys before the TextEdit runs so it
+        // never steals Enter (run), Esc (clear then close), or the arrows.
+        // Ctrl+K shuts the palette with the same key that opened it.
+        let (cancel, confirm) = consume_modal_keys(ctx);
+        let (up, down) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+            )
+        });
+        let toggle = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::K));
+
+        let items = self.palette_items();
+        let mut chosen: Option<PaletteAction> = None;
+
+        let modal = {
+            let palette = &mut self.palette;
+            egui::Modal::new(egui::Id::new("alacritree_command_palette"))
+                .frame(modal_frame(&theme))
+                .show(ctx, |ui| {
+                    ui.set_width(640.0 * s);
+                    ui.spacing_mut().item_spacing.y = 6.0 * s;
+
+                    let input_id = egui::Id::new("alacritree_command_palette_query");
+                    let query_changed = ui
+                        .add(
+                            egui::TextEdit::singleline(palette.query_mut())
+                                .id(input_id)
+                                .hint_text("search actions, sessions, workspaces")
+                                .desired_width(f32::INFINITY),
+                        )
+                        .changed();
+                    focus_default(ui.ctx(), input_id);
+
+                    let ranked = palette.rank(&items);
+                    // A query edit reseeds to the top match; arrows then nudge
+                    // the cursor within this frame's results.
+                    palette.reseed(query_changed, ranked.len());
+                    if up {
+                        palette.select_prev();
+                    }
+                    if down {
+                        palette.select_next(ranked.len());
+                    }
+                    if confirm {
+                        chosen = ranked.get(palette.selected()).map(|&i| items[i].action.clone());
+                    }
+                    let selected = palette.selected();
+
+                    ui.add_space(2.0 * s);
+                    egui::ScrollArea::vertical()
+                        .max_height(400.0 * s)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0 * s;
+                            if ranked.is_empty() {
+                                ui.add_space(4.0 * s);
+                                ui.label(RichText::new("  no matches").color(theme.text_dim));
+                                return;
+                            }
+                            for (row, &i) in ranked.iter().enumerate() {
+                                let is_sel = row == selected;
+                                let resp = paint_palette_row(ui, &theme, &items[i], is_sel)
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                if resp.clicked() {
+                                    chosen = Some(items[i].action.clone());
+                                }
+                                // Keep the keyboard-selected row in view as it
+                                // moves past the fold.
+                                if is_sel && (query_changed || up || down) {
+                                    resp.scroll_to_me(Some(egui::Align::Center));
+                                }
+                            }
+                        });
+
+                    ui.add_space(6.0 * s);
+                    ui.label(
+                        RichText::new("↑↓ move · Enter run · Esc close")
+                            .color(theme.text_muted)
+                            .small(),
+                    );
+                })
+        };
+
+        if chosen.is_some() || toggle {
+            self.palette.close();
+        } else if cancel {
+            // Esc narrows before it closes, mirroring the sidebar filters.
+            if self.palette.query().is_empty() {
+                self.palette.close();
+            } else {
+                self.palette.clear_query();
             }
-            // `/` re-focuses the search box instead of typing into it.
-            let slash = ctx.input_mut(|i| {
-                let mut hit = false;
-                i.events.retain(|ev| {
-                    let is_slash = matches!(ev, egui::Event::Text(t) if t == "/");
-                    hit |= is_slash;
-                    !is_slash
-                });
-                hit
-            });
-            if slash {
-                self.shortcuts_focus_search = true;
-            }
+        } else if modal.should_close() {
+            self.palette.close();
         }
 
-        let win = egui::Window::new(RichText::new("Keyboard shortcuts").color(theme.text).strong())
-            .id(egui::Id::new("alacritree_shortcuts_window"))
-            .frame(modal_frame(&theme))
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                // Three columns (key, action name, description) need more
-                // room than the old stacked two-column layout.
-                ui.set_width(600.0 * s);
-                ui.spacing_mut().item_spacing.y = 4.0 * s;
+        if let Some(action) = chosen {
+            self.run_palette_action(ctx, action);
+        }
+    }
 
-                let search = ui.add(
-                    egui::TextEdit::singleline(&mut self.shortcuts_query)
-                        .hint_text("type to search — / refocuses, Esc clears")
-                        .desired_width(f32::INFINITY),
-                );
-                if std::mem::take(&mut self.shortcuts_focus_search) {
-                    search.request_focus();
+    /// Everything the palette can act on this frame: every runnable keyboard
+    /// action, then each open session, then each switchable workspace.  Rebuilt
+    /// each frame — cheap beside ranking, and always current as sessions and
+    /// worktrees come and go.
+    fn palette_items(&self) -> Vec<PaletteItem> {
+        let mut items = command_palette::action_items(&self.config.bindings);
+        for session in &self.sessions {
+            let ws = self.workspace_label(&session.working_directory);
+            items.push(PaletteItem::session(
+                session.id,
+                session.title.clone(),
+                format!("session · {ws}"),
+            ));
+        }
+        for ws in self.workspace_order() {
+            let (primary, secondary) = self.workspace_entry_label(&ws);
+            items.push(PaletteItem::workspace(ws, primary, secondary));
+        }
+        for project in &self.projects {
+            items.push(PaletteItem::create_worktree(
+                project.root.clone(),
+                format!("{}: new worktree", project.display_name()),
+                format!("project · {}", project.root.display()),
+            ));
+        }
+        items
+    }
+
+    /// Human label for a workspace: `project / worktree` for a known worktree,
+    /// "Home" for the home tab, else the path's final component.
+    fn workspace_label(&self, ws: &WorkspaceKey) -> String {
+        let Some(path) = ws else {
+            return "Home".to_string();
+        };
+        for project in &self.projects {
+            for wt in &project.worktrees {
+                if &wt.path == path {
+                    return format!("{} / {}", project.display_name(), wt.name);
                 }
+            }
+        }
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string())
+    }
 
-                let query = self.shortcuts_query.clone();
-                let app_rows: Vec<_> = shortcuts_window::named_rows(&self.config.bindings)
-                    .into_iter()
-                    .filter(|r| shortcuts_window::row_matches(&query, r))
-                    .collect();
-                let nav_rows: Vec<_> = shortcuts_window::sidebar_nav_rows()
-                    .into_iter()
-                    .filter(|r| shortcuts_window::row_matches(&query, r))
-                    .collect();
-                let unbound_rows: Vec<_> = shortcuts_window::unbound_rows(&self.config.bindings)
-                    .into_iter()
-                    .filter(|r| shortcuts_window::row_matches(&query, r))
-                    .collect();
+    /// The (primary, secondary) a workspace palette row shows.
+    fn workspace_entry_label(&self, ws: &WorkspaceKey) -> (String, String) {
+        let secondary = match ws {
+            None => "workspace · home".to_string(),
+            Some(path) => format!("workspace · {}", path.display()),
+        };
+        (self.workspace_label(ws), secondary)
+    }
 
-                // auto_shrink would size the scroll area to the grids'
-                // content, leaving a dead margin between the rows and the
-                // window edge; fill the window's width instead.
-                let scroll =
-                    egui::ScrollArea::vertical().max_height(list_height).auto_shrink([false, true]);
-                scroll.show(ui, |ui| {
-                    if scroll_delta != 0.0 {
-                        ui.scroll_with_delta(egui::vec2(0.0, scroll_delta));
-                    }
-                    if app_rows.is_empty() && nav_rows.is_empty() && unbound_rows.is_empty() {
-                        ui.label(RichText::new("no matches").color(theme.text_dim));
-                        return;
-                    }
-                    if !app_rows.is_empty() {
-                        ui.label(RichText::new("App shortcuts").color(theme.text_muted).small());
-                        egui::Grid::new("shortcuts_app_grid").num_columns(3).striped(true).show(
-                            ui,
-                            |ui| {
-                                for row in &app_rows {
-                                    ui.label(
-                                        RichText::new(&row.keys).color(theme.accent).monospace(),
-                                    );
-                                    ui.label(
-                                        RichText::new(&row.name).color(theme.text_dim).monospace(),
-                                    );
-                                    ui.vertical(|ui| {
-                                        // Stretch the last column to the
-                                        // window edge so the stripes span the
-                                        // whole row, not just the text.
-                                        ui.set_min_width(ui.available_width());
-                                        ui.label(RichText::new(&row.description).color(theme.text));
-                                    });
-                                    ui.end_row();
-                                }
-                            },
-                        );
-                    }
-                    if !nav_rows.is_empty() {
-                        ui.add_space(6.0 * s);
-                        ui.label(
-                            RichText::new("Sidebar navigation (while a panel has focus)")
-                                .color(theme.text_muted)
-                                .small(),
-                        );
-                        egui::Grid::new("shortcuts_nav_grid").num_columns(2).striped(true).show(
-                            ui,
-                            |ui| {
-                                for row in &nav_rows {
-                                    ui.label(
-                                        RichText::new(&row.keys).color(theme.accent).monospace(),
-                                    );
-                                    ui.vertical(|ui| {
-                                        ui.set_min_width(ui.available_width());
-                                        ui.label(RichText::new(&row.description).color(theme.text));
-                                    });
-                                    ui.end_row();
-                                }
-                            },
-                        );
-                    }
-                    if !unbound_rows.is_empty() {
-                        ui.add_space(6.0 * s);
-                        ui.label(
-                            RichText::new("Unbound actions (name them in [[keyboard.bindings]])")
-                                .color(theme.text_muted)
-                                .small(),
-                        );
-                        egui::Grid::new("shortcuts_unbound_grid")
-                            .num_columns(2)
-                            .striped(true)
-                            .show(ui, |ui| {
-                                for row in &unbound_rows {
-                                    ui.label(
-                                        RichText::new(&row.name).color(theme.accent).monospace(),
-                                    );
-                                    ui.vertical(|ui| {
-                                        ui.set_min_width(ui.available_width());
-                                        ui.label(RichText::new(&row.description).color(theme.text));
-                                    });
-                                    ui.end_row();
-                                }
-                            });
-                    }
-                });
-            });
-        // An informational overlay dismisses like a context menu: a click
-        // that lands outside it closes it (the click still reaches whatever
-        // it landed on, since the overlay is not modal).
-        if win.is_some_and(|w| w.response.clicked_elsewhere()) {
-            self.shortcuts_window_open = false;
+    /// Carry out a chosen palette row.  Actions dispatch exactly as their
+    /// binding would; session/workspace rows switch to the target and hand
+    /// focus back to the terminal so the user can type straight away; a project
+    /// row opens the same new-worktree prompt the sidebar's `+` button does.
+    fn run_palette_action(&mut self, ctx: &Context, action: PaletteAction) {
+        match action {
+            PaletteAction::Run(a) => {
+                self.dispatch_action(ctx, BindingAction::Named(a), ActionOrigin::Keyboard);
+            },
+            PaletteAction::ActivateSession(id) => {
+                self.activate_session_by_id(id);
+                self.focus_terminal();
+            },
+            PaletteAction::SwitchWorkspace(ws) => {
+                match ws {
+                    None => self.activate_home(ctx),
+                    Some(path) => self.activate_worktree(ctx, &path),
+                }
+                self.focus_terminal();
+            },
+            PaletteAction::CreateWorktree(root) => {
+                if let Some(project_idx) = self.projects.iter().position(|p| p.root == root) {
+                    self.pending_create =
+                        Some(CreateState::Prompt { project_idx, branch: String::new(), error: None });
+                }
+            },
         }
     }
 
@@ -5944,16 +6049,18 @@ impl eframe::App for AlacritreeApp {
         // not the app — alacritty's key_input returns early the same way,
         // above binding dispatch.
         if !modal_open && self.ime.preedit().is_none() {
-            // While the shortcuts overlay is open, typed text belongs to its
-            // search box — the panel filters must not intercept it.
-            if !self.shortcuts_window_open {
+            // While the command palette is open it owns every key: neither the
+            // sidebar filters nor the app bindings run, so typing into it never
+            // leaks an action.  The palette consumes its own keys (Ctrl+K to
+            // close included) when it paints below.
+            if !self.palette.is_open() {
                 match self.focus {
                     PaneFocus::ProjectsSidebar => self.handle_sidebar_nav(ctx),
                     PaneFocus::GitSidebar => self.handle_git_sidebar_nav(ctx),
                     PaneFocus::Terminal => {},
                 }
+                self.handle_shortcuts(ctx);
             }
-            self.handle_shortcuts(ctx);
         }
         self.process_notification_actions(ctx);
         self.process_ipc_calls(ctx);
@@ -6023,7 +6130,7 @@ impl eframe::App for AlacritreeApp {
                     ui,
                     session,
                     &self.config,
-                    !modal_open && !self.shortcuts_window_open && self.focus == PaneFocus::Terminal,
+                    !modal_open && !self.palette.is_open() && self.focus == PaneFocus::Terminal,
                     &mut self.builtin_glyphs,
                     ime,
                     &mut self.color_glyphs,
@@ -6065,8 +6172,8 @@ impl eframe::App for AlacritreeApp {
         if self.quit_dialog_open {
             self.show_quit_dialog(ctx);
         }
-        if self.shortcuts_window_open && !modal_open {
-            self.show_shortcuts_window(ctx);
+        if self.palette.is_open() && !modal_open {
+            self.show_command_palette(ctx);
         }
 
         self.reap_exited_sessions(ctx);
