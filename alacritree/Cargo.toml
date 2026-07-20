@@ -88,6 +88,14 @@ winreg = "0.55"
 tauri-winrt-notification = "0.7"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# dlopen libfontconfig at runtime instead of linking it at build time. macOS
+# ships no system fontconfig, and the Homebrew bottle on the CI runners is not
+# reliably pkg-config-visible, so the default build-time `pkg_config::find_library`
+# fails. The runtime requirement is unchanged (the linked build already loaded
+# libfontconfig.dylib dynamically); dlopen just defers the lookup to first use.
+# Cargo unions target features, so this enables dlopen only on macOS, leaving the
+# `cfg(unix)` fontconfig dep above to link normally on Linux.
+fontconfig = { version = "0.8", features = ["dlopen"] }
 # Foreground-agent detection: `proc_pidinfo` supplies the process group,
 # foreground group, and command name Linux reads from /proc, and
 # `sysctl(KERN_PROCARGS2)` the command line.
