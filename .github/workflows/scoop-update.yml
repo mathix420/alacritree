@@ -32,7 +32,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${TAG#v}"
-          asset="alacritree-${TAG}-x86_64-windows.zip"
+          asset="alacritree-x86_64-pc-windows-msvc.zip"
           url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${asset}"
 
           # Bail cleanly if the release exists but doesn't have a Windows

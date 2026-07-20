@@ -31,7 +31,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${TAG#v}"
-          asset="alacritree-${TAG}-aarch64-macos.tar.gz"
+          asset="alacritree-aarch64-apple-darwin.tar.gz"
           url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${asset}"
 
           # Bail cleanly if the release exists but doesn't have the macOS

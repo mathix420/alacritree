@@ -15,13 +15,13 @@ class Alacritree < Formula
   depends_on "git"
   depends_on "git-delta"
 
-  # The release workflow only ships aarch64-apple-darwin today; Intel Macs
-  # need to build from source until the release matrix grows an x86_64
-  # target. The `on_macos` / `on_arm` guard makes the formula install fail
-  # loudly on unsupported arches instead of silently downloading nothing.
+  # Releases also carry an x86_64-apple-darwin archive, but the update
+  # workflow only stamps one sha256, so the formula stays arm-only for now.
+  # The `on_macos` / `on_arm` guard makes the formula install fail loudly on
+  # unsupported arches instead of silently downloading nothing.
   on_macos do
     on_arm do
-      url "https://github.com/mathix420/alacritree/releases/download/v#{version}/alacritree-v#{version}-aarch64-macos.tar.gz"
+      url "https://github.com/mathix420/alacritree/releases/download/v#{version}/alacritree-aarch64-apple-darwin.tar.gz"
       sha256 "a17f6732f19c660233a20d9e7febd7ab0e45f9b72885729fc7e931b481d6d6c8"
     end
   end

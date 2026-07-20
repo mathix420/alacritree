@@ -1,0 +1,54 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = false
+# release-please creates the tag and the GitHub Release at release-PR merge
+# time; dist only builds and attaches the assets.
+create-release = false
+# Downstream packaging (AUR/homebrew/scoop re-dispatch, macOS .app bundle)
+# runs after all assets are uploaded.
+post-announce-jobs = ["./publish-downstream", "./release-macos-app"]
+# .tar.gz over dist's default .tar.xz: every downstream consumer (PKGBUILD,
+# formula, scoop) already handles gzip, and AUR makepkg extracts it natively.
+unix-archive = ".tar.gz"
+windows-archive = ".zip"
+
+# Native runners per target: the GUI links fontconfig/GL system libraries, so
+# cross-compiling from a different-arch host doesn't work.
+[dist.github-custom-runners]
+aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
+aarch64-apple-darwin = "macos-14"
+x86_64-apple-darwin = "macos-15-intel"
+
+# eframe (winit + glow), arboard (X11/Wayland clipboard), and the unix
+# fontconfig dep all need C headers that aren't on the runners by default.
+[dist.dependencies.apt]
+cmake = '*'
+pkg-config = '*'
+libfreetype6-dev = '*'
+libfontconfig1-dev = '*'
+libxkbcommon-dev = '*'
+libxcb-shape0-dev = '*'
+libxcb-xfixes0-dev = '*'
+libwayland-dev = '*'
+libgl1-mesa-dev = '*'
+libegl1-mesa-dev = '*'
+
+[dist.dependencies.homebrew]
+cmake = '*'
+pkg-config = '*'
+fontconfig = '*'
+freetype = '*'

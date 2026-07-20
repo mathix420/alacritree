@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use alacritty_terminal::tty::Shell;
 use eframe::CreationContext;
@@ -21,22 +22,25 @@ use crate::panel_filter::{self, PanelFilter};
 use crate::paste;
 use crate::pr_status::{PrCache, PrInfo, PrState};
 use crate::projects::{Project, Worktree, project_json};
-use crate::session::{Session, SessionId, SessionKind, TermSize};
+use crate::session::{
+    AttentionVerdict, Session, SessionId, SessionKind, TermSize, poll_attention_debounce,
+};
 use crate::shortcuts_window;
 use crate::sidebar_nav::{self, SidebarRow};
 use crate::state::{self, PersistedProject};
 use crate::terminal_view;
 use crate::worktree::{self as wt, CreateRequest, Progress};
 use crate::wsl::{self, ShellChoice};
+use crate::wsl_helper::{self, WslProbe};
 
 /// `None` is the home workspace (sessions inherit `$PWD`); `Some` is a worktree path.
 pub type WorkspaceKey = Option<PathBuf>;
 
 /// Channel from notification-worker threads back to the app.  Set once by
-/// `AlacritreeApp::new`; each worker reads it to deliver the workspace the
+/// `AlacritreeApp::new`; each worker reads it to deliver the session the
 /// user clicked on.  Static because the worker has no other handle to the
 /// app and there's only ever one app instance per process.
-static NOTIFY_TX: OnceLock<Mutex<Sender<WorkspaceKey>>> = OnceLock::new();
+static NOTIFY_TX: OnceLock<Mutex<Sender<SessionId>>> = OnceLock::new();
 
 #[derive(Clone, Copy)]
 struct FocusOutlineTheme {
@@ -319,7 +323,7 @@ pub struct AlacritreeApp {
     /// more shells there doesn't re-invoke the doppler CLI.
     doppler_synced: HashSet<PathBuf>,
     pending_session_close: Option<SessionId>,
-    notify_rx: Receiver<WorkspaceKey>,
+    notify_rx: Receiver<SessionId>,
     /// Requests from IPC connection threads, drained once per frame.
     ipc_rx: Option<Receiver<ipc::AppCall>>,
     /// Held for its Drop: unlinks the socket file on shutdown.
@@ -549,6 +553,14 @@ impl AlacritreeApp {
             })
             .collect();
 
+        // Delegate installation and the permission prompt belong to startup:
+        // deferring them to the first toast would drop that toast (macOS
+        // won't deliver while the authorization sheet is pending).
+        #[cfg(target_os = "macos")]
+        if config.ui.notifications {
+            crate::notify_macos::init(cc.egui_ctx.clone());
+        }
+
         let (notify_tx, notify_rx) = mpsc::channel();
         // `set` may fail only if a previous instance already initialized the
         // static (e.g. tests).  In that case the old sender points at a dead
@@ -738,8 +750,8 @@ impl AlacritreeApp {
         if let Some(dir) = &working_directory {
             self.sync_doppler_scopes(dir.clone());
         }
-        let shell = self.resolve_shell(&working_directory);
-        self.spawn_session_with_shell(ctx, working_directory, shell)
+        let (shell, wsl_probe) = self.resolve_shell(&working_directory);
+        self.spawn_session_with_shell(ctx, working_directory, shell, wsl_probe)
     }
 
     fn spawn_session_with_shell(
@@ -747,6 +759,7 @@ impl AlacritreeApp {
         ctx: &Context,
         working_directory: WorkspaceKey,
         shell: Option<Shell>,
+        wsl_probe: Option<WslProbe>,
     ) -> std::io::Result<SessionId> {
         let session = Session::spawn(
             ctx.clone(),
@@ -755,6 +768,7 @@ impl AlacritreeApp {
             TermSize::new(80, 24),
             (8.0, 16.0),
             shell,
+            wsl_probe,
         )?;
         let id = session.id;
         self.sessions.push(session);
@@ -795,9 +809,9 @@ impl AlacritreeApp {
             self.last_error = Some(format!("no shell profile named `{name}`"));
             return;
         };
-        let shell = Some(profile_shell(profile));
+        let (shell, wsl_probe) = profile_session_shell(profile);
         let ws = self.current_workspace.clone();
-        if let Err(e) = self.spawn_session_with_shell(ctx, ws, shell) {
+        if let Err(e) = self.spawn_session_with_shell(ctx, ws, shell, wsl_probe) {
             self.last_error = Some(format!("failed to spawn profile `{name}`: {e}"));
         }
     }
@@ -806,7 +820,7 @@ impl AlacritreeApp {
     /// falls through to alacritty's config-driven shell with its
     /// OS-guaranteed fallback.  The home tab (`None` workspace) has no
     /// project or location, so only the default profile can apply there.
-    fn resolve_shell(&self, workspace: &WorkspaceKey) -> Option<Shell> {
+    fn resolve_shell(&self, workspace: &WorkspaceKey) -> (Option<Shell>, Option<WslProbe>) {
         let path = workspace.as_deref();
         let choice = path.and_then(|p| {
             self.projects
@@ -826,11 +840,17 @@ impl AlacritreeApp {
             &self.config.profiles,
             self.config.default_profile.as_deref(),
         ) {
-            ShellDecision::ConfigShell => None,
+            ShellDecision::ConfigShell => config_session_shell(&self.config),
             // A WSL decision only arises from a workspace path (override or
             // location), never from the home tab.
-            ShellDecision::WslDistro(distro) => path.map(|p| wsl_shell(&distro, p)),
-            ShellDecision::Profile(name) => self.config.profile(&name).map(profile_shell),
+            ShellDecision::WslDistro(distro) => match path {
+                Some(p) => wsl_session_shell(&distro, p),
+                None => (None, None),
+            },
+            ShellDecision::Profile(name) => match self.config.profile(&name) {
+                Some(profile) => profile_session_shell(profile),
+                None => (None, None),
+            },
         }
     }
 
@@ -3189,6 +3209,53 @@ fn wsl_shell(distro: &str, workdir: &Path) -> Shell {
     Shell::new(program, args)
 }
 
+/// Shimmed when the resident helper is on; the plain wsl.exe login-shell
+/// launch (and an unknown probe) otherwise.
+fn wsl_session_shell(distro: &str, workdir: &Path) -> (Option<Shell>, Option<WslProbe>) {
+    if !wsl_helper::enabled() {
+        return (Some(wsl_shell(distro, workdir)), None);
+    }
+    let key = wsl_helper::new_probe_key();
+    let (program, args) = wsl_helper::shim_invocation(distro, workdir, &key);
+    (Some(Shell::new(program, args)), Some(WslProbe { distro: distro.to_string(), key }))
+}
+
+/// The probe shim for any user-supplied wsl.exe argv (profile or
+/// `[terminal.shell]`): `Some` only when the argv is fully understood and
+/// a distro name is known — the probe registry needs one, so a wrapped
+/// default-distro launch resolves it via enumeration.  Anything exotic
+/// runs unmodified and probes as unknown.
+fn shimmed_wsl_argv(program: &str, args: &[String]) -> Option<(Shell, WslProbe)> {
+    if !wsl_helper::enabled() {
+        return None;
+    }
+    let key = wsl_helper::new_probe_key();
+    let (args, distro) = wsl_helper::wrap_profile_argv(program, args, &key)?;
+    let distro =
+        distro.or_else(|| wsl::distros().into_iter().find(|d| d.is_default).map(|d| d.name))?;
+    Some((Shell::new(program.to_string(), args), WslProbe { distro, key }))
+}
+
+fn profile_session_shell(profile: &crate::config::Profile) -> (Option<Shell>, Option<WslProbe>) {
+    match shimmed_wsl_argv(&profile.program, &profile.args) {
+        Some((shell, probe)) => (Some(shell), Some(probe)),
+        None => (Some(profile_shell(profile)), None),
+    }
+}
+
+/// `[terminal.shell] program = "wsl.exe"` gets the same shim as a wsl.exe
+/// profile; any other config shell (or none) spawns unchanged through
+/// `Session::spawn`'s own config-shell default.
+fn config_session_shell(config: &crate::config::Config) -> (Option<Shell>, Option<WslProbe>) {
+    match &config.shell {
+        Some(s) => match shimmed_wsl_argv(&s.program, &s.args) {
+            Some((shell, probe)) => (Some(shell), Some(probe)),
+            None => (None, None),
+        },
+        None => (None, None),
+    }
+}
+
 /// What shell a new session should run, decided from plain data so the
 /// precedence chain stays testable off the GUI.
 #[derive(Debug, PartialEq, Eq)]
@@ -4219,19 +4286,12 @@ impl AlacritreeApp {
         }
     }
 
-    /// Handle workspace-switch requests from clicked notifications.  Only
-    /// the most recent click is honored — if multiple toasts piled up, the
-    /// user most likely meant the latest one.
+    /// Handle session-switch requests from clicked notifications.  A stale
+    /// id (session closed before the click) makes the activate a no-op, but
+    /// the window still comes forward — the user asked for the app.
     fn process_notification_actions(&mut self, ctx: &Context) {
-        let mut latest: Option<WorkspaceKey> = None;
-        while let Ok(ws) = self.notify_rx.try_recv() {
-            latest = Some(ws);
-        }
-        let Some(ws) = latest else { return };
-        match ws {
-            None => self.activate_home(ctx),
-            Some(p) => self.activate_worktree(ctx, &p),
-        }
+        let Some(id) = latest_notification_click(&self.notify_rx) else { return };
+        self.activate_session_by_id(id);
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
@@ -4243,6 +4303,7 @@ impl AlacritreeApp {
         // treat unknown as "focused" so we don't pile up stale attention dots.
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
 
+        let grace = self.config.ui.attention_grace;
         for idx in 0..self.sessions.len() {
             let outcome = self.sessions[idx].drain_events(&self.config.palette);
             // Ahead of the attention early-out: a background session copying
@@ -4250,20 +4311,34 @@ impl AlacritreeApp {
             for (target, text) in &outcome.clipboard {
                 clipboard::write(*target, text);
             }
-            if !outcome.attention {
-                continue;
-            }
             let is_visible_to_user = Some(idx) == visible_idx && focused;
             if is_visible_to_user {
+                // Nothing pending survives the user already looking at it.
+                self.sessions[idx].pending_attention = None;
                 continue;
             }
-            // Only toast on the *transition* into needs_attention — otherwise
-            // BEL + title-transition firing in the same idle cycle would
-            // produce two toasts for the same "Claude is done" event.
-            let was_attending = self.sessions[idx].needs_attention;
-            self.sessions[idx].needs_attention = true;
-            if !was_attending && self.config.ui.notifications {
-                notify_attention(&self.sessions[idx], ctx);
+            if outcome.attention && self.sessions[idx].pending_attention.is_none() {
+                self.sessions[idx].pending_attention = Some(Instant::now());
+            }
+            let Some(since) = self.sessions[idx].pending_attention else {
+                continue;
+            };
+            match poll_attention_debounce(since, Instant::now(), &self.sessions[idx].title, grace) {
+                AttentionVerdict::Cancel => self.sessions[idx].pending_attention = None,
+                // A quiet PTY repaints nothing on its own, so the wake-up
+                // that decides the ping has to be scheduled here.
+                AttentionVerdict::Wait(remaining) => ctx.request_repaint_after(remaining),
+                AttentionVerdict::Fire => {
+                    self.sessions[idx].pending_attention = None;
+                    // Only toast on the *transition* into needs_attention — otherwise
+                    // BEL + title-transition firing in the same idle cycle would
+                    // produce two toasts for the same "Claude is done" event.
+                    let was_attending = self.sessions[idx].needs_attention;
+                    self.sessions[idx].needs_attention = true;
+                    if !was_attending && self.config.ui.notifications {
+                        notify_attention(&self.sessions[idx], ctx);
+                    }
+                },
             }
         }
 
@@ -5510,10 +5585,20 @@ impl eframe::App for AlacritreeApp {
     }
 }
 
-/// Spawn a throwaway thread so `notify-rust`'s synchronous D-Bus / WinRT
-/// calls don't stall the egui paint loop.  On Linux the thread sticks around
-/// for `wait_for_action` and posts the session's workspace back through
-/// `NOTIFY_TX` when the user clicks the notification.
+/// Drain every queued notification click, keeping only the newest.  Clicks
+/// can pile up while the window is unfocused; the user most likely meant
+/// the latest one.
+fn latest_notification_click(rx: &Receiver<SessionId>) -> Option<SessionId> {
+    let mut latest = None;
+    while let Ok(id) = rx.try_recv() {
+        latest = Some(id);
+    }
+    latest
+}
+
+/// Spawn a throwaway thread so the platform notifier's synchronous calls
+/// don't stall the egui paint loop.  The thread posts the session's id back
+/// through `NOTIFY_TX` when the user clicks the notification.
 fn notify_attention(session: &Session, ctx: &egui::Context) {
     let where_label = session
         .working_directory
@@ -5526,16 +5611,26 @@ fn notify_attention(session: &Session, ctx: &egui::Context) {
     } else {
         format!("{where_label} is waiting for input")
     };
-    let key = session.working_directory.clone();
+    let id = session.id;
     let ctx = ctx.clone();
     std::thread::Builder::new()
         .name("alacritree-notify".into())
-        .spawn(move || notify_worker(body, key, ctx))
+        .spawn(move || notify_worker(body, id, ctx))
         .ok();
 }
 
+/// Deliver a clicked notification's session id to the UI thread.
+pub(crate) fn notify_click(id: SessionId, ctx: &egui::Context) {
+    if let Some(lock) = NOTIFY_TX.get() {
+        if let Ok(tx) = lock.lock() {
+            let _ = tx.send(id);
+            ctx.request_repaint();
+        }
+    }
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
-fn notify_worker(body: String, key: WorkspaceKey, ctx: egui::Context) {
+fn notify_worker(body: String, id: SessionId, ctx: egui::Context) {
     // `default` is the action id freedesktop notifiers fire on body-click.
     let result = notify_rust::Notification::new()
         .summary("alacritree")
@@ -5553,22 +5648,34 @@ fn notify_worker(body: String, key: WorkspaceKey, ctx: egui::Context) {
         if action == "__closed" {
             return;
         }
-        if let Some(lock) = NOTIFY_TX.get() {
-            if let Ok(tx) = lock.lock() {
-                let _ = tx.send(key.clone());
-                ctx.request_repaint();
-            }
-        }
+        notify_click(id, &ctx);
     });
 }
 
-#[cfg(not(all(unix, not(target_os = "macos"))))]
-fn notify_worker(body: String, _key: WorkspaceKey, _ctx: egui::Context) {
-    // mac-notification-sys / WinRT don't expose blocking action waits via
-    // notify-rust today — fall back to a fire-and-forget toast.
-    if let Err(e) = notify_rust::Notification::new().summary("alacritree").body(&body).show() {
+#[cfg(windows)]
+fn notify_worker(body: String, id: SessionId, ctx: egui::Context) {
+    use tauri_winrt_notification::Toast;
+    // notify-rust doesn't surface WinRT activation, so drive its own backend
+    // crate directly.  `show` returns immediately; the WinRT runtime holds
+    // the activation handler, so this worker thread can exit right away.
+    let result = Toast::new(Toast::POWERSHELL_APP_ID)
+        .title("alacritree")
+        .text1(&body)
+        .on_activated(move |_action| {
+            notify_click(id, &ctx);
+            Ok(())
+        })
+        .show();
+    if let Err(e) = result {
         log::debug!("desktop notification failed: {e}");
     }
+}
+
+#[cfg(target_os = "macos")]
+fn notify_worker(body: String, id: SessionId, _ctx: egui::Context) {
+    // Clicks come back through the UNUserNotificationCenter delegate that
+    // `notify_macos::init` installed, not through this worker.
+    crate::notify_macos::notify(&body, id);
 }
 
 #[cfg(test)]
@@ -5588,6 +5695,18 @@ mod tests {
             v.insert(to, it);
         }
         v
+    }
+
+    #[test]
+    fn a_pile_of_notification_clicks_resolves_to_the_newest() {
+        let (tx, rx) = mpsc::channel();
+        assert_eq!(latest_notification_click(&rx), None);
+        tx.send(3).unwrap();
+        tx.send(7).unwrap();
+        tx.send(5).unwrap();
+        assert_eq!(latest_notification_click(&rx), Some(5));
+        // The drain consumed everything, not just the returned click.
+        assert_eq!(latest_notification_click(&rx), None);
     }
 
     #[test]

@@ -10,6 +10,11 @@ repository = "https://github.com/alacritty/alacritty"
 edition.workspace = true
 rust-version.workspace = true
 
+# This fork ships the alacritree binary, not the upstream GUI; without the
+# opt-out dist trips over this crate's upstream `repository` URL.
+[package.metadata.dist]
+dist = false
+
 [dependencies.alacritty_terminal]
 path = "../alacritty_terminal"
 version = "0.26.1-dev"

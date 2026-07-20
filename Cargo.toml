@@ -17,6 +17,11 @@ lto = "thin"
 debug = 1
 incremental = false
 
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
 [workspace.dependencies]
 toml = "0.9.11"
 toml_edit = "0.24.0"

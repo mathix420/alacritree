@@ -1,0 +1,27 @@
+name: release-please
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # Maintains a release PR (version bump in alacritree/Cargo.toml + root
+  # Cargo.lock, changelog) and, on merge, creates the tag + GitHub Release.
+  # Binaries are built and uploaded to that release by the existing `release`
+  # workflow, triggered by the tag push. The tag is pushed with the bot PAT
+  # (not GITHUB_TOKEN) so the tag-push event actually fires that workflow —
+  # events emitted by GITHUB_TOKEN deliberately don't trigger other workflows.
+  release-please:
+    name: release-please
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          token: ${{ secrets.ALACRITREE_BOT_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

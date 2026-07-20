@@ -17,6 +17,7 @@ use alacritty_terminal::vte::ansi::Rgb;
 use crate::clipboard::Target;
 use crate::colors;
 use crate::config::{Config, Palette};
+use crate::wsl_helper::{self, WslProbe};
 
 #[derive(Clone)]
 pub struct EventProxy {
@@ -90,6 +91,9 @@ pub struct Session {
     pub events: mpsc::Receiver<TermEvent>,
     /// Latched attention flag, cleared when the user views this session.
     pub needs_attention: bool,
+    /// When a not-yet-surfaced attention trigger arrived.  `None` once it
+    /// fires, cancels, or the user views the session.
+    pub pending_attention: Option<Instant>,
     /// Sub-cell wheel residue (logical points), retained across frames so that
     /// trackpad pixel-deltas accumulate into whole-line scrolls instead of
     /// being dropped when each frame's delta is smaller than a cell.
@@ -105,6 +109,10 @@ pub struct Session {
     /// timer instead of polling the process table every frame.  `Cell` is
     /// enough since `Session` isn't `Sync` and the values are `Copy`.
     agent_cache: Cell<AgentCache>,
+    /// Set for shimmed WSL sessions: the distro plus the probe key its
+    /// shim published, unregistered again on drop.  The Windows process
+    /// table ends at wsl.exe, so this is the only live view inside.
+    wsl_probe: Option<WslProbe>,
     notifier: Notifier,
     sender: EventLoopSender,
     exited: bool,
@@ -124,10 +132,11 @@ struct AgentCache {
 
 const AGENT_CACHE_TTL: Duration = Duration::from_millis(1000);
 
-/// Map a foreground process name (`/proc/<pid>/comm` on Linux, image name
-/// on Windows) to its static sidebar glyph.  Compared with `starts_with`:
-/// Linux `comm` is kernel-truncated to 15 bytes (`cursor-agent` would
-/// otherwise miss) and Windows names carry an `.exe` suffix.
+/// Map a foreground process name (`/proc/<pid>/comm` on Linux, `p_comm` on
+/// macOS, image name on Windows) to its static sidebar glyph.  Compared with
+/// `starts_with`: `comm` is kernel-truncated — 15 bytes on Linux, 16 on
+/// macOS (`cursor-agent` would otherwise miss) — and Windows names carry an
+/// `.exe` suffix.
 const AGENT_PROCESS_GLYPHS: &[(&str, char)] = &[
     ("claude", '✳'),
     ("codex", '◇'),
@@ -188,20 +197,36 @@ fn agent_glyph_by_name(names: impl IntoIterator<Item = impl AsRef<str>>) -> Opti
 /// direction.  Matches Linux `comm` values (`tmux: client`) and Windows
 /// image names (`nvim.exe`) alike; gvim stays out — it owns its own
 /// window and never runs inside the terminal.
-#[cfg(any(test, target_os = "linux", windows))]
+#[cfg(any(test, target_os = "linux", target_os = "macos", windows))]
 fn is_nav_tui_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n.starts_with("nvim") || n.starts_with("vim") || n.starts_with("tmux")
 }
 
-/// `wsl.exe` (and its `wslhost`/`wslrelay` helpers) mark a session whose
-/// real process tree lives on the Linux side, where this probe cannot see.
-/// Assume the inside cooperates like a nav TUI: the key is forwarded, and
-/// programs in the distro hand focus back by exec'ing the Windows CLI
-/// (`alacritree.exe action Focus…`) through WSL interop.
-#[cfg(any(test, windows))]
-fn is_wsl_boundary_name(name: &str) -> bool {
-    name.to_ascii_lowercase().starts_with("wsl")
+/// FocusLeft/FocusRight passthrough decision for a shimmed WSL session: the
+/// helper's cached foreground `comm`, matched like the native Linux probe.
+/// Unknown means no TUI — the keys move panel focus.  Gated the same as
+/// `is_nav_tui_name` (plus its `not(...)` fallback below) since `Session`
+/// always carries a `wsl_probe` field, so `process_probe`'s match on it must
+/// compile everywhere, even though a shimmed session only exists on Windows.
+#[cfg(any(test, target_os = "linux", windows))]
+fn wsl_nav_tui(comm: Option<&str>) -> bool {
+    comm.is_some_and(is_nav_tui_name)
+}
+
+#[cfg(not(any(test, target_os = "linux", windows)))]
+fn wsl_nav_tui(_comm: Option<&str>) -> bool {
+    // Same gap as the glyph probe: macOS isn't wired up yet.
+    false
+}
+
+/// `(foreground_job, nav_tui)` for a shimmed WSL session, from the helper's
+/// cached foreground `comm`.  Any comm at all means a job owns the tty — the
+/// helper reports nothing for an idle shell.  The Windows descendant probe
+/// can't stand in here: wsl.exe keeps plumbing children alive for the life
+/// of the session, so it reads every idle WSL shell as busy.
+fn wsl_probe_signals(comm: Option<&str>) -> (bool, bool) {
+    (comm.is_some(), wsl_nav_tui(comm))
 }
 
 /// Match full command lines against the agent map — picks up
@@ -262,6 +287,39 @@ fn is_spinner_title(title: &str) -> bool {
     })
 }
 
+/// Outcome of polling a pending attention trigger.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AttentionVerdict {
+    /// Latch the flag and notify now.
+    Fire,
+    /// Still inside the grace window; poll again after the returned delay.
+    Wait(Duration),
+    /// The session went back to work — drop the trigger without notifying.
+    Cancel,
+}
+
+/// Debounce for attention triggers.  Agent CLIs driven by an orchestrator
+/// (e.g. Claude Code running a multi-task workflow) ring BEL and drop their
+/// spinner title at every task boundary, then resume on their own — an
+/// immediate ping per boundary is noise.  A trigger only fires if the title
+/// stays out of its spinner state for the whole grace window.  Zero grace
+/// disables the debounce and fires on the trigger frame, spinner or not.
+pub fn poll_attention_debounce(
+    since: Instant,
+    now: Instant,
+    title: &str,
+    grace: Duration,
+) -> AttentionVerdict {
+    if grace.is_zero() {
+        return AttentionVerdict::Fire;
+    }
+    if is_spinner_title(title) {
+        return AttentionVerdict::Cancel;
+    }
+    let elapsed = now.saturating_duration_since(since);
+    if elapsed >= grace { AttentionVerdict::Fire } else { AttentionVerdict::Wait(grace - elapsed) }
+}
+
 /// A session "looks busy" when its foreground process is a recognized
 /// agent or its title is in a spinner state — the signal the sidebar's
 /// close-confirmation policy keys on.
@@ -302,25 +360,18 @@ fn pty_shell_pid(_pty: &alacritty_terminal::tty::Pty) -> Option<u32> {
     None
 }
 
-#[cfg(target_os = "linux")]
-fn foreground_process_glyph(shell_pid: u32) -> Option<char> {
-    let tpgid = read_tpgid(shell_pid)?;
-    if tpgid <= 0 {
-        return None;
-    }
-    let comm = std::fs::read_to_string(format!("/proc/{tpgid}/comm")).ok();
-    let cmdline = read_cmdline(tpgid as u32);
-    let comm_trim = comm.as_deref().map(str::trim).unwrap_or("");
-
-    // Match `comm` first (cheap), then anywhere in `cmdline` — picks up
-    // `node /path/to/agent-cli.js`-style wrappers that hide behind their
-    // runtime's name.
+/// Match a foreground process against the agent map: `comm` first (cheap),
+/// then anywhere in `cmdline` — picks up `node /path/to/agent-cli.js`-style
+/// wrappers that hide behind their runtime's name.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn agent_glyph_for(comm: Option<&str>, cmdline: Option<&str>) -> Option<char> {
+    let comm_trim = comm.map(str::trim).unwrap_or("");
     let by_comm =
         AGENT_PROCESS_GLYPHS.iter().find(|(name, _)| comm_trim.starts_with(name)).map(|(_, g)| *g);
     if by_comm.is_some() {
         return by_comm;
     }
-    if let Some(cmd) = &cmdline {
+    if let Some(cmd) = cmdline {
         let glyph =
             AGENT_PROCESS_GLYPHS.iter().find(|(name, _)| cmd.contains(name)).map(|(_, g)| *g);
         if glyph.is_some() {
@@ -329,6 +380,17 @@ fn foreground_process_glyph(shell_pid: u32) -> Option<char> {
         log::debug!("foreground process not matched: comm={comm_trim:?} cmdline={cmd:?}");
     }
     None
+}
+
+#[cfg(target_os = "linux")]
+fn foreground_process_glyph(shell_pid: u32) -> Option<char> {
+    let tpgid = read_tpgid(shell_pid)?;
+    if tpgid <= 0 {
+        return None;
+    }
+    let comm = std::fs::read_to_string(format!("/proc/{tpgid}/comm")).ok();
+    let cmdline = read_cmdline(tpgid as u32);
+    agent_glyph_for(comm.as_deref(), cmdline.as_deref())
 }
 
 #[cfg(target_os = "linux")]
@@ -374,6 +436,136 @@ fn shell_has_foreground_job(shell_pid: u32) -> bool {
     stat_pgrp_tpgid(&stat).is_some_and(|(pgrp, tpgid)| tpgid > 0 && tpgid != pgrp)
 }
 
+/// The macOS analogue of the `/proc` reads: `proc_pidinfo(PROC_PIDTBSDINFO)`
+/// returns a `proc_bsdinfo` carrying the process group (`pbi_pgid`), the
+/// terminal's foreground group (`e_tpgid`), and the command name
+/// (`pbi_comm`) — the same fields Linux takes from `/proc/<pid>/stat` and
+/// `comm`.
+#[cfg(target_os = "macos")]
+fn bsdinfo_for_pid(pid: u32) -> Option<libc::proc_bsdinfo> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    // A vanished or inaccessible pid reports fewer bytes than the struct.
+    (written == size).then_some(info)
+}
+
+#[cfg(target_os = "macos")]
+fn pgid_tpgid(pid: u32) -> Option<(u32, u32)> {
+    let info = bsdinfo_for_pid(pid)?;
+    Some((info.pbi_pgid, info.e_tpgid))
+}
+
+/// A process without a controlling terminal reports `e_tpgid` as 0 or as
+/// `-1` wrapped into the unsigned field; neither names a foreground group.
+#[cfg(target_os = "macos")]
+fn foreground_group(tpgid: u32) -> Option<u32> {
+    (tpgid != 0 && tpgid != u32::MAX).then_some(tpgid)
+}
+
+/// `pbi_comm` is kernel-truncated to 16 bytes, like the 15-byte Linux `comm`
+/// — which is why the agent map matches with `starts_with`.
+#[cfg(target_os = "macos")]
+fn comm_for_pid(pid: u32) -> Option<String> {
+    let info = bsdinfo_for_pid(pid)?;
+    let bytes: Vec<u8> = info.pbi_comm.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+    (!bytes.is_empty()).then(|| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// `KERN_PROCARGS2` is readable for same-user processes, which the shell's
+/// foreground job always is.
+#[cfg(target_os = "macos")]
+fn read_cmdline(pid: u32) -> Option<String> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut size = 0usize;
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; size];
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    buf.truncate(size);
+    procargs2_cmdline(&buf)
+}
+
+/// `KERN_PROCARGS2` layout: native-endian `argc`, the executable path, NUL
+/// padding, then argv and environment strings, all NUL-terminated.  Taking
+/// exactly `argc` strings keeps the environment out; spaces join the args
+/// the same way the Linux `/proc/<pid>/cmdline` read renders them.
+#[cfg(target_os = "macos")]
+fn procargs2_cmdline(buf: &[u8]) -> Option<String> {
+    let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?);
+    let argc = usize::try_from(argc).ok().filter(|&n| n > 0)?;
+    let after_exec = buf[4..].iter().position(|&b| b == 0).map(|nul| &buf[4 + nul..])?;
+    let args_start = after_exec.iter().position(|&b| b != 0)?;
+    let joined = after_exec[args_start..]
+        .split(|&b| b == 0)
+        .take(argc)
+        .map(String::from_utf8_lossy)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let joined = joined.trim().to_string();
+    (!joined.is_empty()).then_some(joined)
+}
+
+#[cfg(target_os = "macos")]
+fn foreground_process_glyph(shell_pid: u32) -> Option<char> {
+    let (_, tpgid) = pgid_tpgid(shell_pid)?;
+    let tpgid = foreground_group(tpgid)?;
+    let comm = comm_for_pid(tpgid);
+    let cmdline = read_cmdline(tpgid);
+    agent_glyph_for(comm.as_deref(), cmdline.as_deref())
+}
+
+/// Same rule as Linux: the shell is its own foreground group when idle, so
+/// the terminal's foreground group differing from the shell's own group
+/// means a job owns the terminal right now.
+#[cfg(target_os = "macos")]
+fn shell_has_foreground_job(shell_pid: u32) -> bool {
+    pgid_tpgid(shell_pid)
+        .is_some_and(|(pgid, tpgid)| foreground_group(tpgid).is_some_and(|t| t != pgid))
+}
+
+#[cfg(target_os = "macos")]
+fn foreground_nav_tui(shell_pid: u32) -> bool {
+    let Some((_, tpgid)) = pgid_tpgid(shell_pid) else {
+        return false;
+    };
+    let Some(tpgid) = foreground_group(tpgid) else {
+        return false;
+    };
+    comm_for_pid(tpgid).is_some_and(|comm| is_nav_tui_name(comm.trim()))
+}
+
 /// Windows has no foreground process group, so "a job is running" is
 /// approximated as the shell having any descendant process — the same
 /// approximation the agent glyph uses.
@@ -382,9 +574,9 @@ fn shell_has_foreground_job(shell_pid: u32) -> bool {
     windows_process_probe::probe(shell_pid).1
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn shell_has_foreground_job(_shell_pid: u32) -> bool {
-    // No probe wired (macOS would need `tcgetpgrp` on the PTY master).
+    // No probe wired for this platform (BSDs would mirror the macOS sysctl).
     false
 }
 
@@ -398,10 +590,9 @@ fn foreground_process_glyph(shell_pid: u32) -> Option<char> {
     windows_process_probe::probe(shell_pid).0
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn foreground_process_glyph(_shell_pid: u32) -> Option<char> {
-    // macOS would use `libproc::proc_pidfdinfo` / `tcgetpgrp` on the master
-    // FD.  Not wired up yet.
+    // No probe wired for this platform (BSDs would mirror the macOS sysctl).
     None
 }
 
@@ -427,9 +618,9 @@ fn foreground_nav_tui(shell_pid: u32) -> bool {
     windows_process_probe::probe(shell_pid).2
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn foreground_nav_tui(_shell_pid: u32) -> bool {
-    // Same gap as the glyph probe: macOS isn't wired up yet.
+    // Same gap as the glyph probe: no probe wired for this platform.
     false
 }
 
@@ -461,6 +652,27 @@ fn ensure_working_directory(dir: Option<&Path>) -> std::io::Result<()> {
     }
 }
 
+/// The directory the PTY starts in: an explicit workspace dir always wins,
+/// then `[general] working_directory` fills in for sessions without one (the
+/// home tab).  A configured dir that does not exist is dropped with a warning
+/// rather than failing the spawn — a stale config value must not stop the
+/// home tab from opening (alacritty ignores an invalid `--working-directory`
+/// the same way).
+fn pty_working_directory(explicit: Option<PathBuf>, config: &Config) -> Option<PathBuf> {
+    explicit.or_else(|| {
+        config.working_directory.clone().filter(|dir| {
+            let ok = dir.is_dir();
+            if !ok {
+                log::warn!(
+                    "general.working_directory {} is not a directory; ignoring",
+                    dir.display()
+                );
+            }
+            ok
+        })
+    })
+}
+
 #[cfg(windows)]
 mod windows_process_probe {
     //! Shared, throttled process-table snapshot.  Every session probes at
@@ -474,10 +686,7 @@ mod windows_process_probe {
 
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
-    use super::{
-        agent_glyph_by_cmdline, agent_glyph_by_name, is_nav_tui_name, is_wsl_boundary_name,
-        process_tree_pids,
-    };
+    use super::{agent_glyph_by_cmdline, agent_glyph_by_name, is_nav_tui_name, process_tree_pids};
 
     /// Slightly under `AGENT_CACHE_TTL` so the first session to tick
     /// refreshes and the rest reuse the same table.
@@ -514,7 +723,7 @@ mod windows_process_probe {
             .filter_map(|pid| sys.process(*pid))
             .map(|p| p.name().to_string_lossy().into_owned())
             .collect();
-        let nav_tui = names.iter().any(|n| is_nav_tui_name(n) || is_wsl_boundary_name(n));
+        let nav_tui = names.iter().any(|n| is_nav_tui_name(n));
         if let Some(glyph) = agent_glyph_by_name(&names) {
             return (Some(glyph), has_children, nav_tui);
         }
@@ -542,6 +751,7 @@ impl Session {
         size: TermSize,
         cell_size: (f32, f32),
         shell_override: Option<Shell>,
+        wsl_probe: Option<WslProbe>,
     ) -> std::io::Result<Self> {
         // Overrides are argv built in code (`wsl.exe -d <distro> --cd <dir>`),
         // so their args need Windows quoting like diff-pane argv; config
@@ -564,6 +774,7 @@ impl Session {
             title,
             SessionKind::Shell,
             escape_args,
+            wsl_probe,
         )
     }
 
@@ -591,6 +802,7 @@ impl Session {
             title,
             kind,
             true,
+            None,
         )
     }
 
@@ -604,8 +816,10 @@ impl Session {
         title: String,
         kind: SessionKind,
         escape_args: bool,
+        wsl_probe: Option<WslProbe>,
     ) -> std::io::Result<Self> {
-        ensure_working_directory(working_directory.as_deref())?;
+        let pty_cwd = pty_working_directory(working_directory.clone(), config);
+        ensure_working_directory(pty_cwd.as_deref())?;
         let window_size = window_size(size, cell_size);
 
         let (proxy, events) = EventProxy::new(ctx);
@@ -630,15 +844,16 @@ impl Session {
         let _ = escape_args;
         let pty_options = PtyOptions {
             shell,
-            working_directory: working_directory.clone(),
+            working_directory: pty_cwd,
             drain_on_exit: false,
             env,
             // Windows has no argv: alacritty_terminal joins these args into a
             // single CreateProcess command line, quoting them only when this
-            // is set.  True for argv built in code (diff panes, WSL shells),
-            // where an arg with a space (delta's pager spec, UNC paths) must
-            // survive as one argument; shell args from alacritty.toml stay
-            // raw to match upstream alacritty.
+            // is set.  True for argv built in code (diff panes, WSL shells,
+            // and a config shell shimmed by the resident helper), where an
+            // arg with a space (delta's pager spec, UNC paths) must survive
+            // as one argument; a config shell that isn't shimmed stays raw,
+            // matching upstream alacritty.
             #[cfg(windows)]
             escape_args,
         };
@@ -652,6 +867,9 @@ impl Session {
         let sender = event_loop.channel();
         event_loop.spawn();
 
+        if let Some(probe) = &wsl_probe {
+            wsl_helper::register_probe(&probe.distro, &probe.key);
+        }
         Ok(Self {
             id: next_session_id(),
             title,
@@ -662,10 +880,12 @@ impl Session {
             term,
             events,
             needs_attention: false,
+            pending_attention: None,
             accumulated_scroll: (0.0, 0.0),
             last_report_cell: None,
             shell_pid,
             agent_cache: Cell::new(AgentCache::default()),
+            wsl_probe,
             notifier: Notifier(sender.clone()),
             sender,
             exited: false,
@@ -737,7 +957,8 @@ impl Session {
     }
 
     /// Sidebar glyph for the agent running here.  Identity comes from the
-    /// PTY's foreground process (`/proc` on Linux); the displayed glyph
+    /// PTY's foreground process (`/proc` on Linux, `sysctl` on macOS); the
+    /// displayed glyph
     /// prefers the title's current leading char so the agent's own spinner
     /// frames animate for free, falling back to a per-agent static glyph
     /// when the title is plain ASCII.  When proc identification yields
@@ -753,8 +974,9 @@ impl Session {
     }
 
     /// A session "looks busy" when a process is running in the terminal
-    /// (a foreground job on Linux, any descendant of the shell on Windows),
-    /// its foreground process is a recognized agent, or its title is in a
+    /// (a foreground job on Linux/macOS, any descendant of the shell on
+    /// Windows, the helper's foreground probe for shimmed WSL sessions), its
+    /// foreground process is a recognized agent, or its title is in a
     /// spinner state — the signal the close-confirmation policy keys on.
     pub fn is_busy(&self) -> bool {
         self.process_probe().1 || looks_busy(self.agent_glyph(), &self.title)
@@ -782,8 +1004,15 @@ impl Session {
             return (cached.process_glyph, cached.foreground_job, cached.nav_tui);
         }
         let glyph = self.shell_pid.and_then(foreground_process_glyph);
-        let foreground_job = self.shell_pid.is_some_and(shell_has_foreground_job);
-        let nav_tui = self.shell_pid.is_some_and(foreground_nav_tui);
+        let (foreground_job, nav_tui) = match &self.wsl_probe {
+            Some(probe) => {
+                wsl_probe_signals(wsl_helper::foreground_comm(&probe.distro, &probe.key).as_deref())
+            },
+            None => (
+                self.shell_pid.is_some_and(shell_has_foreground_job),
+                self.shell_pid.is_some_and(foreground_nav_tui),
+            ),
+        };
         self.agent_cache.set(AgentCache {
             polled_at: Some(Instant::now()),
             process_glyph: glyph,
@@ -847,6 +1076,9 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if let Some(probe) = &self.wsl_probe {
+            wsl_helper::unregister_probe(&probe.distro, &probe.key);
+        }
         self.shutdown();
     }
 }
@@ -918,6 +1150,96 @@ mod tests {
 
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn procargs2_cmdline_joins_argv_and_skips_exec_path() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3i32.to_ne_bytes());
+        buf.extend_from_slice(b"/usr/local/bin/node\0\0\0\0");
+        // argv, then the environment block `take(argc)` must never reach.
+        buf.extend_from_slice(b"node\0/path/claude-code/cli.js\0--continue\0HOME=/Users/x\0");
+        assert_eq!(
+            procargs2_cmdline(&buf).as_deref(),
+            Some("node /path/claude-code/cli.js --continue")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn procargs2_cmdline_rejects_truncated_or_empty_buffers() {
+        assert_eq!(procargs2_cmdline(b""), None);
+        assert_eq!(procargs2_cmdline(&0i32.to_ne_bytes()), None);
+        assert_eq!(procargs2_cmdline(&3i32.to_ne_bytes()), None);
+    }
+
+    /// Drives the real sysctl against a real child: its `p_comm` is the
+    /// spawned binary's name and a plain spawn inherits our process group.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sysctl_probe_reads_a_real_childs_comm_and_group() {
+        let mut child = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let comm = comm_for_pid(child.id());
+        let groups = pgid_tpgid(child.id());
+        child.kill().ok();
+        child.wait().ok();
+        assert_eq!(comm.as_deref(), Some("sleep"));
+        let own_pgid = unsafe { libc::getpgrp() };
+        assert_eq!(groups.map(|(pgid, _)| pgid), Some(own_pgid as u32));
+    }
+
+    /// Drives the real foreground-group probe against a real PTY shell: an
+    /// idle shell owns its terminal, a running job flips the probe, and the
+    /// job's comm names it as the foreground process.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_real_shells_foreground_job_flips_the_probe() {
+        let mut config = Config::default();
+        config.env.insert("TERM".to_string(), "xterm-256color".to_string());
+
+        let session = Session::spawn_command(
+            egui::Context::default(),
+            &config,
+            std::env::current_dir().ok(),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            "/bin/zsh".to_string(),
+            // `-f` skips the user's rc files, whose plugins run transient
+            // foreground jobs of their own that would race the probe.
+            vec!["-f".to_string(), "-i".to_string()],
+            "probe".to_string(),
+            SessionKind::Shell,
+        )
+        .unwrap();
+        let shell_pid = session.shell_pid.expect("unix PTYs always report the child pid");
+
+        // The shell owning its terminal (tpgid == pgid) is exactly the state
+        // the probe reads as "not busy".
+        let start = Instant::now();
+        while pgid_tpgid(shell_pid).is_none_or(|(pgid, tpgid)| tpgid != pgid) {
+            assert!(start.elapsed() < Duration::from_secs(10), "shell never took the terminal");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Absolute path: a `sleep` from PATH may be a differently-named
+        // multi-call binary (uutils coreutils).
+        session.write(b"/bin/sleep 30\n".to_vec());
+        let start = Instant::now();
+        loop {
+            let foreground_comm = pgid_tpgid(shell_pid)
+                .and_then(|(_, tpgid)| foreground_group(tpgid))
+                .and_then(comm_for_pid);
+            if shell_has_foreground_job(shell_pid) && foreground_comm.as_deref() == Some("sleep") {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the running job never flipped the foreground probe (last foreground comm: \
+                 {foreground_comm:?})"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// OSC 52 is how Claude Code, tmux and vim copy.  The sequence is
     /// fire-and-forget — the app reports a successful copy either way — so a
     /// dropped `ClipboardStore` shows up only as a stale paste later.  Drives
@@ -938,6 +1260,47 @@ mod tests {
         apply_term_event(event, &mut title, &mut exited, &mut outcome);
 
         assert_eq!(outcome.clipboard, vec![(Target::Clipboard, "hello".to_owned())]);
+    }
+
+    /// Zero grace is the config default and must keep the pre-debounce
+    /// behavior: the trigger frame latches, even mid-spinner (a BEL from a
+    /// still-working agent latched before the debounce existed too).
+    #[test]
+    fn zero_grace_fires_on_the_trigger_frame() {
+        let now = Instant::now();
+        assert_eq!(
+            poll_attention_debounce(now, now, "⠋ working", Duration::ZERO),
+            AttentionVerdict::Fire
+        );
+    }
+
+    /// An orchestrated agent that resumes after a task boundary brings its
+    /// spinner title back — that resumption is what must eat the ping.
+    #[test]
+    fn a_returning_spinner_cancels_a_pending_trigger() {
+        let since = Instant::now();
+        let grace = Duration::from_secs(2);
+        assert_eq!(
+            poll_attention_debounce(since, since + grace, "⠋ working", grace),
+            AttentionVerdict::Cancel
+        );
+    }
+
+    /// A genuinely idle session pings, but only after waiting out the grace
+    /// window — the wait carries the remaining delay so the app can schedule
+    /// the deciding repaint.
+    #[test]
+    fn an_idle_session_waits_out_the_grace_window_then_fires() {
+        let since = Instant::now();
+        let grace = Duration::from_secs(2);
+        assert_eq!(
+            poll_attention_debounce(since, since + Duration::from_secs(1), "~/repo", grace),
+            AttentionVerdict::Wait(Duration::from_secs(1))
+        );
+        assert_eq!(
+            poll_attention_debounce(since, since + grace, "~/repo", grace),
+            AttentionVerdict::Fire
+        );
     }
 
     /// The wheel scrolls a diff pane only because its pager sits on the alternate
@@ -1034,6 +1397,77 @@ mod tests {
             "`cmd /c echo ready` took {exited:?}; the console host is stalling on a \
              handshake (the foreign conpty.dll stall is ~3s)"
         );
+    }
+
+    /// `[general] working_directory` supplies the PTY start dir when a session
+    /// has no explicit one (the home tab), without becoming the session's
+    /// workspace identity — a home-tab session must keep `working_directory:
+    /// None` or it would be filtered into a worktree workspace.
+    #[test]
+    fn a_home_session_starts_in_the_configured_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut config = Config::default();
+        config.working_directory = Some(dir.path().to_path_buf());
+
+        // The child writes its cwd into a relative path; the file landing in
+        // `dir` is itself proof the PTY honored the configured directory.
+        #[cfg(windows)]
+        let (program, args) = ("cmd", vec!["/c", "cd", ">", "cwd-probe.txt"]);
+        #[cfg(not(windows))]
+        let (program, args) = ("sh", vec!["-c", "pwd > cwd-probe.txt"]);
+
+        let session = Session::spawn_command(
+            egui::Context::default(),
+            &config,
+            None,
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            program.to_string(),
+            args.into_iter().map(str::to_string).collect(),
+            "probe".to_string(),
+            SessionKind::Shell,
+        )
+        .unwrap();
+
+        assert!(
+            session.working_directory.is_none(),
+            "the configured cwd must not turn the home tab into a worktree workspace"
+        );
+
+        let start = Instant::now();
+        loop {
+            assert!(start.elapsed() < Duration::from_secs(10), "child never exited");
+            match session.events.try_recv() {
+                Ok(TermEvent::ChildExit(_)) => break,
+                Ok(_) => {},
+                Err(_) => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+
+        let content = std::fs::read_to_string(dir.path().join("cwd-probe.txt"))
+            .expect("no probe file: the child did not start in general.working_directory");
+        let reported = PathBuf::from(content.trim()).canonicalize().unwrap();
+        assert_eq!(reported, dir.path().canonicalize().unwrap());
+    }
+
+    /// An explicit workspace dir (worktree/project tab) always wins over the
+    /// configured default, and a configured dir that no longer exists is
+    /// dropped rather than failing the spawn.
+    #[test]
+    fn explicit_dirs_win_and_missing_configured_dirs_are_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.working_directory = Some(tmp.path().join("gone"));
+
+        assert_eq!(
+            pty_working_directory(Some(tmp.path().to_path_buf()), &config),
+            Some(tmp.path().to_path_buf())
+        );
+        assert_eq!(pty_working_directory(None, &config), None);
+
+        config.working_directory = Some(tmp.path().to_path_buf());
+        assert_eq!(pty_working_directory(None, &config), Some(tmp.path().to_path_buf()));
     }
 
     #[derive(Default)]
@@ -1208,6 +1642,28 @@ mod tests {
     }
 
     #[test]
+    fn wsl_busy_needs_a_foreground_comm() {
+        // Idle shell: the helper reports no foreground comm at all.
+        assert_eq!(wsl_probe_signals(None), (false, false));
+        // Any foreground job counts as busy, cooperating TUI or not.
+        assert_eq!(wsl_probe_signals(Some("sleep")), (true, false));
+        assert_eq!(wsl_probe_signals(Some("claude")), (true, false));
+        assert_eq!(wsl_probe_signals(Some("nvim")), (true, true));
+    }
+
+    #[test]
+    fn wsl_nav_tui_needs_a_known_cooperating_comm() {
+        assert!(wsl_nav_tui(Some("nvim")));
+        assert!(wsl_nav_tui(Some("vim")));
+        assert!(wsl_nav_tui(Some("tmux: client")));
+        // A shell, an agent, or an unknown probe must move panel focus —
+        // losing passthrough beats losing the keys.
+        assert!(!wsl_nav_tui(Some("bash")));
+        assert!(!wsl_nav_tui(Some("claude")));
+        assert!(!wsl_nav_tui(None));
+    }
+
+    #[test]
     fn nav_tui_name_match_covers_both_platforms_naming() {
         // Windows image names.
         assert!(is_nav_tui_name("nvim.exe"));
@@ -1220,14 +1676,12 @@ mod tests {
         assert!(!is_nav_tui_name("gvim.exe"));
         assert!(!is_nav_tui_name("chezmoi.exe"));
         assert!(!is_nav_tui_name("pwsh.exe"));
-    }
-
-    #[test]
-    fn wsl_boundary_match_covers_the_helper_processes() {
-        assert!(is_wsl_boundary_name("wsl.exe"));
-        assert!(is_wsl_boundary_name("wslhost.exe"));
-        assert!(is_wsl_boundary_name("WSLRELAY.EXE"));
-        assert!(!is_wsl_boundary_name("pwsh.exe"));
+        // A wsl.exe in the descendant tree no longer implies a cooperating
+        // TUI — the Windows process table can't see the distro side, so the
+        // resident helper's foreground probe is the only signal now.
+        assert!(!is_nav_tui_name("wsl.exe"));
+        assert!(!is_nav_tui_name("wslhost.exe"));
+        assert!(!is_nav_tui_name("WSLRELAY.EXE"));
     }
 
     #[test]

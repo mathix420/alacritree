@@ -48,10 +48,13 @@ dependencies = [
 
 [[package]]
 name = "alacritree"
-version = "0.1.2"
+version = "0.4.1"
 dependencies = [
+ "ab_glyph",
  "alacritty_terminal",
  "arboard",
+ "base64",
+ "block2 0.6.2",
  "clap",
  "clap_complete",
  "eframe",
@@ -63,10 +66,14 @@ dependencies = [
  "git2",
  "home",
  "interprocess",
+ "libc",
  "log",
  "memmap2",
  "notify-rust",
  "nucleo-matcher",
+ "objc2 0.6.3",
+ "objc2-foundation 0.3.2",
+ "objc2-user-notifications 0.3.2",
  "png 0.17.16",
  "rfd",
  "serde",
@@ -74,6 +81,7 @@ dependencies = [
  "subst",
  "swash",
  "sysinfo",
+ "tauri-winrt-notification",
  "tempfile",
  "toml",
  "ttf-parser",
@@ -2721,7 +2729,7 @@ dependencies = [
  "objc2-quartz-core",
  "objc2-symbols",
  "objc2-uniform-type-identifiers",
- "objc2-user-notifications",
+ "objc2-user-notifications 0.2.2",
 ]
 
 [[package]]
@@ -2746,6 +2754,18 @@ dependencies = [
  "objc2 0.5.2",
  "objc2-core-location",
  "objc2-foundation 0.2.2",
+]
+
+[[package]]
+name = "objc2-user-notifications"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9df9128cbbfef73cda168416ccf7f837b62737d748333bfe9ab71c245d76613e"
+dependencies = [
+ "bitflags 2.9.4",
+ "block2 0.6.2",
+ "objc2 0.6.3",
+ "objc2-foundation 0.3.2",
 ]
 
 [[package]]

@@ -211,7 +211,11 @@ sidebar_background = "#1c1c1c"
 sidebar_foreground = "#d8d8d8"
 sidebar_border     = "#2a2a2a"
 sidebar_accent     = "#6a9fb5"
-notifications      = true   # desktop notification when a hidden session bells
+notifications      = true   # desktop notification when a hidden session bells;
+                            # clicking it focuses the session that pinged
+attention_grace_ms = 0      # hold pings this long and drop them if the session
+                            # resumes work (agents that continue between tasks);
+                            # 0 pings immediately
 scrollbar          = "floating"  # sidebar scrollbar: "floating" (default, thin
                                  # overlay that expands over the row icons on
                                  # hover) or "solid" (reserved gutter that
