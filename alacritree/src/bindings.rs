@@ -45,6 +45,10 @@ pub enum NamedAction {
     /// 1-indexed.
     SelectTab(u8),
     SelectLastTab,
+    /// Like SelectNextTab/SelectPreviousTab, but one flat ring over every
+    /// open session: crossing a workspace boundary switches workspaces.
+    SelectNextSession,
+    SelectPreviousSession,
     ToggleLeftSidebar,
     ToggleRightSidebar,
     SelectNextWorkspace,
@@ -133,6 +137,12 @@ impl NamedAction {
             Self::SelectPreviousTab => "Cycle to the previous session in the workspace".into(),
             Self::SelectTab(n) => format!("Select session {n} in the current workspace"),
             Self::SelectLastTab => "Select the last session in the current workspace".into(),
+            Self::SelectNextSession => {
+                "Cycle to the next session, continuing across workspaces".into()
+            },
+            Self::SelectPreviousSession => {
+                "Cycle to the previous session, continuing across workspaces".into()
+            },
             Self::ToggleLeftSidebar => "Toggle the projects sidebar".into(),
             Self::ToggleRightSidebar => "Toggle the git sidebar".into(),
             Self::SelectNextWorkspace => "Switch to the next workspace".into(),
@@ -638,6 +648,8 @@ pub fn parse_action(name: &str) -> BindingAction {
         "SelectTab8" => BindingAction::Named(SelectTab(8)),
         "SelectTab9" => BindingAction::Named(SelectTab(9)),
         "SelectLastTab" => BindingAction::Named(SelectLastTab),
+        "SelectNextSession" => BindingAction::Named(SelectNextSession),
+        "SelectPreviousSession" => BindingAction::Named(SelectPreviousSession),
         "ToggleLeftSidebar" => BindingAction::Named(ToggleLeftSidebar),
         "ToggleRightSidebar" => BindingAction::Named(ToggleRightSidebar),
         "SelectNextWorkspace" => BindingAction::Named(SelectNextWorkspace),
@@ -1046,6 +1058,19 @@ mod tests {
             parse_action("CloseSession"),
             BindingAction::Named(NamedAction::CloseSession)
         ));
+    }
+
+    #[test]
+    fn select_session_actions_parse_from_config_names() {
+        for (name, expected) in [
+            ("SelectNextSession", NamedAction::SelectNextSession),
+            ("SelectPreviousSession", NamedAction::SelectPreviousSession),
+        ] {
+            assert!(
+                matches!(parse_action(name), BindingAction::Named(a) if a == expected),
+                "{name} does not parse"
+            );
+        }
     }
 
     #[test]

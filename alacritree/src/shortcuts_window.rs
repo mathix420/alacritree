@@ -1,6 +1,7 @@
 //! Data model for the searchable shortcuts window: the effective binding
-//! rows, the static sidebar-navigation entries, and the fuzzy matcher the
-//! search box filters them with.  Pure — painting lives in `app.rs`.
+//! rows, the static sidebar-navigation entries, the actions no binding
+//! currently triggers, and the fuzzy matcher the search box filters them
+//! with.  Pure — painting lives in `app.rs`.
 
 use crate::bindings::{BindingAction, KeyBinding, NamedAction};
 
@@ -50,6 +51,104 @@ pub fn named_rows(bindings: &[KeyBinding]) -> Vec<ShortcutRow> {
             })
         })
         .collect()
+}
+
+/// Actions no current binding triggers — the discoverable remainder the
+/// shortcuts window lists so users learn what `[[keyboard.bindings]]` can
+/// name without reading the docs.
+pub fn unbound_rows(bindings: &[KeyBinding]) -> Vec<ShortcutRow> {
+    let bound: std::collections::HashSet<String> = bindings
+        .iter()
+        .filter_map(|b| match &b.action {
+            BindingAction::Named(a) => Some(a.config_name()),
+            _ => None,
+        })
+        .collect();
+    bindable_rows()
+        .into_iter()
+        .filter(|(names, _)| names.iter().all(|n| !bound.contains(n)))
+        .map(|(_, row)| row)
+        .collect()
+}
+
+fn simple(a: NamedAction) -> (Vec<String>, ShortcutRow) {
+    (
+        vec![a.config_name()],
+        ShortcutRow { keys: String::new(), name: a.config_name(), description: a.description() },
+    )
+}
+
+fn family(prefix: &str, description: &str) -> (Vec<String>, ShortcutRow) {
+    (
+        (1..=9).map(|n| format!("{prefix}{n}")).collect(),
+        ShortcutRow {
+            keys: String::new(),
+            name: format!("{prefix}1 … {prefix}9"),
+            description: description.into(),
+        },
+    )
+}
+
+/// Every action a `[[keyboard.bindings]]` entry can name, paired with the
+/// config names that hide its row once any of them is bound.  Parametrized
+/// families collapse to one row each.  Kept in sync with `NamedAction` by
+/// hand (`NoOp`/`ReceiveChar` unbind rather than bind — no rows).
+fn bindable_rows() -> Vec<(Vec<String>, ShortcutRow)> {
+    use NamedAction::*;
+    let mut rows: Vec<_> = [
+        Paste,
+        PasteSelection,
+        Copy,
+        CopySelection,
+        ScrollPageUp,
+        ScrollPageDown,
+        ScrollHalfPageUp,
+        ScrollHalfPageDown,
+        ScrollLineUp,
+        ScrollLineDown,
+        ScrollToTop,
+        ScrollToBottom,
+        ClearHistory,
+        SpawnNewInstance,
+        IncreaseFontSize,
+        DecreaseFontSize,
+        ResetFontSize,
+        ToggleFullscreen,
+        ToggleMaximized,
+        Minimize,
+        SelectNextTab,
+        SelectPreviousTab,
+        SelectLastTab,
+        SelectNextSession,
+        SelectPreviousSession,
+        SelectNextWorkspace,
+        SelectPreviousWorkspace,
+        ToggleLeftSidebar,
+        ToggleRightSidebar,
+        AddProject,
+        ToggleSidebarFocus,
+        CloseSession,
+        SidebarTop,
+        SidebarBottom,
+        SidebarNextProject,
+        SidebarPreviousProject,
+        ShowShortcuts,
+        FocusProjectsSidebar,
+        FocusGitSidebar,
+        FocusTerminal,
+        FocusLeft,
+        FocusRight,
+        ToggleSessionRows,
+        ToggleSessionTabs,
+        SetBaseBranch,
+        Quit,
+    ]
+    .into_iter()
+    .map(simple)
+    .collect();
+    rows.push(family("SelectTab", "Select the Nth session in the current workspace"));
+    rows.push(family("SpawnProfile", "Open a session with the Nth [[ui.profiles]] entry"));
+    rows
 }
 
 fn format_shortcut(key: egui::Key, mods: egui::Modifiers) -> String {
@@ -141,6 +240,45 @@ mod tests {
         assert!(!NamedAction::SelectTab(3).description().is_empty());
         assert!(!NamedAction::SpawnProfile(2).description().is_empty());
         assert_eq!(NamedAction::SelectTab(3).config_name(), "SelectTab3");
+    }
+
+    #[test]
+    fn unbound_rows_lists_only_actions_without_bindings() {
+        let rows = unbound_rows(&parse_bindings(vec![]));
+        // Actions no default binds show up…
+        assert!(rows.iter().any(|r| r.name == "SelectNextSession"));
+        assert!(rows.iter().any(|r| r.name == "FocusTerminal"));
+        // …while bound defaults stay out.
+        assert!(!rows.iter().any(|r| r.name == "CloseSession"));
+        // Every row is discoverable by name and description; keys stay empty.
+        for r in &rows {
+            assert!(r.keys.is_empty(), "{} has keys", r.name);
+            assert!(!r.name.is_empty() && !r.description.is_empty());
+        }
+    }
+
+    #[test]
+    fn binding_an_action_removes_its_unbound_row() {
+        let rows = unbound_rows(&parse_bindings(vec![raw_action(
+            "N",
+            Some("Control|Shift"),
+            "SelectNextSession",
+        )]));
+        assert!(!rows.iter().any(|r| r.name == "SelectNextSession"));
+    }
+
+    #[test]
+    fn a_family_row_covers_all_members_and_hides_once_one_is_bound() {
+        let rows = unbound_rows(&parse_bindings(vec![]));
+        // SpawnProfile has no default binding on any platform: one collapsed
+        // row for the whole family, not nine.
+        assert_eq!(rows.iter().filter(|r| r.name.contains("SpawnProfile")).count(), 1);
+        let rows = unbound_rows(&parse_bindings(vec![raw_action(
+            "2",
+            Some("Control|Shift"),
+            "SpawnProfile2",
+        )]));
+        assert!(!rows.iter().any(|r| r.name.contains("SpawnProfile")));
     }
 
     #[test]

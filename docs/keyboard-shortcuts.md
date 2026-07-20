@@ -120,6 +120,16 @@ entry. Names match alacritty's own action names, so existing configs port over.
   workspace, so they collapse to the same action.)
 - `SelectNextTab` / `SelectPreviousTab` — cycle through sessions in the
   current workspace.
+- `SelectNextSession` / `SelectPreviousSession` — cycle through every open
+  session across all workspaces: one flat ring with workspaces in sidebar
+  order, switching workspace when the cycle crosses a boundary. Unbound by
+  default; example binding:
+  ```toml
+  [[keyboard.bindings]]
+  key = "PageDown"
+  mods = "Control|Shift"
+  action = "SelectNextSession"
+  ```
 - `SelectTab1` … `SelectTab9` — select the Nth session in the current
   workspace. Out-of-range indices are ignored.
 - `SelectLastTab` — select the last session in the current workspace.
@@ -139,7 +149,9 @@ All four sidebar actions act only while the projects sidebar has keyboard
 focus; anywhere else their keys pass through to the terminal untouched, so
 the unmodified defaults don't shadow Home/End/PageUp/PageDown in TUIs.
 - `ShowShortcuts` — toggle a searchable window listing every effective
-  binding. Type to fuzzy-filter, `/` refocuses the search box, `Escape`
+  binding, plus the actions nothing currently binds (so the full action
+  vocabulary is discoverable without the docs). Type to fuzzy-filter, `/`
+  refocuses the search box, `Escape`
   clears the query and then closes, and `Up`/`Down`/`PageUp`/`PageDown`
   scroll the list without leaving the search box. Clicking outside the
   window closes it. The default `F1` shadows `F1` for terminal apps;

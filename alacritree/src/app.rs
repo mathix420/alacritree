@@ -1100,6 +1100,32 @@ impl AlacritreeApp {
         }
     }
 
+    fn cycle_sessions(&mut self, ctx: &Context, delta: i32) {
+        let ring: Vec<(WorkspaceKey, SessionId)> = self
+            .workspace_order()
+            .into_iter()
+            .flat_map(|ws| {
+                let entries: Vec<_> = self
+                    .workspace_session_indices(&ws)
+                    .into_iter()
+                    .map(|i| (ws.clone(), self.sessions[i].id))
+                    .collect();
+                entries
+            })
+            .collect();
+        let current = self.active_session_index().map(|i| self.sessions[i].id);
+        let Some((target_ws, id)) = session_ring_target(&ring, current, delta) else {
+            return;
+        };
+        // Record the target before switching: ensure_active_session would
+        // otherwise re-adopt the workspace's previously active session.
+        self.active_session.insert(target_ws.clone(), id);
+        match target_ws {
+            None => self.activate_home(ctx),
+            Some(path) => self.activate_worktree(ctx, &path),
+        }
+    }
+
     fn workspace_order(&self) -> Vec<WorkspaceKey> {
         let mut order: Vec<WorkspaceKey> = vec![None];
         for project in &self.projects {
@@ -1820,6 +1846,10 @@ impl AlacritreeApp {
             },
             BindingAction::Named(NamedAction::SelectNextTab) => self.cycle_tabs(1),
             BindingAction::Named(NamedAction::SelectPreviousTab) => self.cycle_tabs(-1),
+            BindingAction::Named(NamedAction::SelectNextSession) => self.cycle_sessions(ctx, 1),
+            BindingAction::Named(NamedAction::SelectPreviousSession) => {
+                self.cycle_sessions(ctx, -1);
+            },
             BindingAction::Named(NamedAction::SelectTab(n)) => self.select_tab(n),
             BindingAction::Named(NamedAction::SelectLastTab) => self.select_last_tab(),
             BindingAction::Named(NamedAction::SpawnProfile(n)) => {
@@ -4215,6 +4245,28 @@ fn base_branch_target(
     current.clone()
 }
 
+/// The session a SelectNextSession/SelectPreviousSession press lands on:
+/// one flat ring over every open session, workspaces in sidebar order and
+/// each workspace's sessions in spawn order.  `None` means stay put — a
+/// ring too small to cycle, or an active session missing from the ring
+/// (its worktree turned prunable).  With no active session (an emptied
+/// workspace on screen) the first entry re-anchors the cycle.
+fn session_ring_target(
+    ring: &[(WorkspaceKey, SessionId)],
+    current: Option<SessionId>,
+    delta: i32,
+) -> Option<(WorkspaceKey, SessionId)> {
+    if ring.len() < 2 {
+        return None;
+    }
+    let Some(current) = current else {
+        return Some(ring[0].clone());
+    };
+    let pos = ring.iter().position(|(_, id)| *id == current)?;
+    let next = (pos as i32 + delta).rem_euclid(ring.len() as i32) as usize;
+    Some(ring[next].clone())
+}
+
 /// Branches whose name contains `query`, case-insensitively.
 fn filter_branches(branches: &[String], query: &str) -> Vec<String> {
     let query = query.to_lowercase();
@@ -4992,7 +5044,9 @@ impl AlacritreeApp {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.set_width(480.0 * s);
+                // Three columns (key, action name, description) need more
+                // room than the old stacked two-column layout.
+                ui.set_width(600.0 * s);
                 ui.spacing_mut().item_spacing.y = 4.0 * s;
 
                 let search = ui.add(
@@ -5013,6 +5067,10 @@ impl AlacritreeApp {
                     .into_iter()
                     .filter(|r| shortcuts_window::row_matches(&query, r))
                     .collect();
+                let unbound_rows: Vec<_> = shortcuts_window::unbound_rows(&self.config.bindings)
+                    .into_iter()
+                    .filter(|r| shortcuts_window::row_matches(&query, r))
+                    .collect();
 
                 // auto_shrink would size the scroll area to the grids'
                 // content, leaving a dead margin between the rows and the
@@ -5023,18 +5081,21 @@ impl AlacritreeApp {
                     if scroll_delta != 0.0 {
                         ui.scroll_with_delta(egui::vec2(0.0, scroll_delta));
                     }
-                    if app_rows.is_empty() && nav_rows.is_empty() {
+                    if app_rows.is_empty() && nav_rows.is_empty() && unbound_rows.is_empty() {
                         ui.label(RichText::new("no matches").color(theme.text_dim));
                         return;
                     }
                     if !app_rows.is_empty() {
                         ui.label(RichText::new("App shortcuts").color(theme.text_muted).small());
-                        egui::Grid::new("shortcuts_app_grid").num_columns(2).striped(true).show(
+                        egui::Grid::new("shortcuts_app_grid").num_columns(3).striped(true).show(
                             ui,
                             |ui| {
                                 for row in &app_rows {
                                     ui.label(
                                         RichText::new(&row.keys).color(theme.accent).monospace(),
+                                    );
+                                    ui.label(
+                                        RichText::new(&row.name).color(theme.text_dim).monospace(),
                                     );
                                     ui.vertical(|ui| {
                                         // Stretch the last column to the
@@ -5042,9 +5103,6 @@ impl AlacritreeApp {
                                         // whole row, not just the text.
                                         ui.set_min_width(ui.available_width());
                                         ui.label(RichText::new(&row.description).color(theme.text));
-                                        ui.label(
-                                            RichText::new(&row.name).color(theme.text_dim).small(),
-                                        );
                                     });
                                     ui.end_row();
                                 }
@@ -5073,6 +5131,29 @@ impl AlacritreeApp {
                                 }
                             },
                         );
+                    }
+                    if !unbound_rows.is_empty() {
+                        ui.add_space(6.0 * s);
+                        ui.label(
+                            RichText::new("Unbound actions (name them in [[keyboard.bindings]])")
+                                .color(theme.text_muted)
+                                .small(),
+                        );
+                        egui::Grid::new("shortcuts_unbound_grid")
+                            .num_columns(2)
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for row in &unbound_rows {
+                                    ui.label(
+                                        RichText::new(&row.name).color(theme.accent).monospace(),
+                                    );
+                                    ui.vertical(|ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        ui.label(RichText::new(&row.description).color(theme.text));
+                                    });
+                                    ui.end_row();
+                                }
+                            });
                     }
                 });
             });
@@ -6114,6 +6195,32 @@ mod tests {
         assert_eq!(latest_notification_click(&rx), Some(5));
         // The drain consumed everything, not just the returned click.
         assert_eq!(latest_notification_click(&rx), None);
+    }
+
+    #[test]
+    fn session_ring_crosses_workspace_boundaries_and_wraps() {
+        let ring = [(None, 1), (None, 2), (ws("a"), 3), (ws("b"), 4)];
+        // Within a workspace it moves like tab cycling…
+        assert_eq!(session_ring_target(&ring, Some(1), 1), Some((None, 2)));
+        // …and crossing a boundary switches workspaces.
+        assert_eq!(session_ring_target(&ring, Some(2), 1), Some((ws("a"), 3)));
+        assert_eq!(session_ring_target(&ring, Some(3), -1), Some((None, 2)));
+        // The ring wraps at both ends.
+        assert_eq!(session_ring_target(&ring, Some(4), 1), Some((None, 1)));
+        assert_eq!(session_ring_target(&ring, Some(1), -1), Some((ws("b"), 4)));
+    }
+
+    #[test]
+    fn session_ring_stays_put_on_degenerate_input() {
+        // Fewer than two sessions: nowhere to go.
+        assert_eq!(session_ring_target(&[], Some(1), 1), None);
+        assert_eq!(session_ring_target(&[(None, 1)], Some(1), 1), None);
+        let ring = [(None, 1), (ws("a"), 2)];
+        // No active session (emptied workspace on screen) re-anchors on the
+        // first entry.
+        assert_eq!(session_ring_target(&ring, None, 1), Some((None, 1)));
+        // An active session missing from the ring does nothing.
+        assert_eq!(session_ring_target(&ring, Some(9), 1), None);
     }
 
     #[test]
