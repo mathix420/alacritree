@@ -132,6 +132,7 @@ fn bindable_rows() -> Vec<(Vec<String>, ShortcutRow)> {
         SidebarBottom,
         SidebarNextProject,
         SidebarPreviousProject,
+        RefreshProjects,
         ShowShortcuts,
         FocusProjectsSidebar,
         FocusGitSidebar,

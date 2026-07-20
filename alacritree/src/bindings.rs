@@ -60,6 +60,8 @@ pub enum NamedAction {
     SidebarBottom,
     SidebarNextProject,
     SidebarPreviousProject,
+    /// Re-run worktree discovery for every project in the sidebar.
+    RefreshProjects,
     ShowShortcuts,
     FocusProjectsSidebar,
     FocusGitSidebar,
@@ -86,10 +88,10 @@ pub enum NamedAction {
 }
 
 impl NamedAction {
-    /// Actions that drive the projects-sidebar cursor.  Their default keys
-    /// (unmodified Home/End/PageUp/PageDown) are terminal input the rest of
-    /// the time, so dispatch must not consume them unless the sidebar owns
-    /// focus.
+    /// Actions that only make sense while the projects sidebar owns focus.
+    /// Their default keys (unmodified Home/End/PageUp/PageDown/R) are
+    /// terminal input the rest of the time, so dispatch must not consume
+    /// them unless the sidebar owns focus.
     pub fn is_sidebar_scoped(&self) -> bool {
         matches!(
             self,
@@ -97,6 +99,7 @@ impl NamedAction {
                 | Self::SidebarBottom
                 | Self::SidebarNextProject
                 | Self::SidebarPreviousProject
+                | Self::RefreshProjects
         )
     }
 
@@ -156,6 +159,7 @@ impl NamedAction {
             Self::SidebarPreviousProject => {
                 "Jump the sidebar cursor to the previous project".into()
             },
+            Self::RefreshProjects => "Rescan every project's worktrees".into(),
             Self::FocusProjectsSidebar => "Focus the projects sidebar".into(),
             Self::FocusGitSidebar => "Focus the git sidebar".into(),
             Self::FocusTerminal => "Focus the terminal".into(),
@@ -320,6 +324,11 @@ fn default_bindings() -> Vec<KeyBinding> {
             key: Key::PageUp,
             mods: Modifiers::NONE,
             action: BindingAction::Named(SidebarPreviousProject),
+        },
+        KeyBinding {
+            key: Key::R,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(RefreshProjects),
         },
         KeyBinding {
             key: Key::F1,
@@ -661,6 +670,7 @@ pub fn parse_action(name: &str) -> BindingAction {
         "SidebarBottom" => BindingAction::Named(SidebarBottom),
         "SidebarNextProject" => BindingAction::Named(SidebarNextProject),
         "SidebarPreviousProject" => BindingAction::Named(SidebarPreviousProject),
+        "RefreshProjects" => BindingAction::Named(RefreshProjects),
         "ShowShortcuts" => BindingAction::Named(ShowShortcuts),
         "FocusProjectsSidebar" => BindingAction::Named(FocusProjectsSidebar),
         "FocusGitSidebar" => BindingAction::Named(FocusGitSidebar),
@@ -1090,17 +1100,30 @@ mod tests {
         }
     }
 
-    /// Only the four sidebar cursor actions are focus-scoped: everything
-    /// else (CloseSession included) must keep firing from the terminal.
+    /// Only the sidebar cursor actions and RefreshProjects are focus-scoped:
+    /// everything else (CloseSession included) must keep firing from the
+    /// terminal.
     #[test]
-    fn only_sidebar_cursor_actions_are_sidebar_scoped() {
+    fn only_sidebar_actions_are_sidebar_scoped() {
         use NamedAction::*;
-        for a in [SidebarTop, SidebarBottom, SidebarNextProject, SidebarPreviousProject] {
+        for a in
+            [SidebarTop, SidebarBottom, SidebarNextProject, SidebarPreviousProject, RefreshProjects]
+        {
             assert!(a.is_sidebar_scoped(), "{a:?}");
         }
         for a in [CloseSession, ScrollToTop, ScrollPageUp, ToggleSidebarFocus, Quit] {
             assert!(!a.is_sidebar_scoped(), "{a:?}");
         }
+    }
+
+    #[test]
+    fn refresh_projects_has_an_unmodified_r_default_and_parses() {
+        let b = parse_bindings(vec![]);
+        assert_eq!(named_matches(&b, Key::R, Modifiers::NONE), vec![NamedAction::RefreshProjects]);
+        assert!(matches!(
+            parse_action("RefreshProjects"),
+            BindingAction::Named(NamedAction::RefreshProjects)
+        ));
     }
 
     #[test]

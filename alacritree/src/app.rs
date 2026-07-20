@@ -757,6 +757,14 @@ impl AlacritreeApp {
         self.pending_project_refresh.insert(root, rx);
     }
 
+    /// Re-run worktree discovery for every project — the keyboard/IPC
+    /// equivalent of pressing each row's refresh button in turn.
+    fn refresh_all_projects(&mut self, ctx: &Context) {
+        for idx in 0..self.projects.len() {
+            self.refresh_project(ctx, idx);
+        }
+    }
+
     /// Adopt completed background discoveries.  Only worktrees and the
     /// default branch are copied — `expanded`, the shell override, and the
     /// label are user state that survives refreshes (mirrors
@@ -1928,6 +1936,16 @@ impl AlacritreeApp {
             },
             BindingAction::Named(NamedAction::SidebarPreviousProject) => {
                 self.sidebar_cursor_project_jump(-1)
+            },
+            BindingAction::Named(NamedAction::RefreshProjects) => {
+                // While the fuzzy prompt is open an unmodified `r` is query
+                // input — its Text event already fed the filter — so only a
+                // browsing-mode press (or IPC) refreshes.
+                if origin == ActionOrigin::Ipc
+                    || self.project_filter.mode() == panel_filter::Mode::Browsing
+                {
+                    self.refresh_all_projects(ctx);
+                }
             },
             BindingAction::Named(NamedAction::ShowShortcuts) => {
                 self.shortcuts_window_open = !self.shortcuts_window_open;
