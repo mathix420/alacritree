@@ -64,6 +64,8 @@ pub enum NamedAction {
     ToggleSessionRows,
     /// Flip the runtime `session_display.tabs_always` value.
     ToggleSessionTabs,
+    /// Open the base-branch picker for the sidebar-cursored or current worktree.
+    SetBaseBranch,
     /// 1-indexed into the `[[ui.profiles]]` order.
     SpawnProfile(u8),
     Quit,
@@ -152,6 +154,7 @@ impl NamedAction {
             Self::ShowShortcuts => "Show this shortcuts window".into(),
             Self::ToggleSessionRows => "Toggle single-session sidebar rows".into(),
             Self::ToggleSessionTabs => "Toggle single-session tab segments".into(),
+            Self::SetBaseBranch => "Choose the branch the git panel diffs against".into(),
             Self::FocusLeft => "Move panel focus left (TUIs get the key first)".into(),
             Self::FocusRight => "Move panel focus right (TUIs get the key first)".into(),
             Self::NoOp | Self::ReceiveChar => String::new(),
@@ -406,12 +409,13 @@ fn parse_key(name: &str) -> Option<Key> {
         let c = n.chars().next().unwrap().to_ascii_uppercase();
         return char_to_key(c);
     }
-    if n == "NumpadEnter" {
-        // egui-winit maps both `KeyCode::Enter` and `KeyCode::NumpadEnter` to
-        // `egui::Key::Enter`, so we can't tell them apart.  Aliasing NumpadEnter
-        // to Enter would silently fire NumpadEnter bindings on the regular
-        // Return key — drop the binding instead.
-        log::warn!("ignoring NumpadEnter binding: egui cannot distinguish it from Return");
+    if n.starts_with("Numpad") {
+        // egui-winit collapses numpad keys into their standard counterparts
+        // (`KeyCode::NumpadEnter` → `egui::Key::Enter`, NumpadAdd → the plus
+        // key, ...), so a numpad binding can't be told apart from the main
+        // key.  Aliasing would silently fire it on the standard key — drop
+        // the binding instead.
+        log::warn!("ignoring {n} binding: egui cannot distinguish numpad keys");
         return None;
     }
     Some(match n {
@@ -426,10 +430,12 @@ fn parse_key(name: &str) -> Option<Key> {
         "End" => Key::End,
         "PageUp" => Key::PageUp,
         "PageDown" => Key::PageDown,
-        "Up" => Key::ArrowUp,
-        "Down" => Key::ArrowDown,
-        "Left" => Key::ArrowLeft,
-        "Right" => Key::ArrowRight,
+        // Alacritty names keys after winit's `NamedKey` ("ArrowUp") and keeps
+        // the pre-0.13 names ("Up") as legacy aliases — accept both.
+        "ArrowUp" | "Up" => Key::ArrowUp,
+        "ArrowDown" | "Down" => Key::ArrowDown,
+        "ArrowLeft" | "Left" => Key::ArrowLeft,
+        "ArrowRight" | "Right" => Key::ArrowRight,
         "Minus" => Key::Minus,
         "Equals" | "Equal" => Key::Equals,
         "Plus" => Key::Plus,
@@ -442,6 +448,11 @@ fn parse_key(name: &str) -> Option<Key> {
         "LBracket" | "LeftBracket" => Key::OpenBracket,
         "RBracket" | "RightBracket" => Key::CloseBracket,
         "Grave" | "Backtick" => Key::Backtick,
+        "Colon" => Key::Colon,
+        // Legacy alacritty digit names: "Key1" is the top-row 1.
+        n if n.len() == 4 && n.starts_with("Key") => {
+            return char_to_key(n.chars().nth(3).unwrap());
+        },
         // F1..F35.
         n if n.starts_with('F') => {
             let num: u8 = n[1..].parse().ok()?;
@@ -489,6 +500,19 @@ fn char_to_key(c: char) -> Option<Key> {
         '7' => Key::Num7,
         '8' => Key::Num8,
         '9' => Key::Num9,
+        '-' => Key::Minus,
+        '=' => Key::Equals,
+        '+' => Key::Plus,
+        ',' => Key::Comma,
+        '.' => Key::Period,
+        '/' => Key::Slash,
+        '\\' => Key::Backslash,
+        ';' => Key::Semicolon,
+        ':' => Key::Colon,
+        '\'' => Key::Quote,
+        '`' => Key::Backtick,
+        '[' => Key::OpenBracket,
+        ']' => Key::CloseBracket,
         _ => return None,
     })
 }
@@ -496,32 +520,33 @@ fn char_to_key(c: char) -> Option<Key> {
 /// Winit key names that egui doesn't model.  Default alacritty configs include
 /// a handful of these, so swallow them silently rather than logging noise.
 fn is_silent_unsupported_key(name: &str) -> bool {
-    matches!(
-        name.trim(),
-        "Paste"
-            | "Copy"
-            | "Cut"
-            | "Find"
-            | "Help"
-            | "Undo"
-            | "BrowserBack"
-            | "BrowserForward"
-            | "BrowserRefresh"
-            | "BrowserStop"
-            | "BrowserHome"
-            | "BrowserSearch"
-            | "BrowserFavorites"
-            | "MediaPlayPause"
-            | "MediaStop"
-            | "MediaTrackNext"
-            | "MediaTrackPrevious"
-            | "VolumeUp"
-            | "VolumeDown"
-            | "VolumeMute"
-            // `parse_key` already logs a dedicated message explaining why
-            // NumpadEnter is dropped; suppress the generic "unknown key" follow-up.
-            | "NumpadEnter"
-    )
+    let n = name.trim();
+    // `parse_key` already logs a dedicated message explaining why numpad
+    // bindings are dropped; suppress the generic "unknown key" follow-up.
+    n.starts_with("Numpad")
+        || matches!(
+            n,
+            "Paste"
+                | "Copy"
+                | "Cut"
+                | "Find"
+                | "Help"
+                | "Undo"
+                | "BrowserBack"
+                | "BrowserForward"
+                | "BrowserRefresh"
+                | "BrowserStop"
+                | "BrowserHome"
+                | "BrowserSearch"
+                | "BrowserFavorites"
+                | "MediaPlayPause"
+                | "MediaStop"
+                | "MediaTrackNext"
+                | "MediaTrackPrevious"
+                | "VolumeUp"
+                | "VolumeDown"
+                | "VolumeMute"
+        )
 }
 
 fn f_key(n: u8) -> Option<Key> {
@@ -630,6 +655,7 @@ pub fn parse_action(name: &str) -> BindingAction {
         "FocusTerminal" => BindingAction::Named(FocusTerminal),
         "ToggleSessionRows" => BindingAction::Named(ToggleSessionRows),
         "ToggleSessionTabs" => BindingAction::Named(ToggleSessionTabs),
+        "SetBaseBranch" => BindingAction::Named(SetBaseBranch),
         "SpawnProfile1" => BindingAction::Named(SpawnProfile(1)),
         "SpawnProfile2" => BindingAction::Named(SpawnProfile(2)),
         "SpawnProfile3" => BindingAction::Named(SpawnProfile(3)),
@@ -780,6 +806,89 @@ mod tests {
         );
     }
 
+    /// Modern alacritty configs name keys after winit's `NamedKey`
+    /// ("ArrowUp"); the legacy alacritty names ("Up") are aliases.  Both
+    /// spellings must keep their bindings.
+    #[test]
+    fn winit_named_arrow_keys_parse() {
+        for (name, key) in [
+            ("ArrowUp", Key::ArrowUp),
+            ("ArrowDown", Key::ArrowDown),
+            ("ArrowLeft", Key::ArrowLeft),
+            ("ArrowRight", Key::ArrowRight),
+            ("Up", Key::ArrowUp),
+        ] {
+            let bindings = parse_bindings(vec![raw_chars(name, None, "x")]);
+            let matched = all_matches(&bindings, key, Modifiers::NONE);
+            assert!(
+                matched.iter().any(|a| matches!(a, BindingAction::Chars(c) if c == b"x")),
+                "{name} binding was dropped: {matched:?}"
+            );
+        }
+    }
+
+    /// Alacritty accepts any single character as a key name; the punctuation
+    /// egui models must round-trip instead of being dropped as unknown.
+    #[test]
+    fn single_char_punctuation_parses() {
+        for (name, key) in [
+            ("-", Key::Minus),
+            ("=", Key::Equals),
+            ("+", Key::Plus),
+            ("[", Key::OpenBracket),
+            ("]", Key::CloseBracket),
+            (";", Key::Semicolon),
+            (":", Key::Colon),
+            ("'", Key::Quote),
+            ("`", Key::Backtick),
+            (",", Key::Comma),
+            (".", Key::Period),
+            ("/", Key::Slash),
+            ("\\", Key::Backslash),
+        ] {
+            let bindings = parse_bindings(vec![raw_chars(name, None, "x")]);
+            let matched = all_matches(&bindings, key, Modifiers::NONE);
+            assert!(
+                matched.iter().any(|a| matches!(a, BindingAction::Chars(c) if c == b"x")),
+                "{name:?} binding was dropped: {matched:?}"
+            );
+        }
+    }
+
+    /// Alacritty's legacy digit names ("Key1") and the "Colon" alias must keep
+    /// their bindings like they do upstream.
+    #[test]
+    fn legacy_key_names_parse() {
+        for (name, key) in
+            [("Key0", Key::Num0), ("Key1", Key::Num1), ("Key9", Key::Num9), ("Colon", Key::Colon)]
+        {
+            let bindings = parse_bindings(vec![raw_chars(name, None, "x")]);
+            let matched = all_matches(&bindings, key, Modifiers::NONE);
+            assert!(
+                matched.iter().any(|a| matches!(a, BindingAction::Chars(c) if c == b"x")),
+                "{name} binding was dropped: {matched:?}"
+            );
+        }
+    }
+
+    /// egui collapses numpad keys into their standard counterparts, so numpad
+    /// bindings are dropped — with the dedicated log message, not the generic
+    /// unknown-key warning.
+    #[test]
+    fn numpad_bindings_drop_without_unknown_key_noise() {
+        for name in ["NumpadEnter", "NumpadAdd", "Numpad1"] {
+            let bindings = parse_bindings(vec![raw_chars(name, None, "x")]);
+            assert!(
+                !bindings.iter().any(|b| matches!(&b.action, BindingAction::Chars(c) if c == b"x")),
+                "{name} must not produce a binding"
+            );
+            assert!(
+                is_silent_unsupported_key(name),
+                "{name} must be exempt from the generic unknown-key warning"
+            );
+        }
+    }
+
     #[test]
     fn spawn_profile_actions_parse() {
         for n in 1..=9u8 {
@@ -841,6 +950,7 @@ mod tests {
             ("ToggleSessionTabs", NamedAction::ToggleSessionTabs),
             ("FocusLeft", NamedAction::FocusLeft),
             ("FocusRight", NamedAction::FocusRight),
+            ("SetBaseBranch", NamedAction::SetBaseBranch),
         ] {
             let b = parse_bindings(vec![raw_action("F1", None, name)]);
             assert_eq!(named_matches(&b, Key::F1, Modifiers::NONE), vec![expected], "{name}");

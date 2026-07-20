@@ -29,6 +29,10 @@ pub fn human(request: &IpcRequest, value: &Value) {
             None => println!("home"),
         },
         IpcRequest::SendText { .. } => {},
+        IpcRequest::MoveSession { .. } => match value["workspace"].as_str() {
+            Some(path) => println!("moved session {} to {path}", text(&value["session_id"])),
+            None => println!("moved session {} to home", text(&value["session_id"])),
+        },
         IpcRequest::ReadScreen { .. } => screen(value),
         IpcRequest::GitStatus { .. } => git_status(value),
         IpcRequest::CreateWorktree { .. } => {

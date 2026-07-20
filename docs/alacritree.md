@@ -102,6 +102,27 @@ so the panel stays responsive even on large repos. A faster cheap path
 (`dirty_counts`) is used by the delete modal — it skips the branch-diff work
 and just counts what `git worktree remove` would reject.
 
+### Per-worktree base branch
+
+The git panel diffs each worktree against an automatically picked base: the
+open PR's base branch if there is one, otherwise the project's default branch.
+To override it for a single worktree (e.g. a branch cut from `develop`):
+
+- right-click the worktree in the left sidebar → *Set base branch…*, or
+- click the `vs <branch>` label in the git panel, or
+- bind the `SetBaseBranch` action and press it (targets the sidebar-cursored
+  worktree when the sidebar has focus, the current worktree otherwise):
+
+  ```toml
+  [[keyboard.bindings]]
+  key = "B"
+  mods = "Control|Alt"
+  action = "SetBaseBranch"
+  ```
+
+Picking *Auto* returns to automatic detection. Overrides persist in
+`state.toml` per worktree path.
+
 ## Terminal grid
 
 Alacritree paints its grid cell-by-cell using the egui font system, with the
@@ -211,10 +232,15 @@ sidebar_background = "#1c1c1c"
 sidebar_foreground = "#d8d8d8"
 sidebar_border     = "#2a2a2a"
 sidebar_accent     = "#6a9fb5"
-notifications      = true   # desktop notification when a hidden session bells
+notifications      = true   # desktop notification when a hidden session bells;
+                            # clicking it focuses the session that pinged
 attention_grace_ms = 0      # hold pings this long and drop them if the session
                             # resumes work (agents that continue between tasks);
                             # 0 pings immediately
+scrollbar          = "floating"  # sidebar scrollbar: "floating" (default, thin
+                                 # overlay that expands over the row icons on
+                                 # hover) or "solid" (reserved gutter that
+                                 # never covers the icons)
 sidebar_click_focus = true  # clicking a sidebar moves keyboard focus to it (default false)
 
 [ui.icons]                  # sidebar glyph overrides (e.g. Nerd Font icons)
@@ -303,6 +329,7 @@ Tools:
 | `close_session` | Close a session |
 | `send_text` | Type into a session's terminal (control chars pass through; `\r` submits) |
 | `read_screen` | Read a session's screen text, cursor position, and optional scrollback |
+| `move_session` | Re-home a session under another worktree (`alacritree session move <session_id> <path>`); path may be anywhere inside it |
 | `git_status` | Staged/unstaged files and per-file +/- vs the default branch |
 | `create_worktree` | Create a worktree + branch, same flow as the sidebar's `+` button |
 | `refresh_project` | Re-scan a project's worktrees |
@@ -315,6 +342,70 @@ clients fall back to scanning the socket directory, or can pass
 `alacritree mcp --socket <path>` explicitly. Set `ipc_socket = false` under
 `[general]` (shared with Alacritty's option of the same name) to disable the
 socket entirely.
+
+### Shell integration: following the cwd
+
+alacritree never guesses a session's directory — a session tells it, via
+`ALACRITREE_SESSION_ID` (exported into every session) and
+`alacritree session move`. Two opt-in hooks cover the common flows; add the
+one(s) you want to your shell config.
+
+**Sidebar follows the shell** — report the cwd at every prompt:
+
+```sh
+# bash (~/.bashrc)
+_alacritree_report_cwd() {
+  [ -n "$ALACRITREE_SESSION_ID" ] || return 0
+  alacritree session move "$ALACRITREE_SESSION_ID" "$PWD" >/dev/null 2>&1 || true
+}
+PROMPT_COMMAND="_alacritree_report_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+
+# zsh (~/.zshrc)
+precmd_functions+=(_alacritree_report_cwd)
+```
+
+```powershell
+# PowerShell ($PROFILE) — wrap your existing prompt function
+function prompt {
+  if ($env:ALACRITREE_SESSION_ID) {
+    alacritree session move $env:ALACRITREE_SESSION_ID "$PWD" *> $null
+  }
+  "PS $PWD> "
+}
+```
+
+Paths outside any known worktree are rejected by alacritree and ignored by
+the hook, so `cd /tmp` moves nothing.
+
+**Shell follows the sidebar** — when an agent moved the session (e.g. via the
+`move_session` MCP tool), land the shell there at the next prompt. Only the
+shell can change its own cwd, which is why this is a hook and not an app
+feature (requires `jq`):
+
+```sh
+# bash (~/.bashrc)
+_alacritree_follow() {
+  [ -n "$ALACRITREE_SESSION_ID" ] || return 0
+  local ws
+  ws=$(alacritree session list --json 2>/dev/null | jq -r --arg id "$ALACRITREE_SESSION_ID" \
+    '.sessions[] | select((.id | tostring) == $id) | .workspace // empty')
+  [ -n "$ws" ] || return 0
+  case "$PWD" in "$ws"|"$ws"/*) ;; *) cd "$ws" ;; esac
+}
+PROMPT_COMMAND="_alacritree_follow${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+
+# zsh (~/.zshrc)
+precmd_functions=(_alacritree_follow "${precmd_functions[@]}")
+```
+
+Both hooks cost one local-socket round trip per prompt; running both at once
+is fine — `_alacritree_follow` only `cd`s when the session's workspace points
+outside the current worktree, so it doesn't fight `_alacritree_report_cwd`
+over ordinary subdirectory moves within the same worktree. If you install
+both, `_alacritree_follow` must run before `_alacritree_report_cwd` in the
+same prompt (as shown above with `PROMPT_COMMAND`/`precmd_functions`
+prepending), so the follow hook `cd`s into an agent-moved workspace before
+report-cwd stamps the session with the (otherwise stale) `$PWD`.
 
 ---
 

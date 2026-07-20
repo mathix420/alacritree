@@ -99,6 +99,10 @@ const POWERLINE_TRIANGLE_LTR: char = '\u{e0b0}';
 const POWERLINE_ARROW_LTR: char = '\u{e0b1}';
 const POWERLINE_TRIANGLE_RTL: char = '\u{e0b2}';
 const POWERLINE_ARROW_RTL: char = '\u{e0b3}';
+const POWERLINE_ROUND_LTR: char = '\u{e0b4}';
+const POWERLINE_ROUND_HOLLOW_LTR: char = '\u{e0b5}';
+const POWERLINE_ROUND_RTL: char = '\u{e0b6}';
+const POWERLINE_ROUND_HOLLOW_RTL: char = '\u{e0b7}';
 
 /// Subset of `crossfont::Metrics` consumed by the built-in renderer.  Only
 /// the three fields actually referenced inside `box_drawing` /
@@ -137,7 +141,7 @@ pub fn is_builtin_glyph(c: char) -> bool {
         '\u{2500}'..='\u{259f}'
             | '\u{1fb00}'..='\u{1fb3b}'
             | '\u{1fb82}'..='\u{1fb8b}'
-            | POWERLINE_TRIANGLE_LTR..=POWERLINE_ARROW_RTL
+            | POWERLINE_TRIANGLE_LTR..=POWERLINE_ROUND_HOLLOW_RTL
     )
 }
 
@@ -156,6 +160,10 @@ pub fn builtin_glyph(
         // Powerline symbols: '','','',''
         POWERLINE_TRIANGLE_LTR..=POWERLINE_ARROW_RTL => {
             powerline_drawing(character, metrics, offset)?
+        },
+        // Rounded powerline caps: '','','',''
+        POWERLINE_ROUND_LTR..=POWERLINE_ROUND_HOLLOW_RTL => {
+            powerline_round_drawing(character, metrics, offset)
         },
         _ => return None,
     };
@@ -785,6 +793,73 @@ fn powerline_drawing(
     })
 }
 
+/// Rounded powerline caps (U+E0B4..=U+E0B7).  Upstream alacritty leaves these
+/// to the font, but a font glyph is sized to the font's line box rather than
+/// the pixel-floored cell, so it pokes out of the colored segment background
+/// it is supposed to cap — kitty and wezterm draw them built-in for the same
+/// reason.  The cap is the right half of an ellipse spanning the full cell
+/// (half circle in the common 1:2 cell, gracefully squashed elsewhere).
+fn powerline_round_drawing(character: char, metrics: &Metrics, offset: &FontDelta) -> BuiltinGlyph {
+    let height = (metrics.line_height as i32 + offset.y as i32).max(1) as usize;
+    let width = (metrics.average_advance as i32 + offset.x as i32).max(1) as usize;
+    let stroke_size = calculate_stroke_size(width) as f32;
+    let hollow =
+        character == POWERLINE_ROUND_HOLLOW_LTR || character == POWERLINE_ROUND_HOLLOW_RTL;
+
+    let rx = width as f32;
+    let ry = height as f32 / 2.;
+    let cy = ry;
+
+    // The ellipse solved for x: horizontal extent of the cap at height `y`,
+    // measured from the flat edge at x = 0.
+    let ellipse_x = |y: f32, rx: f32, ry: f32| -> f32 {
+        let t = (y - cy) / ry;
+        if t.abs() >= 1. { 0. } else { rx * (1. - t * t).sqrt() }
+    };
+
+    // Exact horizontal interval coverage per pixel, vertically supersampled:
+    // the edge is near-vertical along the bulge (where horizontal coverage is
+    // already exact) but turns horizontal at the cell's corners, where only
+    // the subsamples keep the curve smooth.
+    const SUBSAMPLES: usize = 4;
+    let mut canvas = Canvas::new(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            let mut coverage = 0.;
+            for sub in 0..SUBSAMPLES {
+                let sy = y as f32 + (sub as f32 + 0.5) / SUBSAMPLES as f32;
+                let hi = ellipse_x(sy, rx, ry);
+                // Hollow caps keep the inside empty; where the inner ellipse
+                // doesn't reach (the cell's corners, or a cell too small to
+                // hold one at all) the stroke runs to the flat edge, closing
+                // the arc's ends.
+                let lo = if hollow && ry > stroke_size {
+                    ellipse_x(sy, rx - stroke_size, ry - stroke_size)
+                } else {
+                    0.
+                };
+                coverage += (hi.min(x as f32 + 1.) - lo.max(x as f32)).clamp(0., 1.);
+            }
+            let value = coverage / SUBSAMPLES as f32;
+            canvas.put_pixel(x as f32, y as f32, Pixel::gray((COLOR_FILL._r as f32 * value) as u8));
+        }
+    }
+
+    if character == POWERLINE_ROUND_RTL || character == POWERLINE_ROUND_HOLLOW_RTL {
+        canvas.flip_horizontal();
+    }
+
+    let top = height as i32 + metrics.descent as i32;
+    BuiltinGlyph {
+        image: canvas.into_color_image(),
+        top,
+        left: 0,
+        height: height as i32,
+        width: width as i32,
+        advance: (width as i32, height as i32),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct Pixel {
     _r: u8,
@@ -1069,4 +1144,92 @@ fn calculate_stroke_size(cell_width: usize) -> usize {
 
 fn line_equation(slope: i32, x: i32, offset: i32) -> (f32, f32) {
     (x as f32, (slope * x + offset) as f32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CELL_W: usize = 10;
+    const CELL_H: usize = 21;
+
+    fn metrics() -> Metrics {
+        Metrics { average_advance: CELL_W as f64, line_height: CELL_H as f64, descent: 0.0 }
+    }
+
+    fn glyph(c: char) -> BuiltinGlyph {
+        builtin_glyph(c, &metrics(), &FontDelta::default(), &FontDelta::default())
+            .unwrap_or_else(|| panic!("U+{:04X} is not drawn by the built-in font", c as u32))
+    }
+
+    fn alpha_at(glyph: &BuiltinGlyph, x: usize, y: usize) -> u8 {
+        glyph.image.pixels[y * glyph.width as usize + x].a()
+    }
+
+    /// Rounded powerline caps (U+E0B4..=U+E0B7) must come from the built-in
+    /// renderer: font-provided glyphs are taller than the pixel-floored cell,
+    /// so they poke out of the colored segment backgrounds they cap.
+    #[test]
+    fn rounded_powerline_caps_are_builtin_and_cell_sized() {
+        for c in ['\u{e0b4}', '\u{e0b5}', '\u{e0b6}', '\u{e0b7}'] {
+            assert!(is_builtin_glyph(c), "U+{:04X} must be built-in", c as u32);
+            let glyph = glyph(c);
+            assert_eq!(glyph.width, CELL_W as i32, "U+{:04X} width", c as u32);
+            assert_eq!(glyph.height, CELL_H as i32, "U+{:04X} height", c as u32);
+        }
+    }
+
+    /// The solid right-pointing cap sits flush against the left cell edge
+    /// (where it joins the segment body) and tapers off toward the right.
+    #[test]
+    fn solid_round_cap_is_flush_left_and_tapers_right() {
+        let glyph = glyph('\u{e0b4}');
+        let mid_y = CELL_H / 2;
+        assert_eq!(alpha_at(&glyph, 0, mid_y), 255, "flat edge must be opaque at mid height");
+        assert_eq!(alpha_at(&glyph, CELL_W - 1, 0), 0, "top-right corner must stay empty");
+        assert_eq!(
+            alpha_at(&glyph, CELL_W - 1, CELL_H - 1),
+            0,
+            "bottom-right corner must stay empty"
+        );
+    }
+
+    /// The left-pointing solid cap is the mirror image of the right-pointing one.
+    #[test]
+    fn solid_round_caps_mirror_each_other() {
+        let ltr = glyph('\u{e0b4}');
+        let rtl = glyph('\u{e0b6}');
+        for y in 0..CELL_H {
+            for x in 0..CELL_W {
+                assert_eq!(
+                    alpha_at(&ltr, x, y),
+                    alpha_at(&rtl, CELL_W - 1 - x, y),
+                    "mirror mismatch at ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    /// The hollow variants draw only the arc: the interior next to the flat
+    /// edge stays empty so the underlying cell background shows through.
+    #[test]
+    fn hollow_round_cap_leaves_the_interior_empty() {
+        let glyph = glyph('\u{e0b5}');
+        let mid_y = CELL_H / 2;
+        assert_eq!(alpha_at(&glyph, 0, mid_y), 0, "interior must stay empty at the flat edge");
+        assert!(
+            (0..CELL_W).any(|x| alpha_at(&glyph, x, mid_y) >= 250),
+            "the arc must be drawn at mid height"
+        );
+    }
+
+    /// The flat triangles were already built-in; the rounded additions must not
+    /// have disturbed their coverage.
+    #[test]
+    fn flat_powerline_glyphs_remain_builtin() {
+        for c in ['\u{e0b0}', '\u{e0b1}', '\u{e0b2}', '\u{e0b3}'] {
+            assert!(is_builtin_glyph(c), "U+{:04X} must remain built-in", c as u32);
+            glyph(c);
+        }
+    }
 }

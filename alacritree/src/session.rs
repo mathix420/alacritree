@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -132,10 +133,11 @@ struct AgentCache {
 
 const AGENT_CACHE_TTL: Duration = Duration::from_millis(1000);
 
-/// Map a foreground process name (`/proc/<pid>/comm` on Linux, image name
-/// on Windows) to its static sidebar glyph.  Compared with `starts_with`:
-/// Linux `comm` is kernel-truncated to 15 bytes (`cursor-agent` would
-/// otherwise miss) and Windows names carry an `.exe` suffix.
+/// Map a foreground process name (`/proc/<pid>/comm` on Linux, `p_comm` on
+/// macOS, image name on Windows) to its static sidebar glyph.  Compared with
+/// `starts_with`: `comm` is kernel-truncated — 15 bytes on Linux, 16 on
+/// macOS (`cursor-agent` would otherwise miss) — and Windows names carry an
+/// `.exe` suffix.
 const AGENT_PROCESS_GLYPHS: &[(&str, char)] = &[
     ("claude", '✳'),
     ("codex", '◇'),
@@ -196,7 +198,7 @@ fn agent_glyph_by_name(names: impl IntoIterator<Item = impl AsRef<str>>) -> Opti
 /// direction.  Matches Linux `comm` values (`tmux: client`) and Windows
 /// image names (`nvim.exe`) alike; gvim stays out — it owns its own
 /// window and never runs inside the terminal.
-#[cfg(any(test, target_os = "linux", windows))]
+#[cfg(any(test, target_os = "linux", target_os = "macos", windows))]
 fn is_nav_tui_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     n.starts_with("nvim") || n.starts_with("vim") || n.starts_with("tmux")
@@ -359,25 +361,18 @@ fn pty_shell_pid(_pty: &alacritty_terminal::tty::Pty) -> Option<u32> {
     None
 }
 
-#[cfg(target_os = "linux")]
-fn foreground_process_glyph(shell_pid: u32) -> Option<char> {
-    let tpgid = read_tpgid(shell_pid)?;
-    if tpgid <= 0 {
-        return None;
-    }
-    let comm = std::fs::read_to_string(format!("/proc/{tpgid}/comm")).ok();
-    let cmdline = read_cmdline(tpgid as u32);
-    let comm_trim = comm.as_deref().map(str::trim).unwrap_or("");
-
-    // Match `comm` first (cheap), then anywhere in `cmdline` — picks up
-    // `node /path/to/agent-cli.js`-style wrappers that hide behind their
-    // runtime's name.
+/// Match a foreground process against the agent map: `comm` first (cheap),
+/// then anywhere in `cmdline` — picks up `node /path/to/agent-cli.js`-style
+/// wrappers that hide behind their runtime's name.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn agent_glyph_for(comm: Option<&str>, cmdline: Option<&str>) -> Option<char> {
+    let comm_trim = comm.map(str::trim).unwrap_or("");
     let by_comm =
         AGENT_PROCESS_GLYPHS.iter().find(|(name, _)| comm_trim.starts_with(name)).map(|(_, g)| *g);
     if by_comm.is_some() {
         return by_comm;
     }
-    if let Some(cmd) = &cmdline {
+    if let Some(cmd) = cmdline {
         let glyph =
             AGENT_PROCESS_GLYPHS.iter().find(|(name, _)| cmd.contains(name)).map(|(_, g)| *g);
         if glyph.is_some() {
@@ -386,6 +381,17 @@ fn foreground_process_glyph(shell_pid: u32) -> Option<char> {
         log::debug!("foreground process not matched: comm={comm_trim:?} cmdline={cmd:?}");
     }
     None
+}
+
+#[cfg(target_os = "linux")]
+fn foreground_process_glyph(shell_pid: u32) -> Option<char> {
+    let tpgid = read_tpgid(shell_pid)?;
+    if tpgid <= 0 {
+        return None;
+    }
+    let comm = std::fs::read_to_string(format!("/proc/{tpgid}/comm")).ok();
+    let cmdline = read_cmdline(tpgid as u32);
+    agent_glyph_for(comm.as_deref(), cmdline.as_deref())
 }
 
 #[cfg(target_os = "linux")]
@@ -431,6 +437,136 @@ fn shell_has_foreground_job(shell_pid: u32) -> bool {
     stat_pgrp_tpgid(&stat).is_some_and(|(pgrp, tpgid)| tpgid > 0 && tpgid != pgrp)
 }
 
+/// The macOS analogue of the `/proc` reads: `proc_pidinfo(PROC_PIDTBSDINFO)`
+/// returns a `proc_bsdinfo` carrying the process group (`pbi_pgid`), the
+/// terminal's foreground group (`e_tpgid`), and the command name
+/// (`pbi_comm`) — the same fields Linux takes from `/proc/<pid>/stat` and
+/// `comm`.
+#[cfg(target_os = "macos")]
+fn bsdinfo_for_pid(pid: u32) -> Option<libc::proc_bsdinfo> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    // A vanished or inaccessible pid reports fewer bytes than the struct.
+    (written == size).then_some(info)
+}
+
+#[cfg(target_os = "macos")]
+fn pgid_tpgid(pid: u32) -> Option<(u32, u32)> {
+    let info = bsdinfo_for_pid(pid)?;
+    Some((info.pbi_pgid, info.e_tpgid))
+}
+
+/// A process without a controlling terminal reports `e_tpgid` as 0 or as
+/// `-1` wrapped into the unsigned field; neither names a foreground group.
+#[cfg(target_os = "macos")]
+fn foreground_group(tpgid: u32) -> Option<u32> {
+    (tpgid != 0 && tpgid != u32::MAX).then_some(tpgid)
+}
+
+/// `pbi_comm` is kernel-truncated to 16 bytes, like the 15-byte Linux `comm`
+/// — which is why the agent map matches with `starts_with`.
+#[cfg(target_os = "macos")]
+fn comm_for_pid(pid: u32) -> Option<String> {
+    let info = bsdinfo_for_pid(pid)?;
+    let bytes: Vec<u8> = info.pbi_comm.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+    (!bytes.is_empty()).then(|| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// `KERN_PROCARGS2` is readable for same-user processes, which the shell's
+/// foreground job always is.
+#[cfg(target_os = "macos")]
+fn read_cmdline(pid: u32) -> Option<String> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut size = 0usize;
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; size];
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    buf.truncate(size);
+    procargs2_cmdline(&buf)
+}
+
+/// `KERN_PROCARGS2` layout: native-endian `argc`, the executable path, NUL
+/// padding, then argv and environment strings, all NUL-terminated.  Taking
+/// exactly `argc` strings keeps the environment out; spaces join the args
+/// the same way the Linux `/proc/<pid>/cmdline` read renders them.
+#[cfg(target_os = "macos")]
+fn procargs2_cmdline(buf: &[u8]) -> Option<String> {
+    let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?);
+    let argc = usize::try_from(argc).ok().filter(|&n| n > 0)?;
+    let after_exec = buf[4..].iter().position(|&b| b == 0).map(|nul| &buf[4 + nul..])?;
+    let args_start = after_exec.iter().position(|&b| b != 0)?;
+    let joined = after_exec[args_start..]
+        .split(|&b| b == 0)
+        .take(argc)
+        .map(String::from_utf8_lossy)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let joined = joined.trim().to_string();
+    (!joined.is_empty()).then_some(joined)
+}
+
+#[cfg(target_os = "macos")]
+fn foreground_process_glyph(shell_pid: u32) -> Option<char> {
+    let (_, tpgid) = pgid_tpgid(shell_pid)?;
+    let tpgid = foreground_group(tpgid)?;
+    let comm = comm_for_pid(tpgid);
+    let cmdline = read_cmdline(tpgid);
+    agent_glyph_for(comm.as_deref(), cmdline.as_deref())
+}
+
+/// Same rule as Linux: the shell is its own foreground group when idle, so
+/// the terminal's foreground group differing from the shell's own group
+/// means a job owns the terminal right now.
+#[cfg(target_os = "macos")]
+fn shell_has_foreground_job(shell_pid: u32) -> bool {
+    pgid_tpgid(shell_pid)
+        .is_some_and(|(pgid, tpgid)| foreground_group(tpgid).is_some_and(|t| t != pgid))
+}
+
+#[cfg(target_os = "macos")]
+fn foreground_nav_tui(shell_pid: u32) -> bool {
+    let Some((_, tpgid)) = pgid_tpgid(shell_pid) else {
+        return false;
+    };
+    let Some(tpgid) = foreground_group(tpgid) else {
+        return false;
+    };
+    comm_for_pid(tpgid).is_some_and(|comm| is_nav_tui_name(comm.trim()))
+}
+
 /// Windows has no foreground process group, so "a job is running" is
 /// approximated as the shell having any descendant process — the same
 /// approximation the agent glyph uses.
@@ -439,9 +575,9 @@ fn shell_has_foreground_job(shell_pid: u32) -> bool {
     windows_process_probe::probe(shell_pid).1
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn shell_has_foreground_job(_shell_pid: u32) -> bool {
-    // No probe wired (macOS would need `tcgetpgrp` on the PTY master).
+    // No probe wired for this platform (BSDs would mirror the macOS sysctl).
     false
 }
 
@@ -455,10 +591,9 @@ fn foreground_process_glyph(shell_pid: u32) -> Option<char> {
     windows_process_probe::probe(shell_pid).0
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn foreground_process_glyph(_shell_pid: u32) -> Option<char> {
-    // macOS would use `libproc::proc_pidfdinfo` / `tcgetpgrp` on the master
-    // FD.  Not wired up yet.
+    // No probe wired for this platform (BSDs would mirror the macOS sysctl).
     None
 }
 
@@ -484,9 +619,9 @@ fn foreground_nav_tui(shell_pid: u32) -> bool {
     windows_process_probe::probe(shell_pid).2
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn foreground_nav_tui(_shell_pid: u32) -> bool {
-    // Same gap as the glyph probe: macOS isn't wired up yet.
+    // Same gap as the glyph probe: no probe wired for this platform.
     false
 }
 
@@ -516,6 +651,27 @@ fn ensure_working_directory(dir: Option<&Path>) -> std::io::Result<()> {
         )),
         _ => Ok(()),
     }
+}
+
+/// The directory the PTY starts in: an explicit workspace dir always wins,
+/// then `[general] working_directory` fills in for sessions without one (the
+/// home tab).  A configured dir that does not exist is dropped with a warning
+/// rather than failing the spawn — a stale config value must not stop the
+/// home tab from opening (alacritty ignores an invalid `--working-directory`
+/// the same way).
+fn pty_working_directory(explicit: Option<PathBuf>, config: &Config) -> Option<PathBuf> {
+    explicit.or_else(|| {
+        config.working_directory.clone().filter(|dir| {
+            let ok = dir.is_dir();
+            if !ok {
+                log::warn!(
+                    "general.working_directory {} is not a directory; ignoring",
+                    dir.display()
+                );
+            }
+            ok
+        })
+    })
 }
 
 #[cfg(windows)]
@@ -586,6 +742,31 @@ mod windows_process_probe {
             .map(|p| p.cmd().iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "));
         (agent_glyph_by_cmdline(cmds), has_children, nav_tui)
     }
+}
+
+/// The environment a session's PTY starts with: the user's `[env]` table,
+/// the diff-pane `LESS` default, and the session's own id — how a process
+/// inside the terminal names itself to `alacritree session move` / the MCP
+/// tools.
+fn session_env(
+    config_env: &HashMap<String, String>,
+    kind: &SessionKind,
+    id: SessionId,
+) -> HashMap<String, String> {
+    let mut env = config_env.clone();
+    if matches!(kind, SessionKind::Diff { .. }) {
+        // git hands its pager `LESS=FRX`; both of those defaults hurt a diff
+        // tab. `F` (quit-if-one-screen) makes delta's `less` exit the instant
+        // a diff fits the pane, so the tab is reaped before it can be read.
+        // `X` (no-init) keeps `less` off the alternate screen, and without
+        // `ALT_SCREEN` the wheel loses its alternate-scroll arrow keys
+        // (`terminal_view::apply_scroll`) and falls back to a scrollback that
+        // `-X` repaints over instead of filling, leaving the pane unscrollable.
+        // A `LESS` set by the user (via `[env]`) wins.
+        env.entry("LESS".to_string()).or_insert_with(|| "R".to_string());
+    }
+    env.insert("ALACRITREE_SESSION_ID".to_string(), id.to_string());
+    env
 }
 
 impl Session {
@@ -663,7 +844,8 @@ impl Session {
         escape_args: bool,
         wsl_probe: Option<WslProbe>,
     ) -> std::io::Result<Self> {
-        ensure_working_directory(working_directory.as_deref())?;
+        let pty_cwd = pty_working_directory(working_directory.clone(), config);
+        ensure_working_directory(pty_cwd.as_deref())?;
         let window_size = window_size(size, cell_size);
 
         let (proxy, events) = EventProxy::new(ctx);
@@ -671,24 +853,14 @@ impl Session {
         let term = Term::new(term_config(config), &size, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
 
-        let mut env = config.env.clone();
-        if matches!(kind, SessionKind::Diff { .. }) {
-            // git hands its pager `LESS=FRX`; both of those defaults hurt a diff
-            // tab. `F` (quit-if-one-screen) makes delta's `less` exit the instant
-            // a diff fits the pane, so the tab is reaped before it can be read.
-            // `X` (no-init) keeps `less` off the alternate screen, and without
-            // `ALT_SCREEN` the wheel loses its alternate-scroll arrow keys
-            // (`terminal_view::apply_scroll`) and falls back to a scrollback that
-            // `-X` repaints over instead of filling, leaving the pane unscrollable.
-            // A `LESS` set by the user (via `[env]`) wins.
-            env.entry("LESS".to_string()).or_insert_with(|| "R".to_string());
-        }
+        let id = next_session_id();
+        let env = session_env(&config.env, &kind, id);
 
         #[cfg(not(windows))]
         let _ = escape_args;
         let pty_options = PtyOptions {
             shell,
-            working_directory: working_directory.clone(),
+            working_directory: pty_cwd,
             drain_on_exit: false,
             env,
             // Windows has no argv: alacritty_terminal joins these args into a
@@ -715,7 +887,7 @@ impl Session {
             wsl_helper::register_probe(&probe.distro, &probe.key);
         }
         Ok(Self {
-            id: next_session_id(),
+            id,
             title,
             working_directory,
             kind,
@@ -801,7 +973,8 @@ impl Session {
     }
 
     /// Sidebar glyph for the agent running here.  Identity comes from the
-    /// PTY's foreground process (`/proc` on Linux); the displayed glyph
+    /// PTY's foreground process (`/proc` on Linux, `sysctl` on macOS); the
+    /// displayed glyph
     /// prefers the title's current leading char so the agent's own spinner
     /// frames animate for free, falling back to a per-agent static glyph
     /// when the title is plain ASCII.  When proc identification yields
@@ -817,8 +990,8 @@ impl Session {
     }
 
     /// A session "looks busy" when a process is running in the terminal
-    /// (a foreground job on Linux, any descendant of the shell on Windows,
-    /// the helper's foreground probe for shimmed WSL sessions), its
+    /// (a foreground job on Linux/macOS, any descendant of the shell on
+    /// Windows, the helper's foreground probe for shimmed WSL sessions), its
     /// foreground process is a recognized agent, or its title is in a
     /// spinner state — the signal the close-confirmation policy keys on.
     pub fn is_busy(&self) -> bool {
@@ -993,6 +1166,96 @@ mod tests {
 
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn procargs2_cmdline_joins_argv_and_skips_exec_path() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3i32.to_ne_bytes());
+        buf.extend_from_slice(b"/usr/local/bin/node\0\0\0\0");
+        // argv, then the environment block `take(argc)` must never reach.
+        buf.extend_from_slice(b"node\0/path/claude-code/cli.js\0--continue\0HOME=/Users/x\0");
+        assert_eq!(
+            procargs2_cmdline(&buf).as_deref(),
+            Some("node /path/claude-code/cli.js --continue")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn procargs2_cmdline_rejects_truncated_or_empty_buffers() {
+        assert_eq!(procargs2_cmdline(b""), None);
+        assert_eq!(procargs2_cmdline(&0i32.to_ne_bytes()), None);
+        assert_eq!(procargs2_cmdline(&3i32.to_ne_bytes()), None);
+    }
+
+    /// Drives the real sysctl against a real child: its `p_comm` is the
+    /// spawned binary's name and a plain spawn inherits our process group.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sysctl_probe_reads_a_real_childs_comm_and_group() {
+        let mut child = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let comm = comm_for_pid(child.id());
+        let groups = pgid_tpgid(child.id());
+        child.kill().ok();
+        child.wait().ok();
+        assert_eq!(comm.as_deref(), Some("sleep"));
+        let own_pgid = unsafe { libc::getpgrp() };
+        assert_eq!(groups.map(|(pgid, _)| pgid), Some(own_pgid as u32));
+    }
+
+    /// Drives the real foreground-group probe against a real PTY shell: an
+    /// idle shell owns its terminal, a running job flips the probe, and the
+    /// job's comm names it as the foreground process.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_real_shells_foreground_job_flips_the_probe() {
+        let mut config = Config::default();
+        config.env.insert("TERM".to_string(), "xterm-256color".to_string());
+
+        let session = Session::spawn_command(
+            egui::Context::default(),
+            &config,
+            std::env::current_dir().ok(),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            "/bin/zsh".to_string(),
+            // `-f` skips the user's rc files, whose plugins run transient
+            // foreground jobs of their own that would race the probe.
+            vec!["-f".to_string(), "-i".to_string()],
+            "probe".to_string(),
+            SessionKind::Shell,
+        )
+        .unwrap();
+        let shell_pid = session.shell_pid.expect("unix PTYs always report the child pid");
+
+        // The shell owning its terminal (tpgid == pgid) is exactly the state
+        // the probe reads as "not busy".
+        let start = Instant::now();
+        while pgid_tpgid(shell_pid).is_none_or(|(pgid, tpgid)| tpgid != pgid) {
+            assert!(start.elapsed() < Duration::from_secs(10), "shell never took the terminal");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Absolute path: a `sleep` from PATH may be a differently-named
+        // multi-call binary (uutils coreutils).
+        session.write(b"/bin/sleep 30\n".to_vec());
+        let start = Instant::now();
+        loop {
+            let foreground_comm = pgid_tpgid(shell_pid)
+                .and_then(|(_, tpgid)| foreground_group(tpgid))
+                .and_then(comm_for_pid);
+            if shell_has_foreground_job(shell_pid) && foreground_comm.as_deref() == Some("sleep") {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the running job never flipped the foreground probe (last foreground comm: \
+                 {foreground_comm:?})"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// OSC 52 is how Claude Code, tmux and vim copy.  The sequence is
     /// fire-and-forget — the app reports a successful copy either way — so a
     /// dropped `ClipboardStore` shows up only as a stale paste later.  Drives
@@ -1150,6 +1413,77 @@ mod tests {
             "`cmd /c echo ready` took {exited:?}; the console host is stalling on a \
              handshake (the foreign conpty.dll stall is ~3s)"
         );
+    }
+
+    /// `[general] working_directory` supplies the PTY start dir when a session
+    /// has no explicit one (the home tab), without becoming the session's
+    /// workspace identity — a home-tab session must keep `working_directory:
+    /// None` or it would be filtered into a worktree workspace.
+    #[test]
+    fn a_home_session_starts_in_the_configured_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut config = Config::default();
+        config.working_directory = Some(dir.path().to_path_buf());
+
+        // The child writes its cwd into a relative path; the file landing in
+        // `dir` is itself proof the PTY honored the configured directory.
+        #[cfg(windows)]
+        let (program, args) = ("cmd", vec!["/c", "cd", ">", "cwd-probe.txt"]);
+        #[cfg(not(windows))]
+        let (program, args) = ("sh", vec!["-c", "pwd > cwd-probe.txt"]);
+
+        let session = Session::spawn_command(
+            egui::Context::default(),
+            &config,
+            None,
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            program.to_string(),
+            args.into_iter().map(str::to_string).collect(),
+            "probe".to_string(),
+            SessionKind::Shell,
+        )
+        .unwrap();
+
+        assert!(
+            session.working_directory.is_none(),
+            "the configured cwd must not turn the home tab into a worktree workspace"
+        );
+
+        let start = Instant::now();
+        loop {
+            assert!(start.elapsed() < Duration::from_secs(10), "child never exited");
+            match session.events.try_recv() {
+                Ok(TermEvent::ChildExit(_)) => break,
+                Ok(_) => {},
+                Err(_) => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+
+        let content = std::fs::read_to_string(dir.path().join("cwd-probe.txt"))
+            .expect("no probe file: the child did not start in general.working_directory");
+        let reported = PathBuf::from(content.trim()).canonicalize().unwrap();
+        assert_eq!(reported, dir.path().canonicalize().unwrap());
+    }
+
+    /// An explicit workspace dir (worktree/project tab) always wins over the
+    /// configured default, and a configured dir that no longer exists is
+    /// dropped rather than failing the spawn.
+    #[test]
+    fn explicit_dirs_win_and_missing_configured_dirs_are_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.working_directory = Some(tmp.path().join("gone"));
+
+        assert_eq!(
+            pty_working_directory(Some(tmp.path().to_path_buf()), &config),
+            Some(tmp.path().to_path_buf())
+        );
+        assert_eq!(pty_working_directory(None, &config), None);
+
+        config.working_directory = Some(tmp.path().to_path_buf());
+        assert_eq!(pty_working_directory(None, &config), Some(tmp.path().to_path_buf()));
     }
 
     #[derive(Default)]
@@ -1372,5 +1706,21 @@ mod tests {
             r"node C:\Users\lev\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js";
         assert_eq!(agent_glyph_by_cmdline([cmd]), Some('✳'));
         assert_eq!(agent_glyph_by_cmdline([r"pwsh.exe -NoLogo"]), None);
+    }
+
+    #[test]
+    fn every_session_exports_its_id_into_the_environment() {
+        let env = session_env(&Default::default(), &SessionKind::Shell, 42);
+        assert_eq!(env.get("ALACRITREE_SESSION_ID").map(String::as_str), Some("42"));
+    }
+
+    /// The `[env]` table is the user's; the id key is ours.  A user-set
+    /// `ALACRITREE_SESSION_ID` would misroute every shell hook, so ours wins.
+    #[test]
+    fn the_session_id_overrides_a_user_env_entry() {
+        let mut user = std::collections::HashMap::new();
+        user.insert("ALACRITREE_SESSION_ID".to_string(), "999".to_string());
+        let env = session_env(&user, &SessionKind::Shell, 7);
+        assert_eq!(env.get("ALACRITREE_SESSION_ID").map(String::as_str), Some("7"));
     }
 }

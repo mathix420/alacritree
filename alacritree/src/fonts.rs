@@ -379,18 +379,19 @@ pub struct ChainFace {
     pub color_only: bool,
 }
 
-/// Bookkeeping shared by all fallback registration within one install: which
-/// files already back an egui font, which font id serves each file (so one
-/// file can join several variants' family lists without duplicate data), and
+/// Bookkeeping shared by all fallback registration within one install, keyed
+/// by `(file, face index)` because a collection file holds many faces: which
+/// faces already back an egui font, which font id serves each face (so one
+/// face can join several variants' family lists without duplicate data), and
 /// which user entries have already produced a warning.
 #[derive(Default)]
 struct FallbackBook {
-    loaded_paths: HashSet<PathBuf>,
-    ids_by_path: HashMap<PathBuf, String>,
+    loaded_faces: HashSet<(PathBuf, u32)>,
+    ids_by_face: HashMap<(PathBuf, u32), String>,
     warned_entries: HashSet<String>,
     /// Faces withheld from egui because they carry no outlines.  Kept so a
-    /// later variant's chain doesn't re-read and re-probe the same file.
-    color_only: HashSet<PathBuf>,
+    /// later variant's chain doesn't re-read and re-probe the same face.
+    color_only: HashSet<(PathBuf, u32)>,
     /// Height ratio of the primary normal face, used to normalize fallback
     /// faces to the same visual size at a given point size.
     primary_height_ratio: Option<f32>,
@@ -486,6 +487,15 @@ fn is_color_only(data: &[u8], index: u32) -> bool {
     probed > 0 && !outlined
 }
 
+/// Whether epaint will accept this face.  epaint re-parses every registered
+/// face with ab_glyph and aborts the process on failure, so a face must pass
+/// this exact parse before it may reach the definitions.  System font indexes
+/// commonly list faces ab_glyph rejects — macOS `.dfont` suitcases and
+/// bitmap-only families — which the ttf_parser-based probes here don't catch.
+fn epaint_can_parse(bytes: &[u8], face_index: u32) -> bool {
+    ab_glyph::FontRef::try_from_slice_and_index(bytes, face_index).is_ok()
+}
+
 /// Register the user-configured `[font] fallback` entries for one variant.
 /// They slot between the primary face and the automatic system chain, in
 /// list order.  Entries are family names or font file paths, resolved with
@@ -505,18 +515,19 @@ fn register_user_fallbacks(
             }
             continue;
         };
-        if book.color_only.contains(&resolved.path) {
+        let key = (resolved.path.clone(), resolved.face_index);
+        if book.color_only.contains(&key) {
             book.extend_chain(variant, &resolved.path, resolved.face_index, true);
             continue;
         }
-        if let Some(id) = book.ids_by_path.get(&resolved.path) {
+        if let Some(id) = book.ids_by_face.get(&key) {
             for family in targets {
                 defs.families.entry(family.clone()).or_default().push(id.clone());
             }
             book.extend_chain(variant, &resolved.path, resolved.face_index, false);
             continue;
         }
-        if book.loaded_paths.contains(&resolved.path) {
+        if book.loaded_faces.contains(&key) {
             // Already registered as a primary face, which sits ahead of every
             // fallback in the family lists; appending it again is pointless.
             continue;
@@ -532,8 +543,14 @@ fn register_user_fallbacks(
             log::debug!(
                 "font.fallback entry '{entry}' has no outlines; drawing it as colour glyphs"
             );
-            book.color_only.insert(resolved.path.clone());
+            book.color_only.insert(key);
             book.extend_chain(variant, &resolved.path, resolved.face_index, true);
+            continue;
+        }
+        if !epaint_can_parse(bytes, resolved.face_index) {
+            if book.warned_entries.insert(entry.clone()) {
+                log::warn!("font.fallback entry '{entry}' is not a parseable TTF/OTF; skipping");
+            }
             continue;
         }
         let id = format!("alacritree_fallback_{}", defs.font_data.len());
@@ -544,8 +561,8 @@ fn register_user_fallbacks(
             defs.families.entry(family.clone()).or_default().push(id.clone());
         }
         book.extend_chain(variant, &resolved.path, resolved.face_index, false);
-        book.loaded_paths.insert(resolved.path.clone());
-        book.ids_by_path.insert(resolved.path, id);
+        book.loaded_faces.insert(key.clone());
+        book.ids_by_face.insert(key, id);
     }
 }
 
@@ -596,7 +613,14 @@ fn install_ui_font(defs: &mut FontDefinitions, family_or_path: &str, fonts: &Sys
             return false;
         },
     };
-    insert_face(defs, UI_FONT_ID, bytes);
+    if !epaint_can_parse(bytes, resolved.face_index) {
+        log::warn!(
+            "ui font file {} is not a parseable TTF/OTF; keeping the terminal font",
+            resolved.path.display()
+        );
+        return false;
+    }
+    insert_face(defs, UI_FONT_ID, bytes, resolved.face_index);
     let ui_family = FontFamily::Name(UI_FAMILY.into());
     defs.families.insert(ui_family.clone(), vec![UI_FONT_ID.to_string()]);
 
@@ -604,7 +628,7 @@ fn install_ui_font(defs: &mut FontDefinitions, family_or_path: &str, fonts: &Sys
     // chain (which feeds the colour-glyph renderer), and fallback height
     // normalization must anchor to the UI face, not the terminal face.
     let mut book = FallbackBook::default();
-    book.loaded_paths.insert(resolved.path.clone());
+    book.loaded_faces.insert((resolved.path.clone(), resolved.face_index));
     book.primary_height_ratio = face_height_ratio(bytes, resolved.face_index);
     let targets = [ui_family.clone()];
     register_fallback_faces(
@@ -635,69 +659,88 @@ pub fn install_terminal_fonts(
     font: &FontConfig,
     ui_family: Option<&str>,
 ) -> Vec<ChainFace> {
+    let fonts = SystemFonts::default();
+    match build_font_definitions(font, ui_family, &fonts) {
+        Some((defs, chain)) => {
+            ctx.set_fonts(defs);
+            chain
+        },
+        None => Vec::new(),
+    }
+}
+
+/// Resolve and register every face for `install_terminal_fonts`, separated
+/// from the egui handoff so tests can inspect what registration produced.
+fn build_font_definitions(
+    font: &FontConfig,
+    ui_family: Option<&str>,
+    fonts: &SystemFonts,
+) -> Option<(FontDefinitions, Vec<ChainFace>)> {
     let (normal, bold, italic, bold_italic) =
         (&font.normal, &font.bold, &font.italic, &font.bold_italic);
     let family = normal.family.as_deref().unwrap_or(DEFAULT_FAMILY);
-    let fonts = SystemFonts::default();
 
     // The variant lookups compare their resolved path against this one to
     // detect when fontconfig substituted the regular face for a missing variant.
-    let normal_match = match resolve_face(family, normal.style.as_deref(), Variant::Normal, &fonts)
-    {
+    let normal_match = match resolve_face(family, normal.style.as_deref(), Variant::Normal, fonts) {
         Some(m) => m,
         None => {
             log::warn!("could not resolve font '{family}'; using bundled monospace");
-            return Vec::new();
+            return None;
         },
     };
     let normal_bytes = match map_font_file(&normal_match.path) {
         Ok(b) => b,
         Err(e) => {
             log::warn!("could not read font file {}: {e}", normal_match.path.display());
-            return Vec::new();
+            return None;
         },
     };
+    if !epaint_can_parse(normal_bytes, normal_match.face_index) {
+        log::warn!(
+            "font '{family}' resolved to {} which is not a parseable TTF/OTF; using bundled \
+             monospace",
+            normal_match.path.display()
+        );
+        return None;
+    }
 
     // Bold/italic/bold-italic inherit the normal family unless overridden.
     let bold_family = bold.family.as_deref().unwrap_or(family);
     let italic_family = italic.family.as_deref().unwrap_or(family);
     let bold_italic_family = bold_italic.family.as_deref().unwrap_or(family);
 
-    let bold_bytes =
-        load_variant(bold_family, bold.style.as_deref(), Variant::Bold, &normal_match.path, &fonts);
-    let italic_bytes = load_variant(
-        italic_family,
-        italic.style.as_deref(),
-        Variant::Italic,
-        &normal_match.path,
-        &fonts,
-    );
-    let bold_italic_bytes = load_variant(
+    let bold_face =
+        load_variant(bold_family, bold.style.as_deref(), Variant::Bold, &normal_match, fonts);
+    let italic_face =
+        load_variant(italic_family, italic.style.as_deref(), Variant::Italic, &normal_match, fonts);
+    let bold_italic_face = load_variant(
         bold_italic_family,
         bold_italic.style.as_deref(),
         Variant::BoldItalic,
-        &normal_match.path,
-        &fonts,
+        &normal_match,
+        fonts,
     );
 
     let mut defs = FontDefinitions::default();
+    let normal_face = (normal_bytes, normal_match.face_index);
 
-    insert_face(&mut defs, NORMAL_FONT_ID, normal_bytes);
+    insert_face(&mut defs, NORMAL_FONT_ID, normal_bytes, normal_match.face_index);
     register_default_family(&mut defs, FontFamily::Monospace, NORMAL_FONT_ID);
     register_default_family(&mut defs, FontFamily::Proportional, NORMAL_FONT_ID);
 
-    register_variant(&mut defs, BOLD_FONT_ID, BOLD_FAMILY, bold_bytes, normal_bytes);
-    register_variant(&mut defs, ITALIC_FONT_ID, ITALIC_FAMILY, italic_bytes, normal_bytes);
+    register_variant(&mut defs, BOLD_FONT_ID, BOLD_FAMILY, bold_face, normal_face);
+    register_variant(&mut defs, ITALIC_FONT_ID, ITALIC_FAMILY, italic_face, normal_face);
     register_variant(
         &mut defs,
         BOLD_ITALIC_FONT_ID,
         BOLD_ITALIC_FAMILY,
-        bold_italic_bytes,
-        normal_bytes,
+        bold_italic_face,
+        normal_face,
     );
 
     let mut book = FallbackBook::default();
-    book.loaded_paths.insert(normal_match.path.clone());
+    book.loaded_faces.insert((normal_match.path.clone(), normal_match.face_index));
     book.primary_height_ratio = face_height_ratio(normal_bytes, normal_match.face_index);
     // The primary is registered unconditionally above, so it heads the chain
     // as an egui-drawable face even in the pathological case of a colour-only
@@ -726,16 +769,15 @@ pub fn install_terminal_fonts(
         ),
     ];
     for (family, style, variant, targets) in seeds {
-        register_user_fallbacks(&mut defs, &font.fallback, variant, targets, &fonts, &mut book);
-        register_fallback_faces(&mut defs, family, style, variant, targets, &fonts, &mut book);
+        register_user_fallbacks(&mut defs, &font.fallback, variant, targets, fonts, &mut book);
+        register_fallback_faces(&mut defs, family, style, variant, targets, fonts, &mut book);
     }
 
     if let Some(ui_family) = ui_family {
-        install_ui_font(&mut defs, ui_family, &fonts);
+        install_ui_font(&mut defs, ui_family, fonts);
     }
 
-    ctx.set_fonts(defs);
-    book.chain
+    Some((defs, book.chain))
 }
 
 /// Append every font from fontconfig's trimmed sort to `target_families` so
@@ -753,10 +795,10 @@ fn register_fallback_faces(
 ) {
     // Only primaries lack an id to reuse; everything else the chain finds
     // can join this variant's family list without reloading.
-    let primaries: HashSet<PathBuf> = book
-        .loaded_paths
+    let primaries: HashSet<(PathBuf, u32)> = book
+        .loaded_faces
         .iter()
-        .filter(|path| !book.ids_by_path.contains_key(*path))
+        .filter(|face| !book.ids_by_face.contains_key(*face))
         .cloned()
         .collect();
     let fallbacks =
@@ -766,11 +808,12 @@ fn register_fallback_faces(
     }
 
     for face in fallbacks {
-        if book.color_only.contains(&face.path) {
+        let key = (face.path.clone(), face.face_index);
+        if book.color_only.contains(&key) {
             book.extend_chain(variant, &face.path, face.face_index, true);
             continue;
         }
-        if let Some(id) = book.ids_by_path.get(&face.path) {
+        if let Some(id) = book.ids_by_face.get(&key) {
             for family in target_families {
                 defs.families.entry(family.clone()).or_default().push(id.clone());
             }
@@ -785,8 +828,16 @@ fn register_fallback_faces(
             },
         };
         if is_color_only(bytes, face.face_index) {
-            book.color_only.insert(face.path.clone());
+            book.color_only.insert(key);
             book.extend_chain(variant, &face.path, face.face_index, true);
+            continue;
+        }
+        if !epaint_can_parse(bytes, face.face_index) {
+            log::debug!(
+                "skipping fallback font {} (face {}): not a parseable TTF/OTF",
+                face.path.display(),
+                face.face_index
+            );
             continue;
         }
         let id = format!("alacritree_fallback_{}", defs.font_data.len());
@@ -798,8 +849,8 @@ fn register_fallback_faces(
             defs.families.entry(family.clone()).or_default().push(id.clone());
         }
         book.extend_chain(variant, &face.path, face.face_index, false);
-        book.loaded_paths.insert(face.path.clone());
-        book.ids_by_path.insert(face.path, id);
+        book.loaded_faces.insert(key.clone());
+        book.ids_by_face.insert(key, id);
     }
 }
 
@@ -813,11 +864,11 @@ fn gather_fallback_faces(
     family: &str,
     style: Option<&str>,
     variant: Variant,
-    skip_paths: &HashSet<PathBuf>,
+    skip_faces: &HashSet<(PathBuf, u32)>,
     limit: usize,
     _fonts: &SystemFonts,
 ) -> Vec<FallbackFace> {
-    fontconfig_resolve::sorted_fallbacks(family, style, variant, skip_paths, limit)
+    fontconfig_resolve::sorted_fallbacks(family, style, variant, skip_faces, limit)
 }
 
 #[cfg(not(unix))]
@@ -833,12 +884,12 @@ fn cmap_coverage(face: &ttf_parser::Face) -> Option<coverage::Coverage> {
     Some(coverage::Coverage::from_codepoints(codepoints))
 }
 
-/// Coverage of an already-resolved primary face.  Reads index 0, matching
-/// how the primary bytes are handed to egui.
+/// Coverage of an already-resolved primary face, read at its resolved face
+/// index — face 0 of a collection file can be an unrelated family.
 #[cfg(not(unix))]
-fn face_coverage_from_path(path: &Path) -> Option<coverage::Coverage> {
+fn face_coverage(path: &Path, face_index: u32) -> Option<coverage::Coverage> {
     let data = std::fs::read(path).ok()?;
-    let parsed = ttf_parser::Face::parse(&data, 0).ok()?;
+    let parsed = ttf_parser::Face::parse(&data, face_index).ok()?;
     cmap_coverage(&parsed)
 }
 
@@ -850,18 +901,20 @@ fn gather_fallback_faces(
     family: &str,
     style: Option<&str>,
     variant: Variant,
-    skip_paths: &HashSet<PathBuf>,
+    skip_faces: &HashSet<(PathBuf, u32)>,
     limit: usize,
     fonts: &SystemFonts,
 ) -> Vec<FallbackFace> {
     let seed_coverage = resolve_face(family, style, variant, fonts)
-        .and_then(|face| face_coverage_from_path(&face.path))
+        .and_then(|face| face_coverage(&face.path, face.face_index))
         .unwrap_or_default();
 
     let mut candidates: Vec<_> = fonts
         .scanned_coverage()
         .iter()
-        .filter(|(candidate, _)| !skip_paths.contains(&candidate.path))
+        .filter(|(candidate, _)| {
+            !skip_faces.contains(&(candidate.path.clone(), candidate.face_index))
+        })
         .cloned()
         .collect();
     let (weight, db_style) = variant_query(variant);
@@ -913,8 +966,9 @@ fn map_font_file(path: &Path) -> std::io::Result<&'static [u8]> {
     Ok(bytes)
 }
 
-fn insert_face(defs: &mut FontDefinitions, id: &str, bytes: &'static [u8]) {
-    defs.font_data.insert(id.to_string(), Arc::new(FontData::from_static(bytes)));
+fn insert_face(defs: &mut FontDefinitions, id: &str, bytes: &'static [u8], face_index: u32) {
+    let data = FontData { index: face_index, ..FontData::from_static(bytes) };
+    defs.font_data.insert(id.to_string(), Arc::new(data));
 }
 
 fn register_default_family(defs: &mut FontDefinitions, family: FontFamily, id: &str) {
@@ -925,26 +979,29 @@ fn register_variant(
     defs: &mut FontDefinitions,
     font_id: &str,
     family_name: &str,
-    bytes: Option<&'static [u8]>,
-    fallback: &'static [u8],
+    face: Option<(&'static [u8], u32)>,
+    fallback: (&'static [u8], u32),
 ) {
-    let bytes = bytes.unwrap_or(fallback);
-    insert_face(defs, font_id, bytes);
+    let (bytes, face_index) = face.unwrap_or(fallback);
+    insert_face(defs, font_id, bytes, face_index);
     defs.families.insert(FontFamily::Name(family_name.into()), vec![font_id.to_string()]);
 }
 
-/// Returns the bytes of the variant face if a *real* variant exists, or
-/// `None` if the matcher fell back to the normal file.  The caller registers
-/// the normal face as a fallback under the variant's family name.
+/// Returns the bytes and face index of the variant face if a *real* variant
+/// exists, or `None` if the matcher fell back to the normal face.  A
+/// collection file holds many faces, so "fell back" means the same file *and*
+/// the same face index — the bold sibling of a `.ttc` family lives in the
+/// same file.  The caller registers the normal face as a fallback under the
+/// variant's family name.
 fn load_variant(
     family: &str,
     style: Option<&str>,
     variant: Variant,
-    normal_path: &Path,
+    normal: &ResolvedFace,
     fonts: &SystemFonts,
-) -> Option<&'static [u8]> {
+) -> Option<(&'static [u8], u32)> {
     let resolved = resolve_face(family, style, variant, fonts)?;
-    if resolved.path == normal_path {
+    if resolved.path == normal.path && resolved.face_index == normal.face_index {
         log::debug!(
             "no real {} face for '{family}'; cells with that style will use the regular face",
             variant.label()
@@ -952,7 +1009,16 @@ fn load_variant(
         return None;
     }
     match map_font_file(&resolved.path) {
-        Ok(b) => Some(b),
+        Ok(b) if epaint_can_parse(b, resolved.face_index) => Some((b, resolved.face_index)),
+        Ok(_) => {
+            log::warn!(
+                "{} font file {} is not a parseable TTF/OTF; cells with that style will use the \
+                 regular face",
+                variant.label(),
+                resolved.path.display()
+            );
+            None
+        },
         Err(e) => {
             log::warn!(
                 "could not read {} font file {}: {e}",
@@ -1106,8 +1172,16 @@ mod fontconfig_resolve {
 
         let matched = pattern.font_match();
         let path = matched.filename()?;
-        let face_index = matched.face_index().unwrap_or(0).max(0) as u32;
+        let face_index = plain_face_index(matched.face_index().unwrap_or(0));
         Some(ResolvedFace { path: PathBuf::from(path), face_index })
+    }
+
+    /// fontconfig hands back `(named_instance << 16) | face` for a variable
+    /// font's named instances (FreeType's encoding).  ttf_parser and epaint
+    /// take a plain collection index and cannot apply a named instance
+    /// anyway, so the default instance stands in for the named one.
+    pub fn plain_face_index(index: i32) -> u32 {
+        (index.max(0) as u32) & 0xFFFF
     }
 
     /// `FcFontSort` with `trim=true` returns fonts in match order, dropping
@@ -1118,7 +1192,7 @@ mod fontconfig_resolve {
         family: &str,
         style: Option<&str>,
         variant: Variant,
-        skip_paths: &HashSet<PathBuf>,
+        skip_faces: &HashSet<(PathBuf, u32)>,
         limit: usize,
     ) -> Vec<FallbackFace> {
         let Some(fc) = Fontconfig::new() else {
@@ -1161,10 +1235,10 @@ mod fontconfig_resolve {
                 continue;
             };
             let path = PathBuf::from(path_str);
-            if skip_paths.contains(&path) {
+            let face_index = plain_face_index(matched.face_index().unwrap_or(0));
+            if skip_faces.contains(&(path.clone(), face_index)) {
                 continue;
             }
-            let face_index = matched.face_index().unwrap_or(0).max(0) as u32;
             out.push(FallbackFace { path, face_index });
         }
         out
@@ -1175,14 +1249,28 @@ mod fontconfig_resolve {
 mod tests {
     use super::*;
 
+    /// A real font on disk for tests that drive registration: faces failing
+    /// epaint's parse are rejected, so junk bytes would never register.
+    fn write_parseable_font(name: &str) -> PathBuf {
+        let bytes = FontDefinitions::default()
+            .font_data
+            .values()
+            .next()
+            .expect("egui bundles default fonts")
+            .font
+            .to_vec();
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
     #[test]
     fn user_fallback_path_registers_for_every_variant() {
         // A file-path entry resolves to the same file for all four variants;
         // the bytes must be loaded once and the same egui font id appended to
         // each variant's family list (a plain HashSet dedup would starve
         // every variant after the first).
-        let path = std::env::temp_dir().join("alacritree_test_user_fallback.ttf");
-        std::fs::write(&path, b"egui parses this later; registration only reads bytes").unwrap();
+        let path = write_parseable_font("alacritree_test_user_fallback.ttf");
 
         let mut defs = FontDefinitions::default();
         let fonts = SystemFonts::with_cache_dir(None);
@@ -1208,8 +1296,8 @@ mod tests {
             &mut book,
         );
 
-        assert_eq!(book.ids_by_path.len(), 1);
-        let id = book.ids_by_path.values().next().unwrap();
+        assert_eq!(book.ids_by_face.len(), 1);
+        let id = book.ids_by_face.values().next().unwrap();
         assert!(defs.families[&FontFamily::Monospace].contains(id));
         assert!(defs.families[&FontFamily::Name(BOLD_FAMILY.into())].contains(id));
 
@@ -1218,8 +1306,7 @@ mod tests {
 
     #[test]
     fn ui_font_heads_the_proportional_family() {
-        let path = std::env::temp_dir().join("alacritree_test_ui_font.ttf");
-        std::fs::write(&path, b"registration only maps bytes").unwrap();
+        let path = write_parseable_font("alacritree_test_ui_font.ttf");
 
         let mut defs = FontDefinitions::default();
         let fonts = SystemFonts::with_cache_dir(None);
@@ -1252,8 +1339,7 @@ mod tests {
     // an owned face costs its file size twice for the life of the process.
     #[test]
     fn registered_faces_hand_epaint_borrowed_bytes() {
-        let path = std::env::temp_dir().join("alacritree_test_borrowed_bytes.ttf");
-        std::fs::write(&path, b"registration only maps and stats bytes").unwrap();
+        let path = write_parseable_font("alacritree_test_borrowed_bytes.ttf");
 
         let mut defs = FontDefinitions::default();
         let fonts = SystemFonts::with_cache_dir(None);
@@ -1263,7 +1349,7 @@ mod tests {
         let targets = [FontFamily::Monospace];
         register_user_fallbacks(&mut defs, &entries, Variant::Normal, &targets, &fonts, &mut book);
 
-        let id = book.ids_by_path.get(&path).expect("fallback registered");
+        let id = book.ids_by_face.get(&(path.clone(), 0)).expect("fallback registered");
         let data = &defs.font_data[id];
         assert!(
             matches!(data.font, std::borrow::Cow::Borrowed(_)),
@@ -1271,6 +1357,53 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn named_instance_bits_are_stripped_from_fontconfig_indices() {
+        // Instance 7 of face 2 in a collection; the face index survives, the
+        // instance selection does not.
+        assert_eq!(fontconfig_resolve::plain_face_index((7 << 16) | 2), 2);
+        assert_eq!(fontconfig_resolve::plain_face_index(3), 3);
+        assert_eq!(fontconfig_resolve::plain_face_index(-1), 0);
+    }
+
+    // fontconfig returns `(named_instance << 16) | face` for variable fonts;
+    // handing that through unmasked makes ttf_parser and epaint reject the
+    // face outright, silently dropping every variable font from the chain.
+    #[cfg(unix)]
+    #[test]
+    fn fontconfig_face_indices_never_carry_instance_bits() {
+        let skip = HashSet::new();
+        let faces = fontconfig_resolve::sorted_fallbacks(
+            DEFAULT_FAMILY,
+            None,
+            Variant::Normal,
+            &skip,
+            MAX_FALLBACK_FACES,
+        );
+        for face in &faces {
+            assert!(
+                face.face_index < 0x1_0000,
+                "{} face {} carries named-instance bits",
+                face.path.display(),
+                face.face_index
+            );
+        }
+    }
+
+    // epaint re-parses every registered face with ab_glyph at first layout
+    // and panics on any it cannot parse, so the installed definitions must
+    // never contain one.  macOS font indexes commonly carry such faces
+    // (.dfont suitcases, bitmap-only families).
+    #[test]
+    fn every_registered_face_parses_like_epaint() {
+        let ctx = Context::default();
+        install_terminal_fonts(&ctx, &FontConfig::default(), None);
+        // The first pass is what forces epaint to parse every face.
+        ctx.begin_pass(Default::default());
+        let _ = ctx.end_pass();
     }
 
     // Unix-excluded: fontconfig substitutes *some* font for any family name,
@@ -1301,7 +1434,7 @@ mod tests {
         assert!(faces.len() <= 8);
         let mut seen = HashSet::new();
         for face in &faces {
-            assert!(!skip.contains(&face.path));
+            assert!(!skip.contains(&(face.path.clone(), face.face_index)));
             assert!(seen.insert((face.path.clone(), face.face_index)));
         }
         // On any machine with system fonts the chain must not be empty —
@@ -1328,30 +1461,33 @@ mod tests {
             &fonts,
             &mut book,
         );
-        let normal_ids: HashSet<String> = book.ids_by_path.values().cloned().collect();
+        let normal_ids: HashSet<String> = book.ids_by_face.values().cloned().collect();
+        let loaded_before = defs.font_data.len();
 
+        // A later chain that resolves to already-loaded faces (here: the same
+        // family and variant, targeting another family list) must reuse them —
+        // joining the new family list without registering duplicate font data.
         let bold_family = FontFamily::Name(BOLD_FAMILY.into());
         let bold_targets = [bold_family.clone()];
         register_fallback_faces(
             &mut defs,
             "Consolas",
-            Some("Bold"),
-            Variant::Bold,
+            None,
+            Variant::Normal,
             &bold_targets,
             &fonts,
             &mut book,
         );
 
         if fonts.db().faces().next().is_some() && !normal_ids.is_empty() {
-            // The bold chain must be able to reach faces the normal chain already
-            // loaded; on any real system at least one top coverage-adder overlaps.
+            assert_eq!(defs.font_data.len(), loaded_before);
             assert!(defs.families[&bold_family].iter().any(|id| normal_ids.contains(id)));
         }
     }
 
     #[cfg(not(unix))]
     #[test]
-    fn automatic_chain_records_every_loaded_path_in_ids_by_path() {
+    fn automatic_chain_records_every_loaded_face_in_ids_by_face() {
         let mut defs = FontDefinitions::default();
         let fonts = SystemFonts::with_cache_dir(None);
         let mut book = FallbackBook::default();
@@ -1368,8 +1504,8 @@ mod tests {
         );
 
         if fonts.db().faces().next().is_some() {
-            let ids_keys: HashSet<_> = book.ids_by_path.keys().cloned().collect();
-            assert_eq!(ids_keys, book.loaded_paths);
+            let ids_keys: HashSet<_> = book.ids_by_face.keys().cloned().collect();
+            assert_eq!(ids_keys, book.loaded_faces);
         }
     }
 
@@ -1384,8 +1520,7 @@ mod tests {
         // User-configured fallbacks slot between the primary face and the
         // automatic system chain, so their font id must land ahead of every
         // id the automatic chain appends afterward in the family list.
-        let path = std::env::temp_dir().join("alacritree_test_user_precedes.ttf");
-        std::fs::write(&path, b"egui parses this later; registration only reads bytes").unwrap();
+        let path = write_parseable_font("alacritree_test_user_precedes.ttf");
 
         let mut defs = FontDefinitions::default();
         let fonts = SystemFonts::with_cache_dir(None);
@@ -1394,7 +1529,7 @@ mod tests {
         let targets = [FontFamily::Monospace];
 
         register_user_fallbacks(&mut defs, &entries, Variant::Normal, &targets, &fonts, &mut book);
-        let user_id = book.ids_by_path.get(&path).cloned().unwrap();
+        let user_id = book.ids_by_face.get(&(path.clone(), 0)).cloned().unwrap();
         let user_index =
             defs.families[&FontFamily::Monospace].iter().position(|id| *id == user_id).unwrap();
         let before_len = defs.families[&FontFamily::Monospace].len();
@@ -1421,13 +1556,61 @@ mod tests {
     }
 
     #[test]
+    fn primary_face_keeps_its_collection_index() {
+        // A family living at a nonzero face index of a collection file must
+        // reach egui with that index — face 0 of the same file is a different
+        // family entirely (every Sarasa family shares one .ttc, for example),
+        // and rendering it gives every cell the wrong glyph and metrics.
+        let fonts = SystemFonts::with_cache_dir(None);
+        let families: Vec<String> = fonts
+            .db()
+            .faces()
+            .filter(|face| face.index > 0)
+            .filter_map(|face| face.families.first().map(|(name, _)| name.clone()))
+            .collect();
+        let Some((family, resolved)) = families.iter().find_map(|family| {
+            let resolved = resolve_face(family, None, Variant::Normal, &fonts)?;
+            (resolved.face_index > 0).then(|| (family.clone(), resolved))
+        }) else {
+            // No installed collection resolves past face 0; nothing to check.
+            return;
+        };
+
+        let config = crate::config::FontConfig {
+            normal: crate::config::FontFace { family: Some(family), style: None },
+            ..Default::default()
+        };
+        let (defs, chain) = build_font_definitions(&config, None, &fonts).expect("family resolves");
+
+        assert_eq!(defs.font_data[NORMAL_FONT_ID].index, resolved.face_index);
+        assert_eq!(chain[0].face_index, resolved.face_index);
+    }
+
+    #[test]
     fn primary_faces_are_never_tweaked() {
         // Fallback faces get a tweak that rescales them to the primary
         // face's height; the primary itself is the scale reference and must
         // never carry a tweak, or scaling would be relative to a moving target.
         let mut defs = FontDefinitions::default();
-        insert_face(&mut defs, "test_primary", b"egui parses this later; registration only maps");
+        insert_face(
+            &mut defs,
+            "test_primary",
+            b"egui parses this later; registration only maps",
+            0,
+        );
         assert_eq!(defs.font_data["test_primary"].tweak, FontTweak::default());
+    }
+
+    #[test]
+    fn variant_faces_carry_their_collection_index() {
+        // A real variant keeps its own face index; a missing variant falls
+        // back to the normal face *and* its index.
+        let mut defs = FontDefinitions::default();
+        let normal: (&'static [u8], u32) = (b"normal bytes", 3);
+        register_variant(&mut defs, BOLD_FONT_ID, BOLD_FAMILY, Some((b"bold bytes", 7)), normal);
+        register_variant(&mut defs, ITALIC_FONT_ID, ITALIC_FAMILY, None, normal);
+        assert_eq!(defs.font_data[BOLD_FONT_ID].index, 7);
+        assert_eq!(defs.font_data[ITALIC_FONT_ID].index, 3);
     }
 
     #[cfg(not(unix))]

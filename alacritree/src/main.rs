@@ -19,6 +19,8 @@ mod ipc;
 mod links;
 mod mcp;
 mod mouse;
+#[cfg(target_os = "macos")]
+mod notify_macos;
 mod panel_filter;
 mod paste;
 mod pr_status;

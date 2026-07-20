@@ -152,6 +152,14 @@ enum SessionCommand {
         #[arg(long, value_name = "N", default_value_t = 0)]
         scrollback: usize,
     },
+    /// Re-home a session under another worktree in the sidebar.  The running
+    /// process is untouched; inside an alacritree session, your own id is in
+    /// $ALACRITREE_SESSION_ID.
+    Move {
+        session_id: u64,
+        /// A path inside the target worktree (e.g. `.`).
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -257,6 +265,9 @@ fn to_request(command: Command) -> IpcRequest {
             SessionCommand::ReadScreen { session_id, scrollback } => {
                 IpcRequest::ReadScreen { session_id, scrollback_lines: scrollback }
             },
+            SessionCommand::Move { session_id, path } => {
+                IpcRequest::MoveSession { session_id, path: absolute(path) }
+            },
         },
         Command::Workspace { command } => match command {
             WorkspaceCommand::Select { path } => {
@@ -326,6 +337,10 @@ mod tests {
         assert!(matches!(
             request_for(&["alacritree", "session", "read-screen", "7", "--scrollback", "50"]),
             IpcRequest::ReadScreen { session_id: 7, scrollback_lines: 50 }
+        ));
+        assert!(matches!(
+            request_for(&["alacritree", "session", "move", "7", "."]),
+            IpcRequest::MoveSession { session_id: 7, path } if path.is_absolute()
         ));
         assert!(matches!(
             request_for(&["alacritree", "worktree", "create", ".", "topic"]),

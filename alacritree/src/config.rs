@@ -40,6 +40,12 @@ pub struct Config {
     /// Offer the IPC socket that `alacritree mcp` connects to.  Mirrors
     /// alacritty's `[general] ipc_socket` (default on).
     pub ipc_socket: bool,
+    /// Start dir for sessions with no explicit workspace (the home tab);
+    /// worktree tabs always use their checkout path.  Mirrors alacritty's
+    /// `[general] working_directory`, except a leading `~` expands to the
+    /// home directory (upstream only expands `~` in config imports) so one
+    /// shared config works on every platform.
+    pub working_directory: Option<PathBuf>,
     pub wsl_automount_root: String,
     pub wsl_resident_helper: bool,
     /// Explicit `delta` program for the diff pane, from `[ui] delta_path`.
@@ -240,6 +246,29 @@ fn parse_confirm_session_close(raw: Option<&str>) -> ConfirmSessionClose {
     }
 }
 
+/// How the sidebar scroll areas draw their scrollbar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScrollbarStyle {
+    /// egui's default: a thin bar overlaying the content edge, expanding on
+    /// hover — which covers the icons at the right end of sidebar rows.
+    #[default]
+    Floating,
+    /// A reserved gutter right of the content; the bar never covers icons.
+    Solid,
+}
+
+fn parse_scrollbar(raw: Option<&str>) -> ScrollbarStyle {
+    match raw {
+        None => ScrollbarStyle::default(),
+        Some("floating") => ScrollbarStyle::Floating,
+        Some("solid") => ScrollbarStyle::Solid,
+        Some(other) => {
+            log::warn!("unknown ui.scrollbar value {other:?}, using \"floating\"");
+            ScrollbarStyle::default()
+        },
+    }
+}
+
 /// Text-presentation magnifier (U+2315).  Not in egui's bundled fonts; it
 /// resolves through the system fallback chain `fonts.rs` registers.
 const DEFAULT_SEARCH_ICON: &str = "⌕";
@@ -371,6 +400,9 @@ pub struct UiTheme {
     pub pr_status: bool,
     pub icons: Icons,
     pub focus_outline: FocusOutline,
+    /// `[ui] scrollbar`: sidebar scrollbar style, "floating" (default) or
+    /// "solid" (reserved gutter, never covers row icons).
+    pub scrollbar: ScrollbarStyle,
     /// `[ui] sidebar_click_focus`: clicking a sidebar moves keyboard focus to
     /// it (so filter typing works without the focus shortcut).  Off by default
     /// so unmodified configs keep click-through-to-terminal behavior.
@@ -401,6 +433,7 @@ impl Default for UiTheme {
             pr_status: false,
             icons: Icons::default(),
             focus_outline: FocusOutline::default(),
+            scrollbar: ScrollbarStyle::Floating,
             sidebar_click_focus: false,
             worktree_name: None,
             project_name: None,
@@ -461,6 +494,7 @@ impl Default for Config {
             selection: SelectionConfig::default(),
             bindings: Vec::new(),
             ipc_socket: true,
+            working_directory: None,
             wsl_automount_root: "/mnt".to_string(),
             wsl_resident_helper: true,
             delta_path: None,
@@ -760,6 +794,7 @@ struct RawConfig {
 #[serde(default)]
 struct RawGeneral {
     ipc_socket: Option<bool>,
+    working_directory: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1041,6 +1076,8 @@ struct RawUi {
     session_display: RawSessionDisplay,
     delta_path: Option<String>,
     icons: RawIcons,
+    /// Sidebar scrollbar style: "floating" (default) | "solid".
+    scrollbar: Option<String>,
     pr_status: Option<bool>,
     font: RawUiFont,
     worktree_name: Option<String>,
@@ -1190,6 +1227,7 @@ impl RawConfig {
                 color: self.ui.focus_outline.color.map(|v| rgb_to_color32(v.0)),
                 thickness: self.ui.focus_outline.thickness.map_or(1.0, |t| t.max(0.5)),
             },
+            scrollbar: parse_scrollbar(self.ui.scrollbar.as_deref()),
             sidebar_click_focus: self.ui.sidebar_click_focus.unwrap_or(false),
             worktree_name: self.ui.worktree_name.clone().filter(|t| !t.trim().is_empty()),
             project_name: self.ui.project_name.clone().filter(|t| !t.trim().is_empty()),
@@ -1343,6 +1381,11 @@ impl RawConfig {
             selection,
             bindings,
             ipc_socket: self.general.ipc_socket.unwrap_or(true),
+            working_directory: self
+                .general
+                .working_directory
+                .as_deref()
+                .and_then(|raw| parse_config_path(raw, "general.working_directory")),
             wsl_automount_root,
             wsl_resident_helper,
             delta_path: self.ui.delta_path.filter(|s| !s.trim().is_empty()),
@@ -1500,6 +1543,28 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_defaults_to_floating() {
+        let ui = ui_from_toml("");
+        assert_eq!(ui.scrollbar, ScrollbarStyle::Floating);
+    }
+
+    #[test]
+    fn scrollbar_parses_all_values() {
+        for (raw, expected) in
+            [("floating", ScrollbarStyle::Floating), ("solid", ScrollbarStyle::Solid)]
+        {
+            let ui = ui_from_toml(&format!("[ui]\nscrollbar = \"{raw}\""));
+            assert_eq!(ui.scrollbar, expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn scrollbar_invalid_falls_back_to_floating() {
+        let ui = ui_from_toml("[ui]\nscrollbar = \"chunky\"");
+        assert_eq!(ui.scrollbar, ScrollbarStyle::Floating);
+    }
+
+    #[test]
     fn search_icon_defaults_and_overrides() {
         assert_eq!(ui_from_toml("").icons.search, DEFAULT_SEARCH_ICON);
         assert_eq!(ui_from_toml("[ui.icons]\nsearch = \"\u{f002}\"").icons.search, "\u{f002}");
@@ -1563,6 +1628,45 @@ mod tests {
     fn relative_and_user_tilde_paths_are_rejected() {
         assert_eq!(parse_config_path("relative/dir", "test"), None);
         assert_eq!(parse_config_path("~user/dir", "test"), None);
+    }
+
+    #[test]
+    fn general_working_directory_defaults_to_none() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        assert_eq!(raw.into_config().working_directory, None);
+    }
+
+    #[test]
+    fn general_working_directory_expands_tilde_and_forward_slashes() {
+        let home = home::home_dir().unwrap();
+        let raw: RawConfig =
+            toml::from_str("[general]\nworking_directory = \"~/projects\"").unwrap();
+        assert_eq!(raw.into_config().working_directory, Some(home.join("projects")));
+    }
+
+    #[test]
+    fn general_working_directory_accepts_absolute_paths() {
+        let toml_src = format!(
+            "[general]\nworking_directory = \"{}\"",
+            abs("somewhere").replace('\\', "\\\\")
+        );
+        let raw: RawConfig = toml::from_str(&toml_src).unwrap();
+        assert_eq!(raw.into_config().working_directory, Some(PathBuf::from(abs("somewhere"))));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn general_working_directory_accepts_forward_slash_windows_paths() {
+        let raw: RawConfig =
+            toml::from_str("[general]\nworking_directory = \"C:/somewhere\"").unwrap();
+        assert_eq!(raw.into_config().working_directory, Some(PathBuf::from("C:/somewhere")));
+    }
+
+    #[test]
+    fn general_working_directory_rejects_relative_paths() {
+        let raw: RawConfig =
+            toml::from_str("[general]\nworking_directory = \"relative/dir\"").unwrap();
+        assert_eq!(raw.into_config().working_directory, None);
     }
 
     #[test]

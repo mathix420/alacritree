@@ -177,6 +177,18 @@ fn tool_definitions() -> Value {
             },
         },
         {
+            "name": "move_session",
+            "description": "Re-home a session under another worktree in the sidebar. Call after the work in a session moves to a different worktree (e.g. cd). The path may be anywhere inside the target worktree; get your own session id from the ALACRITREE_SESSION_ID environment variable. The running process and scrollback are untouched.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "integer", "description": "Session to move (from list_sessions or ALACRITREE_SESSION_ID)." },
+                    "path": { "type": "string", "description": "A path inside the target worktree." },
+                },
+                "required": ["session_id", "path"],
+            },
+        },
+        {
             "name": "read_screen",
             "description": "Read a session's terminal contents as lines of text (top to bottom), plus the cursor position (as indices into those lines) and the window title. scrollback_lines prepends up to that many history lines above the visible screen.",
             "inputSchema": {
@@ -289,6 +301,7 @@ mod tests {
             IpcRequest::CreateSession { workspace: None },
             IpcRequest::CloseSession { session_id: 1 },
             IpcRequest::SendText { session_id: 1, text: "hi".into() },
+            IpcRequest::MoveSession { session_id: 1, path: repo() },
             IpcRequest::ReadScreen { session_id: 1, scrollback_lines: 0 },
             IpcRequest::GitStatus { path: repo() },
             IpcRequest::CreateWorktree { project_root: repo(), branch: "topic".into() },
@@ -308,6 +321,7 @@ mod tests {
             IpcRequest::CreateSession { .. } => "create_session",
             IpcRequest::CloseSession { .. } => "close_session",
             IpcRequest::SendText { .. } => "send_text",
+            IpcRequest::MoveSession { .. } => "move_session",
             IpcRequest::ReadScreen { .. } => "read_screen",
             IpcRequest::GitStatus { .. } => "git_status",
             IpcRequest::CreateWorktree { .. } => "create_worktree",

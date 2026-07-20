@@ -65,6 +65,10 @@ pub enum IpcRequest {
         session_id: u64,
         text: String,
     },
+    MoveSession {
+        session_id: u64,
+        path: PathBuf,
+    },
     ReadScreen {
         session_id: u64,
         #[serde(default)]

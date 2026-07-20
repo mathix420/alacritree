@@ -37,6 +37,10 @@ fontdb = { version = "0.23", default-features = false, features = ["fontconfig",
 # Reads cmap tables to build coverage sets for the Windows fallback chain.
 # Same major as the ttf-parser fontdb already pulls in, so no duplicate build.
 ttf-parser = "0.25"
+# The exact parse epaint applies to every registered face.  epaint aborts the
+# process on a face ab_glyph rejects, so registration must prove each face
+# parses first.  Same version epaint already links, so no duplicate build.
+ab_glyph = "0.2"
 # Font faces reach egui as mappings, not buffers.  Same version fontdb already
 # links, so no duplicate build.
 memmap2 = "0.9"
@@ -79,6 +83,42 @@ sysinfo = { version = "0.36", default-features = false, features = ["system"] }
 # Distro enumeration reads HKCU\...\Lxss directly (Windows Terminal's
 # approach) — no process spawn at startup, and it identifies the default.
 winreg = "0.55"
+# notify-rust's own WinRT backend, used directly because notify-rust doesn't
+# expose toast activation — needed to focus the pinging session on click.
+tauri-winrt-notification = "0.7"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Foreground-agent detection: `proc_pidinfo` supplies the process group,
+# foreground group, and command name Linux reads from /proc, and
+# `sysctl(KERN_PROCARGS2)` the command line.
+libc = "0.2"
+# UserNotifications framework, used instead of notify-rust because its
+# NSUserNotification backend is defunct on modern macOS: delivery silently
+# fails for unbundled processes and clicks are never surfaced.  Requires
+# running from an app bundle (see extra/osx) — same objc2 stack egui links.
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSBundle",
+    "NSDictionary",
+    "NSError",
+    "NSString",
+    "NSValue",
+] }
+objc2-user-notifications = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "UNError",
+    "UNNotification",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationResponse",
+    "UNNotificationSettings",
+    "UNNotificationSound",
+    "UNNotificationTrigger",
+    "UNUserNotificationCenter",
+] }
 
 [target.'cfg(windows)'.dev-dependencies]
 # Share-mode constants for tests that hold a file the way the loader holds a
