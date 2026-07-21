@@ -706,10 +706,7 @@ pub fn parse_action(name: &str) -> BindingAction {
         "DeleteSelected" => BindingAction::Named(DeleteSelected),
         "RenameSelected" => BindingAction::Named(RenameSelected),
         "ToggleProjectExpanded" => BindingAction::Named(ToggleProjectExpanded),
-        // `ShowShortcuts` is kept as an alias: the command palette is the
-        // shortcuts window's successor, so configs naming the old action still
-        // open it.
-        "TogglePalette" | "ShowShortcuts" => BindingAction::Named(TogglePalette),
+        "TogglePalette" => BindingAction::Named(TogglePalette),
         "FocusProjectsSidebar" => BindingAction::Named(FocusProjectsSidebar),
         "FocusGitSidebar" => BindingAction::Named(FocusGitSidebar),
         "FocusTerminal" => BindingAction::Named(FocusTerminal),
@@ -1222,10 +1219,8 @@ mod tests {
             parse_action("TogglePalette"),
             BindingAction::Named(NamedAction::TogglePalette)
         ));
-        // The old F1 action name still maps to the palette so configs survive.
-        assert!(matches!(
-            parse_action("ShowShortcuts"),
-            BindingAction::Named(NamedAction::TogglePalette)
-        ));
+        // The F1 shortcuts window is gone and the palette lists every action,
+        // so the old `ShowShortcuts` name is no longer recognized.
+        assert!(matches!(parse_action("ShowShortcuts"), BindingAction::Unsupported(_)));
     }
 }

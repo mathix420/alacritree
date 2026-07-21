@@ -175,8 +175,7 @@ forward-delete in TUIs.
   (dispatching an action, jumping to a session, or switching workspace),
   `Escape` clears the query and then closes, and a click outside dismisses it.
   The default is `Ctrl+K` (which shadows `Ctrl+K` for terminal apps; rebind or
-  free it with `ReceiveChar` if you need it there). `ShowShortcuts` is accepted
-  as an alias so older configs keep working.
+  free it with `ReceiveChar` if you need it there).
 - `SpawnProfile1` … `SpawnProfile9` — spawn the Nth `[[ui.profiles]]` entry
   in the current workspace. Out-of-range indices show an error toast.
   Example binding:
