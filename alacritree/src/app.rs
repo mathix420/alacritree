@@ -2817,11 +2817,14 @@ impl AlacritreeApp {
         if rename_request.is_some() {
             self.pending_rename = rename_request;
         }
+        let mut workspace_activated = false;
         if home_clicked {
             self.activate_home(ctx);
+            workspace_activated = true;
         }
         if let Some(path) = activate_request.take() {
             self.activate_worktree(ctx, &path);
+            workspace_activated = true;
         }
         if let Some(path) = base_picker_request.take() {
             self.open_base_branch_picker(path);
@@ -2839,6 +2842,7 @@ impl AlacritreeApp {
             // an existing shell, or the empty-workspace placeholder shows.
             self.current_workspace = ws.clone();
             self.active_session.insert(ws, id);
+            workspace_activated = true;
         }
         if let Some(id) = close_session_request.take() {
             self.request_close_session(ctx, id);
@@ -2850,12 +2854,21 @@ impl AlacritreeApp {
             if let Err(e) = self.spawn_session(ctx, ws) {
                 self.last_error = Some(format!("failed to spawn shell: {e}"));
             }
+            workspace_activated = true;
         }
-        if self.config.ui.sidebar_click_focus
-            && self.focus != PaneFocus::ProjectsSidebar
-            && pressed_on_panel(ctx, &panel_resp.response)
-        {
-            self.focus_sidebar();
+        if self.config.ui.sidebar_click_focus {
+            // A click that picks a workspace or session means "go work
+            // there", so it focuses the terminal; other panel clicks focus
+            // the sidebar for filter typing.  Row activations fire on the
+            // release frame, after the press already focused the sidebar,
+            // which is why this can't fold into the press test below.
+            if workspace_activated {
+                self.focus_terminal();
+            } else if self.focus != PaneFocus::ProjectsSidebar
+                && pressed_on_panel(ctx, &panel_resp.response)
+            {
+                self.focus_sidebar();
+            }
         }
         panel_resp.response.rect
     }
