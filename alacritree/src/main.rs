@@ -110,19 +110,34 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// Borrow the console of whatever shell launched us, if there is one.
+/// Borrow the console of whatever shell launched us, but only when we have no
+/// output destination of our own.
 ///
 /// A `windows_subsystem = "windows"` binary starts with no console attached, so
 /// in a release build `println!` writes to a handle that goes nowhere and the
 /// CLI is silent at a prompt.  (A debug build has a console and looks fine,
-/// which is how this hides.)  Redirected output is unaffected either way —
-/// `GetStdHandle` returns the pipe — so only the interactive case needs this.
+/// which is how this hides.)  Attaching the parent's console fixes that.
+///
+/// But a caller that already gave us a stdout — a redirect, a pipe, or WSL,
+/// which relays the Windows binary's output through a pipe of its own — needs
+/// no console, and grabbing one actively breaks WSL: output is repointed at a
+/// Windows console whose contents WSL relays line by line as CRLF, so `--help`
+/// and every other command come out littered with `^M`.  So attach only when
+/// `GetStdHandle` reports no stdout at all.
 ///
 /// Must run before anything touches `std::io::stdout()`, which caches the
 /// handle it first sees.
 #[cfg(windows)]
 fn attach_parent_console() {
-    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_OUTPUT_HANDLE,
+    };
+
+    let stdout = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    if !stdout.is_null() && stdout != INVALID_HANDLE_VALUE {
+        return;
+    }
 
     // Fails when the parent has no console (launched from a GUI shell), which
     // is exactly when there is nothing to attach to and nothing to report.
