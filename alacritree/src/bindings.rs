@@ -69,6 +69,9 @@ pub enum NamedAction {
     /// Rename the sidebar-cursored row: a session gets a custom display
     /// name, a project gets the same rename dialog as its context menu.
     RenameSelected,
+    /// Expand or collapse the sidebar-cursored project, showing or hiding
+    /// its worktrees and sessions.
+    ToggleProjectExpanded,
     ShowShortcuts,
     FocusProjectsSidebar,
     FocusGitSidebar,
@@ -96,7 +99,7 @@ pub enum NamedAction {
 
 impl NamedAction {
     /// Actions that only make sense while the projects sidebar owns focus.
-    /// Their default keys (unmodified Home/End/PageUp/PageDown/R/Delete and
+    /// Their default keys (unmodified Home/End/PageUp/PageDown/R/O/Delete and
     /// Shift+R) are terminal input the rest of the time, so dispatch must
     /// not consume them unless the sidebar owns focus.
     pub fn is_sidebar_scoped(&self) -> bool {
@@ -109,6 +112,7 @@ impl NamedAction {
                 | Self::RefreshProjects
                 | Self::DeleteSelected
                 | Self::RenameSelected
+                | Self::ToggleProjectExpanded
         )
     }
 
@@ -175,6 +179,7 @@ impl NamedAction {
                     .into()
             },
             Self::RenameSelected => "Rename the selected project".into(),
+            Self::ToggleProjectExpanded => "Expand or collapse the selected project".into(),
             Self::FocusProjectsSidebar => "Focus the projects sidebar".into(),
             Self::FocusGitSidebar => "Focus the git sidebar".into(),
             Self::FocusTerminal => "Focus the terminal".into(),
@@ -354,6 +359,11 @@ fn default_bindings() -> Vec<KeyBinding> {
             key: Key::R,
             mods: Modifiers::SHIFT,
             action: BindingAction::Named(RenameSelected),
+        },
+        KeyBinding {
+            key: Key::O,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(ToggleProjectExpanded),
         },
         KeyBinding {
             key: Key::F1,
@@ -698,6 +708,7 @@ pub fn parse_action(name: &str) -> BindingAction {
         "RefreshProjects" => BindingAction::Named(RefreshProjects),
         "DeleteSelected" => BindingAction::Named(DeleteSelected),
         "RenameSelected" => BindingAction::Named(RenameSelected),
+        "ToggleProjectExpanded" => BindingAction::Named(ToggleProjectExpanded),
         "ShowShortcuts" => BindingAction::Named(ShowShortcuts),
         "FocusProjectsSidebar" => BindingAction::Named(FocusProjectsSidebar),
         "FocusGitSidebar" => BindingAction::Named(FocusGitSidebar),
@@ -1141,6 +1152,7 @@ mod tests {
             RefreshProjects,
             DeleteSelected,
             RenameSelected,
+            ToggleProjectExpanded,
         ] {
             assert!(a.is_sidebar_scoped(), "{a:?}");
         }
@@ -1184,6 +1196,21 @@ mod tests {
         assert!(matches!(
             parse_action("RenameSelected"),
             BindingAction::Named(NamedAction::RenameSelected)
+        ));
+    }
+
+    /// `o` is terminal input, so the unmodified default only works because
+    /// the action is sidebar-scoped.
+    #[test]
+    fn toggle_project_expanded_has_an_unmodified_o_default_and_parses() {
+        let b = parse_bindings(vec![]);
+        assert_eq!(
+            named_matches(&b, Key::O, Modifiers::NONE),
+            vec![NamedAction::ToggleProjectExpanded]
+        );
+        assert!(matches!(
+            parse_action("ToggleProjectExpanded"),
+            BindingAction::Named(NamedAction::ToggleProjectExpanded)
         ));
     }
 

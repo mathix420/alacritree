@@ -2025,6 +2025,20 @@ impl AlacritreeApp {
                     }
                 }
             },
+            BindingAction::Named(NamedAction::ToggleProjectExpanded) => {
+                // Same browsing-mode guard as DeleteSelected: while the fuzzy
+                // prompt is open a letter bound here is query input.
+                if origin != ActionOrigin::Ipc
+                    && self.project_filter.mode() != panel_filter::Mode::Browsing
+                {
+                    return;
+                }
+                if let Some(SidebarRow::Project(root)) = self.sidebar_cursor.clone() {
+                    let expanded =
+                        self.projects.iter().find(|p| p.root == root).is_some_and(|p| p.expanded);
+                    self.set_project_expanded(&root, !expanded);
+                }
+            },
             BindingAction::Named(NamedAction::ShowShortcuts) => {
                 self.shortcuts_window_open = !self.shortcuts_window_open;
                 if self.shortcuts_window_open {

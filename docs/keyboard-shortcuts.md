@@ -61,6 +61,7 @@ and your TOML entries are checked first — so your config overrides any default
 | `Home` / `End`       | Sidebar focused: cursor to the first / last row       |
 | `PageUp` / `PageDown`| Sidebar focused: jump to the previous / next project  |
 | `R`                  | Sidebar focused: rescan every project's worktrees     |
+| `O`                  | Sidebar focused: expand/collapse the selected project |
 | `Delete`             | Sidebar focused: close/delete/remove the selected row |
 | `Shift+R`            | Sidebar focused: rename the selected project          |
 | `F1`                 | Toggle the searchable shortcuts window                |
@@ -155,6 +156,10 @@ entry. Names match alacritty's own action names, so existing configs port over.
 - `RenameSelected` — rename the sidebar-cursored project (the same rename
   dialog as its right-click menu). Only project rows have an editable label;
   on other rows this does nothing. Default: `Shift+R`.
+- `ToggleProjectExpanded` — expand or collapse the sidebar-cursored project,
+  showing or hiding its worktrees and sessions. Only acts on project rows.
+  Default: unmodified `O`. (The arrow keys and `Enter` also expand/collapse
+  a cursored project without a binding.)
 
 These sidebar actions act only while the projects sidebar has keyboard
 focus; anywhere else their keys pass through to the terminal untouched, so
