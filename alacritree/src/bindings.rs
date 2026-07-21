@@ -72,7 +72,8 @@ pub enum NamedAction {
     /// Expand or collapse the sidebar-cursored project, showing or hiding
     /// its worktrees and sessions.
     ToggleProjectExpanded,
-    ShowShortcuts,
+    /// Open (or close) the Ctrl+K command palette.
+    TogglePalette,
     FocusProjectsSidebar,
     FocusGitSidebar,
     FocusTerminal,
@@ -185,7 +186,7 @@ impl NamedAction {
             Self::FocusTerminal => "Focus the terminal".into(),
             Self::SpawnProfile(n) => format!("Open a session with shell profile {n}"),
             Self::Quit => "Open the quit confirmation dialog".into(),
-            Self::ShowShortcuts => "Show this shortcuts window".into(),
+            Self::TogglePalette => "Open the command palette".into(),
             Self::ToggleSessionRows => "Toggle single-session sidebar rows".into(),
             Self::ToggleSessionTabs => "Toggle single-session tab segments".into(),
             Self::SetBaseBranch => "Choose the branch the git panel diffs against".into(),
@@ -365,11 +366,7 @@ fn default_bindings() -> Vec<KeyBinding> {
             mods: Modifiers::NONE,
             action: BindingAction::Named(ToggleProjectExpanded),
         },
-        KeyBinding {
-            key: Key::F1,
-            mods: Modifiers::NONE,
-            action: BindingAction::Named(ShowShortcuts),
-        },
+        KeyBinding { key: Key::K, mods: ctrl, action: BindingAction::Named(TogglePalette) },
         KeyBinding { key: Key::G, mods: ctrl_shift, action: BindingAction::Named(FocusGitSidebar) },
         KeyBinding { key: Key::W, mods: ctrl_shift, action: BindingAction::Named(CloseSession) },
         KeyBinding { key: Key::T, mods: ctrl, action: BindingAction::Named(SpawnNewInstance) },
@@ -709,7 +706,10 @@ pub fn parse_action(name: &str) -> BindingAction {
         "DeleteSelected" => BindingAction::Named(DeleteSelected),
         "RenameSelected" => BindingAction::Named(RenameSelected),
         "ToggleProjectExpanded" => BindingAction::Named(ToggleProjectExpanded),
-        "ShowShortcuts" => BindingAction::Named(ShowShortcuts),
+        // `ShowShortcuts` is kept as an alias: the command palette is the
+        // shortcuts window's successor, so configs naming the old action still
+        // open it.
+        "TogglePalette" | "ShowShortcuts" => BindingAction::Named(TogglePalette),
         "FocusProjectsSidebar" => BindingAction::Named(FocusProjectsSidebar),
         "FocusGitSidebar" => BindingAction::Named(FocusGitSidebar),
         "FocusTerminal" => BindingAction::Named(FocusTerminal),
@@ -1215,12 +1215,17 @@ mod tests {
     }
 
     #[test]
-    fn show_shortcuts_is_a_default_f1_binding_and_parses() {
+    fn toggle_palette_is_a_default_ctrl_k_binding_and_parses() {
         let b = parse_bindings(vec![]);
-        assert_eq!(named_matches(&b, Key::F1, Modifiers::NONE), vec![NamedAction::ShowShortcuts]);
+        assert_eq!(named_matches(&b, Key::K, Modifiers::CTRL), vec![NamedAction::TogglePalette]);
+        assert!(matches!(
+            parse_action("TogglePalette"),
+            BindingAction::Named(NamedAction::TogglePalette)
+        ));
+        // The old F1 action name still maps to the palette so configs survive.
         assert!(matches!(
             parse_action("ShowShortcuts"),
-            BindingAction::Named(NamedAction::ShowShortcuts)
+            BindingAction::Named(NamedAction::TogglePalette)
         ));
     }
 }

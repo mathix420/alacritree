@@ -744,10 +744,12 @@ mod windows_process_probe {
     }
 }
 
+/// How a process inside a session names itself to `alacritree session move`
+/// / the MCP tools.
+pub const SESSION_ID_ENV: &str = "ALACRITREE_SESSION_ID";
+
 /// The environment a session's PTY starts with: the user's `[env]` table,
-/// the diff-pane `LESS` default, and the session's own id — how a process
-/// inside the terminal names itself to `alacritree session move` / the MCP
-/// tools.
+/// the diff-pane `LESS` default, and the session's own id.
 fn session_env(
     config_env: &HashMap<String, String>,
     kind: &SessionKind,
@@ -765,7 +767,7 @@ fn session_env(
         // A `LESS` set by the user (via `[env]`) wins.
         env.entry("LESS".to_string()).or_insert_with(|| "R".to_string());
     }
-    env.insert("ALACRITREE_SESSION_ID".to_string(), id.to_string());
+    env.insert(SESSION_ID_ENV.to_string(), id.to_string());
     env
 }
 

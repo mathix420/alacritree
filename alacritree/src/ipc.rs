@@ -142,27 +142,37 @@ pub fn spawn_listener(ctx: egui::Context) -> std::io::Result<(SocketHandle, Rece
     // Only WSLENV-listed variables cross the wsl.exe boundary — in either
     // direction.  Listing the socket lets programs in a distro find this
     // instance, whether they read the variable themselves or exec the
-    // Windows CLI through interop (which inherits the distro's view).  No
-    // conversion flag: a pipe name is not a path WSL should translate.
+    // Windows CLI through interop (which inherits the distro's view); the
+    // session id lets them name their own session in requests.  No
+    // conversion flags: neither a pipe name nor an id is a path WSL should
+    // translate.
     #[cfg(windows)]
     unsafe {
-        std::env::set_var("WSLENV", wslenv_with_socket(std::env::var("WSLENV").ok().as_deref()))
+        std::env::set_var(
+            "WSLENV",
+            wslenv_with_alacritree_vars(std::env::var("WSLENV").ok().as_deref()),
+        )
     };
 
     Ok(listener)
 }
 
-/// `WSLENV` extended with [`SOCKET_ENV`], preserving whatever the user
+/// `WSLENV` extended with the variables alacritree exports — [`SOCKET_ENV`]
+/// and [`crate::session::SESSION_ID_ENV`] — preserving whatever the user
 /// already shares across the boundary.
 #[cfg(any(test, windows))]
-fn wslenv_with_socket(current: Option<&str>) -> String {
-    match current {
-        None | Some("") => SOCKET_ENV.to_string(),
-        Some(v) if v.split(':').any(|entry| entry.split('/').next() == Some(SOCKET_ENV)) => {
-            v.to_string()
-        },
-        Some(v) => format!("{v}:{SOCKET_ENV}"),
+fn wslenv_with_alacritree_vars(current: Option<&str>) -> String {
+    let mut wslenv = current.unwrap_or("").to_string();
+    for name in [SOCKET_ENV, crate::session::SESSION_ID_ENV] {
+        let listed = wslenv.split(':').any(|entry| entry.split('/').next() == Some(name));
+        if !listed {
+            if !wslenv.is_empty() {
+                wslenv.push(':');
+            }
+            wslenv.push_str(name);
+        }
     }
+    wslenv
 }
 
 /// Listen on a caller-chosen path, without advertising it.
@@ -469,15 +479,30 @@ pub fn listen_for_test(
 mod tests {
     use super::*;
 
+    use crate::session::SESSION_ID_ENV;
+
     #[test]
     fn wslenv_gains_the_socket_exactly_once() {
-        assert_eq!(wslenv_with_socket(None), SOCKET_ENV);
-        assert_eq!(wslenv_with_socket(Some("")), SOCKET_ENV);
-        assert_eq!(wslenv_with_socket(Some("LESS:FOO/p")), format!("LESS:FOO/p:{SOCKET_ENV}"));
-        // Already listed — with or without conversion flags — stays as-is.
-        assert_eq!(wslenv_with_socket(Some(SOCKET_ENV)), SOCKET_ENV);
+        let ours = format!("{SOCKET_ENV}:{SESSION_ID_ENV}");
+        assert_eq!(wslenv_with_alacritree_vars(None), ours);
+        assert_eq!(wslenv_with_alacritree_vars(Some("")), ours);
+        assert_eq!(wslenv_with_alacritree_vars(Some("LESS:FOO/p")), format!("LESS:FOO/p:{ours}"));
+        // Already listed — with or without conversion flags — is not repeated.
+        assert_eq!(wslenv_with_alacritree_vars(Some(&ours)), ours);
         let flagged = format!("{SOCKET_ENV}/u:LESS");
-        assert_eq!(wslenv_with_socket(Some(&flagged)), flagged);
+        assert_eq!(
+            wslenv_with_alacritree_vars(Some(&flagged)),
+            format!("{flagged}:{SESSION_ID_ENV}")
+        );
+    }
+
+    /// Shells in a distro read their own id from the environment; like the
+    /// socket, it only crosses wsl.exe if listed.
+    #[test]
+    fn wslenv_gains_the_session_id_exactly_once() {
+        assert_eq!(wslenv_with_alacritree_vars(None), format!("{SOCKET_ENV}:{SESSION_ID_ENV}"));
+        let flagged = format!("{SESSION_ID_ENV}/u");
+        assert_eq!(wslenv_with_alacritree_vars(Some(&flagged)), format!("{flagged}:{SOCKET_ENV}"));
     }
 
     /// The client/server round trip over whatever transport the platform uses:
