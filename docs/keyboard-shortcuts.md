@@ -156,10 +156,12 @@ entry. Names match alacritty's own action names, so existing configs port over.
 - `RenameSelected` — rename the sidebar-cursored project (the same rename
   dialog as its right-click menu). Only project rows have an editable label;
   on other rows this does nothing. Default: `Shift+R`.
-- `ToggleProjectExpanded` — expand or collapse the sidebar-cursored project,
-  showing or hiding its worktrees and sessions. Only acts on project rows.
-  Default: unmodified `O`. (The arrow keys and `Enter` also expand/collapse
-  a cursored project without a binding.)
+- `ToggleProjectExpanded` — expand or collapse the project owning the
+  sidebar cursor, showing or hiding its worktrees and sessions. Works from
+  the project header or from any of its worktree/session rows; collapsing
+  from a child moves the cursor up to the header. Default: unmodified `O`.
+  (The arrow keys and `Enter` also expand/collapse a cursored project
+  without a binding.)
 
 These sidebar actions act only while the projects sidebar has keyboard
 focus; anywhere else their keys pass through to the terminal untouched, so

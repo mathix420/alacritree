@@ -2033,10 +2033,27 @@ impl AlacritreeApp {
                 {
                     return;
                 }
-                if let Some(SidebarRow::Project(root)) = self.sidebar_cursor.clone() {
+                let Some(cursor) = self.sidebar_cursor.clone() else {
+                    return;
+                };
+                let root = {
+                    let session_workspace = |id: SessionId| {
+                        self.sessions
+                            .iter()
+                            .find(|s| s.id == id)
+                            .map(|s| s.working_directory.clone())
+                    };
+                    row_project_root(&self.projects, session_workspace, &cursor)
+                };
+                if let Some(root) = root {
                     let expanded =
                         self.projects.iter().find(|p| p.root == root).is_some_and(|p| p.expanded);
                     self.set_project_expanded(&root, !expanded);
+                    // Collapsing hides the cursored child; move the cursor to
+                    // the header so it doesn't point at a now-invisible row.
+                    if expanded && !matches!(cursor, SidebarRow::Project(_)) {
+                        self.set_sidebar_cursor(SidebarRow::Project(root));
+                    }
                 }
             },
             BindingAction::Named(NamedAction::ShowShortcuts) => {
@@ -4314,6 +4331,27 @@ fn project_main_for(projects: &[Project], ws: &Path) -> Option<PathBuf> {
     let project = projects.iter().find(|p| p.worktrees.iter().any(|w| w.path == ws))?;
     let main = project.worktrees.iter().find(|w| w.is_main)?;
     if main.path == ws { None } else { Some(main.path.clone()) }
+}
+
+/// The root of the project owning `row`: a worktree resolves by its path, a
+/// session through its workspace.  `None` for Home or a row outside every
+/// known project.  Lets `ToggleProjectExpanded` act on the whole subtree, not
+/// just the header.
+fn row_project_root(
+    projects: &[Project],
+    session_workspace: impl Fn(SessionId) -> Option<WorkspaceKey>,
+    row: &SidebarRow,
+) -> Option<PathBuf> {
+    let workspace = match row {
+        SidebarRow::Project(root) => return Some(root.clone()),
+        SidebarRow::Worktree(path) => path.clone(),
+        SidebarRow::Session(id) => session_workspace(*id).flatten()?,
+        SidebarRow::Home => return None,
+    };
+    projects
+        .iter()
+        .find(|p| p.worktrees.iter().any(|w| w.path == workspace))
+        .map(|p| p.root.clone())
 }
 
 /// The branch the git panel diffs against: the user's explicit override,
@@ -6922,6 +6960,33 @@ mod tests {
         let cursor = SidebarRow::Project(PathBuf::from("C:/repo"));
         let none2 = |_id: SessionId| -> Option<WorkspaceKey> { None };
         assert_eq!(base_branch_target(true, Some(&cursor), none2, &None), None);
+    }
+
+    #[test]
+    fn toggle_expanded_resolves_child_rows_to_their_project_root() {
+        let projects = vec![project_with("/repo", &["/repo/wt"])];
+        let root = PathBuf::from("/repo");
+        let none = |_id: SessionId| -> Option<WorkspaceKey> { None };
+
+        // The project header resolves to itself.
+        assert_eq!(
+            row_project_root(&projects, none, &SidebarRow::Project(root.clone())),
+            Some(root.clone())
+        );
+        // A worktree child resolves to the owning project root — the case the
+        // old dispatch missed, leaving `o` inert inside an expanded project.
+        assert_eq!(
+            row_project_root(&projects, none, &SidebarRow::Worktree(PathBuf::from("/repo/wt"))),
+            Some(root.clone())
+        );
+        // A session resolves through its workspace to the project root.
+        let lookup = |id: SessionId| (id == 7).then(|| Some(PathBuf::from("/repo/wt")));
+        assert_eq!(
+            row_project_root(&projects, lookup, &SidebarRow::Session(7)),
+            Some(root.clone())
+        );
+        // Home belongs to no project.
+        assert_eq!(row_project_root(&projects, none, &SidebarRow::Home), None);
     }
 
     #[test]
