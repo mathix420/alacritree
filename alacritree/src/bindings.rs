@@ -66,6 +66,9 @@ pub enum NamedAction {
     /// the delete/prune dialog, a project gets the remove-from-sidebar
     /// prompt.
     DeleteSelected,
+    /// Rename the sidebar-cursored row: a session gets a custom display
+    /// name, a project gets the same rename dialog as its context menu.
+    RenameSelected,
     ShowShortcuts,
     FocusProjectsSidebar,
     FocusGitSidebar,
@@ -93,9 +96,9 @@ pub enum NamedAction {
 
 impl NamedAction {
     /// Actions that only make sense while the projects sidebar owns focus.
-    /// Their default keys (unmodified Home/End/PageUp/PageDown/R/Delete) are
-    /// terminal input the rest of the time, so dispatch must not consume
-    /// them unless the sidebar owns focus.
+    /// Their default keys (unmodified Home/End/PageUp/PageDown/R/Delete and
+    /// Shift+R) are terminal input the rest of the time, so dispatch must
+    /// not consume them unless the sidebar owns focus.
     pub fn is_sidebar_scoped(&self) -> bool {
         matches!(
             self,
@@ -105,6 +108,7 @@ impl NamedAction {
                 | Self::SidebarPreviousProject
                 | Self::RefreshProjects
                 | Self::DeleteSelected
+                | Self::RenameSelected
         )
     }
 
@@ -170,6 +174,7 @@ impl NamedAction {
                  project"
                     .into()
             },
+            Self::RenameSelected => "Rename the selected project".into(),
             Self::FocusProjectsSidebar => "Focus the projects sidebar".into(),
             Self::FocusGitSidebar => "Focus the git sidebar".into(),
             Self::FocusTerminal => "Focus the terminal".into(),
@@ -344,6 +349,11 @@ fn default_bindings() -> Vec<KeyBinding> {
             key: Key::Delete,
             mods: Modifiers::NONE,
             action: BindingAction::Named(DeleteSelected),
+        },
+        KeyBinding {
+            key: Key::R,
+            mods: Modifiers::SHIFT,
+            action: BindingAction::Named(RenameSelected),
         },
         KeyBinding {
             key: Key::F1,
@@ -687,6 +697,7 @@ pub fn parse_action(name: &str) -> BindingAction {
         "SidebarPreviousProject" => BindingAction::Named(SidebarPreviousProject),
         "RefreshProjects" => BindingAction::Named(RefreshProjects),
         "DeleteSelected" => BindingAction::Named(DeleteSelected),
+        "RenameSelected" => BindingAction::Named(RenameSelected),
         "ShowShortcuts" => BindingAction::Named(ShowShortcuts),
         "FocusProjectsSidebar" => BindingAction::Named(FocusProjectsSidebar),
         "FocusGitSidebar" => BindingAction::Named(FocusGitSidebar),
@@ -1129,6 +1140,7 @@ mod tests {
             SidebarPreviousProject,
             RefreshProjects,
             DeleteSelected,
+            RenameSelected,
         ] {
             assert!(a.is_sidebar_scoped(), "{a:?}");
         }
@@ -1159,6 +1171,19 @@ mod tests {
         assert!(matches!(
             parse_action("RefreshProjects"),
             BindingAction::Named(NamedAction::RefreshProjects)
+        ));
+    }
+
+    /// Shift+R types `R` inside a shell, so like Delete the default only
+    /// works because the action is sidebar-scoped.
+    #[test]
+    fn rename_selected_has_a_shift_r_default_and_parses() {
+        let b = parse_bindings(vec![]);
+        assert_eq!(named_matches(&b, Key::R, Modifiers::SHIFT), vec![NamedAction::RenameSelected]);
+        assert_eq!(named_matches(&b, Key::R, Modifiers::NONE), vec![NamedAction::RefreshProjects]);
+        assert!(matches!(
+            parse_action("RenameSelected"),
+            BindingAction::Named(NamedAction::RenameSelected)
         ));
     }
 

@@ -2007,6 +2007,24 @@ impl AlacritreeApp {
                     Some(SidebarRow::Home) | None => {},
                 }
             },
+            BindingAction::Named(NamedAction::RenameSelected) => {
+                // Same browsing-mode guard as DeleteSelected: while the fuzzy
+                // prompt is open a letter bound here is query input.
+                if origin != ActionOrigin::Ipc
+                    && self.project_filter.mode() != panel_filter::Mode::Browsing
+                {
+                    return;
+                }
+                // Only project rows carry an editable label; sessions and
+                // worktrees take their names from the terminal title and the
+                // `[ui] worktree_name` template.
+                if let Some(SidebarRow::Project(root)) = self.sidebar_cursor.clone() {
+                    if let Some(p) = self.projects.iter().find(|p| p.root == root) {
+                        self.pending_rename =
+                            Some(RenameState { root, label: p.display_name().to_string() });
+                    }
+                }
+            },
             BindingAction::Named(NamedAction::ShowShortcuts) => {
                 self.shortcuts_window_open = !self.shortcuts_window_open;
                 if self.shortcuts_window_open {

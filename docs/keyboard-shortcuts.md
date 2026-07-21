@@ -60,6 +60,9 @@ and your TOML entries are checked first — so your config overrides any default
 | `Ctrl+Shift+W`       | Close the cursored session (sidebar) or the current shell |
 | `Home` / `End`       | Sidebar focused: cursor to the first / last row       |
 | `PageUp` / `PageDown`| Sidebar focused: jump to the previous / next project  |
+| `R`                  | Sidebar focused: rescan every project's worktrees     |
+| `Delete`             | Sidebar focused: close/delete/remove the selected row |
+| `Shift+R`            | Sidebar focused: rename the selected project          |
 | `F1`                 | Toggle the searchable shortcuts window                |
 
 ### Additional defaults on macOS
@@ -144,10 +147,19 @@ entry. Names match alacritty's own action names, so existing configs port over.
   visible row.
 - `SidebarPreviousProject` / `SidebarNextProject` — jump the sidebar cursor to
   the nearest project header above / below.
+- `RefreshProjects` — re-run worktree discovery for every project in the
+  sidebar. Default: unmodified `R`.
+- `DeleteSelected` — act on the sidebar-cursored row: a session gets the
+  close flow, a worktree the delete/prune dialog, a project the
+  remove-from-sidebar prompt. Default: unmodified `Delete`.
+- `RenameSelected` — rename the sidebar-cursored project (the same rename
+  dialog as its right-click menu). Only project rows have an editable label;
+  on other rows this does nothing. Default: `Shift+R`.
 
-All four sidebar actions act only while the projects sidebar has keyboard
+These sidebar actions act only while the projects sidebar has keyboard
 focus; anywhere else their keys pass through to the terminal untouched, so
-the unmodified defaults don't shadow Home/End/PageUp/PageDown in TUIs.
+the unmodified defaults don't shadow Home/End/PageUp/PageDown, `r`, `R`, or
+forward-delete in TUIs.
 - `ShowShortcuts` — toggle a searchable window listing every effective
   binding, plus the actions nothing currently binds (so the full action
   vocabulary is discoverable without the docs). Type to fuzzy-filter, `/`
