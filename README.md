@@ -12,11 +12,13 @@
 
 The first ultrafast, FOSS alternative to the LLM/worktree management apps cropping up everywhere. Built around the amazing [Alacritty] terminal emulator and drop-in compatible with your `alacritty.toml`.
 
-Minimalist approach, only 3 features:
+Minimalist approach, with the terminal at the center:
 
 - **Worktree management.** Sidebar lists projects and worktrees; one click spawns a shell. Create fresh worktrees in seconds with pre-configured AI configs.
 - **Git status bar.** Per-workspace panel with branch + staged/unstaged files, refreshed in the background.
 - **Branch diffs.** Beautiful and meaningful diffs powered by [Delta].
+- **Workspace scratchpads.** `Ctrl+Backtick` opens a minimal built-in Markdown
+  editor that saves every change, with one file per worktree and MCP access.
 
 No Chromium, no bundled agents, no telemetry. No company behind it, and there never will be.
 

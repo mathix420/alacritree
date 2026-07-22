@@ -23,6 +23,7 @@ use crate::panel_filter::{self, PanelFilter};
 use crate::paste;
 use crate::pr_status::{PrCache, PrInfo, PrState};
 use crate::projects::{Project, Worktree, project_json};
+use crate::scratchpad;
 use crate::session::{
     AttentionVerdict, Session, SessionId, SessionKind, TermSize, poll_attention_debounce,
 };
@@ -815,6 +816,44 @@ impl AlacritreeApp {
         Ok(id)
     }
 
+    fn toggle_scratchpad_tab(&mut self, ctx: &Context) {
+        let workspace = self.current_workspace.clone();
+        if let Some(index) = self.scratchpad_session_index(&workspace) {
+            let id = self.sessions[index].id;
+            if self.active_session.get(&workspace).copied() == Some(id) {
+                // Scratchpad edits are persisted as they happen, so toggling
+                // the active tab closed never needs the session-close prompt.
+                self.close_session(ctx, id);
+                return;
+            }
+            self.active_session.insert(workspace, id);
+        } else if let Err(e) = self.spawn_scratchpad(ctx, workspace) {
+            self.last_error = Some(format!("failed to open scratchpad: {e}"));
+            return;
+        }
+        self.focus_terminal();
+    }
+
+    fn spawn_scratchpad(
+        &mut self,
+        ctx: &Context,
+        workspace: WorkspaceKey,
+    ) -> std::io::Result<SessionId> {
+        let file = scratchpad::ensure_file(&workspace)?;
+        let session = Session::spawn_scratchpad(
+            ctx.clone(),
+            &self.config,
+            workspace.clone(),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            file,
+        )?;
+        let id = session.id;
+        self.sessions.push(session);
+        self.active_session.insert(workspace, id);
+        Ok(id)
+    }
+
     /// Mirror Doppler scopes into a worktree the first time a shell opens
     /// there.  The create-time hook in `worktree.rs` covers worktrees we
     /// make; this lazy pass covers ones created outside alacritree, which
@@ -1052,6 +1091,9 @@ impl AlacritreeApp {
             .iter()
             .position(|s| s.id == id)
             .ok_or_else(|| format!("no session with id {id} — see list_sessions"))?;
+        if matches!(&self.sessions[idx].kind, SessionKind::Scratchpad { .. }) {
+            return Err("scratchpads belong to their backing workspace and cannot be moved".into());
+        }
         let source = self.sessions[idx].working_directory.clone();
         let target: WorkspaceKey = Some(target);
         if source == target {
@@ -1095,6 +1137,13 @@ impl AlacritreeApp {
             .filter(|(_, s)| s.working_directory == *ws)
             .map(|(i, _)| i)
             .collect()
+    }
+
+    fn scratchpad_session_index(&self, ws: &WorkspaceKey) -> Option<usize> {
+        self.sessions.iter().position(|session| {
+            session.working_directory == *ws
+                && matches!(&session.kind, SessionKind::Scratchpad { .. })
+        })
     }
 
     fn current_session_indices(&self) -> Vec<usize> {
@@ -1343,6 +1392,10 @@ impl AlacritreeApp {
     /// is `ReceiveChar` (alacritty's pass-through marker).
     fn handle_shortcuts(&mut self, ctx: &Context) {
         let sidebar_focused = self.focus == PaneFocus::ProjectsSidebar && !self.palette.is_open();
+        let scratchpad_focused = self.focus == PaneFocus::Terminal
+            && self
+                .active_session_index()
+                .is_some_and(|idx| self.sessions[idx].scratchpad.is_some());
         let actions: Vec<BindingAction> = ctx.input_mut(|i| {
             let mut actions = Vec::new();
             i.events.retain(|ev| {
@@ -1357,8 +1410,17 @@ impl AlacritreeApp {
                     let matched: Vec<_> = matched
                         .into_iter()
                         .filter(|a| {
-                            sidebar_focused
-                                || !matches!(a, BindingAction::Named(n) if n.is_sidebar_scoped())
+                            let valid_for_focus = sidebar_focused
+                                || !matches!(a, BindingAction::Named(n) if n.is_sidebar_scoped());
+                            // Terminal byte/scroll bindings would swallow
+                            // useful editor keys like Shift+Home and
+                            // Shift+PageUp. Leave those events for TextEdit.
+                            let terminal_only = match a {
+                                BindingAction::Chars(_) => true,
+                                BindingAction::Named(n) => n.is_terminal_only(),
+                                BindingAction::Unsupported(_) => false,
+                            };
+                            valid_for_focus && !(scratchpad_focused && terminal_only)
                         })
                         .collect();
                     if !matched.is_empty() {
@@ -1829,32 +1891,67 @@ impl AlacritreeApp {
         match action {
             BindingAction::Chars(bytes) => {
                 if let Some(idx) = self.active_session_index() {
-                    paste::on_terminal_input_start(&self.sessions[idx]);
-                    self.sessions[idx].write(bytes);
+                    let id = self.sessions[idx].id;
+                    if let Some(editor) = self.sessions[idx].scratchpad.as_mut() {
+                        // Custom `Chars` bindings can carry terminal control
+                        // sequences (Shift+Tab is ESC [ Z, for example).  A
+                        // document should only accept actual text here; native
+                        // editing keys are handled by egui's TextEdit itself.
+                        if let Ok(text) = std::str::from_utf8(&bytes)
+                            && !text.chars().any(|c| c.is_control() && c != '\n' && c != '\t')
+                        {
+                            editor.insert_at_cursor(ctx, id, text);
+                        }
+                    } else {
+                        paste::on_terminal_input_start(&self.sessions[idx]);
+                        self.sessions[idx].write(bytes);
+                    }
                 }
             },
             BindingAction::Named(NamedAction::Paste) => {
                 if let (Some(text), Some(idx)) =
                     (clipboard::read(Target::Clipboard), self.active_session_index())
                 {
-                    paste::paste(&self.sessions[idx], &text, true);
+                    let id = self.sessions[idx].id;
+                    if let Some(editor) = self.sessions[idx].scratchpad.as_mut() {
+                        editor.insert_at_cursor(ctx, id, &text);
+                    } else {
+                        paste::paste(&self.sessions[idx], &text, true);
+                    }
                 }
             },
             BindingAction::Named(NamedAction::PasteSelection) => {
                 if let (Some(text), Some(idx)) =
                     (clipboard::read(Target::Primary), self.active_session_index())
                 {
-                    paste::paste(&self.sessions[idx], &text, true);
+                    let id = self.sessions[idx].id;
+                    if let Some(editor) = self.sessions[idx].scratchpad.as_mut() {
+                        editor.insert_at_cursor(ctx, id, &text);
+                    } else {
+                        paste::paste(&self.sessions[idx], &text, true);
+                    }
                 }
             },
             BindingAction::Named(NamedAction::Copy) => {
                 if let Some(idx) = self.active_session_index() {
-                    paste::copy_selection(&self.sessions[idx], &self.config, Target::Clipboard);
+                    if let Some(editor) = self.sessions[idx].scratchpad.as_ref() {
+                        if let Some(text) = editor.selected_text(ctx, self.sessions[idx].id) {
+                            clipboard::write(Target::Clipboard, &text);
+                        }
+                    } else {
+                        paste::copy_selection(&self.sessions[idx], &self.config, Target::Clipboard);
+                    }
                 }
             },
             BindingAction::Named(NamedAction::CopySelection) => {
                 if let Some(idx) = self.active_session_index() {
-                    paste::copy_selection(&self.sessions[idx], &self.config, Target::Primary);
+                    if let Some(editor) = self.sessions[idx].scratchpad.as_ref() {
+                        if let Some(text) = editor.selected_text(ctx, self.sessions[idx].id) {
+                            clipboard::write(Target::Primary, &text);
+                        }
+                    } else {
+                        paste::copy_selection(&self.sessions[idx], &self.config, Target::Primary);
+                    }
                 }
             },
             BindingAction::Named(NamedAction::SpawnNewInstance) => {
@@ -1869,7 +1966,9 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::ClearHistory) => {
                 use alacritty_terminal::vte::ansi::{ClearMode, Handler};
                 if let Some(idx) = self.active_session_index() {
-                    self.sessions[idx].term.lock().clear_screen(ClearMode::Saved);
+                    if self.sessions[idx].scratchpad.is_none() {
+                        self.sessions[idx].term.lock().clear_screen(ClearMode::Saved);
+                    }
                 }
             },
             BindingAction::Named(NamedAction::ToggleFullscreen) => {
@@ -1937,6 +2036,7 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::SelectPreviousWorkspace) => {
                 self.cycle_workspaces(ctx, -1);
             },
+            BindingAction::Named(NamedAction::OpenScratchpad) => self.toggle_scratchpad_tab(ctx),
             BindingAction::Named(NamedAction::AddProject) => self.add_project_via_dialog(ctx),
             BindingAction::Named(NamedAction::ToggleSidebarFocus) => match self.focus {
                 PaneFocus::Terminal => self.focus_sidebar(),
@@ -2103,6 +2203,9 @@ impl AlacritreeApp {
             return;
         };
         let session = &mut self.sessions[idx];
+        if session.scratchpad.is_some() {
+            return;
+        }
         let mut term = session.term.lock();
         let lines_per_page = term.grid().screen_lines() as i32;
         let scroll = match action {
@@ -6062,15 +6165,19 @@ impl AlacritreeApp {
                 Ok(json!({ "session_id": session_id, "workspace": workspace }))
             },
             Req::SendText { session_id, text } => {
-                let session = self
+                let idx = self
                     .sessions
                     .iter()
-                    .find(|s| s.id == session_id)
+                    .position(|s| s.id == session_id)
                     .ok_or_else(|| format!("no session with id {session_id}"))?;
-                paste::on_terminal_input_start(session);
-                let bytes = text.into_bytes();
-                let written = bytes.len();
-                session.write(bytes);
+                let written = text.len();
+                if let Some(editor) = self.sessions[idx].scratchpad.as_mut() {
+                    editor.insert_at_cursor(ctx, session_id, &text);
+                } else {
+                    let session = &self.sessions[idx];
+                    paste::on_terminal_input_start(session);
+                    session.write(text.into_bytes());
+                }
                 Ok(json!({ "bytes_written": written }))
             },
             Req::ReadScreen { session_id, scrollback_lines } => {
@@ -6086,6 +6193,17 @@ impl AlacritreeApp {
                     "cursor": { "line": snapshot.cursor_line, "column": snapshot.cursor_column },
                     "scrollback_available": snapshot.history_size,
                 }))
+            },
+            Req::ReadScratchpad { workspace } => {
+                let workspace = match workspace.as_deref() {
+                    None | Some("current") => self.current_workspace.clone(),
+                    Some("home") => None,
+                    Some(path) => Some(
+                        self.known_worktree_path(Path::new(path))
+                            .ok_or_else(|| unknown_worktree(Path::new(path)))?,
+                    ),
+                };
+                scratchpad::read_json(&workspace)
             },
             Req::RefreshProject { root } => {
                 let project =
@@ -6165,6 +6283,7 @@ fn session_json(session: &Session, is_active_tab: bool) -> Value {
         "kind": match &session.kind {
             SessionKind::Shell => "shell",
             SessionKind::Diff { .. } => "diff",
+            SessionKind::Scratchpad { .. } => "scratchpad",
         },
         "columns": session.size.columns,
         "lines": session.size.screen_lines,
@@ -6264,17 +6383,35 @@ impl eframe::App for AlacritreeApp {
                     );
                     return;
                 };
+                let editor_text = rgb_to_color32(self.config.palette.fg);
+                let editor_hint = blend_toward(editor_text, theme.terminal_bg, 0.55);
+                let editor_error = rgb_to_color32(self.config.palette.normal[1]);
                 let session = &mut self.sessions[idx];
-                let ime = &mut self.ime;
-                let response = terminal_view::show(
-                    ui,
-                    session,
-                    &self.config,
-                    !modal_open && !self.palette.is_open() && self.focus == PaneFocus::Terminal,
-                    &mut self.builtin_glyphs,
-                    ime,
-                    &mut self.color_glyphs,
-                );
+                let allow_focus =
+                    !modal_open && !self.palette.is_open() && self.focus == PaneFocus::Terminal;
+                let response = if let Some(editor) = session.scratchpad.as_mut() {
+                    self.ime.clear();
+                    scratchpad::show_editor(
+                        ui,
+                        session.id,
+                        editor,
+                        allow_focus,
+                        theme.ui_scale,
+                        editor_text,
+                        editor_hint,
+                        editor_error,
+                    )
+                } else {
+                    terminal_view::show(
+                        ui,
+                        session,
+                        &self.config,
+                        allow_focus,
+                        &mut self.builtin_glyphs,
+                        &mut self.ime,
+                        &mut self.color_glyphs,
+                    )
+                };
                 // egui fake-clicks the natively focused widget on Space/Enter,
                 // and the terminal keeps native focus while the sidebar owns
                 // app focus — so keyboard "clicks" must not steal it back.

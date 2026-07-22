@@ -62,26 +62,27 @@ fn default_true() -> bool {
 }
 
 pub fn config_path() -> Option<PathBuf> {
-    Some(config_dir()?.join("alacritree").join("state.toml"))
+    Some(config_dir()?.join("state.toml"))
 }
 
 /// Per-user config base: XDG on Unix, the roaming app-data dir on Windows
 /// (which has neither `$XDG_CONFIG_HOME` nor `$HOME`).
 #[cfg(not(windows))]
-fn config_dir() -> Option<PathBuf> {
+pub(crate) fn config_dir() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(xdg));
+        return Some(PathBuf::from(xdg).join("alacritree"));
     }
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config"))
+    Some(PathBuf::from(home).join(".config").join("alacritree"))
 }
 
 #[cfg(windows)]
-fn config_dir() -> Option<PathBuf> {
+pub(crate) fn config_dir() -> Option<PathBuf> {
     std::env::var_os("APPDATA")
         .or_else(|| std::env::var_os("LOCALAPPDATA"))
         .map(PathBuf::from)
         .or_else(home::home_dir)
+        .map(|dir| dir.join("alacritree"))
 }
 
 /// Reorder `state.projects` to follow `order` (a list of roots).  Roots absent

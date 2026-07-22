@@ -27,9 +27,35 @@ per workspace is remembered as you switch between them.
   them (or quit the app). Scrollback, running commands, and PTY state survive
   arbitrary switches between worktrees.
 
-Each session has its own background read/write thread, a unique `window_id`
-(so OSC 7 / signal events route correctly), and forwards terminal events
-through an `EventProxy` that requests an egui repaint on every PTY message.
+### Workspace scratchpads
+
+`Ctrl+Backtick` opens the scratchpad tab dedicated to the current workspace.
+If its editor tab already exists, Alacritree selects that tab; otherwise it
+creates and activates a new tab. Scratchpads participate in the normal tab
+strip, sidebar session list, session cycling, command palette, and close flow.
+Pressing `Ctrl+Backtick` while the scratchpad is already active closes it
+immediately without confirmation because every edit has already been saved.
+
+The first invocation creates a Markdown document under Alacritree's config
+folder and opens it in a built-in, borderless text editor. Its padded writing
+surface inherits the terminal background and deliberately has no toolbar or
+save button. Every text change is written to the backing file immediately,
+including typing, deletion, paste, undo, and redo. A filesystem error is shown
+inside the pane while the in-memory text remains intact.
+
+Switching to another tab or workspace leaves the editor state intact. Closing
+the scratchpad tab releases that state; the next invocation reloads the same
+auto-saved file. Deleting a worktree also retains its scratchpad document.
+
+Files live in `$XDG_CONFIG_HOME/alacritree/scratchpads/` (normally
+`~/.config/alacritree/scratchpads/`) or `%APPDATA%\alacritree\scratchpads\` on
+Windows. Home uses `home.md`; worktrees use a readable leaf name plus a stable
+path digest so same-named worktrees cannot collide.
+
+Each terminal session has its own background read/write thread, a unique
+`window_id` (so OSC 7 / signal events route correctly), and forwards terminal
+events through an `EventProxy` that requests an egui repaint on every PTY
+message.
 
 ## Left sidebar — projects and worktrees
 
@@ -293,10 +319,12 @@ WSL auto-selection by project location → `default_profile` →
 
 ## Persistence
 
-Two files are written:
+Persistent files written by Alacritree:
 
 - `$XDG_CONFIG_HOME/alacritree/state.toml` — projects, expanded state,
   sidebar visibility.
+- `$XDG_CONFIG_HOME/alacritree/scratchpads/*.md` — one persistent Markdown
+  scratchpad per workspace. Worktree deletion does not remove these notes.
 - `<worktree>/.claude/settings.local.json` — touched only during worktree
   creation, only to set `preferredNotifChannel = "terminal_bell"`.
 
@@ -329,12 +357,17 @@ Tools:
 | `select_workspace` | Focus a workspace, like clicking it in the sidebar |
 | `create_session` | Open a new shell session in a workspace |
 | `close_session` | Close a session |
-| `send_text` | Type into a session's terminal (control chars pass through; `\r` submits) |
+| `send_text` | Type into a terminal or insert into a scratchpad; scratchpad changes auto-save |
 | `read_screen` | Read a session's screen text, cursor position, and optional scrollback |
+| `read_scratchpad` | Read the auto-saved Markdown scratchpad for the current, Home, or a specified workspace |
 | `move_session` | Re-home a session under another worktree (`alacritree session move <session_id> <path>`); path may be anywhere inside it |
 | `git_status` | Staged/unstaged files and per-file +/- vs the default branch |
 | `create_worktree` | Create a worktree + branch, same flow as the sidebar's `+` button |
 | `refresh_project` | Re-scan a project's worktrees |
+
+`read_scratchpad` reads the backing file directly, so it remains useful when
+the editor tab is closed. Because the built-in editor writes every change
+immediately, MCP clients see the same auto-saved contents as the editor.
 
 Under the hood this mirrors Alacritty's IPC design (unix only): the app
 listens on `$XDG_RUNTIME_DIR/alacritree/alacritree-<pid>.sock` and advertises

@@ -109,7 +109,7 @@ pub fn action_items(bindings: &[KeyBinding]) -> Vec<PaletteItem> {
 /// Every simple (non-parametrized) `NamedAction`, kept in sync with the enum by
 /// hand. Mirrors the old shortcuts window's bindable list; `SelectTab`/
 /// `SpawnProfile` are excluded here because they carry an index.
-fn bindable_actions() -> [NamedAction; 46] {
+fn bindable_actions() -> [NamedAction; 47] {
     use NamedAction::*;
     [
         Paste,
@@ -139,6 +139,7 @@ fn bindable_actions() -> [NamedAction; 46] {
         SelectPreviousSession,
         SelectNextWorkspace,
         SelectPreviousWorkspace,
+        OpenScratchpad,
         ToggleLeftSidebar,
         ToggleRightSidebar,
         AddProject,

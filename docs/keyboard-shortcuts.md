@@ -46,6 +46,7 @@ and your TOML entries are checked first — so your config overrides any default
 | -------------------- | ----------------------------------------------------- |
 | `Ctrl+Shift+V`       | Paste from the clipboard                              |
 | `Ctrl+Shift+C`       | Copy the current selection                            |
+| `Ctrl+Backtick`      | Toggle the workspace's persistent scratchpad tab      |
 | `Shift+Insert`       | Paste from the primary (X11) selection                |
 | `Ctrl+0`             | Reset font size                                       |
 | `Ctrl+=` / `Ctrl++`  | Increase font size                                    |
@@ -122,6 +123,10 @@ entry. Names match alacritty's own action names, so existing configs port over.
   new shell session in the current workspace. (Alacritty distinguishes
   windows from tabs; alacritree has a single window with sessions per
   workspace, so they collapse to the same action.)
+- `OpenScratchpad` — open or select the current workspace's persistent
+  Markdown scratchpad tab in Alacritree's minimal built-in editor, or close it
+  without confirmation when already active. Every text change is saved
+  immediately; closing the tab keeps its backing file. Default: `Ctrl+Backtick`.
 - `SelectNextTab` / `SelectPreviousTab` — cycle through sessions in the
   current workspace.
 - `SelectNextSession` / `SelectPreviousSession` — cycle through every open

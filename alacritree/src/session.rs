@@ -18,6 +18,7 @@ use alacritty_terminal::vte::ansi::Rgb;
 use crate::clipboard::Target;
 use crate::colors;
 use crate::config::{Config, Palette};
+use crate::scratchpad;
 use crate::wsl_helper::{self, WslProbe};
 
 #[derive(Clone)]
@@ -68,19 +69,24 @@ impl Dimensions for TermSize {
 
 pub type SessionId = u64;
 
-/// What this session is showing.  Shells are persistent; Diff panes are
-/// throwaway — replaced when the user clicks a different file in the git
-/// sidebar, and reaped on the user's `q` inside delta.  The key disambiguates
-/// (file, source) so the sidebar can highlight the active row and toggle the
-/// pane closed on a repeat click.
+/// What this session is showing. Shells are persistent; diff panes are
+/// throwaway terminal commands; scratchpads are built-in document editors.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum SessionKind {
     Shell,
-    Diff { key: String },
+    Diff {
+        key: String,
+    },
+    /// Alacritree's built-in editor for the workspace's Markdown document.
+    /// It participates in the ordinary tab/sidebar model without a PTY.
+    Scratchpad {
+        path: PathBuf,
+    },
 }
 
-/// PTY child + parsed terminal state.  The read/write loop is on its own
-/// thread and survives workspace switches, so running processes aren't killed.
+/// One tab in a workspace. Shell/diff tabs own a PTY and parsed terminal;
+/// scratchpad tabs retain the same lightweight terminal allocation so the tab
+/// model stays uniform, but own no child process or event-loop thread.
 pub struct Session {
     pub id: SessionId,
     pub title: String,
@@ -90,6 +96,7 @@ pub struct Session {
     pub cell_size: (f32, f32),
     pub term: Arc<FairMutex<Term<EventProxy>>>,
     pub events: mpsc::Receiver<TermEvent>,
+    pub scratchpad: Option<scratchpad::Editor>,
     /// Latched attention flag, cleared when the user views this session.
     pub needs_attention: bool,
     /// When a not-yet-surfaced attention trigger arrived.  `None` once it
@@ -114,8 +121,8 @@ pub struct Session {
     /// shim published, unregistered again on drop.  The Windows process
     /// table ends at wsl.exe, so this is the only live view inside.
     wsl_probe: Option<WslProbe>,
-    notifier: Notifier,
-    sender: EventLoopSender,
+    notifier: Option<Notifier>,
+    sender: Option<EventLoopSender>,
     exited: bool,
 }
 
@@ -806,6 +813,40 @@ impl Session {
         )
     }
 
+    pub fn spawn_scratchpad(
+        ctx: egui::Context,
+        config: &Config,
+        working_directory: Option<PathBuf>,
+        size: TermSize,
+        cell_size: (f32, f32),
+        path: PathBuf,
+    ) -> std::io::Result<Self> {
+        let editor = scratchpad::Editor::open(path.clone())?;
+        let (proxy, events) = EventProxy::new(ctx);
+        let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, proxy)));
+        Ok(Self {
+            id: next_session_id(),
+            title: "scratchpad".to_string(),
+            working_directory,
+            kind: SessionKind::Scratchpad { path },
+            size,
+            cell_size,
+            term,
+            events,
+            scratchpad: Some(editor),
+            needs_attention: false,
+            pending_attention: None,
+            accumulated_scroll: (0.0, 0.0),
+            last_report_cell: None,
+            shell_pid: None,
+            agent_cache: Cell::new(AgentCache::default()),
+            wsl_probe: None,
+            notifier: None,
+            sender: None,
+            exited: false,
+        })
+    }
+
     /// Spawn a session running `program args` instead of the user's shell.
     /// Used by the git sidebar to drop into `delta` for an inline diff view —
     /// once the command exits, `reap_exited_sessions` removes the tab.
@@ -897,6 +938,7 @@ impl Session {
             cell_size,
             term,
             events,
+            scratchpad: None,
             needs_attention: false,
             pending_attention: None,
             accumulated_scroll: (0.0, 0.0),
@@ -904,14 +946,16 @@ impl Session {
             shell_pid,
             agent_cache: Cell::new(AgentCache::default()),
             wsl_probe,
-            notifier: Notifier(sender.clone()),
-            sender,
+            notifier: Some(Notifier(sender.clone())),
+            sender: Some(sender),
             exited: false,
         })
     }
 
     pub fn write(&self, bytes: Vec<u8>) {
-        self.notifier.notify(bytes);
+        if let Some(notifier) = &self.notifier {
+            notifier.notify(bytes);
+        }
     }
 
     /// Pull every pending event out of the PTY channel.  Called once per frame
@@ -966,7 +1010,10 @@ impl Session {
         self.size = size;
         self.cell_size = cell_size;
         let ws = window_size(size, cell_size);
-        let _ = self.sender.send(Msg::Resize(ws));
+        let Some(sender) = &self.sender else {
+            return;
+        };
+        let _ = sender.send(Msg::Resize(ws));
         self.term.lock().resize(size);
     }
 
@@ -983,6 +1030,9 @@ impl Session {
     /// nothing, accept a decorative title as a permissive fallback so
     /// agents we don't have in the process map still show *something*.
     pub fn agent_glyph(&self) -> Option<char> {
+        if self.scratchpad.is_some() {
+            return None;
+        }
         let proc_glyph = self.process_agent_glyph();
         let title_glyph = title_decorative_glyph(&self.title);
         if proc_glyph.is_some() {
@@ -997,6 +1047,9 @@ impl Session {
     /// foreground process is a recognized agent, or its title is in a
     /// spinner state — the signal the close-confirmation policy keys on.
     pub fn is_busy(&self) -> bool {
+        if self.scratchpad.is_some() {
+            return false;
+        }
         self.process_probe().1 || looks_busy(self.agent_glyph(), &self.title)
     }
 
@@ -1012,6 +1065,9 @@ impl Session {
     /// stream, so a launcher touching it after vim starts clobbers vim's
     /// own title until vim re-emits it.
     pub fn nav_tui_running(&self) -> bool {
+        if self.scratchpad.is_some() {
+            return false;
+        }
         self.process_probe().2
     }
 
@@ -1045,6 +1101,15 @@ impl Session {
     /// the user's display offset so IPC clients always see where output and
     /// the cursor actually are.
     pub fn screen_snapshot(&self, scrollback_lines: usize) -> ScreenSnapshot {
+        if let Some(editor) = &self.scratchpad {
+            let mut lines: Vec<String> = editor.text().lines().map(str::to_owned).collect();
+            if lines.is_empty() || editor.text().ends_with('\n') {
+                lines.push(String::new());
+            }
+            let cursor_line = lines.len() - 1;
+            let cursor_column = lines[cursor_line].chars().count();
+            return ScreenSnapshot { lines, cursor_line, cursor_column, history_size: 0 };
+        }
         use alacritty_terminal::index::{Column, Line};
         use alacritty_terminal::term::cell::Flags;
 
@@ -1088,7 +1153,9 @@ impl Session {
     }
 
     pub fn shutdown(&self) {
-        let _ = self.sender.send(Msg::Shutdown);
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(Msg::Shutdown);
+        }
     }
 }
 

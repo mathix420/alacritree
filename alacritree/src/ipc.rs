@@ -74,6 +74,13 @@ pub enum IpcRequest {
         #[serde(default)]
         scrollback_lines: usize,
     },
+    /// Read the auto-saved Markdown document, independently of whether its
+    /// editor tab is open. `None`/`"current"` resolves on the UI thread;
+    /// `"home"` and absolute worktree paths are explicit targets.
+    ReadScratchpad {
+        #[serde(default)]
+        workspace: Option<String>,
+    },
     RefreshProject {
         root: PathBuf,
     },

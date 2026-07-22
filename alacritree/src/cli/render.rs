@@ -34,6 +34,9 @@ pub fn human(request: &IpcRequest, value: &Value) {
             None => println!("moved session {} to home", text(&value["session_id"])),
         },
         IpcRequest::ReadScreen { .. } => screen(value),
+        IpcRequest::ReadScratchpad { .. } => {
+            print!("{}", value["content"].as_str().unwrap_or_default());
+        },
         IpcRequest::GitStatus { .. } => git_status(value),
         IpcRequest::CreateWorktree { .. } => {
             println!("{}", text(&value["path"]));
@@ -151,6 +154,7 @@ mod tests {
             IpcRequest::ListSessions,
             IpcRequest::GitStatus { path: "/repo".into() },
             IpcRequest::ReadScreen { session_id: 1, scrollback_lines: 0 },
+            IpcRequest::ReadScratchpad { workspace: Some("home".into()) },
         ] {
             human(&request, &serde_json::json!({}));
         }

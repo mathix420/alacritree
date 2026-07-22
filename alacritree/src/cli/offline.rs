@@ -17,7 +17,7 @@ use crate::ipc::{IpcRequest, IpcResult};
 use crate::projects::{self, Project, project_json};
 use crate::state::{self, PersistedProject, PersistedState};
 use crate::worktree::{self as wt, CreateRequest};
-use crate::{git_status, ipc};
+use crate::{git_status, ipc, scratchpad};
 
 pub fn handle(request: &IpcRequest) -> IpcResult {
     let Some(path) = state::config_path() else {
@@ -62,6 +62,13 @@ fn handle_at(state_path: &Path, request: &IpcRequest) -> IpcResult {
         },
         IpcRequest::CreateWorktree { project_root, branch } => {
             create_worktree(project_root.clone(), branch.clone())
+        },
+        IpcRequest::ReadScratchpad { workspace } => match workspace.as_deref() {
+            None | Some("current") => {
+                Err("alacritree is not running; specify `home` or a workspace path".to_string())
+            },
+            Some("home") => scratchpad::read_json(&None),
+            Some(path) => scratchpad::read_json(&Some(PathBuf::from(path))),
         },
         IpcRequest::ListSessions
         | IpcRequest::SelectWorkspace { .. }

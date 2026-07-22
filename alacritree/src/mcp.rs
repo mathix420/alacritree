@@ -130,7 +130,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "list_sessions",
-            "description": "List terminal sessions across all workspaces: id, title, workspace path (null = the home workspace), kind (shell or diff pane), grid size, whether it is its workspace's active tab, and whether it flagged for attention (bell / agent finished).",
+            "description": "List tabs across all workspaces: id, title, workspace path (null = the home workspace), kind (shell, diff, or scratchpad editor), grid size, whether it is its workspace's active tab, and whether it flagged for attention (bell / agent finished).",
             "inputSchema": { "type": "object", "properties": {} },
         },
         {
@@ -198,6 +198,16 @@ fn tool_definitions() -> Value {
                     "scrollback_lines": { "type": "integer", "description": "History lines to include above the visible screen (default 0)." },
                 },
                 "required": ["session_id"],
+            },
+        },
+        {
+            "name": "read_scratchpad",
+            "description": "Read the auto-saved contents of a workspace's persistent Markdown scratchpad. Use this whenever the user refers to their scratchpad, workspace notes, reminders, or saved context. Omit workspace (or pass \"current\") for the focused workspace, pass \"home\" for Home, or pass an absolute worktree path from list_projects. The built-in editor writes every text change to this same backing file immediately.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspace": { "type": "string", "description": "\"current\" (default), \"home\", or an absolute worktree path from list_projects." },
+                },
             },
         },
         {
@@ -303,6 +313,7 @@ mod tests {
             IpcRequest::SendText { session_id: 1, text: "hi".into() },
             IpcRequest::MoveSession { session_id: 1, path: repo() },
             IpcRequest::ReadScreen { session_id: 1, scrollback_lines: 0 },
+            IpcRequest::ReadScratchpad { workspace: None },
             IpcRequest::GitStatus { path: repo() },
             IpcRequest::CreateWorktree { project_root: repo(), branch: "topic".into() },
             IpcRequest::RefreshProject { root: repo() },
@@ -323,6 +334,7 @@ mod tests {
             IpcRequest::SendText { .. } => "send_text",
             IpcRequest::MoveSession { .. } => "move_session",
             IpcRequest::ReadScreen { .. } => "read_screen",
+            IpcRequest::ReadScratchpad { .. } => "read_scratchpad",
             IpcRequest::GitStatus { .. } => "git_status",
             IpcRequest::CreateWorktree { .. } => "create_worktree",
             IpcRequest::RefreshProject { .. } => "refresh_project",

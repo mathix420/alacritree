@@ -53,6 +53,8 @@ pub enum NamedAction {
     ToggleRightSidebar,
     SelectNextWorkspace,
     SelectPreviousWorkspace,
+    /// Open/select the current workspace's scratchpad, or close it when active.
+    OpenScratchpad,
     AddProject,
     ToggleSidebarFocus,
     CloseSession,
@@ -117,6 +119,24 @@ impl NamedAction {
         )
     }
 
+    /// Actions whose keys should remain native text-editing input while the
+    /// scratchpad owns focus. For example, Shift+Home selects to the start of
+    /// a line in the editor instead of trying to scroll a terminal grid.
+    pub fn is_terminal_only(&self) -> bool {
+        matches!(
+            self,
+            Self::ScrollPageUp
+                | Self::ScrollPageDown
+                | Self::ScrollHalfPageUp
+                | Self::ScrollHalfPageDown
+                | Self::ScrollLineUp
+                | Self::ScrollLineDown
+                | Self::ScrollToTop
+                | Self::ScrollToBottom
+                | Self::ClearHistory
+        )
+    }
+
     /// The name `parse_action` accepts for this action — what a user writes
     /// in `[[keyboard.bindings]]`, and the label the shortcuts window shows.
     pub fn config_name(&self) -> String {
@@ -164,6 +184,7 @@ impl NamedAction {
             Self::ToggleRightSidebar => "Toggle the git sidebar".into(),
             Self::SelectNextWorkspace => "Switch to the next workspace".into(),
             Self::SelectPreviousWorkspace => "Switch to the previous workspace".into(),
+            Self::OpenScratchpad => "Toggle the workspace scratchpad tab".into(),
             Self::AddProject => "Add a project to the sidebar".into(),
             Self::ToggleSidebarFocus => "Toggle keyboard focus between terminal and sidebar".into(),
             Self::CloseSession => "Close the cursored or active session".into(),
@@ -304,6 +325,7 @@ fn default_bindings() -> Vec<KeyBinding> {
     b.extend([
         KeyBinding { key: Key::B, mods: ctrl, action: BindingAction::Named(ToggleLeftSidebar) },
         KeyBinding { key: Key::G, mods: ctrl, action: BindingAction::Named(ToggleRightSidebar) },
+        KeyBinding { key: Key::Backtick, mods: ctrl, action: BindingAction::Named(OpenScratchpad) },
         KeyBinding { key: Key::Tab, mods: ctrl, action: BindingAction::Named(SelectNextTab) },
         KeyBinding {
             key: Key::Tab,
@@ -695,6 +717,7 @@ pub fn parse_action(name: &str) -> BindingAction {
         "ToggleRightSidebar" => BindingAction::Named(ToggleRightSidebar),
         "SelectNextWorkspace" => BindingAction::Named(SelectNextWorkspace),
         "SelectPreviousWorkspace" => BindingAction::Named(SelectPreviousWorkspace),
+        "OpenScratchpad" => BindingAction::Named(OpenScratchpad),
         "AddProject" => BindingAction::Named(AddProject),
         "ToggleSidebarFocus" => BindingAction::Named(ToggleSidebarFocus),
         "CloseSession" => BindingAction::Named(CloseSession),
@@ -1063,6 +1086,7 @@ mod tests {
         for (key, mods, expected) in [
             (Key::B, ctrl, ToggleLeftSidebar),
             (Key::G, ctrl, ToggleRightSidebar),
+            (Key::Backtick, ctrl, OpenScratchpad),
             (Key::Tab, ctrl, SelectNextTab),
             (Key::Tab, ctrl_shift, SelectPreviousTab),
             (Key::ArrowRight, alt, SelectNextWorkspace),
@@ -1158,6 +1182,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_terminal_grid_actions_are_terminal_only() {
+        use NamedAction::*;
+        for action in [
+            ScrollPageUp,
+            ScrollPageDown,
+            ScrollHalfPageUp,
+            ScrollHalfPageDown,
+            ScrollLineUp,
+            ScrollLineDown,
+            ScrollToTop,
+            ScrollToBottom,
+            ClearHistory,
+        ] {
+            assert!(action.is_terminal_only(), "{action:?}");
+        }
+        for action in [Paste, Copy, OpenScratchpad, CloseSession, Quit] {
+            assert!(!action.is_terminal_only(), "{action:?}");
+        }
+    }
+
     /// Delete is forward-delete inside a shell, so the default binding only
     /// works because the action is sidebar-scoped.
     #[test]
@@ -1222,5 +1267,18 @@ mod tests {
         // The F1 shortcuts window is gone and the palette lists every action,
         // so the old `ShowShortcuts` name is no longer recognized.
         assert!(matches!(parse_action("ShowShortcuts"), BindingAction::Unsupported(_)));
+    }
+
+    #[test]
+    fn scratchpad_tab_is_a_default_ctrl_backtick_binding_and_parses() {
+        let b = parse_bindings(vec![]);
+        assert_eq!(
+            named_matches(&b, Key::Backtick, Modifiers::CTRL),
+            vec![NamedAction::OpenScratchpad]
+        );
+        assert!(matches!(
+            parse_action("OpenScratchpad"),
+            BindingAction::Named(NamedAction::OpenScratchpad)
+        ));
     }
 }
