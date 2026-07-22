@@ -211,6 +211,26 @@ a project header it toggles expansion instead), `Escape` returns without
 switching. All other keys keep their bindings; unbound keys reach
 neither the shell nor the UI.
 
+### Sidebar search
+
+Typing `/` in a focused sidebar opens a fuzzy-search prompt. The confirm and
+cancel keys are rebindable, **search-scoped** actions — they act only while the
+focused panel is in search mode, so their default keys pass straight through to
+the terminal whenever it owns focus (the terminal's own `Enter`/`Esc` are never
+affected):
+
+- `SidebarSearchConfirm` (default `Enter`) — open the highlighted row and scroll
+  it into view.
+- `SidebarSearchCancel` (default `Esc`) — leave search, staying in the sidebar on
+  the previously active row.
+- `SidebarSearchCancelToTerminal` (default `Shift+Esc`) — leave search and return
+  focus to the terminal.
+
+Rebind them to any non-text-producing key or chord (`Enter`, `Esc`, `Shift+Esc`,
+function keys, `Ctrl`/`Shift` chords). Binding a search action to a key that also
+produces text (a bare, `Shift`-, or `AltGr`-printable) is unsupported: the
+keystroke would both type into the query and fire the action.
+
 ### Misc
 
 - `None` — consume the key without doing anything. Useful to unbind a

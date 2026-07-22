@@ -98,6 +98,14 @@ pub enum NamedAction {
     /// `app.rs`).
     FocusLeft,
     FocusRight,
+    /// Confirm the focused sidebar's fuzzy search: activate the highlighted row
+    /// and scroll it into view. Only fires while that panel is in search mode.
+    SidebarSearchConfirm,
+    /// Cancel the focused sidebar's fuzzy search, staying in the sidebar with the
+    /// cursor on the previously active row.
+    SidebarSearchCancel,
+    /// Cancel the focused sidebar's fuzzy search and return focus to the terminal.
+    SidebarSearchCancelToTerminal,
 }
 
 impl NamedAction {
@@ -134,6 +142,19 @@ impl NamedAction {
                 | Self::ScrollToTop
                 | Self::ScrollToBottom
                 | Self::ClearHistory
+        )
+    }
+
+    /// Actions that only act while the *focused* sidebar panel is in fuzzy-search
+    /// mode. Their default keys (`Enter`, `Esc`, `Shift+Esc`) are terminal input
+    /// otherwise, so dispatch is owned by the sidebar nav pass and suppressed in
+    /// `handle_shortcuts`, keeping the terminal's own keys untouched.
+    pub fn is_search_scoped(&self) -> bool {
+        matches!(
+            self,
+            Self::SidebarSearchConfirm
+                | Self::SidebarSearchCancel
+                | Self::SidebarSearchCancelToTerminal
         )
     }
 
@@ -213,6 +234,13 @@ impl NamedAction {
             Self::SetBaseBranch => "Choose the branch the git panel diffs against".into(),
             Self::FocusLeft => "Move panel focus left (TUIs get the key first)".into(),
             Self::FocusRight => "Move panel focus right (TUIs get the key first)".into(),
+            Self::SidebarSearchConfirm => {
+                "Confirm the sidebar search and open the highlighted row".into()
+            },
+            Self::SidebarSearchCancel => "Cancel the sidebar search, staying in the sidebar".into(),
+            Self::SidebarSearchCancelToTerminal => {
+                "Cancel the sidebar search and focus the terminal".into()
+            },
             Self::NoOp | Self::ReceiveChar => String::new(),
         }
     }
@@ -393,6 +421,23 @@ fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding { key: Key::W, mods: ctrl_shift, action: BindingAction::Named(CloseSession) },
         KeyBinding { key: Key::T, mods: ctrl, action: BindingAction::Named(SpawnNewInstance) },
         KeyBinding { key: Key::Q, mods: ctrl, action: BindingAction::Named(Quit) },
+        // Sidebar fuzzy-search: gated to the focused searching panel, so these
+        // pass straight through to the PTY whenever the terminal owns focus.
+        KeyBinding {
+            key: Key::Enter,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(SidebarSearchConfirm),
+        },
+        KeyBinding {
+            key: Key::Escape,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(SidebarSearchCancel),
+        },
+        KeyBinding {
+            key: Key::Escape,
+            mods: shift,
+            action: BindingAction::Named(SidebarSearchCancelToTerminal),
+        },
     ]);
 
     // macOS uses Cmd instead of Ctrl+Shift for clipboard / window actions.
@@ -751,6 +796,9 @@ pub fn parse_action(name: &str) -> BindingAction {
         "ReceiveChar" => BindingAction::Named(ReceiveChar),
         "FocusLeft" => BindingAction::Named(FocusLeft),
         "FocusRight" => BindingAction::Named(FocusRight),
+        "SidebarSearchConfirm" => BindingAction::Named(SidebarSearchConfirm),
+        "SidebarSearchCancel" => BindingAction::Named(SidebarSearchCancel),
+        "SidebarSearchCancelToTerminal" => BindingAction::Named(SidebarSearchCancelToTerminal),
         other => BindingAction::Unsupported(other.to_string()),
     }
 }
@@ -1035,6 +1083,59 @@ mod tests {
             let b = parse_bindings(vec![raw_action("F1", None, name)]);
             assert_eq!(named_matches(&b, Key::F1, Modifiers::NONE), vec![expected], "{name}");
         }
+    }
+
+    #[test]
+    fn search_action_names_parse() {
+        for (name, expected) in [
+            ("SidebarSearchConfirm", NamedAction::SidebarSearchConfirm),
+            ("SidebarSearchCancel", NamedAction::SidebarSearchCancel),
+            ("SidebarSearchCancelToTerminal", NamedAction::SidebarSearchCancelToTerminal),
+        ] {
+            let b = parse_bindings(vec![raw_action("F1", None, name)]);
+            assert_eq!(named_matches(&b, Key::F1, Modifiers::NONE), vec![expected], "{name}");
+        }
+    }
+
+    #[test]
+    fn is_search_scoped_is_exactly_the_three_search_actions() {
+        assert!(NamedAction::SidebarSearchConfirm.is_search_scoped());
+        assert!(NamedAction::SidebarSearchCancel.is_search_scoped());
+        assert!(NamedAction::SidebarSearchCancelToTerminal.is_search_scoped());
+        for a in [
+            NamedAction::Paste,
+            NamedAction::FocusTerminal,
+            NamedAction::SidebarTop,
+            NamedAction::ToggleProjectExpanded,
+            NamedAction::Quit,
+        ] {
+            assert!(!a.is_search_scoped(), "{a:?} must not be search-scoped");
+        }
+    }
+
+    #[test]
+    fn search_actions_have_default_bindings() {
+        let b = parse_bindings(vec![]);
+        assert_eq!(
+            named_matches(&b, Key::Enter, Modifiers::NONE),
+            vec![NamedAction::SidebarSearchConfirm]
+        );
+        assert_eq!(
+            named_matches(&b, Key::Escape, Modifiers::NONE),
+            vec![NamedAction::SidebarSearchCancel]
+        );
+        assert_eq!(
+            named_matches(&b, Key::Escape, Modifiers::SHIFT),
+            vec![NamedAction::SidebarSearchCancelToTerminal]
+        );
+        // Plain Esc and Shift+Esc are distinct triggers, not aliases.
+        assert!(named_matches(&b, Key::Enter, Modifiers::SHIFT).is_empty());
+    }
+
+    #[test]
+    fn user_binding_replaces_search_confirm_default() {
+        let b = parse_bindings(vec![raw_action("Enter", None, "ReceiveChar")]);
+        assert_eq!(named_matches(&b, Key::Enter, Modifiers::NONE), vec![NamedAction::ReceiveChar]);
     }
 
     #[test]

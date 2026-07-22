@@ -283,6 +283,10 @@ pub struct AlacritreeApp {
     sidebar_auto_shown: bool,
     /// One-shot: scroll the cursor row into view on the next sidebar paint.
     sidebar_cursor_moved: bool,
+    /// One-shot scroll target for the projects sidebar, independent of focus and
+    /// cursor: a search confirm activates a row and focuses the terminal (nulling
+    /// the paint-time cursor), so the row to reveal is carried here instead.
+    pending_sidebar_scroll: Option<SidebarRow>,
     /// Fuzzy-search query and `s`/`a` toggle state for the projects panel.
     /// Transient: never persisted, never touches the `expanded` flag.
     project_filter: PanelFilter,
@@ -611,6 +615,7 @@ impl AlacritreeApp {
             reorder_mode: false,
             sidebar_auto_shown: false,
             sidebar_cursor_moved: false,
+            pending_sidebar_scroll: None,
             project_filter: PanelFilter::new(&['s', 'a']),
             git_filter: PanelFilter::new(&['m', 'd', 'u']),
             git_cursor: None,
@@ -1425,6 +1430,11 @@ impl AlacritreeApp {
                             };
                             valid_for_focus && !(scratchpad_focused && terminal_only)
                         })
+                        // Search actions are owned by the sidebar nav pass; here
+                        // their default Enter/Esc/Shift+Esc must fall through to
+                        // the PTY when the terminal (or a non-searching panel)
+                        // has focus.
+                        .filter(|a| !matches!(a, BindingAction::Named(n) if n.is_search_scoped()))
                         .collect();
                     if !matched.is_empty() {
                         let suppress_chars = matched
@@ -1450,6 +1460,7 @@ impl AlacritreeApp {
     /// app shortcuts still match in `handle_shortcuts` afterwards.
     fn handle_sidebar_nav(&mut self, ctx: &Context) {
         let filter = &mut self.project_filter;
+        let bindings = &self.config.bindings;
         let steps: Vec<SidebarNavStep> = ctx.input_mut(|i| {
             let mut steps = Vec::new();
             i.events.retain(|ev| match ev {
@@ -1460,16 +1471,8 @@ impl AlacritreeApp {
                     },
                     None => true,
                 },
-                egui::Event::Key { key, pressed: true, modifiers, .. } if modifiers.is_none() => {
-                    if let Some(outcome) = filter.on_key(*key) {
-                        steps.push(SidebarNavStep::Filter(outcome));
-                        return false;
-                    }
-                    if is_sidebar_nav_key(*key) {
-                        steps.push(SidebarNavStep::Nav(*key));
-                        return false;
-                    }
-                    true
+                egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                    drain_search_or_nav(&mut steps, filter, bindings, *key, *modifiers)
                 },
                 _ => true,
             });
@@ -1477,27 +1480,21 @@ impl AlacritreeApp {
         });
         for step in steps {
             match step {
-                SidebarNavStep::Filter(outcome) => self.apply_filter_outcome(ctx, outcome),
+                SidebarNavStep::Filter(outcome) => self.apply_filter_outcome(outcome),
                 SidebarNavStep::Nav(key) => self.apply_sidebar_nav(ctx, key),
+                SidebarNavStep::SearchAction(action) => {
+                    self.dispatch_action(ctx, BindingAction::Named(action), ActionOrigin::Keyboard);
+                },
             }
         }
     }
 
-    fn apply_filter_outcome(&mut self, ctx: &Context, outcome: panel_filter::Outcome) {
+    fn apply_filter_outcome(&mut self, outcome: panel_filter::Outcome) {
         use panel_filter::Outcome;
         match outcome {
             Outcome::FilterChanged => self.after_filter_changed(),
             Outcome::Consumed => {},
             Outcome::MoveCursor(delta) => self.move_sidebar_cursor(delta),
-            // Enter clears the query before yielding Activate, so the filtered
-            // row set is already gone; activate the cursor the preceding
-            // MoveCursor/FilterChanged handling maintained against it, rather
-            // than re-deriving rows and rejecting a now-hidden worktree.
-            Outcome::Activate => {
-                if let Some(cursor) = self.sidebar_cursor.clone() {
-                    self.activate_sidebar_row(ctx, &cursor);
-                }
-            },
             Outcome::LeavePanel => self.focus_terminal(),
         }
     }
@@ -1715,6 +1712,7 @@ impl AlacritreeApp {
     /// `handle_shortcuts`.
     fn handle_git_sidebar_nav(&mut self, ctx: &Context) {
         let filter = &mut self.git_filter;
+        let bindings = &self.config.bindings;
         let steps: Vec<SidebarNavStep> = ctx.input_mut(|i| {
             let mut steps = Vec::new();
             i.events.retain(|ev| match ev {
@@ -1725,16 +1723,8 @@ impl AlacritreeApp {
                     },
                     None => true,
                 },
-                egui::Event::Key { key, pressed: true, modifiers, .. } if modifiers.is_none() => {
-                    if let Some(outcome) = filter.on_key(*key) {
-                        steps.push(SidebarNavStep::Filter(outcome));
-                        return false;
-                    }
-                    if is_sidebar_nav_key(*key) {
-                        steps.push(SidebarNavStep::Nav(*key));
-                        return false;
-                    }
-                    true
+                egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                    drain_search_or_nav(&mut steps, filter, bindings, *key, *modifiers)
                 },
                 _ => true,
             });
@@ -1744,29 +1734,19 @@ impl AlacritreeApp {
             match step {
                 SidebarNavStep::Filter(outcome) => self.apply_git_filter_outcome(ctx, outcome),
                 SidebarNavStep::Nav(key) => self.apply_git_sidebar_nav(ctx, key),
+                SidebarNavStep::SearchAction(action) => {
+                    self.dispatch_action(ctx, BindingAction::Named(action), ActionOrigin::Keyboard);
+                },
             }
         }
     }
 
-    fn apply_git_filter_outcome(&mut self, ctx: &Context, outcome: panel_filter::Outcome) {
+    fn apply_git_filter_outcome(&mut self, _ctx: &Context, outcome: panel_filter::Outcome) {
         use panel_filter::Outcome;
         match outcome {
             Outcome::FilterChanged => self.after_git_filter_changed(),
             Outcome::Consumed => {},
             Outcome::MoveCursor(delta) => self.move_git_cursor(delta),
-            // Enter clears the query before yielding Activate, so act on the
-            // cursor the preceding movement maintained against the filtered
-            // rows rather than re-deriving a now-widened set.  Focus stays on
-            // the panel so the next file is one keystroke away.
-            Outcome::Activate => {
-                if let Some(cursor) = self.git_cursor.clone() {
-                    if let Some(req) =
-                        git_row_diff_request(&cursor, self.git_branch_base.as_deref())
-                    {
-                        self.open_diff(ctx, req);
-                    }
-                }
-            },
             Outcome::LeavePanel => self.focus_terminal(),
         }
     }
@@ -2191,12 +2171,120 @@ impl AlacritreeApp {
                     self.open_base_branch_picker(path);
                 }
             },
+            BindingAction::Named(NamedAction::SidebarSearchConfirm) => {
+                self.sidebar_search_confirm(ctx);
+            },
+            BindingAction::Named(NamedAction::SidebarSearchCancel) => {
+                self.sidebar_search_cancel();
+            },
+            BindingAction::Named(NamedAction::SidebarSearchCancelToTerminal) => {
+                self.sidebar_search_cancel_to_terminal();
+            },
             BindingAction::Named(other) => {
                 self.dispatch_scroll_or_other(other);
             },
             BindingAction::Unsupported(name) => {
                 log::debug!("unsupported keyboard binding action: {name}");
             },
+        }
+    }
+
+    /// Confirm the focused sidebar's fuzzy search: activate the highlighted row
+    /// and mark it to scroll into view once search exits (the row may be a child
+    /// force-shown only during search, so a now-hidden one resolves to its
+    /// owning header). No-op unless the focused panel is in search mode.
+    fn sidebar_search_confirm(&mut self, ctx: &Context) {
+        match self.focus {
+            PaneFocus::ProjectsSidebar
+                if self.project_filter.mode() == panel_filter::Mode::Search =>
+            {
+                let acted = self.sidebar_cursor.clone();
+                self.project_filter.exit_search();
+                if let Some(row) = acted {
+                    self.activate_sidebar_row(ctx, &row);
+                    self.pending_sidebar_scroll = self.resolve_confirm_scroll_target(&row);
+                }
+            },
+            PaneFocus::GitSidebar if self.git_filter.mode() == panel_filter::Mode::Search => {
+                let cursor = self.git_cursor.clone();
+                self.git_filter.exit_search();
+                self.recompute_git_rows();
+                if let Some(c) = cursor {
+                    if let Some(req) = git_row_diff_request(&c, self.git_branch_base.as_deref()) {
+                        self.open_diff(ctx, req);
+                    }
+                    // Focus stays in the git panel, so the render pass scrolls the
+                    // cursor row via `git_cursor_moved`.
+                    self.git_cursor = git_nav::ensure_cursor(&self.git_rows, Some(&c));
+                    self.git_cursor_moved = true;
+                }
+            },
+            _ => {},
+        }
+    }
+
+    /// The confirm scroll target: the acted-on row when it still renders after
+    /// search exits, else its owning project header (never Home, which
+    /// `ensure_cursor` would otherwise pick for a vanished child).
+    fn resolve_confirm_scroll_target(&mut self, acted: &SidebarRow) -> Option<SidebarRow> {
+        let rows = self.current_project_rows();
+        if rows.contains(acted) {
+            return sidebar_nav::ensure_cursor(&rows, Some(acted));
+        }
+        let header = {
+            let session_workspace = |id: SessionId| {
+                self.sessions.iter().find(|s| s.id == id).map(|s| s.working_directory.clone())
+            };
+            row_project_root(&self.projects, session_workspace, acted).map(SidebarRow::Project)
+        };
+        sidebar_nav::ensure_cursor(&rows, header.as_ref())
+    }
+
+    /// Cancel the focused sidebar's fuzzy search, staying in the sidebar with the
+    /// cursor on the seed row (active session / workspace, else Home). No-op
+    /// unless the focused panel is in search mode.
+    fn sidebar_search_cancel(&mut self) {
+        match self.focus {
+            PaneFocus::ProjectsSidebar
+                if self.project_filter.mode() == panel_filter::Mode::Search =>
+            {
+                self.project_filter.exit_search();
+                let seed = sidebar_nav::seed(
+                    &self.projects,
+                    self.current_workspace.as_deref(),
+                    &self.listed_session_ids(),
+                    self.active_session.get(&self.current_workspace).copied(),
+                );
+                let rows = self.current_project_rows();
+                let target = sidebar_nav::ensure_cursor(&rows, Some(&seed));
+                self.sidebar_cursor = target.clone();
+                self.sidebar_cursor_moved = true;
+                self.pending_sidebar_scroll = target;
+            },
+            PaneFocus::GitSidebar if self.git_filter.mode() == panel_filter::Mode::Search => {
+                self.git_filter.exit_search();
+                self.after_git_filter_changed();
+            },
+            _ => {},
+        }
+    }
+
+    /// Cancel the focused sidebar's fuzzy search and return focus to the
+    /// terminal. No-op unless the focused panel is in search mode.
+    fn sidebar_search_cancel_to_terminal(&mut self) {
+        match self.focus {
+            PaneFocus::ProjectsSidebar
+                if self.project_filter.mode() == panel_filter::Mode::Search =>
+            {
+                self.project_filter.exit_search();
+                self.focus_terminal();
+            },
+            PaneFocus::GitSidebar if self.git_filter.mode() == panel_filter::Mode::Search => {
+                self.git_filter.exit_search();
+                self.recompute_git_rows();
+                self.focus_terminal();
+            },
+            _ => {},
         }
     }
 
@@ -2380,6 +2468,12 @@ impl AlacritreeApp {
             None
         };
         let cursor_moved = std::mem::take(&mut self.sidebar_cursor_moved);
+        // Focus-independent scroll target from a search confirm/cancel: honored
+        // when its row renders this pass, dropped otherwise (taken either way).
+        let scroll_target = self.pending_sidebar_scroll.take();
+        let scrolls = |row: &SidebarRow, is_cursor: bool| {
+            (is_cursor && cursor_moved) || scroll_target.as_ref() == Some(row)
+        };
 
         // Membership for the active filter, resolved once so paint can skip
         // non-surviving rows.  While filtering, matched projects render their
@@ -2596,11 +2690,12 @@ impl AlacritreeApp {
                     // whenever the list otherwise fits the panel.
                     let mut group_gap = 0.0_f32;
                     if !filtering || home_visible {
+                        let home_is_cursor = matches!(&cursor_row, Some(SidebarRow::Home));
                         let home_action = home_row(
                             ui,
                             self.current_workspace.is_none(),
-                            matches!(&cursor_row, Some(SidebarRow::Home)),
-                            cursor_moved,
+                            home_is_cursor,
+                            scrolls(&SidebarRow::Home, home_is_cursor),
                             home_attention,
                             home_agent_glyph,
                             &icons,
@@ -2617,7 +2712,8 @@ impl AlacritreeApp {
                                 &cursor_row,
                                 Some(SidebarRow::Session(id)) if *id == row.id
                             );
-                            let act = session_row(ui, row, is_cursor, cursor_moved, &icons, &theme);
+                            let scroll = scrolls(&SidebarRow::Session(row.id), is_cursor);
+                            let act = session_row(ui, row, is_cursor, scroll, &icons, &theme);
                             if act.activate {
                                 activate_session_request.set(Some((None, row.id)));
                             }
@@ -2721,14 +2817,18 @@ impl AlacritreeApp {
                                 }
                             },
                         );
-                        if matches!(&cursor_row, Some(SidebarRow::Project(r)) if *r == project.root)
-                        {
+                        let header_is_cursor =
+                            matches!(&cursor_row, Some(SidebarRow::Project(r)) if *r == project.root);
+                        let header_row = SidebarRow::Project(project.root.clone());
+                        if header_is_cursor || scroll_target.as_ref() == Some(&header_row) {
                             let rect = egui::Rect::from_x_y_ranges(
                                 ui.max_rect().x_range(),
                                 row_rect.y_range(),
                             );
-                            paint_cursor_outline(ui, rect, &theme);
-                            if cursor_moved {
+                            if header_is_cursor {
+                                paint_cursor_outline(ui, rect, &theme);
+                            }
+                            if scrolls(&header_row, header_is_cursor) {
                                 ui.scroll_to_rect(rect, None);
                             }
                         }
@@ -2861,6 +2961,8 @@ impl AlacritreeApp {
                                     &cursor_row,
                                     Some(SidebarRow::Worktree(p)) if *p == wt.path
                                 );
+                                let wt_scroll =
+                                    scrolls(&SidebarRow::Worktree(wt.path.clone()), is_cursor);
                                 let is_deleting = deleting_paths.contains(&wt.path);
                                 let action = worktree_row(
                                     ui,
@@ -2876,7 +2978,7 @@ impl AlacritreeApp {
                                         .and_then(Option::as_ref),
                                     is_active,
                                     is_cursor,
-                                    cursor_moved,
+                                    wt_scroll,
                                     wt_attention,
                                     wt_glyph,
                                     is_deleting,
@@ -2905,11 +3007,13 @@ impl AlacritreeApp {
                                         &cursor_row,
                                         Some(SidebarRow::Session(id)) if *id == row.id
                                     );
+                                    let scroll =
+                                        scrolls(&SidebarRow::Session(row.id), is_cursor);
                                     let act = session_row(
                                         ui,
                                         row,
                                         is_cursor,
-                                        cursor_moved,
+                                        scroll,
                                         &icons,
                                         &theme,
                                     );
@@ -4283,6 +4387,7 @@ fn paint_git_row_cursor(
 enum SidebarNavStep {
     Filter(panel_filter::Outcome),
     Nav(egui::Key),
+    SearchAction(NamedAction),
 }
 
 /// Panel title plus its filter chrome, shared by both sidebars: the heading,
@@ -4317,6 +4422,55 @@ fn panel_header_filter_ui(
                 );
             });
     }
+}
+
+/// Decide one key event for a focused sidebar panel and record its step.
+///
+/// In search mode a search-scoped binding match (any modifiers, so `Shift+Esc`
+/// counts) is dispatched through the binding table, keeping `Enter`/`Esc`
+/// rebindable. Otherwise an unmodified key drives the filter or browsing nav; a
+/// modified non-search key is retained for `handle_shortcuts`. Returns whether
+/// the event stays in the queue (`true`) or is consumed here (`false`).
+fn drain_search_or_nav(
+    steps: &mut Vec<SidebarNavStep>,
+    filter: &mut PanelFilter,
+    bindings: &[crate::bindings::KeyBinding],
+    key: egui::Key,
+    modifiers: egui::Modifiers,
+) -> bool {
+    if filter.mode() == panel_filter::Mode::Search {
+        let mut matched = false;
+        for a in crate::bindings::all_matches(bindings, key, modifiers) {
+            if let BindingAction::Named(n) = a {
+                if n.is_search_scoped() {
+                    steps.push(SidebarNavStep::SearchAction(*n));
+                    matched = true;
+                }
+            }
+        }
+        if matched {
+            return false;
+        }
+    }
+    if !modifiers.is_none() {
+        return true;
+    }
+    if let Some(outcome) = filter.on_key(key) {
+        steps.push(SidebarNavStep::Filter(outcome));
+        return false;
+    }
+    // Browsing consumes the whole nav-key set; in search only Space stays
+    // consumed as a no-op, preserving the fake-click guard on the terminal view.
+    let consume = if filter.mode() == panel_filter::Mode::Browsing {
+        is_sidebar_nav_key(key)
+    } else {
+        key == egui::Key::Space
+    };
+    if consume {
+        steps.push(SidebarNavStep::Nav(key));
+        return false;
+    }
+    true
 }
 
 fn is_sidebar_nav_key(key: egui::Key) -> bool {
@@ -4413,12 +4567,12 @@ fn home_row(
         let rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
         ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
     }
+    let full_rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
     if is_cursor {
-        let full_rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
         paint_cursor_outline(ui, full_rect, theme);
-        if scroll_into_view {
-            ui.scroll_to_rect(full_rect, None);
-        }
+    }
+    if scroll_into_view {
+        ui.scroll_to_rect(full_rect, None);
     }
     HomeAction { activate: resp.clicked() && !spawn_clicked, spawn: spawn_clicked }
 }
@@ -4828,9 +4982,9 @@ fn worktree_row(
     }
     if is_cursor {
         paint_cursor_outline(ui, full_rect, theme);
-        if scroll_into_view {
-            ui.scroll_to_rect(full_rect, None);
-        }
+    }
+    if scroll_into_view {
+        ui.scroll_to_rect(full_rect, None);
     }
     WorktreeAction {
         activate: !deleting && resp.clicked() && !delete_clicked && !spawn_clicked && !wt.prunable,
@@ -4919,9 +5073,9 @@ fn session_row(
     }
     if is_cursor {
         paint_cursor_outline(ui, full_rect, theme);
-        if scroll_into_view {
-            ui.scroll_to_rect(full_rect, None);
-        }
+    }
+    if scroll_into_view {
+        ui.scroll_to_rect(full_rect, None);
     }
     SessionRowAction { activate: resp.clicked() && !close_clicked, close: close_clicked }
 }
@@ -6345,6 +6499,10 @@ impl eframe::App for AlacritreeApp {
             {
                 paint_focus_outline(ctx, r, &theme);
             }
+        } else {
+            // A confirm that focuses the terminal can hide an auto-shown sidebar
+            // before it paints; drop its scroll target so it can't fire later.
+            self.pending_sidebar_scroll = None;
         }
 
         if self.show_right_sidebar {
@@ -6570,6 +6728,128 @@ mod tests {
             v.insert(to, it);
         }
         v
+    }
+
+    fn searching_filter() -> PanelFilter {
+        let mut f = PanelFilter::new(&['s', 'a']);
+        f.on_text("/");
+        f
+    }
+
+    #[test]
+    fn search_enter_escape_and_shift_escape_dispatch_distinct_actions() {
+        let binds = crate::bindings::parse_bindings(vec![]);
+        let mut f = searching_filter();
+        f.on_text("foo");
+
+        let mut steps = Vec::new();
+        let retain = drain_search_or_nav(
+            &mut steps,
+            &mut f,
+            &binds,
+            egui::Key::Enter,
+            egui::Modifiers::NONE,
+        );
+        assert!(!retain, "a matched search action consumes the key");
+        assert!(matches!(steps.as_slice(), [SidebarNavStep::SearchAction(
+            NamedAction::SidebarSearchConfirm
+        )]));
+        // The filter is untouched by the drain — the action does the exit.
+        assert_eq!(f.mode(), panel_filter::Mode::Search);
+        assert_eq!(f.query(), "foo");
+
+        let mut steps = Vec::new();
+        drain_search_or_nav(&mut steps, &mut f, &binds, egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(matches!(steps.as_slice(), [SidebarNavStep::SearchAction(
+            NamedAction::SidebarSearchCancel
+        )]));
+
+        let mut steps = Vec::new();
+        drain_search_or_nav(&mut steps, &mut f, &binds, egui::Key::Escape, egui::Modifiers::SHIFT);
+        assert!(
+            matches!(steps.as_slice(), [SidebarNavStep::SearchAction(
+                NamedAction::SidebarSearchCancelToTerminal
+            )]),
+            "Shift+Esc is a distinct search action from plain Esc"
+        );
+    }
+
+    #[test]
+    fn search_arrows_move_cursor_and_space_is_swallowed() {
+        let binds = crate::bindings::parse_bindings(vec![]);
+        let mut f = searching_filter();
+
+        let mut steps = Vec::new();
+        drain_search_or_nav(
+            &mut steps,
+            &mut f,
+            &binds,
+            egui::Key::ArrowDown,
+            egui::Modifiers::NONE,
+        );
+        assert!(matches!(steps.as_slice(), [SidebarNavStep::Filter(
+            panel_filter::Outcome::MoveCursor(1)
+        )]));
+
+        // Space stays consumed as a no-op nav even in search (fake-click guard).
+        let mut steps = Vec::new();
+        let retain = drain_search_or_nav(
+            &mut steps,
+            &mut f,
+            &binds,
+            egui::Key::Space,
+            egui::Modifiers::NONE,
+        );
+        assert!(!retain);
+        assert!(matches!(steps.as_slice(), [SidebarNavStep::Nav(egui::Key::Space)]));
+    }
+
+    #[test]
+    fn browsing_enter_navigates_and_modified_keys_fall_through() {
+        let binds = crate::bindings::parse_bindings(vec![]);
+        let mut f = PanelFilter::new(&['s', 'a']); // browsing
+
+        let mut steps = Vec::new();
+        let retain = drain_search_or_nav(
+            &mut steps,
+            &mut f,
+            &binds,
+            egui::Key::Enter,
+            egui::Modifiers::NONE,
+        );
+        assert!(!retain, "Enter in browsing is a nav activate, consumed here");
+        assert!(matches!(steps.as_slice(), [SidebarNavStep::Nav(egui::Key::Enter)]));
+
+        // A modifier-bound key is left for handle_shortcuts.
+        let mut steps = Vec::new();
+        let retain = drain_search_or_nav(
+            &mut steps,
+            &mut f,
+            &binds,
+            egui::Key::Enter,
+            egui::Modifiers::CTRL,
+        );
+        assert!(retain);
+        assert!(steps.is_empty());
+    }
+
+    #[test]
+    fn search_enter_with_no_binding_falls_through_without_activating() {
+        // User freed Enter (no search binding): it must not hard-fire browsing
+        // activate — it falls through for the terminal/shortcuts instead.
+        let binds: Vec<crate::bindings::KeyBinding> = Vec::new();
+        let mut f = searching_filter();
+
+        let mut steps = Vec::new();
+        let retain = drain_search_or_nav(
+            &mut steps,
+            &mut f,
+            &binds,
+            egui::Key::Enter,
+            egui::Modifiers::NONE,
+        );
+        assert!(retain, "an unbound Enter in search is retained, not consumed as nav");
+        assert!(steps.is_empty());
     }
 
     #[test]

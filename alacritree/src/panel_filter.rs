@@ -26,7 +26,6 @@ pub enum Mode {
 pub enum Outcome {
     FilterChanged,
     MoveCursor(i32),
-    Activate,
     LeavePanel,
     Consumed,
 }
@@ -96,16 +95,9 @@ impl PanelFilter {
                 },
                 egui::Key::ArrowUp => Some(Outcome::MoveCursor(-1)),
                 egui::Key::ArrowDown => Some(Outcome::MoveCursor(1)),
-                egui::Key::Enter => {
-                    self.clear_query();
-                    self.mode = Mode::Browsing;
-                    Some(Outcome::Activate)
-                },
-                egui::Key::Escape => {
-                    self.clear_query();
-                    self.mode = Mode::Browsing;
-                    Some(Outcome::FilterChanged)
-                },
+                // Enter/Escape are search-scoped keyboard actions dispatched
+                // through the binding table by the sidebar nav handler, not
+                // consumed here, so they stay rebindable.
                 _ => None,
             },
         }
@@ -148,6 +140,14 @@ impl PanelFilter {
         self.pattern.score(haystack, &mut self.matcher).is_some()
     }
 
+    /// Leave search mode: clear the query (rebuilding the empty, match-all
+    /// pattern) and return to browsing. Toggle filters are a separate dimension
+    /// and are left intact.
+    pub fn exit_search(&mut self) {
+        self.clear_query();
+        self.mode = Mode::Browsing;
+    }
+
     fn clear_query(&mut self) {
         self.query.clear();
         self.rebuild_pattern();
@@ -185,26 +185,40 @@ mod tests {
     }
 
     #[test]
-    fn backspace_pops_and_esc_clears_back_to_browsing() {
+    fn backspace_pops_the_query_in_search() {
         let mut f = PanelFilter::new(TOGGLES);
         f.on_text("/");
         f.on_text("foo");
         assert_eq!(f.on_key(egui::Key::Backspace), Some(Outcome::FilterChanged));
         assert_eq!(f.query(), "fo");
-
-        assert_eq!(f.on_key(egui::Key::Escape), Some(Outcome::FilterChanged));
-        assert_eq!(f.mode(), Mode::Browsing);
-        assert_eq!(f.query(), "");
+        assert_eq!(f.mode(), Mode::Search);
     }
 
     #[test]
-    fn enter_in_search_activates_and_clears_the_query() {
+    fn enter_and_escape_in_search_fall_through_unconsumed() {
+        // Both are rebindable search actions dispatched via the binding table,
+        // so the filter must not consume them or mutate its own state.
         let mut f = PanelFilter::new(TOGGLES);
         f.on_text("/");
         f.on_text("foo");
-        assert_eq!(f.on_key(egui::Key::Enter), Some(Outcome::Activate));
+        assert_eq!(f.on_key(egui::Key::Enter), None);
+        assert_eq!(f.on_key(egui::Key::Escape), None);
+        assert_eq!(f.mode(), Mode::Search);
+        assert_eq!(f.query(), "foo");
+    }
+
+    #[test]
+    fn exit_search_clears_query_and_returns_to_browsing_keeping_toggles() {
+        let mut f = PanelFilter::new(TOGGLES);
+        f.on_text("s");
+        f.on_text("/");
+        f.on_text("foo");
+        assert!(f.is_toggled('s'));
+
+        f.exit_search();
         assert_eq!(f.mode(), Mode::Browsing);
         assert_eq!(f.query(), "");
+        assert!(f.is_toggled('s'), "exit_search must leave toggle filters intact");
     }
 
     #[test]

@@ -109,7 +109,7 @@ pub fn action_items(bindings: &[KeyBinding]) -> Vec<PaletteItem> {
 /// Every simple (non-parametrized) `NamedAction`, kept in sync with the enum by
 /// hand. Mirrors the old shortcuts window's bindable list; `SelectTab`/
 /// `SpawnProfile` are excluded here because they carry an index.
-fn bindable_actions() -> [NamedAction; 47] {
+fn bindable_actions() -> [NamedAction; 50] {
     use NamedAction::*;
     [
         Paste,
@@ -157,6 +157,9 @@ fn bindable_actions() -> [NamedAction; 47] {
         ToggleSessionRows,
         ToggleSessionTabs,
         SetBaseBranch,
+        SidebarSearchConfirm,
+        SidebarSearchCancel,
+        SidebarSearchCancelToTerminal,
         Quit,
         TogglePalette,
     ]
@@ -292,6 +295,15 @@ mod tests {
         // FocusTerminal has no default binding: present, discoverable, keyless.
         let focus = find(&items, "FocusTerminal").expect("FocusTerminal missing");
         assert!(focus.keys.is_empty());
+    }
+
+    #[test]
+    fn palette_lists_the_sidebar_search_actions() {
+        let items = action_items(&parse_bindings(vec![]));
+        for name in ["SidebarSearchConfirm", "SidebarSearchCancel", "SidebarSearchCancelToTerminal"]
+        {
+            assert!(items.iter().any(|i| i.secondary == name), "{name} should be a palette row");
+        }
     }
 
     #[test]
