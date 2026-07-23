@@ -600,49 +600,39 @@ fn foreground_nav_tui(shell_pid: u32) -> bool {
     foreground_group_has_nav_tui(tpgid)
 }
 
-/// A nav TUI anywhere in foreground process group `pgid`.  `KERN_PROC_PGRP`
-/// returns a `kinfo_proc` per group member; `p_comm` is the same kernel-
-/// truncated command name the `/proc/<pid>/comm` read yields on Linux.
+/// A nav TUI anywhere in foreground process group `pgid`.
+///
+/// `proc_listpgrppids` gives us just the stable, public PID list instead of
+/// relying on Darwin's private `kinfo_proc` layout.  Command names then come
+/// from the same `proc_bsdinfo` query used by the group-leader fast path.
 #[cfg(target_os = "macos")]
 fn foreground_group_has_nav_tui(pgid: u32) -> bool {
-    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PGRP, pgid as libc::c_int];
-    let mut size = 0usize;
-    let sized = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as libc::c_uint,
-            std::ptr::null_mut(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
+    let Ok(pgid) = libc::pid_t::try_from(pgid) else {
+        return false;
     };
-    if sized != 0 || size == 0 {
+
+    let count = unsafe { libc::proc_listpgrppids(pgid, std::ptr::null_mut(), 0) };
+    let Ok(count) = usize::try_from(count) else {
+        return false;
+    };
+    if count == 0 {
         return false;
     }
-    let mut buf: Vec<libc::kinfo_proc> =
-        Vec::with_capacity(size / std::mem::size_of::<libc::kinfo_proc>());
-    let filled = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as libc::c_uint,
-            buf.as_mut_ptr().cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if filled != 0 {
+
+    // Leave room for processes spawned between the sizing and filling calls.
+    let mut pids = vec![0 as libc::pid_t; count.saturating_add(16)];
+    let Ok(buffer_size) = libc::c_int::try_from(std::mem::size_of_val(pids.as_slice())) else {
         return false;
-    }
-    // The set can shrink between the sizing and filling calls; trust the second
-    // byte count, never the first capacity.
-    unsafe { buf.set_len(size / std::mem::size_of::<libc::kinfo_proc>()) };
-    buf.iter().any(|kp| {
-        let bytes: Vec<u8> =
-            kp.kp_proc.p_comm.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
-        !bytes.is_empty() && is_nav_tui_name(String::from_utf8_lossy(&bytes).trim())
-    })
+    };
+    let listed = unsafe { libc::proc_listpgrppids(pgid, pids.as_mut_ptr().cast(), buffer_size) };
+    let Ok(listed) = usize::try_from(listed) else {
+        return false;
+    };
+    pids.truncate(listed.min(pids.len()));
+
+    pids.into_iter()
+        .filter_map(|pid| u32::try_from(pid).ok().filter(|&pid| pid != 0))
+        .any(|pid| comm_for_pid(pid).is_some_and(|comm| is_nav_tui_name(comm.trim())))
 }
 
 /// Windows has no foreground process group, so "a job is running" is
