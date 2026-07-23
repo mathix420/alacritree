@@ -898,7 +898,10 @@ impl AlacritreeApp {
         // click. Switching first would strand the user on a dead workspace
         // with a failed spawn — stay put and let the sidebar re-mark the row.
         if !path.is_dir() {
-            self.last_error =
+            // This is recoverable from the sidebar, so use the dismissible
+            // dialog instead of replacing the terminal with `last_error`
+            // forever.
+            self.error_dialog =
                 Some("worktree directory is missing — prune it from the sidebar".to_string());
             if let Some(idx) =
                 self.projects.iter().position(|p| p.worktrees.iter().any(|w| w.path == path))
