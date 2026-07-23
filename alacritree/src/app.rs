@@ -32,6 +32,7 @@ use crate::scratchpad;
 use crate::session::{
     AttentionVerdict, Session, SessionId, SessionKind, TermSize, poll_attention_debounce,
 };
+use crate::sidebar_focus;
 use crate::sidebar_nav::{self, SidebarRow};
 use crate::state::{self, PersistedProject};
 use crate::terminal_view;
@@ -370,6 +371,9 @@ pub struct AlacritreeApp {
     /// `pending_project_refresh` — resolved off the UI thread, adopted in
     /// `wsl_delta_path`.
     pending_delta: HashMap<String, Receiver<Option<String>>>,
+    /// Rows behind the last-built focus snapshot. Paint reuses this until the
+    /// next rebuild instead of recomputing the projection every frame.
+    sidebar_rows_cache: Option<Vec<SidebarRow>>,
 }
 
 struct DeleteRequest {
@@ -666,6 +670,7 @@ impl AlacritreeApp {
             pending_project_refresh: HashMap::new(),
             wsl_delta_paths: HashMap::new(),
             pending_delta: HashMap::new(),
+            sidebar_rows_cache: None,
         };
 
         let wsl_indices: Vec<usize> = app
@@ -1620,6 +1625,42 @@ impl AlacritreeApp {
 
     fn workspace_has_sessions(&self, key: &WorkspaceKey) -> bool {
         self.sessions.iter().any(|s| s.working_directory == *key)
+    }
+
+    /// Every live session as a `(workspace, id)` pair — the same shape
+    /// `close_fallback` and `sidebar_session_ids` take, and the model the
+    /// focus reconciler observes.
+    fn session_pairs(&self) -> Vec<(WorkspaceKey, SessionId)> {
+        self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect()
+    }
+
+    /// Live sessions borrowed for the unchanged-inputs check, which runs on
+    /// every frame and must not allocate.
+    fn session_inputs(&self) -> impl Iterator<Item = sidebar_focus::SessionInput<'_>> {
+        self.sessions.iter().map(|s| sidebar_focus::SessionInput {
+            workspace: &s.working_directory,
+            id: s.id,
+            attention: s.needs_attention,
+        })
+    }
+
+    fn sidebar_snapshot(&mut self, skip_worktree: Option<&Path>) -> sidebar_focus::TreeSnapshot {
+        let inputs = sidebar_focus::ObservedInputs::capture(
+            &self.projects,
+            self.session_inputs(),
+            sidebar_focus::UiInputs {
+                session_rows_always: self.session_rows_always,
+                query: self.project_filter.query(),
+                toggles: self.project_filter.toggle_bits(),
+            },
+        );
+        let rows = self.current_project_rows();
+        let live = self.session_pairs();
+        let snapshot = build_sidebar_snapshot(&self.projects, &live, &rows, skip_worktree, inputs);
+        // Paint reuses these until the next rebuild, so an unchanged filtering
+        // frame runs no fuzzy matching at all.
+        self.sidebar_rows_cache = Some(rows);
+        snapshot
     }
 
     fn apply_sidebar_nav(&mut self, ctx: &Context, key: egui::Key) {
@@ -3942,11 +3983,10 @@ fn single_line_galley(
     max_w: f32,
 ) -> std::sync::Arc<egui::Galley> {
     use egui::text::{LayoutJob, TextFormat};
-    let mut job = LayoutJob::single_section(text.to_owned(), TextFormat {
-        font_id: egui::FontId::new(size, family),
-        color,
-        ..Default::default()
-    });
+    let mut job = LayoutJob::single_section(
+        text.to_owned(),
+        TextFormat { font_id: egui::FontId::new(size, family), color, ..Default::default() },
+    );
     job.wrap.max_width = max_w.max(0.0);
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
@@ -4104,8 +4144,12 @@ fn paint_palette_row(
     let painter = ui.painter().clone();
 
     if selected {
-        let wash =
-            Color32::from_rgba_unmultiplied(theme.accent.r(), theme.accent.g(), theme.accent.b(), 46);
+        let wash = Color32::from_rgba_unmultiplied(
+            theme.accent.r(),
+            theme.accent.g(),
+            theme.accent.b(),
+            46,
+        );
         painter.rect_filled(rect, 5.0 * s, wash);
         let bar = egui::Rect::from_min_size(rect.left_top(), egui::vec2(2.5 * s, rect.height()));
         painter.rect_filled(bar, 0.0, theme.accent);
@@ -4859,6 +4903,89 @@ fn sidebar_session_ids(
     let ids: Vec<SessionId> = pairs.iter().filter(|(w, _)| w == ws).map(|(_, id)| *id).collect();
     let threshold = if always { 1 } else { 2 };
     if ids.len() < threshold { Vec::new() } else { ids }
+}
+
+/// Assemble the model arena and the projection.  `rows` is the projection —
+/// exactly what the cursor steps over — and `live` is the model: every running
+/// session, whatever the listing threshold or the filter says.  Building
+/// membership from `listed` instead would make the last session in a workspace
+/// read as deleted the moment its sibling closed.
+///
+/// `skip_worktree` drops a worktree whose deletion is already committed but
+/// whose git operation has not finished, so nothing lands the cursor — or a
+/// new shell — inside a directory on its way out.
+///
+/// Nodes are pushed in exactly the order `sidebar_nav::visible_rows` emits,
+/// with unprojected nodes interleaved, so one forward index into `rows`
+/// classifies every node.  Asking `rows.contains` per node instead would be
+/// quadratic in path comparisons on a path that runs whenever the user types.
+fn build_sidebar_snapshot(
+    projects: &[Project],
+    live: &[(WorkspaceKey, SessionId)],
+    rows: &[SidebarRow],
+    skip_worktree: Option<&Path>,
+    inputs: sidebar_focus::ObservedInputs,
+) -> sidebar_focus::TreeSnapshot {
+    use sidebar_focus::Parent;
+
+    let mut b = sidebar_focus::SnapshotBuilder::default();
+    let mut next_row = 0usize;
+    let mut placed = vec![false; live.len()];
+
+    // Consume `rows` in lockstep: a node is projected exactly when it is the
+    // row the projection expects next.
+    let push = |b: &mut sidebar_focus::SnapshotBuilder,
+                next_row: &mut usize,
+                row: SidebarRow,
+                parent: Parent| {
+        let projected = rows.get(*next_row) == Some(&row);
+        if projected {
+            *next_row += 1;
+        }
+        b.push(row, parent, projected)
+    };
+
+    let home_id = push(&mut b, &mut next_row, SidebarRow::Home, Parent::Root);
+    for (i, (ws, id)) in live.iter().enumerate() {
+        if ws.is_none() {
+            push(&mut b, &mut next_row, SidebarRow::Session(*id), Parent::Node(home_id));
+            placed[i] = true;
+        }
+    }
+
+    for p in projects {
+        let project_id =
+            push(&mut b, &mut next_row, SidebarRow::Project(p.root.clone()), Parent::Root);
+        for wt in &p.worktrees {
+            if skip_worktree == Some(wt.path.as_path()) {
+                continue;
+            }
+            let wt_id = push(
+                &mut b,
+                &mut next_row,
+                SidebarRow::Worktree(wt.path.clone()),
+                Parent::Node(project_id),
+            );
+            for (i, (ws, id)) in live.iter().enumerate() {
+                if ws.as_deref() == Some(wt.path.as_path()) {
+                    push(&mut b, &mut next_row, SidebarRow::Session(*id), Parent::Node(wt_id));
+                    placed[i] = true;
+                }
+            }
+        }
+    }
+
+    // Sessions whose workspace has no row left — a removed project, or a
+    // worktree already treated as gone.  They are running, so they belong in
+    // the model; they have no place in the tree, so they are nobody's sibling.
+    for (i, (_, id)) in live.iter().enumerate() {
+        if !placed[i] {
+            b.push(SidebarRow::Session(*id), Parent::Detached, false);
+        }
+    }
+
+    debug_assert_eq!(next_row, rows.len(), "every projected row must be in the arena");
+    b.finish(inputs)
 }
 
 /// Where the view goes after a session's removal.
@@ -5949,8 +6076,11 @@ impl AlacritreeApp {
             },
             PaletteAction::CreateWorktree(root) => {
                 if let Some(project_idx) = self.projects.iter().position(|p| p.root == root) {
-                    self.pending_create =
-                        Some(CreateState::Prompt { project_idx, branch: String::new(), error: None });
+                    self.pending_create = Some(CreateState::Prompt {
+                        project_idx,
+                        branch: String::new(),
+                        error: None,
+                    });
                 }
             },
         }
@@ -7033,25 +7163,28 @@ mod tests {
             egui::Modifiers::NONE,
         );
         assert!(!retain, "a matched search action consumes the key");
-        assert!(matches!(steps.as_slice(), [SidebarNavStep::SearchAction(
-            NamedAction::SidebarSearchConfirm
-        )]));
+        assert!(matches!(
+            steps.as_slice(),
+            [SidebarNavStep::SearchAction(NamedAction::SidebarSearchConfirm)]
+        ));
         // The filter is untouched by the drain — the action does the exit.
         assert_eq!(f.mode(), panel_filter::Mode::Search);
         assert_eq!(f.query(), "foo");
 
         let mut steps = Vec::new();
         drain_search_or_nav(&mut steps, &mut f, &binds, egui::Key::Escape, egui::Modifiers::NONE);
-        assert!(matches!(steps.as_slice(), [SidebarNavStep::SearchAction(
-            NamedAction::SidebarSearchCancel
-        )]));
+        assert!(matches!(
+            steps.as_slice(),
+            [SidebarNavStep::SearchAction(NamedAction::SidebarSearchCancel)]
+        ));
 
         let mut steps = Vec::new();
         drain_search_or_nav(&mut steps, &mut f, &binds, egui::Key::Escape, egui::Modifiers::SHIFT);
         assert!(
-            matches!(steps.as_slice(), [SidebarNavStep::SearchAction(
-                NamedAction::SidebarSearchCancelToTerminal
-            )]),
+            matches!(
+                steps.as_slice(),
+                [SidebarNavStep::SearchAction(NamedAction::SidebarSearchCancelToTerminal)]
+            ),
             "Shift+Esc is a distinct search action from plain Esc"
         );
     }
@@ -7069,9 +7202,10 @@ mod tests {
             egui::Key::ArrowDown,
             egui::Modifiers::NONE,
         );
-        assert!(matches!(steps.as_slice(), [SidebarNavStep::Filter(
-            panel_filter::Outcome::MoveCursor(1)
-        )]));
+        assert!(matches!(
+            steps.as_slice(),
+            [SidebarNavStep::Filter(panel_filter::Outcome::MoveCursor(1))]
+        ));
 
         // Space stays consumed as a no-op nav even in search (fake-click guard).
         let mut steps = Vec::new();
@@ -7950,5 +8084,115 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn snapshot_parents_agree_with_the_row_model() {
+        use crate::sidebar_focus::Parent;
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        // Two projects, one collapsed, with sessions under the expanded one.
+        let projects = vec![
+            sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2"]),
+            sidebar_nav::tests::project("/b", false, &["/b/wt1"]),
+        ];
+        let live =
+            vec![(None, 1), (Some(PathBuf::from("/a/wt1")), 2), (Some(PathBuf::from("/a/wt1")), 3)];
+        let listed = sidebar_nav::ListedSessions::from([
+            (None, vec![1]),
+            (Some(PathBuf::from("/a/wt1")), vec![2, 3]),
+        ]);
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let snapshot = build_sidebar_snapshot(&projects, &live, &rows, None, Default::default());
+
+        for row in &rows {
+            let id = snapshot.find(row).expect("every projected row is in the model");
+            let arena_parent = match snapshot.parent(id) {
+                Parent::Root => None,
+                Parent::Node(p) => Some(snapshot.row(p).clone()),
+                Parent::Detached => panic!("a projected row is never detached: {row:?}"),
+            };
+            assert_eq!(
+                arena_parent,
+                sidebar_nav::left_target(&rows, row),
+                "arena parent must agree with the row model for {row:?}"
+            );
+        }
+
+        // The collapsed project's worktree is in the model but not projected.
+        let hidden = snapshot
+            .find(&SidebarRow::Worktree(PathBuf::from("/b/wt1")))
+            .expect("collapsed worktrees stay in the model");
+        assert!(!snapshot.is_projected(hidden));
+    }
+
+    #[test]
+    fn a_session_below_the_listing_threshold_is_still_in_the_model() {
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1"])];
+        // One live session in the worktree.  The real rule needs two before it
+        // lists any, so this one is live but unprojected.
+        let live = vec![(Some(PathBuf::from("/a/wt1")), 7)];
+        let listed = {
+            let mut l = sidebar_nav::ListedSessions::new();
+            let ids = sidebar_session_ids(&live, &Some(PathBuf::from("/a/wt1")), false);
+            assert!(ids.is_empty(), "the threshold rule must actually drop this session");
+            if !ids.is_empty() {
+                l.insert(Some(PathBuf::from("/a/wt1")), ids);
+            }
+            l
+        };
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let snapshot = build_sidebar_snapshot(&projects, &live, &rows, None, Default::default());
+
+        let id = snapshot
+            .find(&SidebarRow::Session(7))
+            .expect("a live session is in the model whatever the listing threshold says");
+        assert!(!snapshot.is_projected(id), "but it is not a navigable row");
+    }
+
+    #[test]
+    fn a_session_whose_project_is_gone_is_detached_not_deleted() {
+        use crate::sidebar_focus::Parent;
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        // `remove_project` drops the project but keeps its sessions running.
+        let projects: Vec<crate::projects::Project> = vec![];
+        let live = vec![(Some(PathBuf::from("/orphan/wt1")), 5)];
+        let listed = sidebar_nav::ListedSessions::new();
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let snapshot = build_sidebar_snapshot(&projects, &live, &rows, None, Default::default());
+
+        let id = snapshot.find(&SidebarRow::Session(5)).expect("the session is still running");
+        assert_eq!(
+            snapshot.parent(id),
+            Parent::Detached,
+            "an orphan must not become a sibling of Home"
+        );
+    }
+
+    #[test]
+    fn a_worktree_being_deleted_reads_as_gone_immediately() {
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2"])];
+        let listed = sidebar_nav::ListedSessions::new();
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let doomed = PathBuf::from("/a/wt2");
+        let snapshot = build_sidebar_snapshot(
+            &projects,
+            &[],
+            &rows,
+            Some(doomed.as_path()),
+            Default::default(),
+        );
+
+        assert_eq!(
+            snapshot.find(&SidebarRow::Worktree(doomed)),
+            None,
+            "the async git delete has not finished, but the row must not read as present"
+        );
+        assert!(snapshot.find(&SidebarRow::Worktree(PathBuf::from("/a/wt1"))).is_some());
     }
 }
