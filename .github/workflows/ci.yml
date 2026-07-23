@@ -39,3 +39,22 @@ jobs:
       # want anyway.
       - name: Clippy
         run: cargo clippy -p alacritree --all-targets --locked --no-deps
+
+  # Compile the platform-specific process and notification integrations before
+  # a release tag reaches cargo-dist.  Branch pushes with an open PR already
+  # receive the pull_request run, so only run direct pushes for master.
+  alacritree-macos:
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/master'
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: brew install cmake pkg-config fontconfig freetype
+
+      - name: Rust toolchain
+        run: rustup show
+
+      - name: Check
+        run: cargo check -p alacritree --locked
