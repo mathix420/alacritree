@@ -302,6 +302,30 @@ pub struct UiInputs<'a> {
     pub toggles: u32,
 }
 
+#[cfg(test)]
+thread_local! {
+    static VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Records one examined record.  Compiled out of release builds entirely —
+/// the counter exists so the linearity of `matches` can be asserted without a
+/// wall-clock threshold, which on a shared runner is either flaky or blind.
+#[inline(always)]
+fn visit() {
+    #[cfg(test)]
+    VISITS.with(|v| v.set(v.get() + 1));
+}
+
+#[cfg(test)]
+pub fn visits() -> usize {
+    VISITS.with(|v| v.get())
+}
+
+#[cfg(test)]
+pub fn reset_visits() {
+    VISITS.with(|v| v.set(0));
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ProjectInput {
     root: PathBuf,
@@ -372,6 +396,7 @@ impl ObservedInputs {
             return false;
         }
         for (was, now) in self.projects.iter().zip(projects) {
+            visit();
             if was.root != now.root
                 || was.name != now.display_name()
                 || was.expanded != now.expanded
@@ -380,6 +405,7 @@ impl ObservedInputs {
                 return false;
             }
             for (wt_was, wt_now) in was.worktrees.iter().zip(&now.worktrees) {
+                visit();
                 if wt_was.0 != wt_now.path || wt_was.1 != wt_now.name || wt_was.2 != wt_now.prunable
                 {
                     return false;
@@ -388,6 +414,7 @@ impl ObservedInputs {
         }
         let mut seen = 0usize;
         for s in sessions {
+            visit();
             match self.sessions.get(seen) {
                 Some((ws, id, attention))
                     if ws == s.workspace && *id == s.id && *attention == s.attention =>
