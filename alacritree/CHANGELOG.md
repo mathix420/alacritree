@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/mathix420/alacritree/compare/v0.7.0...v0.7.1) (2026-07-23)
+
+
+### Bug Fixes
+
+* **macos:** use public process-group API ([#146](https://github.com/mathix420/alacritree/issues/146)) ([ddbd07e](https://github.com/mathix420/alacritree/commit/ddbd07e0d49c934fb1b343dfe009f3e5c04df017))
+
 ## [0.7.0](https://github.com/mathix420/alacritree/compare/v0.6.0...v0.7.0) (2026-07-23)
 
 
