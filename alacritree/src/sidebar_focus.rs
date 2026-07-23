@@ -126,6 +126,143 @@ fn slide(prev: &TreeSnapshot, next: &TreeSnapshot, removed: NodeId) -> Option<Si
     }
 }
 
+/// What the terminal switches to when a removal landing has something live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FollowTarget {
+    Session(SessionId),
+    /// The caller activates this workspace's active session, or its first
+    /// live one when the active entry is stale.
+    Workspace(WorkspaceKey),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repair {
+    pub cursor: Option<SidebarRow>,
+    pub anchor: Option<SidebarRow>,
+    /// Only ever `Some` for a removal landing.  The caller drops it unless
+    /// `ui.sidebar_focus` is `"follow"`.
+    pub follow: Option<FollowTarget>,
+}
+
+/// The nearest ancestor of `from` that `next` still projects, walking `from`'s
+/// own snapshot so a removed row's chain is still readable.  Root rows have no
+/// ancestor, so the first projected row — Home whenever it is visible — is the
+/// last resort.
+fn climb(from_tree: &TreeSnapshot, next: &TreeSnapshot, from: NodeId) -> Option<SidebarRow> {
+    let mut cur = from_tree.parent(from);
+    while let Parent::Node(id) = cur {
+        let row = from_tree.row(id);
+        if next.find(row).is_some_and(|n| next.is_projected(n)) {
+            return Some(row.clone());
+        }
+        cur = from_tree.parent(id);
+    }
+    next.projected.first().map(|&id| next.row(id).clone())
+}
+
+/// What a removal landing offers the terminal.  A workspace row with no live
+/// session yields `None`: spawning a shell the user did not ask for is not
+/// this module's job.
+fn follow_target(next: &TreeSnapshot, landing: &SidebarRow) -> Option<FollowTarget> {
+    match landing {
+        SidebarRow::Session(id) => Some(FollowTarget::Session(*id)),
+        SidebarRow::Project(_) => None,
+        SidebarRow::Home | SidebarRow::Worktree(_) => {
+            let id = next.find(landing)?;
+            let has_session = next.nodes.iter().any(|node| {
+                matches!(node.row, SidebarRow::Session(_)) && node.parent == Parent::Node(id)
+            });
+            if !has_session {
+                return None;
+            }
+            let ws = match landing {
+                SidebarRow::Worktree(path) => Some(path.clone()),
+                _ => None,
+            };
+            Some(FollowTarget::Workspace(ws))
+        },
+    }
+}
+
+/// Repair the cursor against what changed between two snapshots.
+///
+/// The row under repair is the anchor when one is set — a climb parks the
+/// visible cursor on an ancestor while the user's real position waits in the
+/// anchor, so judging removal by the visible cursor would never notice a
+/// hidden row being deleted.  Cursor, anchor, and terminal resolve together so
+/// the caller cannot apply them out of order.
+pub fn repair(
+    prev: &TreeSnapshot,
+    next: &TreeSnapshot,
+    cursor: Option<&SidebarRow>,
+    anchor: Option<&SidebarRow>,
+) -> Repair {
+    // The anchor belongs to one filter episode.  Nothing is filtering, so the
+    // episode is over however it ended — confirmed, cancelled, or widened.
+    let anchor = anchor.filter(|_| next.inputs.is_filtering());
+
+    if let Some(a) = anchor {
+        match next.find(a) {
+            // Visible again: the user gets their row back.
+            Some(id) if next.is_projected(id) => {
+                return Repair { cursor: Some(a.clone()), anchor: None, follow: None };
+            },
+            // Still hidden: leave it parked and repair the visible cursor.
+            Some(_) => {},
+            // Deleted while out of sight; there is nothing left to restore.
+            None => {
+                return repair_visible(prev, next, cursor, None);
+            },
+        }
+    }
+
+    repair_visible(prev, next, cursor, anchor)
+}
+
+fn repair_visible(
+    prev: &TreeSnapshot,
+    next: &TreeSnapshot,
+    cursor: Option<&SidebarRow>,
+    anchor: Option<&SidebarRow>,
+) -> Repair {
+    let unchanged = Repair { cursor: cursor.cloned(), anchor: anchor.cloned(), follow: None };
+
+    let Some(c) = cursor else {
+        return unchanged;
+    };
+
+    match next.find(c) {
+        Some(id) if next.is_projected(id) => unchanged,
+        // Still in the model, so a filter or a collapse hid it: climb, and
+        // remember the deepest row the user actually chose.
+        Some(id) => Repair {
+            cursor: climb(next, next, id),
+            anchor: Some(anchor.cloned().unwrap_or_else(|| c.clone())),
+            follow: None,
+        },
+        None => {
+            let Some(removed) = prev.find(c) else {
+                return Repair {
+                    cursor: next.projected.first().map(|&id| next.row(id).clone()),
+                    anchor: None,
+                    follow: None,
+                };
+            };
+            let landing = slide(prev, next, removed)
+                .filter(|row| next.find(row).is_some_and(|id| next.is_projected(id)));
+            match landing {
+                Some(row) => {
+                    let follow = follow_target(next, &row);
+                    Repair { cursor: Some(row), anchor: None, follow }
+                },
+                // The slide target is itself hidden — a removal that also
+                // changed what the filter keeps.  Fall through to the climb.
+                None => Repair { cursor: climb(prev, next, removed), anchor: None, follow: None },
+            }
+        },
+    }
+}
+
 #[derive(Default)]
 pub struct SnapshotBuilder {
     nodes: Vec<Node>,
@@ -607,5 +744,243 @@ mod tests {
         };
 
         assert_eq!(slide_from(&prev, &next, &SidebarRow::Session(9)), None);
+    }
+
+    /// Inputs standing for "a query is narrowing the tree", so the anchor's
+    /// filter episode is open.  `ObservedInputs::default()` is *not* filtering,
+    /// which would retire the anchor on sight.
+    fn filtering() -> ObservedInputs {
+        ObservedInputs::capture(&[], std::iter::empty(), ui("wt", 0))
+    }
+
+    /// The reference tree with /p1/wt2 and its sessions hidden by a filter.
+    fn reference_tree_filtered() -> TreeSnapshot {
+        let mut b = SnapshotBuilder::default();
+        b.push(SidebarRow::Home, Parent::Root, true);
+        let p1 = b.push(row_project("/p1"), Parent::Root, true);
+        let p1wt1 = b.push(row_worktree("/p1/wt1"), Parent::Node(p1), true);
+        b.push(SidebarRow::Session(11), Parent::Node(p1wt1), true);
+        b.push(SidebarRow::Session(12), Parent::Node(p1wt1), true);
+        let p1wt2 = b.push(row_worktree("/p1/wt2"), Parent::Node(p1), false);
+        b.push(SidebarRow::Session(21), Parent::Node(p1wt2), false);
+        b.push(SidebarRow::Session(22), Parent::Node(p1wt2), false);
+        b.push(SidebarRow::Session(23), Parent::Node(p1wt2), false);
+        b.finish(filtering())
+    }
+
+    #[test]
+    fn a_visible_cursor_is_left_alone() {
+        let t = reference_tree();
+        let r = repair(&t, &t, Some(&SidebarRow::Session(11)), None);
+        assert_eq!(r.cursor, Some(SidebarRow::Session(11)));
+        assert_eq!(r.anchor, None);
+        assert_eq!(r.follow, None);
+    }
+
+    #[test]
+    fn an_unrelated_removal_does_not_move_the_cursor() {
+        let prev = reference_tree();
+        let next = reference_tree_without(&[SidebarRow::Session(31)]);
+
+        let r = repair(&prev, &next, Some(&SidebarRow::Session(11)), None);
+        assert_eq!(r.cursor, Some(SidebarRow::Session(11)));
+        assert_eq!(r.follow, None);
+    }
+
+    #[test]
+    fn collapsing_a_project_climbs_rather_than_slides() {
+        let prev = reference_tree();
+        // /p1 collapses: its worktrees and their sessions leave the projection
+        // but stay in the model.
+        let next = {
+            let mut b = SnapshotBuilder::default();
+            b.push(SidebarRow::Home, Parent::Root, true);
+            let p1 = b.push(row_project("/p1"), Parent::Root, true);
+            let wt1 = b.push(row_worktree("/p1/wt1"), Parent::Node(p1), false);
+            b.push(SidebarRow::Session(11), Parent::Node(wt1), false);
+            b.push(SidebarRow::Session(12), Parent::Node(wt1), false);
+            b.finish(filtering())
+        };
+
+        let r = repair(&prev, &next, Some(&SidebarRow::Session(12)), None);
+        assert_eq!(
+            r.cursor,
+            Some(row_project("/p1")),
+            "the collapsed header is the nearest visible ancestor"
+        );
+        assert_eq!(r.anchor, Some(SidebarRow::Session(12)), "expanding again must restore the row");
+        assert_eq!(r.follow, None, "collapsing is a projection change, so nothing follows");
+    }
+
+    #[test]
+    fn dropping_below_the_listing_threshold_climbs_rather_than_slides() {
+        // Two sessions under /a/wt1 are listed; one is closed, so the survivor
+        // falls below the threshold and stops being a row while staying live.
+        let mut b = SnapshotBuilder::default();
+        b.push(SidebarRow::Home, Parent::Root, true);
+        let p = b.push(row_project("/a"), Parent::Root, true);
+        let wt = b.push(row_worktree("/a/wt1"), Parent::Node(p), true);
+        b.push(SidebarRow::Session(1), Parent::Node(wt), true);
+        b.push(SidebarRow::Session(2), Parent::Node(wt), true);
+        let prev = b.finish(filtering());
+
+        let mut b = SnapshotBuilder::default();
+        b.push(SidebarRow::Home, Parent::Root, true);
+        let p = b.push(row_project("/a"), Parent::Root, true);
+        let wt = b.push(row_worktree("/a/wt1"), Parent::Node(p), true);
+        b.push(SidebarRow::Session(1), Parent::Node(wt), false);
+        let next = b.finish(filtering());
+
+        let r = repair(&prev, &next, Some(&SidebarRow::Session(1)), None);
+        assert_eq!(r.cursor, Some(row_worktree("/a/wt1")));
+        assert_eq!(
+            r.anchor,
+            Some(SidebarRow::Session(1)),
+            "the session is live, so it can come back"
+        );
+        assert_eq!(r.follow, None);
+    }
+
+    #[test]
+    fn a_filtered_out_cursor_climbs_and_anchors() {
+        let prev = reference_tree();
+        let next = reference_tree_filtered();
+
+        let r = repair(&prev, &next, Some(&SidebarRow::Session(22)), None);
+        assert_eq!(r.cursor, Some(row_project("/p1")), "wt2 is hidden too, so the climb continues");
+        assert_eq!(r.anchor, Some(SidebarRow::Session(22)));
+        assert_eq!(r.follow, None, "a filter never moves the terminal");
+    }
+
+    #[test]
+    fn successive_narrowing_keeps_the_deepest_anchor() {
+        let prev = reference_tree();
+        let next = reference_tree_filtered();
+
+        let r =
+            repair(&prev, &next, Some(&row_worktree("/p1/wt2")), Some(&SidebarRow::Session(22)));
+        assert_eq!(
+            r.anchor,
+            Some(SidebarRow::Session(22)),
+            "the intermediate ancestor must not win"
+        );
+    }
+
+    #[test]
+    fn a_visible_anchor_is_restored_and_retired() {
+        let prev = reference_tree_filtered();
+        let mut next = reference_tree();
+        next.inputs = filtering();
+
+        let r = repair(&prev, &next, Some(&row_project("/p1")), Some(&SidebarRow::Session(22)));
+        assert_eq!(r.cursor, Some(SidebarRow::Session(22)));
+        assert_eq!(r.anchor, None);
+        assert_eq!(r.follow, None, "restoring an anchor is a filter event, not a removal");
+    }
+
+    #[test]
+    fn ending_the_filter_episode_retires_the_anchor() {
+        // Confirm/cancel/Shift+Esc all clear the query.  The confirmed row here is
+        // the same one the climb already chose, so nothing observable changed —
+        // only the episode ending can retire the anchor.
+        let prev = reference_tree_filtered();
+        let next = reference_tree();
+        assert!(!next.inputs.is_filtering(), "the reference tree is unfiltered");
+
+        let r = repair(&prev, &next, Some(&row_project("/p1")), Some(&SidebarRow::Session(22)));
+        assert_eq!(r.cursor, Some(row_project("/p1")), "the confirmed row stands");
+        assert_eq!(r.anchor, None, "a stale anchor must not yank the cursor away later");
+    }
+
+    #[test]
+    fn an_anchored_row_deleted_while_hidden_drops_the_anchor() {
+        let prev = reference_tree_filtered();
+        // Session 22 was hidden and anchored; it exits while out of sight.
+        let mut next = reference_tree_without(&[SidebarRow::Session(22)]);
+        next.inputs = filtering();
+
+        let r = repair(&prev, &next, Some(&row_project("/p1")), Some(&SidebarRow::Session(22)));
+        assert_eq!(r.anchor, None, "an anchor that left the model can never be restored");
+        assert_eq!(r.cursor, Some(row_project("/p1")), "the visible cursor is still fine");
+        assert_eq!(r.follow, None, "the row was not on screen, so the terminal does not chase it");
+    }
+
+    #[test]
+    fn a_removed_cursor_slides_and_follows() {
+        let prev = reference_tree();
+        let next = reference_tree_without(&[SidebarRow::Session(22)]);
+
+        let r = repair(&prev, &next, Some(&SidebarRow::Session(22)), None);
+        assert_eq!(r.cursor, Some(SidebarRow::Session(23)));
+        assert_eq!(r.follow, Some(FollowTarget::Session(23)));
+    }
+
+    #[test]
+    fn a_landing_on_a_workspace_follows_its_live_session() {
+        let prev = reference_tree();
+        // /p2/wt2 has no sessions, so landing there offers nothing to follow.
+        let next = reference_tree_without(&[row_worktree("/p2/wt3")]);
+        let r = repair(&prev, &next, Some(&row_worktree("/p2/wt3")), None);
+        assert_eq!(r.cursor, Some(row_worktree("/p2/wt2")));
+        assert_eq!(r.follow, None);
+
+        // Landing on a worktree that does have sessions follows the workspace.
+        let next = reference_tree_without(&[row_worktree("/p1/wt2")]);
+        let r = repair(&prev, &next, Some(&row_worktree("/p1/wt2")), None);
+        assert_eq!(r.cursor, Some(row_worktree("/p1/wt1")));
+        assert_eq!(r.follow, Some(FollowTarget::Workspace(Some(PathBuf::from("/p1/wt1")))));
+    }
+
+    #[test]
+    fn a_project_landing_never_follows() {
+        let mut b = SnapshotBuilder::default();
+        b.push(SidebarRow::Home, Parent::Root, true);
+        let p = b.push(row_project("/a"), Parent::Root, true);
+        b.push(row_worktree("/a/wt1"), Parent::Node(p), true);
+        let prev = b.finish(ObservedInputs::default());
+
+        let next = {
+            let mut b = SnapshotBuilder::default();
+            b.push(SidebarRow::Home, Parent::Root, true);
+            b.push(row_project("/a"), Parent::Root, true);
+            b.finish(ObservedInputs::default())
+        };
+
+        let r = repair(&prev, &next, Some(&row_worktree("/a/wt1")), None);
+        assert_eq!(r.cursor, Some(row_project("/a")));
+        assert_eq!(r.follow, None, "a project header is not a workspace");
+    }
+
+    #[test]
+    fn a_landing_hidden_by_the_filter_falls_through_to_the_climb() {
+        let prev = reference_tree();
+        // Session 22 is deleted, and in the same pass the filter hides everything
+        // under /p1/wt2 that could have caught the slide.
+        let next = {
+            let mut b = SnapshotBuilder::default();
+            b.push(SidebarRow::Home, Parent::Root, true);
+            let p1 = b.push(row_project("/p1"), Parent::Root, true);
+            let wt2 = b.push(row_worktree("/p1/wt2"), Parent::Node(p1), false);
+            b.push(SidebarRow::Session(21), Parent::Node(wt2), false);
+            b.push(SidebarRow::Session(23), Parent::Node(wt2), false);
+            b.finish(filtering())
+        };
+
+        let r = repair(&prev, &next, Some(&SidebarRow::Session(22)), None);
+        assert_eq!(r.cursor, Some(row_project("/p1")));
+        assert_eq!(r.follow, None, "the climb is a filter outcome, so nothing follows");
+    }
+
+    #[test]
+    fn a_cursor_gone_with_nothing_to_land_on_takes_the_first_row() {
+        let prev = reference_tree();
+        let next = {
+            let mut b = SnapshotBuilder::default();
+            b.push(SidebarRow::Home, Parent::Root, true);
+            b.finish(ObservedInputs::default())
+        };
+
+        let r = repair(&prev, &next, Some(&SidebarRow::Session(22)), None);
+        assert_eq!(r.cursor, Some(SidebarRow::Home));
     }
 }
