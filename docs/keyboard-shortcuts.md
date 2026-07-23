@@ -66,6 +66,8 @@ and your TOML entries are checked first — so your config overrides any default
 | `Delete`             | Sidebar focused: close/delete/remove the selected row |
 | `Shift+R`            | Sidebar focused: rename the selected project          |
 | `Ctrl+K`             | Open the command palette                              |
+| `Home` / `End`       | Palette open: cursor to the first / last row          |
+| `PageUp` / `PageDown`| Palette open: cursor a screenful up / down            |
 
 ### Additional defaults on macOS
 
@@ -175,12 +177,28 @@ forward-delete in TUIs.
 - `TogglePalette` — open (or close) the command palette: one fuzzy-searchable,
   executable list of every keyboard action, every open session, and every
   switchable workspace. The same fzf-style matcher the sidebars use ranks the
-  rows, so the full action vocabulary stays discoverable without the docs. Type
-  to filter, `Up`/`Down` move the selection, `Enter` runs the highlighted row
-  (dispatching an action, jumping to a session, or switching workspace),
-  `Escape` clears the query and then closes, and a click outside dismisses it.
-  The default is `Ctrl+K` (which shadows `Ctrl+K` for terminal apps; rebind or
-  free it with `ReceiveChar` if you need it there).
+  rows, so the full action vocabulary stays discoverable without the docs. Rows
+  are grouped under section headings and laid out in three columns —
+  description, action name, and every key bound to that action — so a
+  multi-bound action reads as one row listing all its keys. A query promotes
+  whichever section holds the best match. Type to filter, `Up`/`Down` move the
+  selection, `Enter` runs the highlighted row (dispatching an action, jumping to
+  a session, or switching workspace), `Escape` clears the query and then closes,
+  and a click outside dismisses it. The default is `Ctrl+K` (which shadows
+  `Ctrl+K` for terminal apps; rebind or free it with `ReceiveChar` if you need it
+  there).
+- `PaletteTop` / `PaletteBottom` — move the palette cursor to the first / last
+  row. Defaults: unmodified `Home` / `End`.
+- `PalettePageUp` / `PalettePageDown` — move the palette cursor a screenful (ten
+  rows) up / down. Defaults: unmodified `PageUp` / `PageDown`.
+
+These four act only while the palette is open — it is a modal that owns every
+key while it is up — so they share the sidebar's unmodified defaults without
+shadowing them, and pass through to the terminal whenever the palette is
+closed. Rebinding one replaces the whole default trigger, sidebar action
+included: `key = "End"` bound to `PaletteTop` also unbinds `SidebarBottom`.
+Because the palette's query box has focus, `Home`/`End` no longer move the text
+caret there; bind them elsewhere if you want the caret back.
 - `SpawnProfile1` … `SpawnProfile9` — spawn the Nth `[[ui.profiles]]` entry
   in the current workspace. Out-of-range indices show an error toast.
   Example binding:

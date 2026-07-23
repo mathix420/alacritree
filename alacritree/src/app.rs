@@ -10,7 +10,7 @@ use egui::{Color32, Context, Frame, Margin, RichText, ScrollArea, SidePanel, Str
 
 use serde_json::{Value, json};
 
-use crate::bindings::{BindingAction, NamedAction};
+use crate::bindings::{self, BindingAction, KeyBinding, NamedAction};
 use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
@@ -1430,6 +1430,11 @@ impl AlacritreeApp {
                         // the PTY when the terminal (or a non-searching panel)
                         // has focus.
                         .filter(|a| !matches!(a, BindingAction::Named(n) if n.is_search_scoped()))
+                        // Palette cursor moves are owned by the palette modal,
+                        // which suppresses this pass entirely while it is up.
+                        // Reaching here means it is closed, so their keys belong
+                        // to the sidebar or the PTY.
+                        .filter(|a| !matches!(a, BindingAction::Named(n) if n.is_palette_scoped()))
                         .collect();
                     if !matched.is_empty() {
                         let suppress_chars = matched
@@ -3832,6 +3837,53 @@ fn modal_frame(theme: &Theme) -> Frame {
         .inner_margin(Margin { left: pad_x, right: pad_x, top: pad_y, bottom: pad_y })
 }
 
+/// Take this frame's palette cursor jumps off the event queue, honoring
+/// rebinds.  The palette owns these keys only while it is up, which is why they
+/// are read here rather than dispatched like an ordinary action — and why they
+/// can share the sidebar's unmodified Home/End/PageUp/PageDown.
+fn consume_palette_keys(ctx: &Context, bindings: &[KeyBinding]) -> Vec<NamedAction> {
+    ctx.input_mut(|i| {
+        let mut jumps = Vec::new();
+        i.events.retain(|ev| {
+            let egui::Event::Key { key, pressed: true, modifiers, .. } = ev else {
+                return true;
+            };
+            let matched: Vec<NamedAction> = bindings::all_matches(bindings, *key, *modifiers)
+                .into_iter()
+                .filter_map(|a| match a {
+                    BindingAction::Named(n) if n.is_palette_scoped() => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            if matched.is_empty() {
+                return true;
+            }
+            jumps.extend(matched);
+            false
+        });
+        jumps
+    })
+}
+
+/// The palette's footer, naming the keys actually bound to its cursor moves so
+/// a rebind shows up here instead of the hint quietly going stale.
+fn palette_hint(bindings: &[KeyBinding]) -> String {
+    let mut parts = vec!["↑↓ move".to_string()];
+    for (action, label) in [
+        (NamedAction::PaletteTop, "top"),
+        (NamedAction::PaletteBottom, "bottom"),
+        (NamedAction::PalettePageUp, "page up"),
+        (NamedAction::PalettePageDown, "page down"),
+    ] {
+        if let Some(key) = command_palette::first_key(bindings, action) {
+            parts.push(format!("{key} {label}"));
+        }
+    }
+    parts.push("Enter run".into());
+    parts.push("Esc close".into());
+    parts.join(" · ")
+}
+
 fn consume_modal_keys(ctx: &Context) -> (bool, bool) {
     ctx.input_mut(|i| {
         (
@@ -3873,27 +3925,154 @@ fn single_line_galley(
     ctx.fonts(|f| f.layout_job(job))
 }
 
-/// Paint one command-palette row: the description leads on the left (bright,
-/// the primary column), with the shortcut (accent) pinned to the far right and
-/// the action/context tag (dim) just inside it.  Every field is a one-line
-/// galley so nothing wraps, and the description claims all the width the
-/// right-hand columns leave it.  A selected row gets a soft accent wash and a
-/// crisp accent bar; a hovered one a faint fill.
+/// Text wrapped to `max_w` over as many lines as it needs — the description
+/// column, which reads as a sentence and so must not be cut short.
+fn wrapped_galley(
+    ctx: &Context,
+    text: &str,
+    family: egui::FontFamily,
+    size: f32,
+    color: Color32,
+    max_w: f32,
+) -> std::sync::Arc<egui::Galley> {
+    use egui::text::{LayoutJob, TextFormat};
+    let mut job = LayoutJob::single_section(text.to_owned(), TextFormat {
+        font_id: egui::FontId::new(size, family),
+        color,
+        ..Default::default()
+    });
+    job.wrap.max_width = max_w.max(0.0);
+    ctx.fonts(|f| f.layout_job(job))
+}
+
+/// Fixed geometry for the palette's `description | action | keys` grid.  Every
+/// row and the header lay out against the same widths, so the columns line up
+/// down the list instead of each row packing its own way.
+struct PaletteColumns {
+    width: f32,
+    pad: f32,
+    desc: f32,
+    action: f32,
+    keys: f32,
+    gap: f32,
+}
+
+impl PaletteColumns {
+    fn new(theme: &Theme, width: f32) -> Self {
+        let s = theme.ui_scale;
+        let pad = 10.0 * s;
+        let gap = 14.0 * s;
+        let action = 200.0 * s;
+        let keys = 180.0 * s;
+        let desc = (width - 2.0 * pad - 2.0 * gap - action - keys).max(120.0 * s);
+        Self { width, pad, desc, action, keys, gap }
+    }
+
+    fn desc_x(&self, left: f32) -> f32 {
+        left + self.pad
+    }
+
+    fn action_x(&self, left: f32) -> f32 {
+        self.desc_x(left) + self.desc + self.gap
+    }
+
+    fn keys_x(&self, left: f32) -> f32 {
+        self.action_x(left) + self.action + self.gap
+    }
+}
+
+/// The palette's column captions, on the same grid as its rows and outside the
+/// scrolling list so they stay put while it moves.
+fn paint_palette_header(ui: &mut egui::Ui, theme: &Theme, cols: &PaletteColumns) {
+    let s = theme.ui_scale;
+    let size = (theme.font_normal - 2.0).max(8.0);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(cols.width, size + 10.0 * s), egui::Sense::hover());
+    let painter = ui.painter().clone();
+    let left = rect.left();
+    for (text, x, w) in [
+        ("DESCRIPTION", cols.desc_x(left), cols.desc),
+        ("ACTION", cols.action_x(left), cols.action),
+        ("KEYS", cols.keys_x(left), cols.keys),
+    ] {
+        let g = single_line_galley(
+            ui.ctx(),
+            text,
+            egui::FontFamily::Proportional,
+            size,
+            theme.text_muted,
+            w,
+        );
+        painter.galley(egui::pos2(x, rect.top() + 2.0 * s), g, theme.text_muted);
+    }
+    painter.hline(rect.x_range(), rect.bottom(), Stroke::new(1.0_f32, theme.sidebar_border));
+}
+
+/// A section heading in the palette list.  Not selectable — the cursor steps
+/// over rows only.
+fn paint_palette_section(ui: &mut egui::Ui, theme: &Theme, cols: &PaletteColumns, title: &str) {
+    let s = theme.ui_scale;
+    let size = (theme.font_normal - 2.0).max(8.0);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(cols.width, size + 14.0 * s), egui::Sense::hover());
+    let g = single_line_galley(
+        ui.ctx(),
+        &title.to_uppercase(),
+        egui::FontFamily::Proportional,
+        size,
+        theme.accent,
+        cols.desc,
+    );
+    ui.painter().galley(
+        egui::pos2(cols.desc_x(rect.left()), rect.bottom() - size - 3.0 * s),
+        g,
+        theme.accent,
+    );
+}
+
+/// Paint one command-palette row across the three columns: the description
+/// (bright, wrapped over as many lines as it needs), the action's config name
+/// (dim), and every key bound to it (accent).  A selected row gets a soft
+/// accent wash and a crisp accent bar; a hovered one a faint fill.
 fn paint_palette_row(
     ui: &mut egui::Ui,
     theme: &Theme,
+    cols: &PaletteColumns,
     item: &PaletteItem,
     selected: bool,
 ) -> egui::Response {
     let s = theme.ui_scale;
-    let pad = 10.0 * s;
-    let gap = 14.0 * s;
-    let row_h = (theme.font_normal + 12.0 * s).round();
-
-    let (rect, resp) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), egui::Sense::click());
-    let painter = ui.painter().clone();
+    let v_pad = 6.0 * s;
     let ctx = ui.ctx();
+
+    let desc = wrapped_galley(
+        ctx,
+        &item.primary,
+        egui::FontFamily::Proportional,
+        theme.font_normal,
+        theme.text,
+        cols.desc,
+    );
+    let action = single_line_galley(
+        ctx,
+        &item.secondary,
+        egui::FontFamily::Proportional,
+        theme.font_normal,
+        theme.text_dim,
+        cols.action,
+    );
+    let keys = single_line_galley(
+        ctx,
+        &item.keys,
+        egui::FontFamily::Monospace,
+        theme.font_normal,
+        theme.accent,
+        cols.keys,
+    );
+
+    let row_h = (desc.size().y.max(action.size().y) + 2.0 * v_pad).round();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(cols.width, row_h), egui::Sense::click());
+    let painter = ui.painter().clone();
 
     if selected {
         let wash =
@@ -3905,52 +4084,12 @@ fn paint_palette_row(
         painter.rect_filled(rect, 5.0 * s, theme.row_hover_bg);
     }
 
-    let mid_y = rect.center().y;
-    let draw = |g: std::sync::Arc<egui::Galley>, x: f32| {
-        painter.galley(egui::pos2(x, mid_y - g.size().y / 2.0), g, theme.text);
-    };
-
-    // The secondary columns hug the right edge, right to left; the description
-    // then takes everything to their left, so it always leads the row.
-    let mut right = rect.right() - pad;
-    if !item.keys.is_empty() {
-        let g = single_line_galley(
-            ctx,
-            &item.keys,
-            egui::FontFamily::Monospace,
-            theme.font_normal,
-            theme.accent,
-            240.0 * s,
-        );
-        let w = g.size().x;
-        draw(g, right - w);
-        right -= w + gap;
-    }
-    if !item.secondary.is_empty() {
-        let tag_max = (rect.width() * 0.42).min(360.0 * s);
-        let g = single_line_galley(
-            ctx,
-            &item.secondary,
-            egui::FontFamily::Proportional,
-            theme.font_normal,
-            theme.text_dim,
-            tag_max,
-        );
-        let w = g.size().x;
-        draw(g, right - w);
-        right -= w + gap;
-    }
-
-    let left = rect.left() + pad;
-    let desc = single_line_galley(
-        ctx,
-        &item.primary,
-        egui::FontFamily::Proportional,
-        theme.font_normal,
-        theme.text,
-        (right - left).max(20.0 * s),
-    );
-    draw(desc, left);
+    // Top-aligned, so a wrapped description's first line shares a baseline with
+    // the single-line columns beside it.
+    let (left, top) = (rect.left(), rect.top() + v_pad);
+    painter.galley(egui::pos2(cols.desc_x(left), top), desc, theme.text);
+    painter.galley(egui::pos2(cols.action_x(left), top), action, theme.text_dim);
+    painter.galley(egui::pos2(cols.keys_x(left), top), keys, theme.accent);
 
     resp
 }
@@ -5489,8 +5628,9 @@ impl AlacritreeApp {
         let s = theme.ui_scale;
 
         // Drain the nav/confirm/cancel keys before the TextEdit runs so it
-        // never steals Enter (run), Esc (clear then close), or the arrows.
-        // Ctrl+K shuts the palette with the same key that opened it.
+        // never steals Enter (run), Esc (clear then close), the arrows, or the
+        // bound cursor jumps.  Ctrl+K shuts the palette with the same key that
+        // opened it.
         let (cancel, confirm) = consume_modal_keys(ctx);
         let (up, down) = ctx.input_mut(|i| {
             (
@@ -5498,9 +5638,11 @@ impl AlacritreeApp {
                 i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
             )
         });
+        let jumps = consume_palette_keys(ctx, &self.config.bindings);
         let toggle = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::K));
 
         let items = self.palette_items();
+        let hint = palette_hint(&self.config.bindings);
         let mut chosen: Option<PaletteAction> = None;
 
         let modal = {
@@ -5508,8 +5650,9 @@ impl AlacritreeApp {
             egui::Modal::new(egui::Id::new("alacritree_command_palette"))
                 .frame(modal_frame(&theme))
                 .show(ctx, |ui| {
-                    ui.set_width(640.0 * s);
+                    ui.set_width(760.0 * s);
                     ui.spacing_mut().item_spacing.y = 6.0 * s;
+                    let cols = PaletteColumns::new(&theme, ui.available_width());
 
                     let input_id = egui::Id::new("alacritree_command_palette_query");
                     let query_changed = ui
@@ -5523,52 +5666,70 @@ impl AlacritreeApp {
                     focus_default(ui.ctx(), input_id);
 
                     let ranked = palette.rank(&items);
-                    // A query edit reseeds to the top match; arrows then nudge
-                    // the cursor within this frame's results.
+                    // A query edit reseeds to the top match; the cursor keys
+                    // then move within this frame's results.
                     palette.reseed(query_changed, ranked.len());
+                    let groups = command_palette::group(&items, &ranked);
+                    // Sections reorder the ranked rows, so the cursor steps over
+                    // this flattened view rather than the ranking itself.
+                    let flat: Vec<usize> =
+                        groups.iter().flat_map(|(_, rows)| rows.iter().copied()).collect();
                     if up {
                         palette.select_prev();
                     }
                     if down {
-                        palette.select_next(ranked.len());
+                        palette.select_next(flat.len());
                     }
+                    for jump in &jumps {
+                        match jump {
+                            NamedAction::PaletteTop => palette.select_top(),
+                            NamedAction::PaletteBottom => palette.select_bottom(flat.len()),
+                            NamedAction::PalettePageUp => palette.page_up(),
+                            NamedAction::PalettePageDown => palette.page_down(flat.len()),
+                            _ => {},
+                        }
+                    }
+                    let moved = query_changed || up || down || !jumps.is_empty();
                     if confirm {
-                        chosen = ranked.get(palette.selected()).map(|&i| items[i].action.clone());
+                        chosen = flat.get(palette.selected()).map(|&i| items[i].action.clone());
                     }
                     let selected = palette.selected();
 
                     ui.add_space(2.0 * s);
+                    paint_palette_header(ui, &theme, &cols);
                     egui::ScrollArea::vertical()
                         .max_height(400.0 * s)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing.y = 2.0 * s;
-                            if ranked.is_empty() {
+                            if flat.is_empty() {
                                 ui.add_space(4.0 * s);
                                 ui.label(RichText::new("  no matches").color(theme.text_dim));
                                 return;
                             }
-                            for (row, &i) in ranked.iter().enumerate() {
-                                let is_sel = row == selected;
-                                let resp = paint_palette_row(ui, &theme, &items[i], is_sel)
-                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                if resp.clicked() {
-                                    chosen = Some(items[i].action.clone());
-                                }
-                                // Keep the keyboard-selected row in view as it
-                                // moves past the fold.
-                                if is_sel && (query_changed || up || down) {
-                                    resp.scroll_to_me(Some(egui::Align::Center));
+                            let mut row = 0usize;
+                            for (section, rows) in &groups {
+                                paint_palette_section(ui, &theme, &cols, section.title());
+                                for &i in rows {
+                                    let is_sel = row == selected;
+                                    let resp =
+                                        paint_palette_row(ui, &theme, &cols, &items[i], is_sel)
+                                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                    if resp.clicked() {
+                                        chosen = Some(items[i].action.clone());
+                                    }
+                                    // Keep the keyboard-selected row in view as
+                                    // it moves past the fold.
+                                    if is_sel && moved {
+                                        resp.scroll_to_me(Some(egui::Align::Center));
+                                    }
+                                    row += 1;
                                 }
                             }
                         });
 
                     ui.add_space(6.0 * s);
-                    ui.label(
-                        RichText::new("↑↓ move · Enter run · Esc close")
-                            .color(theme.text_muted)
-                            .small(),
-                    );
+                    ui.label(RichText::new(hint).color(theme.text_muted).small());
                 })
         };
 

@@ -11,7 +11,6 @@
 //! owns the item model, the ranking, and the palette's own query/selection
 //! state; painting and dispatch live in `app.rs`.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -35,11 +34,68 @@ pub enum PaletteAction {
     CreateWorktree(PathBuf),
 }
 
+/// The heading a row files under. Grouping keeps the list readable now that a
+/// row per action (rather than per binding) still runs to fifty-odd entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteSection {
+    Clipboard,
+    Scrollback,
+    Sessions,
+    Workspaces,
+    Sidebar,
+    Window,
+    OpenSessions,
+    SwitchWorkspace,
+    NewWorktree,
+}
+
+impl PaletteSection {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Clipboard => "Clipboard",
+            Self::Scrollback => "Scrollback",
+            Self::Sessions => "Sessions",
+            Self::Workspaces => "Workspaces & projects",
+            Self::Sidebar => "Sidebar & focus",
+            Self::Window => "Window & application",
+            Self::OpenSessions => "Open sessions",
+            Self::SwitchWorkspace => "Switch workspace",
+            Self::NewWorktree => "New worktree",
+        }
+    }
+}
+
+/// Where an action row files. Hidden actions land in `Window` and never paint.
+fn section_of(a: NamedAction) -> PaletteSection {
+    use NamedAction::*;
+    use PaletteSection::*;
+    match a {
+        Paste | PasteSelection | Copy | CopySelection => Clipboard,
+        ScrollPageUp | ScrollPageDown | ScrollHalfPageUp | ScrollHalfPageDown => Scrollback,
+        ScrollLineUp | ScrollLineDown | ScrollToTop | ScrollToBottom => Scrollback,
+        ClearHistory => Scrollback,
+        SpawnNewInstance | SpawnProfile(_) | CloseSession => Sessions,
+        SelectNextTab | SelectPreviousTab | SelectTab(_) | SelectLastTab => Sessions,
+        SelectNextSession | SelectPreviousSession => Sessions,
+        ToggleSessionRows | ToggleSessionTabs => Sessions,
+        SelectNextWorkspace | SelectPreviousWorkspace => Workspaces,
+        AddProject | RefreshProjects | SetBaseBranch => Workspaces,
+        ToggleLeftSidebar | ToggleRightSidebar | ToggleSidebarFocus => Sidebar,
+        SidebarTop | SidebarBottom | SidebarNextProject | SidebarPreviousProject => Sidebar,
+        DeleteSelected | RenameSelected | ToggleProjectExpanded => Sidebar,
+        FocusProjectsSidebar | FocusGitSidebar | FocusTerminal => Sidebar,
+        FocusLeft | FocusRight => Sidebar,
+        SidebarSearchConfirm | SidebarSearchCancel | SidebarSearchCancelToTerminal => Sidebar,
+        _ => Window,
+    }
+}
+
 /// One selectable row. `keys`/`primary`/`secondary` are what the row paints;
 /// `search` is the precomputed haystack the matcher scores, so ranking never
 /// re-allocates a per-item string on every keystroke.
 pub struct PaletteItem {
     pub action: PaletteAction,
+    pub section: PaletteSection,
     pub keys: String,
     pub primary: String,
     pub secondary: String,
@@ -47,63 +103,113 @@ pub struct PaletteItem {
 }
 
 impl PaletteItem {
-    fn new(action: PaletteAction, keys: String, primary: String, secondary: String) -> Self {
+    fn new(
+        action: PaletteAction,
+        section: PaletteSection,
+        keys: String,
+        primary: String,
+        secondary: String,
+    ) -> Self {
         let search = format!("{primary} {secondary} {keys}");
-        Self { action, keys, primary, secondary, search }
+        Self { action, section, keys, primary, secondary, search }
     }
 
     fn action(a: NamedAction, keys: String) -> Self {
-        Self::new(PaletteAction::Run(a), keys, a.description(), a.config_name())
+        Self::new(PaletteAction::Run(a), section_of(a), keys, a.description(), a.config_name())
     }
 
     pub fn session(id: SessionId, primary: String, secondary: String) -> Self {
-        Self::new(PaletteAction::ActivateSession(id), String::new(), primary, secondary)
+        Self::new(
+            PaletteAction::ActivateSession(id),
+            PaletteSection::OpenSessions,
+            String::new(),
+            primary,
+            secondary,
+        )
     }
 
     pub fn workspace(ws: WorkspaceKey, primary: String, secondary: String) -> Self {
-        Self::new(PaletteAction::SwitchWorkspace(ws), String::new(), primary, secondary)
+        Self::new(
+            PaletteAction::SwitchWorkspace(ws),
+            PaletteSection::SwitchWorkspace,
+            String::new(),
+            primary,
+            secondary,
+        )
     }
 
     pub fn create_worktree(root: PathBuf, primary: String, secondary: String) -> Self {
-        Self::new(PaletteAction::CreateWorktree(root), String::new(), primary, secondary)
+        Self::new(
+            PaletteAction::CreateWorktree(root),
+            PaletteSection::NewWorktree,
+            String::new(),
+            primary,
+            secondary,
+        )
     }
 }
 
 /// Rows the palette must not offer to run: unbinds, the pass-through marker,
-/// and its own toggle (running which from inside would just reopen it).
+/// its own toggle (running which from inside would just reopen it), and the
+/// palette's own cursor moves — activating a row closes the palette, so a
+/// "scroll the palette" row could never do anything. Their keys are advertised
+/// in the palette's footer hint instead.
 fn is_hidden(a: NamedAction) -> bool {
     matches!(a, NamedAction::NoOp | NamedAction::ReceiveChar | NamedAction::TogglePalette)
+        || a.is_palette_scoped()
 }
 
-/// Every runnable keyboard action as a palette row: one per binding first (so a
-/// multi-bound action shows once per key, and a concrete `SelectTab`/
-/// `SpawnProfile` binding carries its index), then the actions no binding names
-/// yet — runnable all the same, shown without keys so the full vocabulary stays
-/// discoverable. The parametrized families themselves are left out: they need
-/// an index to run, and the palette's session rows already cover "jump to the
-/// Nth session" more directly.
+/// Every runnable keyboard action as one row, listing every key bound to it.
+/// The fixed vocabulary comes first, then whatever else the config binds — the
+/// parametrized `SelectTab`/`SpawnProfile` families, which need an index to
+/// run and so only exist as concrete bindings. Actions no binding names are
+/// listed too, keyless: runnable from here all the same, and that is how the
+/// full vocabulary stays discoverable without the docs.
 pub fn action_items(bindings: &[KeyBinding]) -> Vec<PaletteItem> {
-    let mut items = Vec::new();
+    let mut order: Vec<NamedAction> =
+        bindable_actions().into_iter().filter(|a| !is_hidden(*a)).collect();
     for b in bindings {
         if let BindingAction::Named(a) = &b.action {
-            if !is_hidden(*a) {
-                items.push(PaletteItem::action(*a, format_shortcut(b.key, b.mods)));
+            if !is_hidden(*a) && !order.contains(a) {
+                order.push(*a);
             }
         }
     }
-    let bound: HashSet<String> = bindings
+    order.into_iter().map(|a| PaletteItem::action(a, keys_for(bindings, a))).collect()
+}
+
+/// Every trigger bound to `action`, in binding order — user bindings before the
+/// defaults they did not replace.
+fn keys_for(bindings: &[KeyBinding], action: NamedAction) -> String {
+    bindings
         .iter()
-        .filter_map(|b| match &b.action {
-            BindingAction::Named(a) => Some(a.config_name()),
-            _ => None,
-        })
-        .collect();
-    for a in bindable_actions() {
-        if !is_hidden(a) && !bound.contains(&a.config_name()) {
-            items.push(PaletteItem::action(a, String::new()));
+        .filter(|b| matches!(&b.action, BindingAction::Named(a) if *a == action))
+        .map(|b| format_shortcut(b.key, b.mods))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The first key bound to `action`, for the footer hint.
+pub fn first_key(bindings: &[KeyBinding], action: NamedAction) -> Option<String> {
+    bindings
+        .iter()
+        .find(|b| matches!(&b.action, BindingAction::Named(a) if *a == action))
+        .map(|b| format_shortcut(b.key, b.mods))
+}
+
+/// Ranked rows grouped under their headings. A section appears where its
+/// best-ranked row does, so the top match always leads the list and an
+/// unfiltered palette keeps the natural order.
+pub fn group(items: &[PaletteItem], ranked: &[usize]) -> Vec<(PaletteSection, Vec<usize>)> {
+    let mut out: Vec<(PaletteSection, Vec<usize>)> = Vec::new();
+    for &i in ranked {
+        let section = items[i].section;
+        match out.iter_mut().find(|(s, _)| *s == section) {
+            Some((_, rows)) => rows.push(i),
+            None => out.push((section, vec![i])),
         }
     }
-    items
+    out
 }
 
 /// Every simple (non-parametrized) `NamedAction`, kept in sync with the enum by
@@ -269,7 +375,27 @@ impl CommandPalette {
             self.selected = (self.selected + 1).min(len - 1);
         }
     }
+
+    pub fn select_top(&mut self) {
+        self.selected = 0;
+    }
+
+    pub fn select_bottom(&mut self, len: usize) {
+        self.selected = len.saturating_sub(1);
+    }
+
+    pub fn page_up(&mut self) {
+        self.selected = self.selected.saturating_sub(PAGE);
+    }
+
+    pub fn page_down(&mut self, len: usize) {
+        self.selected = (self.selected + PAGE).min(len.saturating_sub(1));
+    }
 }
+
+/// Rows a page jump covers — a screenful of the palette's list at its default
+/// height, so PgUp/PgDn moves about as far as the eye already sees.
+const PAGE: usize = 10;
 
 #[cfg(test)]
 mod tests {
@@ -304,6 +430,77 @@ mod tests {
         {
             assert!(items.iter().any(|i| i.secondary == name), "{name} should be a palette row");
         }
+    }
+
+    /// A multi-bound action stays one row that lists both keys, rather than one
+    /// row per key.
+    #[test]
+    fn a_multi_bound_action_is_one_row_listing_every_key() {
+        let bindings = parse_bindings(vec![]);
+        let items = action_items(&bindings);
+        let rows: Vec<_> = items.iter().filter(|i| i.secondary == "IncreaseFontSize").collect();
+        assert_eq!(rows.len(), 1, "IncreaseFontSize should be a single row");
+        let expected = keys_for(&bindings, NamedAction::IncreaseFontSize);
+        assert!(expected.contains(", "), "IncreaseFontSize has two default keys: {expected}");
+        assert_eq!(rows[0].keys, expected);
+    }
+
+    /// The palette's own cursor moves are keyboard-only: a row for them would
+    /// close the palette it is meant to scroll.
+    #[test]
+    fn palette_nav_actions_are_not_rows() {
+        let items = action_items(&parse_bindings(vec![]));
+        for name in ["PaletteTop", "PaletteBottom", "PalettePageUp", "PalettePageDown"] {
+            assert!(!items.iter().any(|i| i.secondary == name), "{name} must not be a row");
+        }
+    }
+
+    #[test]
+    fn sections_follow_the_best_match_and_hold_natural_order_unfiltered() {
+        let items = action_items(&parse_bindings(vec![]));
+        let mut palette = CommandPalette::new();
+
+        let sections: Vec<_> =
+            group(&items, &palette.rank(&items)).into_iter().map(|(s, _)| s).collect();
+        assert_eq!(
+            sections.first().copied(),
+            Some(PaletteSection::Clipboard),
+            "an unfiltered palette keeps the declared order"
+        );
+
+        palette.query_mut().push_str("scrollback");
+        let ranked = palette.rank(&items);
+        let grouped = group(&items, &ranked);
+        assert_eq!(
+            grouped.first().map(|(s, _)| *s),
+            Some(PaletteSection::Scrollback),
+            "the section holding the best match leads"
+        );
+        // Grouping is a regrouping of the ranked rows, never a filter.
+        let total: usize = grouped.iter().map(|(_, rows)| rows.len()).sum();
+        assert_eq!(total, ranked.len());
+    }
+
+    #[test]
+    fn page_and_edge_moves_clamp_to_the_result_count() {
+        let mut palette = CommandPalette::new();
+        palette.page_down(100);
+        assert_eq!(palette.selected(), PAGE);
+        palette.page_up();
+        assert_eq!(palette.selected(), 0);
+        // Already at the top, a page up stays there rather than wrapping.
+        palette.page_up();
+        assert_eq!(palette.selected(), 0);
+
+        palette.select_bottom(4);
+        assert_eq!(palette.selected(), 3);
+        palette.page_down(4);
+        assert_eq!(palette.selected(), 3);
+        palette.select_top();
+        assert_eq!(palette.selected(), 0);
+        // An empty result set has no row to land on.
+        palette.select_bottom(0);
+        assert_eq!(palette.selected(), 0);
     }
 
     #[test]

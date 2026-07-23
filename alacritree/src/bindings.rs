@@ -76,6 +76,14 @@ pub enum NamedAction {
     ToggleProjectExpanded,
     /// Open (or close) the Ctrl+K command palette.
     TogglePalette,
+    /// Move the palette cursor to the first row.
+    PaletteTop,
+    /// Move the palette cursor to the last row.
+    PaletteBottom,
+    /// Move the palette cursor a screenful up.
+    PalettePageUp,
+    /// Move the palette cursor a screenful down.
+    PalettePageDown,
     FocusProjectsSidebar,
     FocusGitSidebar,
     FocusTerminal,
@@ -158,6 +166,17 @@ impl NamedAction {
         )
     }
 
+    /// Actions that only act while the command palette is open. It is a modal
+    /// that owns every key while it is up, so these are dispatched there and
+    /// nowhere else — their default keys (unmodified Home/End/PageUp/PageDown)
+    /// stay the sidebar's and the terminal's the rest of the time.
+    pub fn is_palette_scoped(&self) -> bool {
+        matches!(
+            self,
+            Self::PaletteTop | Self::PaletteBottom | Self::PalettePageUp | Self::PalettePageDown
+        )
+    }
+
     /// The name `parse_action` accepts for this action — what a user writes
     /// in `[[keyboard.bindings]]`, and the label the shortcuts window shows.
     pub fn config_name(&self) -> String {
@@ -229,6 +248,10 @@ impl NamedAction {
             Self::SpawnProfile(n) => format!("Open a session with shell profile {n}"),
             Self::Quit => "Open the quit confirmation dialog".into(),
             Self::TogglePalette => "Open the command palette".into(),
+            Self::PaletteTop => "Move the palette cursor to the first row".into(),
+            Self::PaletteBottom => "Move the palette cursor to the last row".into(),
+            Self::PalettePageUp => "Move the palette cursor a screenful up".into(),
+            Self::PalettePageDown => "Move the palette cursor a screenful down".into(),
             Self::ToggleSessionRows => "Toggle single-session sidebar rows".into(),
             Self::ToggleSessionTabs => "Toggle single-session tab segments".into(),
             Self::SetBaseBranch => "Choose the branch the git panel diffs against".into(),
@@ -437,6 +460,28 @@ fn default_bindings() -> Vec<KeyBinding> {
             key: Key::Escape,
             mods: shift,
             action: BindingAction::Named(SidebarSearchCancelToTerminal),
+        },
+        // Palette list navigation: the same unmodified keys the sidebar uses,
+        // claimed only while the palette modal is up.
+        KeyBinding {
+            key: Key::Home,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(PaletteTop),
+        },
+        KeyBinding {
+            key: Key::End,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(PaletteBottom),
+        },
+        KeyBinding {
+            key: Key::PageUp,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(PalettePageUp),
+        },
+        KeyBinding {
+            key: Key::PageDown,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(PalettePageDown),
         },
     ]);
 
@@ -775,6 +820,10 @@ pub fn parse_action(name: &str) -> BindingAction {
         "RenameSelected" => BindingAction::Named(RenameSelected),
         "ToggleProjectExpanded" => BindingAction::Named(ToggleProjectExpanded),
         "TogglePalette" => BindingAction::Named(TogglePalette),
+        "PaletteTop" => BindingAction::Named(PaletteTop),
+        "PaletteBottom" => BindingAction::Named(PaletteBottom),
+        "PalettePageUp" => BindingAction::Named(PalettePageUp),
+        "PalettePageDown" => BindingAction::Named(PalettePageDown),
         "FocusProjectsSidebar" => BindingAction::Named(FocusProjectsSidebar),
         "FocusGitSidebar" => BindingAction::Named(FocusGitSidebar),
         "FocusTerminal" => BindingAction::Named(FocusTerminal),
@@ -1252,12 +1301,54 @@ mod tests {
             (Key::PageDown, NamedAction::SidebarNextProject, "SidebarNextProject"),
             (Key::PageUp, NamedAction::SidebarPreviousProject, "SidebarPreviousProject"),
         ] {
-            assert_eq!(named_matches(&b, key, Modifiers::NONE), vec![expected], "{name}");
+            assert!(named_matches(&b, key, Modifiers::NONE).contains(&expected), "{name}");
             assert!(
                 matches!(parse_action(name), BindingAction::Named(a) if a == expected),
                 "{name} does not parse"
             );
         }
+    }
+
+    /// The palette shares the sidebar's unmodified nav keys: both actions match
+    /// the press, and scope decides which one acts.
+    #[test]
+    fn palette_nav_actions_have_unmodified_defaults_and_parse() {
+        let b = parse_bindings(vec![]);
+        for (key, expected, name) in [
+            (Key::Home, NamedAction::PaletteTop, "PaletteTop"),
+            (Key::End, NamedAction::PaletteBottom, "PaletteBottom"),
+            (Key::PageUp, NamedAction::PalettePageUp, "PalettePageUp"),
+            (Key::PageDown, NamedAction::PalettePageDown, "PalettePageDown"),
+        ] {
+            assert!(named_matches(&b, key, Modifiers::NONE).contains(&expected), "{name}");
+            assert!(
+                matches!(parse_action(name), BindingAction::Named(a) if a == expected),
+                "{name} does not parse"
+            );
+            assert!(expected.is_palette_scoped(), "{name} must be palette-scoped");
+            assert!(!expected.is_sidebar_scoped(), "{name} must not be sidebar-scoped");
+        }
+    }
+
+    #[test]
+    fn only_palette_nav_actions_are_palette_scoped() {
+        for a in [
+            NamedAction::Paste,
+            NamedAction::TogglePalette,
+            NamedAction::SidebarTop,
+            NamedAction::SidebarSearchConfirm,
+            NamedAction::Quit,
+        ] {
+            assert!(!a.is_palette_scoped(), "{a:?} must not be palette-scoped");
+        }
+    }
+
+    /// Rebinding a palette key replaces the default on that trigger, sidebar
+    /// action included — the shared key stays one trigger, not two.
+    #[test]
+    fn user_binding_replaces_palette_nav_default() {
+        let b = parse_bindings(vec![raw_action("End", None, "PaletteTop")]);
+        assert_eq!(named_matches(&b, Key::End, Modifiers::NONE), vec![NamedAction::PaletteTop]);
     }
 
     /// Only the sidebar cursor actions and RefreshProjects are focus-scoped:
