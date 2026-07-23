@@ -1006,9 +1006,9 @@ impl AlacritreeApp {
         if let Some(&idx) = ws_idx.first() {
             let id = self.sessions[idx].id;
             self.active_session.insert(self.current_workspace.clone(), id);
+            // Filling in a missing active entry is self-healing, not navigation.
+            self.mark_sidebar_focus_write();
         }
-        // Filling in a missing active entry is self-healing, not navigation.
-        self.mark_sidebar_focus_write();
     }
 
     fn close_session(&mut self, ctx: &Context, id: SessionId) {
