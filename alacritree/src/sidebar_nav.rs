@@ -210,6 +210,7 @@ mod tests {
                 .collect(),
             expanded,
             shell_override: None,
+            home: None,
         }
     }
 

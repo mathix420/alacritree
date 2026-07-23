@@ -7172,6 +7172,7 @@ mod tests {
                 .collect(),
             expanded: true,
             shell_override: None,
+            home: None,
         }
     }
 

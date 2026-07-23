@@ -20,6 +20,10 @@ pub struct Project {
     pub worktrees: Vec<Worktree>,
     pub expanded: bool,
     pub shell_override: Option<crate::wsl::ShellChoice>,
+    /// The distro's own `$HOME` for a WSL project, so a path can collapse to
+    /// `~` without guessing the prefix from the path itself.  `None` for a
+    /// native project, whose home comes from `home::home_dir()`.
+    pub home: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +119,7 @@ impl Project {
             default_branch: None,
             expanded: true,
             shell_override: None,
+            home: None,
         }
     }
 
@@ -163,6 +168,7 @@ impl Project {
                 label: None,
                 expanded: true,
                 shell_override: None,
+                home: Some(text(5)).filter(|h| !h.is_empty()),
             }),
         }
     }
@@ -209,6 +215,7 @@ impl Project {
             label: None,
             expanded: true,
             shell_override: None,
+            home: None,
         }
     }
 
@@ -224,15 +231,17 @@ impl Project {
     }
 
     /// Adopt a discovery result.  A non-authoritative result leaves the
-    /// worktree list and default branch alone: an unreachable backend must not
-    /// read as deletion.  `expanded`, `shell_override`, and `label` are user
-    /// state and are never touched either way.
+    /// discovered fields alone: an unreachable backend must not read as
+    /// deletion.  `expanded`, `shell_override`, and `label` are user state and
+    /// are never touched either way.  One list, so a field cannot be adopted by
+    /// the synchronous refresh and dropped by the background one.
     pub fn apply(&mut self, found: Discovered) {
         if !found.authoritative {
             return;
         }
         self.worktrees = found.project.worktrees;
         self.default_branch = found.project.default_branch;
+        self.home = found.project.home;
     }
 }
 
@@ -329,7 +338,8 @@ fn display_name(root: &std::path::Path) -> String {
 
 /// Sections: 0 repo-or-not, 1 `worktree list --porcelain -z`,
 /// 2 origin/HEAD symref, 3 which common default-branch names exist,
-/// 4 `init.defaultBranch` only if it names an existing branch.
+/// 4 `init.defaultBranch` only if it names an existing branch,
+/// 5 the distro's `$HOME`.
 const DISCOVER_SCRIPT: &str = r#"
 p="$1"
 sep() { printf '\n@@ALACRITREE@@\n'; }
@@ -343,6 +353,8 @@ git -C "$p" for-each-ref --format='%(refname:short)' refs/heads/main refs/heads/
 sep
 cfg=$(git -C "$p" config init.defaultBranch 2>/dev/null)
 if [ -n "$cfg" ] && git -C "$p" rev-parse --verify --quiet "refs/heads/$cfg" >/dev/null 2>&1; then printf '%s' "$cfg"; fi
+sep
+printf '%s' "$HOME"
 "#;
 
 /// One record from `git worktree list --porcelain -z`.  The main worktree is
@@ -578,6 +590,40 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
         let bytes = b"worktree /home/lev/my proj\0HEAD abc\0branch refs/heads/main\0\0";
         let records = parse_worktree_list_z(bytes);
         assert_eq!(records[0].path, "/home/lev/my proj");
+    }
+
+    /// `$HOME` rides the existing discovery batch, so its section index must not
+    /// drift from the script.  A blank section means the distro reported nothing
+    /// and there is no home to collapse to.
+    #[test]
+    fn the_discover_script_ends_with_the_home_section() {
+        assert!(
+            DISCOVER_SCRIPT.trim_end().ends_with(r#"printf '%s' "$HOME""#),
+            "the $HOME section must be last so its index stays 5"
+        );
+        assert_eq!(DISCOVER_SCRIPT.matches("\nsep\n").count(), 5, "one sep per section boundary");
+    }
+
+    /// Discovery is adopted through one method by both refresh paths.  Two paths
+    /// each listing fields by hand is what lets a newly discovered field land in
+    /// one and be dropped by the other — and the folder-picker path, which starts
+    /// from a placeholder, is the one that matters most.
+    #[test]
+    fn adopting_a_discovery_keeps_user_state_and_takes_the_rest() {
+        let mut existing = Project::placeholder(PathBuf::from("/repo"));
+        existing.label = Some("Work".to_string());
+        existing.expanded = false;
+
+        let mut fresh = Project::placeholder(PathBuf::from("/repo"));
+        fresh.default_branch = Some("main".to_string());
+        fresh.home = Some("/home/lev".to_string());
+
+        existing.apply(Discovered::found(fresh));
+
+        assert_eq!(existing.home.as_deref(), Some("/home/lev"));
+        assert_eq!(existing.default_branch.as_deref(), Some("main"));
+        assert_eq!(existing.label.as_deref(), Some("Work"), "a rename is user state");
+        assert!(!existing.expanded, "the expand toggle is user state");
     }
 
     #[test]

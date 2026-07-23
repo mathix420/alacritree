@@ -128,6 +128,7 @@ mod tests {
             worktrees: Vec::new(),
             expanded: false,
             shell_override: None,
+            home: None,
         }
     }
 
