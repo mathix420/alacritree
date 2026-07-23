@@ -15,8 +15,8 @@ use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
 use crate::config::{
-    Config, FontConfig, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, TextEmphasis,
-    UiFont,
+    Config, FontConfig, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SidebarFocus,
+    TextEmphasis, UiFont,
 };
 use crate::doppler;
 use crate::git_nav::{self, GitSection, SectionCount};
@@ -382,6 +382,8 @@ pub struct AlacritreeApp {
     /// pass mean the user navigated — a click, session cycling, the palette, a
     /// notification, IPC — and the anchor has been overtaken.
     sidebar_focus_written: Option<SidebarFocusWrite>,
+    /// A close verdict the reconciler still owes the terminal.
+    sidebar_deferred_close: Option<DeferredClose>,
 }
 
 struct DeleteRequest {
@@ -682,6 +684,7 @@ impl AlacritreeApp {
             sidebar_focus_prev: None,
             sidebar_anchor: None,
             sidebar_focus_written: None,
+            sidebar_deferred_close: None,
         };
 
         let wsl_indices: Vec<usize> = app
@@ -1047,21 +1050,24 @@ impl AlacritreeApp {
             }
             return;
         }
+        if defers_close_navigation(self.config.ui.sidebar_focus) && verdict != CloseFallback::Stay {
+            self.sidebar_deferred_close = Some(DeferredClose { verdict, removed_worktree: None });
+            // `reap_exited_sessions` runs after paint, so a shell that exited
+            // on its own has no reconciler pass left this frame; without this
+            // the deferral would wait for unrelated input.
+            ctx.request_repaint();
+            return;
+        }
+        self.apply_close_fallback(ctx, verdict);
+    }
+
+    /// Act on a close verdict: stay put, move to the project's main checkout,
+    /// or go home.
+    fn apply_close_fallback(&mut self, ctx: &Context, verdict: CloseFallback) {
         match verdict {
             CloseFallback::Stay => {},
-            CloseFallback::Activate(main) => {
-                // The fallback verified a session exists there, so this
-                // adopts rather than spawns.
-                self.current_workspace = Some(main);
-                self.ensure_active_session(ctx);
-                // Adopting an existing session produces no PTY events, so
-                // nothing else would wake the next paint.
-                ctx.request_repaint();
-            },
-            CloseFallback::Home => {
-                self.activate_home(ctx);
-                ctx.request_repaint();
-            },
+            CloseFallback::Activate(main) => self.activate_worktree(ctx, &main),
+            CloseFallback::Home => self.activate_home(ctx),
         }
     }
 
@@ -1526,21 +1532,13 @@ impl AlacritreeApp {
     fn apply_filter_outcome(&mut self, outcome: panel_filter::Outcome) {
         use panel_filter::Outcome;
         match outcome {
-            Outcome::FilterChanged => self.after_filter_changed(),
+            // The reconciler repairs the cursor later in this same update, from
+            // a snapshot that still knows which row the filter hid.  Repairing
+            // here would reset it before anything could observe that.
+            Outcome::FilterChanged => {},
             Outcome::Consumed => {},
             Outcome::MoveCursor(delta) => self.move_sidebar_cursor(delta),
             Outcome::LeavePanel => self.focus_terminal(),
-        }
-    }
-
-    /// Repair the cursor after the row set narrows or widens: keep it where it
-    /// is when still visible, otherwise fall to the first surviving row.
-    fn after_filter_changed(&mut self) {
-        let rows = self.current_project_rows();
-        let next = sidebar_nav::ensure_cursor(&rows, self.sidebar_cursor.as_ref());
-        if next != self.sidebar_cursor {
-            self.sidebar_cursor = next;
-            self.sidebar_cursor_moved = true;
         }
     }
 
@@ -1699,10 +1697,8 @@ impl AlacritreeApp {
             self.sidebar_anchor = None;
         }
 
-        // Stubbed until Task 7 introduces deferred-close tracking; a real
-        // deferred verdict will replace both lines below.
-        let deferred: Option<()> = None;
-        let skip: Option<PathBuf> = None;
+        let deferred = self.sidebar_deferred_close.take();
+        let skip = deferred.as_ref().and_then(|d| d.removed_worktree.clone());
 
         if deferred.is_none() {
             if let Some(prev) = &self.sidebar_focus_prev {
@@ -1738,8 +1734,12 @@ impl AlacritreeApp {
         self.sidebar_focus_prev = Some(next);
 
         if self.config.ui.sidebar_focus.follows() {
-            if let Some(target) = outcome.follow {
-                self.apply_follow_target(ctx, target);
+            match (outcome.follow, deferred) {
+                (Some(target), _) => self.apply_follow_target(ctx, target),
+                // Nothing live to land on, so the verdict this pass took over
+                // from still decides where the terminal goes.
+                (None, Some(deferred)) => self.apply_close_fallback(ctx, deferred.verdict),
+                (None, None) => {},
             }
         }
 
@@ -5135,7 +5135,7 @@ fn sidebar_focus_overtaken(
 }
 
 /// Where the view goes after a session's removal.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum CloseFallback {
     /// Removal didn't empty the on-screen workspace — no navigation.
     Stay,
@@ -5165,6 +5165,26 @@ fn close_fallback(
         },
         _ => CloseFallback::Home,
     }
+}
+
+/// A close-fallback verdict the reconciler owes the terminal, and the worktree
+/// whose rows must already read as gone.  The verdict is carried rather than
+/// recomputed because only `close_fallback` knows the difference between
+/// staying put, hopping to the project's main checkout, and going home.
+#[derive(Debug, Clone)]
+struct DeferredClose {
+    verdict: CloseFallback,
+    /// Set when an asynchronous worktree deletion is in flight: `projects`
+    /// still lists it, so without this the reconciler would see an intact row
+    /// and could spawn a shell inside the directory being removed.
+    removed_worktree: Option<PathBuf>,
+}
+
+/// Whether the reconciler owns post-removal navigation.  Under `"follow"` the
+/// landing row decides where the terminal goes, so acting here first would
+/// show one workspace for a frame and another the next.
+fn defers_close_navigation(mode: SidebarFocus) -> bool {
+    mode.follows()
 }
 
 /// What re-homing a session does to the active-session maps and the view.
@@ -6243,10 +6263,18 @@ impl AlacritreeApp {
         self.sessions.retain(|s| s.working_directory.as_deref() != Some(&req.worktree_path));
         self.active_session.remove(&Some(req.worktree_path.clone()));
         if self.current_workspace.as_deref() == Some(&req.worktree_path) {
-            // Deleting the on-screen worktree is an explicit user action, so
-            // home should greet with a live shell rather than the "no
-            // session" placeholder.
-            self.activate_home(ctx);
+            if defers_close_navigation(self.config.ui.sidebar_focus) {
+                self.sidebar_deferred_close = Some(DeferredClose {
+                    verdict: CloseFallback::Home,
+                    removed_worktree: Some(req.worktree_path.clone()),
+                });
+                ctx.request_repaint();
+            } else {
+                // Deleting the on-screen worktree is an explicit user action,
+                // so home should greet with a live shell rather than the "no
+                // session" placeholder.
+                self.activate_home(ctx);
+            }
         }
 
         // The git removal (shellouts, branch delete, doppler cleanup) is slow
@@ -7677,6 +7705,34 @@ mod tests {
             ),
             CloseFallback::Stay
         );
+    }
+
+    #[test]
+    fn a_deferred_verdict_survives_instead_of_being_re_derived() {
+        // `close_fallback` is the only thing that knows to hop to the project's
+        // main checkout; a generic "spawn something" fallback would strand
+        // last_session_close = "navigate" in the workspace that just emptied.
+        let main = PathBuf::from("/p/main");
+        let removed = Some(PathBuf::from("/p/feature"));
+        let remaining = vec![(Some(main.clone()), 1)];
+
+        let verdict = close_fallback(&removed, &removed, &remaining, Some(main.clone()));
+        assert_eq!(verdict, CloseFallback::Activate(main.clone()));
+
+        let deferred = DeferredClose { verdict, removed_worktree: None };
+        assert_eq!(
+            deferred.verdict,
+            CloseFallback::Activate(main),
+            "the verdict is carried, not recomputed from whatever state remains"
+        );
+    }
+
+    #[test]
+    fn only_follow_defers_close_navigation() {
+        use crate::config::SidebarFocus;
+
+        assert!(defers_close_navigation(SidebarFocus::Follow));
+        assert!(!defers_close_navigation(SidebarFocus::Preserve));
     }
 
     #[test]
