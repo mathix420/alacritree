@@ -19,7 +19,10 @@ jobs:
     steps:
       - name: Re-run downstream publishers
         env:
-          GH_TOKEN: ${{ secrets.ALACRITREE_BOT_TOKEN }}
+          # The caller grants actions:write to this repository-scoped token.
+          # Unlike the bot PAT, it can dispatch workflows without requiring
+          # repository-level Actions access on a separate credential.
+          GH_TOKEN: ${{ github.token }}
           PLAN: ${{ inputs.plan }}
         run: |
           set -euo pipefail
