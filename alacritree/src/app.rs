@@ -14,13 +14,18 @@ use crate::bindings::{self, BindingAction, KeyBinding, NamedAction};
 use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
-use crate::config::{Config, FontConfig, Icons, LastSessionClose, ScrollbarStyle, UiFont};
+use crate::config::{
+    Config, FontConfig, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, UiFont,
+};
 use crate::doppler;
 use crate::git_nav::{self, GitSection, SectionCount};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
 use crate::ipc;
 use crate::panel_filter::{self, PanelFilter};
 use crate::paste;
+use crate::path_style;
+#[cfg(test)]
+use crate::path_style::PathStyle;
 use crate::pr_status::{PrCache, PrInfo, PrState};
 use crate::projects::{Discovered, Project, Worktree, project_json};
 use crate::scratchpad;
@@ -83,6 +88,9 @@ struct Theme {
     /// existing layout proportions.
     ui_scale: f32,
     focus_outline: FocusOutlineTheme,
+    /// Per-site path abbreviation, so free-standing row painters can spell a
+    /// path without taking a `&Config`.
+    path_style: PathStyleConfig,
 }
 
 /// Logical-pixel (normal, heading) sizes for UI text.  `[ui.font] size`
@@ -135,6 +143,7 @@ impl Theme {
                 color: config.ui.focus_outline.color.unwrap_or(accent),
                 thickness: config.ui.focus_outline.thickness,
             },
+            path_style: config.ui.path_style,
         }
     }
 }
@@ -3119,6 +3128,20 @@ impl AlacritreeApp {
         self.current_workspace.clone()
     }
 
+    /// The home directory a workspace path should collapse to.  A WSL path's
+    /// home lives inside the distro and is only known through discovery, so a
+    /// project that has not finished discovering yet simply gets no `~`.
+    fn workspace_home(&self, path: &Path) -> Option<String> {
+        match wsl::classify(path) {
+            wsl::Location::Wsl { .. } => self
+                .projects
+                .iter()
+                .find(|p| p.worktrees.iter().any(|w| w.path == path))
+                .and_then(|p| p.home.clone()),
+            wsl::Location::Windows(_) => home::home_dir().map(|h| h.display().to_string()),
+        }
+    }
+
     fn project_default_branch_for(&self, path: &Path) -> Option<String> {
         for project in &self.projects {
             for wt in &project.worktrees {
@@ -3205,6 +3228,7 @@ impl AlacritreeApp {
                         return;
                     },
                 };
+                let workspace_home = self.workspace_home(&path);
 
                 let project_default = self.project_default_branch_for(&path);
                 let cache = self
@@ -3288,7 +3312,13 @@ impl AlacritreeApp {
 
                     ui.add(
                         egui::Label::new(
-                            RichText::new(wsl::display_path(&path)).color(theme.text_muted).small(),
+                            RichText::new(path_style::render(
+                                &wsl::display_path(&path),
+                                theme.path_style.git_header,
+                                workspace_home.as_deref(),
+                            ))
+                            .color(theme.text_muted)
+                            .small(),
                         )
                         .truncate(),
                     );
@@ -3532,7 +3562,10 @@ impl AlacritreeApp {
                 build_diff_command(delta_override.as_deref().unwrap_or("delta"), &req)
             },
         };
-        let title = format!("diff: {}", req.file);
+        let title = format!(
+            "diff: {}",
+            path_style::render(&req.file, self.config.ui.path_style.diff_title, None)
+        );
         match Session::spawn_command(
             ctx.clone(),
             &self.config,
@@ -4201,7 +4234,14 @@ fn file_row(
                 );
                 ui.add(
                     egui::Label::new(
-                        RichText::new(&change.path).color(path_color).monospace().small(),
+                        RichText::new(path_style::render(
+                            &change.path,
+                            theme.path_style.git_rows,
+                            None,
+                        ))
+                        .color(path_color)
+                        .monospace()
+                        .small(),
                     )
                     .truncate()
                     .selectable(false),
@@ -4269,7 +4309,14 @@ fn branch_diff_row(
                             ui.set_min_height(row_h);
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(&stat.path).color(path_color).monospace().small(),
+                                    RichText::new(path_style::render(
+                                        &stat.path,
+                                        theme.path_style.git_rows,
+                                        None,
+                                    ))
+                                    .color(path_color)
+                                    .monospace()
+                                    .small(),
                                 )
                                 .truncate()
                                 .selectable(false),
@@ -7707,5 +7754,34 @@ mod tests {
         assert_eq!(base_branch_target(false, None, none, &Some(wt.clone())), Some(wt));
         let none2 = |_id: SessionId| -> Option<WorkspaceKey> { None };
         assert_eq!(base_branch_target(false, None, none2, &None), None, "home has no base branch");
+    }
+
+    /// The row painters are free functions that only ever see a `Theme`, so the
+    /// configured style has to survive the trip through it.
+    #[test]
+    fn the_theme_carries_the_configured_path_style() {
+        let mut config = Config::default();
+        config.ui.path_style.git_rows = PathStyle::Fish;
+        config.ui.path_style.filename.bold = true;
+
+        let theme = Theme::from_config(&config);
+        assert_eq!(theme.path_style.git_rows, PathStyle::Fish);
+        assert_eq!(theme.path_style.git_header, PathStyle::Full);
+        assert!(theme.path_style.filename.bold);
+    }
+
+    /// The header is the one site whose path is absolute, so it is the one that
+    /// must convert before it abbreviates: fish-abbreviating the UNC spelling
+    /// would produce `\\w\k\h\l\monorepo` instead of `~/G/monorepo`.
+    #[cfg(windows)]
+    #[test]
+    fn the_git_header_converts_before_it_abbreviates() {
+        let unc = std::path::Path::new(r"\\wsl.localhost\kali-linux\home\lev\Git\monorepo");
+        let shown = crate::path_style::render(
+            &crate::wsl::display_path(unc),
+            crate::path_style::PathStyle::Fish,
+            Some("/home/lev"),
+        );
+        assert_eq!(shown, "~/G/monorepo");
     }
 }
