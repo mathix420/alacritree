@@ -324,7 +324,7 @@ pub fn normalize_label(label: Option<String>) -> Option<String> {
 fn display_name(root: &std::path::Path) -> String {
     root.file_name()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| root.display().to_string())
+        .unwrap_or_else(|| wsl::display_path(root))
 }
 
 /// Sections: 0 repo-or-not, 1 `worktree list --porcelain -z`,
@@ -500,6 +500,14 @@ mod tests {
         let wt = project.worktrees.iter().find(|w| w.name == "feature").unwrap();
         assert!(!wt.prunable);
         assert_eq!(wt.branch.as_deref(), Some("feature"));
+    }
+
+    /// A distro root has no `file_name()`, so the name falls back to the whole
+    /// path — which must not be the UNC spelling.
+    #[cfg(windows)]
+    #[test]
+    fn a_rootless_path_names_itself_in_the_distros_spelling() {
+        assert_eq!(display_name(std::path::Path::new(r"\\wsl.localhost\kali-linux")), "/");
     }
 
     #[test]

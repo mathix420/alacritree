@@ -3288,9 +3288,7 @@ impl AlacritreeApp {
 
                     ui.add(
                         egui::Label::new(
-                            RichText::new(path.display().to_string())
-                                .color(theme.text_muted)
-                                .small(),
+                            RichText::new(wsl::display_path(&path)).color(theme.text_muted).small(),
                         )
                         .truncate(),
                     );
@@ -5773,7 +5771,7 @@ impl AlacritreeApp {
             items.push(PaletteItem::create_worktree(
                 project.root.clone(),
                 format!("{}: new worktree", project.display_name()),
-                format!("project · {}", project.root.display()),
+                format!("project · {}", wsl::display_path(&project.root)),
             ));
         }
         items
@@ -5794,14 +5792,14 @@ impl AlacritreeApp {
         }
         path.file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string())
+            .unwrap_or_else(|| wsl::display_path(path))
     }
 
     /// The (primary, secondary) a workspace palette row shows.
     fn workspace_entry_label(&self, ws: &WorkspaceKey) -> (String, String) {
         let secondary = match ws {
             None => "workspace · home".to_string(),
-            Some(path) => format!("workspace · {}", path.display()),
+            Some(path) => format!("workspace · {}", wsl::display_path(path)),
         };
         (self.workspace_label(ws), secondary)
     }
@@ -6027,7 +6025,7 @@ impl AlacritreeApp {
                     .worktree
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| picker.worktree.display().to_string());
+                    .unwrap_or_else(|| wsl::display_path(&picker.worktree));
                 ui.label(
                     RichText::new(format!("Base branch for `{name}`")).color(theme.text).strong(),
                 );

@@ -55,7 +55,7 @@ impl LabelTemplates {
         if let Some(branch) = &wt.branch {
             vars.insert("branch".to_string(), branch.clone());
         }
-        vars.insert("path".to_string(), wt.path.display().to_string());
+        vars.insert("path".to_string(), crate::wsl::display_path(&wt.path));
         if let Some(pr) = pr {
             vars.insert("pr".to_string(), format!("#{}", pr.number));
         }
@@ -74,7 +74,7 @@ impl LabelTemplates {
         };
         let mut vars = HashMap::new();
         vars.insert("name".to_string(), project.name.clone());
-        vars.insert("path".to_string(), project.root.display().to_string());
+        vars.insert("path".to_string(), crate::wsl::display_path(&project.root));
         self.render_or_fallback("project_name", &template, &vars, &project.name)
     }
 
@@ -102,6 +102,7 @@ impl LabelTemplates {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::projects::Worktree;
     use std::path::PathBuf;
 
     fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -235,5 +236,21 @@ mod tests {
         let mut t = LabelTemplates::new(Some("$pr $name".into()), None);
         assert_eq!(t.worktree_label(&wt("alpha", None), Some(&pr(7))), "#7 alpha");
         assert_eq!(t.worktree_label(&wt("alpha", None), None), "alpha");
+    }
+
+    /// `$path` is the template's window onto the filesystem, so a WSL worktree
+    /// must substitute the path the user would type inside the distro.
+    #[cfg(windows)]
+    #[test]
+    fn the_path_variable_uses_the_distros_spelling() {
+        let wt = Worktree {
+            name: "monorepo".to_string(),
+            path: PathBuf::from(r"\\wsl.localhost\kali-linux\home\lev\Git\monorepo"),
+            branch: Some("main".to_string()),
+            is_main: true,
+            prunable: false,
+        };
+        let mut templates = LabelTemplates::new(Some("$path".to_string()), None);
+        assert_eq!(templates.worktree_label(&wt, None), "/home/lev/Git/monorepo");
     }
 }
