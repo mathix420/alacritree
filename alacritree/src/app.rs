@@ -283,10 +283,6 @@ pub struct AlacritreeApp {
     sidebar_auto_shown: bool,
     /// One-shot: scroll the cursor row into view on the next sidebar paint.
     sidebar_cursor_moved: bool,
-    /// One-shot scroll target for the projects sidebar, independent of focus and
-    /// cursor: a search confirm activates a row and focuses the terminal (nulling
-    /// the paint-time cursor), so the row to reveal is carried here instead.
-    pending_sidebar_scroll: Option<SidebarRow>,
     /// Fuzzy-search query and `s`/`a` toggle state for the projects panel.
     /// Transient: never persisted, never touches the `expanded` flag.
     project_filter: PanelFilter,
@@ -615,7 +611,6 @@ impl AlacritreeApp {
             reorder_mode: false,
             sidebar_auto_shown: false,
             sidebar_cursor_moved: false,
-            pending_sidebar_scroll: None,
             project_filter: PanelFilter::new(&['s', 'a']),
             git_filter: PanelFilter::new(&['m', 'd', 'u']),
             git_cursor: None,
@@ -2172,7 +2167,7 @@ impl AlacritreeApp {
                 }
             },
             BindingAction::Named(NamedAction::SidebarSearchConfirm) => {
-                self.sidebar_search_confirm(ctx);
+                self.sidebar_search_confirm();
             },
             BindingAction::Named(NamedAction::SidebarSearchCancel) => {
                 self.sidebar_search_cancel();
@@ -2189,55 +2184,63 @@ impl AlacritreeApp {
         }
     }
 
-    /// Confirm the focused sidebar's fuzzy search: activate the highlighted row
-    /// and mark it to scroll into view once search exits (the row may be a child
-    /// force-shown only during search, so a now-hidden one resolves to its
-    /// owning header). No-op unless the focused panel is in search mode.
-    fn sidebar_search_confirm(&mut self, ctx: &Context) {
+    /// Confirm the focused sidebar's fuzzy search: leave search and land the
+    /// cursor on the highlighted row, scrolled into view, keeping focus in the
+    /// sidebar. Selecting a row never activates it — a following browsing
+    /// `Enter` does that. No-op unless the focused panel is in search mode.
+    fn sidebar_search_confirm(&mut self) {
         match self.focus {
             PaneFocus::ProjectsSidebar
                 if self.project_filter.mode() == panel_filter::Mode::Search =>
             {
                 let acted = self.sidebar_cursor.clone();
-                self.project_filter.exit_search();
-                if let Some(row) = acted {
-                    self.activate_sidebar_row(ctx, &row);
-                    self.pending_sidebar_scroll = self.resolve_confirm_scroll_target(&row);
+                if let Some(row) = acted.as_ref() {
+                    self.reveal_search_row(row);
                 }
+                self.finish_project_search_at(acted);
             },
             PaneFocus::GitSidebar if self.git_filter.mode() == panel_filter::Mode::Search => {
                 let cursor = self.git_cursor.clone();
-                self.git_filter.exit_search();
-                self.recompute_git_rows();
-                if let Some(c) = cursor {
-                    if let Some(req) = git_row_diff_request(&c, self.git_branch_base.as_deref()) {
-                        self.open_diff(ctx, req);
-                    }
-                    // Focus stays in the git panel, so the render pass scrolls the
-                    // cursor row via `git_cursor_moved`.
-                    self.git_cursor = git_nav::ensure_cursor(&self.git_rows, Some(&c));
-                    self.git_cursor_moved = true;
-                }
+                self.finish_git_search_at(cursor);
             },
             _ => {},
         }
     }
 
-    /// The confirm scroll target: the acted-on row when it still renders after
-    /// search exits, else its owning project header (never Home, which
-    /// `ensure_cursor` would otherwise pick for a vanished child).
-    fn resolve_confirm_scroll_target(&mut self, acted: &SidebarRow) -> Option<SidebarRow> {
-        let rows = self.current_project_rows();
-        if rows.contains(acted) {
-            return sidebar_nav::ensure_cursor(&rows, Some(acted));
-        }
-        let header = {
+    /// Expand the project owning a worktree/session row so the row outlives the
+    /// search exit: search lists matched children whatever their project's
+    /// `expanded` flag says, so a child under a collapsed project would vanish
+    /// the moment the query clears. Expand-only, and headers are left alone, so
+    /// confirming a project row never toggles it.
+    fn reveal_search_row(&mut self, row: &SidebarRow) {
+        let root = {
             let session_workspace = |id: SessionId| {
                 self.sessions.iter().find(|s| s.id == id).map(|s| s.working_directory.clone())
             };
-            row_project_root(&self.projects, session_workspace, acted).map(SidebarRow::Project)
+            search_reveal_root(&self.projects, session_workspace, row)
         };
-        sidebar_nav::ensure_cursor(&rows, header.as_ref())
+        if let Some(root) = root {
+            self.set_project_expanded(&root, true);
+        }
+    }
+
+    /// Leave search and land the projects cursor on `requested`, falling back
+    /// through `ensure_cursor` when it no longer renders. The scroll is forced
+    /// rather than keyed on the cursor changing: restoring the unfiltered list
+    /// can move the very same row far off-screen.
+    fn finish_project_search_at(&mut self, requested: Option<SidebarRow>) {
+        self.project_filter.exit_search();
+        let rows = self.current_project_rows();
+        self.sidebar_cursor = sidebar_nav::ensure_cursor(&rows, requested.as_ref());
+        self.sidebar_cursor_moved = true;
+    }
+
+    /// Git-panel counterpart of `finish_project_search_at`.
+    fn finish_git_search_at(&mut self, requested: Option<git_nav::GitRow>) {
+        self.git_filter.exit_search();
+        self.recompute_git_rows();
+        self.git_cursor = git_nav::ensure_cursor(&self.git_rows, requested.as_ref());
+        self.git_cursor_moved = true;
     }
 
     /// Cancel the focused sidebar's fuzzy search, staying in the sidebar with the
@@ -2248,22 +2251,17 @@ impl AlacritreeApp {
             PaneFocus::ProjectsSidebar
                 if self.project_filter.mode() == panel_filter::Mode::Search =>
             {
-                self.project_filter.exit_search();
                 let seed = sidebar_nav::seed(
                     &self.projects,
                     self.current_workspace.as_deref(),
                     &self.listed_session_ids(),
                     self.active_session.get(&self.current_workspace).copied(),
                 );
-                let rows = self.current_project_rows();
-                let target = sidebar_nav::ensure_cursor(&rows, Some(&seed));
-                self.sidebar_cursor = target.clone();
-                self.sidebar_cursor_moved = true;
-                self.pending_sidebar_scroll = target;
+                self.finish_project_search_at(Some(seed));
             },
             PaneFocus::GitSidebar if self.git_filter.mode() == panel_filter::Mode::Search => {
-                self.git_filter.exit_search();
-                self.after_git_filter_changed();
+                let cursor = self.git_cursor.clone();
+                self.finish_git_search_at(cursor);
             },
             _ => {},
         }
@@ -2468,12 +2466,7 @@ impl AlacritreeApp {
             None
         };
         let cursor_moved = std::mem::take(&mut self.sidebar_cursor_moved);
-        // Focus-independent scroll target from a search confirm/cancel: honored
-        // when its row renders this pass, dropped otherwise (taken either way).
-        let scroll_target = self.pending_sidebar_scroll.take();
-        let scrolls = |row: &SidebarRow, is_cursor: bool| {
-            (is_cursor && cursor_moved) || scroll_target.as_ref() == Some(row)
-        };
+        let scrolls = |is_cursor: bool| is_cursor && cursor_moved;
 
         // Membership for the active filter, resolved once so paint can skip
         // non-surviving rows.  While filtering, matched projects render their
@@ -2695,7 +2688,7 @@ impl AlacritreeApp {
                             ui,
                             self.current_workspace.is_none(),
                             home_is_cursor,
-                            scrolls(&SidebarRow::Home, home_is_cursor),
+                            scrolls(home_is_cursor),
                             home_attention,
                             home_agent_glyph,
                             &icons,
@@ -2712,7 +2705,7 @@ impl AlacritreeApp {
                                 &cursor_row,
                                 Some(SidebarRow::Session(id)) if *id == row.id
                             );
-                            let scroll = scrolls(&SidebarRow::Session(row.id), is_cursor);
+                            let scroll = scrolls(is_cursor);
                             let act = session_row(ui, row, is_cursor, scroll, &icons, &theme);
                             if act.activate {
                                 activate_session_request.set(Some((None, row.id)));
@@ -2819,16 +2812,13 @@ impl AlacritreeApp {
                         );
                         let header_is_cursor =
                             matches!(&cursor_row, Some(SidebarRow::Project(r)) if *r == project.root);
-                        let header_row = SidebarRow::Project(project.root.clone());
-                        if header_is_cursor || scroll_target.as_ref() == Some(&header_row) {
+                        if header_is_cursor {
                             let rect = egui::Rect::from_x_y_ranges(
                                 ui.max_rect().x_range(),
                                 row_rect.y_range(),
                             );
-                            if header_is_cursor {
-                                paint_cursor_outline(ui, rect, &theme);
-                            }
-                            if scrolls(&header_row, header_is_cursor) {
+                            paint_cursor_outline(ui, rect, &theme);
+                            if scrolls(header_is_cursor) {
                                 ui.scroll_to_rect(rect, None);
                             }
                         }
@@ -2961,8 +2951,7 @@ impl AlacritreeApp {
                                     &cursor_row,
                                     Some(SidebarRow::Worktree(p)) if *p == wt.path
                                 );
-                                let wt_scroll =
-                                    scrolls(&SidebarRow::Worktree(wt.path.clone()), is_cursor);
+                                let wt_scroll = scrolls(is_cursor);
                                 let is_deleting = deleting_paths.contains(&wt.path);
                                 let action = worktree_row(
                                     ui,
@@ -3007,8 +2996,7 @@ impl AlacritreeApp {
                                         &cursor_row,
                                         Some(SidebarRow::Session(id)) if *id == row.id
                                     );
-                                    let scroll =
-                                        scrolls(&SidebarRow::Session(row.id), is_cursor);
+                                    let scroll = scrolls(is_cursor);
                                     let act = session_row(
                                         ui,
                                         row,
@@ -4686,6 +4674,22 @@ fn project_main_for(projects: &[Project], ws: &Path) -> Option<PathBuf> {
     let project = projects.iter().find(|p| p.worktrees.iter().any(|w| w.path == ws))?;
     let main = project.worktrees.iter().find(|w| w.is_main)?;
     if main.path == ws { None } else { Some(main.path.clone()) }
+}
+
+/// The project to expand so `row` still renders once search exits, if any.
+/// Only child rows qualify: search lists matched worktrees and sessions whatever
+/// their project's `expanded` flag says, so they vanish when the query clears.
+/// A header is already its own row, and expanding it would turn selecting a
+/// project into a toggle.
+fn search_reveal_root(
+    projects: &[Project],
+    session_workspace: impl Fn(SessionId) -> Option<WorkspaceKey>,
+    row: &SidebarRow,
+) -> Option<PathBuf> {
+    if !matches!(row, SidebarRow::Worktree(_) | SidebarRow::Session(_)) {
+        return None;
+    }
+    row_project_root(projects, session_workspace, row)
 }
 
 /// The root of the project owning `row`: a worktree resolves by its path, a
@@ -6499,10 +6503,6 @@ impl eframe::App for AlacritreeApp {
             {
                 paint_focus_outline(ctx, r, &theme);
             }
-        } else {
-            // A confirm that focuses the terminal can hide an auto-shown sidebar
-            // before it paints; drop its scroll target so it can't fire later.
-            self.pending_sidebar_scroll = None;
         }
 
         if self.show_right_sidebar {
@@ -7514,6 +7514,30 @@ mod tests {
         );
         // Home belongs to no project.
         assert_eq!(row_project_root(&projects, none, &SidebarRow::Home), None);
+    }
+
+    #[test]
+    fn search_confirm_reveals_only_child_rows() {
+        let projects = vec![project_with("/repo", &["/repo/wt"])];
+        let root = PathBuf::from("/repo");
+        let none = |_id: SessionId| -> Option<WorkspaceKey> { None };
+
+        // A worktree matched under a collapsed project would vanish once the
+        // query clears, so its project is expanded to keep it selectable.
+        assert_eq!(
+            search_reveal_root(&projects, none, &SidebarRow::Worktree(PathBuf::from("/repo/wt"))),
+            Some(root.clone())
+        );
+        // A session resolves through its workspace to the same project.
+        let lookup = |id: SessionId| (id == 7).then(|| Some(PathBuf::from("/repo/wt")));
+        assert_eq!(search_reveal_root(&projects, lookup, &SidebarRow::Session(7)), Some(root));
+        // Confirming a header selects it without expanding or collapsing it.
+        assert_eq!(
+            search_reveal_root(&projects, none, &SidebarRow::Project(PathBuf::from("/repo"))),
+            None
+        );
+        // Home owns no project to reveal.
+        assert_eq!(search_reveal_root(&projects, none, &SidebarRow::Home), None);
     }
 
     #[test]

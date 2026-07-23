@@ -219,8 +219,10 @@ focused panel is in search mode, so their default keys pass straight through to
 the terminal whenever it owns focus (the terminal's own `Enter`/`Esc` are never
 affected):
 
-- `SidebarSearchConfirm` (default `Enter`) — open the highlighted row and scroll
-  it into view.
+- `SidebarSearchConfirm` (default `Enter`) — leave search with the cursor on the
+  highlighted row, scrolled into view. Selecting never opens the row: press
+  `Enter` again, outside search, to activate it. A worktree or session matched
+  under a collapsed project expands that project so the row stays selectable.
 - `SidebarSearchCancel` (default `Esc`) — leave search, staying in the sidebar on
   the previously active row.
 - `SidebarSearchCancelToTerminal` (default `Shift+Esc`) — leave search and return

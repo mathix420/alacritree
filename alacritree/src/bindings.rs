@@ -235,7 +235,7 @@ impl NamedAction {
             Self::FocusLeft => "Move panel focus left (TUIs get the key first)".into(),
             Self::FocusRight => "Move panel focus right (TUIs get the key first)".into(),
             Self::SidebarSearchConfirm => {
-                "Confirm the sidebar search and open the highlighted row".into()
+                "Leave the sidebar search with the highlighted row selected".into()
             },
             Self::SidebarSearchCancel => "Cancel the sidebar search, staying in the sidebar".into(),
             Self::SidebarSearchCancelToTerminal => {
