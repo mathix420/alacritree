@@ -3318,6 +3318,7 @@ impl AlacritreeApp {
                         theme.path_style.git_header,
                         egui::FontFamily::Proportional,
                         workspace_home.as_deref(),
+                        true,
                     );
                     if let Some(branch) = &status.branch {
                         // A greedy `truncate()` label in a plain `horizontal` row
@@ -4237,6 +4238,7 @@ fn file_row(
                     theme.path_style.git_rows,
                     egui::FontFamily::Proportional,
                     None,
+                    false,
                 );
                 fill_row(ui);
             },
@@ -4307,6 +4309,7 @@ fn branch_diff_row(
                                 theme.path_style.git_rows,
                                 egui::FontFamily::Proportional,
                                 None,
+                                false,
                             );
                             fill_row(ui);
                         },
@@ -4348,9 +4351,10 @@ fn path_label(
     style: PathStyle,
     family: egui::FontFamily,
     home: Option<&str>,
-) {
+    selectable: bool,
+) -> egui::Response {
     if style != PathStyle::Zed {
-        ui.add(
+        return ui.add(
             egui::Label::new(
                 RichText::new(path_style::render(path, style, home))
                     .color(base)
@@ -4358,9 +4362,8 @@ fn path_label(
                     .small(),
             )
             .truncate()
-            .selectable(false),
+            .selectable(selectable),
         );
-        return;
     }
 
     let size = egui::TextStyle::Small.resolve(ui.style()).size;
@@ -4385,13 +4388,25 @@ fn path_label(
             },
         );
     };
-    if parts.parent.is_empty() {
-        push(format!("{}{}", parts.root, parts.name), &theme.path_style.filename);
-    } else {
-        push(parts.name.clone(), &theme.path_style.filename);
-        push(format!(" {}{}", parts.root, parts.parent), &theme.path_style.parent);
+    let emphases = [&theme.path_style.filename, &theme.path_style.parent];
+    for (text, e) in zed_spans(&parts).into_iter().zip(emphases) {
+        push(text, e);
     }
-    ui.add(egui::Label::new(job).truncate().selectable(false));
+    ui.add(egui::Label::new(job).truncate().selectable(selectable))
+}
+
+/// The Zed style's span decomposition: the filename text, then — when there
+/// is a parent to show — the parent text with its separating space already
+/// folded in. Position carries the emphasis: span 0 always paints with the
+/// filename emphasis, span 1 (if present) with the parent emphasis. Shared by
+/// `path_label`'s job builder and its fidelity test so a regression in the
+/// split logic fails the test that exercises the real render path.
+fn zed_spans(parts: &path_style::Parts) -> Vec<String> {
+    if parts.parent.is_empty() {
+        vec![format!("{}{}", parts.root, parts.name)]
+    } else {
+        vec![parts.name.clone(), format!(" {}{}", parts.root, parts.parent)]
+    }
 }
 
 /// Extend a row's bounding rect to its parent's full width so the response
@@ -7873,8 +7888,9 @@ mod tests {
         }
     }
 
-    /// The job's two spans must reassemble into exactly what `render` produces,
-    /// so the emphasis only changes how the text looks, never what it says.
+    /// The job's spans, as `path_label` itself builds them via `zed_spans`,
+    /// must reassemble into exactly what `render` produces, so the emphasis
+    /// only changes how the text looks, never what it says.
     #[test]
     fn the_zed_job_spells_the_same_text_as_render() {
         for (path, home) in [
@@ -7885,12 +7901,54 @@ mod tests {
             ("/home/lev/Git/x/y.rs", Some("/home/lev")),
         ] {
             let parts = crate::path_style::split(path, PathStyle::Zed, home);
-            let spans = if parts.parent.is_empty() {
-                format!("{}{}", parts.root, parts.name)
-            } else {
-                format!("{} {}{}", parts.name, parts.root, parts.parent)
-            };
+            let spans = zed_spans(&parts).concat();
             assert_eq!(spans, crate::path_style::render(path, PathStyle::Zed, home), "{path:?}");
+        }
+    }
+
+    /// The header must stay text-selectable exactly as it was before
+    /// `path_label` existed; a row must stay non-selectable so its own click
+    /// wins the hit test instead of a text drag-select. Both the plain and
+    /// the `Zed` `LayoutJob` branch build their own label, so both are
+    /// checked here.
+    #[test]
+    fn path_label_selectability_matches_the_caller() {
+        let theme = Theme::from_config(&Config::default());
+        let ctx = egui::Context::default();
+
+        for style in [PathStyle::Full, PathStyle::Zed] {
+            for selectable in [true, false] {
+                let mut sense = None;
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::Vec2::new(400.0, 100.0),
+                    )),
+                    ..Default::default()
+                };
+                let _ = ctx.run(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let resp = path_label(
+                            ui,
+                            "path/to/file.txt",
+                            theme.text,
+                            &theme,
+                            style,
+                            egui::FontFamily::Proportional,
+                            None,
+                            selectable,
+                        );
+                        sense = Some(resp.sense);
+                    });
+                });
+
+                let sense = sense.expect("path_label must run inside the panel closure");
+                assert_eq!(
+                    sense.senses_drag(),
+                    selectable,
+                    "style {style:?} selectable {selectable}: {sense:?}"
+                );
+            }
         }
     }
 }
