@@ -270,6 +270,14 @@ scrollbar          = "floating"  # sidebar scrollbar: "floating" (default, thin
 sidebar_click_focus = true  # clicking a sidebar moves keyboard focus to it;
                             # picking a session/worktree focuses the terminal
                             # instead (default false)
+sidebar_focus      = "preserve"  # how far the projects sidebar goes when the
+                                  # cursor's row stops being rendered.
+                                  # "preserve" (default): a filtered-out cursor
+                                  # climbs to its nearest visible ancestor and
+                                  # returns when the filter widens; a deleted row
+                                  # slides to a sibling bounded by its parent.
+                                  # "follow": also moves the terminal to a delete
+                                  # landing that has a live session
 
 [ui.icons]                  # sidebar glyph overrides (e.g. Nerd Font icons)
 search = "⌕"                # glyph prefixing the sidebar search prompt
@@ -284,6 +292,11 @@ worktree_dir = "D:/wt"
 [window]
 opacity = 0.92   # restart required — transparency is a ViewportBuilder flag
 ```
+
+The sidebar cursor used to drop to the first row whenever its own row stopped
+being rendered — by a filter, or by deleting a session or worktree. It now
+climbs or slides instead, under `sidebar_focus = "preserve"`. There is no
+setting that restores the old drop-to-first-row behavior.
 
 Everything Alacritty's TOML accepts for palette, cursor, scrolling, window
 padding, shell, env, and bindings is parsed by the same `Raw*` structs.
