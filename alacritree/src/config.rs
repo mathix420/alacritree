@@ -319,6 +319,39 @@ fn parse_last_session_close(raw: Option<&str>) -> LastSessionClose {
     }
 }
 
+/// How far the projects sidebar goes when the cursor's row stops being
+/// rendered.  Both values keep the cursor; they differ only in whether the
+/// terminal comes along.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SidebarFocus {
+    /// A filtered-out cursor climbs to its nearest visible ancestor and is
+    /// restored when the filter widens; a removed cursor slides to a sibling
+    /// bounded by its parent.  The terminal stays where it is.
+    #[default]
+    Preserve,
+    /// `Preserve`, and a removal landing that has a live session also moves
+    /// the terminal to it.
+    Follow,
+}
+
+impl SidebarFocus {
+    pub fn follows(self) -> bool {
+        matches!(self, Self::Follow)
+    }
+}
+
+fn parse_sidebar_focus(raw: Option<&str>) -> SidebarFocus {
+    match raw {
+        None => SidebarFocus::default(),
+        Some("preserve") => SidebarFocus::Preserve,
+        Some("follow") => SidebarFocus::Follow,
+        Some(other) => {
+            log::warn!("unknown ui.sidebar_focus value {other:?}, using \"preserve\"");
+            SidebarFocus::default()
+        },
+    }
+}
+
 /// Whether per-session UI (sidebar session rows, tab-strip segments) renders
 /// for a single-session workspace instead of waiting for the two-session
 /// threshold.  These are startup defaults only: the app copies them into
@@ -438,6 +471,8 @@ pub struct UiTheme {
     pub confirm_session_close: ConfirmSessionClose,
     /// What closing the last session in the on-screen workspace does.
     pub last_session_close: LastSessionClose,
+    /// How the projects sidebar repairs a cursor whose row stopped rendering.
+    pub sidebar_focus: SidebarFocus,
     /// Show single-session sidebar rows / tab segments ([`SessionDisplay`]).
     pub session_display: SessionDisplay,
     /// Paint PR-status badges on worktree rows (and poll `gh` for expanded
@@ -479,6 +514,7 @@ impl Default for UiTheme {
             attention_grace: Duration::ZERO,
             confirm_session_close: ConfirmSessionClose::Never,
             last_session_close: LastSessionClose::Respawn,
+            sidebar_focus: SidebarFocus::default(),
             session_display: SessionDisplay::default(),
             pr_status: false,
             icons: Icons::default(),
@@ -1124,6 +1160,9 @@ struct RawUi {
     /// What closing the on-screen workspace's last session does:
     /// "respawn" (default) | "navigate".
     last_session_close: Option<String>,
+    /// How far the projects sidebar goes when the cursor's row stops being
+    /// rendered: "preserve" (default) | "follow".
+    sidebar_focus: Option<String>,
     session_display: RawSessionDisplay,
     delta_path: Option<String>,
     icons: RawIcons,
@@ -1286,6 +1325,7 @@ impl RawConfig {
                 self.ui.confirm_session_close.as_deref(),
             ),
             last_session_close: parse_last_session_close(self.ui.last_session_close.as_deref()),
+            sidebar_focus: parse_sidebar_focus(self.ui.sidebar_focus.as_deref()),
             session_display: SessionDisplay {
                 sidebar_always: self.ui.session_display.sidebar_always.unwrap_or(false),
                 tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
@@ -1711,6 +1751,42 @@ mod tests {
     fn last_session_close_invalid_falls_back_to_respawn() {
         let ui = ui_from_toml("[ui]\nlast_session_close = \"panic\"");
         assert_eq!(ui.last_session_close, LastSessionClose::Respawn);
+    }
+
+    #[test]
+    fn sidebar_focus_defaults_to_preserve() {
+        let ui = ui_from_toml("");
+        assert_eq!(ui.sidebar_focus, SidebarFocus::Preserve);
+    }
+
+    #[test]
+    fn sidebar_focus_parses_all_values() {
+        for (raw, expected) in
+            [("preserve", SidebarFocus::Preserve), ("follow", SidebarFocus::Follow)]
+        {
+            let ui = ui_from_toml(&format!("[ui]\nsidebar_focus = \"{raw}\""));
+            assert_eq!(ui.sidebar_focus, expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn sidebar_focus_invalid_falls_back_to_preserve() {
+        let ui = ui_from_toml("[ui]\nsidebar_focus = \"sideways\"");
+        assert_eq!(ui.sidebar_focus, SidebarFocus::Preserve);
+    }
+
+    #[test]
+    fn a_retired_sidebar_focus_value_still_parses_to_the_default() {
+        // "reset" named the pre-reconciler behavior and was removed rather than
+        // kept as a mode.  A config file carrying it must start, not refuse.
+        let ui = ui_from_toml("[ui]\nsidebar_focus = \"reset\"");
+        assert_eq!(ui.sidebar_focus, SidebarFocus::Preserve);
+    }
+
+    #[test]
+    fn only_follow_moves_the_terminal() {
+        assert!(!SidebarFocus::Preserve.follows());
+        assert!(SidebarFocus::Follow.follows());
     }
 
     #[test]
