@@ -1066,8 +1066,16 @@ impl AlacritreeApp {
     fn apply_close_fallback(&mut self, ctx: &Context, verdict: CloseFallback) {
         match verdict {
             CloseFallback::Stay => {},
-            CloseFallback::Activate(main) => self.activate_worktree(ctx, &main),
-            CloseFallback::Home => self.activate_home(ctx),
+            CloseFallback::Activate(main) => {
+                self.activate_worktree(ctx, &main);
+                // Adopting an existing idle session produces no PTY event, so
+                // nothing else would wake the paint that shows it.
+                ctx.request_repaint();
+            },
+            CloseFallback::Home => {
+                self.activate_home(ctx);
+                ctx.request_repaint();
+            },
         }
     }
 
@@ -5135,7 +5143,7 @@ fn sidebar_focus_overtaken(
 }
 
 /// Where the view goes after a session's removal.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 enum CloseFallback {
     /// Removal didn't empty the on-screen workspace — no navigation.
     Stay,
@@ -5171,7 +5179,7 @@ fn close_fallback(
 /// whose rows must already read as gone.  The verdict is carried rather than
 /// recomputed because only `close_fallback` knows the difference between
 /// staying put, hopping to the project's main checkout, and going home.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct DeferredClose {
     verdict: CloseFallback,
     /// Set when an asynchronous worktree deletion is in flight: `projects`
