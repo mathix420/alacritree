@@ -374,6 +374,14 @@ pub struct AlacritreeApp {
     /// Rows behind the last-built focus snapshot. Paint reuses this until the
     /// next rebuild instead of recomputing the projection every frame.
     sidebar_rows_cache: Option<Vec<SidebarRow>>,
+    /// Last reconciled snapshot, the baseline for the next cursor repair.
+    sidebar_focus_prev: Option<sidebar_focus::TreeSnapshot>,
+    /// The deepest row a filter hid, restored when it becomes visible again.
+    sidebar_anchor: Option<SidebarRow>,
+    /// What the reconciler itself last wrote.  Different values on the next
+    /// pass mean the user navigated — a click, session cycling, the palette, a
+    /// notification, IPC — and the anchor has been overtaken.
+    sidebar_focus_written: Option<SidebarFocusWrite>,
 }
 
 struct DeleteRequest {
@@ -671,6 +679,9 @@ impl AlacritreeApp {
             wsl_delta_paths: HashMap::new(),
             pending_delta: HashMap::new(),
             sidebar_rows_cache: None,
+            sidebar_focus_prev: None,
+            sidebar_anchor: None,
+            sidebar_focus_written: None,
         };
 
         let wsl_indices: Vec<usize> = app
@@ -980,7 +991,10 @@ impl AlacritreeApp {
         }
         if let Err(e) = self.spawn_session(ctx, self.current_workspace.clone()) {
             self.last_error = Some(format!("failed to spawn shell: {e}"));
+            return;
         }
+        // Filling in a missing active entry is self-healing, not navigation.
+        self.mark_sidebar_focus_write();
     }
 
     /// Re-attach to an existing session when the active id went stale
@@ -993,6 +1007,8 @@ impl AlacritreeApp {
             let id = self.sessions[idx].id;
             self.active_session.insert(self.current_workspace.clone(), id);
         }
+        // Filling in a missing active entry is self-healing, not navigation.
+        self.mark_sidebar_focus_write();
     }
 
     fn close_session(&mut self, ctx: &Context, id: SessionId) {
@@ -1342,6 +1358,10 @@ impl AlacritreeApp {
         let rows = self.current_project_rows();
         self.sidebar_cursor = sidebar_nav::ensure_cursor(&rows, self.sidebar_cursor.as_ref());
         self.sidebar_cursor_moved = true;
+        // Seeding rewrites the cursor from terminal state, which the overtaken
+        // check would otherwise read as the user navigating.  The anchor
+        // outlives a trip through the terminal by design.
+        self.mark_sidebar_focus_write();
     }
 
     fn focus_git_sidebar(&mut self) {
@@ -1661,6 +1681,101 @@ impl AlacritreeApp {
         // frame runs no fuzzy matching at all.
         self.sidebar_rows_cache = Some(rows);
         snapshot
+    }
+
+    /// Repair the sidebar cursor against what changed since the last pass.
+    /// Called twice per `update` — before paint for everything the input and
+    /// background drains produced, and again at the end for what only
+    /// `reap_exited_sessions` and paint-time clicks can produce.  A pass with
+    /// nothing to do costs one `ObservedInputs` compare, which is the whole
+    /// steady-state budget: there is no setting that skips this.
+    fn reconcile_sidebar_focus(&mut self, ctx: &Context) {
+        if sidebar_focus_overtaken(
+            &self.sidebar_focus_written,
+            self.sidebar_cursor.as_ref(),
+            &self.current_workspace,
+            self.active_session.get(&self.current_workspace).copied(),
+        ) {
+            self.sidebar_anchor = None;
+        }
+
+        // Stubbed until Task 7 introduces deferred-close tracking; a real
+        // deferred verdict will replace both lines below.
+        let deferred: Option<()> = None;
+        let skip: Option<PathBuf> = None;
+
+        if deferred.is_none() {
+            if let Some(prev) = &self.sidebar_focus_prev {
+                let unchanged = prev.inputs.matches(
+                    &self.projects,
+                    self.session_inputs(),
+                    sidebar_focus::UiInputs {
+                        session_rows_always: self.session_rows_always,
+                        query: self.project_filter.query(),
+                        toggles: self.project_filter.toggle_bits(),
+                    },
+                );
+                if unchanged {
+                    return;
+                }
+            }
+        }
+
+        let next = self.sidebar_snapshot(skip.as_deref());
+        let prev = self.sidebar_focus_prev.take().unwrap_or_else(|| next.clone());
+        let outcome = sidebar_focus::repair(
+            &prev,
+            &next,
+            self.sidebar_cursor.as_ref(),
+            self.sidebar_anchor.as_ref(),
+        );
+
+        if outcome.cursor != self.sidebar_cursor {
+            self.sidebar_cursor = outcome.cursor;
+            self.sidebar_cursor_moved = true;
+        }
+        self.sidebar_anchor = outcome.anchor;
+        self.sidebar_focus_prev = Some(next);
+
+        if self.config.ui.sidebar_focus.follows() {
+            if let Some(target) = outcome.follow {
+                self.apply_follow_target(ctx, target);
+            }
+        }
+
+        self.mark_sidebar_focus_write();
+    }
+
+    /// Record the current focus triple as the reconciler's own, so the next
+    /// pass does not mistake it for the user navigating.
+    fn mark_sidebar_focus_write(&mut self) {
+        self.sidebar_focus_written = Some(SidebarFocusWrite {
+            cursor: self.sidebar_cursor.clone(),
+            workspace: self.current_workspace.clone(),
+            active: self.active_session.get(&self.current_workspace).copied(),
+        });
+    }
+
+    /// Move the terminal to a removal landing.  A workspace target adopts its
+    /// active session, or its first live one when that entry went stale.
+    fn apply_follow_target(&mut self, ctx: &Context, target: sidebar_focus::FollowTarget) {
+        match target {
+            sidebar_focus::FollowTarget::Session(id) => self.activate_session_by_id(id),
+            sidebar_focus::FollowTarget::Workspace(ws) => {
+                let id = self
+                    .active_session
+                    .get(&ws)
+                    .copied()
+                    .filter(|id| self.sessions.iter().any(|s| s.id == *id))
+                    .or_else(|| {
+                        self.sessions.iter().find(|s| s.working_directory == ws).map(|s| s.id)
+                    });
+                if let Some(id) = id {
+                    self.activate_session_by_id(id);
+                }
+            },
+        }
+        ctx.request_repaint();
     }
 
     fn apply_sidebar_nav(&mut self, ctx: &Context, key: egui::Key) {
@@ -2533,7 +2648,11 @@ impl AlacritreeApp {
         let mut visible_worktrees: HashSet<PathBuf> = HashSet::new();
         if filtering {
             home_visible = false;
-            for row in self.current_project_rows() {
+            let rows = match &self.sidebar_rows_cache {
+                Some(rows) => rows.clone(),
+                None => self.current_project_rows(),
+            };
+            for row in rows {
                 match row {
                     SidebarRow::Home => home_visible = true,
                     SidebarRow::Project(root) => {
@@ -4988,6 +5107,33 @@ fn build_sidebar_snapshot(
     b.finish(inputs)
 }
 
+/// The cursor, workspace, and active session the reconciler last wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidebarFocusWrite {
+    cursor: Option<SidebarRow>,
+    workspace: WorkspaceKey,
+    active: Option<SessionId>,
+}
+
+/// Whether focus moved behind the reconciler's back.  The active session is
+/// part of the comparison because the tab and session cycling actions can
+/// switch sessions without leaving the workspace, changing nothing else.
+/// Comparing the resulting state rather than matching on action names covers
+/// every route to them — rebound keys, the command palette, MCP — at the price
+/// of `ensure_active_session` and `adopt_active_session` marking their own
+/// writes so their self-healing does not read as navigation.
+fn sidebar_focus_overtaken(
+    written: &Option<SidebarFocusWrite>,
+    cursor: Option<&SidebarRow>,
+    workspace: &WorkspaceKey,
+    active: Option<SessionId>,
+) -> bool {
+    match written {
+        None => false,
+        Some(w) => w.cursor.as_ref() != cursor || w.workspace != *workspace || w.active != active,
+    }
+}
+
 /// Where the view goes after a session's removal.
 #[derive(Debug, PartialEq)]
 enum CloseFallback {
@@ -6897,6 +7043,7 @@ impl eframe::App for AlacritreeApp {
         self.process_notification_actions(ctx);
         self.process_ipc_calls(ctx);
         self.process_session_events(ctx);
+        self.reconcile_sidebar_focus(ctx);
         let theme = self.theme;
         // GL clear is the sole source of the bg when opacity < 1; painting any
         // panel fill on top would compound the alpha through egui's blend.
@@ -7027,6 +7174,11 @@ impl eframe::App for AlacritreeApp {
         }
 
         self.reap_exited_sessions(ctx);
+        // A shell that exited on its own is only removed here, after paint.
+        // Without this pass its deferred verdict would wait for unrelated
+        // input; with it, the repair is queued for the frame the repaint
+        // request has already scheduled.
+        self.reconcile_sidebar_focus(ctx);
     }
 }
 
@@ -7146,6 +7298,38 @@ mod tests {
         let mut f = PanelFilter::new(&['s', 'a']);
         f.on_text("/");
         f
+    }
+
+    #[test]
+    fn the_sentinel_sees_a_same_workspace_session_switch() {
+        let written =
+            SidebarFocusWrite { cursor: Some(SidebarRow::Home), workspace: None, active: Some(1) };
+        let written = Some(written);
+
+        // The reconciler's own values still stand.
+        assert!(!sidebar_focus_overtaken(&written, Some(&SidebarRow::Home), &None, Some(1)));
+
+        // Any action that switches sessions without leaving the workspace —
+        // SelectNextTab, SelectNextSession, SelectTab(n) — changes neither the
+        // cursor nor the workspace, only the active session.
+        assert!(sidebar_focus_overtaken(&written, Some(&SidebarRow::Home), &None, Some(2)));
+
+        // A different workspace, and a different cursor, each count too.
+        assert!(sidebar_focus_overtaken(
+            &written,
+            Some(&SidebarRow::Home),
+            &Some(PathBuf::from("/a/wt1")),
+            Some(1),
+        ));
+        assert!(sidebar_focus_overtaken(
+            &written,
+            Some(&SidebarRow::Project(PathBuf::from("/a"))),
+            &None,
+            Some(1),
+        ));
+
+        // Nothing written yet cannot have been overtaken.
+        assert!(!sidebar_focus_overtaken(&None, Some(&SidebarRow::Home), &None, Some(1)));
     }
 
     #[test]
