@@ -1061,6 +1061,9 @@ impl Session {
     /// changes, and child-exits from non-visible sessions don't pile up.
     pub fn drain_events(&mut self, palette: &Palette) -> DrainOutcome {
         let mut outcome = DrainOutcome::default();
+        // Derived rather than stored: a `title_pinned` field set at spawn is a
+        // second source of truth that can drift from `kind`.
+        let title_pinned = matches!(self.kind, SessionKind::Diff { .. });
         while let Ok(event) = self.events.try_recv() {
             match event {
                 // OSC 4 / 10 / 11 / 12.  Programs that ask the terminal for its
@@ -1087,9 +1090,13 @@ impl Session {
                     self.write(reply);
                 },
                 event => {
-                    if let Some(bytes) =
-                        apply_term_event(event, &mut self.title, &mut self.exited, &mut outcome)
-                    {
+                    if let Some(bytes) = apply_term_event(
+                        event,
+                        &mut self.title,
+                        title_pinned,
+                        &mut self.exited,
+                        &mut outcome,
+                    ) {
                         self.write(bytes);
                     }
                 },
@@ -1271,12 +1278,13 @@ impl Drop for Session {
 fn apply_term_event(
     event: TermEvent,
     title: &mut String,
+    pinned: bool,
     exited: &mut bool,
     outcome: &mut DrainOutcome,
 ) -> Option<Vec<u8>> {
     match event {
         TermEvent::PtyWrite(s) => return Some(s.into_bytes()),
-        TermEvent::Title(t) => {
+        TermEvent::Title(t) if !pinned => {
             // A spinner-shaped title transitioning to a non-spinner one
             // is how Claude Code (and similar tools that don't ring
             // BEL) signal "done — your turn".  Treat it like a bell.
@@ -1440,9 +1448,114 @@ mod tests {
         let mut outcome = DrainOutcome::default();
         let mut title = String::new();
         let mut exited = false;
-        apply_term_event(event, &mut title, &mut exited, &mut outcome);
+        apply_term_event(event, &mut title, false, &mut exited, &mut outcome);
 
         assert_eq!(outcome.clipboard, vec![(Target::Clipboard, "hello".to_owned())]);
+    }
+
+    /// A session whose child has already exited, so nothing more arrives from
+    /// the PTY and an injected sequence is the only event left to drain.  On
+    /// Windows that also consumes ConPTY's own startup title, so the assertions
+    /// below are about *our* sequence rather than racing that one.
+    fn spawn_exited_probe(kind: SessionKind, title: &str) -> Session {
+        #[cfg(windows)]
+        let (program, args) = ("cmd", vec!["/c", "exit"]);
+        #[cfg(not(windows))]
+        let (program, args) = ("sh", vec!["-c", "true"]);
+
+        let mut session = Session::spawn_command(
+            egui::Context::default(),
+            &Config::default(),
+            std::env::current_dir().ok(),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            program.to_string(),
+            args.into_iter().map(str::to_string).collect(),
+            title.to_string(),
+            kind,
+        )
+        .unwrap();
+
+        // Draining until `ChildExit` is seen consumes everything the child sent:
+        // the loop emits `ChildExit` and then stops reading the PTY, because
+        // `spawn_with` passes `drain_on_exit: false` (`session.rs:866`,
+        // `event_loop.rs:263`).  Only a `Wakeup` can follow, and nothing maps it
+        // to a title.
+        let palette = Palette::default();
+        let start = Instant::now();
+        while !session.is_exited() {
+            assert!(start.elapsed() < Duration::from_secs(10), "child never exited");
+            session.drain_events(&palette);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        session
+    }
+
+    /// Drive a real OSC 0 through the real VT parser into the real drain, the
+    /// way ConPTY delivers its startup title.
+    fn title_after_osc(mut session: Session, osc_title: &str) -> String {
+        let sequence = format!("\x1b]0;{osc_title}\x07");
+        {
+            let mut term = session.term.lock();
+            Processor::<StdSyncHandler>::new().advance(&mut *term, sequence.as_bytes());
+        }
+        session.drain_events(&Palette::default());
+        session.title.clone()
+    }
+
+    /// ConPTY defaults a child's console title to its command line and publishes
+    /// it as OSC 0, so a diff pane on Windows renamed itself after git's exe
+    /// path.  A diff pane's title is set by alacritree and never means to change.
+    #[test]
+    fn a_diff_panes_title_survives_a_title_sequence() {
+        let session =
+            spawn_exited_probe(SessionKind::Diff { key: "probe".to_string() }, "diff: src/app.rs");
+        assert_eq!(
+            title_after_osc(session, r"C:\Program Files\Git\cmd\git"),
+            "diff: src/app.rs",
+            "a diff pane must keep the name alacritree gave it"
+        );
+    }
+
+    /// The pin is scoped to diff panes: a shell's title is the child's to set,
+    /// and that is how editors and agents label their tab.
+    #[test]
+    fn a_shell_still_follows_its_childs_title() {
+        let session = spawn_exited_probe(SessionKind::Shell, "shell");
+        assert_eq!(title_after_osc(session, "nvim src/app.rs"), "nvim src/app.rs");
+    }
+
+    /// Pinning suppresses one event arm, not the drain.  A bell in a diff pane
+    /// still raises attention and a child exit still reaps the pane.
+    #[test]
+    fn a_pinned_session_still_reports_bells_and_exit() {
+        #[cfg(windows)]
+        let exit_status = {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(0)
+        };
+        #[cfg(not(windows))]
+        let exit_status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(0)
+        };
+
+        let mut outcome = DrainOutcome::default();
+        let mut title = "diff: src/app.rs".to_string();
+        let mut exited = false;
+
+        apply_term_event(TermEvent::Bell, &mut title, true, &mut exited, &mut outcome);
+        apply_term_event(
+            TermEvent::ChildExit(exit_status),
+            &mut title,
+            true,
+            &mut exited,
+            &mut outcome,
+        );
+
+        assert!(outcome.attention);
+        assert!(exited);
+        assert_eq!(title, "diff: src/app.rs");
     }
 
     /// Zero grace is the config default and must keep the pre-debounce
