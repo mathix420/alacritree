@@ -24,6 +24,7 @@ mod mouse;
 mod notify_macos;
 mod panel_filter;
 mod paste;
+mod path_style;
 mod pr_status;
 mod projects;
 mod row_label;
