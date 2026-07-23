@@ -22,7 +22,7 @@ use crate::ipc;
 use crate::panel_filter::{self, PanelFilter};
 use crate::paste;
 use crate::pr_status::{PrCache, PrInfo, PrState};
-use crate::projects::{Project, Worktree, project_json};
+use crate::projects::{Discovered, Project, Worktree, project_json};
 use crate::scratchpad;
 use crate::session::{
     AttentionVerdict, Session, SessionId, SessionKind, TermSize, poll_attention_debounce,
@@ -352,7 +352,7 @@ pub struct AlacritreeApp {
     /// In-flight background re-discoveries, keyed by project root.  WSL
     /// discovery shells out to wsl.exe and must never block paint; results
     /// are adopted in `poll_project_refreshes`.
-    pending_project_refresh: HashMap<PathBuf, Receiver<Project>>,
+    pending_project_refresh: HashMap<PathBuf, Receiver<Discovered>>,
     /// Resolved absolute path of `delta` inside each WSL distro, so diff panes
     /// stop re-sourcing a login profile on every open.  Successes only: a miss
     /// is never stored, so installing delta mid-session is picked up later.
@@ -571,7 +571,7 @@ impl AlacritreeApp {
                 // background discovery later swaps in via `poll_project_refreshes`.
                 let root = wsl::normalize_root(p.root.clone());
                 let mut project = match wsl::classify(&root) {
-                    wsl::Location::Windows(_) => Project::discover(root),
+                    wsl::Location::Windows(_) => Project::discover(root).project,
                     wsl::Location::Wsl { .. } => Project::placeholder(root),
                 };
                 project.expanded = p.expanded;
@@ -761,17 +761,15 @@ impl AlacritreeApp {
         }
     }
 
-    /// Adopt completed background discoveries.  Only worktrees and the
-    /// default branch are copied — `expanded`, the shell override, and the
-    /// label are user state that survives refreshes (mirrors
-    /// `Project::refresh`).
+    /// Adopt completed background discoveries through `Project::apply`, which
+    /// drops a result the backend could not vouch for and keeps `expanded`,
+    /// the shell override, and the label either way.
     fn poll_project_refreshes(&mut self) {
         let projects = &mut self.projects;
         self.pending_project_refresh.retain(|root, rx| match rx.try_recv() {
-            Ok(fresh) => {
+            Ok(found) => {
                 if let Some(project) = projects.iter_mut().find(|p| p.root == *root) {
-                    project.worktrees = fresh.worktrees;
-                    project.default_branch = fresh.default_branch;
+                    project.apply(found);
                 }
                 false
             },
@@ -1241,7 +1239,9 @@ impl AlacritreeApp {
             return;
         }
         match wsl::classify(&path) {
-            wsl::Location::Windows(_) => self.projects.push(Project::discover(path.clone())),
+            wsl::Location::Windows(_) => {
+                self.projects.push(Project::discover(path.clone()).project)
+            },
             wsl::Location::Wsl { .. } => {
                 self.projects.push(Project::placeholder(path.clone()));
                 let idx = self.projects.len() - 1;
@@ -1260,7 +1260,7 @@ impl AlacritreeApp {
         if let Some(idx) = self.projects.iter().position(|p| p.root == path) {
             return &self.projects[idx];
         }
-        self.projects.push(Project::discover(path.clone()));
+        self.projects.push(Project::discover(path.clone()).project);
         self.persist_project(&path);
         self.projects.last().expect("just pushed")
     }

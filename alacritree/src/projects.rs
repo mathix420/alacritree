@@ -34,19 +34,65 @@ pub struct Worktree {
     pub prunable: bool,
 }
 
+/// A discovery result and whether it can be trusted to replace an existing
+/// worktree list.  A backend that could not be reached returns a placeholder
+/// standing in for an unknown tree, which must never overwrite what the
+/// caller already knows.
+#[derive(Debug, Clone)]
+pub struct Discovered {
+    pub project: Project,
+    pub authoritative: bool,
+}
+
+impl Discovered {
+    fn found(project: Project) -> Self {
+        Self { project, authoritative: true }
+    }
+
+    fn unavailable(project: Project) -> Self {
+        Self { project, authoritative: false }
+    }
+}
+
+/// What an in-distro discovery round trip established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WslAnswer {
+    Repo,
+    NotARepo,
+    /// The distro could not be reached, or answered malformed — the tree is
+    /// unknown rather than empty.
+    Unreachable,
+}
+
+/// Decide what a discovery round trip established, kept separate from running
+/// it so all three outcomes are reachable without a WSL host.
+fn classify_wsl_answer(reached: bool, is_repo: bool, worktrees_parsed: usize) -> WslAnswer {
+    if !reached {
+        WslAnswer::Unreachable
+    } else if !is_repo {
+        WslAnswer::NotARepo
+    } else if worktrees_parsed == 0 {
+        // A repository always has at least its main checkout.
+        WslAnswer::Unreachable
+    } else {
+        WslAnswer::Repo
+    }
+}
+
 impl Project {
     /// Classify the root and discover through the owning backend: in-distro
     /// git for WSL paths, git2 for Windows paths, and a pseudo-worktree
     /// placeholder when the root is not a repository.
-    pub fn discover(root: PathBuf) -> Self {
+    pub fn discover(root: PathBuf) -> Discovered {
         let name = display_name(&root);
         match wsl::classify(&root) {
             wsl::Location::Wsl { distro, linux_path } => {
                 Self::discover_wsl(root, name, &distro, &linux_path)
             },
+            // A directory that is not a repository is a fact, not a failure.
             wsl::Location::Windows(_) => match Repository::open(&root) {
-                Ok(repo) => Self::from_repo(root, name, &repo),
-                Err(_) => Self::placeholder(root),
+                Ok(repo) => Discovered::found(Self::from_repo(root, name, &repo)),
+                Err(_) => Discovered::found(Self::placeholder(root)),
             },
         }
     }
@@ -73,27 +119,20 @@ impl Project {
     }
 
     /// One wsl.exe round trip answers everything discovery needs; sections
-    /// are split on `wsl::SECTION_SEP`.  Any failure degrades to the same
-    /// pseudo-worktree a non-git folder gets.
-    fn discover_wsl(root: PathBuf, name: String, distro: &str, linux_path: &str) -> Self {
-        let stdout = match wsl::run_batch(distro, DISCOVER_SCRIPT, &[linux_path]) {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!("WSL discovery failed for {}: {e}", root.display());
-                return Self::placeholder(root);
-            },
-        };
-        let sections = wsl::split_sections(&stdout);
+    /// are split on `wsl::SECTION_SEP`.  A round trip that never landed yields
+    /// the same pseudo-worktree a non-git folder gets, but marked
+    /// non-authoritative so it cannot overwrite a known worktree list.
+    fn discover_wsl(root: PathBuf, name: String, distro: &str, linux_path: &str) -> Discovered {
+        let batch = wsl::run_batch(distro, DISCOVER_SCRIPT, &[linux_path]).map_err(|e| {
+            log::warn!("WSL discovery failed for {}: {e}", root.display());
+        });
+        let sections = batch.as_ref().map(|s| wsl::split_sections(s)).unwrap_or_default();
         let text = |i: usize| {
             sections
                 .get(i)
                 .map(|s| String::from_utf8_lossy(s).trim().to_string())
                 .unwrap_or_default()
         };
-
-        if text(0) != "yes" {
-            return Self::placeholder(root);
-        }
 
         let records = parse_worktree_list_z(sections.get(1).copied().unwrap_or_default());
         let worktrees: Vec<Worktree> = records
@@ -112,18 +151,19 @@ impl Project {
                 Worktree { name: wt_name, path, branch, is_main: i == 0, prunable }
             })
             .collect();
-        if worktrees.is_empty() {
-            return Self::placeholder(root);
-        }
 
-        Project {
-            default_branch: default_branch_from_batch(&text(2), &text(3), &text(4)),
-            worktrees,
-            root,
-            name,
-            label: None,
-            expanded: true,
-            shell_override: None,
+        match classify_wsl_answer(batch.is_ok(), text(0) == "yes", worktrees.len()) {
+            WslAnswer::Unreachable => Discovered::unavailable(Self::placeholder(root)),
+            WslAnswer::NotARepo => Discovered::found(Self::placeholder(root)),
+            WslAnswer::Repo => Discovered::found(Project {
+                default_branch: default_branch_from_batch(&text(2), &text(3), &text(4)),
+                worktrees,
+                root,
+                name,
+                label: None,
+                expanded: true,
+                shell_override: None,
+            }),
         }
     }
 
@@ -179,9 +219,20 @@ impl Project {
     }
 
     pub fn refresh(&mut self) {
-        let updated = Project::discover(self.root.clone());
-        self.worktrees = updated.worktrees;
-        self.default_branch = updated.default_branch;
+        let found = Project::discover(self.root.clone());
+        self.apply(found);
+    }
+
+    /// Adopt a discovery result.  A non-authoritative result leaves the
+    /// worktree list and default branch alone: an unreachable backend must not
+    /// read as deletion.  `expanded`, `shell_override`, and `label` are user
+    /// state and are never touched either way.
+    pub fn apply(&mut self, found: Discovered) {
+        if !found.authoritative {
+            return;
+        }
+        self.worktrees = found.project.worktrees;
+        self.default_branch = found.project.default_branch;
     }
 }
 
@@ -367,13 +418,85 @@ mod tests {
     use crate::test_util::{add_worktree, init_repo};
 
     #[test]
+    fn refresh_keeps_worktrees_when_discovery_is_not_authoritative() {
+        let mut project = Project::placeholder(PathBuf::from("/nonexistent-root"));
+        project.default_branch = Some("develop".to_string());
+        project.worktrees = vec![
+            Worktree {
+                name: "main".to_string(),
+                path: PathBuf::from("/nonexistent-root"),
+                branch: None,
+                is_main: true,
+                prunable: false,
+            },
+            Worktree {
+                name: "feature".to_string(),
+                path: PathBuf::from("/nonexistent-root-feature"),
+                branch: Some("feature".to_string()),
+                is_main: false,
+                prunable: false,
+            },
+        ];
+
+        let before = project.worktrees.clone();
+        project.apply(Discovered {
+            project: Project::placeholder(project.root.clone()),
+            authoritative: false,
+        });
+
+        assert_eq!(project.worktrees.len(), before.len());
+        assert_eq!(project.worktrees[1].name, "feature");
+        assert_eq!(
+            project.default_branch.as_deref(),
+            Some("develop"),
+            "an unreachable backend must not erase the known default branch either"
+        );
+    }
+
+    #[test]
+    fn apply_adopts_an_authoritative_result() {
+        let mut project = Project::placeholder(PathBuf::from("/root"));
+        let mut fresh = Project::placeholder(PathBuf::from("/root"));
+        fresh.worktrees.clear();
+        fresh.default_branch = Some("main".to_string());
+
+        project.apply(Discovered { project: fresh, authoritative: true });
+
+        assert!(project.worktrees.is_empty());
+        assert_eq!(project.default_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn only_a_reachable_distro_gives_an_authoritative_answer() {
+        let (reached, unreachable) = (true, false);
+        let (repo, not_repo) = (true, false);
+
+        // The round trip failed: the tree is unknown, not empty.
+        assert_eq!(classify_wsl_answer(unreachable, not_repo, 0), WslAnswer::Unreachable);
+        // The distro answered "this is not a repository" — that is the truth.
+        assert_eq!(classify_wsl_answer(reached, not_repo, 0), WslAnswer::NotARepo);
+        // A repository always has at least its main checkout, so parsing none of
+        // them means the round trip came back malformed.
+        assert_eq!(classify_wsl_answer(reached, repo, 0), WslAnswer::Unreachable);
+        assert_eq!(classify_wsl_answer(reached, repo, 2), WslAnswer::Repo);
+    }
+
+    #[test]
+    fn a_non_git_windows_root_is_authoritative() {
+        let dir = tempfile::tempdir().unwrap();
+        let found = Project::discover(dir.path().to_path_buf());
+        assert!(found.authoritative, "a directory that is genuinely not a repo is the truth");
+        assert_eq!(found.project.worktrees.len(), 1);
+    }
+
+    #[test]
     fn live_worktree_is_not_prunable() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_dir = tmp.path().join("repo");
         let repo = init_repo(&repo_dir);
         add_worktree(&repo, "feature");
 
-        let project = Project::discover(repo_dir);
+        let project = Project::discover(repo_dir).project;
         let wt = project.worktrees.iter().find(|w| w.name == "feature").unwrap();
         assert!(!wt.prunable);
         assert_eq!(wt.branch.as_deref(), Some("feature"));
@@ -387,7 +510,7 @@ mod tests {
         let wt_path = add_worktree(&repo, "feature");
         std::fs::remove_dir_all(&wt_path).unwrap();
 
-        let project = Project::discover(repo_dir);
+        let project = Project::discover(repo_dir).project;
         let wt = project.worktrees.iter().find(|w| w.name == "feature").unwrap();
         assert!(wt.prunable);
         assert_eq!(wt.branch.as_deref(), Some("feature"));
@@ -399,7 +522,7 @@ mod tests {
         let repo_dir = tmp.path().join("repo");
         init_repo(&repo_dir);
 
-        let project = Project::discover(repo_dir);
+        let project = Project::discover(repo_dir).project;
         assert!(project.worktrees[0].is_main);
         assert!(!project.worktrees[0].prunable);
     }
@@ -410,7 +533,7 @@ mod tests {
         let repo_dir = tmp.path().join("repo");
         init_repo(&repo_dir);
 
-        let mut project = Project::discover(repo_dir);
+        let mut project = Project::discover(repo_dir).project;
         assert_eq!(project.display_name(), "repo");
 
         project.label = Some("Work".to_string());
