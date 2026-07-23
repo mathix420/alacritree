@@ -74,6 +74,7 @@ impl TreeSnapshot {
         self.projected.iter().copied().filter(|&id| self.nodes[id].parent == parent).collect()
     }
 
+    #[cfg(test)]
     pub fn is_descendant(&self, id: NodeId, ancestor: NodeId) -> bool {
         let mut cur = self.nodes[id].parent;
         while let Parent::Node(p) = cur {
