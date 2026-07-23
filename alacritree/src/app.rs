@@ -15,7 +15,8 @@ use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
 use crate::config::{
-    Config, FontConfig, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, UiFont,
+    Config, FontConfig, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, TextEmphasis,
+    UiFont,
 };
 use crate::doppler;
 use crate::git_nav::{self, GitSection, SectionCount};
@@ -24,7 +25,6 @@ use crate::ipc;
 use crate::panel_filter::{self, PanelFilter};
 use crate::paste;
 use crate::path_style;
-#[cfg(test)]
 use crate::path_style::PathStyle;
 use crate::pr_status::{PrCache, PrInfo, PrState};
 use crate::projects::{Discovered, Project, Worktree, project_json};
@@ -3310,17 +3310,14 @@ impl AlacritreeApp {
                         return;
                     }
 
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(path_style::render(
-                                &wsl::display_path(&path),
-                                theme.path_style.git_header,
-                                workspace_home.as_deref(),
-                            ))
-                            .color(theme.text_muted)
-                            .small(),
-                        )
-                        .truncate(),
+                    path_label(
+                        ui,
+                        &wsl::display_path(&path),
+                        theme.text_muted,
+                        &theme,
+                        theme.path_style.git_header,
+                        egui::FontFamily::Proportional,
+                        workspace_home.as_deref(),
                     );
                     if let Some(branch) = &status.branch {
                         // A greedy `truncate()` label in a plain `horizontal` row
@@ -4232,19 +4229,14 @@ fn file_row(
                     )
                     .selectable(false),
                 );
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(path_style::render(
-                            &change.path,
-                            theme.path_style.git_rows,
-                            None,
-                        ))
-                        .color(path_color)
-                        .monospace()
-                        .small(),
-                    )
-                    .truncate()
-                    .selectable(false),
+                path_label(
+                    ui,
+                    &change.path,
+                    path_color,
+                    theme,
+                    theme.path_style.git_rows,
+                    egui::FontFamily::Proportional,
+                    None,
                 );
                 fill_row(ui);
             },
@@ -4307,19 +4299,14 @@ fn branch_diff_row(
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
                             ui.set_min_height(row_h);
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(path_style::render(
-                                        &stat.path,
-                                        theme.path_style.git_rows,
-                                        None,
-                                    ))
-                                    .color(path_color)
-                                    .monospace()
-                                    .small(),
-                                )
-                                .truncate()
-                                .selectable(false),
+                            path_label(
+                                ui,
+                                &stat.path,
+                                path_color,
+                                theme,
+                                theme.path_style.git_rows,
+                                egui::FontFamily::Proportional,
+                                None,
                             );
                             fill_row(ui);
                         },
@@ -4331,6 +4318,80 @@ fn branch_diff_row(
         .interact(egui::Sense::click());
     paint_row_bg(ui, &resp, bg_idx, panel_x, theme, is_active);
     resp
+}
+
+/// Bold and italic are real faces rather than a colour swap, but only the
+/// terminal font registers them — an emphasized span at a proportional site
+/// keeps the weight and shifts family rather than losing the weight.
+fn emphasis_family(e: &TextEmphasis, base: &egui::FontFamily) -> egui::FontFamily {
+    match (e.bold, e.italic) {
+        (true, true) => egui::FontFamily::Name(crate::fonts::BOLD_ITALIC_FAMILY.into()),
+        (true, false) => egui::FontFamily::Name(crate::fonts::BOLD_FAMILY.into()),
+        (false, true) => egui::FontFamily::Name(crate::fonts::ITALIC_FAMILY.into()),
+        (false, false) => base.clone(),
+    }
+}
+
+/// Paint a path as one truncating label.
+///
+/// `Zed` needs two differently-formatted spans, and one `LayoutJob` is the
+/// only way to get them without an `item_spacing` gap between two labels, a
+/// second response competing for the row's click, and a filename that can
+/// overflow the width `row_with_trailing` is managing.  Putting the filename
+/// first only *prioritizes* it: epaint truncates the tail of one linear glyph
+/// stream, so a row narrower than the filename still elides it.
+fn path_label(
+    ui: &mut egui::Ui,
+    path: &str,
+    base: Color32,
+    theme: &Theme,
+    style: PathStyle,
+    family: egui::FontFamily,
+    home: Option<&str>,
+) {
+    if style != PathStyle::Zed {
+        ui.add(
+            egui::Label::new(
+                RichText::new(path_style::render(path, style, home))
+                    .color(base)
+                    .family(family)
+                    .small(),
+            )
+            .truncate()
+            .selectable(false),
+        );
+        return;
+    }
+
+    let size = egui::TextStyle::Small.resolve(ui.style()).size;
+    // A hand-built job does not inherit the ui's text valign the way RichText
+    // does, so it must be carried across or the path sits off-centre against
+    // the change glyph beside it.
+    let valign = ui.text_valign();
+    let parts = path_style::split(path, style, home);
+    let mut job = egui::text::LayoutJob::default();
+    let mut push = |text: String, e: &TextEmphasis| {
+        if text.is_empty() {
+            return;
+        }
+        job.append(
+            &text,
+            0.0,
+            egui::TextFormat {
+                font_id: egui::FontId::new(size, emphasis_family(e, &family)),
+                color: e.color.unwrap_or(base),
+                valign,
+                ..Default::default()
+            },
+        );
+    };
+    if parts.parent.is_empty() {
+        push(format!("{}{}", parts.root, parts.name), &theme.path_style.filename);
+    } else {
+        push(parts.name.clone(), &theme.path_style.filename);
+        push(format!(" {}{}", parts.root, parts.parent), &theme.path_style.parent);
+    }
+    ui.add(egui::Label::new(job).truncate().selectable(false));
 }
 
 /// Extend a row's bounding rect to its parent's full width so the response
@@ -7783,5 +7844,53 @@ mod tests {
             Some("/home/lev"),
         );
         assert_eq!(shown, "~/G/monorepo");
+    }
+
+    /// Every emphasis combination must resolve to a registered face; falling back
+    /// to the base family for, say, bold-italic would silently drop the weight.
+    /// An unemphasized span keeps whatever family the site already paints in.
+    #[test]
+    fn emphasis_resolves_to_the_registered_faces() {
+        let plain = TextEmphasis::default();
+        let bold = TextEmphasis { bold: true, ..Default::default() };
+        let italic = TextEmphasis { italic: true, ..Default::default() };
+        let both = TextEmphasis { bold: true, italic: true, ..Default::default() };
+
+        for base in [egui::FontFamily::Monospace, egui::FontFamily::Proportional] {
+            assert_eq!(emphasis_family(&plain, &base), base);
+            assert_eq!(
+                emphasis_family(&bold, &base),
+                egui::FontFamily::Name(crate::fonts::BOLD_FAMILY.into())
+            );
+            assert_eq!(
+                emphasis_family(&italic, &base),
+                egui::FontFamily::Name(crate::fonts::ITALIC_FAMILY.into())
+            );
+            assert_eq!(
+                emphasis_family(&both, &base),
+                egui::FontFamily::Name(crate::fonts::BOLD_ITALIC_FAMILY.into())
+            );
+        }
+    }
+
+    /// The job's two spans must reassemble into exactly what `render` produces,
+    /// so the emphasis only changes how the text looks, never what it says.
+    #[test]
+    fn the_zed_job_spells_the_same_text_as_render() {
+        for (path, home) in [
+            ("path/to/file.txt", None),
+            ("/a/b/c.txt", None),
+            ("f.txt", None),
+            ("/f.txt", None),
+            ("/home/lev/Git/x/y.rs", Some("/home/lev")),
+        ] {
+            let parts = crate::path_style::split(path, PathStyle::Zed, home);
+            let spans = if parts.parent.is_empty() {
+                format!("{}{}", parts.root, parts.name)
+            } else {
+                format!("{} {}{}", parts.name, parts.root, parts.parent)
+            };
+            assert_eq!(spans, crate::path_style::render(path, PathStyle::Zed, home), "{path:?}");
+        }
     }
 }
