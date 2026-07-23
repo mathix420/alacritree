@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.0](https://github.com/mathix420/alacritree/compare/v0.6.0...v0.7.0) (2026-07-23)
+
+
+### Features
+
+* **scratchpad:** add per-workspace notes ([#140](https://github.com/mathix420/alacritree/issues/140)) ([402b6c5](https://github.com/mathix420/alacritree/commit/402b6c5c8f2378d2fe7944e9b638aeacc8ac5ad6))
+
+
+### Bug Fixes
+
+* make missing worktree error dismissible ([#142](https://github.com/mathix420/alacritree/issues/142)) ([c1ad81c](https://github.com/mathix420/alacritree/commit/c1ad81c588969a5b4afd2cb02c1869d084bede76))
+* **probe:** detect a nav-TUI anywhere in the foreground group ([#139](https://github.com/mathix420/alacritree/issues/139)) ([049b230](https://github.com/mathix420/alacritree/commit/049b23063935f901a1804c2659326ae0cd4b0dfa))
+
 ## [0.6.0](https://github.com/mathix420/alacritree/compare/v0.5.1...v0.6.0) (2026-07-21)
 
 
