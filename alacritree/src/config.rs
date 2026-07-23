@@ -22,6 +22,7 @@ use egui::Color32;
 use serde::Deserialize;
 
 use crate::bindings::{self, KeyBinding};
+use crate::path_style::PathStyle;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -269,6 +270,27 @@ fn parse_scrollbar(raw: Option<&str>) -> ScrollbarStyle {
     }
 }
 
+fn parse_path_style(raw: Option<&str>) -> PathStyle {
+    match raw {
+        None => PathStyle::default(),
+        Some("full") => PathStyle::Full,
+        Some("fish") => PathStyle::Fish,
+        Some("zed") => PathStyle::Zed,
+        Some(other) => {
+            log::warn!("unknown ui.path_style value {other:?}, using \"full\"");
+            PathStyle::default()
+        },
+    }
+}
+
+fn text_emphasis(raw: &RawTextEmphasis) -> TextEmphasis {
+    TextEmphasis {
+        color: raw.color.map(|v| rgb_to_color32(v.0)),
+        bold: raw.bold.unwrap_or(false),
+        italic: raw.italic.unwrap_or(false),
+    }
+}
+
 /// Text-presentation magnifier (U+2315).  Not in egui's bundled fonts; it
 /// resolves through the system fallback chain `fonts.rs` registers.
 const DEFAULT_SEARCH_ICON: &str = "⌕";
@@ -376,6 +398,31 @@ impl Default for Icons {
     }
 }
 
+/// How one text span is emphasized.  `color: None` inherits whatever color the
+/// site normally paints, so an emphasis that sets only `bold` still tracks the
+/// theme.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TextEmphasis {
+    pub color: Option<Color32>,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+/// `[ui.path_style]`: how each site spells a path, plus the two emphases the
+/// `Zed` style paints with.  Every field defaults to today's rendering.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PathStyleConfig {
+    /// The `diff: <path>` pane title.
+    pub diff_title: PathStyle,
+    /// Staged / Unstaged / Changes-vs file rows in the git panel.
+    pub git_rows: PathStyle,
+    /// The workspace path atop the git panel.
+    pub git_header: PathStyle,
+    /// `Zed` style only, and only at the two egui sites.
+    pub filename: TextEmphasis,
+    pub parent: TextEmphasis,
+}
+
 #[derive(Debug, Clone)]
 pub struct UiTheme {
     pub sidebar_background: Option<Color32>,
@@ -416,6 +463,9 @@ pub struct UiTheme {
     /// `[ui] project_name`: template for project row labels (`$name`, `$path`).
     /// A manual rename (`Project.label`) always wins over the template.
     pub project_name: Option<String>,
+    /// `[ui.path_style]`: per-site path abbreviation.  All `Full` by default,
+    /// which renders every path byte-for-byte as it does today.
+    pub path_style: PathStyleConfig,
 }
 
 impl Default for UiTheme {
@@ -437,6 +487,7 @@ impl Default for UiTheme {
             sidebar_click_focus: false,
             worktree_name: None,
             project_name: None,
+            path_style: PathStyleConfig::default(),
         }
     }
 }
@@ -1088,6 +1139,26 @@ struct RawUi {
     focus_outline: RawFocusOutline,
     /// Clicking a sidebar moves keyboard focus to it.  Default false.
     sidebar_click_focus: Option<bool>,
+    path_style: RawPathStyle,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawPathStyle {
+    /// "full" (default) | "fish" | "zed", per site.
+    diff_title: Option<String>,
+    git_rows: Option<String>,
+    git_header: Option<String>,
+    filename: RawTextEmphasis,
+    parent: RawTextEmphasis,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawTextEmphasis {
+    color: Option<RgbStr>,
+    bold: Option<bool>,
+    italic: Option<bool>,
 }
 
 /// One `[[ui.profiles]]` entry.  Fields are optional so a malformed entry
@@ -1231,6 +1302,13 @@ impl RawConfig {
             sidebar_click_focus: self.ui.sidebar_click_focus.unwrap_or(false),
             worktree_name: self.ui.worktree_name.clone().filter(|t| !t.trim().is_empty()),
             project_name: self.ui.project_name.clone().filter(|t| !t.trim().is_empty()),
+            path_style: PathStyleConfig {
+                diff_title: parse_path_style(self.ui.path_style.diff_title.as_deref()),
+                git_rows: parse_path_style(self.ui.path_style.git_rows.as_deref()),
+                git_header: parse_path_style(self.ui.path_style.git_header.as_deref()),
+                filename: text_emphasis(&self.ui.path_style.filename),
+                parent: text_emphasis(&self.ui.path_style.parent),
+            },
         };
 
         // ---- Font ----
@@ -1516,6 +1594,49 @@ mod tests {
         // A blank override is treated as unset so discovery still runs.
         let raw: RawConfig = toml::from_str("[ui]\ndelta_path = \"  \"").unwrap();
         assert_eq!(raw.into_config().delta_path, None);
+    }
+
+    #[test]
+    fn path_style_defaults_to_full_everywhere() {
+        let ui = ui_from_toml("");
+        assert_eq!(ui.path_style.diff_title, PathStyle::Full);
+        assert_eq!(ui.path_style.git_rows, PathStyle::Full);
+        assert_eq!(ui.path_style.git_header, PathStyle::Full);
+        assert_eq!(ui.path_style.filename, TextEmphasis::default());
+        assert_eq!(ui.path_style.parent, TextEmphasis::default());
+    }
+
+    #[test]
+    fn path_style_parses_per_site_and_falls_back_on_nonsense() {
+        let ui = ui_from_toml("[ui.path_style]\ndiff_title = \"zed\"\ngit_rows = \"fish\"");
+        assert_eq!(ui.path_style.diff_title, PathStyle::Zed);
+        assert_eq!(ui.path_style.git_rows, PathStyle::Fish);
+        // An omitted key is not an error, it is "full".
+        assert_eq!(ui.path_style.git_header, PathStyle::Full);
+
+        let ui = ui_from_toml("[ui.path_style]\ngit_header = \"zeb\"");
+        assert_eq!(ui.path_style.git_header, PathStyle::Full);
+    }
+
+    #[test]
+    fn path_style_emphasis_parses_and_a_blank_color_is_an_error() {
+        let ui = ui_from_toml(
+            "[ui.path_style.filename]\ncolor = \"#e6e6e6\"\nbold = true\n\
+             [ui.path_style.parent]\nitalic = true\n",
+        );
+        assert_eq!(ui.path_style.filename.color, Some(Color32::from_rgb(0xe6, 0xe6, 0xe6)));
+        assert!(ui.path_style.filename.bold);
+        assert!(!ui.path_style.filename.italic);
+        assert_eq!(ui.path_style.parent.color, None);
+        assert!(ui.path_style.parent.italic);
+
+        // `RgbStr` rejects a blank string and a raw-schema error discards the
+        // whole merged config, so an empty color is a mistake to fix, not a way
+        // to say "absent" — omit the key instead.
+        let value: toml::Value =
+            toml::from_str("[ui.path_style.filename]\ncolor = \"\"").expect("valid toml");
+        let raw: Result<RawConfig, _> = value.try_into();
+        assert!(raw.is_err(), "a blank color must not parse as absent");
     }
 
     #[test]
