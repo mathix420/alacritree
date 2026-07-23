@@ -86,6 +86,46 @@ impl TreeSnapshot {
     }
 }
 
+/// Where the cursor lands when `removed` leaves the model.
+///
+/// The removed row's parent and its ordinal among that parent's children come
+/// from `prev`; the landing is chosen from the *surviving* children in `next`.
+/// Resolving forward is what makes a simultaneous removal land on a survivor
+/// rather than escaping to the parent, and what makes a reordered refresh land
+/// on the row that actually occupies the vacated slot.
+///
+/// `Home` and project headers share `Parent::Root`, which makes them siblings
+/// and lets the only project fall back to Home with no special case.
+fn slide(prev: &TreeSnapshot, next: &TreeSnapshot, removed: NodeId) -> Option<SidebarRow> {
+    let parent = prev.parent(removed);
+    if parent == Parent::Detached {
+        return None;
+    }
+
+    let was = prev.children(parent);
+    let ordinal = was.iter().position(|&id| id == removed)?;
+
+    let parent_in_next = match parent {
+        Parent::Root => Parent::Root,
+        Parent::Node(p) => Parent::Node(next.find(prev.row(p))?),
+        Parent::Detached => return None,
+    };
+    let survivors = next.children(parent_in_next);
+
+    if let Some(&landed) = survivors.get(ordinal) {
+        return Some(next.row(landed).clone());
+    }
+    // The removed row was last, so the nearest preceding survivor is the new
+    // last child.
+    if let Some(&last) = survivors.last() {
+        return Some(next.row(last).clone());
+    }
+    match parent {
+        Parent::Node(p) => Some(prev.row(p).clone()),
+        _ => None,
+    }
+}
+
 #[derive(Default)]
 pub struct SnapshotBuilder {
     nodes: Vec<Node>,
@@ -362,5 +402,210 @@ mod tests {
             ui("", 0)
         ));
         assert!(!base.matches(&[], std::iter::empty(), ui("", 0)));
+    }
+
+    /// The reference tree from the design spec.
+    fn reference_tree() -> TreeSnapshot {
+        let mut b = SnapshotBuilder::default();
+        b.push(SidebarRow::Home, Parent::Root, true);
+
+        let p1 = b.push(row_project("/p1"), Parent::Root, true);
+        let p1wt1 = b.push(row_worktree("/p1/wt1"), Parent::Node(p1), true);
+        b.push(SidebarRow::Session(11), Parent::Node(p1wt1), true);
+        b.push(SidebarRow::Session(12), Parent::Node(p1wt1), true);
+        let p1wt2 = b.push(row_worktree("/p1/wt2"), Parent::Node(p1), true);
+        b.push(SidebarRow::Session(21), Parent::Node(p1wt2), true);
+        b.push(SidebarRow::Session(22), Parent::Node(p1wt2), true);
+        b.push(SidebarRow::Session(23), Parent::Node(p1wt2), true);
+
+        let p2 = b.push(row_project("/p2"), Parent::Root, true);
+        let p2wt1 = b.push(row_worktree("/p2/wt1"), Parent::Node(p2), true);
+        b.push(SidebarRow::Session(31), Parent::Node(p2wt1), true);
+        b.push(SidebarRow::Session(32), Parent::Node(p2wt1), true);
+        b.push(row_worktree("/p2/wt2"), Parent::Node(p2), true);
+        b.push(row_worktree("/p2/wt3"), Parent::Node(p2), true);
+
+        b.finish(ObservedInputs::default())
+    }
+
+    /// The reference tree with every row in `drop` and their descendants absent
+    /// from the model — what a deletion leaves behind.
+    fn reference_tree_without(drop: &[SidebarRow]) -> TreeSnapshot {
+        let full = reference_tree();
+        let dropped: Vec<NodeId> =
+            drop.iter().map(|r| full.find(r).expect("row is in the reference tree")).collect();
+        let gone = |id: NodeId| dropped.iter().any(|&d| d == id || full.is_descendant(id, d));
+
+        let mut b = SnapshotBuilder::default();
+        let mut remap = std::collections::HashMap::new();
+        for (old, node) in full.nodes.iter().enumerate() {
+            if gone(old) {
+                continue;
+            }
+            let parent = match node.parent {
+                Parent::Node(p) => Parent::Node(remap[&p]),
+                other => other,
+            };
+            let new = b.push(node.row.clone(), parent, full.is_projected(old));
+            remap.insert(old, new);
+        }
+        b.finish(ObservedInputs::default())
+    }
+
+    fn slide_from(
+        prev: &TreeSnapshot,
+        next: &TreeSnapshot,
+        row: &SidebarRow,
+    ) -> Option<SidebarRow> {
+        slide(prev, next, prev.find(row).expect("row is in the previous model"))
+    }
+
+    #[test]
+    fn a_last_child_slides_back_to_its_previous_sibling() {
+        let prev = reference_tree();
+        let next = reference_tree_without(&[SidebarRow::Session(12)]);
+        assert_eq!(
+            slide_from(&prev, &next, &SidebarRow::Session(12)),
+            Some(SidebarRow::Session(11))
+        );
+    }
+
+    #[test]
+    fn a_middle_child_slides_forward_into_the_vacated_slot() {
+        let prev = reference_tree();
+        let next = reference_tree_without(&[SidebarRow::Session(22)]);
+        assert_eq!(
+            slide_from(&prev, &next, &SidebarRow::Session(22)),
+            Some(SidebarRow::Session(23))
+        );
+    }
+
+    #[test]
+    fn a_middle_worktree_slides_to_the_next_worktree() {
+        let prev = reference_tree();
+        let next = reference_tree_without(&[row_worktree("/p2/wt2")]);
+        assert_eq!(
+            slide_from(&prev, &next, &row_worktree("/p2/wt2")),
+            Some(row_worktree("/p2/wt3"))
+        );
+    }
+
+    #[test]
+    fn a_removed_worktree_carries_its_sessions_out_of_the_slot() {
+        let prev = reference_tree();
+        let next = reference_tree_without(&[row_worktree("/p1/wt1")]);
+        // /p1/wt1 owns sessions 11 and 12; the slot must hold /p1/wt2, never a
+        // session orphaned by the removal.
+        assert_eq!(
+            slide_from(&prev, &next, &row_worktree("/p1/wt1")),
+            Some(row_worktree("/p1/wt2"))
+        );
+    }
+
+    #[test]
+    fn two_siblings_removed_at_once_still_land_on_a_survivor() {
+        let prev = reference_tree();
+        // Sessions 22 and 23 both go; 21 survives and must catch the cursor
+        // instead of the parent worktree.
+        let next = reference_tree_without(&[SidebarRow::Session(22), SidebarRow::Session(23)]);
+        assert_eq!(
+            slide_from(&prev, &next, &SidebarRow::Session(22)),
+            Some(SidebarRow::Session(21))
+        );
+    }
+
+    #[test]
+    fn a_reorder_alongside_a_removal_takes_the_row_now_in_the_slot() {
+        let prev = reference_tree();
+        // A background refresh reinstalls /p2's worktrees in a different order
+        // while wt2 disappears: the row now occupying wt2's ordinal is wt1.
+        let next = {
+            let mut b = SnapshotBuilder::default();
+            b.push(SidebarRow::Home, Parent::Root, true);
+            let p2 = b.push(row_project("/p2"), Parent::Root, true);
+            b.push(row_worktree("/p2/wt3"), Parent::Node(p2), true);
+            b.push(row_worktree("/p2/wt1"), Parent::Node(p2), true);
+            b.finish(ObservedInputs::default())
+        };
+
+        assert_eq!(
+            slide_from(&prev, &next, &row_worktree("/p2/wt2")),
+            Some(row_worktree("/p2/wt1")),
+            "the vacated ordinal wins, not whichever row used to follow"
+        );
+    }
+
+    #[test]
+    fn an_only_child_falls_back_to_its_parent() {
+        let mut b = SnapshotBuilder::default();
+        b.push(SidebarRow::Home, Parent::Root, true);
+        let p = b.push(row_project("/a"), Parent::Root, true);
+        let wt = b.push(row_worktree("/a/wt1"), Parent::Node(p), true);
+        b.push(SidebarRow::Session(7), Parent::Node(wt), true);
+        let prev = b.finish(ObservedInputs::default());
+
+        let without_session = {
+            let mut b = SnapshotBuilder::default();
+            b.push(SidebarRow::Home, Parent::Root, true);
+            let p = b.push(row_project("/a"), Parent::Root, true);
+            b.push(row_worktree("/a/wt1"), Parent::Node(p), true);
+            b.finish(ObservedInputs::default())
+        };
+        assert_eq!(
+            slide_from(&prev, &without_session, &SidebarRow::Session(7)),
+            Some(row_worktree("/a/wt1"))
+        );
+
+        let without_worktree = {
+            let mut b = SnapshotBuilder::default();
+            b.push(SidebarRow::Home, Parent::Root, true);
+            b.push(row_project("/a"), Parent::Root, true);
+            b.finish(ObservedInputs::default())
+        };
+        assert_eq!(
+            slide_from(&prev, &without_worktree, &row_worktree("/a/wt1")),
+            Some(row_project("/a"))
+        );
+    }
+
+    #[test]
+    fn top_level_rows_are_siblings_of_home() {
+        let prev = reference_tree();
+
+        // A middle project takes the next project.
+        let next = reference_tree_without(&[row_project("/p1")]);
+        assert_eq!(slide_from(&prev, &next, &row_project("/p1")), Some(row_project("/p2")));
+
+        // The last project falls back to the previous one.
+        let next = reference_tree_without(&[row_project("/p2")]);
+        assert_eq!(slide_from(&prev, &next, &row_project("/p2")), Some(row_project("/p1")));
+
+        let mut b = SnapshotBuilder::default();
+        b.push(SidebarRow::Home, Parent::Root, true);
+        b.push(row_project("/only"), Parent::Root, true);
+        let single = b.finish(ObservedInputs::default());
+        let bare = {
+            let mut b = SnapshotBuilder::default();
+            b.push(SidebarRow::Home, Parent::Root, true);
+            b.finish(ObservedInputs::default())
+        };
+        // The only project has no project sibling, so Home stands in.
+        assert_eq!(slide_from(&single, &bare, &row_project("/only")), Some(SidebarRow::Home));
+    }
+
+    #[test]
+    fn a_detached_row_has_no_slide() {
+        let mut b = SnapshotBuilder::default();
+        b.push(SidebarRow::Home, Parent::Root, true);
+        b.push(SidebarRow::Session(9), Parent::Detached, false);
+        let prev = b.finish(ObservedInputs::default());
+
+        let next = {
+            let mut b = SnapshotBuilder::default();
+            b.push(SidebarRow::Home, Parent::Root, true);
+            b.finish(ObservedInputs::default())
+        };
+
+        assert_eq!(slide_from(&prev, &next, &SidebarRow::Session(9)), None);
     }
 }
