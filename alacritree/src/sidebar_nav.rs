@@ -184,7 +184,7 @@ pub fn ensure_cursor(rows: &[SidebarRow], cursor: Option<&SidebarRow>) -> Option
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::projects::Worktree;
 
@@ -192,7 +192,7 @@ mod tests {
         HashMap::new()
     }
 
-    pub(super) fn project(root: &str, expanded: bool, worktrees: &[&str]) -> Project {
+    pub(crate) fn project(root: &str, expanded: bool, worktrees: &[&str]) -> Project {
         Project {
             root: PathBuf::from(root),
             name: root.to_string(),

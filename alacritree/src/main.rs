@@ -30,6 +30,7 @@ mod projects;
 mod row_label;
 mod scratchpad;
 mod session;
+mod sidebar_focus;
 mod sidebar_nav;
 mod stale_exe;
 mod state;

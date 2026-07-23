@@ -1,0 +1,366 @@
+//! Cursor repair for the projects sidebar, derived by observation.
+//!
+//! Every mutation site reporting what it removed proved unbounded — sessions
+//! leave through four paths and worktrees through a background refresh — so
+//! this module infers the repair from what changed instead.  The distinction
+//! that matters is model versus projection: a row hidden by a filter or a
+//! collapsed project still exists and the cursor climbs to an ancestor it can
+//! return from, while a row gone from the model was deleted and the cursor
+//! slides to a sibling.
+
+use std::path::PathBuf;
+
+use crate::app::WorkspaceKey;
+use crate::projects::Project;
+use crate::session::SessionId;
+use crate::sidebar_nav::SidebarRow;
+
+/// Index into a single snapshot's `nodes`.  Deliberately not stable across
+/// snapshots: cross-snapshot matching goes through the row's own path/session
+/// key, because the project list mutates under the cursor and an index would
+/// silently retarget.
+pub type NodeId = usize;
+
+/// A node's place in the tree.  `Detached` exists because a live session whose
+/// project was dropped keeps running: it must be in the model so it never
+/// reads as deleted, while never being a sibling of anything and so never a
+/// landing the cursor could slide onto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Parent {
+    Root,
+    Node(NodeId),
+    Detached,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Node {
+    pub row: SidebarRow,
+    pub parent: Parent,
+}
+
+/// Model membership plus the current projection.  `nodes` holds every
+/// project, worktree, and live session regardless of expansion, listing
+/// threshold, or filter; `projected` holds exactly the navigable rows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TreeSnapshot {
+    pub nodes: Vec<Node>,
+    pub projected: Vec<NodeId>,
+    pub inputs: ObservedInputs,
+}
+
+impl TreeSnapshot {
+    pub fn find(&self, row: &SidebarRow) -> Option<NodeId> {
+        self.nodes.iter().position(|n| n.row == *row)
+    }
+
+    pub fn is_projected(&self, id: NodeId) -> bool {
+        self.projected.contains(&id)
+    }
+
+    pub fn row(&self, id: NodeId) -> &SidebarRow {
+        &self.nodes[id].row
+    }
+
+    pub fn parent(&self, id: NodeId) -> Parent {
+        self.nodes[id].parent
+    }
+
+    /// `parent`'s projected children in render order — the sibling group a
+    /// slide chooses from.
+    pub fn children(&self, parent: Parent) -> Vec<NodeId> {
+        if parent == Parent::Detached {
+            return Vec::new();
+        }
+        self.projected.iter().copied().filter(|&id| self.nodes[id].parent == parent).collect()
+    }
+
+    pub fn is_descendant(&self, id: NodeId, ancestor: NodeId) -> bool {
+        let mut cur = self.nodes[id].parent;
+        while let Parent::Node(p) = cur {
+            if p == ancestor {
+                return true;
+            }
+            cur = self.nodes[p].parent;
+        }
+        false
+    }
+}
+
+#[derive(Default)]
+pub struct SnapshotBuilder {
+    nodes: Vec<Node>,
+    projected: Vec<NodeId>,
+}
+
+impl SnapshotBuilder {
+    pub fn push(&mut self, row: SidebarRow, parent: Parent, projected: bool) -> NodeId {
+        let id = self.nodes.len();
+        self.nodes.push(Node { row, parent });
+        if projected {
+            self.projected.push(id);
+        }
+        id
+    }
+
+    pub fn finish(self, inputs: ObservedInputs) -> TreeSnapshot {
+        TreeSnapshot { nodes: self.nodes, projected: self.projected, inputs }
+    }
+}
+
+/// One live session, borrowed for the per-frame comparison.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionInput<'a> {
+    pub workspace: &'a WorkspaceKey,
+    pub id: SessionId,
+    pub attention: bool,
+}
+
+/// Sidebar UI inputs that change the projection without changing the model.
+/// `toggles` is a bitmask rather than a slice so the comparison never
+/// allocates.
+#[derive(Debug, Clone, Copy)]
+pub struct UiInputs<'a> {
+    pub session_rows_always: bool,
+    pub query: &'a str,
+    pub toggles: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProjectInput {
+    root: PathBuf,
+    name: String,
+    expanded: bool,
+    worktrees: Vec<(PathBuf, String, bool)>,
+}
+
+/// Everything the snapshot is a function of.  Captured on rebuild, compared
+/// borrowed on every other frame so the steady state allocates nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObservedInputs {
+    projects: Vec<ProjectInput>,
+    sessions: Vec<(WorkspaceKey, SessionId, bool)>,
+    session_rows_always: bool,
+    query: String,
+    toggles: u32,
+}
+
+impl ObservedInputs {
+    pub fn capture<'a>(
+        projects: &[Project],
+        sessions: impl Iterator<Item = SessionInput<'a>>,
+        ui: UiInputs<'_>,
+    ) -> Self {
+        Self {
+            projects: projects
+                .iter()
+                .map(|p| ProjectInput {
+                    root: p.root.clone(),
+                    name: p.display_name().to_string(),
+                    expanded: p.expanded,
+                    worktrees: p
+                        .worktrees
+                        .iter()
+                        .map(|wt| (wt.path.clone(), wt.name.clone(), wt.prunable))
+                        .collect(),
+                })
+                .collect(),
+            sessions: sessions.map(|s| (s.workspace.clone(), s.id, s.attention)).collect(),
+            session_rows_always: ui.session_rows_always,
+            query: ui.query.to_string(),
+            toggles: ui.toggles,
+        }
+    }
+
+    /// Whether a filter is narrowing the tree.  The anchor exists only for the
+    /// duration of one filter episode, so this is what ends it.
+    pub fn is_filtering(&self) -> bool {
+        !self.query.is_empty() || self.toggles != 0
+    }
+
+    /// Whether every observed input still holds.  Allocation-free: this runs
+    /// on every frame the sidebar is live.
+    pub fn matches<'a>(
+        &self,
+        projects: &[Project],
+        sessions: impl Iterator<Item = SessionInput<'a>>,
+        ui: UiInputs<'_>,
+    ) -> bool {
+        if self.session_rows_always != ui.session_rows_always
+            || self.query != ui.query
+            || self.toggles != ui.toggles
+        {
+            return false;
+        }
+        if self.projects.len() != projects.len() {
+            return false;
+        }
+        for (was, now) in self.projects.iter().zip(projects) {
+            if was.root != now.root
+                || was.name != now.display_name()
+                || was.expanded != now.expanded
+                || was.worktrees.len() != now.worktrees.len()
+            {
+                return false;
+            }
+            for (wt_was, wt_now) in was.worktrees.iter().zip(&now.worktrees) {
+                if wt_was.0 != wt_now.path || wt_was.1 != wt_now.name || wt_was.2 != wt_now.prunable
+                {
+                    return false;
+                }
+            }
+        }
+        let mut seen = 0usize;
+        for s in sessions {
+            match self.sessions.get(seen) {
+                Some((ws, id, attention))
+                    if ws == s.workspace && *id == s.id && *attention == s.attention =>
+                {
+                    seen += 1;
+                },
+                _ => return false,
+            }
+        }
+        seen == self.sessions.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row_project(p: &str) -> SidebarRow {
+        SidebarRow::Project(PathBuf::from(p))
+    }
+
+    fn row_worktree(p: &str) -> SidebarRow {
+        SidebarRow::Worktree(PathBuf::from(p))
+    }
+
+    fn ui(query: &str, toggles: u32) -> UiInputs<'_> {
+        UiInputs { session_rows_always: false, query, toggles }
+    }
+
+    /// home, project /a expanded with worktree /a/wt1 holding sessions 1 and 2.
+    fn snapshot() -> TreeSnapshot {
+        let mut b = SnapshotBuilder::default();
+        b.push(SidebarRow::Home, Parent::Root, true);
+        let a = b.push(row_project("/a"), Parent::Root, true);
+        let wt1 = b.push(row_worktree("/a/wt1"), Parent::Node(a), true);
+        b.push(SidebarRow::Session(1), Parent::Node(wt1), true);
+        b.push(SidebarRow::Session(2), Parent::Node(wt1), true);
+        b.finish(ObservedInputs::default())
+    }
+
+    #[test]
+    fn find_matches_across_snapshots_by_stable_key() {
+        let s = snapshot();
+        let id = s.find(&row_worktree("/a/wt1")).expect("worktree is in the model");
+        assert_eq!(*s.row(id), row_worktree("/a/wt1"));
+        assert_eq!(s.find(&row_worktree("/a/gone")), None);
+    }
+
+    #[test]
+    fn unprojected_nodes_stay_in_the_model() {
+        let mut b = SnapshotBuilder::default();
+        let a = b.push(row_project("/a"), Parent::Root, true);
+        b.push(row_worktree("/a/wt1"), Parent::Node(a), false);
+        let s = b.finish(ObservedInputs::default());
+
+        let wt = s.find(&row_worktree("/a/wt1")).expect("collapsed worktrees stay in the model");
+        assert!(!s.is_projected(wt), "a collapsed worktree is not navigable");
+    }
+
+    #[test]
+    fn a_detached_node_is_in_the_model_but_is_nobodys_sibling() {
+        let mut b = SnapshotBuilder::default();
+        let home = b.push(SidebarRow::Home, Parent::Root, true);
+        b.push(SidebarRow::Session(9), Parent::Detached, false);
+        let s = b.finish(ObservedInputs::default());
+
+        assert!(s.find(&SidebarRow::Session(9)).is_some(), "an orphan session is not deleted");
+        assert!(
+            !s.children(Parent::Root).contains(&s.find(&SidebarRow::Session(9)).unwrap()),
+            "an orphan must never be a root sibling — it would be a legal slide landing"
+        );
+        assert_eq!(s.children(Parent::Root), vec![home]);
+    }
+
+    #[test]
+    fn children_are_projected_only_and_in_render_order() {
+        let s = snapshot();
+        let wt1 = s.find(&row_worktree("/a/wt1")).unwrap();
+        let kids = s.children(Parent::Node(wt1));
+        assert_eq!(
+            kids.iter().map(|&id| s.row(id).clone()).collect::<Vec<_>>(),
+            vec![SidebarRow::Session(1), SidebarRow::Session(2)]
+        );
+    }
+
+    #[test]
+    fn is_filtering_tracks_the_query_and_the_toggle_bits() {
+        assert!(!ObservedInputs::capture(&[], std::iter::empty(), ui("", 0)).is_filtering());
+        assert!(ObservedInputs::capture(&[], std::iter::empty(), ui("x", 0)).is_filtering());
+        assert!(ObservedInputs::capture(&[], std::iter::empty(), ui("", 0b10)).is_filtering());
+    }
+
+    #[test]
+    fn every_observed_input_in_isolation_triggers_a_rebuild() {
+        let session = |ws: &'static WorkspaceKey, id, attention| SessionInput {
+            workspace: ws,
+            id,
+            attention,
+        };
+        static HOME: WorkspaceKey = None;
+
+        let base = ObservedInputs::capture(&[], [session(&HOME, 1, false)].into_iter(), ui("", 0));
+
+        assert!(base.matches(&[], [session(&HOME, 1, false)].into_iter(), ui("", 0)));
+
+        // Each UI input on its own.
+        assert!(!base.matches(&[], [session(&HOME, 1, false)].into_iter(), ui("x", 0)));
+        assert!(!base.matches(&[], [session(&HOME, 1, false)].into_iter(), ui("", 0b01)));
+        assert!(!base.matches(
+            &[],
+            [session(&HOME, 1, false)].into_iter(),
+            UiInputs { session_rows_always: true, query: "", toggles: 0 },
+        ));
+
+        // Each session input on its own: attention, id, count.
+        assert!(!base.matches(&[], [session(&HOME, 1, true)].into_iter(), ui("", 0)));
+        assert!(!base.matches(&[], [session(&HOME, 2, false)].into_iter(), ui("", 0)));
+        assert!(!base.matches(&[], std::iter::empty(), ui("", 0)));
+        assert!(!base.matches(
+            &[],
+            [session(&HOME, 1, false), session(&HOME, 2, false)].into_iter(),
+            ui("", 0),
+        ));
+    }
+
+    #[test]
+    fn project_shape_changes_trigger_a_rebuild() {
+        use crate::sidebar_nav::tests::project;
+
+        let a = vec![project("/a", true, &["/a/wt1", "/a/wt2"])];
+        let base = ObservedInputs::capture(&a, std::iter::empty(), ui("", 0));
+        assert!(base.matches(&a, std::iter::empty(), ui("", 0)));
+
+        // Expansion, worktree set, worktree order, root, and count each count.
+        assert!(!base.matches(
+            &[project("/a", false, &["/a/wt1", "/a/wt2"])],
+            std::iter::empty(),
+            ui("", 0)
+        ));
+        assert!(!base.matches(&[project("/a", true, &["/a/wt1"])], std::iter::empty(), ui("", 0)));
+        assert!(!base.matches(
+            &[project("/a", true, &["/a/wt2", "/a/wt1"])],
+            std::iter::empty(),
+            ui("", 0)
+        ));
+        assert!(!base.matches(
+            &[project("/b", true, &["/a/wt1", "/a/wt2"])],
+            std::iter::empty(),
+            ui("", 0)
+        ));
+        assert!(!base.matches(&[], std::iter::empty(), ui("", 0)));
+    }
+}

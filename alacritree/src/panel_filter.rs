@@ -71,6 +71,17 @@ impl PanelFilter {
         self.allowed_toggles.iter().copied().filter(|k| self.toggles.contains(k)).collect()
     }
 
+    /// The active toggles as a bitmask over `allowed_toggles` order.  The
+    /// focus reconciler compares this on every frame, where `active_toggles`'s
+    /// `Vec` would put an allocation in the steady-state path.
+    pub fn toggle_bits(&self) -> u32 {
+        self.allowed_toggles
+            .iter()
+            .enumerate()
+            .filter(|(_, key)| self.toggles.contains(key))
+            .fold(0, |bits, (i, _)| bits | (1 << i))
+    }
+
     /// Whether the panel currently narrows its rows: a non-empty query or
     /// any active toggle.
     pub fn is_filtering(&self) -> bool {
@@ -263,6 +274,21 @@ mod tests {
         assert_eq!(f.on_text("x"), None);
         assert_eq!(f.on_key(egui::Key::ArrowDown), None);
         assert_eq!(f.on_key(egui::Key::Enter), None);
+    }
+
+    #[test]
+    fn toggle_bits_report_the_set_without_allocating() {
+        let mut f = PanelFilter::new(TOGGLES);
+        assert_eq!(f.toggle_bits(), 0);
+
+        f.on_text("s");
+        assert_eq!(f.toggle_bits(), 0b01, "'s' is index 0 in TOGGLES");
+
+        f.on_text("a");
+        assert_eq!(f.toggle_bits(), 0b11);
+
+        f.on_text("s");
+        assert_eq!(f.toggle_bits(), 0b10, "'a' alone is index 1");
     }
 
     #[test]
