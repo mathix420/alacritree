@@ -130,6 +130,17 @@ pub fn normalize_root(path: PathBuf) -> PathBuf {
     }
 }
 
+/// How a workspace path should read to the user: WSL workspaces in the
+/// distro's own spelling, native paths untouched.  Not `windows_to_linux`,
+/// which also rewrites `C:\…` into `/mnt/c/…` — correct for handing a path to
+/// git inside a distro, wrong for showing a Windows user their own path.
+pub fn display_path(path: &Path) -> String {
+    match classify(path) {
+        Location::Wsl { linux_path, .. } => linux_path,
+        Location::Windows(_) => path.display().to_string(),
+    }
+}
+
 /// Translate a Windows path to what git inside a distro can resolve:
 /// WSL UNC paths strip to their Linux part; drive paths map under the
 /// automount root; anything else (non-WSL UNC shares) is untranslatable.
@@ -418,6 +429,50 @@ mod tests {
     fn classifies_drive_and_non_wsl_unc_as_windows() {
         assert!(matches!(classify(Path::new(r"C:\Users\Lev")), Location::Windows(_)));
         assert!(matches!(classify(Path::new(r"\\server\share\x")), Location::Windows(_)));
+    }
+
+    /// `classify` is documented to accept the verbatim forms, but only the plain
+    /// prefixes were ever exercised.  `display_path` makes that reachable from
+    /// the UI, so pin it.
+    #[cfg(windows)]
+    #[test]
+    fn classifies_verbatim_unc() {
+        let loc = classify(Path::new(r"\\?\UNC\wsl.localhost\kali-linux\home\lev"));
+        assert_eq!(
+            loc,
+            Location::Wsl { distro: "kali-linux".to_string(), linux_path: "/home/lev".to_string() }
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn display_path_shows_wsl_paths_in_the_distros_spelling() {
+        assert_eq!(
+            display_path(Path::new(r"\\wsl.localhost\kali-linux\home\lev\Git\monorepo")),
+            "/home/lev/Git/monorepo"
+        );
+        assert_eq!(display_path(Path::new(r"\\wsl$\Ubuntu\srv")), "/srv");
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\wsl.localhost\kali-linux\home\lev")),
+            "/home/lev"
+        );
+        // A distro root has no segments of its own.
+        assert_eq!(display_path(Path::new(r"\\wsl.localhost\kali-linux")), "/");
+    }
+
+    /// Native paths are the user's own spelling and must survive untouched —
+    /// this is not `windows_to_linux`, which would rewrite `C:\` into `/mnt/c`.
+    #[cfg(windows)]
+    #[test]
+    fn display_path_leaves_windows_paths_alone() {
+        assert_eq!(display_path(Path::new(r"C:\Users\Lev\Git")), r"C:\Users\Lev\Git");
+        assert_eq!(display_path(Path::new(r"\\server\share\x")), r"\\server\share\x");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn display_path_leaves_native_paths_alone() {
+        assert_eq!(display_path(Path::new("/home/lev/Git")), "/home/lev/Git");
     }
 
     #[cfg(windows)]
