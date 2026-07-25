@@ -1421,6 +1421,10 @@ mod tests {
         for clipped in &out.shapes {
             collect_text(&clipped.shape, &mut text);
         }
+        // Tessellate as the real loop does: nothing is on screen until the
+        // shapes have become vertices, so a caller timing a frame that skipped
+        // this would be timing half of one.
+        ctx.tessellate(out.shapes, out.pixels_per_point);
         text
     }
 
@@ -1759,6 +1763,163 @@ mod tests {
                 elapsed / iterations,
                 total / waits.max(1),
                 100.0 * total.as_secs_f64() / elapsed.as_secs_f64(),
+            );
+        }
+    }
+
+    /// Not a gate — run it by hand:
+    /// `cargo test -p alacritree --release -- --ignored --nocapture --test-threads=1 report_echo_latency`
+    ///
+    /// What the user actually waits for: output reaching the terminal, and
+    /// that output reaching the screen.  The frame loop is modelled the way
+    /// eframe drives it — a frame runs only when something asked for a repaint
+    /// — and the sample is written from another thread so it lands mid-frame
+    /// the way real PTY output does.  The paint harnesses time one frame in
+    /// isolation; this times the wait a frame is only part of.
+    #[test]
+    #[ignore = "timing harness, not an assertion"]
+    fn report_echo_latency() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use alacritty_terminal::event::{Event as TermEvent, EventListener};
+
+        /// Written to a fixed cell, so each sample overwrites the last and a
+        /// stale marker can never be mistaken for the pending one.
+        const MARKERS: [char; 2] = ['§', '¶'];
+        const SAMPLES: usize = 150;
+
+        let config = Config::default();
+        let screen = Vec2::new(2560.0, 1440.0);
+
+        // The last row is the control: the same background load with the
+        // sessions left marked visible, which is what every session looked
+        // like before off-screen output stopped waking the loop.
+        for (load, background, mark_hidden, stream_visible) in [
+            ("idle", 0, true, false),
+            ("visible session streaming", 0, true, true),
+            ("8 background sessions streaming", 8, true, false),
+            ("8 background sessions, none marked hidden", 8, false, false),
+        ] {
+            let ctx = egui::Context::default();
+            let (mut session, _dir) = headless_session(&ctx, &config);
+            let mut caches = Caches::new();
+            painted_text(&ctx, &mut session, &config, &mut caches, screen, Vec::new());
+            let (cols, rows) = (session.size.columns, session.size.screen_lines);
+            {
+                let mut term = session.term.lock();
+                term.resize(TermSize::new(cols, rows));
+                Processor::<StdSyncHandler>::new().advance(&mut *term, &dense_screen(cols, rows));
+            }
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut threads = Vec::new();
+
+            // A background session reaches the loop through `send_event` and
+            // nothing else, so its proxy is the whole of what matters here.
+            for _ in 0..background {
+                let (proxy, events) = EventProxy::new(ctx.clone());
+                proxy.set_visible(!mark_hidden);
+                let stop = Arc::clone(&stop);
+                threads.push(std::thread::spawn(move || {
+                    let _events = events;
+                    while !stop.load(Ordering::Relaxed) {
+                        proxy.send_event(TermEvent::Wakeup);
+                        std::thread::sleep(std::time::Duration::from_micros(500));
+                    }
+                }));
+            }
+
+            if stream_visible {
+                let term = Arc::clone(&session.term);
+                let ctx = ctx.clone();
+                let stop = Arc::clone(&stop);
+                threads.push(std::thread::spawn(move || {
+                    let mut parser = Processor::<StdSyncHandler>::new();
+                    while !stop.load(Ordering::Relaxed) {
+                        // In place rather than appending: the load under test
+                        // is repaint pressure and parse work, and scrolling
+                        // would carry the marker cell off screen.
+                        parser.advance(&mut *term.lock(), b"\x1b[20;1Hstreaming output");
+                        ctx.request_repaint();
+                        std::thread::sleep(std::time::Duration::from_micros(500));
+                    }
+                }));
+            }
+
+            // Timestamped before the lock is taken: waiting for the terminal
+            // is part of what the output waits through.
+            let pending: Arc<std::sync::Mutex<Option<(char, std::time::Instant)>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            {
+                let (term, ctx, stop, pending) = (
+                    Arc::clone(&session.term),
+                    ctx.clone(),
+                    Arc::clone(&stop),
+                    Arc::clone(&pending),
+                );
+                threads.push(std::thread::spawn(move || {
+                    let mut parser = Processor::<StdSyncHandler>::new();
+                    let mut next = 0;
+                    while !stop.load(Ordering::Relaxed) {
+                        if pending.lock().expect("pending").is_some() {
+                            std::thread::yield_now();
+                            continue;
+                        }
+                        // Settle first, by an interval that does not divide
+                        // the frame period: injecting the moment the last
+                        // sample landed would phase-lock to the loop and
+                        // measure how fast it can cycle rather than how long
+                        // an arbitrary write waits.  Spun rather than slept
+                        // because Windows rounds a sleep up to the timer tick.
+                        let gap = std::time::Duration::from_micros(2000 + (next as u64 % 7) * 1500);
+                        let until = std::time::Instant::now() + gap;
+                        while std::time::Instant::now() < until {
+                            std::hint::spin_loop();
+                        }
+
+                        let marker = MARKERS[next % MARKERS.len()];
+                        next += 1;
+                        let at = std::time::Instant::now();
+                        parser.advance(&mut *term.lock(), format!("\x1b[1;1H{marker}").as_bytes());
+                        *pending.lock().expect("pending") = Some((marker, at));
+                        ctx.request_repaint();
+                    }
+                }));
+            }
+
+            let mut samples: Vec<std::time::Duration> = Vec::with_capacity(SAMPLES);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while samples.len() < SAMPLES && std::time::Instant::now() < deadline {
+                if !ctx.has_requested_repaint() {
+                    std::thread::yield_now();
+                    continue;
+                }
+                let painted =
+                    painted_text(&ctx, &mut session, &config, &mut caches, screen, Vec::new());
+                let mut slot = pending.lock().expect("pending");
+                if let Some((marker, at)) = *slot
+                    && painted.contains(marker)
+                {
+                    samples.push(at.elapsed());
+                    *slot = None;
+                }
+            }
+
+            stop.store(true, Ordering::Relaxed);
+            for thread in threads {
+                let _ = thread.join();
+            }
+
+            samples.sort_unstable();
+            let at = |q: f64| samples[((samples.len() as f64 * q) as usize).min(samples.len() - 1)];
+            println!(
+                "{load}: {} samples, p50 {:?}, p95 {:?}, p99 {:?}, worst {:?}",
+                samples.len(),
+                at(0.50),
+                at(0.95),
+                at(0.99),
+                samples[samples.len() - 1],
             );
         }
     }
