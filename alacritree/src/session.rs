@@ -815,71 +815,136 @@ fn pty_working_directory(explicit: Option<PathBuf>, config: &Config) -> Option<P
 
 #[cfg(windows)]
 mod windows_process_probe {
-    //! Shared, throttled process-table snapshot.  Every session probes at
-    //! its own `AGENT_CACHE_TTL` cadence; keeping one global `System` means
-    //! N sessions cost one enumeration per tick, not N.  Two-phase refresh:
-    //! names + parent pids for the whole table (one cheap system call
-    //! class), command lines only for the shell's descendants and only when
-    //! no name matched.
-    use std::collections::BTreeMap;
-    use std::sync::{Mutex, PoisonError};
-    use std::time::{Duration, Instant};
+    //! Background process-table scan behind the sidebar's agent signals.
+    //!
+    //! Enumerating the process table costs ~12 ms and fetching command lines
+    //! another ~15 ms, both far too much for the UI thread that asks for them.
+    //! A single refresher thread does the work for every shell the UI has
+    //! asked about and publishes the results; `probe` only reads what was last
+    //! published.  Sessions already tolerate an answer up to `AGENT_CACHE_TTL`
+    //! old, so nothing about the displayed result changes.
+    //!
+    //! The scan is two-phase: names and parent pids for the whole table (one
+    //! cheap system call class), command lines only for a shell's descendants
+    //! and only when no name matched.
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::{Condvar, Mutex, PoisonError};
+    use std::time::Duration;
 
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
     use super::{agent_glyph_by_cmdline, agent_glyph_by_name, is_nav_tui_name, process_tree_pids};
 
-    /// Slightly under `AGENT_CACHE_TTL` so the first session to tick
-    /// refreshes and the rest reuse the same table.
-    pub(super) const SNAPSHOT_TTL: Duration = Duration::from_millis(900);
+    /// Slightly under `AGENT_CACHE_TTL`, so a session polling on its own clock
+    /// finds a result no older than one of its own cache windows.
+    pub(super) const REFRESH_INTERVAL: Duration = Duration::from_millis(900);
 
-    static SNAPSHOT: Mutex<Option<(Instant, System)>> = Mutex::new(None);
-
-    /// The command-line scan the name scan falls back to, remembered per shell
-    /// against the descendant tree it ran on.
-    ///
-    /// Fetching command lines costs ~15 ms against ~10 µs for the rest of the
-    /// probe, and a shell running nothing recognizable by name reaches it on
-    /// every poll — three times a second per session, on the UI thread.  Its
-    /// answer can only change when the tree does, so an idle shell pays it
-    /// once instead.
-    static CMDLINE_GLYPH: Mutex<ScannedTrees> = Mutex::new(BTreeMap::new());
+    /// Agent glyph found in the shell's descendant tree, whether the shell has
+    /// any descendants at all, and whether one of them is a nav TUI.
+    pub(super) type Signals = (Option<char>, bool, bool);
 
     /// Per shell: the descendant tree the last command-line scan ran on, and
     /// the glyph it found there.
     pub(super) type ScannedTrees = BTreeMap<u32, (Vec<u32>, Option<char>)>;
 
-    /// The glyph remembered for `shell_pid`, or `None` when the tree has
-    /// changed since it was taken and the scan has to run again.
-    pub(super) fn remembered_glyph(
-        cache: &ScannedTrees,
-        shell_pid: u32,
-        tree: &[u32],
-    ) -> Option<Option<char>> {
-        cache.get(&shell_pid).filter(|(scanned, _)| scanned == tree).map(|(_, glyph)| *glyph)
+    #[derive(Default)]
+    struct Shared {
+        /// Shells asked about since the last pass.  Taken rather than kept, so
+        /// a window nobody is drawing costs nothing: with no frames there are
+        /// no probes, and the refresher blocks instead of enumerating.
+        wanted: BTreeSet<u32>,
+        published: BTreeMap<u32, Signals>,
+        refresher_running: bool,
     }
 
-    /// Agent glyph found in the shell's descendant tree, whether the shell
-    /// has any descendants at all, and whether one of them is a nav TUI.
-    pub(super) fn probe(shell_pid: u32) -> (Option<char>, bool, bool) {
-        let mut guard = SNAPSHOT.lock().unwrap_or_else(PoisonError::into_inner);
-        if guard.as_ref().is_none_or(|(at, _)| at.elapsed() >= SNAPSHOT_TTL) {
-            let mut sys = guard.take().map(|(_, sys)| sys).unwrap_or_default();
+    static SHARED: Mutex<Shared> = Mutex::new(Shared {
+        wanted: BTreeSet::new(),
+        published: BTreeMap::new(),
+        refresher_running: false,
+    });
+    /// Wakes the refresher when it is idling with nothing to scan.
+    static WANTED: Condvar = Condvar::new();
+
+    /// The last published signals for `shell_pid`, defaulting to "nothing
+    /// running" until the refresher has seen it.  Registers the shell so the
+    /// next pass covers it.
+    pub(super) fn probe(shell_pid: u32) -> Signals {
+        let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+        if !shared.refresher_running {
+            shared.refresher_running = true;
+            std::thread::Builder::new()
+                .name("alacritree-process-probe".into())
+                .spawn(refresh_loop)
+                .expect("spawn process probe thread");
+        }
+        let signals = shared.published.get(&shell_pid).copied();
+        if shared.wanted.insert(shell_pid) {
+            WANTED.notify_one();
+        }
+        signals.unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(super) fn published(shell_pid: u32) -> Option<Signals> {
+        SHARED.lock().unwrap_or_else(PoisonError::into_inner).published.get(&shell_pid).copied()
+    }
+
+    #[cfg(test)]
+    pub(super) fn nothing_wanted() -> bool {
+        SHARED.lock().unwrap_or_else(PoisonError::into_inner).wanted.is_empty()
+    }
+
+    fn refresh_loop() {
+        let mut sys = System::new();
+        let mut scanned = ScannedTrees::new();
+        loop {
+            let wanted = {
+                let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+                while shared.wanted.is_empty() {
+                    shared = WANTED.wait(shared).unwrap_or_else(PoisonError::into_inner);
+                }
+                std::mem::take(&mut shared.wanted)
+            };
+
+            // Everything below runs with no lock held: the UI thread must
+            // never wait on an enumeration.
             sys.refresh_processes_specifics(
                 ProcessesToUpdate::All,
                 true,
                 ProcessRefreshKind::nothing(),
             );
-            *guard = Some((Instant::now(), sys));
-        }
-        let (_, sys) = guard.as_mut().expect("snapshot populated above");
+            let table: Vec<(u32, Option<u32>)> = sys
+                .processes()
+                .iter()
+                .map(|(pid, p)| (pid.as_u32(), p.parent().map(|pp| pp.as_u32())))
+                .collect();
+            let alive: BTreeSet<u32> = table.iter().map(|(pid, _)| *pid).collect();
+            let published: BTreeMap<u32, Signals> = wanted
+                .iter()
+                .filter(|pid| alive.contains(pid))
+                .map(|&pid| (pid, scan(&mut sys, &table, pid, &mut scanned)))
+                .collect();
+            scanned.retain(|pid, _| alive.contains(pid));
 
-        let table: Vec<(u32, Option<u32>)> = sys
-            .processes()
-            .iter()
-            .map(|(pid, p)| (pid.as_u32(), p.parent().map(|pp| pp.as_u32())))
-            .collect();
-        let mut tree = process_tree_pids(&table, shell_pid);
+            {
+                // Merged, not replaced: a shell that happened not to be asked
+                // about this pass keeps its last answer instead of blinking
+                // back to "nothing running".
+                let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+                shared.published.retain(|pid, _| alive.contains(pid));
+                shared.published.extend(published);
+            }
+            std::thread::sleep(REFRESH_INTERVAL);
+        }
+    }
+
+    fn scan(
+        sys: &mut System,
+        table: &[(u32, Option<u32>)],
+        shell_pid: u32,
+        scanned: &mut ScannedTrees,
+    ) -> Signals {
+        let mut tree = process_tree_pids(table, shell_pid);
         let has_children = tree.len() > 1;
         // The table comes out of a hash map, so the tree has to be ordered
         // before it can be compared against the one the last scan ran on.
@@ -895,9 +960,7 @@ mod windows_process_probe {
         if let Some(glyph) = agent_glyph_by_name(&names) {
             return (Some(glyph), has_children, nav_tui);
         }
-
-        let mut cache = CMDLINE_GLYPH.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(glyph) = remembered_glyph(&cache, shell_pid, &tree) {
+        if let Some(glyph) = remembered_glyph(scanned, shell_pid, &tree) {
             return (glyph, has_children, nav_tui);
         }
 
@@ -913,8 +976,20 @@ mod windows_process_probe {
             .filter_map(|pid| sys.process(*pid))
             .map(|p| p.cmd().iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "));
         let glyph = agent_glyph_by_cmdline(cmds);
-        cache.insert(shell_pid, (tree, glyph));
+        scanned.insert(shell_pid, (tree, glyph));
         (glyph, has_children, nav_tui)
+    }
+
+    /// The glyph remembered for `shell_pid`, or `None` when the tree has
+    /// changed since it was taken and the scan has to run again.  Fetching
+    /// command lines is the expensive half of a pass, and its answer can only
+    /// change when the descendant set does.
+    pub(super) fn remembered_glyph(
+        cache: &ScannedTrees,
+        shell_pid: u32,
+        tree: &[u32],
+    ) -> Option<Option<char>> {
+        cache.get(&shell_pid).filter(|(scanned, _)| scanned == tree).map(|(_, glyph)| *glyph)
     }
 }
 
@@ -1491,6 +1566,34 @@ mod tests {
         assert!(matches!(events.try_recv(), Ok(TermEvent::Title(_))));
     }
 
+    /// Refreshing the process table costs ~12 ms — a dropped frame — and
+    /// `process_probe` runs on the UI thread.  The whole round trip: the call
+    /// registers what it wants and returns with whatever was last computed,
+    /// the refresher answers on its own clock, and it then stops scanning for
+    /// a shell nobody has asked about again.
+    #[cfg(windows)]
+    #[test]
+    fn the_probe_hands_the_scan_to_the_refresher() {
+        let pid = std::process::id();
+
+        let started = Instant::now();
+        let first = windows_process_probe::probe(pid);
+        let waited = started.elapsed();
+
+        assert_eq!(first, (None, false, false), "the first probe had an answer to give");
+        assert!(waited < Duration::from_millis(5), "the probe took {waited:?} to return");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while windows_process_probe::published(pid).is_none() {
+            assert!(Instant::now() < deadline, "the background refresh never published a result");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            windows_process_probe::nothing_wanted(),
+            "the refresher would keep enumerating for a window nobody is drawing"
+        );
+    }
+
     /// Starting an agent through a shim (`node`, `python`) is only visible in
     /// its command line, and it always adds a process.  A remembered scan that
     /// outlived the tree it ran on would leave the sidebar showing no agent
@@ -1522,25 +1625,20 @@ mod tests {
     fn report_process_probe_cost() {
         let pid = std::process::id();
         windows_process_probe::probe(pid);
+        // Let the refresher publish, so the reported cost is the steady state
+        // rather than the empty-map one.
+        std::thread::sleep(super::windows_process_probe::REFRESH_INTERVAL * 2);
 
-        // A burst well inside the 900 ms snapshot TTL, so every call after the
-        // first reuses the table and measures only the per-call derivation.
-        let iterations = 50;
+        let iterations = 1000;
         let started = std::time::Instant::now();
         for _ in 0..iterations {
             std::hint::black_box(windows_process_probe::probe(pid));
         }
-        let warm = started.elapsed() / iterations;
-
-        std::thread::sleep(super::windows_process_probe::SNAPSHOT_TTL);
-        let started = std::time::Instant::now();
-        std::hint::black_box(windows_process_probe::probe(pid));
-        let refresh = started.elapsed();
+        let each = started.elapsed() / iterations;
 
         let (_, counts) = crate::steady_state::measure(|| windows_process_probe::probe(pid));
         println!(
-            "probe: {warm:?} warm, {refresh:?} when the snapshot has expired, {} allocations \
-             ({} KiB)",
+            "probe on the calling thread: {each:?}, {} allocations ({} KiB)",
             counts.allocs,
             counts.bytes / 1024,
         );
