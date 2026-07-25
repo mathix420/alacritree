@@ -111,6 +111,7 @@ pub fn show(
         );
     }
     handle_wheel_scroll(ui, &response, session, config, rect, cell_w, cell_h, cols, rows);
+    dispatch_input(ui, &response, session, ime, allow_focus);
     // Built-in renderer expects the *unadjusted* pixel cell size so it can
     // re-apply `font.offset` itself — passing `cell_w * ppp` (which already
     // includes the offset) would double-add it.  Descent is zero here: the
@@ -147,6 +148,39 @@ pub fn show(
         .map(|p| p.to_owned())
         .and_then(|p| paint_preedit(&painter, rect, session, config, &font_id, cell_w, cell_h, &p));
 
+    if allow_focus && response.has_focus() {
+        // Setting `PlatformOutput::ime` is what makes egui-winit call
+        // `set_ime_allowed(true)` — without it the OS IME never engages.
+        // The rect drives `set_ime_cursor_area`, so the candidate window
+        // follows the caret like alacritty's `update_ime_position`
+        // (TextEdit passes its whole widget rect there, which for a
+        // fullscreen terminal would pin the popup to the window corner).
+        let caret = preedit_caret
+            .or_else(|| cursor_cell_rect(session, rect, cell_w, cell_h))
+            .unwrap_or(rect);
+        ui.ctx().output_mut(|o| {
+            o.ime = Some(egui::output::IMEOutput { rect: caret, cursor_rect: caret });
+        });
+    }
+
+    response
+}
+
+/// Drain this frame's keyboard and IME events into the terminal.
+///
+/// Runs ahead of the paint so a keystroke reaches the PTY without queueing
+/// behind a full-screen grid walk, and so the selection clear and snap-to-
+/// prompt that typing triggers are visible in the frame the user typed in
+/// rather than the next one.  The preedit is likewise resolved before the grid
+/// is built, so a composition starting or ending this frame is painted this
+/// frame.
+fn dispatch_input(
+    ui: &Ui,
+    response: &Response,
+    session: &mut Session,
+    ime: &mut crate::ime::Ime,
+    allow_focus: bool,
+) {
     if allow_focus && response.has_focus() {
         // Kitty-protocol and mouse modes negotiated by the running app decide
         // how events encode, so the encoder needs the live terminal mode.
@@ -191,18 +225,6 @@ pub fn show(
                 },
             }
         }
-        // Setting `PlatformOutput::ime` is what makes egui-winit call
-        // `set_ime_allowed(true)` — without it the OS IME never engages.
-        // The rect drives `set_ime_cursor_area`, so the candidate window
-        // follows the caret like alacritty's `update_ime_position`
-        // (TextEdit passes its whole widget rect there, which for a
-        // fullscreen terminal would pin the popup to the window corner).
-        let caret = preedit_caret
-            .or_else(|| cursor_cell_rect(session, rect, cell_w, cell_h))
-            .unwrap_or(rect);
-        ui.ctx().output_mut(|o| {
-            o.ime = Some(egui::output::IMEOutput { rect: caret, cursor_rect: caret });
-        });
     } else {
         // IMEs commonly auto-commit an in-progress composition when focus
         // moves away (winit pairs the `Commit` with an immediate
@@ -234,8 +256,6 @@ pub fn show(
         // backstop that drops the painted preedit either way.
         ime.clear();
     }
-
-    response
 }
 
 /// Whether the grid owns the pointer at `pos`: inside `rect` with no floating
@@ -1253,6 +1273,94 @@ mod tests {
             })
             .sum();
         FrameCost { build, tessellate, vertices }
+    }
+
+    /// Every glyph a focused frame painted, in paint order, after feeding it
+    /// `events`.  Reading the frame's own shapes is the only way to tell what
+    /// the user saw *that* frame rather than what the terminal state became by
+    /// the end of it.
+    fn painted_text(
+        ctx: &egui::Context,
+        session: &mut Session,
+        config: &Config,
+        ime: &mut crate::ime::Ime,
+        screen: Vec2,
+        events: Vec<Event>,
+    ) -> String {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, screen)),
+            events,
+            ..Default::default()
+        };
+        let mut builtin = BuiltinGlyphCache::new();
+        let mut colors = ColorGlyphCache::new(Vec::new(), 0);
+        let mut glyphs = GlyphCache::new();
+        let out = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(ui, session, config, true, &mut builtin, ime, &mut colors, &mut glyphs);
+            });
+        });
+        let mut text = String::new();
+        for clipped in &out.shapes {
+            collect_text(&clipped.shape, &mut text);
+        }
+        text
+    }
+
+    fn collect_text(shape: &egui::Shape, out: &mut String) {
+        match shape {
+            egui::Shape::Text(text) => out.push_str(text.galley.text()),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect_text(s, out)),
+            _ => {},
+        }
+    }
+
+    /// Typing snaps the view back to the prompt (`on_terminal_input_start`), so
+    /// the frame carrying the keystroke has to paint the bottom of the buffer.
+    /// Consuming input only after the grid is built paints the stale
+    /// scrolled-back view for one more frame, and delays the bytes reaching the
+    /// PTY by a whole paint.
+    #[test]
+    fn a_keystroke_reaches_the_terminal_before_the_grid_is_painted() {
+        let config = Config::default();
+        let ctx = egui::Context::default();
+        let (mut session, _dir) = headless_session(&ctx, &config);
+        let mut ime = crate::ime::Ime::default();
+        let screen = Vec2::new(640.0, 480.0);
+
+        // The first frame is what tells the session how big the grid is, and
+        // `Session::resize` forwards to the `Term` only when a PTY sender
+        // exists, so a headless session needs the grid resized by hand.
+        painted_text(&ctx, &mut session, &config, &mut ime, screen, Vec::new());
+        let (cols, rows) = (session.size.columns, session.size.screen_lines);
+        {
+            let mut term = session.term.lock();
+            term.resize(TermSize::new(cols, rows));
+            let mut output = Vec::new();
+            for line in 0..rows * 4 {
+                output.extend_from_slice(format!("L{line}\r\n").as_bytes());
+            }
+            Processor::<StdSyncHandler>::new().advance(&mut *term, &output);
+            term.scroll_display(Scroll::Delta(rows as i32));
+        }
+        let last = format!("L{}", rows * 4 - 1);
+
+        let scrolled_back = painted_text(&ctx, &mut session, &config, &mut ime, screen, Vec::new());
+        assert!(!scrolled_back.contains(&last), "the grid is not scrolled back to begin with");
+
+        let typed = painted_text(
+            &ctx,
+            &mut session,
+            &config,
+            &mut ime,
+            screen,
+            vec![Event::Text("a".to_owned())],
+        );
+
+        assert!(
+            typed.contains(&last),
+            "the frame carrying the keystroke painted the stale scrolled-back view"
+        );
     }
 
     /// Where a frame's time goes.  `build` is the grid walk that turns cells
