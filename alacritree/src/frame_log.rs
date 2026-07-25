@@ -77,6 +77,67 @@ fn take_pending(slot: &AtomicU64, painted: u64) -> Option<Duration> {
     }
 }
 
+/// A frame this slow is felt as a hitch rather than seen as a frame rate, so
+/// it is worth a line of its own naming what consumed it.
+const SLOW_FRAME: Duration = Duration::from_millis(15);
+
+/// Phases that fit in one frame's breakdown.  Marks past this are dropped:
+/// the breakdown is a debugging aid, not a reason to allocate mid-frame.
+const MAX_PHASES: usize = 16;
+
+/// Where one frame's time went.
+///
+/// A stall that strikes once every few seconds does not move any percentile,
+/// so the summary cannot find it.  This names the phase it happened in.
+pub struct Phases {
+    marks: [(&'static str, Duration); MAX_PHASES],
+    len: usize,
+    since: Instant,
+    on: bool,
+}
+
+impl Phases {
+    pub fn new() -> Self {
+        Self {
+            marks: [("", Duration::ZERO); MAX_PHASES],
+            len: 0,
+            since: Instant::now(),
+            on: enabled(),
+        }
+    }
+
+    pub fn restart(&mut self) {
+        self.len = 0;
+        self.since = Instant::now();
+    }
+
+    /// Close the phase that ended here, naming it.
+    pub fn mark(&mut self, name: &'static str) {
+        if !self.on || self.len == MAX_PHASES {
+            return;
+        }
+        let now = Instant::now();
+        self.marks[self.len] = (name, now.saturating_duration_since(self.since));
+        self.since = now;
+        self.len += 1;
+    }
+
+    pub fn report_if_slow(&self) {
+        let marks = &self.marks[..self.len];
+        let total: Duration = marks.iter().map(|(_, d)| *d).sum();
+        if total < SLOW_FRAME {
+            return;
+        }
+
+        let mut ranked: Vec<_> =
+            marks.iter().filter(|(_, d)| *d >= Duration::from_millis(1)).collect();
+        ranked.sort_unstable_by_key(|(_, d)| std::cmp::Reverse(*d));
+        let breakdown =
+            ranked.iter().map(|(name, d)| format!("{name} {d:?}")).collect::<Vec<_>>().join(", ");
+        log::info!("slow frame: {total:?} | {breakdown}");
+    }
+}
+
 #[derive(Default)]
 struct Samples {
     totals: Vec<Duration>,
@@ -295,5 +356,45 @@ mod tests {
         mark_pending(&slot, 0);
 
         assert!(take_pending(&slot, 5_000).is_some());
+    }
+
+    /// Each mark closes the phase that ran since the previous one, so the
+    /// phases partition the frame instead of all dating from its start.
+    #[test]
+    fn each_phase_measures_only_its_own_span() {
+        let mut phases = Phases { on: true, ..Phases::new() };
+
+        phases.restart();
+        std::thread::sleep(Duration::from_millis(20));
+        phases.mark("first");
+        phases.mark("second");
+
+        let [(_, first), (_, second)] = phases.marks[..2] else { unreachable!() };
+        assert!(first >= Duration::from_millis(20), "{first:?}");
+        assert!(second < Duration::from_millis(10), "{second:?}");
+    }
+
+    /// A frame with more phases than the breakdown holds must drop the extras
+    /// rather than run off the end of the array.
+    #[test]
+    fn marks_past_the_last_slot_are_dropped() {
+        let mut phases = Phases { on: true, ..Phases::new() };
+
+        for _ in 0..MAX_PHASES + 5 {
+            phases.mark("phase");
+        }
+
+        assert_eq!(phases.len, MAX_PHASES);
+    }
+
+    /// Disabled, a mark must not even read the clock.
+    #[test]
+    fn a_disabled_breakdown_records_nothing() {
+        let mut phases = Phases::new();
+        phases.on = false;
+
+        phases.mark("phase");
+
+        assert_eq!(phases.len, 0);
     }
 }

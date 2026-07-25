@@ -365,6 +365,7 @@ pub struct AlacritreeApp {
     grid_snapshot: crate::terminal_view::GridSnapshot,
     /// Present only under `ALACRITREE_FRAME_LOG`; `None` is the normal run.
     frame_log: Option<crate::frame_log::FrameLog>,
+    phases: crate::frame_log::Phases,
     /// How much of the frame in progress went to painting the terminal grid,
     /// as opposed to the sidebars and everything else sharing it.
     grid_paint: std::time::Duration,
@@ -689,6 +690,7 @@ impl AlacritreeApp {
             glyph_cache: crate::glyph_cache::GlyphCache::new(),
             grid_snapshot: crate::terminal_view::GridSnapshot::new(),
             frame_log: crate::frame_log::FrameLog::from_env(),
+            phases: crate::frame_log::Phases::new(),
             grid_paint: std::time::Duration::ZERO,
             pending_project_refresh: HashMap::new(),
             wsl_delta_paths: HashMap::new(),
@@ -7100,9 +7102,11 @@ impl eframe::App for AlacritreeApp {
             .as_ref()
             .map(|_| (std::time::Instant::now(), crate::frame_log::output_wait()));
         self.grid_paint = std::time::Duration::ZERO;
+        self.phases.restart();
         self.poll_project_refreshes();
         self.poll_pending_deletes(ctx);
         self.poll_pending_creates(ctx);
+        self.phases.mark("polls");
         let modal_open = self.is_modal_open();
         // Keys pressed mid-composition drive the IME's candidate window,
         // not the app — alacritty's key_input returns early the same way,
@@ -7121,10 +7125,14 @@ impl eframe::App for AlacritreeApp {
                 self.handle_shortcuts(ctx);
             }
         }
+        self.phases.mark("input");
         self.process_notification_actions(ctx);
         self.process_ipc_calls(ctx);
+        self.phases.mark("ipc");
         self.process_session_events(ctx);
+        self.phases.mark("session-events");
         self.reconcile_sidebar_focus(ctx);
+        self.phases.mark("focus");
         let theme = self.theme;
         // GL clear is the sole source of the bg when opacity < 1; painting any
         // panel fill on top would compound the alpha through egui's blend.
@@ -7145,6 +7153,8 @@ impl eframe::App for AlacritreeApp {
             }
         }
 
+        self.phases.mark("projects-sidebar");
+
         if self.show_right_sidebar {
             let r = self.show_git_sidebar(ctx, panel_frame);
             paint_panel_border(ctx, r.left(), r.y_range(), theme.sidebar_border);
@@ -7152,6 +7162,7 @@ impl eframe::App for AlacritreeApp {
                 paint_focus_outline(ctx, r, &theme);
             }
         }
+        self.phases.mark("git-sidebar");
 
         let central = egui::CentralPanel::default()
             .frame(Frame::default().fill(central_fill).inner_margin(Margin::same(0)))
@@ -7230,6 +7241,7 @@ impl eframe::App for AlacritreeApp {
         if theme.focus_outline.terminal && !modal_open && self.focus == PaneFocus::Terminal {
             paint_focus_outline(ctx, central.response.rect, &theme);
         }
+        self.phases.mark("central");
 
         if self.pending_create.is_some() {
             self.show_create_dialog(ctx);
@@ -7258,6 +7270,7 @@ impl eframe::App for AlacritreeApp {
         if self.palette.is_open() && !modal_open {
             self.show_command_palette(ctx);
         }
+        self.phases.mark("dialogs");
 
         self.reap_exited_sessions(ctx);
         // A shell that exited on its own is only removed here, after paint.
@@ -7265,6 +7278,8 @@ impl eframe::App for AlacritreeApp {
         // input; with it, the repair is queued for the frame the repaint
         // request has already scheduled.
         self.reconcile_sidebar_focus(ctx);
+        self.phases.mark("reap");
+        self.phases.report_if_slow();
 
         if let (Some(log), Some((started, waited))) = (self.frame_log.as_mut(), frame_started) {
             log.record(crate::frame_log::Timings {
