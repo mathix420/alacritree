@@ -1924,6 +1924,62 @@ mod tests {
         }
     }
 
+    /// Not a gate — run it by hand:
+    /// `cargo test -p alacritree --release -- --ignored --nocapture --test-threads=1 report_cost_by_rows`
+    ///
+    /// A full-screen app repaints in place, so its damage is a handful of rows
+    /// rather than the whole grid — the one workload where skipping unchanged
+    /// rows is possible at all.  What that would be worth is how much of a
+    /// frame the rows carry: blank rows emit no glyphs, so painting `filled`
+    /// of `rows` approximates repainting only that many.
+    #[test]
+    #[ignore = "timing harness, not an assertion"]
+    fn report_cost_by_rows() {
+        let config = Config::default();
+        let screen = Vec2::new(2560.0, 1440.0);
+        let ctx = egui::Context::default();
+        let (mut session, _dir) = headless_session(&ctx, &config);
+        let mut caches = Caches::new();
+        paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
+        let (cols, rows) = (session.size.columns, session.size.screen_lines);
+        session.term.lock().resize(TermSize::new(cols, rows));
+
+        for filled in [rows, rows / 2, 8, 3, 1] {
+            {
+                let mut term = session.term.lock();
+                let mut parser = Processor::<StdSyncHandler>::new();
+                parser.advance(&mut *term, b"\x1b[2J");
+                parser.advance(&mut *term, &dense_screen(cols, filled));
+            }
+
+            let mut cost = FrameCost::default();
+            for _ in 0..10 {
+                cost = paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
+            }
+            let iterations = 40;
+            let (mut build, mut tessellate) =
+                (std::time::Duration::ZERO, std::time::Duration::ZERO);
+            for _ in 0..iterations {
+                cost = std::hint::black_box(paint_one_frame(
+                    &ctx,
+                    &mut session,
+                    &config,
+                    &mut caches,
+                    screen,
+                ));
+                build += cost.build;
+                tessellate += cost.tessellate;
+            }
+
+            println!(
+                "{filled:>3} of {rows} rows with content: build {:?} + tessellate {:?}, {} vertices",
+                build / iterations,
+                tessellate / iterations,
+                cost.vertices,
+            );
+        }
+    }
+
     /// Dense output that fills every visible cell, with a colour change every
     /// few columns so the run-splitting in `paint_grid` behaves like it does
     /// under real program output rather than collapsing to one run per line.
