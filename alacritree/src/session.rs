@@ -821,6 +821,7 @@ mod windows_process_probe {
     //! names + parent pids for the whole table (one cheap system call
     //! class), command lines only for the shell's descendants and only when
     //! no name matched.
+    use std::collections::BTreeMap;
     use std::sync::{Mutex, PoisonError};
     use std::time::{Duration, Instant};
 
@@ -830,9 +831,33 @@ mod windows_process_probe {
 
     /// Slightly under `AGENT_CACHE_TTL` so the first session to tick
     /// refreshes and the rest reuse the same table.
-    const SNAPSHOT_TTL: Duration = Duration::from_millis(900);
+    pub(super) const SNAPSHOT_TTL: Duration = Duration::from_millis(900);
 
     static SNAPSHOT: Mutex<Option<(Instant, System)>> = Mutex::new(None);
+
+    /// The command-line scan the name scan falls back to, remembered per shell
+    /// against the descendant tree it ran on.
+    ///
+    /// Fetching command lines costs ~15 ms against ~10 µs for the rest of the
+    /// probe, and a shell running nothing recognizable by name reaches it on
+    /// every poll — three times a second per session, on the UI thread.  Its
+    /// answer can only change when the tree does, so an idle shell pays it
+    /// once instead.
+    static CMDLINE_GLYPH: Mutex<ScannedTrees> = Mutex::new(BTreeMap::new());
+
+    /// Per shell: the descendant tree the last command-line scan ran on, and
+    /// the glyph it found there.
+    pub(super) type ScannedTrees = BTreeMap<u32, (Vec<u32>, Option<char>)>;
+
+    /// The glyph remembered for `shell_pid`, or `None` when the tree has
+    /// changed since it was taken and the scan has to run again.
+    pub(super) fn remembered_glyph(
+        cache: &ScannedTrees,
+        shell_pid: u32,
+        tree: &[u32],
+    ) -> Option<Option<char>> {
+        cache.get(&shell_pid).filter(|(scanned, _)| scanned == tree).map(|(_, glyph)| *glyph)
+    }
 
     /// Agent glyph found in the shell's descendant tree, whether the shell
     /// has any descendants at all, and whether one of them is a nav TUI.
@@ -854,11 +879,14 @@ mod windows_process_probe {
             .iter()
             .map(|(pid, p)| (pid.as_u32(), p.parent().map(|pp| pp.as_u32())))
             .collect();
-        let tree = process_tree_pids(&table, shell_pid);
+        let mut tree = process_tree_pids(&table, shell_pid);
         let has_children = tree.len() > 1;
-        let tree: Vec<Pid> = tree.into_iter().map(Pid::from_u32).collect();
+        // The table comes out of a hash map, so the tree has to be ordered
+        // before it can be compared against the one the last scan ran on.
+        tree.sort_unstable();
+        let pids: Vec<Pid> = tree.iter().copied().map(Pid::from_u32).collect();
 
-        let names: Vec<String> = tree
+        let names: Vec<String> = pids
             .iter()
             .filter_map(|pid| sys.process(*pid))
             .map(|p| p.name().to_string_lossy().into_owned())
@@ -868,18 +896,25 @@ mod windows_process_probe {
             return (Some(glyph), has_children, nav_tui);
         }
 
+        let mut cache = CMDLINE_GLYPH.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(glyph) = remembered_glyph(&cache, shell_pid, &tree) {
+            return (glyph, has_children, nav_tui);
+        }
+
         // Names missed: fetch command lines for just the tree to catch
         // agents launched through node/python shims.
         sys.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&tree),
+            ProcessesToUpdate::Some(&pids),
             false,
             ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
         );
-        let cmds = tree
+        let cmds = pids
             .iter()
             .filter_map(|pid| sys.process(*pid))
             .map(|p| p.cmd().iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "));
-        (agent_glyph_by_cmdline(cmds), has_children, nav_tui)
+        let glyph = agent_glyph_by_cmdline(cmds);
+        cache.insert(shell_pid, (tree, glyph));
+        (glyph, has_children, nav_tui)
     }
 }
 
@@ -1454,6 +1489,61 @@ mod tests {
         proxy.send_event(TermEvent::Title("claude: thinking".into()));
 
         assert!(matches!(events.try_recv(), Ok(TermEvent::Title(_))));
+    }
+
+    /// Starting an agent through a shim (`node`, `python`) is only visible in
+    /// its command line, and it always adds a process.  A remembered scan that
+    /// outlived the tree it ran on would leave the sidebar showing no agent
+    /// for as long as that shell lived.
+    #[cfg(windows)]
+    #[test]
+    fn a_remembered_cmdline_scan_expires_when_the_tree_changes() {
+        use std::collections::BTreeMap;
+
+        use super::windows_process_probe::remembered_glyph;
+
+        let mut cache = BTreeMap::new();
+        cache.insert(42, (vec![42, 100], None));
+
+        assert_eq!(remembered_glyph(&cache, 42, &[42, 100]), Some(None));
+        assert_eq!(remembered_glyph(&cache, 42, &[42, 100, 101]), None);
+        assert_eq!(remembered_glyph(&cache, 43, &[42, 100]), None);
+    }
+
+    /// Not a gate — run it by hand:
+    /// `cargo test -p alacritree --release -- --ignored --nocapture report_process_probe_cost`
+    ///
+    /// `process_probe` runs on the UI thread whenever a session's agent cache
+    /// goes stale, and every visible frame asks for the glyph.  What one call
+    /// costs is what a keystroke can queue behind.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "timing harness, not an assertion"]
+    fn report_process_probe_cost() {
+        let pid = std::process::id();
+        windows_process_probe::probe(pid);
+
+        // A burst well inside the 900 ms snapshot TTL, so every call after the
+        // first reuses the table and measures only the per-call derivation.
+        let iterations = 50;
+        let started = std::time::Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(windows_process_probe::probe(pid));
+        }
+        let warm = started.elapsed() / iterations;
+
+        std::thread::sleep(super::windows_process_probe::SNAPSHOT_TTL);
+        let started = std::time::Instant::now();
+        std::hint::black_box(windows_process_probe::probe(pid));
+        let refresh = started.elapsed();
+
+        let (_, counts) = crate::steady_state::measure(|| windows_process_probe::probe(pid));
+        println!(
+            "probe: {warm:?} warm, {refresh:?} when the snapshot has expired, {} allocations \
+             ({} KiB)",
+            counts.allocs,
+            counts.bytes / 1024,
+        );
     }
 
     /// Nothing drains a hidden session's channel, because nothing wakes the
