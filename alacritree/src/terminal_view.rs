@@ -228,6 +228,7 @@ fn dispatch_input(
                     // so the user sees their input — matches alacritty's
                     // on_terminal_input_start.
                     paste::on_terminal_input_start(session);
+                    crate::frame_log::keystroke_sent();
                     session.write(bytes);
                 },
             }

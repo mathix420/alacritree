@@ -7294,6 +7294,7 @@ impl eframe::App for AlacritreeApp {
                 grid: self.grid_paint,
                 cpu: frame.info().cpu_usage.map(std::time::Duration::from_secs_f32),
                 waited,
+                echo: crate::frame_log::echo(),
             });
         }
     }

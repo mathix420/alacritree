@@ -41,12 +41,59 @@ fn epoch() -> Instant {
     *EPOCH.get_or_init(Instant::now)
 }
 
+/// When the visible session last had a keystroke written to its PTY, as
+/// nanoseconds since `epoch()`; zero when nothing is awaiting an echo.
+static KEYSTROKE_AT: AtomicU64 = AtomicU64::new(0);
+
+/// The round trip of the most recent keystroke, waiting to be sampled.
+static ECHO: AtomicU64 = AtomicU64::new(0);
+
+/// Note that a keystroke went to the visible session's PTY.
+///
+/// The newest keystroke replaces the last, so a burst measures the round trip
+/// of the character still outstanding rather than of the one that started it.
+pub fn keystroke_sent() {
+    if enabled() {
+        KEYSTROKE_AT.store(now().max(1), Ordering::Relaxed);
+    }
+}
+
 /// Note that a session produced output that no frame has shown yet.
 ///
 /// Called from the PTY threads.
 pub fn output_arrived() {
-    if enabled() {
-        mark_pending(&OUTPUT_PENDING, now());
+    if !enabled() {
+        return;
+    }
+    let now = now();
+    mark_pending(&OUTPUT_PENDING, now);
+
+    close_echo(&KEYSTROKE_AT, &ECHO, now);
+}
+
+/// The round trip of the last keystroke to be echoed, once.
+pub fn echo() -> Option<Duration> {
+    take_echo(&ECHO)
+}
+
+/// Close the round trip of the keystroke still outstanding, if any.
+///
+/// Everything between the write and here is outside this process: the ConPTY
+/// round trip, the child's own redraw, and alacritty's parse.  It is the one
+/// segment of a keystroke's journey the frame timings cannot see.  Output the
+/// keystroke did not cause closes the trip early, so this bounds the segment
+/// from below.
+fn close_echo(sent_at: &AtomicU64, echo: &AtomicU64, arrived: u64) {
+    let sent = sent_at.swap(0, Ordering::Relaxed);
+    if sent != 0 {
+        echo.store(arrived.saturating_sub(sent).max(1), Ordering::Relaxed);
+    }
+}
+
+fn take_echo(echo: &AtomicU64) -> Option<Duration> {
+    match echo.swap(0, Ordering::Relaxed) {
+        0 => None,
+        nanos => Some(Duration::from_nanos(nanos)),
     }
 }
 
@@ -160,6 +207,7 @@ struct Samples {
     periods: Vec<Duration>,
     cpus: Vec<Duration>,
     waits: Vec<Duration>,
+    echoes: Vec<Duration>,
 }
 
 /// One frame's readings, gathered across `update` and handed over at the end.
@@ -170,6 +218,7 @@ pub struct Timings {
     /// not survive into a percentile over thousands of frames.
     pub cpu: Option<Duration>,
     pub waited: Option<Duration>,
+    pub echo: Option<Duration>,
 }
 
 pub struct FrameLog {
@@ -190,11 +239,12 @@ impl FrameLog {
     }
 
     pub fn record(&mut self, frame: Timings) {
-        let Timings { started, grid, cpu, waited } = frame;
+        let Timings { started, grid, cpu, waited, echo } = frame;
         self.samples.totals.push(started.elapsed());
         self.samples.grids.push(grid);
         self.samples.cpus.extend(cpu);
         self.samples.waits.extend(waited);
+        self.samples.echoes.extend(echo);
         if let Some(previous) = self.started_previous.replace(started) {
             self.samples.periods.push(started.saturating_duration_since(previous));
         }
@@ -207,7 +257,7 @@ impl FrameLog {
     fn report(&mut self) {
         let elapsed = self.reported_at.elapsed();
         self.reported_at = Instant::now();
-        let Samples { mut totals, mut grids, mut periods, mut cpus, mut waits } =
+        let Samples { mut totals, mut grids, mut periods, mut cpus, mut waits, mut echoes } =
             std::mem::take(&mut self.samples);
         if totals.is_empty() {
             return;
@@ -218,12 +268,14 @@ impl FrameLog {
         periods.sort_unstable();
         cpus.sort_unstable();
         waits.sort_unstable();
+        echoes.sort_unstable();
         let spent: Duration = totals.iter().sum();
 
         log::info!(
             "frames: {} in {:.1}s ({:.0}/s, {:.0}% of the thread) | total p50 {:?} p95 {:?} p99 \
              {:?} max {:?} | grid p50 {:?} p95 {:?} | period p50 {:?} p95 {:?} | render+update \
-             p50 {:?} p95 {:?} | output waited p50 {:?} p95 {:?} max {:?}",
+             p50 {:?} p95 {:?} | output waited p50 {:?} p95 {:?} max {:?} | echo n={} p50 {:?} \
+             p95 {:?} p99 {:?}",
             totals.len(),
             elapsed.as_secs_f64(),
             totals.len() as f64 / elapsed.as_secs_f64(),
@@ -241,6 +293,10 @@ impl FrameLog {
             Reading(quantile(&waits, 0.50)),
             Reading(quantile(&waits, 0.95)),
             Reading(waits.last().copied()),
+            echoes.len(),
+            Reading(quantile(&echoes, 0.50)),
+            Reading(quantile(&echoes, 0.95)),
+            Reading(quantile(&echoes, 0.99)),
         );
     }
 }
@@ -276,7 +332,7 @@ mod tests {
     }
 
     fn frame(started: Instant) -> Timings {
-        Timings { started, grid: Duration::ZERO, cpu: None, waited: None }
+        Timings { started, grid: Duration::ZERO, cpu: None, waited: None, echo: None }
     }
 
     #[test]
@@ -371,6 +427,40 @@ mod tests {
         mark_pending(&slot, 0);
 
         assert!(take_pending(&slot, 5_000).is_some());
+    }
+
+    /// The round trip runs from the keystroke's write to the output that
+    /// answered it.
+    #[test]
+    fn output_after_a_keystroke_closes_its_round_trip() {
+        let (sent_at, echo) = (AtomicU64::new(2_000), AtomicU64::new(0));
+
+        close_echo(&sent_at, &echo, 9_000);
+
+        assert_eq!(take_echo(&echo), Some(Duration::from_nanos(7_000)));
+    }
+
+    /// Output nobody typed for is most of what a terminal produces, and it
+    /// must not enter the sample as a round trip of its own.
+    #[test]
+    fn output_with_no_keystroke_outstanding_reports_nothing() {
+        let (sent_at, echo) = (AtomicU64::new(0), AtomicU64::new(0));
+
+        close_echo(&sent_at, &echo, 9_000);
+
+        assert_eq!(take_echo(&echo), None);
+    }
+
+    /// One keystroke is one round trip: the output that keeps coming after it
+    /// is the child still redrawing, not further keystrokes being answered.
+    #[test]
+    fn only_the_first_output_after_a_keystroke_counts() {
+        let (sent_at, echo) = (AtomicU64::new(2_000), AtomicU64::new(0));
+
+        close_echo(&sent_at, &echo, 9_000);
+        close_echo(&sent_at, &echo, 40_000);
+
+        assert_eq!(take_echo(&echo), Some(Duration::from_nanos(7_000)));
     }
 
     /// Each mark closes the phase that ran since the previous one, so the
