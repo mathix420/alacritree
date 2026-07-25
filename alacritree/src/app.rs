@@ -360,6 +360,9 @@ pub struct AlacritreeApp {
     ime: crate::ime::Ime,
     color_glyphs: crate::color_glyph::ColorGlyphCache,
     glyph_cache: crate::glyph_cache::GlyphCache,
+    /// Scratch buffers the painter copies the visible grid into, so the
+    /// terminal lock is released before any shape is built.
+    grid_snapshot: crate::terminal_view::GridSnapshot,
     /// In-flight background re-discoveries, keyed by project root.  WSL
     /// discovery shells out to wsl.exe and must never block paint; results
     /// are adopted in `poll_project_refreshes`.
@@ -679,6 +682,7 @@ impl AlacritreeApp {
                 color_glyph_budget_mb,
             ),
             glyph_cache: crate::glyph_cache::GlyphCache::new(),
+            grid_snapshot: crate::terminal_view::GridSnapshot::new(),
             pending_project_refresh: HashMap::new(),
             wsl_delta_paths: HashMap::new(),
             pending_delta: HashMap::new(),
@@ -7196,6 +7200,7 @@ impl eframe::App for AlacritreeApp {
                         &mut self.ime,
                         &mut self.color_glyphs,
                         &mut self.glyph_cache,
+                        &mut self.grid_snapshot,
                     )
                 };
                 // egui fake-clicks the natively focused widget on Space/Enter,
