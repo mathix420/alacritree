@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -25,19 +26,41 @@ use crate::wsl_helper::{self, WslProbe};
 pub struct EventProxy {
     ctx: egui::Context,
     sender: mpsc::Sender<TermEvent>,
+    /// Whether this session's grid is the one on screen.  Read from the PTY
+    /// thread on every event, written by the UI thread once per frame.
+    visible: Arc<AtomicBool>,
 }
 
 impl EventProxy {
     pub fn new(ctx: egui::Context) -> (Self, mpsc::Receiver<TermEvent>) {
         let (sender, receiver) = mpsc::channel();
-        (Self { ctx, sender }, receiver)
+        (Self { ctx, sender, visible: Arc::new(AtomicBool::new(true)) }, receiver)
     }
+
+    pub fn set_visible(&self, visible: bool) {
+        self.visible.store(visible, Ordering::Relaxed);
+    }
+}
+
+/// Whether an event has to wake the egui loop even though this session's grid
+/// is off screen.  `Wakeup` and `MouseCursorDirty` report only that grid
+/// content changed, which nothing on screen shows until the session is
+/// displayed again — a frame drawn for them repaints the *visible* session to
+/// the same pixels it already had.  Every other event has an effect the user
+/// can observe while looking elsewhere: titles and bells reach the sidebar,
+/// exits close a tab, and PTY replies are what the asking program is blocked
+/// on until a frame drains them.
+fn wakes_hidden_ui(event: &TermEvent) -> bool {
+    !matches!(event, TermEvent::Wakeup | TermEvent::MouseCursorDirty)
 }
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: TermEvent) {
+        let wake = self.visible.load(Ordering::Relaxed) || wakes_hidden_ui(&event);
         let _ = self.sender.send(event);
-        self.ctx.request_repaint();
+        if wake {
+            self.ctx.request_repaint();
+        }
     }
 }
 
@@ -123,6 +146,9 @@ pub struct Session {
     wsl_probe: Option<WslProbe>,
     notifier: Option<Notifier>,
     sender: Option<EventLoopSender>,
+    /// Shares this session's on-screen flag with the `EventProxy` its PTY
+    /// thread posts events through.
+    proxy: EventProxy,
     exited: bool,
 }
 
@@ -921,7 +947,7 @@ impl Session {
     ) -> std::io::Result<Self> {
         let editor = scratchpad::Editor::open(path.clone())?;
         let (proxy, events) = EventProxy::new(ctx);
-        let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, proxy)));
+        let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, proxy.clone())));
         Ok(Self {
             id: next_session_id(),
             title: "scratchpad".to_string(),
@@ -941,6 +967,7 @@ impl Session {
             wsl_probe: None,
             notifier: None,
             sender: None,
+            proxy,
             exited: false,
         })
     }
@@ -1020,7 +1047,7 @@ impl Session {
         let pty = tty::new(&pty_options, window_size, window_id)?;
         let shell_pid = pty_shell_pid(&pty);
 
-        let event_loop = EventLoop::new(term.clone(), proxy, pty, false, false)?;
+        let event_loop = EventLoop::new(term.clone(), proxy.clone(), pty, false, false)?;
         let sender = event_loop.channel();
         event_loop.spawn();
 
@@ -1046,8 +1073,16 @@ impl Session {
             wsl_probe,
             notifier: Some(Notifier(sender.clone())),
             sender: Some(sender),
+            proxy,
             exited: false,
         })
+    }
+
+    /// Mark whether this session's grid is the one being painted.  Output from
+    /// a session that isn't stops waking the egui loop, so a busy agent in a
+    /// background tab no longer costs a full repaint per chunk of output.
+    pub fn set_visible(&self, visible: bool) {
+        self.proxy.set_visible(visible);
     }
 
     pub fn write(&self, bytes: Vec<u8>) {
@@ -1340,6 +1375,78 @@ mod tests {
     use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 
     use super::*;
+
+    /// A repainted frame costs a full grid paint of whatever session is on
+    /// screen — milliseconds, at a maximized window.  Output from a session
+    /// the user cannot see changes nothing about that frame, so waking the UI
+    /// for it spends that cost to draw the same pixels again.  Several busy
+    /// agents in background tabs is enough to keep the loop saturated, which
+    /// is what typing then queues behind.
+    #[test]
+    fn a_hidden_sessions_output_does_not_wake_the_ui() {
+        let ctx = egui::Context::default();
+        let (proxy, _events) = EventProxy::new(ctx.clone());
+        proxy.set_visible(false);
+
+        proxy.send_event(TermEvent::Wakeup);
+
+        assert!(
+            !ctx.has_requested_repaint(),
+            "output from an off-screen session repainted the visible grid"
+        );
+    }
+
+    #[test]
+    fn a_visible_sessions_output_wakes_the_ui() {
+        let ctx = egui::Context::default();
+        let (proxy, _events) = EventProxy::new(ctx.clone());
+
+        proxy.send_event(TermEvent::Wakeup);
+
+        assert!(ctx.has_requested_repaint(), "the on-screen grid must repaint when it changes");
+    }
+
+    /// Only grid content is invisible while a session is off-screen.  Titles
+    /// and bells drive the sidebar, and PTY replies block the program that
+    /// asked until a frame drains them, so those still have to wake the loop.
+    #[test]
+    fn a_hidden_sessions_title_still_wakes_the_ui() {
+        let ctx = egui::Context::default();
+        let (proxy, _events) = EventProxy::new(ctx.clone());
+        proxy.set_visible(false);
+
+        proxy.send_event(TermEvent::Title("claude: thinking".into()));
+
+        assert!(ctx.has_requested_repaint(), "a background title change must reach the sidebar");
+    }
+
+    #[test]
+    fn a_hidden_sessions_pty_reply_still_wakes_the_ui() {
+        let ctx = egui::Context::default();
+        let (proxy, _events) = EventProxy::new(ctx.clone());
+        proxy.set_visible(false);
+
+        proxy.send_event(TermEvent::TextAreaSizeRequest(Arc::new(|_| String::new())));
+
+        assert!(
+            ctx.has_requested_repaint(),
+            "a program blocked on a terminal reply must not wait for unrelated input"
+        );
+    }
+
+    /// Events are queued whether or not they wake the loop, so a session that
+    /// was hidden while it produced output has all of it waiting the moment
+    /// something else draws a frame.
+    #[test]
+    fn a_hidden_sessions_events_are_still_queued() {
+        let ctx = egui::Context::default();
+        let (proxy, events) = EventProxy::new(ctx);
+        proxy.set_visible(false);
+
+        proxy.send_event(TermEvent::Wakeup);
+
+        assert!(matches!(events.try_recv(), Ok(TermEvent::Wakeup)));
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

@@ -5697,6 +5697,9 @@ impl AlacritreeApp {
 
         let grace = self.config.ui.attention_grace;
         for idx in 0..self.sessions.len() {
+            // Window focus is deliberately not part of this: an unfocused
+            // window still shows its grid, so its output still has to repaint.
+            self.sessions[idx].set_visible(Some(idx) == visible_idx);
             let outcome = self.sessions[idx].drain_events(&self.config.palette);
             // Ahead of the attention early-out: a background session copying
             // with OSC 52 still owns the clipboard.
