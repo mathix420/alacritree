@@ -359,6 +359,7 @@ pub struct AlacritreeApp {
     builtin_glyphs: crate::builtin_font::BuiltinGlyphCache,
     ime: crate::ime::Ime,
     color_glyphs: crate::color_glyph::ColorGlyphCache,
+    glyph_cache: crate::glyph_cache::GlyphCache,
     /// In-flight background re-discoveries, keyed by project root.  WSL
     /// discovery shells out to wsl.exe and must never block paint; results
     /// are adopted in `poll_project_refreshes`.
@@ -677,6 +678,7 @@ impl AlacritreeApp {
                 font_chain,
                 color_glyph_budget_mb,
             ),
+            glyph_cache: crate::glyph_cache::GlyphCache::new(),
             pending_project_refresh: HashMap::new(),
             wsl_delta_paths: HashMap::new(),
             pending_delta: HashMap::new(),
@@ -7193,6 +7195,7 @@ impl eframe::App for AlacritreeApp {
                         &mut self.builtin_glyphs,
                         &mut self.ime,
                         &mut self.color_glyphs,
+                        &mut self.glyph_cache,
                     )
                 };
                 // egui fake-clicks the natively focused widget on Space/Enter,

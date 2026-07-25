@@ -17,12 +17,14 @@ use crate::color_glyph::{CachedColorGlyph, ColorGlyphCache};
 use crate::colors::{background, foreground, resolve, rgb_to_color32};
 use crate::config::Config;
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
+use crate::glyph_cache::{Face, GlyphCache};
 use crate::input::event_to_bytes;
 use crate::links::{self, Link};
 use crate::mouse;
 use crate::paste;
 use crate::session::{EventProxy, Session, SessionKind, TermSize};
 
+#[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut Ui,
     session: &mut Session,
@@ -31,6 +33,7 @@ pub fn show(
     builtin_glyphs: &mut BuiltinGlyphCache,
     ime: &mut crate::ime::Ime,
     color_glyphs: &mut ColorGlyphCache,
+    glyphs: &mut GlyphCache,
 ) -> Response {
     let font_id = FontId::monospace(config.font.egui_size());
     let (cell_w_pt, cell_h_pt) = ui.ctx().fonts(|f| {
@@ -131,6 +134,7 @@ pub fn show(
         &metrics,
         builtin_glyphs,
         color_glyphs,
+        glyphs,
         ui.ctx(),
         hovered_link.as_ref().map(|l| &l.bounds),
         // The preedit overlay replaces the cursor while composing
@@ -747,6 +751,7 @@ fn paint_grid(
     metrics: &Metrics,
     builtin_glyphs: &mut BuiltinGlyphCache,
     color_glyphs: &mut ColorGlyphCache,
+    glyphs: &mut GlyphCache,
     ctx: &egui::Context,
     link_bounds: Option<&Match>,
     cursor_hidden: bool,
@@ -814,6 +819,7 @@ fn paint_grid(
                 metrics,
                 builtin_glyphs,
                 color_glyphs,
+                glyphs,
                 ctx,
             );
         }
@@ -885,6 +891,7 @@ fn paint_run(
     metrics: &Metrics,
     builtin_glyphs: &mut BuiltinGlyphCache,
     color_glyphs: &mut ColorGlyphCache,
+    glyphs: &mut GlyphCache,
     ctx: &egui::Context,
 ) {
     if run.is_empty() {
@@ -936,10 +943,10 @@ fn paint_run(
 
     if !style.flags.contains(Flags::HIDDEN) {
         // Per-glyph paint: egui's run layout drifts off the cursor's `col * cell_w` grid (worse with zoom).
-        let glyph_font = font_for_flags(style.flags, font_id);
+        let face =
+            Face::new(style.flags.contains(Flags::BOLD), style.flags.contains(Flags::ITALIC));
         let glyph_dx = config.font.glyph_offset.x as f32;
         let glyph_dy = config.font.glyph_offset.y as f32;
-        let mut buf = [0u8; 4];
         for (i, ch) in run.chars().enumerate() {
             if ch == ' ' {
                 continue;
@@ -967,12 +974,14 @@ fn paint_run(
                 paint_color_glyph(painter, cached, cell_x, y, ppp);
                 continue;
             }
-            painter.text(
-                Pos2::new(cell_x + glyph_dx, y + glyph_dy),
-                egui::Align2::LEFT_TOP,
-                ch.encode_utf8(&mut buf).to_string(),
-                glyph_font.clone(),
-                fg,
+            let galley = glyphs.get(ctx, ch, face, font_id.size);
+            painter.add(
+                egui::epaint::TextShape::new(
+                    Pos2::new(cell_x + glyph_dx, y + glyph_dy),
+                    galley,
+                    fg,
+                )
+                .with_override_text_color(fg),
             );
         }
     }
@@ -1185,6 +1194,171 @@ mod tests {
         let mut term = Term::new(TermConfig::default(), &TermSize::new(80, 24), proxy);
         Processor::<StdSyncHandler>::new().advance(&mut term, output);
         term
+    }
+
+    /// A PTY-less session whose grid can be driven straight from a byte
+    /// stream.  `spawn_scratchpad` is the only constructor that builds a
+    /// `Session` without a child process; dropping the editor afterwards
+    /// leaves a plain terminal session behind.
+    fn headless_session(ctx: &egui::Context, config: &Config) -> (Session, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("scratch.md");
+        std::fs::write(&path, "").expect("write scratch file");
+        let mut session = Session::spawn_scratchpad(
+            ctx.clone(),
+            config,
+            Some(dir.path().to_path_buf()),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            path,
+        )
+        .expect("scratchpad session");
+        session.scratchpad = None;
+        (session, dir)
+    }
+
+    /// One full paint of the grid: layout, shape building, and tessellation —
+    /// everything between a PTY wakeup and the vertex buffer the GPU gets.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_one_frame(
+        ctx: &egui::Context,
+        session: &mut Session,
+        config: &Config,
+        builtin: &mut BuiltinGlyphCache,
+        colors: &mut ColorGlyphCache,
+        glyphs: &mut GlyphCache,
+        ime: &mut crate::ime::Ime,
+        screen: Vec2,
+    ) -> usize {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, screen)),
+            ..Default::default()
+        };
+        let out = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(ui, session, config, false, builtin, ime, colors, glyphs);
+            });
+        });
+        let ppp = out.pixels_per_point;
+        ctx.tessellate(out.shapes, ppp)
+            .iter()
+            .map(|p| match &p.primitive {
+                egui::epaint::Primitive::Mesh(mesh) => mesh.vertices.len(),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// Dense output that fills every visible cell, with a colour change every
+    /// few columns so the run-splitting in `paint_grid` behaves like it does
+    /// under real program output rather than collapsing to one run per line.
+    fn dense_screen(cols: usize, rows: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for row in 0..rows {
+            out.extend_from_slice(format!("\x1b[{};1H", row + 1).as_bytes());
+            for col in 0..cols {
+                if col % 7 == 0 {
+                    out.extend_from_slice(format!("\x1b[3{}m", 1 + (col / 7) % 7).as_bytes());
+                }
+                out.push(b'a' + (col % 26) as u8);
+            }
+        }
+        out
+    }
+
+    /// Not a gate — run it by hand:
+    /// `cargo test -p alacritree --release -- --ignored --nocapture paint_cost`
+    ///
+    /// Every PTY wakeup requests a repaint, and a repaint runs this whole path
+    /// for the visible session.  What it costs is what a keystroke queues
+    /// behind while a session is streaming output.
+    #[test]
+    #[ignore = "timing harness, not an assertion"]
+    fn report_paint_cost() {
+        #[cfg(windows)]
+        crate::harden_dll_search_path();
+
+        let config = Config::default();
+        for screen in [Vec2::new(1280.0, 720.0), Vec2::new(2560.0, 1440.0)] {
+            let ctx = egui::Context::default();
+            let (mut session, _dir) = headless_session(&ctx, &config);
+            let mut builtin = BuiltinGlyphCache::new();
+            let mut colors = ColorGlyphCache::new(Vec::new(), 0);
+            let mut glyphs = GlyphCache::new();
+            let mut ime = crate::ime::Ime::default();
+
+            // The first frame is what tells the session how big the grid is.
+            paint_one_frame(
+                &ctx,
+                &mut session,
+                &config,
+                &mut builtin,
+                &mut colors,
+                &mut glyphs,
+                &mut ime,
+                screen,
+            );
+            // `Session::resize` forwards to the `Term` only when a PTY sender
+            // exists, so a headless session needs the grid resized by hand.
+            let (cols, rows) = (session.size.columns, session.size.screen_lines);
+            {
+                let mut term = session.term.lock();
+                term.resize(TermSize::new(cols, rows));
+                Processor::<StdSyncHandler>::new().advance(&mut *term, &dense_screen(cols, rows));
+            }
+
+            let mut verts = 0;
+            for _ in 0..10 {
+                verts = paint_one_frame(
+                    &ctx,
+                    &mut session,
+                    &config,
+                    &mut builtin,
+                    &mut colors,
+                    &mut glyphs,
+                    &mut ime,
+                    screen,
+                );
+            }
+
+            let iterations = 60;
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(paint_one_frame(
+                    &ctx,
+                    &mut session,
+                    &config,
+                    &mut builtin,
+                    &mut colors,
+                    &mut glyphs,
+                    &mut ime,
+                    screen,
+                ));
+            }
+            let each = start.elapsed() / iterations;
+
+            let (_, counts) = crate::steady_state::measure(|| {
+                paint_one_frame(
+                    &ctx,
+                    &mut session,
+                    &config,
+                    &mut builtin,
+                    &mut colors,
+                    &mut glyphs,
+                    &mut ime,
+                    screen,
+                )
+            });
+
+            println!(
+                "{}x{} logical px = {cols}x{rows} cells: {each:?} per frame, {} allocations \
+                 ({} KiB), {verts} vertices",
+                screen.x,
+                screen.y,
+                counts.allocs,
+                counts.bytes / 1024,
+            );
+        }
     }
 
     /// Full-screen apps hide the cursor with DECTCEM while they repaint, then

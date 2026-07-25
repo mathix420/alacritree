@@ -14,6 +14,7 @@ mod doppler;
 mod fonts;
 mod git_nav;
 mod git_status;
+mod glyph_cache;
 mod ime;
 mod input;
 mod ipc;
