@@ -73,6 +73,7 @@ impl EventListener for EventProxy {
         // as long as the window stayed idle.
         if !carries_payload(&event) {
             if self.visible.load(Ordering::Relaxed) {
+                crate::frame_log::output_arrived();
                 self.ctx.request_repaint();
             }
             return;

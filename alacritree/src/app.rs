@@ -7094,8 +7094,11 @@ impl eframe::App for AlacritreeApp {
         [n(bg.r()), n(bg.g()), n(bg.b()), self.config.window.opacity]
     }
 
-    fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        let frame_started = self.frame_log.as_ref().map(|_| std::time::Instant::now());
+    fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
+        let frame_started = self
+            .frame_log
+            .as_ref()
+            .map(|_| (std::time::Instant::now(), crate::frame_log::output_wait()));
         self.grid_paint = std::time::Duration::ZERO;
         self.poll_project_refreshes();
         self.poll_pending_deletes(ctx);
@@ -7263,8 +7266,13 @@ impl eframe::App for AlacritreeApp {
         // request has already scheduled.
         self.reconcile_sidebar_focus(ctx);
 
-        if let (Some(log), Some(started)) = (self.frame_log.as_mut(), frame_started) {
-            log.record(started.elapsed(), self.grid_paint);
+        if let (Some(log), Some((started, waited))) = (self.frame_log.as_mut(), frame_started) {
+            log.record(crate::frame_log::Timings {
+                started,
+                grid: self.grid_paint,
+                cpu: frame.info().cpu_usage.map(std::time::Duration::from_secs_f32),
+                waited,
+            });
         }
     }
 }
