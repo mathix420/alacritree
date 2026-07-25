@@ -42,25 +42,33 @@ impl EventProxy {
     }
 }
 
-/// Whether an event has to wake the egui loop even though this session's grid
-/// is off screen.  `Wakeup` and `MouseCursorDirty` report only that grid
-/// content changed, which nothing on screen shows until the session is
-/// displayed again — a frame drawn for them repaints the *visible* session to
-/// the same pixels it already had.  Every other event has an effect the user
-/// can observe while looking elsewhere: titles and bells reach the sidebar,
-/// exits close a tab, and PTY replies are what the asking program is blocked
-/// on until a frame drains them.
-fn wakes_hidden_ui(event: &TermEvent) -> bool {
+/// Whether an event carries something a frame has to act on, rather than just
+/// reporting that the grid changed.  `Wakeup` and `MouseCursorDirty` carry no
+/// payload: the grid they announce was already updated under the terminal
+/// lock, and the mouse icon is recomputed from hover state every frame, so a
+/// repaint is the whole of their effect.  Every other event has one a frame
+/// must observe: titles and bells reach the sidebar, exits close a tab, and
+/// PTY replies are what the asking program is blocked on until a frame drains
+/// them.
+fn carries_payload(event: &TermEvent) -> bool {
     !matches!(event, TermEvent::Wakeup | TermEvent::MouseCursorDirty)
 }
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: TermEvent) {
-        let wake = self.visible.load(Ordering::Relaxed) || wakes_hidden_ui(&event);
-        let _ = self.sender.send(event);
-        if wake {
-            self.ctx.request_repaint();
+        // A hidden session's grid is not on screen, so a repaint for it would
+        // redraw the *visible* session to the same pixels.  Nothing then
+        // drains the channel either, which is why the payload-free events must
+        // not enter it: a background agent streaming output would grow it for
+        // as long as the window stayed idle.
+        if !carries_payload(&event) {
+            if self.visible.load(Ordering::Relaxed) {
+                self.ctx.request_repaint();
+            }
+            return;
         }
+        let _ = self.sender.send(event);
+        self.ctx.request_repaint();
     }
 }
 
@@ -1443,9 +1451,26 @@ mod tests {
         let (proxy, events) = EventProxy::new(ctx);
         proxy.set_visible(false);
 
-        proxy.send_event(TermEvent::Wakeup);
+        proxy.send_event(TermEvent::Title("claude: thinking".into()));
 
-        assert!(matches!(events.try_recv(), Ok(TermEvent::Wakeup)));
+        assert!(matches!(events.try_recv(), Ok(TermEvent::Title(_))));
+    }
+
+    /// Nothing drains a hidden session's channel, because nothing wakes the
+    /// loop for it.  Payload-free wakeups therefore cannot go in: a background
+    /// agent streaming output would grow the channel for as long as the window
+    /// stays idle, and the next frame would have to pop all of it.
+    #[test]
+    fn a_hidden_sessions_wakeups_do_not_accumulate() {
+        let (proxy, events) = EventProxy::new(egui::Context::default());
+        proxy.set_visible(false);
+
+        for _ in 0..10_000 {
+            proxy.send_event(TermEvent::Wakeup);
+            proxy.send_event(TermEvent::MouseCursorDirty);
+        }
+
+        assert_eq!(events.try_iter().count(), 0);
     }
 
     #[cfg(target_os = "macos")]
