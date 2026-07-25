@@ -18,6 +18,36 @@ pub enum BindingAction {
     Unsupported(String),
 }
 
+/// A `Copy` stand-in for an action's identity, for logs that outlive the
+/// action itself.  The payloads are dropped: they are the user's keystrokes
+/// and config text, and naming the action is what a timing log needs.
+#[derive(Clone, Copy)]
+pub enum ActionLabel {
+    Chars,
+    Named(NamedAction),
+    Unsupported,
+}
+
+impl std::fmt::Debug for ActionLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Chars => f.write_str("Chars"),
+            Self::Named(action) => write!(f, "{action:?}"),
+            Self::Unsupported => f.write_str("Unsupported"),
+        }
+    }
+}
+
+impl BindingAction {
+    pub fn label(&self) -> ActionLabel {
+        match self {
+            Self::Chars(_) => ActionLabel::Chars,
+            Self::Named(n) => ActionLabel::Named(*n),
+            Self::Unsupported(_) => ActionLabel::Unsupported,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NamedAction {
     Paste,

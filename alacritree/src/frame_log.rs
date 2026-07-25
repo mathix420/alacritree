@@ -81,6 +81,11 @@ fn take_pending(slot: &AtomicU64, painted: u64) -> Option<Duration> {
 /// it is worth a line of its own naming what consumed it.
 const SLOW_FRAME: Duration = Duration::from_millis(15);
 
+/// One piece of work worth naming inside a slow frame.  Below the frame
+/// threshold, so the thing that caused a hitch is named even when it shared
+/// the frame with something bigger.
+const SLOW_PHASE: Duration = Duration::from_millis(10);
+
 /// Phases that fit in one frame's breakdown.  Marks past this are dropped:
 /// the breakdown is a debugging aid, not a reason to allocate mid-frame.
 const MAX_PHASES: usize = 16;
@@ -135,6 +140,16 @@ impl Phases {
         let breakdown =
             ranked.iter().map(|(name, d)| format!("{name} {d:?}")).collect::<Vec<_>>().join(", ");
         log::info!("slow frame: {total:?} | {breakdown}");
+    }
+}
+
+/// Name the individual piece of work that made a phase slow.
+///
+/// A phase is only as useful as its narrowest name: "ipc 101 ms" says the
+/// stall is on the socket path, not which request sat on the UI thread.
+pub fn note_if_slow(kind: &str, what: impl std::fmt::Debug, took: Duration) {
+    if enabled() && took >= SLOW_PHASE {
+        log::info!("slow {kind}: {what:?} {took:?}");
     }
 }
 

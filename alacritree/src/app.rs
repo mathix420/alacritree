@@ -1514,7 +1514,10 @@ impl AlacritreeApp {
             actions
         });
         for action in actions {
+            let name = action.label();
+            let started = std::time::Instant::now();
             self.dispatch_action(ctx, action, ActionOrigin::Keyboard);
+            crate::frame_log::note_if_slow("action", name, started.elapsed());
         }
     }
 
@@ -6897,7 +6900,10 @@ impl AlacritreeApp {
         let Some(rx) = &self.ipc_rx else { return };
         let calls: Vec<ipc::AppCall> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         for call in calls {
+            let name = call.request.name();
+            let started = std::time::Instant::now();
             let result = self.handle_ipc_request(ctx, call.request);
+            crate::frame_log::note_if_slow("ipc request", name, started.elapsed());
             // A send error means the client gave up waiting — nothing to do.
             let _ = call.reply_tx.send(result);
         }
@@ -7122,10 +7128,11 @@ impl eframe::App for AlacritreeApp {
                     PaneFocus::GitSidebar => self.handle_git_sidebar_nav(ctx),
                     PaneFocus::Terminal => {},
                 }
+                self.phases.mark("sidebar-nav");
                 self.handle_shortcuts(ctx);
             }
         }
-        self.phases.mark("input");
+        self.phases.mark("shortcuts");
         self.process_notification_actions(ctx);
         self.process_ipc_calls(ctx);
         self.phases.mark("ipc");

@@ -116,6 +116,31 @@ pub enum IpcRequest {
     },
 }
 
+impl IpcRequest {
+    /// The variant's name, for logs that must not print the payload: paths and
+    /// `SendText` bodies are the caller's data, not ours to write to a file.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::ListProjects => "ListProjects",
+            Self::ListSessions => "ListSessions",
+            Self::SelectWorkspace { .. } => "SelectWorkspace",
+            Self::CreateSession { .. } => "CreateSession",
+            Self::CloseSession { .. } => "CloseSession",
+            Self::SendText { .. } => "SendText",
+            Self::MoveSession { .. } => "MoveSession",
+            Self::ReadScreen { .. } => "ReadScreen",
+            Self::ReadScratchpad { .. } => "ReadScratchpad",
+            Self::RefreshProject { .. } => "RefreshProject",
+            Self::AddProject { .. } => "AddProject",
+            Self::RemoveProject { .. } => "RemoveProject",
+            Self::RenameProject { .. } => "RenameProject",
+            Self::GitStatus { .. } => "GitStatus",
+            Self::CreateWorktree { .. } => "CreateWorktree",
+            Self::RunAction { .. } => "RunAction",
+        }
+    }
+}
+
 pub type IpcResult = Result<Value, String>;
 
 /// One request en route to the UI thread, with the channel the connection
