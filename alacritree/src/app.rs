@@ -363,6 +363,11 @@ pub struct AlacritreeApp {
     /// Scratch buffers the painter copies the visible grid into, so the
     /// terminal lock is released before any shape is built.
     grid_snapshot: crate::terminal_view::GridSnapshot,
+    /// Present only under `ALACRITREE_FRAME_LOG`; `None` is the normal run.
+    frame_log: Option<crate::frame_log::FrameLog>,
+    /// How much of the frame in progress went to painting the terminal grid,
+    /// as opposed to the sidebars and everything else sharing it.
+    grid_paint: std::time::Duration,
     /// In-flight background re-discoveries, keyed by project root.  WSL
     /// discovery shells out to wsl.exe and must never block paint; results
     /// are adopted in `poll_project_refreshes`.
@@ -683,6 +688,8 @@ impl AlacritreeApp {
             ),
             glyph_cache: crate::glyph_cache::GlyphCache::new(),
             grid_snapshot: crate::terminal_view::GridSnapshot::new(),
+            frame_log: crate::frame_log::FrameLog::from_env(),
+            grid_paint: std::time::Duration::ZERO,
             pending_project_refresh: HashMap::new(),
             wsl_delta_paths: HashMap::new(),
             pending_delta: HashMap::new(),
@@ -7088,6 +7095,8 @@ impl eframe::App for AlacritreeApp {
     }
 
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        let frame_started = self.frame_log.as_ref().map(|_| std::time::Instant::now());
+        self.grid_paint = std::time::Duration::ZERO;
         self.poll_project_refreshes();
         self.poll_pending_deletes(ctx);
         self.poll_pending_creates(ctx);
@@ -7191,7 +7200,8 @@ impl eframe::App for AlacritreeApp {
                         editor_error,
                     )
                 } else {
-                    terminal_view::show(
+                    let started = std::time::Instant::now();
+                    let response = terminal_view::show(
                         ui,
                         session,
                         &self.config,
@@ -7201,7 +7211,9 @@ impl eframe::App for AlacritreeApp {
                         &mut self.color_glyphs,
                         &mut self.glyph_cache,
                         &mut self.grid_snapshot,
-                    )
+                    );
+                    self.grid_paint += started.elapsed();
+                    response
                 };
                 // egui fake-clicks the natively focused widget on Space/Enter,
                 // and the terminal keeps native focus while the sidebar owns
@@ -7250,6 +7262,10 @@ impl eframe::App for AlacritreeApp {
         // input; with it, the repair is queued for the frame the repaint
         // request has already scheduled.
         self.reconcile_sidebar_focus(ctx);
+
+        if let (Some(log), Some(started)) = (self.frame_log.as_mut(), frame_started) {
+            log.record(started.elapsed(), self.grid_paint);
+        }
     }
 }
 

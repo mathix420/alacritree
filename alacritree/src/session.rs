@@ -54,6 +54,16 @@ fn carries_payload(event: &TermEvent) -> bool {
     !matches!(event, TermEvent::Wakeup | TermEvent::MouseCursorDirty)
 }
 
+/// How long a background session's spinner frame may wait for the loop.
+///
+/// Agents animate a Braille spinner in the terminal title, so a busy one emits
+/// a title change several times a second.  Off screen that moves a sidebar
+/// glyph, and waking the loop for each one repaints the entire visible grid to
+/// do it — with a few agents running, enough to saturate the UI thread.
+/// Coalescing to this interval keeps the glyph turning without letting the
+/// animation set the frame rate.
+const SPINNER_COALESCE: Duration = Duration::from_millis(120);
+
 impl EventListener for EventProxy {
     fn send_event(&self, event: TermEvent) {
         // A hidden session's grid is not on screen, so a repaint for it would
@@ -67,8 +77,17 @@ impl EventListener for EventProxy {
             }
             return;
         }
+        // The frame that ends the animation is the one that matters — a
+        // spinner title giving way to a plain one is how an agent says it is
+        // done — so only the animation frames themselves are held back.
+        let spinner_frame = !self.visible.load(Ordering::Relaxed)
+            && matches!(&event, TermEvent::Title(title) if is_spinner_title(title));
         let _ = self.sender.send(event);
-        self.ctx.request_repaint();
+        if spinner_frame {
+            self.ctx.request_repaint_after(SPINNER_COALESCE);
+        } else {
+            self.ctx.request_repaint();
+        }
     }
 }
 
@@ -1524,9 +1543,44 @@ mod tests {
         assert!(ctx.has_requested_repaint(), "the on-screen grid must repaint when it changes");
     }
 
+    /// An agent animating a Braille spinner in its title emits one of these
+    /// several times a second.  Off screen it moves a sidebar glyph, and
+    /// waking the loop for each repaints the whole visible grid to do it —
+    /// with a few agents running, that alone saturates the UI thread.
+    #[test]
+    fn a_hidden_sessions_spinner_frame_does_not_force_a_repaint() {
+        let ctx = egui::Context::default();
+        let (proxy, events) = EventProxy::new(ctx.clone());
+        proxy.set_visible(false);
+
+        // The delay egui hands its repaint callback is what winit schedules
+        // the wakeup on, so it is the difference between "draw now" and "draw
+        // when convenient".  `has_requested_repaint` reports both alike.
+        let delays = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&delays);
+        ctx.set_request_repaint_callback(move |info| {
+            seen.lock().expect("delays").push(info.delay);
+        });
+
+        proxy.send_event(TermEvent::Title("⠋ claude".into()));
+
+        let delays = delays.lock().expect("delays");
+        assert_eq!(delays.len(), 1, "a spinner frame asked for more than one repaint");
+        assert!(
+            delays[0] > Duration::ZERO,
+            "a background spinner frame repainted the visible grid immediately"
+        );
+        assert!(
+            matches!(events.try_recv(), Ok(TermEvent::Title(_))),
+            "the title still has to reach the sidebar, just not this instant"
+        );
+    }
+
     /// Only grid content is invisible while a session is off-screen.  Titles
     /// and bells drive the sidebar, and PTY replies block the program that
     /// asked until a frame drains them, so those still have to wake the loop.
+    /// A spinner giving way to a plain title is how an agent signals it is
+    /// done, so that transition is exactly the one that must not be held back.
     #[test]
     fn a_hidden_sessions_title_still_wakes_the_ui() {
         let ctx = egui::Context::default();

@@ -12,6 +12,7 @@ mod command_palette;
 mod config;
 mod doppler;
 mod fonts;
+mod frame_log;
 mod git_nav;
 mod git_status;
 mod glyph_cache;
