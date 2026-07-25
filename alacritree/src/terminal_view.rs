@@ -1229,24 +1229,91 @@ mod tests {
         glyphs: &mut GlyphCache,
         ime: &mut crate::ime::Ime,
         screen: Vec2,
-    ) -> usize {
+    ) -> FrameCost {
         let raw = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, screen)),
             ..Default::default()
         };
+        let started = std::time::Instant::now();
         let out = ctx.run(raw, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 show(ui, session, config, false, builtin, ime, colors, glyphs);
             });
         });
+        let build = started.elapsed();
         let ppp = out.pixels_per_point;
-        ctx.tessellate(out.shapes, ppp)
+        let started = std::time::Instant::now();
+        let primitives = ctx.tessellate(out.shapes, ppp);
+        let tessellate = started.elapsed();
+        let vertices = primitives
             .iter()
             .map(|p| match &p.primitive {
                 egui::epaint::Primitive::Mesh(mesh) => mesh.vertices.len(),
                 _ => 0,
             })
-            .sum()
+            .sum();
+        FrameCost { build, tessellate, vertices }
+    }
+
+    /// Where a frame's time goes.  `build` is the grid walk that turns cells
+    /// into shapes — the part damage tracking can skip; `tessellate` turns
+    /// those shapes into vertices and runs whether or not anything changed.
+    #[derive(Default, Clone, Copy)]
+    struct FrameCost {
+        build: std::time::Duration,
+        tessellate: std::time::Duration,
+        vertices: usize,
+    }
+
+    /// How much of the grid `Term` reports as damaged, as a renderer that
+    /// wanted to repaint only what changed would see it.
+    fn damage_extent(term: &mut Term<EventProxy>) -> String {
+        let extent = match term.damage() {
+            alacritty_terminal::term::TermDamage::Full => "FULL".to_string(),
+            alacritty_terminal::term::TermDamage::Partial(lines) => {
+                format!("{} lines", lines.count())
+            },
+        };
+        term.reset_damage();
+        extent
+    }
+
+    /// Not a gate — run it by hand:
+    /// `cargo test -p alacritree --release -- --ignored --nocapture report_damage`
+    ///
+    /// Decides whether damage can drive a partial repaint at all.  Scrolling
+    /// the screen marks the whole terminal damaged (`Term::scroll_up_relative`
+    /// calls `mark_fully_damaged`), and a program appending output to a full
+    /// screen scrolls on every line.
+    #[test]
+    #[ignore = "reporting harness, not an assertion"]
+    fn report_damage_under_output() {
+        let (proxy, _events) = EventProxy::new(egui::Context::default());
+        let mut term = Term::new(TermConfig::default(), &TermSize::new(80, 24), proxy);
+        let mut parser = Processor::<StdSyncHandler>::new();
+
+        parser.advance(&mut term, &dense_screen(80, 24));
+        term.reset_damage();
+
+        parser.advance(&mut term, b"\x1b[5;1Hin-place edit");
+        println!("write inside the screen, no scroll: {}", damage_extent(&mut term));
+
+        // The cursor is parked on the last row by the fill, so a newline here
+        // scrolls — the steady state for any program streaming output.
+        parser.advance(&mut term, b"\x1b[24;1H");
+        term.reset_damage();
+        parser.advance(&mut term, b"one appended line\r\n");
+        println!("append one line at the bottom: {}", damage_extent(&mut term));
+
+        parser.advance(&mut term, b"another line\r\n");
+        term.reset_damage();
+        parser.advance(&mut term, b"and another\r\n");
+        println!("append again: {}", damage_extent(&mut term));
+
+        term.scroll_display(Scroll::Delta(5));
+        term.reset_damage();
+        parser.advance(&mut term, b"output while scrolled back\r\n");
+        println!("append while scrolled back: {}", damage_extent(&mut term));
     }
 
     /// Dense output that fills every visible cell, with a colour change every
@@ -1307,9 +1374,9 @@ mod tests {
                 Processor::<StdSyncHandler>::new().advance(&mut *term, &dense_screen(cols, rows));
             }
 
-            let mut verts = 0;
+            let mut cost = FrameCost::default();
             for _ in 0..10 {
-                verts = paint_one_frame(
+                cost = paint_one_frame(
                     &ctx,
                     &mut session,
                     &config,
@@ -1323,8 +1390,10 @@ mod tests {
 
             let iterations = 60;
             let start = std::time::Instant::now();
+            let (mut build, mut tessellate) =
+                (std::time::Duration::ZERO, std::time::Duration::ZERO);
             for _ in 0..iterations {
-                std::hint::black_box(paint_one_frame(
+                cost = std::hint::black_box(paint_one_frame(
                     &ctx,
                     &mut session,
                     &config,
@@ -1334,8 +1403,11 @@ mod tests {
                     &mut ime,
                     screen,
                 ));
+                build += cost.build;
+                tessellate += cost.tessellate;
             }
             let each = start.elapsed() / iterations;
+            let (build, tessellate) = (build / iterations, tessellate / iterations);
 
             let (_, counts) = crate::steady_state::measure(|| {
                 paint_one_frame(
@@ -1351,12 +1423,13 @@ mod tests {
             });
 
             println!(
-                "{}x{} logical px = {cols}x{rows} cells: {each:?} per frame, {} allocations \
-                 ({} KiB), {verts} vertices",
+                "{}x{} logical px = {cols}x{rows} cells: {each:?} per frame (build {build:?} + \
+                 tessellate {tessellate:?}), {} allocations ({} KiB), {} vertices",
                 screen.x,
                 screen.y,
                 counts.allocs,
                 counts.bytes / 1024,
+                cost.vertices,
             );
         }
     }
