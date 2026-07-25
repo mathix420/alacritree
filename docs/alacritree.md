@@ -278,6 +278,10 @@ sidebar_focus      = "preserve"  # how far the projects sidebar goes when the
                                   # slides to a sibling bounded by its parent.
                                   # "follow": also moves the terminal to a delete
                                   # landing that has a live session
+vsync              = true   # restart required — wait for the display's refresh
+                            # before showing a finished frame (default true).
+                            # false presents each frame as soon as it is drawn,
+                            # trading tearing for lower keystroke-to-screen delay
 
 [ui.icons]                  # sidebar glyph overrides (e.g. Nerd Font icons)
 search = "⌕"                # glyph prefixing the sidebar search prompt

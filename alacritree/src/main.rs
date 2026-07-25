@@ -108,7 +108,8 @@ fn main() -> eframe::Result<()> {
         viewport = viewport.with_icon(icon);
     }
 
-    let native_options = eframe::NativeOptions { viewport, ..Default::default() };
+    let native_options =
+        eframe::NativeOptions { viewport, vsync: config.ui.vsync, ..Default::default() };
 
     eframe::run_native(
         "Alacritree",

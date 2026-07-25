@@ -489,6 +489,11 @@ pub struct UiTheme {
     /// it (so filter typing works without the focus shortcut).  Off by default
     /// so unmodified configs keep click-through-to-terminal behavior.
     pub sidebar_click_focus: bool,
+    /// `[ui] vsync`: block each present until the display's next refresh.  On
+    /// by default, as upstream eframe has it.  Turning it off presents a
+    /// finished frame immediately, trading tearing for the queueing delay
+    /// between a keystroke's frame and the screen.
+    pub vsync: bool,
     /// `[ui] worktree_name`: template for worktree row labels (subst syntax:
     /// `$name`, `$branch`, `$path`, `${var:fallback}`; `$pr` is the branch's
     /// PR number as `#123`, absent when none is known — it needs
@@ -521,6 +526,7 @@ impl Default for UiTheme {
             focus_outline: FocusOutline::default(),
             scrollbar: ScrollbarStyle::Floating,
             sidebar_click_focus: false,
+            vsync: true,
             worktree_name: None,
             project_name: None,
             path_style: PathStyleConfig::default(),
@@ -1178,6 +1184,9 @@ struct RawUi {
     focus_outline: RawFocusOutline,
     /// Clicking a sidebar moves keyboard focus to it.  Default false.
     sidebar_click_focus: Option<bool>,
+    /// Wait for the display's refresh before showing a finished frame.
+    /// Default true.
+    vsync: Option<bool>,
     path_style: RawPathStyle,
 }
 
@@ -1340,6 +1349,7 @@ impl RawConfig {
             },
             scrollbar: parse_scrollbar(self.ui.scrollbar.as_deref()),
             sidebar_click_focus: self.ui.sidebar_click_focus.unwrap_or(false),
+            vsync: self.ui.vsync.unwrap_or(true),
             worktree_name: self.ui.worktree_name.clone().filter(|t| !t.trim().is_empty()),
             project_name: self.ui.project_name.clone().filter(|t| !t.trim().is_empty()),
             path_style: PathStyleConfig {
@@ -2131,6 +2141,16 @@ program = "second"
     #[test]
     fn sidebar_click_focus_defaults_off() {
         assert!(!ui_from_toml("").sidebar_click_focus);
+    }
+
+    #[test]
+    fn vsync_defaults_on() {
+        assert!(ui_from_toml("").vsync);
+    }
+
+    #[test]
+    fn vsync_parses() {
+        assert!(!ui_from_toml("[ui]\nvsync = false").vsync);
     }
 
     #[test]
