@@ -1432,6 +1432,132 @@ mod tests {
         }
     }
 
+    /// A context with the three named terminal families bound, as
+    /// `fonts::install_terminal_fonts` leaves it in the app.  egui panics on a
+    /// family it was never given, so any fixture with a bold or italic cell
+    /// needs them.
+    fn ctx_with_terminal_faces() -> egui::Context {
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        let mono = fonts.families[&FontFamily::Monospace].clone();
+        for name in [BOLD_FAMILY, ITALIC_FAMILY, BOLD_ITALIC_FAMILY] {
+            fonts.families.insert(FontFamily::Name(name.into()), mono.clone());
+        }
+        ctx.set_fonts(fonts);
+        ctx
+    }
+
+    /// A glyph as it was painted: which character, in what colour, and from
+    /// which font family.
+    #[derive(Debug, PartialEq)]
+    struct PaintedGlyph {
+        ch: String,
+        color: Color32,
+        family: FontFamily,
+    }
+
+    /// Every glyph and every filled rectangle a focused frame painted.  The
+    /// snapshot resolves colours and faces before the painter ever runs, so
+    /// this is where a mistake in that resolution becomes visible.
+    fn painted_cells(
+        ctx: &egui::Context,
+        session: &mut Session,
+        config: &Config,
+        caches: &mut Caches,
+        screen: Vec2,
+    ) -> (Vec<PaintedGlyph>, Vec<Color32>) {
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, screen)),
+            ..Default::default()
+        };
+        let out = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(
+                    ui,
+                    session,
+                    config,
+                    true,
+                    &mut caches.builtin,
+                    &mut caches.ime,
+                    &mut caches.colors,
+                    &mut caches.glyphs,
+                    &mut caches.snapshot,
+                );
+            });
+        });
+        let (mut glyphs, mut fills) = (Vec::new(), Vec::new());
+        for clipped in &out.shapes {
+            collect_cells(&clipped.shape, &mut glyphs, &mut fills);
+        }
+        (glyphs, fills)
+    }
+
+    fn collect_cells(
+        shape: &egui::Shape,
+        glyphs: &mut Vec<PaintedGlyph>,
+        fills: &mut Vec<Color32>,
+    ) {
+        match shape {
+            egui::Shape::Text(text) => glyphs.push(PaintedGlyph {
+                ch: text.galley.text().to_owned(),
+                color: text.override_text_color.unwrap_or(text.fallback_color),
+                family: text.galley.job.sections[0].format.font_id.family.clone(),
+            }),
+            egui::Shape::Rect(rect) => fills.push(rect.fill),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect_cells(s, glyphs, fills)),
+            _ => {},
+        }
+    }
+
+    /// The snapshot resolves every cell's foreground, background and face
+    /// before the terminal lock is released, so a cell that reverses video,
+    /// picks a palette colour, or asks for bold has to come out of that copy
+    /// looking the way the terminal asked.
+    #[test]
+    fn styled_cells_keep_their_colours_and_faces_through_the_snapshot() {
+        let config = Config::default();
+        let ctx = ctx_with_terminal_faces();
+        let (mut session, _dir) = headless_session(&ctx, &config);
+        let mut caches = Caches::new();
+        let screen = Vec2::new(640.0, 480.0);
+
+        painted_cells(&ctx, &mut session, &config, &mut caches, screen);
+        let (cols, rows) = (session.size.columns, session.size.screen_lines);
+        {
+            let mut term = session.term.lock();
+            term.resize(TermSize::new(cols, rows));
+            Processor::<StdSyncHandler>::new().advance(
+                &mut *term,
+                b"\x1b[0mP\x1b[7mR\x1b[0m\x1b[1mB\x1b[0m\x1b[3mI\x1b[0m\x1b[31mC",
+            );
+        }
+
+        let (glyphs, fills) = painted_cells(&ctx, &mut session, &config, &mut caches, screen);
+        let at = |ch: &str| glyphs.iter().find(|g| g.ch == ch).expect("glyph was not painted");
+
+        let fg = rgb_to_color32(resolve(
+            AnsiColor::Named(alacritty_terminal::vte::ansi::NamedColor::Foreground),
+            Flags::empty(),
+            session.term.lock().colors(),
+            &config.palette,
+            true,
+        ));
+        let bg = background(&config.palette);
+
+        assert_eq!(at("P").color, fg, "a plain cell");
+        assert_eq!(at("P").family, FontFamily::Monospace);
+
+        // Reverse video swaps the pair, so the glyph takes the default
+        // background and the run paints the default foreground behind it.
+        assert_eq!(at("R").color, bg, "a reverse-video cell");
+        assert!(fills.contains(&fg), "reverse video painted no background behind the glyph");
+
+        assert_eq!(at("B").family, FontFamily::Name(BOLD_FAMILY.into()), "a bold cell");
+        assert_eq!(at("I").family, FontFamily::Name(ITALIC_FAMILY.into()), "an italic cell");
+
+        assert_ne!(at("C").color, fg, "SGR 31 painted in the default foreground");
+    }
+
     /// Typing snaps the view back to the prompt (`on_terminal_input_start`), so
     /// the frame carrying the keystroke has to paint the bottom of the buffer.
     /// Consuming input only after the grid is built paints the stale
