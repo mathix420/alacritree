@@ -29,6 +29,18 @@ use alacritty_terminal::tty::{
 use polling::os::iocp::{CompletionPacket, PollerIocpExt};
 use polling::{Event, PollMode, Poller};
 
+/// How much one read may hand back.
+///
+/// The read loop reserves the terminal for as long as it runs and stops once
+/// it has parsed its own cap, but it checks that cap only after parsing
+/// whatever the last read returned — so a single drain the size of its buffer
+/// becomes a single parse of the same size, and the pane holds the grid for as
+/// long as that takes.  A console delivers hundreds of kilobytes at a time
+/// under load, which is tens of milliseconds the UI thread spends queued for a
+/// lock it needs every frame.  Handing back a slice instead splits that into
+/// batches the loop can be interrupted between.
+const READ_CHUNK: usize = 32 * 1024;
+
 /// Owns the PTY because `EventedReadWrite` hands out `&mut Self::Reader`, and
 /// only the type holding the reader can supply that.
 pub struct RearmingReader {
@@ -38,7 +50,8 @@ pub struct RearmingReader {
 
 impl Read for RearmingReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let read = self.pty.reader().read(buf)?;
+        let chunk = buf.len().min(READ_CHUNK);
+        let read = self.pty.reader().read(&mut buf[..chunk])?;
         if read > 0 {
             if let Some(poller) = &self.poller {
                 let _ = poller.post(CompletionPacket::new(Event::readable(PTY_READ_WRITE_TOKEN)));
