@@ -5032,6 +5032,30 @@ fn sidebar_session_ids(
     if ids.len() < threshold { Vec::new() } else { ids }
 }
 
+/// Step the lockstep index over the rows a skipped worktree owns.
+///
+/// The projection is built before the deletion is known, so it still lists
+/// the worktree and any sessions under it.  Leaving the index parked on a row
+/// no node will match again would mark every later node unprojected, and the
+/// cursor repair reads an unprojected row as one that has gone away.
+fn skip_projected_rows(
+    rows: &[SidebarRow],
+    next_row: &mut usize,
+    live: &[(WorkspaceKey, SessionId)],
+    path: &Path,
+) {
+    if rows.get(*next_row) != Some(&SidebarRow::Worktree(path.to_path_buf())) {
+        return;
+    }
+    *next_row += 1;
+    while let Some(SidebarRow::Session(id)) = rows.get(*next_row) {
+        if !live.iter().any(|(ws, live_id)| live_id == id && ws.as_deref() == Some(path)) {
+            break;
+        }
+        *next_row += 1;
+    }
+}
+
 /// Assemble the model arena and the projection.  `rows` is the projection —
 /// exactly what the cursor steps over — and `live` is the model: every running
 /// session, whatever the listing threshold or the filter says.  Building
@@ -5085,6 +5109,7 @@ fn build_sidebar_snapshot(
             push(&mut b, &mut next_row, SidebarRow::Project(p.root.clone()), Parent::Root);
         for wt in &p.worktrees {
             if skip_worktree == Some(wt.path.as_path()) {
+                skip_projected_rows(rows, &mut next_row, live, &wt.path);
                 continue;
             }
             let wt_id = push(
@@ -8442,5 +8467,39 @@ mod tests {
             "the async git delete has not finished, but the row must not read as present"
         );
         assert!(snapshot.find(&SidebarRow::Worktree(PathBuf::from("/a/wt1"))).is_some());
+    }
+
+    /// The rows below a worktree being deleted must stay navigable.
+    ///
+    /// The projection is built before the deletion is known, so it still
+    /// lists the doomed worktree.  The builder consumes that projection in
+    /// lockstep, so skipping the worktree without stepping the index leaves
+    /// it parked on a row nothing will ever match again — every later node
+    /// reads as unprojected, and the cursor repair treats an unprojected row
+    /// as one that has gone away.
+    #[test]
+    fn rows_below_a_deleted_worktree_stay_navigable() {
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        let projects =
+            vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2", "/a/wt3"])];
+        let listed = sidebar_nav::ListedSessions::new();
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let doomed = PathBuf::from("/a/wt2");
+        let snapshot = build_sidebar_snapshot(
+            &projects,
+            &[],
+            &rows,
+            Some(doomed.as_path()),
+            Default::default(),
+        );
+
+        let below = snapshot
+            .find(&SidebarRow::Worktree(PathBuf::from("/a/wt3")))
+            .expect("the worktree below the deleted one is still in the tree");
+        assert!(
+            snapshot.is_projected(below),
+            "a row below the one being deleted must still be navigable"
+        );
     }
 }
