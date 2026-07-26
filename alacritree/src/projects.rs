@@ -225,11 +225,6 @@ impl Project {
         self.label.as_deref().unwrap_or(&self.name)
     }
 
-    pub fn refresh(&mut self) {
-        let found = Project::discover(self.root.clone());
-        self.apply(found);
-    }
-
     /// Adopt a discovery result.  A non-authoritative result leaves the
     /// discovered fields alone: an unreachable backend must not read as
     /// deletion.  `expanded`, `shell_override`, and `label` are user state and

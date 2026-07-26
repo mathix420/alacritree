@@ -982,7 +982,7 @@ impl AlacritreeApp {
             if let Some(idx) =
                 self.projects.iter().position(|p| p.worktrees.iter().any(|w| w.path == path))
             {
-                self.projects[idx].refresh();
+                self.refresh_project(ctx, idx);
             }
             return;
         }
@@ -6920,8 +6920,8 @@ impl AlacritreeApp {
         reply_tx: mpsc::Sender<ipc::IpcResult>,
     ) {
         let Some(idx) = self.projects.iter().position(|p| p.root == root) else {
-            let _ = reply_tx
-                .send(Err(format!("{} is not a project in the sidebar", root.display())));
+            let _ =
+                reply_tx.send(Err(format!("{} is not a project in the sidebar", root.display())));
             return;
         };
         self.refresh_project(ctx, idx);
