@@ -70,6 +70,10 @@ tempfile = "3"
 fontconfig = "0.8"
 
 [target.'cfg(windows)'.dependencies]
+# Re-posts the console-pipe readiness that the emulated level mode drops
+# mid-burst (`pty_rearm`).  Must resolve to the same version alacritty_terminal
+# links, or the `Poller` handed to the registration is a different type.
+polling = "3.11"
 # Restricts the DLL search path at startup (`harden_dll_search_path`) and
 # borrows the launching shell's console so the CLI can print
 # (`attach_parent_console`).

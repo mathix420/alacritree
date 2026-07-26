@@ -30,6 +30,8 @@ mod path_style;
 mod pr_status;
 mod project_refresh;
 mod projects;
+#[cfg(windows)]
+mod pty_rearm;
 mod row_label;
 mod scratchpad;
 mod session;

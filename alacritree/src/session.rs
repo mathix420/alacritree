@@ -1185,6 +1185,9 @@ impl Session {
         let pty = tty::new(&pty_options, window_size, window_id)?;
         let shell_pid = pty_shell_pid(&pty);
 
+        #[cfg(windows)]
+        let pty = crate::pty_rearm::RearmingPty::new(pty);
+
         let event_loop = EventLoop::new(term.clone(), proxy.clone(), pty, false, false)?;
         let sender = event_loop.channel();
         event_loop.spawn();
@@ -2025,6 +2028,84 @@ mod tests {
         // Paired with ALT_SCREEN this is what `apply_scroll` keys off; it is on by
         // default, so a pager resetting it would silently break the wheel too.
         assert!(session.term.lock().mode().contains(TermMode::ALTERNATE_SCROLL));
+    }
+
+    /// A burst bigger than one read must keep flowing with nothing typed.
+    ///
+    /// Windows has no real readiness for the console pipe, so the reader
+    /// emulates it: a completion packet is posted from the waker `piper`
+    /// holds, and `piper` installs that waker only when a drain comes up
+    /// empty.  A read burst that stops at `MAX_LOCKED_READ` with more still
+    /// buffered therefore leaves nothing able to announce the rest, and the
+    /// loop sleeps until an unrelated event arrives.  A keystroke is one; a
+    /// benchmark writing megabytes is not, so its output stalls until the
+    /// user types.
+    #[cfg(windows)]
+    #[test]
+    fn a_burst_bigger_than_one_read_keeps_flowing_without_input() {
+        crate::harden_dll_search_path();
+
+        const MARKER: &str = "BURST-COMPLETE";
+
+        // Writing to the standard output handle rather than `Console.Out`,
+        // because the stall needs one drain to come back holding more than
+        // `MAX_LOCKED_READ`.  `Console.Out` is a `StreamWriter` and hands the
+        // console a few hundred bytes at a time however large the string is,
+        // which the reader keeps up with; the handle takes the whole buffer in
+        // one write.  This is also why a program printing line by line never
+        // stalls and an ordinary shell session looks fine.
+        let script =
+            std::env::temp_dir().join(format!("alacritree-burst-{}.ps1", std::process::id()));
+        std::fs::write(
+            &script,
+            format!(
+                "$out = [Console]::OpenStandardOutput()\n\
+                 $block = [Text.Encoding]::ASCII.GetBytes([string]::new('x', 262144))\n\
+                 for ($i = 0; $i -lt 32; $i++) {{\n\
+                 $out.Write($block, 0, $block.Length)\n\
+                 }}\n\
+                 $tail = [Text.Encoding]::ASCII.GetBytes(\"`n{MARKER}`n\")\n\
+                 $out.Write($tail, 0, $tail.Length)\n\
+                 $out.Flush()\n\
+                 Start-Sleep -Seconds 600\n"
+            ),
+        )
+        .unwrap();
+
+        // The producer sleeps rather than exits: a child that exits would end
+        // the read loop through its own watcher, which is exactly the
+        // unrelated event this has to do without.
+        let session = Session::spawn_command(
+            egui::Context::default(),
+            &Config::default(),
+            std::env::current_dir().ok(),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            "powershell".to_string(),
+            vec!["-NoProfile".to_string(), "-File".to_string(), script.display().to_string()],
+            "probe".to_string(),
+            SessionKind::Shell,
+        )
+        .unwrap();
+
+        let start = Instant::now();
+        let arrived = loop {
+            if session.screen_snapshot(0).lines.iter().any(|line| line.contains(MARKER)) {
+                break Some(start.elapsed());
+            }
+            if start.elapsed() > Duration::from_secs(60) {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        };
+        let _ = std::fs::remove_file(&script);
+
+        let screen = session.screen_snapshot(0).lines.join("\n");
+        assert!(
+            arrived.is_some(),
+            "the pane was written 8 MiB back to back and the last line never arrived: the read \
+             loop is waiting for input it should not need.\nScreen was:\n{screen}"
+        );
     }
 
     /// A pane must not wait on the console host's startup handshake.
