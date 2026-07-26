@@ -28,6 +28,17 @@ post-announce-jobs = ["./publish-downstream", "./release-macos-app"]
 # formula, scoop) already handles gzip, and AUR makepkg extracts it natively.
 unix-archive = ".tar.gz"
 windows-archive = ".zip"
+# The console host alacritree loads from its own directory on Windows, plus the
+# upstream MIT notice that has to travel with it (alacritree/vendor/conpty).
+# Both files have to land in the archive root, next to alacritree.exe, or
+# LoadLibraryW does not find them.  dist copies `include` into every archive and
+# offers no per-target scoping, so the Unix tarballs carry them as well; they
+# are inert there, and the alternative is hand-editing a generated workflow.
+include = [
+    "alacritree/vendor/conpty/conpty.dll",
+    "alacritree/vendor/conpty/OpenConsole.exe",
+    "alacritree/vendor/conpty/LICENSE-conpty.txt",
+]
 
 # Native runners per target: the GUI links fontconfig/GL system libraries, so
 # cross-compiling from a different-arch host doesn't work.
