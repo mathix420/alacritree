@@ -1701,6 +1701,12 @@ mod tests {
     /// None` or it would be filtered into a worktree workspace.
     #[test]
     fn a_home_session_starts_in_the_configured_working_directory() {
+        // Whichever test spawns first decides which `conpty.dll` the process
+        // loads, and the loaded module answers every later `LoadLibraryW`.
+        // The binary gets this from `main`; a test binary has no such entry,
+        // so every test that opens a PTY has to harden before it does.
+        crate::harden_dll_search_path();
+
         let dir = tempfile::tempdir().unwrap();
 
         let mut config = Config::default();

@@ -4132,11 +4132,10 @@ fn wrapped_galley(
     max_w: f32,
 ) -> std::sync::Arc<egui::Galley> {
     use egui::text::{LayoutJob, TextFormat};
-    let mut job = LayoutJob::single_section(text.to_owned(), TextFormat {
-        font_id: egui::FontId::new(size, family),
-        color,
-        ..Default::default()
-    });
+    let mut job = LayoutJob::single_section(
+        text.to_owned(),
+        TextFormat { font_id: egui::FontId::new(size, family), color, ..Default::default() },
+    );
     job.wrap.max_width = max_w.max(0.0);
     ctx.fonts(|f| f.layout_job(job))
 }
