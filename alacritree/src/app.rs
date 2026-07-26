@@ -27,7 +27,7 @@ use crate::paste;
 use crate::path_style;
 use crate::path_style::PathStyle;
 use crate::pr_status::{PrCache, PrInfo, PrState};
-use crate::projects::{Discovered, Project, Worktree, project_json};
+use crate::projects::{Project, Worktree, project_json};
 use crate::scratchpad;
 use crate::session::{
     AttentionVerdict, Session, SessionId, SessionKind, TermSize, poll_attention_debounce,
@@ -369,10 +369,11 @@ pub struct AlacritreeApp {
     /// How much of the frame in progress went to painting the terminal grid,
     /// as opposed to the sidebars and everything else sharing it.
     grid_paint: std::time::Duration,
-    /// In-flight background re-discoveries, keyed by project root.  WSL
-    /// discovery shells out to wsl.exe and must never block paint; results
-    /// are adopted in `poll_project_refreshes`.
-    pending_project_refresh: HashMap<PathBuf, Receiver<Discovered>>,
+    /// In-flight background re-discoveries, keyed by project root.  Neither
+    /// backend may block paint: wsl.exe takes seconds while the distro VM
+    /// boots, and git2 takes tens of milliseconds on a project with many
+    /// worktrees.  Results are adopted in `poll_project_refreshes`.
+    project_refreshes: crate::project_refresh::ProjectRefreshes,
     /// Resolved absolute path of `delta` inside each WSL distro, so diff panes
     /// stop re-sourcing a login profile on every open.  Successes only: a miss
     /// is never stored, so installing delta mid-session is picked up later.
@@ -692,7 +693,7 @@ impl AlacritreeApp {
             frame_log: crate::frame_log::FrameLog::from_env(),
             phases: crate::frame_log::Phases::new(),
             grid_paint: std::time::Duration::ZERO,
-            pending_project_refresh: HashMap::new(),
+            project_refreshes: Default::default(),
             wsl_delta_paths: HashMap::new(),
             pending_delta: HashMap::new(),
             sidebar_rows_cache: None,
@@ -774,16 +775,12 @@ impl AlacritreeApp {
         Ok(idx)
     }
 
-    /// Windows projects re-discover synchronously (git2, fast).  WSL
-    /// projects re-discover on a worker thread: wsl.exe takes ~400 ms warm
-    /// and seconds while the distro VM boots.
+    /// Re-discovery always runs on a worker thread: wsl.exe takes ~400 ms warm
+    /// and seconds while the distro VM boots, and git2 discovery costs tens of
+    /// milliseconds on a project with many worktrees.
     fn refresh_project(&mut self, ctx: &Context, idx: usize) {
         let root = self.projects[idx].root.clone();
-        if matches!(wsl::classify(&root), wsl::Location::Windows(_)) {
-            self.projects[idx].refresh();
-            return;
-        }
-        if self.pending_project_refresh.contains_key(&root) {
+        if self.project_refreshes.is_running(&root) {
             return;
         }
         let (tx, rx) = mpsc::channel();
@@ -793,7 +790,7 @@ impl AlacritreeApp {
             let _ = tx.send(Project::discover(worker_root));
             ctx.request_repaint();
         });
-        self.pending_project_refresh.insert(root, rx);
+        self.project_refreshes.start(root, rx);
     }
 
     /// Re-run worktree discovery for every project — the keyboard/IPC
@@ -809,15 +806,14 @@ impl AlacritreeApp {
     /// the shell override, and the label either way.
     fn poll_project_refreshes(&mut self) {
         let projects = &mut self.projects;
-        self.pending_project_refresh.retain(|root, rx| match rx.try_recv() {
-            Ok(found) => {
-                if let Some(project) = projects.iter_mut().find(|p| p.root == *root) {
+        self.project_refreshes.poll(|root, found| {
+            match projects.iter_mut().find(|p| p.root == *root) {
+                Some(project) => {
                     project.apply(found);
-                }
-                false
-            },
-            Err(mpsc::TryRecvError::Empty) => true,
-            Err(mpsc::TryRecvError::Disconnected) => false,
+                    Ok(project_json(project))
+                },
+                None => Err(format!("{} is not a project in the sidebar", root.display())),
+            }
         });
     }
 
@@ -6900,12 +6896,37 @@ impl AlacritreeApp {
         let Some(rx) = &self.ipc_rx else { return };
         let calls: Vec<ipc::AppCall> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         for call in calls {
-            let name = call.request.name();
+            let ipc::AppCall { request, reply_tx } = call;
+            // Discovery is far too slow to run here, and the caller still has
+            // to be answered from the refreshed list rather than the stale
+            // one, so this request owns its reply channel until then.
+            if let ipc::IpcRequest::RefreshProject { root } = request {
+                self.defer_project_refresh(ctx, root, reply_tx);
+                continue;
+            }
+            let name = request.name();
             let started = std::time::Instant::now();
-            let result = self.handle_ipc_request(ctx, call.request);
+            let result = self.handle_ipc_request(ctx, request);
             crate::frame_log::note_if_slow("ipc request", name, started.elapsed());
             // A send error means the client gave up waiting — nothing to do.
-            let _ = call.reply_tx.send(result);
+            let _ = reply_tx.send(result);
+        }
+    }
+
+    fn defer_project_refresh(
+        &mut self,
+        ctx: &Context,
+        root: PathBuf,
+        reply_tx: mpsc::Sender<ipc::IpcResult>,
+    ) {
+        let Some(idx) = self.projects.iter().position(|p| p.root == root) else {
+            let _ = reply_tx
+                .send(Err(format!("{} is not a project in the sidebar", root.display())));
+            return;
+        };
+        self.refresh_project(ctx, idx);
+        if let Some(reply_tx) = self.project_refreshes.watch(&root, reply_tx) {
+            let _ = reply_tx.send(Ok(project_json(&self.projects[idx])));
         }
     }
 
@@ -7008,14 +7029,10 @@ impl AlacritreeApp {
                 };
                 scratchpad::read_json(&workspace)
             },
-            Req::RefreshProject { root } => {
-                let project =
-                    self.projects.iter_mut().find(|p| p.root == root).ok_or_else(|| {
-                        format!("{} is not a project in the sidebar", root.display())
-                    })?;
-                project.refresh();
-                Ok(project_json(project))
-            },
+            // Claimed by `process_ipc_calls` before dispatch: the reply is
+            // held until the background discovery lands, which needs the
+            // reply channel this method does not have.
+            Req::RefreshProject { .. } => Err("refresh was not deferred".to_string()),
             Req::AddProject { path } => Ok(project_json(self.add_project(path))),
             Req::RemoveProject { root } => {
                 let idx =

@@ -28,6 +28,7 @@ mod panel_filter;
 mod paste;
 mod path_style;
 mod pr_status;
+mod project_refresh;
 mod projects;
 mod row_label;
 mod scratchpad;
