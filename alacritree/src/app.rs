@@ -1367,6 +1367,11 @@ impl AlacritreeApp {
                 }
             },
         }
+
+        // This runs after the sidebar and central panel have painted for the
+        // frame, and eframe here is reactive, so the mutation above would
+        // otherwise sit invisible until some unrelated event wakes the loop.
+        ctx.request_repaint();
     }
 
     /// Drop a project from the sidebar.  Nothing on disk is touched, and
