@@ -200,6 +200,40 @@ Two clipboards are distinguished:
 
 OSC 52 in the terminal flows through the same wrapper.
 
+### Drag and drop
+
+Dropping files on the window does something different per region:
+
+- **Terminal grid** — the paths are *pasted*, quoted for the shell, joined by
+  spaces, with a trailing space. It is a paste, not typing: bracketed paste is
+  honoured and there is no newline, so nothing runs until you press Enter.
+  Dropping an image on a session running Claude Code gives you `[Image #N]`,
+  because Claude Code resolves a pasted image path.
+- **Projects sidebar** — a folder is added as a project; a file adds the folder
+  containing it. Several files from one folder add it once.
+- **Scratchpad tab** — the plain path is inserted at the cursor, one per line
+  and unquoted, since a document is not a command line. Dropping mid-line puts
+  the block on lines of its own rather than welding it to the text either side.
+
+Paths dropped into a WSL session are rewritten to their distro-side spelling
+(`C:\pics\a.png` becomes `/mnt/c/pics/a.png`) and quoted POSIX-style, because a
+`C:` path resolves to nothing inside a distro. That POSIX quoting applies even
+when `quote` names another mode — `windows` quoting fed to `bash` is broken by
+construction. A `\\wsl.localhost\<distro>\…` path is only rewritten when it
+belongs to the distro the session is running in; one from a *different* distro
+is pasted as-is, because the same Linux path means a different file there.
+
+Filenames carrying a carriage return, newline, ESC or ETX (control-C) are
+skipped. An application that has not enabled bracketed paste cannot tell a paste
+from typing, so a newline in a pasted path would submit a line on its own.
+
+While files hover, the region that would receive them is tinted.
+
+Windows only, for now: winit reports no cursor position during a drag, so on
+other platforms the sidebar cannot be targeted and no tint is drawn. Drops
+still reach the terminal or the scratchpad there, chosen by which tab is
+active.
+
 ## Input and key bindings
 
 Input handling is layered:
@@ -285,6 +319,21 @@ vsync              = true   # restart required — wait for the display's refres
 
 [ui.icons]                  # sidebar glyph overrides (e.g. Nerd Font icons)
 search = "⌕"                # glyph prefixing the sidebar search prompt
+
+[ui.drop]                   # what dragging files onto the window does
+enabled       = true        # master switch; false ignores every drop
+terminal      = true        # paste the paths into the shell
+sidebar       = true        # a folder dropped on the projects sidebar becomes a project
+scratchpad    = true        # insert the path into an open scratchpad tab
+quote         = "auto"      # "auto" (POSIX inside a distro, otherwise the host
+                            # default), or "none" / "spaces_only" / "posix" /
+                            # "windows" / "windows_always_quoted" to force one.
+                            # A path rewritten for WSL is always POSIX-quoted.
+                            # No mode escapes shell metacharacters beyond what
+                            # the receiving OS needs: "posix" is the only one
+                            # that makes an arbitrary filename inert.
+wsl_translate = true        # rewrite C:\x as /mnt/c/x for a WSL session
+highlight     = true        # tint the region a drop would land on
 
 [workspace]
 worktree_dir = "~/dev/worktrees"   # base dir for new worktrees (default ~/.alacritree/worktrees)

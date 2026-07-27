@@ -1321,6 +1321,43 @@ impl AlacritreeApp {
         self.projects.last().expect("just pushed")
     }
 
+    /// Tint whichever region a drop would land on while files are hovering, so
+    /// three targets do not become a guessing game.  Silent off Windows: no
+    /// cursor position is available there, so the tint would be a lie.
+    fn paint_drop_hover(&self, ctx: &Context, regions: &file_drop::Regions) {
+        if !self.config.ui.drop.highlight || ctx.input(|i| i.raw.hovered_files.is_empty()) {
+            return;
+        }
+        // winit's `DragOver` handler emits no event, so moving the cursor
+        // mid-drag wakes nothing and the polled position would stay frozen at
+        // wherever the drag entered.  This is the only place the feature drives
+        // the loop, and it stops when the drag leaves or drops.
+        ctx.request_repaint();
+        let Some(pointer) = file_drop::screen_pointer(ctx) else {
+            return;
+        };
+        let active_is_scratchpad =
+            self.active_session_index().is_some_and(|idx| self.sessions[idx].scratchpad.is_some());
+        let Some(target) =
+            file_drop::route(Some(pointer), regions, active_is_scratchpad, &self.config.ui.drop)
+        else {
+            return;
+        };
+        let rect = match target {
+            file_drop::Target::ProjectsSidebar => match regions.sidebar {
+                Some(rect) => rect,
+                None => return,
+            },
+            file_drop::Target::Terminal | file_drop::Target::Scratchpad => regions.central,
+        };
+        // `Theme::accent` is already resolved (config accent, else ANSI blue);
+        // `UiTheme::sidebar_accent` is the raw `Option` and would paint nothing
+        // on an unconfigured palette.
+        let accent = self.theme.accent;
+        ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop_hover")))
+            .rect_filled(rect, 0.0, accent.linear_multiply(0.15));
+    }
+
     /// Send this frame's dropped files wherever they landed.  All of the
     /// deciding happens in `file_drop`; this only reaches the sinks.
     fn handle_dropped_files(&mut self, ctx: &Context, regions: &file_drop::Regions) {
@@ -7328,6 +7365,7 @@ impl eframe::App for AlacritreeApp {
         if !modal_open && !self.palette.is_open() {
             let regions =
                 file_drop::Regions::new(sidebar_rect, central.response.rect, &self.config.ui.drop);
+            self.paint_drop_hover(ctx, &regions);
             self.handle_dropped_files(ctx, &regions);
         }
         self.phases.mark("central");
