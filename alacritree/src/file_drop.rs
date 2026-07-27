@@ -391,6 +391,16 @@ mod tests {
         assert_eq!(shell_payload(&paths, None, &cfg), "/a/one.png /a/two.png ");
     }
 
+    /// The guard in `app.rs` skips the paste on an empty payload, so a batch
+    /// where nothing survives the filter must produce exactly that.
+    #[test]
+    fn a_batch_of_only_unsafe_paths_produces_no_payload() {
+        let cfg =
+            DropConfig { quote: Quoting::None, wsl_translate: false, ..DropConfig::default() };
+        let paths = [PathBuf::from("/a/evil\nrm -rf ~"), PathBuf::from("/a/accept\x0frm -rf ~")];
+        assert_eq!(shell_payload(&paths, None, &cfg), "");
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_drive_path_becomes_a_distro_path_for_a_wsl_shell() {
@@ -416,6 +426,19 @@ mod tests {
             DropConfig { wsl_translate: false, quote: Quoting::None, ..DropConfig::default() };
         let paths = [PathBuf::from(r"C:\pics\a.png")];
         assert_eq!(shell_payload(&paths, Some("Ubuntu"), &cfg), "C:\\pics\\a.png ");
+    }
+
+    /// `auto` follows the receiving shell, not the path: a WSL session gets
+    /// POSIX quoting even where translation is off and the word being quoted is
+    /// still a `C:\` path, whose separators the quoting then escapes so the
+    /// shell hands the backslashes on intact.
+    #[cfg(windows)]
+    #[test]
+    fn an_untranslated_path_for_a_wsl_shell_is_still_quoted_posix_style() {
+        let cfg =
+            DropConfig { wsl_translate: false, quote: Quoting::Auto, ..DropConfig::default() };
+        let paths = [PathBuf::from(r"C:\pics\my pic.png")];
+        assert_eq!(shell_payload(&paths, Some("Ubuntu"), &cfg), r#""C:\\pics\\my pic.png" "#);
     }
 
     /// A plain UNC share has no distro-side spelling.  Pasting the raw path is
@@ -469,6 +492,15 @@ mod tests {
     fn a_document_payload_adds_no_newline_where_there_already_is_one() {
         let paths = [PathBuf::from("/a/one.png")];
         assert_eq!(document_payload(&paths, Some('\n'), Some('\n')), "/a/one.png");
+    }
+
+    /// Each boundary is decided on its own, so a drop at the start of a
+    /// non-empty line needs a newline after it and none before.
+    #[test]
+    fn a_document_payload_treats_its_two_boundaries_separately() {
+        let paths = [PathBuf::from("/a/one.png")];
+        assert_eq!(document_payload(&paths, None, Some('d')), "/a/one.png\n");
+        assert_eq!(document_payload(&paths, Some('c'), None), "\n/a/one.png");
     }
 
     #[test]
@@ -557,5 +589,15 @@ mod tests {
         let origin = pos2(100.0, 50.0);
         assert_eq!(to_egui_pos(300.0, 250.0, origin, 1.0), pos2(200.0, 200.0));
         assert_eq!(to_egui_pos(600.0, 500.0, origin, 2.0), pos2(200.0, 200.0));
+    }
+
+    /// A monitor left of or above the primary one has negative coordinates, and
+    /// a window on it has a negative origin — the ordinary multi-display
+    /// layout, not an edge case.
+    #[test]
+    fn a_window_on_a_monitor_left_of_the_primary_converts_the_same_way() {
+        let origin = pos2(-1920.0, -200.0);
+        assert_eq!(to_egui_pos(-1720.0, -100.0, origin, 1.0), pos2(200.0, 100.0));
+        assert_eq!(to_egui_pos(-3840.0, -400.0, origin, 2.0), pos2(0.0, 0.0));
     }
 }
