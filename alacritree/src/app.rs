@@ -1290,7 +1290,14 @@ impl AlacritreeApp {
         let Some(path) = rfd::FileDialog::new().pick_folder() else {
             return;
         };
-        let path = wsl::normalize_root(path);
+        self.add_project_off_thread(ctx, wsl::normalize_root(path));
+    }
+
+    /// Put a project in the sidebar without stalling the frame: `wsl.exe` takes
+    /// hundreds of milliseconds warm and seconds while the distro VM boots, so
+    /// a WSL root goes in as a placeholder and discovers on a worker.  Native
+    /// roots spawn nothing and are cheap enough to discover in place.
+    fn add_project_off_thread(&mut self, ctx: &Context, path: PathBuf) {
         if self.projects.iter().any(|p| p.root == path) {
             return;
         }
@@ -1310,8 +1317,8 @@ impl AlacritreeApp {
     /// Put a project in the sidebar, discovering its worktrees.  A project that
     /// is already there is left alone rather than duplicated, so callers that
     /// cannot see the sidebar (IPC) need not check first.  WSL roots discover
-    /// synchronously here (no `ctx` for a worker); the folder picker uses the
-    /// async path in `add_project_via_dialog`.
+    /// synchronously here (no `ctx` for a worker); callers holding one use
+    /// `add_project_off_thread`.
     fn add_project(&mut self, path: PathBuf) -> &Project {
         if let Some(idx) = self.projects.iter().position(|p| p.root == path) {
             return &self.projects[idx];
@@ -1400,7 +1407,7 @@ impl AlacritreeApp {
             },
             file_drop::Target::ProjectsSidebar => {
                 for root in file_drop::project_roots(&paths) {
-                    self.add_project(wsl::normalize_root(root));
+                    self.add_project_off_thread(ctx, wsl::normalize_root(root));
                 }
             },
         }
