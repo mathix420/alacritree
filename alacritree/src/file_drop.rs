@@ -68,17 +68,18 @@ pub fn route(
     None
 }
 
-/// Characters that would make a pasted path do something other than sit on the
-/// command line.  `paste::paste` strips ESC and ETX, but only on its
-/// bracketed-paste branch; without bracketed paste it turns `\n` into `\r`,
-/// which is Enter (`paste.rs:29`).
-const UNSAFE_IN_TERMINAL: [char; 4] = ['\r', '\n', '\x1b', '\x03'];
-
 /// Whether a path can go on a PTY without acting as input in its own right.
-/// Quoting is no substitute: `shlex` will happily put a newline inside single
-/// quotes, and the newline rewrite happens downstream of any quoting.
+///
+/// Every control character is rejected — C0, DEL and C1 — because far more of
+/// them than the obvious two are commands to whatever is reading the line.
+/// `paste::paste_bytes`'s unbracketed branch turns `\n` into `\r`, which is
+/// Enter; readline binds `\x0f` to `operate-and-get-next`, which accepts the
+/// line just as Enter does, `\x18\x05` to `edit-and-execute-command`, `\x04`
+/// to end-of-file and `\t` to completion.  Quoting is no substitute for any of
+/// it: the line editor acts on the byte before the shell parser ever sees the
+/// quotes around it.
 pub fn is_terminal_safe(path: &str) -> bool {
-    !path.contains(UNSAFE_IN_TERMINAL)
+    !path.contains(char::is_control)
 }
 
 /// The text a set of dropped paths becomes for a shell: each path translated
@@ -351,20 +352,28 @@ mod tests {
         assert_eq!(shell_payload(&[], None, &cfg), "");
     }
 
+    /// `\x0f` is readline's `operate-and-get-next`, which accepts the line as
+    /// if Enter had been pressed — the byte submits a command without a
+    /// carriage return anywhere in the payload.
     #[test]
-    fn a_path_carrying_a_terminal_control_character_is_not_safe() {
+    fn a_path_carrying_any_control_character_is_not_safe() {
         assert!(is_terminal_safe("/a/ordinary name.png"));
         assert!(!is_terminal_safe("/a/two\nlines.png"));
         assert!(!is_terminal_safe("/a/carriage\rreturn.png"));
         assert!(!is_terminal_safe("/a/escape\x1b[0m.png"));
         assert!(!is_terminal_safe("/a/interrupt\x03.png"));
+        assert!(!is_terminal_safe("/a/accept\x0frm -rf ~"));
+
+        for c in ('\0'..='\u{9f}').filter(|c| c.is_control()) {
+            assert!(!is_terminal_safe(&format!("/a/name{c}.png")), "{c:?} passed the filter");
+        }
     }
 
-    /// `paste::paste` rewrites `\n` to `\r` when the receiving application has
-    /// not enabled bracketed paste (`paste.rs:29`), and `\r` is Enter — so a
-    /// filename containing a newline would run whatever follows it without the
-    /// user touching the keyboard.  Quoting does not help: `shlex` wraps the
-    /// newline inside single quotes and the rewrite still fires.
+    /// `paste::paste_bytes`'s unbracketed branch rewrites `\n` to `\r`, and
+    /// `\r` is Enter — so a filename containing a newline would run whatever
+    /// follows it without the user touching the keyboard.  Quoting does not
+    /// help: `shlex` wraps the newline inside single quotes and the rewrite
+    /// still fires.
     #[test]
     fn an_unsafe_path_is_dropped_and_the_rest_of_the_batch_survives() {
         let cfg =
@@ -502,20 +511,38 @@ mod tests {
 
     /// The seam, not either half.  `shell_payload` cannot see what `paste.rs`
     /// does to its output and `paste.rs` cannot see where the text came from,
-    /// so a filename carrying a newline is inert only if the two agree.  This
-    /// is the assertion that fails if the control-character filter is ever
-    /// removed as redundant with quoting.  It stops at the bytes `paste` would
-    /// write — reaching the PTY needs a spawned child.
+    /// so a filename carrying a line-submitting byte is inert only if the two
+    /// agree.  This is the assertion that fails if the control-character filter
+    /// is ever removed as redundant with quoting — `paste::paste_bytes`'s
+    /// unbracketed branch turns `\n` into `\r`, and readline accepts the line
+    /// on `\x0f` with no `\r` involved at all.  It stops at the bytes `paste`
+    /// would write — reaching the PTY needs a spawned child.
+    ///
+    /// Run under `Auto` as well as `None` because `Auto` is what ships.
     #[test]
     fn a_payload_reaching_an_unbracketed_paste_submits_nothing() {
-        let cfg =
-            DropConfig { quote: Quoting::None, wsl_translate: false, ..DropConfig::default() };
-        let paths = [PathBuf::from("/a/evil\nrm -rf ~"), PathBuf::from("/a/ok.png")];
+        let paths = [
+            PathBuf::from("/a/evil\nrm -rf ~"),
+            PathBuf::from("/a/accept\x0frm -rf ~"),
+            PathBuf::from("/a/ok.png"),
+        ];
 
-        let on_the_pty = crate::paste::paste_bytes(&shell_payload(&paths, None, &cfg), true, false);
+        for quote in [Quoting::None, Quoting::Auto] {
+            let cfg = DropConfig { quote, wsl_translate: false, ..DropConfig::default() };
 
-        assert!(!on_the_pty.contains(&b'\r'), "{on_the_pty:?} would press Enter on its own");
-        assert_eq!(on_the_pty, b"/a/ok.png ".to_vec());
+            let on_the_pty =
+                crate::paste::paste_bytes(&shell_payload(&paths, None, &cfg), true, false);
+
+            assert!(
+                !on_the_pty.contains(&b'\r'),
+                "{quote:?}: {on_the_pty:?} would press Enter on its own"
+            );
+            assert!(
+                !on_the_pty.contains(&0x0f),
+                "{quote:?}: {on_the_pty:?} would accept the line through operate-and-get-next"
+            );
+            assert_eq!(on_the_pty, b"/a/ok.png ".to_vec(), "{quote:?}");
+        }
     }
 
     /// `GetCursorPos` reports physical screen pixels while egui works in

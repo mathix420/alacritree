@@ -206,7 +206,8 @@ Dropping files on the window does something different per region:
 
 - **Terminal grid** — the paths are *pasted*, quoted for the shell, joined by
   spaces, with a trailing space. It is a paste, not typing: bracketed paste is
-  honoured and there is no newline, so nothing runs until you press Enter.
+  honoured, and any path carrying a control character is left out of the payload
+  (see below), so what arrives is a command line waiting on your Enter.
   Dropping an image on a session running Claude Code gives you `[Image #N]`,
   because Claude Code resolves a pasted image path.
 - **Projects sidebar** — a folder is added as a project; a file adds the folder
@@ -223,9 +224,11 @@ construction. A `\\wsl.localhost\<distro>\…` path is only rewritten when it
 belongs to the distro the session is running in; one from a *different* distro
 is pasted as-is, because the same Linux path means a different file there.
 
-Filenames carrying a carriage return, newline, ESC or ETX (control-C) are
-skipped. An application that has not enabled bracketed paste cannot tell a paste
-from typing, so a newline in a pasted path would submit a line on its own.
+Filenames carrying any control character are skipped. An application that has
+not enabled bracketed paste cannot tell a paste from typing, and a line editor
+acts on those bytes as commands: a newline arrives as Enter, and readline
+accepts the line on `Ctrl-O` as well. Quoting is no defence, because the editor
+binds the byte before the shell ever parses the quotes around it.
 
 While files hover, the region that would receive them is tinted.
 
