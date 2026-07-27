@@ -193,6 +193,46 @@ pub fn project_roots(paths: &[PathBuf]) -> Vec<PathBuf> {
     roots
 }
 
+/// The OS cursor in egui coordinates, or `None` when it cannot be known.
+///
+/// winit 0.30 discards the drag position on every platform — its Windows
+/// `DragEnter`/`DragOver`/`Drop` handlers all ignore their `POINTL`, and no
+/// `CursorMoved` is synthesized during a drag — so egui's own pointer is still
+/// wherever it was before the drag began.  Asking Win32 directly is the only
+/// way to learn where a drop landed.  Other platforms have no equivalent here
+/// yet, so they route by the central-panel fallback in `route`.
+#[cfg(windows)]
+pub fn screen_pointer(ctx: &egui::Context) -> Option<egui::Pos2> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let mut point = POINT { x: 0, y: 0 };
+    // SAFETY: `GetCursorPos` only writes a `POINT` through the pointer it is
+    // given, and `point` is a live, correctly aligned local.
+    if unsafe { GetCursorPos(&mut point) } == 0 {
+        return None;
+    }
+    let origin = ctx.input(|i| i.viewport().inner_rect)?.min;
+    Some(to_egui_pos(point.x as f32, point.y as f32, origin, ctx.pixels_per_point()))
+}
+
+#[cfg(not(windows))]
+pub fn screen_pointer(_ctx: &egui::Context) -> Option<egui::Pos2> {
+    None
+}
+
+/// `ViewportInfo::inner_rect` is in monitor space at ui-point scale, which is
+/// physical pixels divided by `Context::pixels_per_point` — the same divisor
+/// `egui-winit` used to produce it.
+fn to_egui_pos(
+    x_px: f32,
+    y_px: f32,
+    window_origin: egui::Pos2,
+    pixels_per_point: f32,
+) -> egui::Pos2 {
+    egui::pos2(x_px / pixels_per_point - window_origin.x, y_px / pixels_per_point - window_origin.y)
+}
+
 #[cfg(test)]
 mod tests {
     use egui::{Rect, pos2};
@@ -476,5 +516,14 @@ mod tests {
 
         assert!(!on_the_pty.contains(&b'\r'), "{on_the_pty:?} would press Enter on its own");
         assert_eq!(on_the_pty, b"/a/ok.png ".to_vec());
+    }
+
+    /// `GetCursorPos` reports physical screen pixels while egui works in
+    /// logical points measured from the window's content origin.
+    #[test]
+    fn a_screen_pixel_converts_to_a_window_relative_egui_point() {
+        let origin = pos2(100.0, 50.0);
+        assert_eq!(to_egui_pos(300.0, 250.0, origin, 1.0), pos2(200.0, 200.0));
+        assert_eq!(to_egui_pos(600.0, 500.0, origin, 2.0), pos2(200.0, 200.0));
     }
 }
