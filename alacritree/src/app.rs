@@ -7126,6 +7126,7 @@ impl eframe::App for AlacritreeApp {
             .map(|_| (std::time::Instant::now(), crate::frame_log::output_wait()));
         self.grid_paint = std::time::Duration::ZERO;
         self.phases.restart();
+        self.glyph_cache.begin_frame(ctx);
         self.poll_project_refreshes();
         self.poll_pending_deletes(ctx);
         self.poll_pending_creates(ctx);
