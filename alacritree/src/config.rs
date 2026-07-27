@@ -247,6 +247,122 @@ fn parse_confirm_session_close(raw: Option<&str>) -> ConfirmSessionClose {
     }
 }
 
+/// `[ui.drop] quote` as written in the config.  The five concrete modes are
+/// ported from wezterm's `quote_dropped_files` so an existing wezterm config
+/// carries over unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Quoting {
+    /// Decide per session: a path headed into a distro is a POSIX shell word
+    /// no matter what the host OS is.
+    #[default]
+    Auto,
+    None,
+    SpacesOnly,
+    Posix,
+    Windows,
+    WindowsAlwaysQuoted,
+}
+
+/// `Quoting` with `Auto` already decided against the receiving shell.
+// The drop pipeline is the only production caller of `resolve`/`escape`;
+// until it lands, only the tests below construct these.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellQuoting {
+    None,
+    SpacesOnly,
+    Posix,
+    Windows,
+    WindowsAlwaysQuoted,
+}
+
+impl Quoting {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn resolve(self, wsl: bool) -> ShellQuoting {
+        match self {
+            Self::Auto if wsl => ShellQuoting::Posix,
+            Self::Auto if cfg!(windows) => ShellQuoting::Windows,
+            Self::Auto => ShellQuoting::SpacesOnly,
+            Self::None => ShellQuoting::None,
+            Self::SpacesOnly => ShellQuoting::SpacesOnly,
+            Self::Posix => ShellQuoting::Posix,
+            Self::Windows => ShellQuoting::Windows,
+            Self::WindowsAlwaysQuoted => ShellQuoting::WindowsAlwaysQuoted,
+        }
+    }
+}
+
+impl ShellQuoting {
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn escape(self, path: &str) -> String {
+        match self {
+            Self::None => path.to_string(),
+            Self::SpacesOnly => path.replace(' ', "\\ "),
+            // A quoting failure is only possible for a NUL byte, which no
+            // path from the OS carries; wezterm collapses it the same way.
+            Self::Posix => shlex::try_quote(path).unwrap_or_default().into_owned(),
+            Self::Windows => {
+                const NEEDS_QUOTING: [char; 5] = [' ', '\t', '\n', '\x0b', '"'];
+                if path.chars().any(|c| NEEDS_QUOTING.contains(&c)) {
+                    format!("\"{path}\"")
+                } else {
+                    path.to_string()
+                }
+            },
+            Self::WindowsAlwaysQuoted => format!("\"{path}\""),
+        }
+    }
+}
+
+fn parse_quoting(raw: Option<&str>) -> Quoting {
+    match raw {
+        None => Quoting::default(),
+        Some("auto") => Quoting::Auto,
+        Some("none") => Quoting::None,
+        Some("spaces_only") => Quoting::SpacesOnly,
+        Some("posix") => Quoting::Posix,
+        Some("windows") => Quoting::Windows,
+        Some("windows_always_quoted") => Quoting::WindowsAlwaysQuoted,
+        Some(other) => {
+            log::warn!("unknown ui.drop.quote value {other:?}, using \"auto\"");
+            Quoting::default()
+        },
+    }
+}
+
+/// `[ui.drop]`: what dragging files onto the window does.  Every target is on
+/// by default — a drop was discarded before, so no path here changes an
+/// existing behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropConfig {
+    /// Master switch; false ignores every drop.
+    pub enabled: bool,
+    pub terminal: bool,
+    pub sidebar: bool,
+    pub scratchpad: bool,
+    pub quote: Quoting,
+    /// Rewrite a Windows path to its distro-side spelling before it reaches a
+    /// WSL shell, where a `C:\` path resolves to nothing.
+    pub wsl_translate: bool,
+    /// Tint the region a drop would land on while files hover.
+    pub highlight: bool,
+}
+
+impl Default for DropConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            terminal: true,
+            sidebar: true,
+            scratchpad: true,
+            quote: Quoting::Auto,
+            wsl_translate: true,
+            highlight: true,
+        }
+    }
+}
+
 /// How the sidebar scroll areas draw their scrollbar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScrollbarStyle {
@@ -506,6 +622,11 @@ pub struct UiTheme {
     /// `[ui.path_style]`: per-site path abbreviation.  All `Full` by default,
     /// which renders every path byte-for-byte as it does today.
     pub path_style: PathStyleConfig,
+    /// `[ui.drop]`: what a file dragged onto the window does.
+    // The drop pipeline is the only production reader; until it lands, only
+    // the tests below read this field.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub drop: DropConfig,
 }
 
 impl Default for UiTheme {
@@ -530,6 +651,7 @@ impl Default for UiTheme {
             worktree_name: None,
             project_name: None,
             path_style: PathStyleConfig::default(),
+            drop: DropConfig::default(),
         }
     }
 }
@@ -1151,6 +1273,18 @@ struct RawFocusOutline {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
+struct RawUiDrop {
+    enabled: Option<bool>,
+    terminal: Option<bool>,
+    sidebar: Option<bool>,
+    scratchpad: Option<bool>,
+    quote: Option<String>,
+    wsl_translate: Option<bool>,
+    highlight: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 struct RawUi {
     sidebar_background: Option<RgbStr>,
     sidebar_foreground: Option<RgbStr>,
@@ -1188,6 +1322,8 @@ struct RawUi {
     /// Default true.
     vsync: Option<bool>,
     path_style: RawPathStyle,
+    /// What a file dragged onto the window does.  Default: every target on.
+    drop: RawUiDrop,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1358,6 +1494,15 @@ impl RawConfig {
                 git_header: parse_path_style(self.ui.path_style.git_header.as_deref()),
                 filename: text_emphasis(&self.ui.path_style.filename),
                 parent: text_emphasis(&self.ui.path_style.parent),
+            },
+            drop: DropConfig {
+                enabled: self.ui.drop.enabled.unwrap_or(true),
+                terminal: self.ui.drop.terminal.unwrap_or(true),
+                sidebar: self.ui.drop.sidebar.unwrap_or(true),
+                scratchpad: self.ui.drop.scratchpad.unwrap_or(true),
+                quote: parse_quoting(self.ui.drop.quote.as_deref()),
+                wsl_translate: self.ui.drop.wsl_translate.unwrap_or(true),
+                highlight: self.ui.drop.highlight.unwrap_or(true),
             },
         };
 
@@ -2177,5 +2322,120 @@ program = "second"
     fn blank_name_templates_are_dropped() {
         let ui = ui_from_toml("[ui]\nworktree_name = \"  \"");
         assert_eq!(ui.worktree_name, None);
+    }
+
+    #[test]
+    fn quoting_none_passes_the_path_through() {
+        assert_eq!(ShellQuoting::None.escape("hello ($world)"), "hello ($world)");
+    }
+
+    #[test]
+    fn quoting_spaces_only_escapes_spaces_and_nothing_else() {
+        assert_eq!(ShellQuoting::SpacesOnly.escape("hello ($world)"), "hello\\ ($world)");
+    }
+
+    #[test]
+    fn quoting_posix_single_quotes_a_path_with_shell_metacharacters() {
+        assert_eq!(ShellQuoting::Posix.escape("hello ($world)"), "'hello ($world)'");
+        assert_eq!(ShellQuoting::Posix.escape("/mnt/c/plain.png"), "/mnt/c/plain.png");
+        assert_eq!(
+            ShellQuoting::Posix.escape("/mnt/c/Users/Lev/my pic.png"),
+            "'/mnt/c/Users/Lev/my pic.png'"
+        );
+    }
+
+    #[test]
+    fn quoting_windows_quotes_only_when_the_path_needs_it() {
+        assert_eq!(ShellQuoting::Windows.escape("hello ($world)"), "\"hello ($world)\"");
+        assert_eq!(ShellQuoting::Windows.escape("C:\\pics\\plain.png"), "C:\\pics\\plain.png");
+    }
+
+    #[test]
+    fn quoting_windows_always_quoted_quotes_unconditionally() {
+        assert_eq!(
+            ShellQuoting::WindowsAlwaysQuoted.escape("C:\\pics\\plain.png"),
+            "\"C:\\pics\\plain.png\""
+        );
+    }
+
+    #[test]
+    fn auto_quoting_picks_posix_inside_a_distro() {
+        assert_eq!(Quoting::Auto.resolve(true), ShellQuoting::Posix);
+    }
+
+    #[test]
+    fn auto_quoting_picks_the_host_default_outside_a_distro() {
+        let expected = if cfg!(windows) { ShellQuoting::Windows } else { ShellQuoting::SpacesOnly };
+        assert_eq!(Quoting::Auto.resolve(false), expected);
+    }
+
+    #[test]
+    fn an_explicit_quoting_mode_ignores_the_shell() {
+        assert_eq!(Quoting::None.resolve(true), ShellQuoting::None);
+        assert_eq!(Quoting::Windows.resolve(true), ShellQuoting::Windows);
+    }
+
+    #[test]
+    fn drop_options_default_to_on_with_auto_quoting() {
+        let ui = ui_from_toml("");
+        assert_eq!(
+            ui.drop,
+            DropConfig {
+                enabled: true,
+                terminal: true,
+                sidebar: true,
+                scratchpad: true,
+                quote: Quoting::Auto,
+                wsl_translate: true,
+                highlight: true,
+            }
+        );
+    }
+
+    #[test]
+    fn drop_options_parse_from_the_ui_drop_table() {
+        let ui = ui_from_toml(
+            "[ui.drop]\n\
+             enabled = false\n\
+             terminal = false\n\
+             sidebar = false\n\
+             scratchpad = false\n\
+             quote = \"posix\"\n\
+             wsl_translate = false\n\
+             highlight = false\n",
+        );
+        assert_eq!(
+            ui.drop,
+            DropConfig {
+                enabled: false,
+                terminal: false,
+                sidebar: false,
+                scratchpad: false,
+                quote: Quoting::Posix,
+                wsl_translate: false,
+                highlight: false,
+            }
+        );
+    }
+
+    #[test]
+    fn every_quoting_name_parses() {
+        for (raw, expected) in [
+            ("auto", Quoting::Auto),
+            ("none", Quoting::None),
+            ("spaces_only", Quoting::SpacesOnly),
+            ("posix", Quoting::Posix),
+            ("windows", Quoting::Windows),
+            ("windows_always_quoted", Quoting::WindowsAlwaysQuoted),
+        ] {
+            let ui = ui_from_toml(&format!("[ui.drop]\nquote = \"{raw}\""));
+            assert_eq!(ui.drop.quote, expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_quoting_name_falls_back_to_auto() {
+        let ui = ui_from_toml("[ui.drop]\nquote = \"shell\"");
+        assert_eq!(ui.drop.quote, Quoting::Auto);
     }
 }
