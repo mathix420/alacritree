@@ -11,6 +11,7 @@ mod command_ext;
 mod command_palette;
 mod config;
 mod doppler;
+mod file_drop;
 mod fonts;
 mod frame_log;
 mod git_nav;

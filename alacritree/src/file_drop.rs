@@ -1,0 +1,480 @@
+//! Where a dropped file goes and what text it becomes.
+//!
+//! Everything here is a pure function over a pointer position, a set of paths
+//! and the config; `app.rs` supplies the region rectangles and owns the sinks.
+//! Keeping the decisions out of the frame loop is what makes them testable
+//! without a window.
+
+// Nothing routes a drop event here yet, so every item in this module is only
+// reached from the tests below.
+#![cfg_attr(not(test), allow(dead_code))]
+
+use std::path::{Path, PathBuf};
+
+use crate::config::{DropConfig, ShellQuoting};
+use crate::wsl;
+
+/// Which region a drop landed on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    Terminal,
+    ProjectsSidebar,
+    Scratchpad,
+}
+
+/// The drop-accepting rectangles of the current frame, in egui coordinates.
+/// The git-status sidebar is deliberately absent: it accepts nothing, so a
+/// drop over it falls through to `None`.
+pub struct Regions {
+    /// `None` when the projects sidebar is hidden or its target is disabled.
+    pub sidebar: Option<egui::Rect>,
+    pub central: egui::Rect,
+}
+
+impl Regions {
+    /// A hidden sidebar and a disabled sidebar target collapse to the same
+    /// `None`, so `route` needs to know about neither.
+    pub fn new(sidebar: Option<egui::Rect>, central: egui::Rect, cfg: &DropConfig) -> Self {
+        Self { sidebar: sidebar.filter(|_| cfg.sidebar), central }
+    }
+}
+
+/// `None` when the drop lands nowhere useful — outside every region, over the
+/// git-status sidebar, or on a target the config switched off.
+///
+/// An unknown pointer resolves to the central panel rather than nothing:
+/// winit reports no cursor position during a drag on any platform, so off
+/// Windows this is the only branch that ever runs, and pasting into the shell
+/// is what every other terminal does with a drop.
+pub fn route(
+    pointer: Option<egui::Pos2>,
+    regions: &Regions,
+    active_is_scratchpad: bool,
+    cfg: &DropConfig,
+) -> Option<Target> {
+    if !cfg.enabled {
+        return None;
+    }
+    let central = match (active_is_scratchpad, cfg.scratchpad, cfg.terminal) {
+        (true, true, _) => Some(Target::Scratchpad),
+        (false, _, true) => Some(Target::Terminal),
+        _ => None,
+    };
+    let Some(pointer) = pointer else {
+        return central;
+    };
+    if regions.sidebar.is_some_and(|r| r.contains(pointer)) {
+        return cfg.sidebar.then_some(Target::ProjectsSidebar);
+    }
+    if regions.central.contains(pointer) {
+        return central;
+    }
+    None
+}
+
+/// Characters that would make a pasted path do something other than sit on the
+/// command line.  `paste::paste` strips ESC and ETX, but only on its
+/// bracketed-paste branch; without bracketed paste it turns `\n` into `\r`,
+/// which is Enter (`paste.rs:29`).
+const UNSAFE_IN_TERMINAL: [char; 4] = ['\r', '\n', '\x1b', '\x03'];
+
+/// Whether a path can go on a PTY without acting as input in its own right.
+/// Quoting is no substitute: `shlex` will happily put a newline inside single
+/// quotes, and the newline rewrite happens downstream of any quoting.
+pub fn is_terminal_safe(path: &str) -> bool {
+    !path.contains(UNSAFE_IN_TERMINAL)
+}
+
+/// The text a set of dropped paths becomes for a shell: each path translated
+/// and escaped, joined with spaces, with the trailing space wezterm appends so
+/// the next argument does not run into the last path.
+///
+/// `distro` names the WSL distro the receiving session runs in, `None` for a
+/// native session.  Paths that would act as terminal input are left out.
+pub fn shell_payload(paths: &[PathBuf], distro: Option<&str>, cfg: &DropConfig) -> String {
+    let mut out = String::new();
+    for path in paths {
+        let (word, quoting) = shell_word(path, distro, cfg);
+        if !is_terminal_safe(&word) {
+            log::warn!("dropped path {word:?} carries terminal control characters, skipping it");
+            continue;
+        }
+        out.push_str(&quoting.escape(&word));
+        out.push(' ');
+    }
+    out
+}
+
+/// A path as the receiving shell should spell it, with the quoting rules that
+/// spelling implies.  A path rewritten for a distro is a POSIX shell word even
+/// when the configured mode says otherwise — `windows` quoting fed to `bash` is
+/// broken by construction.
+fn shell_word(path: &Path, distro: Option<&str>, cfg: &DropConfig) -> (String, ShellQuoting) {
+    if let Some(distro) = distro.filter(|_| cfg.wsl_translate) {
+        if let Some(linux) = distro_path(path, distro) {
+            return (linux, ShellQuoting::Posix);
+        }
+        log::debug!("no path in {distro} for {}, pasting it as-is", path.display());
+    }
+    (path.to_string_lossy().into_owned(), cfg.quote.resolve(distro.is_some()))
+}
+
+/// The path as `distro` resolves it, or `None` when it has no spelling there.
+///
+/// `windows_to_linux` discards which distro a UNC path names (`wsl.rs:141`), so
+/// handing it `\\wsl.localhost\Ubuntu\home\a` inside a Kali session would return
+/// `/home/a` — a different file, with nothing to show for it.  Classify first
+/// and only accept a UNC path that belongs to this distro.
+fn distro_path(path: &Path, distro: &str) -> Option<String> {
+    match wsl::classify(path) {
+        wsl::Location::Wsl { distro: owner, linux_path } => {
+            if owner.eq_ignore_ascii_case(distro) {
+                return Some(linux_path);
+            }
+            // Louder than the plain-UNC case below: a share that no distro owns
+            // has no distro-side spelling at all, but this one looks as though
+            // it does and silently would not resolve to the same file.
+            log::warn!("{} belongs to {owner}, not {distro}; pasting it as-is", path.display());
+            None
+        },
+        wsl::Location::Windows(_) => wsl::windows_to_linux(path),
+    }
+}
+
+/// Dropped paths as text for the Markdown scratchpad: no shell quoting, one per
+/// line, since a document is not a command line.
+///
+/// `preceding` and `following` are the characters either side of the insertion
+/// point.  Without the boundary newlines a drop into the middle of a line welds
+/// the first path onto the text before it and the last onto the text after.
+pub fn document_payload(
+    paths: &[PathBuf],
+    preceding: Option<char>,
+    following: Option<char>,
+) -> String {
+    if paths.is_empty() {
+        return String::new();
+    }
+    let needs_newline = |edge: Option<char>| matches!(edge, Some(c) if c != '\n');
+    let mut out = String::new();
+    if needs_newline(preceding) {
+        out.push('\n');
+    }
+    for (i, path) in paths.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&path.to_string_lossy());
+    }
+    if needs_newline(following) {
+        out.push('\n');
+    }
+    out
+}
+
+/// The project roots a set of dropped paths names.  A directory is its own
+/// root; a file means the directory holding it, which is what dragging a file
+/// out of a checkout is asking for.  Dragging several files from one folder is
+/// ordinary, so repeats collapse rather than adding the same project twice.
+pub fn project_roots(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for path in paths {
+        let root = if path.is_dir() {
+            Some(path.clone())
+        } else if path.is_file() {
+            path.parent().map(Path::to_path_buf)
+        } else {
+            None
+        };
+        if let Some(root) = root.filter(|r| !roots.contains(r)) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+#[cfg(test)]
+mod tests {
+    use egui::{Rect, pos2};
+
+    use super::*;
+    use crate::config::{DropConfig, Quoting};
+
+    fn regions() -> Regions {
+        Regions {
+            sidebar: Some(Rect::from_min_max(pos2(0.0, 0.0), pos2(200.0, 600.0))),
+            central: Rect::from_min_max(pos2(200.0, 0.0), pos2(1000.0, 600.0)),
+        }
+    }
+
+    #[test]
+    fn a_pointer_over_the_sidebar_routes_to_the_sidebar() {
+        let cfg = DropConfig::default();
+        assert_eq!(
+            route(Some(pos2(100.0, 300.0)), &regions(), false, &cfg),
+            Some(Target::ProjectsSidebar)
+        );
+    }
+
+    #[test]
+    fn a_pointer_over_the_central_panel_routes_to_the_terminal() {
+        let cfg = DropConfig::default();
+        assert_eq!(
+            route(Some(pos2(600.0, 300.0)), &regions(), false, &cfg),
+            Some(Target::Terminal)
+        );
+    }
+
+    #[test]
+    fn the_central_panel_routes_to_the_scratchpad_when_that_tab_is_active() {
+        let cfg = DropConfig::default();
+        assert_eq!(
+            route(Some(pos2(600.0, 300.0)), &regions(), true, &cfg),
+            Some(Target::Scratchpad)
+        );
+    }
+
+    /// No cursor position is available off Windows, and the central panel is
+    /// the only sane assumption: the terminal is what every other terminal
+    /// emulator does with a drop.
+    #[test]
+    fn an_unknown_pointer_falls_back_to_the_central_panel() {
+        let cfg = DropConfig::default();
+        assert_eq!(route(None, &regions(), false, &cfg), Some(Target::Terminal));
+        assert_eq!(route(None, &regions(), true, &cfg), Some(Target::Scratchpad));
+    }
+
+    /// A hidden sidebar, or `[ui.drop] sidebar = false`, is passed as `None`.
+    #[test]
+    fn a_missing_sidebar_region_can_never_be_hit() {
+        let cfg = DropConfig::default();
+        let regions = Regions { sidebar: None, ..regions() };
+        assert_eq!(route(Some(pos2(100.0, 300.0)), &regions, false, &cfg), None);
+    }
+
+    /// A hidden sidebar and `[ui.drop] sidebar = false` are the same thing to
+    /// `route`: no rectangle, so no hit.
+    #[test]
+    fn regions_drop_the_sidebar_when_it_is_hidden_or_disabled() {
+        let visible = Rect::from_min_max(pos2(0.0, 0.0), pos2(200.0, 600.0));
+        let central = Rect::from_min_max(pos2(200.0, 0.0), pos2(1000.0, 600.0));
+        let on = DropConfig::default();
+        let off = DropConfig { sidebar: false, ..DropConfig::default() };
+
+        assert!(Regions::new(Some(visible), central, &on).sidebar.is_some());
+        assert!(Regions::new(None, central, &on).sidebar.is_none());
+        assert!(Regions::new(Some(visible), central, &off).sidebar.is_none());
+    }
+
+    #[test]
+    fn a_pointer_outside_every_region_routes_nowhere() {
+        let cfg = DropConfig::default();
+        assert_eq!(route(Some(pos2(5000.0, 5000.0)), &regions(), false, &cfg), None);
+    }
+
+    #[test]
+    fn each_target_can_be_switched_off_on_its_own() {
+        let no_terminal = DropConfig { terminal: false, ..DropConfig::default() };
+        assert_eq!(route(Some(pos2(600.0, 300.0)), &regions(), false, &no_terminal), None);
+
+        let no_scratchpad = DropConfig { scratchpad: false, ..DropConfig::default() };
+        assert_eq!(route(Some(pos2(600.0, 300.0)), &regions(), true, &no_scratchpad), None);
+    }
+
+    #[test]
+    fn the_master_switch_disables_every_target() {
+        let off = DropConfig { enabled: false, ..DropConfig::default() };
+        assert_eq!(route(Some(pos2(100.0, 300.0)), &regions(), false, &off), None);
+        assert_eq!(route(Some(pos2(600.0, 300.0)), &regions(), false, &off), None);
+        assert_eq!(route(None, &regions(), true, &off), None);
+    }
+
+    #[test]
+    fn a_shell_payload_joins_paths_with_spaces_and_ends_with_one() {
+        let cfg =
+            DropConfig { quote: Quoting::None, wsl_translate: false, ..DropConfig::default() };
+        let paths = [PathBuf::from("/a/one.png"), PathBuf::from("/a/two.png")];
+        assert_eq!(shell_payload(&paths, None, &cfg), "/a/one.png /a/two.png ");
+    }
+
+    #[test]
+    fn a_shell_payload_quotes_a_path_containing_spaces() {
+        let cfg =
+            DropConfig { quote: Quoting::Posix, wsl_translate: false, ..DropConfig::default() };
+        let paths = [PathBuf::from("/a/my pic.png")];
+        assert_eq!(shell_payload(&paths, None, &cfg), "'/a/my pic.png' ");
+    }
+
+    #[test]
+    fn an_empty_drop_produces_no_payload() {
+        let cfg = DropConfig::default();
+        assert_eq!(shell_payload(&[], None, &cfg), "");
+    }
+
+    #[test]
+    fn a_path_carrying_a_terminal_control_character_is_not_safe() {
+        assert!(is_terminal_safe("/a/ordinary name.png"));
+        assert!(!is_terminal_safe("/a/two\nlines.png"));
+        assert!(!is_terminal_safe("/a/carriage\rreturn.png"));
+        assert!(!is_terminal_safe("/a/escape\x1b[0m.png"));
+        assert!(!is_terminal_safe("/a/interrupt\x03.png"));
+    }
+
+    /// `paste::paste` rewrites `\n` to `\r` when the receiving application has
+    /// not enabled bracketed paste (`paste.rs:29`), and `\r` is Enter — so a
+    /// filename containing a newline would run whatever follows it without the
+    /// user touching the keyboard.  Quoting does not help: `shlex` wraps the
+    /// newline inside single quotes and the rewrite still fires.
+    #[test]
+    fn an_unsafe_path_is_dropped_and_the_rest_of_the_batch_survives() {
+        let cfg =
+            DropConfig { quote: Quoting::None, wsl_translate: false, ..DropConfig::default() };
+        let paths = [
+            PathBuf::from("/a/one.png"),
+            PathBuf::from("/a/evil\nrm -rf ~"),
+            PathBuf::from("/a/two.png"),
+        ];
+        assert_eq!(shell_payload(&paths, None, &cfg), "/a/one.png /a/two.png ");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_drive_path_becomes_a_distro_path_for_a_wsl_shell() {
+        let cfg = DropConfig::default();
+        let paths = [PathBuf::from(r"C:\pics\a.png")];
+        assert_eq!(shell_payload(&paths, Some("Ubuntu"), &cfg), "/mnt/c/pics/a.png ");
+    }
+
+    /// Translation forces POSIX rules even under `quote = "windows"`: the
+    /// string is a word for a Linux shell once it has been rewritten.
+    #[cfg(windows)]
+    #[test]
+    fn a_translated_path_is_quoted_posix_style_whatever_the_mode_says() {
+        let cfg = DropConfig { quote: Quoting::Windows, ..DropConfig::default() };
+        let paths = [PathBuf::from(r"C:\pics\my pic.png")];
+        assert_eq!(shell_payload(&paths, Some("Ubuntu"), &cfg), "'/mnt/c/pics/my pic.png' ");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn translation_off_leaves_the_windows_path_alone() {
+        let cfg =
+            DropConfig { wsl_translate: false, quote: Quoting::None, ..DropConfig::default() };
+        let paths = [PathBuf::from(r"C:\pics\a.png")];
+        assert_eq!(shell_payload(&paths, Some("Ubuntu"), &cfg), "C:\\pics\\a.png ");
+    }
+
+    /// A plain UNC share has no distro-side spelling.  Pasting the raw path is
+    /// more useful than pasting nothing.
+    #[cfg(windows)]
+    #[test]
+    fn an_untranslatable_path_falls_back_to_the_raw_spelling() {
+        let cfg = DropConfig { quote: Quoting::None, ..DropConfig::default() };
+        let paths = [PathBuf::from(r"\\fileserver\share\a.png")];
+        assert_eq!(shell_payload(&paths, Some("Ubuntu"), &cfg), "\\\\fileserver\\share\\a.png ");
+    }
+
+    /// The distro is compared the way Windows compares the UNC share name.
+    #[cfg(windows)]
+    #[test]
+    fn a_unc_path_for_this_distro_strips_to_its_linux_form() {
+        let cfg = DropConfig { quote: Quoting::None, ..DropConfig::default() };
+        let paths = [PathBuf::from(r"\\wsl.localhost\Ubuntu\home\lev\a.png")];
+        assert_eq!(shell_payload(&paths, Some("ubuntu"), &cfg), "/home/lev/a.png ");
+    }
+
+    /// `windows_to_linux` throws the distro away (`wsl.rs:141`), so stripping a
+    /// UNC prefix that belongs to another distro would name a different file
+    /// with no error.  Refuse it: an unresolvable Windows path fails loudly.
+    #[cfg(windows)]
+    #[test]
+    fn a_unc_path_for_another_distro_is_never_stripped() {
+        let cfg = DropConfig { quote: Quoting::None, ..DropConfig::default() };
+        let paths = [PathBuf::from(r"\\wsl.localhost\Ubuntu\home\lev\a.png")];
+        assert_eq!(
+            shell_payload(&paths, Some("kali-linux"), &cfg),
+            "\\\\wsl.localhost\\Ubuntu\\home\\lev\\a.png "
+        );
+    }
+
+    #[test]
+    fn a_document_payload_is_unquoted_and_newline_separated() {
+        let paths = [PathBuf::from("/a/my pic.png"), PathBuf::from("/a/two.png")];
+        assert_eq!(document_payload(&paths, None, None), "/a/my pic.png\n/a/two.png");
+    }
+
+    /// Dropping mid-line must not weld the first path onto the text before the
+    /// cursor, nor the last onto the text after it.
+    #[test]
+    fn a_document_payload_adds_the_newlines_its_neighbours_need() {
+        let paths = [PathBuf::from("/a/one.png")];
+        assert_eq!(document_payload(&paths, Some('c'), Some('d')), "\n/a/one.png\n");
+    }
+
+    #[test]
+    fn a_document_payload_adds_no_newline_where_there_already_is_one() {
+        let paths = [PathBuf::from("/a/one.png")];
+        assert_eq!(document_payload(&paths, Some('\n'), Some('\n')), "/a/one.png");
+    }
+
+    #[test]
+    fn project_roots_keeps_a_directory_and_lifts_a_file_to_its_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+
+        let roots = project_roots(&[dir.path().to_path_buf(), file]);
+
+        assert_eq!(roots, vec![dir.path().to_path_buf()]);
+    }
+
+    /// Selecting several files in one folder is the ordinary way to drag, and
+    /// every one of them names the same root.
+    #[test]
+    fn project_roots_collapses_repeats_in_first_seen_order() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        for dir in [&first, &second] {
+            std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+            std::fs::write(dir.path().join("b.txt"), "x").unwrap();
+        }
+
+        let roots = project_roots(&[
+            second.path().join("a.txt"),
+            first.path().join("a.txt"),
+            second.path().join("b.txt"),
+            first.path().join("b.txt"),
+        ]);
+
+        assert_eq!(roots, vec![second.path().to_path_buf(), first.path().to_path_buf()]);
+    }
+
+    /// Derived from a real temporary directory rather than a hardcoded
+    /// absolute path: a literal is a guess about the host, and a Unix-shaped
+    /// one is a guess about the platform too.
+    #[test]
+    fn project_roots_skips_a_path_that_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never-created");
+
+        assert!(project_roots(&[missing]).is_empty());
+    }
+
+    /// The seam, not either half.  `shell_payload` cannot see what `paste.rs`
+    /// does to its output and `paste.rs` cannot see where the text came from,
+    /// so a filename carrying a newline is inert only if the two agree.  This
+    /// is the assertion that fails if the control-character filter is ever
+    /// removed as redundant with quoting.  It stops at the bytes `paste` would
+    /// write — reaching the PTY needs a spawned child.
+    #[test]
+    fn a_payload_reaching_an_unbracketed_paste_submits_nothing() {
+        let cfg =
+            DropConfig { quote: Quoting::None, wsl_translate: false, ..DropConfig::default() };
+        let paths = [PathBuf::from("/a/evil\nrm -rf ~"), PathBuf::from("/a/ok.png")];
+
+        let on_the_pty = crate::paste::paste_bytes(&shell_payload(&paths, None, &cfg), true, false);
+
+        assert!(!on_the_pty.contains(&b'\r'), "{on_the_pty:?} would press Enter on its own");
+        assert_eq!(on_the_pty, b"/a/ok.png ".to_vec());
+    }
+}

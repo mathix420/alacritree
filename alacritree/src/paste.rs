@@ -16,20 +16,25 @@ pub fn paste(session: &Session, text: &str, bracketed: bool) {
 
     on_terminal_input_start(session);
 
+    session.write(paste_bytes(text, bracketed, bracketed_active));
+}
+
+/// The bytes a paste puts on the PTY.
+///
+/// ESC and ETX are stripped inside a bracketed paste so the text cannot forge
+/// the end marker.  Without bracketed paste the receiving application cannot
+/// tell a paste from typing, so a newline has to become `\r` — which is also
+/// what Enter sends, meaning any newline reaching here submits a line.  That is
+/// why text built from filenames is filtered first
+/// (`file_drop::is_terminal_safe`).
+pub(crate) fn paste_bytes(text: &str, bracketed: bool, bracketed_active: bool) -> Vec<u8> {
     if bracketed && bracketed_active {
-        // Strip ESC/ETX so pasted text can't forge the end marker or trip a
-        // shell into terminating paste early.
-        session.write(b"\x1b[200~".to_vec());
         let filtered = text.replace(['\x1b', '\x03'], "");
-        session.write(filtered.into_bytes());
-        session.write(b"\x1b[201~".to_vec());
+        format!("\x1b[200~{filtered}\x1b[201~").into_bytes()
     } else if bracketed {
-        // Apps that didn't enable bracketed paste can't tell paste from
-        // keystrokes — collapse newlines to `\r` (what Enter sends).
-        let payload = text.replace("\r\n", "\r").replace('\n', "\r");
-        session.write(payload.into_bytes());
+        text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
     } else {
-        session.write(text.as_bytes().to_vec());
+        text.as_bytes().to_vec()
     }
 }
 
@@ -60,5 +65,29 @@ pub fn on_terminal_input_start(session: &Session) {
     let _ = term.selection.take();
     if term.grid().display_offset() != 0 {
         term.scroll_display(Scroll::Bottom);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bracketed_paste_wraps_the_text_and_strips_the_end_marker_bytes() {
+        let bytes = paste_bytes("a\x1bb\x03c", true, true);
+        assert_eq!(bytes, b"\x1b[200~abc\x1b[201~".to_vec());
+    }
+
+    /// An application that never enabled bracketed paste sees typing, and `\r`
+    /// is Enter — so every newline here submits a line.
+    #[test]
+    fn a_paste_into_an_app_without_bracketed_paste_turns_newlines_into_enter() {
+        assert_eq!(paste_bytes("a\r\nb\nc", true, false), b"a\rb\rc".to_vec());
+    }
+
+    /// `bracketed = false` is for writes that must reach the PTY verbatim.
+    #[test]
+    fn an_unbracketed_write_is_passed_through_untouched() {
+        assert_eq!(paste_bytes("a\nb\x1b", false, true), "a\nb\x1b".as_bytes().to_vec());
     }
 }
