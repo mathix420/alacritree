@@ -1,9 +1,10 @@
 //! Where a dropped file goes and what text it becomes.
 //!
-//! Everything here is a pure function over a pointer position, a set of paths
-//! and the config; `app.rs` supplies the region rectangles and owns the sinks.
-//! Keeping the decisions out of the frame loop is what makes them testable
-//! without a window.
+//! The decisions are functions of a pointer position, a set of paths and the
+//! config, with two exceptions: `project_roots` stats the paths it is given,
+//! and `screen_pointer` asks the OS and egui where the cursor is.  `app.rs`
+//! supplies the region rectangles and owns the sinks; keeping the rest out of
+//! the frame loop is what makes it testable without a window.
 
 use std::path::{Path, PathBuf};
 
@@ -181,6 +182,10 @@ pub fn project_roots(paths: &[PathBuf]) -> Vec<PathBuf> {
         } else if path.is_file() {
             path.parent().map(Path::to_path_buf)
         } else {
+            // Both queries also come back false when the metadata call was
+            // refused, so this covers a permission error as well as a path
+            // that has gone away between the drag and the drop.
+            log::debug!("dropped path {} is neither a file nor a directory", path.display());
             None
         };
         if let Some(root) = root.filter(|r| !roots.contains(r)) {
@@ -196,8 +201,8 @@ pub fn project_roots(paths: &[PathBuf]) -> Vec<PathBuf> {
 /// `DragEnter`/`DragOver`/`Drop` handlers all ignore their `POINTL`, and no
 /// `CursorMoved` is synthesized during a drag — so egui's own pointer is still
 /// wherever it was before the drag began.  Asking Win32 directly is the only
-/// way to learn where a drop landed.  Other platforms have no equivalent here
-/// yet, so they route by the central-panel fallback in `route`.
+/// way to learn where a drop landed.  No other platform has an equivalent
+/// here, so they route by the central-panel fallback in `route`.
 #[cfg(windows)]
 pub fn screen_pointer(ctx: &egui::Context) -> Option<egui::Pos2> {
     use windows_sys::Win32::Foundation::POINT;

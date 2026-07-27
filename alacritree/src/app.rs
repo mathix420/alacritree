@@ -1379,11 +1379,15 @@ impl AlacritreeApp {
         let Some(target) =
             file_drop::route(pointer, regions, active_is_scratchpad, &self.config.ui.drop)
         else {
+            log::debug!("drop at {pointer:?} lands on no enabled target, discarding {paths:?}");
             return;
         };
         match target {
             file_drop::Target::Terminal => {
                 let Some(idx) = self.active_session_index() else {
+                    log::debug!(
+                        "drop on the terminal with no active session, discarding {paths:?}"
+                    );
                     return;
                 };
                 let session = &self.sessions[idx];
@@ -1395,6 +1399,9 @@ impl AlacritreeApp {
             },
             file_drop::Target::Scratchpad => {
                 let Some(idx) = self.active_session_index() else {
+                    log::debug!(
+                        "drop on the scratchpad with no active session, discarding {paths:?}"
+                    );
                     return;
                 };
                 let id = self.sessions[idx].id;

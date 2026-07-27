@@ -326,9 +326,9 @@ fn parse_quoting(raw: Option<&str>) -> Quoting {
     }
 }
 
-/// `[ui.drop]`: what dragging files onto the window does.  Every target is on
-/// by default — a drop was discarded before, so no path here changes an
-/// existing behavior.
+/// `[ui.drop]`: what dragging files onto the window does.  Every target
+/// accepts drops by default; each one can be switched off on its own, and
+/// `enabled` turns the lot off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DropConfig {
     /// Master switch; false ignores every drop.
