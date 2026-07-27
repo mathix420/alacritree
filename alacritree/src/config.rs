@@ -264,8 +264,8 @@ pub enum Quoting {
 }
 
 /// `Quoting` with `Auto` already decided against the receiving shell.
-// The drop pipeline is the only production caller of `resolve`/`escape`;
-// until it lands, only the tests below construct these.
+// File drop is the only production consumer of `resolve`/`escape`; only the
+// tests below construct these otherwise.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellQuoting {
@@ -623,8 +623,8 @@ pub struct UiTheme {
     /// which renders every path byte-for-byte as it does today.
     pub path_style: PathStyleConfig,
     /// `[ui.drop]`: what a file dragged onto the window does.
-    // The drop pipeline is the only production reader; until it lands, only
-    // the tests below read this field.
+    // File drop is the only production reader; only the tests below read
+    // this field otherwise.
     #[cfg_attr(not(test), allow(dead_code))]
     pub drop: DropConfig,
 }
