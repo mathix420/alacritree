@@ -1325,21 +1325,21 @@ impl AlacritreeApp {
     /// three targets do not become a guessing game.  Silent off Windows: no
     /// cursor position is available there, so the tint would be a lie.
     fn paint_drop_hover(&self, ctx: &Context, regions: &file_drop::Regions) {
-        if !self.config.ui.drop.highlight || ctx.input(|i| i.raw.hovered_files.is_empty()) {
+        let cfg = &self.config.ui.drop;
+        if !cfg.enabled || !cfg.highlight || ctx.input(|i| i.raw.hovered_files.is_empty()) {
             return;
         }
+        let Some(pointer) = file_drop::screen_pointer(ctx) else {
+            return;
+        };
         // winit's `DragOver` handler emits no event, so moving the cursor
         // mid-drag wakes nothing and the polled position would stay frozen at
         // wherever the drag entered.  This is the only place the feature drives
         // the loop, and it stops when the drag leaves or drops.
         ctx.request_repaint();
-        let Some(pointer) = file_drop::screen_pointer(ctx) else {
-            return;
-        };
         let active_is_scratchpad =
             self.active_session_index().is_some_and(|idx| self.sessions[idx].scratchpad.is_some());
-        let Some(target) =
-            file_drop::route(Some(pointer), regions, active_is_scratchpad, &self.config.ui.drop)
+        let Some(target) = file_drop::route(Some(pointer), regions, active_is_scratchpad, cfg)
         else {
             return;
         };
