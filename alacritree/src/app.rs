@@ -19,6 +19,7 @@ use crate::config::{
     TextEmphasis, UiFont,
 };
 use crate::doppler;
+use crate::file_drop;
 use crate::git_nav::{self, GitSection, SectionCount};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
 use crate::ipc;
@@ -1318,6 +1319,54 @@ impl AlacritreeApp {
         self.projects.push(Project::discover(path.clone()).project);
         self.persist_project(&path);
         self.projects.last().expect("just pushed")
+    }
+
+    /// Send this frame's dropped files wherever they landed.  All of the
+    /// deciding happens in `file_drop`; this only reaches the sinks.
+    fn handle_dropped_files(&mut self, ctx: &Context, regions: &file_drop::Regions) {
+        let paths: Vec<PathBuf> =
+            ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        if paths.is_empty() {
+            return;
+        }
+        let active_is_scratchpad =
+            self.active_session_index().is_some_and(|idx| self.sessions[idx].scratchpad.is_some());
+        let pointer = file_drop::screen_pointer(ctx);
+        let Some(target) =
+            file_drop::route(pointer, regions, active_is_scratchpad, &self.config.ui.drop)
+        else {
+            return;
+        };
+        match target {
+            file_drop::Target::Terminal => {
+                let Some(idx) = self.active_session_index() else {
+                    return;
+                };
+                let session = &self.sessions[idx];
+                let text =
+                    file_drop::shell_payload(&paths, session.wsl_distro(), &self.config.ui.drop);
+                if !text.is_empty() {
+                    paste::paste(session, &text, true);
+                }
+            },
+            file_drop::Target::Scratchpad => {
+                let Some(idx) = self.active_session_index() else {
+                    return;
+                };
+                let id = self.sessions[idx].id;
+                let Some(editor) = self.sessions[idx].scratchpad.as_mut() else {
+                    return;
+                };
+                let (preceding, following) = editor.cursor_boundary(ctx, id);
+                let text = file_drop::document_payload(&paths, preceding, following);
+                editor.insert_at_cursor(ctx, id, &text);
+            },
+            file_drop::Target::ProjectsSidebar => {
+                for root in file_drop::project_roots(&paths) {
+                    self.add_project(wsl::normalize_root(root));
+                }
+            },
+        }
     }
 
     /// Drop a project from the sidebar.  Nothing on disk is touched, and
@@ -7167,6 +7216,7 @@ impl eframe::App for AlacritreeApp {
 
         let panel_frame = Frame::default().fill(sidebar_fill).inner_margin(Margin::same(8));
 
+        let mut sidebar_rect = None;
         if self.show_left_sidebar {
             let r = self.show_project_sidebar(ctx, panel_frame.clone());
             paint_panel_border(ctx, r.right(), r.y_range(), theme.sidebar_border);
@@ -7176,6 +7226,7 @@ impl eframe::App for AlacritreeApp {
             {
                 paint_focus_outline(ctx, r, &theme);
             }
+            sidebar_rect = Some(r);
         }
 
         self.phases.mark("projects-sidebar");
@@ -7265,6 +7316,14 @@ impl eframe::App for AlacritreeApp {
             });
         if theme.focus_outline.terminal && !modal_open && self.focus == PaneFocus::Terminal {
             paint_focus_outline(ctx, central.response.rect, &theme);
+        }
+
+        // A modal or the palette owns input while it is up; a drop landing
+        // behind one would act on a surface the user cannot see.
+        if !modal_open && !self.palette.is_open() {
+            let regions =
+                file_drop::Regions::new(sidebar_rect, central.response.rect, &self.config.ui.drop);
+            self.handle_dropped_files(ctx, &regions);
         }
         self.phases.mark("central");
 

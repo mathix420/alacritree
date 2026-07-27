@@ -1302,6 +1302,12 @@ impl Session {
         self.exited
     }
 
+    /// The distro a shimmed WSL session runs in.  Dropped paths need it to
+    /// decide whether a `C:\` path has to be rewritten before a shell sees it.
+    pub fn wsl_distro(&self) -> Option<&str> {
+        self.wsl_probe.as_ref().map(|probe| probe.distro.as_str())
+    }
+
     /// Sidebar glyph for the agent running here.  Identity comes from the
     /// PTY's foreground process (`/proc` on Linux, `sysctl` on macOS); the
     /// displayed glyph

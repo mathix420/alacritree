@@ -5,10 +5,6 @@
 //! Keeping the decisions out of the frame loop is what makes them testable
 //! without a window.
 
-// Nothing routes a drop event here yet, so every item in this module is only
-// reached from the tests below.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::path::{Path, PathBuf};
 
 use crate::config::{DropConfig, ShellQuoting};
@@ -224,6 +220,10 @@ pub fn screen_pointer(_ctx: &egui::Context) -> Option<egui::Pos2> {
 /// `ViewportInfo::inner_rect` is in monitor space at ui-point scale, which is
 /// physical pixels divided by `Context::pixels_per_point` — the same divisor
 /// `egui-winit` used to produce it.
+///
+/// Only the Windows `screen_pointer` has a pixel position to convert; the
+/// conversion itself is platform-independent, so its test still runs everywhere.
+#[cfg(any(windows, test))]
 fn to_egui_pos(
     x_px: f32,
     y_px: f32,

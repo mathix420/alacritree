@@ -264,10 +264,6 @@ pub enum Quoting {
 }
 
 /// `Quoting` with `Auto` already decided against the receiving shell.
-// `file_drop::shell_word` is the only caller of `resolve`/`escape`, and
-// nothing routes a drop event to `file_drop` yet, so only the tests below
-// construct these directly.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellQuoting {
     None,
@@ -278,7 +274,6 @@ pub enum ShellQuoting {
 }
 
 impl Quoting {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn resolve(self, wsl: bool) -> ShellQuoting {
         match self {
             Self::Auto if wsl => ShellQuoting::Posix,
@@ -295,7 +290,6 @@ impl Quoting {
 
 impl ShellQuoting {
     #[must_use]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn escape(self, path: &str) -> String {
         match self {
             Self::None => path.to_string(),
@@ -624,8 +618,6 @@ pub struct UiTheme {
     /// which renders every path byte-for-byte as it does today.
     pub path_style: PathStyleConfig,
     /// `[ui.drop]`: what a file dragged onto the window does.
-    // Nothing reads this field in production yet — only the tests below do.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub drop: DropConfig,
 }
 

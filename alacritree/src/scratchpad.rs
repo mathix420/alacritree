@@ -59,6 +59,25 @@ impl Editor {
         self.save();
     }
 
+    /// The characters either side of where `insert_at_cursor` would write, so a
+    /// caller inserting a block can tell whether it needs its own newlines.
+    /// A selection is replaced, so the following character is the one at the
+    /// end of the range, not the start.
+    pub fn cursor_boundary(
+        &self,
+        ctx: &egui::Context,
+        session_id: u64,
+    ) -> (Option<char>, Option<char>) {
+        let end = self.text.chars().count();
+        let range = TextEdit::load_state(ctx, editor_id(session_id))
+            .and_then(|state| state.cursor.char_range())
+            .unwrap_or_else(|| CCursorRange::one(CCursor::new(end)));
+        let [min, max] = range.sorted();
+        let mut chars = self.text.chars();
+        let preceding = (min.index > 0).then(|| chars.nth(min.index - 1)).flatten();
+        (preceding, self.text.chars().nth(max.index))
+    }
+
     pub fn selected_text(&self, ctx: &egui::Context, session_id: u64) -> Option<String> {
         let state = TextEdit::load_state(ctx, editor_id(session_id))?;
         let [min, max] = state.cursor.char_range()?.sorted();
@@ -349,5 +368,93 @@ mod tests {
         assert_eq!(value["exists"], true);
         assert_eq!(ensure_file_in(dir.path(), &workspace).unwrap(), path);
         assert_eq!(fs::read_to_string(path).unwrap(), "# Notes\n\nkeep me\n");
+    }
+
+    fn editor_holding(dir: &TempDir, text: &str) -> Editor {
+        let path = dir.path().join("note.md");
+        fs::write(&path, text).unwrap();
+        Editor::open(path).unwrap()
+    }
+
+    fn put_cursor(ctx: &egui::Context, session_id: u64, range: CCursorRange) {
+        let mut state = egui::text_edit::TextEditState::default();
+        state.cursor.set_char_range(Some(range));
+        TextEdit::store_state(ctx, editor_id(session_id), state);
+    }
+
+    #[test]
+    fn a_collapsed_cursor_reports_the_characters_either_side_of_it() {
+        let dir = TempDir::new().unwrap();
+        let editor = editor_holding(&dir, "abcd");
+        let ctx = egui::Context::default();
+
+        put_cursor(&ctx, 1, CCursorRange::one(CCursor::new(2)));
+
+        assert_eq!(editor.cursor_boundary(&ctx, 1), (Some('b'), Some('c')));
+    }
+
+    #[test]
+    fn a_cursor_at_either_end_of_the_buffer_reports_no_neighbour_there() {
+        let dir = TempDir::new().unwrap();
+        let editor = editor_holding(&dir, "abcd");
+        let ctx = egui::Context::default();
+
+        put_cursor(&ctx, 1, CCursorRange::one(CCursor::new(0)));
+        assert_eq!(editor.cursor_boundary(&ctx, 1), (None, Some('a')));
+
+        put_cursor(&ctx, 1, CCursorRange::one(CCursor::new(4)));
+        assert_eq!(editor.cursor_boundary(&ctx, 1), (Some('d'), None));
+    }
+
+    /// `insert_at_cursor` replaces the selection, so the text that survives
+    /// after the insertion starts at the *end* of the range.  Reading the
+    /// following character from `min.index` would report a character the
+    /// insertion is about to delete.
+    #[test]
+    fn a_selection_reports_what_survives_it_not_what_it_replaces() {
+        let dir = TempDir::new().unwrap();
+        let editor = editor_holding(&dir, "abcdef");
+        let ctx = egui::Context::default();
+
+        put_cursor(&ctx, 1, CCursorRange::two(CCursor::new(2), CCursor::new(4)));
+
+        assert_eq!(editor.cursor_boundary(&ctx, 1), (Some('b'), Some('e')));
+    }
+
+    /// Dragging a selection right-to-left stores it reversed; `sorted()` is
+    /// what makes the two directions agree.
+    #[test]
+    fn a_backwards_selection_reads_the_same_as_a_forwards_one() {
+        let dir = TempDir::new().unwrap();
+        let editor = editor_holding(&dir, "abcdef");
+        let ctx = egui::Context::default();
+
+        put_cursor(&ctx, 1, CCursorRange::two(CCursor::new(4), CCursor::new(2)));
+
+        assert_eq!(editor.cursor_boundary(&ctx, 1), (Some('b'), Some('e')));
+    }
+
+    /// `CCursor` counts characters, not bytes.  Indexing the buffer by byte
+    /// would land mid-codepoint here.
+    #[test]
+    fn multibyte_neighbours_are_read_as_whole_characters() {
+        let dir = TempDir::new().unwrap();
+        let editor = editor_holding(&dir, "aé→b");
+        let ctx = egui::Context::default();
+
+        put_cursor(&ctx, 1, CCursorRange::one(CCursor::new(2)));
+
+        assert_eq!(editor.cursor_boundary(&ctx, 1), (Some('é'), Some('→')));
+    }
+
+    /// A tab that has never been focused has no stored cursor, and
+    /// `insert_at_cursor` appends in that case — the boundary has to agree.
+    #[test]
+    fn an_editor_with_no_stored_cursor_reports_the_end_of_the_buffer() {
+        let dir = TempDir::new().unwrap();
+        let editor = editor_holding(&dir, "abcd");
+        let ctx = egui::Context::default();
+
+        assert_eq!(editor.cursor_boundary(&ctx, 1), (Some('d'), None));
     }
 }
