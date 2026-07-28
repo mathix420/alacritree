@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.8.0](https://github.com/mathix420/alacritree/compare/v0.7.1...v0.8.0) (2026-07-28)
+
+
+### Features
+
+* **palette:** add nav keys, sections, and columns ([#144](https://github.com/mathix420/alacritree/issues/144)) ([613393a](https://github.com/mathix420/alacritree/commit/613393a76194faf4c866987afd9938f2fc0e9d09))
+* **sidebar:** add configurable path abbreviation styles [5] ([#152](https://github.com/mathix420/alacritree/issues/152)) ([497911b](https://github.com/mathix420/alacritree/commit/497911b7cce544234710412785cb265c9248db9d))
+* **sidebar:** add search confirm/cancel actions [3] ([#138](https://github.com/mathix420/alacritree/issues/138)) ([d67c202](https://github.com/mathix420/alacritree/commit/d67c20255f32adb8f2b43e5b04a4540f20ab3d38))
+* **sidebar:** keep the cursor when a row disappears [6] ([#153](https://github.com/mathix420/alacritree/issues/153)) ([ac6d3a5](https://github.com/mathix420/alacritree/commit/ac6d3a559c69a52feda9e7b9f21987b6f19976c2))
+* **wsl:** advertise the binary path and hold the probe cache [1] ([#151](https://github.com/mathix420/alacritree/issues/151)) ([f637257](https://github.com/mathix420/alacritree/commit/f6372573426a45b524b572284261562ee74f8278))
+
+
+### Bug Fixes
+
+* **projects:** keep worktrees when unreachable ([#145](https://github.com/mathix420/alacritree/issues/145)) ([361ee88](https://github.com/mathix420/alacritree/commit/361ee8803108ca60a916e6225626e8b5f958b6f2))
+
+
+### Performance Improvements
+
+* **terminal:** cut input latency and output stalls [7] ([#154](https://github.com/mathix420/alacritree/issues/154)) ([2ea4408](https://github.com/mathix420/alacritree/commit/2ea44082fe0894ca9847117fef3673538cc071d1))
+
 ## [0.7.1](https://github.com/mathix420/alacritree/compare/v0.7.0...v0.7.1) (2026-07-23)
 
 
