@@ -1633,18 +1633,29 @@ impl AlacritreeApp {
         let bindings = &self.config.bindings;
         let steps: Vec<SidebarNavStep> = ctx.input_mut(|i| {
             let mut steps = Vec::new();
-            i.events.retain(|ev| match ev {
-                egui::Event::Text(text) => match filter.on_text(text) {
-                    Some(outcome) => {
-                        steps.push(SidebarNavStep::Filter(outcome));
-                        false
+            let text_keys = keys_paired_with_text(&i.events);
+            let mut idx = 0;
+            i.events.retain(|ev| {
+                let produced_text = text_keys[idx];
+                idx += 1;
+                match ev {
+                    egui::Event::Text(text) => match filter.on_text(text) {
+                        Some(outcome) => {
+                            steps.push(SidebarNavStep::Filter(outcome));
+                            false
+                        },
+                        None => true,
                     },
-                    None => true,
-                },
-                egui::Event::Key { key, pressed: true, modifiers, .. } => {
-                    drain_search_or_nav(&mut steps, filter, bindings, *key, *modifiers)
-                },
-                _ => true,
+                    egui::Event::Key { key, pressed: true, modifiers, .. } => drain_search_or_nav(
+                        &mut steps,
+                        filter,
+                        bindings,
+                        *key,
+                        *modifiers,
+                        produced_text,
+                    ),
+                    _ => true,
+                }
             });
             steps
         });
@@ -2010,18 +2021,29 @@ impl AlacritreeApp {
         let bindings = &self.config.bindings;
         let steps: Vec<SidebarNavStep> = ctx.input_mut(|i| {
             let mut steps = Vec::new();
-            i.events.retain(|ev| match ev {
-                egui::Event::Text(text) => match filter.on_text(text) {
-                    Some(outcome) => {
-                        steps.push(SidebarNavStep::Filter(outcome));
-                        false
+            let text_keys = keys_paired_with_text(&i.events);
+            let mut idx = 0;
+            i.events.retain(|ev| {
+                let produced_text = text_keys[idx];
+                idx += 1;
+                match ev {
+                    egui::Event::Text(text) => match filter.on_text(text) {
+                        Some(outcome) => {
+                            steps.push(SidebarNavStep::Filter(outcome));
+                            false
+                        },
+                        None => true,
                     },
-                    None => true,
-                },
-                egui::Event::Key { key, pressed: true, modifiers, .. } => {
-                    drain_search_or_nav(&mut steps, filter, bindings, *key, *modifiers)
-                },
-                _ => true,
+                    egui::Event::Key { key, pressed: true, modifiers, .. } => drain_search_or_nav(
+                        &mut steps,
+                        filter,
+                        bindings,
+                        *key,
+                        *modifiers,
+                        produced_text,
+                    ),
+                    _ => true,
+                }
             });
             steps
         });
@@ -5020,21 +5042,47 @@ fn panel_header_filter_ui(
     }
 }
 
+/// Which events are key presses whose text the search box will swallow.
+///
+/// egui-winit pushes `Event::Key` and then `Event::Text` adjacently for one
+/// printable press, so adjacency identifies the pair.  The result is positional
+/// rather than a set of triggers: key repeat and the `logical_key.or(physical_key)`
+/// fallback both let two presses in one frame share a `(key, modifiers)`, and
+/// only the occurrence carrying text may be treated as query input.
+fn keys_paired_with_text(events: &[egui::Event]) -> Vec<bool> {
+    events
+        .iter()
+        .enumerate()
+        .map(|(n, ev)| {
+            matches!(ev, egui::Event::Key { pressed: true, .. })
+                && matches!(events.get(n + 1), Some(egui::Event::Text(_)))
+        })
+        .collect()
+}
+
 /// Decide one key event for a focused sidebar panel and record its step.
 ///
-/// In search mode a search-scoped binding match (any modifiers, so `Shift+Esc`
-/// counts) is dispatched through the binding table, keeping `Enter`/`Esc`
-/// rebindable. Otherwise an unmodified key drives the filter or browsing nav; a
-/// modified non-search key is retained for `handle_shortcuts`. Returns whether
-/// the event stays in the queue (`true`) or is consumed here (`false`).
+/// In search mode a key whose text the query already swallowed is consumed
+/// outright — text input is unconditional, so it outranks even a search-scoped
+/// binding on that letter.  Otherwise a search-scoped binding match (any
+/// modifiers, so `Shift+Esc` counts) is dispatched through the binding table,
+/// keeping `Enter`/`Esc` rebindable; an unmodified key drives the filter or
+/// browsing nav; and a modified non-search key is retained for
+/// `handle_shortcuts`.  Returns whether the event stays in the queue (`true`)
+/// or is consumed here (`false`).
 fn drain_search_or_nav(
     steps: &mut Vec<SidebarNavStep>,
     filter: &mut PanelFilter,
     bindings: &[crate::bindings::KeyBinding],
     key: egui::Key,
     modifiers: egui::Modifiers,
+    produced_text: bool,
 ) -> bool {
-    if filter.mode() == panel_filter::Mode::Search {
+    let searching = filter.mode() == panel_filter::Mode::Search;
+    if searching && produced_text {
+        return false;
+    }
+    if searching {
         let mut matched = false;
         for a in crate::bindings::all_matches(bindings, key, modifiers) {
             if let BindingAction::Named(n) = a {
@@ -5055,12 +5103,14 @@ fn drain_search_or_nav(
         steps.push(SidebarNavStep::Filter(outcome));
         return false;
     }
-    // Browsing consumes the whole nav-key set; in search only Space stays
-    // consumed as a no-op, preserving the fake-click guard on the terminal view.
+    // Browsing consumes the whole nav-key set.  In search only Space and Delete
+    // stay consumed as no-ops: Space preserves the fake-click guard on the
+    // terminal view, and Delete is a text-editing key the append-only query has
+    // nothing to do with, so it must not fall through to the cursored row.
     let consume = if filter.mode() == panel_filter::Mode::Browsing {
         is_sidebar_nav_key(key)
     } else {
-        key == egui::Key::Space
+        key == egui::Key::Space || key == egui::Key::Delete
     };
     if consume {
         steps.push(SidebarNavStep::Nav(key));
@@ -7639,6 +7689,50 @@ mod tests {
         v
     }
 
+    fn key_ev(key: egui::Key, pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn text_pairing_marks_only_keys_followed_by_text() {
+        let events = vec![
+            key_ev(egui::Key::A, true),
+            egui::Event::Text("a".into()),
+            key_ev(egui::Key::Enter, true),
+            key_ev(egui::Key::B, true),
+            egui::Event::Text("b".into()),
+        ];
+        assert_eq!(keys_paired_with_text(&events), vec![true, false, false, true, false]);
+    }
+
+    #[test]
+    fn text_pairing_ignores_released_keys_and_orphan_text() {
+        let events = vec![
+            key_ev(egui::Key::A, false),
+            egui::Event::Text("a".into()),
+            egui::Event::Text("pasted".into()),
+        ];
+        assert_eq!(keys_paired_with_text(&events), vec![false, false, false]);
+    }
+
+    /// Two presses sharing one `(key, modifiers)` in a frame: only the occurrence
+    /// actually followed by text is marked. A set keyed by value would mark both.
+    #[test]
+    fn text_pairing_is_per_occurrence_not_per_trigger() {
+        let events = vec![
+            key_ev(egui::Key::A, true),
+            egui::Event::Text("a".into()),
+            key_ev(egui::Key::A, true),
+        ];
+        assert_eq!(keys_paired_with_text(&events), vec![true, false, false]);
+    }
+
     fn searching_filter() -> PanelFilter {
         let mut f = PanelFilter::new(&['s', 'a']);
         f.on_text("/");
@@ -7690,6 +7784,7 @@ mod tests {
             &binds,
             egui::Key::Enter,
             egui::Modifiers::NONE,
+            false,
         );
         assert!(!retain, "a matched search action consumes the key");
         assert!(matches!(
@@ -7701,14 +7796,28 @@ mod tests {
         assert_eq!(f.query(), "foo");
 
         let mut steps = Vec::new();
-        drain_search_or_nav(&mut steps, &mut f, &binds, egui::Key::Escape, egui::Modifiers::NONE);
+        drain_search_or_nav(
+            &mut steps,
+            &mut f,
+            &binds,
+            egui::Key::Escape,
+            egui::Modifiers::NONE,
+            false,
+        );
         assert!(matches!(
             steps.as_slice(),
             [SidebarNavStep::SearchAction(NamedAction::SidebarSearchCancel)]
         ));
 
         let mut steps = Vec::new();
-        drain_search_or_nav(&mut steps, &mut f, &binds, egui::Key::Escape, egui::Modifiers::SHIFT);
+        drain_search_or_nav(
+            &mut steps,
+            &mut f,
+            &binds,
+            egui::Key::Escape,
+            egui::Modifiers::SHIFT,
+            false,
+        );
         assert!(
             matches!(
                 steps.as_slice(),
@@ -7730,6 +7839,7 @@ mod tests {
             &binds,
             egui::Key::ArrowDown,
             egui::Modifiers::NONE,
+            false,
         );
         assert!(matches!(
             steps.as_slice(),
@@ -7744,6 +7854,7 @@ mod tests {
             &binds,
             egui::Key::Space,
             egui::Modifiers::NONE,
+            false,
         );
         assert!(!retain);
         assert!(matches!(steps.as_slice(), [SidebarNavStep::Nav(egui::Key::Space)]));
@@ -7761,6 +7872,7 @@ mod tests {
             &binds,
             egui::Key::Enter,
             egui::Modifiers::NONE,
+            false,
         );
         assert!(!retain, "Enter in browsing is a nav activate, consumed here");
         assert!(matches!(steps.as_slice(), [SidebarNavStep::Nav(egui::Key::Enter)]));
@@ -7773,6 +7885,7 @@ mod tests {
             &binds,
             egui::Key::Enter,
             egui::Modifiers::CTRL,
+            false,
         );
         assert!(retain);
         assert!(steps.is_empty());
@@ -7792,9 +7905,138 @@ mod tests {
             &binds,
             egui::Key::Enter,
             egui::Modifiers::NONE,
+            false,
         );
         assert!(retain, "an unbound Enter in search is retained, not consumed as nav");
         assert!(steps.is_empty());
+    }
+
+    /// A text-producing key in search mode is query input and must not also run a
+    /// binding — including one bound to a search action, since text input is
+    /// unconditional.
+    #[test]
+    fn a_text_key_in_search_is_consumed_before_any_binding() {
+        let binds = crate::bindings::parse_bindings(vec![crate::bindings::RawBinding {
+            key: "G".into(),
+            mods: None,
+            mode: None,
+            chars: None,
+            action: Some("SidebarSearchConfirm".into()),
+            command: None,
+        }]);
+        let mut f = searching_filter();
+
+        let mut steps = Vec::new();
+        let retain = drain_search_or_nav(
+            &mut steps,
+            &mut f,
+            &binds,
+            egui::Key::G,
+            egui::Modifiers::NONE,
+            true,
+        );
+
+        assert!(!retain, "a key carrying query text is consumed");
+        assert!(steps.is_empty(), "and dispatches nothing, not even a search action");
+    }
+
+    /// Shift+letter still produces text, so it must be consumed too. The modifier
+    /// early-return would otherwise let the built-in Shift+R reach RenameSelected.
+    #[test]
+    fn shift_letter_in_search_is_consumed() {
+        let binds = crate::bindings::parse_bindings(vec![]);
+        let mut f = searching_filter();
+
+        let mut steps = Vec::new();
+        let retain = drain_search_or_nav(
+            &mut steps,
+            &mut f,
+            &binds,
+            egui::Key::R,
+            egui::Modifiers::SHIFT,
+            true,
+        );
+
+        assert!(!retain);
+        assert!(steps.is_empty());
+    }
+
+    /// Bare Delete carries no text, so the pairing rule cannot claim it. It is a
+    /// search-box editing key, so it is consumed as a no-op instead of reaching the
+    /// cursored row.
+    #[test]
+    fn bare_delete_in_search_is_consumed_as_a_no_op() {
+        let binds = crate::bindings::parse_bindings(vec![]);
+        let mut f = searching_filter();
+
+        let mut steps = Vec::new();
+        let retain = drain_search_or_nav(
+            &mut steps,
+            &mut f,
+            &binds,
+            egui::Key::Delete,
+            egui::Modifiers::NONE,
+            false,
+        );
+
+        assert!(!retain);
+    }
+
+    /// Keys that produce no text keep falling through to the binding table, which
+    /// is what lets Home/End/PageUp/PageDown navigate filtered results.
+    #[test]
+    fn non_text_keys_in_search_still_fall_through() {
+        let binds = crate::bindings::parse_bindings(vec![]);
+        for key in [egui::Key::ArrowLeft, egui::Key::ArrowRight, egui::Key::Tab, egui::Key::Home] {
+            let mut f = searching_filter();
+            let mut steps = Vec::new();
+            let retain =
+                drain_search_or_nav(&mut steps, &mut f, &binds, key, egui::Modifiers::NONE, false);
+            assert!(retain, "{key:?} produces no query text and must reach the binding table");
+        }
+    }
+
+    /// Ctrl-modified keys suppress text generation, so they have no query input
+    /// and must reach the binding table to fire user bindings.
+    #[test]
+    fn ctrl_keys_in_search_still_fall_through() {
+        let binds = crate::bindings::parse_bindings(vec![]);
+        let mut f = searching_filter();
+
+        let mut steps = Vec::new();
+        let retain = drain_search_or_nav(
+            &mut steps,
+            &mut f,
+            &binds,
+            egui::Key::C,
+            egui::Modifiers::CTRL,
+            false,
+        );
+
+        assert!(
+            retain,
+            "ctrl-modified key produces no query text and must reach the binding table"
+        );
+    }
+
+    /// Browsing mode is untouched: a letter must reach the binding table, which is
+    /// how the filter toggle actions fire.
+    #[test]
+    fn a_text_key_in_browsing_is_not_consumed_by_the_pairing_rule() {
+        let binds = crate::bindings::parse_bindings(vec![]);
+        let mut f = PanelFilter::new(&['s', 'a']);
+
+        let mut steps = Vec::new();
+        let retain = drain_search_or_nav(
+            &mut steps,
+            &mut f,
+            &binds,
+            egui::Key::S,
+            egui::Modifiers::NONE,
+            true,
+        );
+
+        assert!(retain);
     }
 
     #[test]
