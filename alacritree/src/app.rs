@@ -325,6 +325,21 @@ fn project_filter_toggles(pr_status: bool) -> &'static [char] {
     if pr_status { &['s', 'a', 'o', 'd', 'm', 'c'] } else { &['s', 'a'] }
 }
 
+/// Whether any toggle dimension narrows the projects panel this frame —
+/// session presence, attention, or PR state. `project_self` falls back to
+/// plain fuzzy matching only when this is false.
+fn any_project_toggle_active(toggle_sessions: bool, toggle_attention: bool, any_pr: bool) -> bool {
+    toggle_sessions || toggle_attention || any_pr
+}
+
+/// Whether a worktree survives the projects panel's PR dimension. Inert
+/// when no PR toggle is active, so a worktree passes regardless of what
+/// `pr_matches` holds for it. Once a PR toggle is active, a worktree
+/// missing from `pr_matches` is excluded — its PR lookup hasn't landed.
+fn worktree_pr_passes(any_pr: bool, pr_matches: &HashMap<PathBuf, bool>, path: &Path) -> bool {
+    !any_pr || pr_matches.get(path).copied().unwrap_or(false)
+}
+
 /// Whether the projects panel is filtering on PR state this frame.
 fn any_pr_toggle_active(filter: &PanelFilter) -> bool {
     ['o', 'd', 'm', 'c'].into_iter().any(|key| filter.is_toggled(key))
@@ -1821,7 +1836,7 @@ impl AlacritreeApp {
         let pr_merged = apply && self.project_filter.is_toggled('m');
         let pr_closed = apply && self.project_filter.is_toggled('c');
         let any_pr = pr_open || pr_draft || pr_merged || pr_closed;
-        let any_toggle = toggle_sessions || toggle_attention || any_pr;
+        let any_toggle = any_project_toggle_active(toggle_sessions, toggle_attention, any_pr);
 
         // Precompute every fuzzy result before building the closures: the
         // matcher needs `&mut self.project_filter`, and releasing that borrow
@@ -1877,7 +1892,7 @@ impl AlacritreeApp {
         let mut worktree = |_p: &Project, wt: &Worktree| {
             worktree_matches.get(&wt.path).copied().unwrap_or(false)
                 && toggles_pass(&Some(wt.path.clone()))
-                && pr_matches.get(&wt.path).copied().unwrap_or(false)
+                && worktree_pr_passes(any_pr, &pr_matches, &wt.path)
         };
         sidebar_nav::filtered_rows(
             &self.projects,
@@ -8697,6 +8712,37 @@ mod tests {
         // toggle applies and passes once a wide search stands it down.
         assert!(!git_toggles_pass(true, false, false, ChangeKind::Untracked));
         assert!(git_toggles_pass(false, false, false, ChangeKind::Untracked));
+    }
+
+    #[test]
+    fn a_pr_toggle_alone_makes_any_toggle_active() {
+        assert!(!any_project_toggle_active(false, false, false));
+        assert!(any_project_toggle_active(false, false, true));
+    }
+
+    #[test]
+    fn worktree_pr_passes_is_inert_without_a_pr_toggle() {
+        let path = PathBuf::from("/worktree");
+        let mut pr_matches = HashMap::new();
+        pr_matches.insert(path.clone(), false);
+        assert!(worktree_pr_passes(false, &pr_matches, &path));
+    }
+
+    #[test]
+    fn worktree_pr_passes_follows_the_map_once_a_pr_toggle_is_active() {
+        let path = PathBuf::from("/worktree");
+        let mut pr_matches = HashMap::new();
+        pr_matches.insert(path.clone(), true);
+        assert!(worktree_pr_passes(true, &pr_matches, &path));
+        pr_matches.insert(path.clone(), false);
+        assert!(!worktree_pr_passes(true, &pr_matches, &path));
+    }
+
+    #[test]
+    fn worktree_pr_passes_excludes_a_worktree_missing_from_the_map() {
+        let path = PathBuf::from("/worktree");
+        let pr_matches: HashMap<PathBuf, bool> = HashMap::new();
+        assert!(!worktree_pr_passes(true, &pr_matches, &path));
     }
 
     fn req(file: &str, source: DiffSource) -> DiffRequest {
