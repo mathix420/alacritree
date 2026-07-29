@@ -310,9 +310,16 @@ fn pr_state(state: &str, is_draft: bool) -> PrState {
 
 /// Ask `gh` for the PR associated with `branch` in `path`.  Returns `None`
 /// on any failure mode (no `gh`, not authenticated, no PR, non-GitHub
-/// remote, ...).  The branch is passed as a positional selector so the
-/// answer is tied to that specific branch rather than whatever ref happens
-/// to be checked out in the worktree.
+/// remote, ...).  The branch is named explicitly so the answer is tied to
+/// that specific branch rather than whatever ref happens to be checked out
+/// in the worktree.
+///
+/// `--head` rather than `gh pr view <branch>`: `pr view` matches a PR's head
+/// *label*, which is the bare branch only while the head lives in the base
+/// repo and becomes `owner:branch` once it lives on a fork.  A checkout whose
+/// `origin` is a personal fork therefore finds nothing.  `--head` filters on
+/// the head ref name alone, which both layouts share, and `--state all` keeps
+/// the merged and closed badges that `pr list` would otherwise drop.
 fn query_gh(path: &Path, branch: &str) -> Option<PrInfo> {
     const PR_JSON_FIELDS: &str = "number,baseRefName,url,state,isDraft";
     match wsl::classify(path) {
@@ -320,7 +327,7 @@ fn query_gh(path: &Path, branch: &str) -> Option<PrInfo> {
             let output = Command::new("gh")
                 .hide_console()
                 .current_dir(p)
-                .args(["pr", "view", branch, "--json", PR_JSON_FIELDS])
+                .args(["pr", "list", "--head", branch, "--state", "all", "--json", PR_JSON_FIELDS])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .stdin(Stdio::null())
@@ -339,7 +346,7 @@ fn query_gh(path: &Path, branch: &str) -> Option<PrInfo> {
         // `--exec` PATH lacks.
         wsl::Location::Wsl { distro, linux_path } => {
             let gh = crate::wsl_helper::capability_gh(&distro).unwrap_or_else(|| "gh".to_string());
-            let script = r#"cd "$1" && exec "$2" pr view "$3" --json "$4""#;
+            let script = r#"cd "$1" && exec "$2" pr list --head "$3" --state all --json "$4""#;
             let stdout =
                 wsl::run_batch(&distro, script, &[&linux_path, &gh, branch, PR_JSON_FIELDS])
                     .ok()?;
@@ -348,8 +355,19 @@ fn query_gh(path: &Path, branch: &str) -> Option<PrInfo> {
     }
 }
 
+/// Pick the PR a head branch's badge should show.  `gh pr list` answers newest
+/// first, and a branch accumulates PRs over its life; an open one is the live
+/// PR, so it outranks a newer abandoned attempt.  Drafts report `OPEN` too, so
+/// this covers them.  Mirrors how `gh pr view` orders its own candidates.
+fn select_pr(prs: &[serde_json::Value]) -> Option<&serde_json::Value> {
+    prs.iter()
+        .find(|pr| pr.get("state").and_then(|s| s.as_str()) == Some("OPEN"))
+        .or_else(|| prs.first())
+}
+
 fn parse_gh_output(stdout: &[u8]) -> Option<PrInfo> {
-    let value: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    let list: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    let value = select_pr(list.as_array()?)?;
     let number = value.get("number")?.as_u64()?;
     let base = value.get("baseRefName")?.as_str()?.to_string();
     let url = value.get("url")?.as_str()?.to_string();
@@ -365,7 +383,7 @@ mod tests {
     #[test]
     fn parses_gh_json() {
         let stdout =
-            br#"{"baseRefName":"main","number":42,"url":"https://github.com/o/r/pull/42"}"#;
+            br#"[{"baseRefName":"main","number":42,"url":"https://github.com/o/r/pull/42"}]"#;
         let info = parse_gh_output(stdout).unwrap();
         assert_eq!(info.number, 42);
         assert_eq!(info.base_branch, "main");
@@ -378,6 +396,48 @@ mod tests {
     }
 
     #[test]
+    fn rejects_an_empty_pr_list() {
+        assert!(parse_gh_output(b"[]").is_none());
+    }
+
+    /// A head branch accumulates PRs over its life. `gh pr list` answers newest
+    /// first, but the open one is the live PR — a newer abandoned attempt must
+    /// not shadow it.
+    #[test]
+    fn an_open_pr_wins_over_a_newer_closed_one() {
+        let stdout = br#"[
+            {"baseRefName":"main","number":9,"url":"u9","state":"CLOSED","isDraft":false},
+            {"baseRefName":"main","number":4,"url":"u4","state":"OPEN","isDraft":false}
+        ]"#;
+        let info = parse_gh_output(stdout).unwrap();
+        assert_eq!(info.number, 4);
+        assert_eq!(info.state, PrState::Open);
+    }
+
+    #[test]
+    fn a_draft_counts_as_open_when_selecting() {
+        let stdout = br#"[
+            {"baseRefName":"main","number":9,"url":"u9","state":"MERGED","isDraft":false},
+            {"baseRefName":"main","number":4,"url":"u4","state":"OPEN","isDraft":true}
+        ]"#;
+        let info = parse_gh_output(stdout).unwrap();
+        assert_eq!(info.number, 4);
+        assert_eq!(info.state, PrState::Draft);
+    }
+
+    /// With nothing open, the newest attempt is the one worth painting.
+    #[test]
+    fn the_newest_pr_wins_when_none_are_open() {
+        let stdout = br#"[
+            {"baseRefName":"main","number":9,"url":"u9","state":"MERGED","isDraft":false},
+            {"baseRefName":"main","number":4,"url":"u4","state":"CLOSED","isDraft":false}
+        ]"#;
+        let info = parse_gh_output(stdout).unwrap();
+        assert_eq!(info.number, 9);
+        assert_eq!(info.state, PrState::Merged);
+    }
+
+    #[test]
     fn parses_pr_states() {
         for (json_state, is_draft, expected) in [
             ("OPEN", false, PrState::Open),
@@ -387,7 +447,7 @@ mod tests {
             ("SOMETHING_NEW", false, PrState::Open),
         ] {
             let stdout = format!(
-                r#"{{"baseRefName":"main","number":1,"url":"https://github.com/o/r/pull/1","state":"{json_state}","isDraft":{is_draft}}}"#
+                r#"[{{"baseRefName":"main","number":1,"url":"https://github.com/o/r/pull/1","state":"{json_state}","isDraft":{is_draft}}}]"#
             );
             let info = parse_gh_output(stdout.as_bytes()).unwrap();
             assert_eq!(info.state, expected, "state={json_state} draft={is_draft}");
@@ -398,7 +458,7 @@ mod tests {
     fn missing_state_fields_default_to_open() {
         // Old gh versions may omit fields we didn't ask for; degrade, don't drop.
         let stdout =
-            br#"{"baseRefName":"main","number":42,"url":"https://github.com/o/r/pull/42"}"#;
+            br#"[{"baseRefName":"main","number":42,"url":"https://github.com/o/r/pull/42"}]"#;
         assert_eq!(parse_gh_output(stdout).unwrap().state, PrState::Open);
     }
 
