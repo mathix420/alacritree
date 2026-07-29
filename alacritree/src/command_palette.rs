@@ -43,6 +43,7 @@ pub enum PaletteSection {
     Sessions,
     Workspaces,
     Sidebar,
+    Filters,
     Window,
     OpenSessions,
     SwitchWorkspace,
@@ -57,6 +58,7 @@ impl PaletteSection {
             Self::Sessions => "Sessions",
             Self::Workspaces => "Workspaces & projects",
             Self::Sidebar => "Sidebar & focus",
+            Self::Filters => "Filters",
             Self::Window => "Window & application",
             Self::OpenSessions => "Open sessions",
             Self::SwitchWorkspace => "Switch workspace",
@@ -86,6 +88,12 @@ fn section_of(a: NamedAction) -> PaletteSection {
         FocusProjectsSidebar | FocusGitSidebar | FocusTerminal => Sidebar,
         FocusLeft | FocusRight => Sidebar,
         SidebarSearchConfirm | SidebarSearchCancel | SidebarSearchCancelToTerminal => Sidebar,
+        ToggleSessionsFilter | ToggleAttentionFilter | ClearProjectFilters => Filters,
+        TogglePrOpenFilter | TogglePrDraftFilter => Filters,
+        TogglePrMergedFilter | TogglePrClosedFilter => Filters,
+        ToggleModifiedFilter | ToggleDeletedFilter => Filters,
+        ToggleUntrackedFilter | ClearGitFilters | ToggleSearchScope => Filters,
+        RefreshPrStatus => Sidebar,
         _ => Window,
     }
 }
@@ -215,7 +223,7 @@ pub fn group(items: &[PaletteItem], ranked: &[usize]) -> Vec<(PaletteSection, Ve
 /// Every simple (non-parametrized) `NamedAction`, kept in sync with the enum by
 /// hand. Mirrors the old shortcuts window's bindable list; `SelectTab`/
 /// `SpawnProfile` are excluded here because they carry an index.
-fn bindable_actions() -> [NamedAction; 50] {
+fn bindable_actions() -> [NamedAction; 63] {
     use NamedAction::*;
     [
         Paste,
@@ -268,6 +276,19 @@ fn bindable_actions() -> [NamedAction; 50] {
         SidebarSearchCancelToTerminal,
         Quit,
         TogglePalette,
+        ToggleSessionsFilter,
+        ToggleAttentionFilter,
+        TogglePrOpenFilter,
+        TogglePrDraftFilter,
+        TogglePrMergedFilter,
+        TogglePrClosedFilter,
+        ClearProjectFilters,
+        ToggleModifiedFilter,
+        ToggleDeletedFilter,
+        ToggleUntrackedFilter,
+        ClearGitFilters,
+        ToggleSearchScope,
+        RefreshPrStatus,
     ]
 }
 
@@ -546,5 +567,38 @@ mod tests {
         // Editing the query jumps back to the top match.
         palette.reseed(true, 2);
         assert_eq!(palette.selected(), 0);
+    }
+
+    #[test]
+    fn filter_actions_are_listed_under_their_own_section() {
+        let items = action_items(&parse_bindings(vec![]));
+        for name in [
+            "ToggleSessionsFilter",
+            "ToggleAttentionFilter",
+            "TogglePrOpenFilter",
+            "TogglePrDraftFilter",
+            "TogglePrMergedFilter",
+            "TogglePrClosedFilter",
+            "ClearProjectFilters",
+            "ToggleModifiedFilter",
+            "ToggleDeletedFilter",
+            "ToggleUntrackedFilter",
+            "ClearGitFilters",
+            "ToggleSearchScope",
+        ] {
+            let item = find(&items, name).unwrap_or_else(|| panic!("{name} is not in the palette"));
+            assert_eq!(item.section, PaletteSection::Filters, "{name}");
+        }
+        let refresh = find(&items, "RefreshPrStatus").expect("RefreshPrStatus missing");
+        assert_eq!(refresh.section, PaletteSection::Sidebar);
+    }
+
+    /// The PR filters ship keyless, so the palette is the only place they are
+    /// discoverable until a user binds them.
+    #[test]
+    fn pr_filter_actions_are_listed_without_keys() {
+        let items = action_items(&parse_bindings(vec![]));
+        assert_eq!(find(&items, "TogglePrOpenFilter").unwrap().keys, "");
+        assert_eq!(find(&items, "ToggleSessionsFilter").unwrap().keys, "S");
     }
 }

@@ -1563,6 +1563,7 @@ impl AlacritreeApp {
     /// is `ReceiveChar` (alacritty's pass-through marker).
     fn handle_shortcuts(&mut self, ctx: &Context) {
         let sidebar_focused = self.focus == PaneFocus::ProjectsSidebar && !self.palette.is_open();
+        let git_focused = self.focus == PaneFocus::GitSidebar && !self.palette.is_open();
         let scratchpad_focused = self.focus == PaneFocus::Terminal
             && self
                 .active_session_index()
@@ -1581,8 +1582,14 @@ impl AlacritreeApp {
                     let matched: Vec<_> = matched
                         .into_iter()
                         .filter(|a| {
-                            let valid_for_focus = sidebar_focused
-                                || !matches!(a, BindingAction::Named(n) if n.is_sidebar_scoped());
+                            let valid_for_focus = match a {
+                                BindingAction::Named(n) if n.is_projects_filter_scoped() => {
+                                    sidebar_focused
+                                },
+                                BindingAction::Named(n) if n.is_git_filter_scoped() => git_focused,
+                                BindingAction::Named(n) if n.is_sidebar_scoped() => sidebar_focused,
+                                _ => true,
+                            };
                             // Terminal byte/scroll bindings would swallow
                             // useful editor keys like Shift+Home and
                             // Shift+PageUp. Leave those events for TextEdit.
@@ -2461,6 +2468,45 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::SidebarSearchCancelToTerminal) => {
                 self.sidebar_search_cancel_to_terminal();
             },
+            BindingAction::Named(NamedAction::ToggleSessionsFilter) => {
+                self.project_filter.toggle('s');
+            },
+            BindingAction::Named(NamedAction::ToggleAttentionFilter) => {
+                self.project_filter.toggle('a');
+            },
+            BindingAction::Named(NamedAction::TogglePrOpenFilter) => {
+                self.project_filter.toggle('o');
+            },
+            BindingAction::Named(NamedAction::TogglePrDraftFilter) => {
+                self.project_filter.toggle('d');
+            },
+            BindingAction::Named(NamedAction::TogglePrMergedFilter) => {
+                self.project_filter.toggle('m');
+            },
+            BindingAction::Named(NamedAction::TogglePrClosedFilter) => {
+                self.project_filter.toggle('c');
+            },
+            BindingAction::Named(NamedAction::ClearProjectFilters) => {
+                self.project_filter.clear_toggles();
+            },
+            BindingAction::Named(NamedAction::ToggleModifiedFilter) => {
+                self.git_filter.toggle('m');
+                self.after_git_filter_changed();
+            },
+            BindingAction::Named(NamedAction::ToggleDeletedFilter) => {
+                self.git_filter.toggle('d');
+                self.after_git_filter_changed();
+            },
+            BindingAction::Named(NamedAction::ToggleUntrackedFilter) => {
+                self.git_filter.toggle('u');
+                self.after_git_filter_changed();
+            },
+            BindingAction::Named(NamedAction::ClearGitFilters) => {
+                self.git_filter.clear_toggles();
+                self.after_git_filter_changed();
+            },
+            BindingAction::Named(NamedAction::ToggleSearchScope) => {},
+            BindingAction::Named(NamedAction::RefreshPrStatus) => {},
             BindingAction::Named(other) => {
                 self.dispatch_scroll_or_other(other);
             },
