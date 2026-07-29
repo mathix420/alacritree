@@ -165,6 +165,20 @@ impl NamedAction {
         )
     }
 
+    /// Sidebar-cursor actions whose meaning depends on the project panel
+    /// browsing rather than searching.  Narrower than `is_sidebar_scoped`: the
+    /// four cursor *moves* stay valid mid-query, because navigating filtered
+    /// results is the point of filtering.
+    pub fn requires_project_browsing(&self) -> bool {
+        matches!(
+            self,
+            Self::RefreshProjects
+                | Self::DeleteSelected
+                | Self::RenameSelected
+                | Self::ToggleProjectExpanded
+        )
+    }
+
     /// Actions whose keys should remain native text-editing input while the
     /// scratchpad owns focus. For example, Shift+Home selects to the start of
     /// a line in the editor instead of trying to scroll a terminal grid.
@@ -1401,6 +1415,27 @@ mod tests {
         }
         for a in [CloseSession, ScrollToTop, ScrollPageUp, ToggleSidebarFocus, Quit] {
             assert!(!a.is_sidebar_scoped(), "{a:?}");
+        }
+    }
+
+    /// Exactly the four actions that carry a browsing-mode guard at dispatch. It
+    /// must not be widened to `is_sidebar_scoped`, whose four extra actions run
+    /// from the palette during search today.
+    #[test]
+    fn requires_project_browsing_is_exactly_the_four_guarded_actions() {
+        use NamedAction::*;
+        for a in [RefreshProjects, DeleteSelected, RenameSelected, ToggleProjectExpanded] {
+            assert!(a.requires_project_browsing(), "{a:?}");
+        }
+        for a in [
+            SidebarTop,
+            SidebarBottom,
+            SidebarNextProject,
+            SidebarPreviousProject,
+            CloseSession,
+            Quit,
+        ] {
+            assert!(!a.requires_project_browsing(), "{a:?}");
         }
     }
 

@@ -232,6 +232,7 @@ enum FocusDir {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActionOrigin {
     Keyboard,
+    Palette,
     Ipc,
 }
 
@@ -2188,6 +2189,16 @@ impl AlacritreeApp {
     }
 
     fn dispatch_action(&mut self, ctx: &Context, action: BindingAction, origin: ActionOrigin) {
+        // A palette row is dispatched with the panel still searching, and the
+        // cursor operations below act on a row the query may have hidden.  The
+        // keyboard path cannot reach here mid-query at all: a letter's text is
+        // swallowed by the query before the binding table sees the key.
+        if origin == ActionOrigin::Palette
+            && matches!(&action, BindingAction::Named(n) if n.requires_project_browsing())
+            && self.project_filter.mode() != panel_filter::Mode::Browsing
+        {
+            return;
+        }
         match action {
             BindingAction::Chars(bytes) => {
                 if let Some(idx) = self.active_session_index() {
@@ -2351,24 +2362,9 @@ impl AlacritreeApp {
                 self.sidebar_cursor_project_jump(-1)
             },
             BindingAction::Named(NamedAction::RefreshProjects) => {
-                // While the fuzzy prompt is open an unmodified `r` is query
-                // input — its Text event already fed the filter — so only a
-                // browsing-mode press (or IPC) refreshes.
-                if origin == ActionOrigin::Ipc
-                    || self.project_filter.mode() == panel_filter::Mode::Browsing
-                {
-                    self.refresh_all_projects(ctx);
-                }
+                self.refresh_all_projects(ctx);
             },
             BindingAction::Named(NamedAction::DeleteSelected) => {
-                // While the fuzzy prompt is open a letter bound here is query
-                // input — its Text event already fed the filter — so only a
-                // browsing-mode press (or IPC) acts.  Mirrors RefreshProjects.
-                if origin != ActionOrigin::Ipc
-                    && self.project_filter.mode() != panel_filter::Mode::Browsing
-                {
-                    return;
-                }
                 match self.sidebar_cursor.clone() {
                     Some(SidebarRow::Session(id)) => self.request_close_session(ctx, id),
                     Some(SidebarRow::Worktree(path)) => self.request_worktree_delete(&path),
@@ -2384,13 +2380,6 @@ impl AlacritreeApp {
                 }
             },
             BindingAction::Named(NamedAction::RenameSelected) => {
-                // Same browsing-mode guard as DeleteSelected: while the fuzzy
-                // prompt is open a letter bound here is query input.
-                if origin != ActionOrigin::Ipc
-                    && self.project_filter.mode() != panel_filter::Mode::Browsing
-                {
-                    return;
-                }
                 // Only project rows carry an editable label; sessions and
                 // worktrees take their names from the terminal title and the
                 // `[ui] worktree_name` template.
@@ -2402,13 +2391,6 @@ impl AlacritreeApp {
                 }
             },
             BindingAction::Named(NamedAction::ToggleProjectExpanded) => {
-                // Same browsing-mode guard as DeleteSelected: while the fuzzy
-                // prompt is open a letter bound here is query input.
-                if origin != ActionOrigin::Ipc
-                    && self.project_filter.mode() != panel_filter::Mode::Browsing
-                {
-                    return;
-                }
                 let Some(cursor) = self.sidebar_cursor.clone() else {
                     return;
                 };
@@ -6524,7 +6506,7 @@ impl AlacritreeApp {
     fn run_palette_action(&mut self, ctx: &Context, action: PaletteAction) {
         match action {
             PaletteAction::Run(a) => {
-                self.dispatch_action(ctx, BindingAction::Named(a), ActionOrigin::Keyboard);
+                self.dispatch_action(ctx, BindingAction::Named(a), ActionOrigin::Palette);
             },
             PaletteAction::ActivateSession(id) => {
                 self.activate_session_by_id(id);
