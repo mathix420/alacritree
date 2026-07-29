@@ -316,7 +316,9 @@ sidebar_focus      = "preserve"  # how far the projects sidebar goes when the
                                   # returns when the filter widens; a deleted row
                                   # slides to a sibling bounded by its parent.
                                   # "follow": also moves the terminal to a delete
-                                  # landing that has a live session
+                                  # landing that has a live session, and lands a
+                                  # closed session on its neighbour instead of on
+                                  # the workspace's first session
 vsync              = true   # restart required — wait for the display's refresh
                             # before showing a finished frame (default true).
                             # false presents each frame as soon as it is drawn,
@@ -445,6 +447,13 @@ The sidebar cursor used to drop to the first row whenever its own row stopped
 being rendered — by a filter, or by deleting a session or worktree. It now
 climbs or slides instead, under `sidebar_focus = "preserve"`. There is no
 setting that restores the old drop-to-first-row behavior.
+
+Closing a session is the one removal the cursor cannot speak for: `Ctrl+Shift+W`
+from the terminal and a shell exiting on its own both originate outside the
+sidebar, so there is no cursor to slide. Under `"preserve"` the workspace falls
+back to its first session, whichever one closed. `"follow"` lands on the closed
+session's neighbour instead — the next one, or the previous when the last
+session closed, the same ordinal rule the cursor slides by.
 
 Alacritty's palette, cursor, scrolling, window padding, shell, env, and binding
 tables are read by the same `Raw*` structs, so those parts of an existing

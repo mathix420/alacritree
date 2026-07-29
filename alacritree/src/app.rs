@@ -1034,10 +1034,11 @@ impl AlacritreeApp {
         let workspace = self.sessions[idx].working_directory.clone();
         self.sessions.remove(idx);
 
+        let remaining: Vec<(WorkspaceKey, SessionId)> =
+            self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect();
+
         if self.active_session.get(&workspace).copied() == Some(id) {
-            let fallback =
-                self.sessions.iter().find(|s| s.working_directory == workspace).map(|s| s.id);
-            match fallback {
+            match close_landing(&remaining, &workspace, idx, self.config.ui.sidebar_focus) {
                 Some(new_id) => {
                     self.active_session.insert(workspace.clone(), new_id);
                 },
@@ -1051,8 +1052,6 @@ impl AlacritreeApp {
         // view on an empty pane. What happens instead is policy: `respawn`
         // recycles a shell in place (the last session is by design
         // unclosable), `navigate` falls back to the project main, then home.
-        let remaining: Vec<(WorkspaceKey, SessionId)> =
-            self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect();
         let main = workspace.as_deref().and_then(|p| project_main_for(&self.projects, p));
         let verdict = close_fallback(&workspace, &self.current_workspace, &remaining, main);
         if verdict != CloseFallback::Stay
@@ -5356,6 +5355,40 @@ enum CloseFallback {
     Home,
 }
 
+/// Which session a workspace switches to when the one at `removed_idx` is
+/// closed.  `sessions` is the list *after* removal; `removed_idx` indexes the
+/// list *before* it, so the first surviving sibling at or past it is the
+/// closed session's successor.  Pure over (workspace, id) pairs for the same
+/// reason as `close_fallback`.
+///
+/// `Preserve` hands the workspace its first session whichever one closed.
+/// `Follow` takes the successor, or the predecessor when the last session
+/// closed — the ordinal rule `sidebar_focus::slide` lands the cursor by, so a
+/// close that moves both cannot point them at different siblings.
+fn close_landing(
+    sessions: &[(WorkspaceKey, SessionId)],
+    workspace: &WorkspaceKey,
+    removed_idx: usize,
+    mode: SidebarFocus,
+) -> Option<SessionId> {
+    let mut siblings = sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, (w, _))| w == workspace)
+        .map(|(i, (_, id))| (i, *id));
+    if !mode.follows() {
+        return siblings.next().map(|(_, id)| id);
+    }
+    let mut predecessor = None;
+    for (i, id) in siblings {
+        if i >= removed_idx {
+            return Some(id);
+        }
+        predecessor = Some(id);
+    }
+    predecessor
+}
+
 /// Post-close navigation for the workspace that just lost a session.
 /// `remaining` is the session list after removal; `main_checkout` is the
 /// removed workspace's project main (None when the workspace *is* the main,
@@ -7926,6 +7959,73 @@ mod tests {
             expanded: true,
             shell_override: None,
             home: None,
+        }
+    }
+
+    /// One worktree holding a `main` shell and three more, with an unrelated
+    /// workspace ahead of them so a landing that ignored `workspace` would
+    /// show up as picking id 9.
+    fn close_row() -> Vec<(WorkspaceKey, SessionId)> {
+        vec![
+            (ws("/other"), 9),
+            (ws("/repo/wt"), 1),
+            (ws("/repo/wt"), 2),
+            (ws("/repo/wt"), 3),
+            (ws("/repo/wt"), 4),
+        ]
+    }
+
+    fn closing(idx: usize) -> Vec<(WorkspaceKey, SessionId)> {
+        let mut sessions = close_row();
+        sessions.remove(idx);
+        sessions
+    }
+
+    #[test]
+    fn preserve_hands_the_workspace_its_first_session() {
+        for (removed_idx, expected) in [(1, 2), (2, 1), (3, 1), (4, 1)] {
+            assert_eq!(
+                close_landing(
+                    &closing(removed_idx),
+                    &ws("/repo/wt"),
+                    removed_idx,
+                    SidebarFocus::Preserve
+                ),
+                Some(expected),
+                "closing index {removed_idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn follow_lands_on_the_successor() {
+        for (removed_idx, expected) in [(1, 2), (2, 3), (3, 4)] {
+            assert_eq!(
+                close_landing(
+                    &closing(removed_idx),
+                    &ws("/repo/wt"),
+                    removed_idx,
+                    SidebarFocus::Follow
+                ),
+                Some(expected),
+                "closing index {removed_idx}"
+            );
+        }
+    }
+
+    /// Matches `sidebar_focus::slide`, which falls back to the last survivor
+    /// when the removed row had no successor; cursor and terminal would
+    /// otherwise pick different siblings under `"follow"`.
+    #[test]
+    fn follow_lands_on_the_predecessor_when_the_last_session_closes() {
+        assert_eq!(close_landing(&closing(4), &ws("/repo/wt"), 4, SidebarFocus::Follow), Some(3));
+    }
+
+    #[test]
+    fn an_emptied_workspace_has_no_landing_under_either_mode() {
+        let remaining = vec![(ws("/other"), 9)];
+        for mode in [SidebarFocus::Preserve, SidebarFocus::Follow] {
+            assert_eq!(close_landing(&remaining, &ws("/repo/wt"), 1, mode), None, "{mode:?}");
         }
     }
 
