@@ -32,6 +32,8 @@ pub enum Outcome {
 
 /// Search/toggle state for one sidebar panel.
 pub struct PanelFilter {
+    /// Render/bit order of this panel's toggle filters, not a set of keys:
+    /// `active_toggles` renders in this order and `toggle_bits` indexes it.
     allowed_toggles: &'static [char],
     mode: Mode,
     query: String,
@@ -64,6 +66,21 @@ impl PanelFilter {
 
     pub fn is_toggled(&self, key: char) -> bool {
         self.toggles.contains(&key)
+    }
+
+    /// Flip one toggle by its identity char.  A char outside `allowed_toggles`
+    /// names no filter on this panel and is ignored.
+    pub fn toggle(&mut self, key: char) {
+        if !self.allowed_toggles.contains(&key) {
+            return;
+        }
+        if !self.toggles.remove(&key) {
+            self.toggles.insert(key);
+        }
+    }
+
+    pub fn clear_toggles(&mut self) {
+        self.toggles.clear();
     }
 
     /// Active toggles in `allowed_toggles` order (render order).
@@ -121,17 +138,7 @@ impl PanelFilter {
                     self.mode = Mode::Search;
                     return Some(Outcome::Consumed);
                 }
-                let mut chars = text.chars();
-                let (Some(c), None) = (chars.next(), chars.next()) else {
-                    return None;
-                };
-                if !self.allowed_toggles.contains(&c) {
-                    return None;
-                }
-                if !self.toggles.remove(&c) {
-                    self.toggles.insert(c);
-                }
-                Some(Outcome::FilterChanged)
+                None
             },
             Mode::Search => {
                 self.query.push_str(text);
@@ -221,7 +228,7 @@ mod tests {
     #[test]
     fn exit_search_clears_query_and_returns_to_browsing_keeping_toggles() {
         let mut f = PanelFilter::new(TOGGLES);
-        f.on_text("s");
+        f.toggle('s');
         f.on_text("/");
         f.on_text("foo");
         assert!(f.is_toggled('s'));
@@ -241,25 +248,49 @@ mod tests {
     }
 
     #[test]
-    fn toggle_keys_flip_in_browsing_and_are_inert_in_search() {
+    fn toggle_flips_an_allowed_identity_and_ignores_an_unknown_one() {
         let mut f = PanelFilter::new(TOGGLES);
-        assert_eq!(f.on_text("s"), Some(Outcome::FilterChanged));
+        f.toggle('s');
         assert!(f.is_toggled('s'));
         assert_eq!(f.active_toggles(), vec!['s']);
 
-        assert_eq!(f.on_text("s"), Some(Outcome::FilterChanged));
+        f.toggle('s');
         assert!(!f.is_toggled('s'));
 
+        f.toggle('z');
+        assert!(!f.is_toggled('z'), "a char outside allowed_toggles is not a filter");
+        assert_eq!(f.toggle_bits(), 0);
+    }
+
+    #[test]
+    fn clear_toggles_empties_the_set_and_leaves_the_query() {
+        let mut f = PanelFilter::new(TOGGLES);
+        f.toggle('s');
+        f.toggle('a');
         f.on_text("/");
-        assert_eq!(f.on_text("s"), Some(Outcome::FilterChanged));
+        f.on_text("foo");
+
+        f.clear_toggles();
+        assert_eq!(f.toggle_bits(), 0);
+        assert_eq!(f.query(), "foo", "the query is a separate dimension");
+    }
+
+    /// Browsing recognizes only `/`; every other char falls through so the
+    /// binding table can act on the paired key event.
+    #[test]
+    fn browsing_text_other_than_slash_is_not_consumed() {
+        let mut f = PanelFilter::new(TOGGLES);
+        assert_eq!(f.on_text("s"), None);
+        assert_eq!(f.on_text("x"), None);
+        assert_eq!(f.on_text("/"), Some(Outcome::Consumed));
+        assert_eq!(f.on_text("s"), Some(Outcome::FilterChanged), "in search it is query input");
         assert_eq!(f.query(), "s");
-        assert!(!f.is_toggled('s'));
     }
 
     #[test]
     fn esc_in_browsing_clears_toggles_before_leaving_the_panel() {
         let mut f = PanelFilter::new(TOGGLES);
-        f.on_text("s");
+        f.toggle('s');
         assert!(f.is_toggled('s'));
 
         assert_eq!(f.on_key(egui::Key::Escape), Some(Outcome::FilterChanged));
@@ -281,13 +312,13 @@ mod tests {
         let mut f = PanelFilter::new(TOGGLES);
         assert_eq!(f.toggle_bits(), 0);
 
-        f.on_text("s");
+        f.toggle('s');
         assert_eq!(f.toggle_bits(), 0b01, "'s' is index 0 in TOGGLES");
 
-        f.on_text("a");
+        f.toggle('a');
         assert_eq!(f.toggle_bits(), 0b11);
 
-        f.on_text("s");
+        f.toggle('s');
         assert_eq!(f.toggle_bits(), 0b10, "'a' alone is index 1");
     }
 
@@ -296,9 +327,9 @@ mod tests {
         let mut f = PanelFilter::new(TOGGLES);
         assert!(!f.is_filtering());
 
-        f.on_text("s");
+        f.toggle('s');
         assert!(f.is_filtering());
-        f.on_text("s");
+        f.toggle('s');
         assert!(!f.is_filtering());
 
         f.on_text("/");
