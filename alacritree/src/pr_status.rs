@@ -17,6 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::command_ext::CommandExt;
+use crate::projects::Worktree;
 use crate::wsl;
 
 /// Re-query at most this often.  PR base branches rarely change, and a stale
@@ -65,6 +66,18 @@ struct LookupResult {
 impl PrCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The state of a cached lookup, without starting or refreshing one.
+    /// `None` unless the entry was queried for `branch`: an entry is keyed by
+    /// path but only ever valid for one branch, so a caller reading it under a
+    /// different branch would be reading the previous branch's PR.
+    pub fn state(&self, path: &Path, branch: Option<&str>) -> Option<PrState> {
+        let entry = self.entries.get(path)?;
+        if entry.branch.as_deref() != branch {
+            return None;
+        }
+        entry.info.as_ref().map(|i| i.state)
     }
 
     /// Returns the PR info known for `(path, branch)` right now, kicking off
@@ -126,6 +139,43 @@ fn should_invalidate(cached_branch: Option<&str>, incoming_branch: Option<&str>)
     match incoming_branch {
         None => false,
         Some(_) => cached_branch != incoming_branch,
+    }
+}
+
+/// Whether a worktree in `state` survives the projects panel's PR dimension.
+/// The active states union; with none active every worktree passes.  An unknown
+/// state — no lookup yet, no PR, or no `gh` — satisfies no active toggle.
+pub fn pr_pass(
+    state: Option<PrState>,
+    open: bool,
+    draft: bool,
+    merged: bool,
+    closed: bool,
+) -> bool {
+    if !(open || draft || merged || closed) {
+        return true;
+    }
+    match state {
+        None => false,
+        Some(PrState::Open) => open,
+        Some(PrState::Draft) => draft,
+        Some(PrState::Merged) => merged,
+        Some(PrState::Closed) => closed,
+    }
+}
+
+/// The branch a worktree's PR lookup is keyed to.  The active worktree prefers
+/// its live status branch; every other worktree, and an active one whose
+/// `StatusCache` has not produced a branch yet, uses the stored snapshot.
+pub fn effective_branch<'a>(
+    wt: &'a Worktree,
+    current_workspace: Option<&Path>,
+    live_branch: Option<&'a str>,
+) -> Option<&'a str> {
+    if current_workspace == Some(wt.path.as_path()) {
+        live_branch.or(wt.branch.as_deref())
+    } else {
+        wt.branch.as_deref()
     }
 }
 
@@ -290,5 +340,99 @@ mod tests {
         assert_eq!(entry.branch.as_deref(), Some("b"));
         assert!(entry.info.is_some(), "None poll must not clear the cached info");
         assert!(entry.pending.is_none(), "None poll must not spawn a competing lookup");
+    }
+
+    fn worktree(path: &str, branch: Option<&str>) -> Worktree {
+        Worktree {
+            name: String::new(),
+            path: PathBuf::from(path),
+            branch: branch.map(String::from),
+            is_main: false,
+            prunable: false,
+        }
+    }
+
+    #[test]
+    fn no_active_pr_toggle_passes_every_state() {
+        for state in [
+            None,
+            Some(PrState::Open),
+            Some(PrState::Draft),
+            Some(PrState::Merged),
+            Some(PrState::Closed),
+        ] {
+            assert!(pr_pass(state, false, false, false, false), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn an_active_pr_toggle_admits_only_its_own_state() {
+        assert!(pr_pass(Some(PrState::Open), true, false, false, false));
+        assert!(!pr_pass(Some(PrState::Draft), true, false, false, false));
+        assert!(!pr_pass(Some(PrState::Merged), true, false, false, false));
+    }
+
+    #[test]
+    fn pr_toggles_union_within_the_dimension() {
+        for state in [PrState::Open, PrState::Draft] {
+            assert!(pr_pass(Some(state), true, true, false, false), "{state:?}");
+        }
+        assert!(!pr_pass(Some(PrState::Closed), true, true, false, false));
+    }
+
+    /// No lookup yet, no PR, or no `gh` are indistinguishable here, and none of
+    /// them is evidence a worktree belongs in a PR-filtered list.
+    #[test]
+    fn an_unknown_state_never_satisfies_an_active_toggle() {
+        assert!(!pr_pass(None, true, false, false, false));
+        assert!(!pr_pass(None, true, true, true, true));
+    }
+
+    #[test]
+    fn effective_branch_prefers_the_live_branch_for_the_active_worktree() {
+        let wt = worktree("/repo/wt", Some("stored"));
+        let active = Some(Path::new("/repo/wt"));
+        assert_eq!(effective_branch(&wt, active, Some("live")), Some("live"));
+    }
+
+    /// A workspace that just became active has a fresh `StatusCache` with no
+    /// branch yet; falling back to the stored one is what stops a valid cached
+    /// lookup from reading as unknown for a frame.
+    #[test]
+    fn effective_branch_falls_back_to_the_stored_branch() {
+        let wt = worktree("/repo/wt", Some("stored"));
+        let active = Some(Path::new("/repo/wt"));
+        assert_eq!(effective_branch(&wt, active, None), Some("stored"));
+    }
+
+    #[test]
+    fn effective_branch_ignores_a_live_branch_from_another_workspace() {
+        let wt = worktree("/repo/wt", Some("stored"));
+        let active = Some(Path::new("/repo/other"));
+        assert_eq!(effective_branch(&wt, active, Some("live")), Some("stored"));
+    }
+
+    #[test]
+    fn state_is_none_for_a_branch_the_entry_was_not_queried_for() {
+        let mut cache = PrCache::new();
+        cache.entries.insert(
+            PathBuf::from("/repo/wt"),
+            Entry {
+                branch: Some("main".into()),
+                info: Some(PrInfo {
+                    number: 1,
+                    base_branch: "master".into(),
+                    url: String::new(),
+                    state: PrState::Open,
+                }),
+                queried_at: None,
+                pending: None,
+            },
+        );
+
+        let p = Path::new("/repo/wt");
+        assert_eq!(cache.state(p, Some("main")), Some(PrState::Open));
+        assert_eq!(cache.state(p, Some("feature")), None);
+        assert_eq!(cache.state(p, None), None);
     }
 }
