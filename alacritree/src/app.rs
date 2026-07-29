@@ -359,6 +359,29 @@ fn should_poll_pr(pr_enabled: bool, expanded: bool, any_pr_toggle: bool) -> bool
     pr_enabled && (expanded || any_pr_toggle)
 }
 
+/// Resolves one worktree's PR info against this frame's memo. `lookup` runs
+/// at most once per distinct `path`: a repeated path (the same worktree under
+/// two projects) reuses the banked answer instead of polling `PrCache` twice.
+fn resolve_pr_info<F>(
+    memo: &mut HashMap<PathBuf, Option<PrInfo>>,
+    path: &Path,
+    eligible: bool,
+    lookup: F,
+) -> Option<PrInfo>
+where
+    F: FnOnce() -> Option<PrInfo>,
+{
+    if !eligible {
+        return None;
+    }
+    if let Some(cached) = memo.get(path) {
+        return cached.clone();
+    }
+    let info = lookup();
+    memo.insert(path.to_path_buf(), info.clone());
+    info
+}
+
 /// Whether a git-status row survives the git panel's toggle dimension. Unlike
 /// `project_toggles_pass`, standing this down needs no separate `apply` flag:
 /// forcing all three toggles to `false` already makes `!any` admit every row.
@@ -3165,16 +3188,16 @@ impl AlacritreeApp {
                 // at whatever it was on last visit and shadow later
                 // `refresh_project` updates to `wt.branch`. Use the
                 // refresh-responsive snapshot instead.
-                let info = if !should_poll_pr(pr_enabled, project.expanded, any_pr_toggle) {
-                    None
-                } else if let Some(cached) = polled.get(&wt.path) {
-                    cached.clone()
-                } else {
-                    let branch = pr_status::effective_branch(wt, current_workspace, live_branch);
-                    let info = self.pr_cache.poll(&wt.path, branch, ctx);
-                    polled.insert(wt.path.clone(), info.clone());
-                    info
-                };
+                let info = resolve_pr_info(
+                    &mut polled,
+                    &wt.path,
+                    should_poll_pr(pr_enabled, project.expanded, any_pr_toggle),
+                    || {
+                        let branch =
+                            pr_status::effective_branch(wt, current_workspace, live_branch);
+                        self.pr_cache.poll(&wt.path, branch, ctx)
+                    },
+                );
                 rows.push(info);
             }
             pr_infos.push(rows);
@@ -9431,30 +9454,29 @@ mod tests {
     /// by path alone — two pollers would burn a `gh` process per frame.
     #[test]
     fn a_repeated_path_is_polled_once_but_rendered_everywhere() {
-        let mut polled: HashMap<PathBuf, Option<PrInfo>> = HashMap::new();
-        let mut lookups = 0;
+        let mut memo: HashMap<PathBuf, Option<PrInfo>> = HashMap::new();
+        let lookups = std::cell::Cell::new(0);
         let path = PathBuf::from("/repo/wt");
 
-        let mut resolve = |p: &PathBuf| {
-            if let Some(cached) = polled.get(p) {
-                return cached.clone();
-            }
-            lookups += 1;
-            let info = Some(PrInfo {
+        let poll = || {
+            lookups.set(lookups.get() + 1);
+            Some(PrInfo {
                 number: 1,
                 base_branch: "master".into(),
                 url: String::new(),
                 state: PrState::Open,
-            });
-            polled.insert(p.clone(), info.clone());
-            info
+            })
         };
 
-        let first = resolve(&path);
-        let second = resolve(&path);
+        let first = resolve_pr_info(&mut memo, &path, true, &poll);
+        let second = resolve_pr_info(&mut memo, &path, true, &poll);
 
-        assert_eq!(lookups, 1, "one lookup per path per frame");
+        assert_eq!(lookups.get(), 1, "one lookup per path per frame");
         assert!(second.is_some(), "the duplicate row still renders its badge");
         assert_eq!(first.map(|i| i.number), second.map(|i| i.number));
+
+        let ineligible = resolve_pr_info(&mut memo, &PathBuf::from("/repo/other"), false, &poll);
+        assert_eq!(lookups.get(), 1, "an ineligible path never runs the lookup");
+        assert!(ineligible.is_none());
     }
 }
