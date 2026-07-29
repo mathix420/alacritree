@@ -321,9 +321,10 @@ fn pr_state(state: &str, is_draft: bool) -> PrState {
 /// the head ref name alone, which both layouts share, and `--state all` keeps
 /// the merged and closed badges that `pr list` would otherwise drop.
 fn query_gh(path: &Path, branch: &str) -> Option<PrInfo> {
-    const PR_JSON_FIELDS: &str = "number,baseRefName,url,state,isDraft";
+    const PR_JSON_FIELDS: &str = "number,baseRefName,url,state,isDraft,headRepositoryOwner";
     match wsl::classify(path) {
         wsl::Location::Windows(p) => {
+            let owner = local_origin_owner(&p);
             let output = Command::new("gh")
                 .hide_console()
                 .current_dir(p)
@@ -336,7 +337,7 @@ fn query_gh(path: &Path, branch: &str) -> Option<PrInfo> {
             if !output.status.success() {
                 return None;
             }
-            parse_gh_output(&output.stdout)
+            parse_gh_output(&output.stdout, owner.as_deref())
         },
         // `gh` must be installed and authenticated *inside* the distro; any
         // failure falls back to the default branch, same as a missing
@@ -346,28 +347,133 @@ fn query_gh(path: &Path, branch: &str) -> Option<PrInfo> {
         // `--exec` PATH lacks.
         wsl::Location::Wsl { distro, linux_path } => {
             let gh = crate::wsl_helper::capability_gh(&distro).unwrap_or_else(|| "gh".to_string());
-            let script = r#"cd "$1" && exec "$2" pr list --head "$3" --state all --json "$4""#;
+            // The `origin` URL rides along on the first line: git2 cannot read
+            // a repository that lives inside the distro, and a second round
+            // trip would double the cost of a badge that already forks `gh`.
+            // The substitution collapses a missing remote to a blank line, so
+            // the JSON always starts after exactly one newline.
+            let script = r#"cd "$1" || exit 1
+printf '%s\n' "$(git config --get remote.origin.url 2>/dev/null)"
+exec "$2" pr list --head "$3" --state all --json "$4""#;
             let stdout =
                 wsl::run_batch(&distro, script, &[&linux_path, &gh, branch, PR_JSON_FIELDS])
                     .ok()?;
-            parse_gh_output(&stdout)
+            let (origin_url, json) = split_origin_url_line(&stdout);
+            let owner = origin_url.and_then(github_owner_from_url);
+            parse_gh_output(json, owner.as_deref())
         },
     }
 }
 
-/// Pick the PR a head branch's badge should show.  `gh pr list` answers newest
-/// first, and a branch accumulates PRs over its life; an open one is the live
-/// PR, so it outranks a newer abandoned attempt.  Drafts report `OPEN` too, so
-/// this covers them.  Mirrors how `gh pr view` orders its own candidates.
-fn select_pr(prs: &[serde_json::Value]) -> Option<&serde_json::Value> {
-    prs.iter()
-        .find(|pr| pr.get("state").and_then(|s| s.as_str()) == Some("OPEN"))
-        .or_else(|| prs.first())
+/// Split the WSL batch's leading `origin` URL off the JSON that follows it.
+/// An empty first line means the worktree has no readable `origin`.
+fn split_origin_url_line(stdout: &[u8]) -> (Option<&str>, &[u8]) {
+    let Some(end) = stdout.iter().position(|b| *b == b'\n') else {
+        // Nothing ran far enough to emit the line; hand the payload to the
+        // JSON parser, which rejects it the way it rejects any non-JSON.
+        return (None, stdout);
+    };
+    let url = std::str::from_utf8(&stdout[..end]).ok().map(str::trim).filter(|u| !u.is_empty());
+    (url, &stdout[end + 1..])
 }
 
-fn parse_gh_output(stdout: &[u8]) -> Option<PrInfo> {
+/// The GitHub owner of this worktree's `origin`, read straight from the
+/// repository config so the badge still costs exactly one `gh` process.
+fn local_origin_owner(path: &Path) -> Option<String> {
+    let repo = git2::Repository::open(path).ok()?;
+    let remote = repo.find_remote("origin").ok()?;
+    github_owner_from_url(remote.url()?)
+}
+
+/// Owner of a GitHub remote URL, for the shapes git accepts:
+/// `https://github.com/owner/repo.git`, `git@github.com:owner/repo.git`, and
+/// the scp-style host alias `gh:owner/repo.git`.  `None` for anything else —
+/// the owner only breaks ties, so an unreadable remote costs nothing.
+fn github_owner_from_url(url: &str) -> Option<String> {
+    let (host, path) = split_remote_url(url.trim())?;
+    if !is_github_host(host) {
+        return None;
+    }
+    let (owner, repo) = path.trim_start_matches('/').split_once('/')?;
+    (!owner.is_empty() && !repo.is_empty()).then(|| owner.to_string())
+}
+
+/// Host and path of a remote URL, covering both the scheme form and the
+/// scp-style `[user@]host:path` one that git reads whenever the colon comes
+/// before any slash.
+fn split_remote_url(url: &str) -> Option<(&str, &str)> {
+    if let Some((_, rest)) = url.split_once("://") {
+        let (authority, path) = rest.split_once('/')?;
+        return Some((remote_host(authority), path));
+    }
+    let (authority, path) = url.split_once(':')?;
+    // A leading slash means an absolute local path (`C:/repos/x`), which git
+    // does not read as scp-style however much it looks like one.
+    if authority.contains('/') || path.starts_with('/') {
+        return None;
+    }
+    Some((remote_host(authority), path))
+}
+
+fn remote_host(authority: &str) -> &str {
+    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    host.split(':').next().unwrap_or(host)
+}
+
+/// `github.com`, or any host with no dot in it.  A dotless host is an
+/// `~/.ssh/config` alias whose real target we cannot see, and aliases are how
+/// fork checkouts pick an SSH identity — refusing them would blind the owner
+/// preference to the layout it exists for.  Guessing wrong on one just yields
+/// an owner no PR matches.
+fn is_github_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("github.com") || !host.contains('.')
+}
+
+/// Pick the PR a head branch's badge should show.  Two rules, in order:
+///
+/// `--head` matches the ref name across *every* head repository, so a generic
+/// branch name ("dev", "patch-1") also collects PRs strangers opened from their
+/// own forks.  A head repo owned by the same account as this worktree's
+/// `origin` is the one this checkout actually pushed, so it outranks a
+/// stranger's however live that one is.  Without a readable owner, or with no
+/// candidate matching it, every PR stays in the running.
+///
+/// Among what survives, `gh pr list` answers newest first and a branch
+/// accumulates PRs over its life; an open one is the live PR, so it outranks a
+/// newer abandoned attempt.  Drafts report `OPEN` too, so this covers them.
+/// Mirrors how `gh pr view` orders its own candidates.
+fn select_pr<'a>(
+    prs: &'a [serde_json::Value],
+    origin_owner: Option<&str>,
+) -> Option<&'a serde_json::Value> {
+    origin_owner
+        .and_then(|owner| open_or_newest(prs.iter().filter(|pr| head_owner_is(pr, owner))))
+        .or_else(|| open_or_newest(prs.iter()))
+}
+
+fn open_or_newest<'a>(
+    prs: impl Iterator<Item = &'a serde_json::Value>,
+) -> Option<&'a serde_json::Value> {
+    let mut newest = None;
+    for pr in prs {
+        if pr.get("state").and_then(|s| s.as_str()) == Some("OPEN") {
+            return Some(pr);
+        }
+        newest = newest.or(Some(pr));
+    }
+    newest
+}
+
+fn head_owner_is(pr: &serde_json::Value, owner: &str) -> bool {
+    pr.get("headRepositoryOwner")
+        .and_then(|o| o.get("login"))
+        .and_then(|l| l.as_str())
+        .is_some_and(|login| login.eq_ignore_ascii_case(owner))
+}
+
+fn parse_gh_output(stdout: &[u8], origin_owner: Option<&str>) -> Option<PrInfo> {
     let list: serde_json::Value = serde_json::from_slice(stdout).ok()?;
-    let value = select_pr(list.as_array()?)?;
+    let value = select_pr(list.as_array()?, origin_owner)?;
     let number = value.get("number")?.as_u64()?;
     let base = value.get("baseRefName")?.as_str()?.to_string();
     let url = value.get("url")?.as_str()?.to_string();
@@ -384,7 +490,7 @@ mod tests {
     fn parses_gh_json() {
         let stdout =
             br#"[{"baseRefName":"main","number":42,"url":"https://github.com/o/r/pull/42"}]"#;
-        let info = parse_gh_output(stdout).unwrap();
+        let info = parse_gh_output(stdout, None).unwrap();
         assert_eq!(info.number, 42);
         assert_eq!(info.base_branch, "main");
         assert_eq!(info.url, "https://github.com/o/r/pull/42");
@@ -392,12 +498,12 @@ mod tests {
 
     #[test]
     fn rejects_empty_output() {
-        assert!(parse_gh_output(b"").is_none());
+        assert!(parse_gh_output(b"", None).is_none());
     }
 
     #[test]
     fn rejects_an_empty_pr_list() {
-        assert!(parse_gh_output(b"[]").is_none());
+        assert!(parse_gh_output(b"[]", None).is_none());
     }
 
     /// A head branch accumulates PRs over its life. `gh pr list` answers newest
@@ -409,7 +515,7 @@ mod tests {
             {"baseRefName":"main","number":9,"url":"u9","state":"CLOSED","isDraft":false},
             {"baseRefName":"main","number":4,"url":"u4","state":"OPEN","isDraft":false}
         ]"#;
-        let info = parse_gh_output(stdout).unwrap();
+        let info = parse_gh_output(stdout, None).unwrap();
         assert_eq!(info.number, 4);
         assert_eq!(info.state, PrState::Open);
     }
@@ -420,7 +526,7 @@ mod tests {
             {"baseRefName":"main","number":9,"url":"u9","state":"MERGED","isDraft":false},
             {"baseRefName":"main","number":4,"url":"u4","state":"OPEN","isDraft":true}
         ]"#;
-        let info = parse_gh_output(stdout).unwrap();
+        let info = parse_gh_output(stdout, None).unwrap();
         assert_eq!(info.number, 4);
         assert_eq!(info.state, PrState::Draft);
     }
@@ -432,7 +538,7 @@ mod tests {
             {"baseRefName":"main","number":9,"url":"u9","state":"MERGED","isDraft":false},
             {"baseRefName":"main","number":4,"url":"u4","state":"CLOSED","isDraft":false}
         ]"#;
-        let info = parse_gh_output(stdout).unwrap();
+        let info = parse_gh_output(stdout, None).unwrap();
         assert_eq!(info.number, 9);
         assert_eq!(info.state, PrState::Merged);
     }
@@ -449,7 +555,7 @@ mod tests {
             let stdout = format!(
                 r#"[{{"baseRefName":"main","number":1,"url":"https://github.com/o/r/pull/1","state":"{json_state}","isDraft":{is_draft}}}]"#
             );
-            let info = parse_gh_output(stdout.as_bytes()).unwrap();
+            let info = parse_gh_output(stdout.as_bytes(), None).unwrap();
             assert_eq!(info.state, expected, "state={json_state} draft={is_draft}");
         }
     }
@@ -459,7 +565,139 @@ mod tests {
         // Old gh versions may omit fields we didn't ask for; degrade, don't drop.
         let stdout =
             br#"[{"baseRefName":"main","number":42,"url":"https://github.com/o/r/pull/42"}]"#;
-        assert_eq!(parse_gh_output(stdout).unwrap().state, PrState::Open);
+        assert_eq!(parse_gh_output(stdout, None).unwrap().state, PrState::Open);
+    }
+
+    fn pr(number: u64, state: &str, head_owner: &str) -> serde_json::Value {
+        serde_json::json!({
+            "number": number,
+            "baseRefName": "main",
+            "url": format!("u{number}"),
+            "state": state,
+            "isDraft": false,
+            "headRepositoryOwner": { "login": head_owner },
+        })
+    }
+
+    fn number_of(pr: Option<&serde_json::Value>) -> Option<u64> {
+        pr?.get("number")?.as_u64()
+    }
+
+    #[test]
+    fn select_pr_prefers_an_open_pr_over_a_newer_non_open_one() {
+        let prs = [pr(9, "MERGED", "someone"), pr(4, "OPEN", "someone")];
+        assert_eq!(number_of(select_pr(&prs, None)), Some(4));
+    }
+
+    #[test]
+    fn select_pr_takes_the_newest_when_none_are_open() {
+        let prs = [pr(9, "MERGED", "someone"), pr(4, "CLOSED", "someone")];
+        assert_eq!(number_of(select_pr(&prs, None)), Some(9));
+    }
+
+    /// `--head` matches the ref name in *every* head repository, so a generic
+    /// branch name ("dev", "patch-1") collects strangers' PRs.  Theirs must not
+    /// decide this worktree's badge or diff base, however live they are.
+    #[test]
+    fn select_pr_prefers_the_origin_owners_pr_over_a_strangers_open_one() {
+        let prs = [pr(9, "OPEN", "stranger"), pr(4, "MERGED", "me")];
+        assert_eq!(number_of(select_pr(&prs, Some("me"))), Some(4));
+    }
+
+    #[test]
+    fn select_pr_prefers_an_open_pr_among_the_origin_owners_own() {
+        let prs = [pr(9, "MERGED", "me"), pr(7, "OPEN", "stranger"), pr(4, "OPEN", "me")];
+        assert_eq!(number_of(select_pr(&prs, Some("me"))), Some(4));
+    }
+
+    /// GitHub logins are case-insensitive, so a remote URL that disagrees with
+    /// the API's casing still names the same account.
+    #[test]
+    fn select_pr_matches_the_owner_case_insensitively() {
+        let prs = [pr(9, "OPEN", "stranger"), pr(4, "MERGED", "Me")];
+        assert_eq!(number_of(select_pr(&prs, Some("me"))), Some(4));
+    }
+
+    #[test]
+    fn select_pr_falls_back_to_the_plain_policy_when_no_owner_matches() {
+        let prs = [pr(9, "MERGED", "stranger"), pr(4, "OPEN", "other")];
+        assert_eq!(number_of(select_pr(&prs, Some("me"))), Some(4));
+    }
+
+    /// A `gh` too old to report the head owner must not filter every candidate
+    /// away — an unknown owner is no evidence the PR belongs to someone else.
+    #[test]
+    fn select_pr_tolerates_a_missing_head_owner() {
+        let prs = [serde_json::json!({"number": 4, "state": "OPEN"})];
+        assert_eq!(number_of(select_pr(&prs, Some("me"))), Some(4));
+    }
+
+    #[test]
+    fn select_pr_reports_nothing_for_an_empty_list() {
+        assert!(select_pr(&[], Some("me")).is_none());
+    }
+
+    /// The regression this preference exists for: a stale PR opened by a
+    /// stranger on the same branch name, still carrying the base branch the
+    /// repository has since renamed away from.
+    #[test]
+    fn the_origin_owners_pr_decides_the_diff_base() {
+        let stdout = br#"[
+            {"baseRefName":"master","number":9,"url":"u9","state":"OPEN","isDraft":false,"headRepositoryOwner":{"login":"stranger"}},
+            {"baseRefName":"main","number":4,"url":"u4","state":"MERGED","isDraft":false,"headRepositoryOwner":{"login":"me"}}
+        ]"#;
+        let info = parse_gh_output(stdout, Some("me")).unwrap();
+        assert_eq!(info.number, 4);
+        assert_eq!(info.base_branch, "main");
+    }
+
+    #[test]
+    fn derives_the_owner_from_an_https_remote() {
+        let owner = github_owner_from_url("https://github.com/owner/repo.git");
+        assert_eq!(owner.as_deref(), Some("owner"));
+    }
+
+    #[test]
+    fn derives_the_owner_from_an_scp_style_ssh_remote() {
+        let owner = github_owner_from_url("git@github.com:owner/repo.git");
+        assert_eq!(owner.as_deref(), Some("owner"));
+    }
+
+    /// An `~/.ssh/config` alias is how a fork checkout picks an identity, and it
+    /// hides the host it resolves to — reading it as foreign would blind the
+    /// preference to exactly the layout it exists for.
+    #[test]
+    fn derives_the_owner_from_an_ssh_host_alias() {
+        let owner = github_owner_from_url("gh:owner/repo.git");
+        assert_eq!(owner.as_deref(), Some("owner"));
+    }
+
+    #[test]
+    fn rejects_a_non_github_remote() {
+        assert!(github_owner_from_url("https://gitlab.com/owner/repo.git").is_none());
+        assert!(github_owner_from_url("git@gitlab.com:owner/repo.git").is_none());
+    }
+
+    #[test]
+    fn rejects_a_malformed_remote() {
+        assert!(github_owner_from_url("").is_none());
+        assert!(github_owner_from_url("not a url").is_none());
+        assert!(github_owner_from_url("https://github.com/owner").is_none());
+        assert!(github_owner_from_url("C:/repos/checkout").is_none());
+    }
+
+    #[test]
+    fn the_wsl_batch_line_carries_the_origin_url() {
+        let (url, json) = split_origin_url_line(b"gh:me/repo.git\n[]");
+        assert_eq!(url, Some("gh:me/repo.git"));
+        assert_eq!(json, b"[]".as_slice());
+    }
+
+    #[test]
+    fn a_worktree_without_a_remote_leaves_the_wsl_line_blank() {
+        let (url, json) = split_origin_url_line(b"\n[]");
+        assert_eq!(url, None);
+        assert_eq!(json, b"[]".as_slice());
     }
 
     fn sample_info() -> PrInfo {
