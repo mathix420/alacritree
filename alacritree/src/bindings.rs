@@ -144,6 +144,29 @@ pub enum NamedAction {
     SidebarSearchCancel,
     /// Cancel the focused sidebar's fuzzy search and return focus to the terminal.
     SidebarSearchCancelToTerminal,
+    /// Narrow the projects sidebar to workspaces with a live session.
+    ToggleSessionsFilter,
+    /// Narrow the projects sidebar to workspaces whose session wants attention.
+    ToggleAttentionFilter,
+    /// PR-state filters.  One dimension: the active states union, and the
+    /// result ANDs with the session and attention filters.
+    TogglePrOpenFilter,
+    TogglePrDraftFilter,
+    TogglePrMergedFilter,
+    TogglePrClosedFilter,
+    /// Drop every projects-sidebar toggle.  Reachable without knowing which are
+    /// set, which `Esc` cannot offer a caller that has no view of the state.
+    ClearProjectFilters,
+    /// Git sidebar change-kind filters.  The active kinds union.
+    ToggleModifiedFilter,
+    ToggleDeletedFilter,
+    ToggleUntrackedFilter,
+    ClearGitFilters,
+    /// Switch between a query confined by the active toggles and one evaluated
+    /// against every row.  Session-only; restarting returns to `[ui] search_scope`.
+    ToggleSearchScope,
+    /// Re-query `gh` for every cached worktree.
+    RefreshPrStatus,
 }
 
 impl NamedAction {
@@ -162,6 +185,7 @@ impl NamedAction {
                 | Self::DeleteSelected
                 | Self::RenameSelected
                 | Self::ToggleProjectExpanded
+                | Self::RefreshPrStatus
         )
     }
 
@@ -176,6 +200,34 @@ impl NamedAction {
                 | Self::DeleteSelected
                 | Self::RenameSelected
                 | Self::ToggleProjectExpanded
+        )
+    }
+
+    /// Valid only while the projects sidebar owns focus: the default triggers
+    /// are bare letters that belong to the PTY anywhere else.  No mode
+    /// component is needed — a letter typed into the search box never reaches
+    /// the binding table, because its text is swallowed first.
+    pub fn is_projects_filter_scoped(&self) -> bool {
+        matches!(
+            self,
+            Self::ToggleSessionsFilter
+                | Self::ToggleAttentionFilter
+                | Self::TogglePrOpenFilter
+                | Self::TogglePrDraftFilter
+                | Self::TogglePrMergedFilter
+                | Self::TogglePrClosedFilter
+                | Self::ClearProjectFilters
+        )
+    }
+
+    /// The git sidebar's equivalent.
+    pub fn is_git_filter_scoped(&self) -> bool {
+        matches!(
+            self,
+            Self::ToggleModifiedFilter
+                | Self::ToggleDeletedFilter
+                | Self::ToggleUntrackedFilter
+                | Self::ClearGitFilters
         )
     }
 
@@ -308,6 +360,23 @@ impl NamedAction {
             Self::SidebarSearchCancelToTerminal => {
                 "Cancel the sidebar search and focus the terminal".into()
             },
+            Self::ToggleSessionsFilter => "Filter the sidebar to workspaces with a session".into(),
+            Self::ToggleAttentionFilter => {
+                "Filter the sidebar to workspaces wanting attention".into()
+            },
+            Self::TogglePrOpenFilter => "Filter the sidebar to worktrees with an open PR".into(),
+            Self::TogglePrDraftFilter => "Filter the sidebar to worktrees with a draft PR".into(),
+            Self::TogglePrMergedFilter => "Filter the sidebar to worktrees with a merged PR".into(),
+            Self::TogglePrClosedFilter => "Filter the sidebar to worktrees with a closed PR".into(),
+            Self::ClearProjectFilters => "Clear every projects-sidebar filter".into(),
+            Self::ToggleModifiedFilter => "Filter git changes to modified and renamed files".into(),
+            Self::ToggleDeletedFilter => "Filter git changes to deleted files".into(),
+            Self::ToggleUntrackedFilter => "Filter git changes to untracked and added files".into(),
+            Self::ClearGitFilters => "Clear every git-sidebar filter".into(),
+            Self::ToggleSearchScope => {
+                "Search inside the active filters or across every row".into()
+            },
+            Self::RefreshPrStatus => "Re-query GitHub for every worktree's PR".into(),
             Self::NoOp | Self::ReceiveChar => String::new(),
         }
     }
@@ -482,6 +551,31 @@ fn default_bindings() -> Vec<KeyBinding> {
             key: Key::O,
             mods: Modifiers::NONE,
             action: BindingAction::Named(ToggleProjectExpanded),
+        },
+        KeyBinding {
+            key: Key::S,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(ToggleSessionsFilter),
+        },
+        KeyBinding {
+            key: Key::A,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(ToggleAttentionFilter),
+        },
+        KeyBinding {
+            key: Key::M,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(ToggleModifiedFilter),
+        },
+        KeyBinding {
+            key: Key::D,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(ToggleDeletedFilter),
+        },
+        KeyBinding {
+            key: Key::U,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(ToggleUntrackedFilter),
         },
         KeyBinding { key: Key::K, mods: ctrl, action: BindingAction::Named(TogglePalette) },
         KeyBinding { key: Key::G, mods: ctrl_shift, action: BindingAction::Named(FocusGitSidebar) },
@@ -892,6 +986,19 @@ pub fn parse_action(name: &str) -> BindingAction {
         "SidebarSearchConfirm" => BindingAction::Named(SidebarSearchConfirm),
         "SidebarSearchCancel" => BindingAction::Named(SidebarSearchCancel),
         "SidebarSearchCancelToTerminal" => BindingAction::Named(SidebarSearchCancelToTerminal),
+        "ToggleSessionsFilter" => BindingAction::Named(ToggleSessionsFilter),
+        "ToggleAttentionFilter" => BindingAction::Named(ToggleAttentionFilter),
+        "TogglePrOpenFilter" => BindingAction::Named(TogglePrOpenFilter),
+        "TogglePrDraftFilter" => BindingAction::Named(TogglePrDraftFilter),
+        "TogglePrMergedFilter" => BindingAction::Named(TogglePrMergedFilter),
+        "TogglePrClosedFilter" => BindingAction::Named(TogglePrClosedFilter),
+        "ClearProjectFilters" => BindingAction::Named(ClearProjectFilters),
+        "ToggleModifiedFilter" => BindingAction::Named(ToggleModifiedFilter),
+        "ToggleDeletedFilter" => BindingAction::Named(ToggleDeletedFilter),
+        "ToggleUntrackedFilter" => BindingAction::Named(ToggleUntrackedFilter),
+        "ClearGitFilters" => BindingAction::Named(ClearGitFilters),
+        "ToggleSearchScope" => BindingAction::Named(ToggleSearchScope),
+        "RefreshPrStatus" => BindingAction::Named(RefreshPrStatus),
         other => BindingAction::Unsupported(other.to_string()),
     }
 }
@@ -1537,5 +1644,130 @@ mod tests {
             parse_action("OpenScratchpad"),
             BindingAction::Named(NamedAction::OpenScratchpad)
         ));
+    }
+
+    const PROJECT_FILTER_ACTIONS: [NamedAction; 7] = [
+        NamedAction::ToggleSessionsFilter,
+        NamedAction::ToggleAttentionFilter,
+        NamedAction::TogglePrOpenFilter,
+        NamedAction::TogglePrDraftFilter,
+        NamedAction::TogglePrMergedFilter,
+        NamedAction::TogglePrClosedFilter,
+        NamedAction::ClearProjectFilters,
+    ];
+
+    const GIT_FILTER_ACTIONS: [NamedAction; 4] = [
+        NamedAction::ToggleModifiedFilter,
+        NamedAction::ToggleDeletedFilter,
+        NamedAction::ToggleUntrackedFilter,
+        NamedAction::ClearGitFilters,
+    ];
+
+    #[test]
+    fn every_new_action_round_trips_and_is_described() {
+        let mut all = PROJECT_FILTER_ACTIONS.to_vec();
+        all.extend(GIT_FILTER_ACTIONS);
+        all.push(NamedAction::ToggleSearchScope);
+        all.push(NamedAction::RefreshPrStatus);
+        for a in all {
+            let name = a.config_name();
+            assert!(
+                matches!(parse_action(&name), BindingAction::Named(p) if p == a),
+                "{name} does not parse back"
+            );
+            assert!(!a.description().is_empty(), "{name} has no description");
+        }
+    }
+
+    #[test]
+    fn filter_actions_are_scoped_to_their_own_panel() {
+        for a in PROJECT_FILTER_ACTIONS {
+            assert!(a.is_projects_filter_scoped(), "{a:?}");
+            assert!(!a.is_git_filter_scoped(), "{a:?}");
+        }
+        for a in GIT_FILTER_ACTIONS {
+            assert!(a.is_git_filter_scoped(), "{a:?}");
+            assert!(!a.is_projects_filter_scoped(), "{a:?}");
+        }
+    }
+
+    /// The filter actions own their own focus predicates and must not leak into
+    /// the ones that already gate other dispatch paths.
+    #[test]
+    fn filter_actions_carry_no_other_scope() {
+        let mut all = PROJECT_FILTER_ACTIONS.to_vec();
+        all.extend(GIT_FILTER_ACTIONS);
+        for a in all {
+            assert!(!a.is_sidebar_scoped(), "{a:?}");
+            assert!(!a.is_search_scoped(), "{a:?}");
+            assert!(!a.is_palette_scoped(), "{a:?}");
+            assert!(!a.requires_project_browsing(), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn refresh_pr_status_is_sidebar_scoped_and_toggle_search_scope_is_unscoped() {
+        assert!(NamedAction::RefreshPrStatus.is_sidebar_scoped());
+        assert!(!NamedAction::RefreshPrStatus.requires_project_browsing());
+        assert!(!NamedAction::ToggleSearchScope.is_sidebar_scoped());
+        assert!(!NamedAction::ToggleSearchScope.is_projects_filter_scoped());
+        assert!(!NamedAction::ToggleSearchScope.is_git_filter_scoped());
+    }
+
+    /// The five filters that exist today keep their keys; the four PR filters
+    /// introduce no new bare-letter default for anyone.
+    #[test]
+    fn default_bindings_cover_the_existing_filters_and_no_pr_filter() {
+        let binds = parse_bindings(vec![]);
+        let bound = |a: NamedAction| {
+            binds.iter().find(|b| matches!(&b.action, BindingAction::Named(n) if *n == a))
+        };
+        for (key, action) in [
+            (Key::S, NamedAction::ToggleSessionsFilter),
+            (Key::A, NamedAction::ToggleAttentionFilter),
+            (Key::M, NamedAction::ToggleModifiedFilter),
+            (Key::D, NamedAction::ToggleDeletedFilter),
+            (Key::U, NamedAction::ToggleUntrackedFilter),
+        ] {
+            let b = bound(action).unwrap_or_else(|| panic!("{action:?} has no default"));
+            assert_eq!(b.key, key);
+            assert_eq!(b.mods, Modifiers::NONE);
+        }
+        for a in [
+            NamedAction::TogglePrOpenFilter,
+            NamedAction::TogglePrDraftFilter,
+            NamedAction::TogglePrMergedFilter,
+            NamedAction::TogglePrClosedFilter,
+            NamedAction::RefreshPrStatus,
+            NamedAction::ToggleSearchScope,
+        ] {
+            assert!(bound(a).is_none(), "{a:?} must ship without a default key");
+        }
+    }
+
+    /// Two user bindings on one trigger both survive and both come back from
+    /// `all_matches`, which is how a user who claimed a letter recovers the
+    /// default it displaced. Only the *default* is dropped.
+    #[test]
+    fn two_user_bindings_on_one_trigger_both_survive() {
+        let raw = |action: &str| RawBinding {
+            key: "D".into(),
+            mods: None,
+            mode: None,
+            chars: None,
+            action: Some(action.into()),
+            command: None,
+        };
+        let binds = parse_bindings(vec![raw("DeleteSelected"), raw("ToggleDeletedFilter")]);
+
+        let matched: Vec<_> = all_matches(&binds, Key::D, Modifiers::NONE);
+        assert!(
+            matched.iter().any(|a| matches!(a, BindingAction::Named(NamedAction::DeleteSelected)))
+        );
+        assert!(
+            matched
+                .iter()
+                .any(|a| matches!(a, BindingAction::Named(NamedAction::ToggleDeletedFilter)))
+        );
     }
 }
