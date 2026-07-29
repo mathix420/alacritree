@@ -16,8 +16,8 @@ use crate::clipboard_image;
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
 use crate::config::{
-    Config, FontConfig, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SidebarFocus,
-    TextEmphasis, UiFont,
+    Config, FontConfig, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SearchScope,
+    SidebarFocus, TextEmphasis, UiFont,
 };
 use crate::doppler;
 use crate::file_drop;
@@ -304,6 +304,30 @@ fn valid_for_focus(
     focus_ok && !(scratchpad_focused && terminal_only)
 }
 
+/// Whether a workspace survives the projects panel's toggle dimension.
+fn project_toggles_pass(
+    apply: bool,
+    toggle_sessions: bool,
+    has_sessions: bool,
+    toggle_attention: bool,
+    needs_attention: bool,
+) -> bool {
+    if !apply {
+        return true;
+    }
+    (!toggle_sessions || has_sessions) && (!toggle_attention || needs_attention)
+}
+
+/// Whether a git-status row survives the git panel's toggle dimension. Unlike
+/// `project_toggles_pass`, standing this down needs no separate `apply` flag:
+/// forcing all three toggles to `false` already makes `!any` admit every row.
+fn git_toggles_pass(m: bool, d: bool, u: bool, kind: ChangeKind) -> bool {
+    let any = m || d || u;
+    !any || (m && matches!(kind, ChangeKind::Modified | ChangeKind::Renamed))
+        || (d && kind == ChangeKind::Deleted)
+        || (u && matches!(kind, ChangeKind::Untracked | ChangeKind::Added))
+}
+
 pub struct AlacritreeApp {
     show_left_sidebar: bool,
     show_right_sidebar: bool,
@@ -328,6 +352,9 @@ pub struct AlacritreeApp {
     /// Fuzzy-search query and `m`/`d`/`u` change-kind toggle state for the git
     /// panel.  Transient: never persisted.
     git_filter: PanelFilter,
+    /// `[ui] search_scope`: whether a live query stands down both panels'
+    /// toggle filters.  Toggled at runtime, never persisted.
+    search_scope: SearchScope,
     /// Git-panel cursor, identified by `(section, path)`.  Rebuilt every render
     /// pass from `git_rows`, so it survives the 1.5 s status refresh.
     git_cursor: Option<git_nav::GitRow>,
@@ -676,6 +703,7 @@ impl AlacritreeApp {
             sidebar_cursor_moved: false,
             project_filter: PanelFilter::new(&['s', 'a']),
             git_filter: PanelFilter::new(&['m', 'd', 'u']),
+            search_scope: config.ui.search_scope,
             git_cursor: None,
             git_cursor_moved: false,
             git_rows: Vec::new(),
@@ -1754,8 +1782,9 @@ impl AlacritreeApp {
             return sidebar_nav::visible_rows(&self.projects, &listed_sessions);
         }
 
-        let toggle_sessions = self.project_filter.is_toggled('s');
-        let toggle_attention = self.project_filter.is_toggled('a');
+        let apply = self.project_filter.toggles_apply(self.search_scope);
+        let toggle_sessions = apply && self.project_filter.is_toggled('s');
+        let toggle_attention = apply && self.project_filter.is_toggled('a');
         let any_toggle = toggle_sessions || toggle_attention;
 
         // Precompute every fuzzy result before building the closures: the
@@ -1779,8 +1808,13 @@ impl AlacritreeApp {
         };
 
         let toggles_pass = |key: &WorkspaceKey| {
-            (!toggle_sessions || self.workspace_has_sessions(key))
-                && (!toggle_attention || self.workspace_needs_attention(key))
+            project_toggles_pass(
+                apply,
+                toggle_sessions,
+                self.workspace_has_sessions(key),
+                toggle_attention,
+                self.workspace_needs_attention(key),
+            )
         };
         let home = home_matches && toggles_pass(&None);
         let project_self =
@@ -1832,7 +1866,7 @@ impl AlacritreeApp {
                 session_rows_always: self.session_rows_always,
                 query: self.project_filter.query(),
                 toggles: self.project_filter.toggle_bits(),
-                toggles_apply: true,
+                toggles_apply: self.project_filter.toggles_apply(self.search_scope),
                 pr_generation: 0,
                 active_workspace,
                 active_branch,
@@ -1879,7 +1913,7 @@ impl AlacritreeApp {
                         session_rows_always: self.session_rows_always,
                         query: self.project_filter.query(),
                         toggles: self.project_filter.toggle_bits(),
-                        toggles_apply: true,
+                        toggles_apply: self.project_filter.toggles_apply(self.search_scope),
                         pr_generation: 0,
                         active_workspace,
                         active_branch,
@@ -2150,15 +2184,11 @@ impl AlacritreeApp {
     /// toggles union (`m`: Modified/Renamed, `d`: Deleted, `u`: Untracked/Added).
     /// Conflicted rows and the branch-diff section are handled by `visible_rows`.
     fn filtered_git_rows(&mut self, status: &GitStatus) -> git_nav::GitRows {
-        let m = self.git_filter.is_toggled('m');
-        let d = self.git_filter.is_toggled('d');
-        let u = self.git_filter.is_toggled('u');
-        let any = m || d || u;
-        let kind_pass = move |k: ChangeKind| {
-            !any || (m && matches!(k, ChangeKind::Modified | ChangeKind::Renamed))
-                || (d && k == ChangeKind::Deleted)
-                || (u && matches!(k, ChangeKind::Untracked | ChangeKind::Added))
-        };
+        let apply = self.git_filter.toggles_apply(self.search_scope);
+        let m = apply && self.git_filter.is_toggled('m');
+        let d = apply && self.git_filter.is_toggled('d');
+        let u = apply && self.git_filter.is_toggled('u');
+        let kind_pass = move |k: ChangeKind| git_toggles_pass(m, d, u, k);
         let filter = &mut self.git_filter;
         let mut query_pass = |path: &str| filter.matches(path);
         git_nav::visible_rows(
@@ -2530,7 +2560,12 @@ impl AlacritreeApp {
                 self.git_filter.clear_toggles();
                 self.after_git_filter_changed();
             },
-            BindingAction::Named(NamedAction::ToggleSearchScope) => {},
+            BindingAction::Named(NamedAction::ToggleSearchScope) => {
+                self.search_scope = match self.search_scope {
+                    SearchScope::Filtered => SearchScope::All,
+                    SearchScope::All => SearchScope::Filtered,
+                };
+            },
             BindingAction::Named(NamedAction::RefreshPrStatus) => {},
             BindingAction::Named(other) => {
                 self.dispatch_scroll_or_other(other);
@@ -3088,6 +3123,7 @@ impl AlacritreeApp {
                         &self.project_filter,
                         &self.config.ui.icons.search,
                         &theme,
+                        self.project_filter.toggles_apply(self.search_scope),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icon_button(ui, "+", theme.text_dim, &theme)
@@ -3624,6 +3660,7 @@ impl AlacritreeApp {
                         &self.git_filter,
                         &self.config.ui.icons.search,
                         &theme,
+                        self.git_filter.toggles_apply(self.search_scope),
                     );
                 });
                 ui.separator();
@@ -5071,10 +5108,12 @@ fn panel_header_filter_ui(
     filter: &PanelFilter,
     search_icon: &str,
     theme: &Theme,
+    toggles_apply: bool,
 ) {
     ui.label(RichText::new(title).color(theme.text).strong());
+    let chip = if toggles_apply { theme.accent } else { theme.text_muted };
     for key in filter.active_toggles() {
-        ui.label(RichText::new(format!("[{key}]")).color(theme.accent).monospace().small());
+        ui.label(RichText::new(format!("[{key}]")).color(chip).monospace().small());
     }
     if filter.mode() == panel_filter::Mode::Search || !filter.query().is_empty() {
         let s = theme.ui_scale;
@@ -8567,6 +8606,22 @@ mod tests {
         let action = BindingAction::Named(NamedAction::ScrollPageUp);
         assert!(!valid_for_focus(&action, false, false, true));
         assert!(valid_for_focus(&action, false, false, false));
+    }
+
+    #[test]
+    fn a_wide_search_stands_down_the_project_toggles() {
+        // Toggled on, workspace fails both: excluded while the toggles apply,
+        // included once a wide search stands them down.
+        assert!(!project_toggles_pass(true, true, false, true, false));
+        assert!(project_toggles_pass(false, true, false, true, false));
+    }
+
+    #[test]
+    fn a_wide_search_stands_down_the_git_toggles() {
+        // Toggled on for "modified" only, an untracked row fails while the
+        // toggle applies and passes once a wide search stands it down.
+        assert!(!git_toggles_pass(true, false, false, ChangeKind::Untracked));
+        assert!(git_toggles_pass(false, false, false, ChangeKind::Untracked));
     }
 
     fn req(file: &str, source: DiffSource) -> DiffRequest {

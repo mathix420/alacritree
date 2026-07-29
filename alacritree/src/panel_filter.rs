@@ -105,6 +105,12 @@ impl PanelFilter {
         !self.query.is_empty() || !self.toggles.is_empty()
     }
 
+    /// Whether the toggle filters apply this frame.  Under `All` a live query
+    /// stands them down, so a search reaches rows the toggles hide.
+    pub fn toggles_apply(&self, scope: crate::config::SearchScope) -> bool {
+        scope == crate::config::SearchScope::Filtered || self.query.is_empty()
+    }
+
     pub fn on_key(&mut self, key: egui::Key) -> Option<Outcome> {
         match self.mode {
             Mode::Browsing => match key {
@@ -355,5 +361,19 @@ mod tests {
         f.on_text("/");
         f.on_text("Read");
         assert!(!f.matches("readme"));
+    }
+
+    #[test]
+    fn toggles_apply_only_stands_down_for_a_live_query_under_all() {
+        use crate::config::SearchScope;
+        let mut f = PanelFilter::new(TOGGLES);
+
+        assert!(f.toggles_apply(SearchScope::Filtered));
+        assert!(f.toggles_apply(SearchScope::All), "an empty query narrows nothing");
+
+        f.on_text("/");
+        f.on_text("foo");
+        assert!(f.toggles_apply(SearchScope::Filtered));
+        assert!(!f.toggles_apply(SearchScope::All));
     }
 }

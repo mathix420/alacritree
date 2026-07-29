@@ -533,6 +533,30 @@ fn parse_sidebar_focus(raw: Option<&str>) -> SidebarFocus {
     }
 }
 
+/// `[ui] search_scope`: whether a fuzzy query is confined by the panel's active
+/// toggle filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchScope {
+    /// A query narrows the rows the toggles already allow.
+    #[default]
+    Filtered,
+    /// A query is evaluated against every row; the toggles stand aside until it
+    /// empties.
+    All,
+}
+
+fn parse_search_scope(raw: Option<&str>) -> SearchScope {
+    match raw {
+        None => SearchScope::default(),
+        Some("filtered") => SearchScope::Filtered,
+        Some("all") => SearchScope::All,
+        Some(other) => {
+            log::warn!("unknown ui.search_scope value {other:?}, using \"filtered\"");
+            SearchScope::default()
+        },
+    }
+}
+
 /// Whether per-session UI (sidebar session rows, tab-strip segments) renders
 /// for a single-session workspace instead of waiting for the two-session
 /// threshold.  These are startup defaults only: the app copies them into
@@ -654,6 +678,8 @@ pub struct UiTheme {
     pub last_session_close: LastSessionClose,
     /// How the projects sidebar repairs a cursor whose row stopped rendering.
     pub sidebar_focus: SidebarFocus,
+    /// Whether a fuzzy query is confined by the panel's active toggle filters.
+    pub search_scope: SearchScope,
     /// Show single-session sidebar rows / tab segments ([`SessionDisplay`]).
     pub session_display: SessionDisplay,
     /// Paint PR-status badges on worktree rows (and poll `gh` for expanded
@@ -705,6 +731,7 @@ impl Default for UiTheme {
             confirm_session_close: ConfirmSessionClose::Never,
             last_session_close: LastSessionClose::Respawn,
             sidebar_focus: SidebarFocus::default(),
+            search_scope: SearchScope::default(),
             session_display: SessionDisplay::default(),
             pr_status: false,
             icons: Icons::default(),
@@ -1377,6 +1404,9 @@ struct RawUi {
     /// How far the projects sidebar goes when the cursor's row stops being
     /// rendered: "preserve" (default) | "follow".
     sidebar_focus: Option<String>,
+    /// Whether a fuzzy query is confined by the panel's active toggle filters:
+    /// "filtered" (default) | "all".
+    search_scope: Option<String>,
     session_display: RawSessionDisplay,
     delta_path: Option<String>,
     icons: RawIcons,
@@ -1546,6 +1576,7 @@ impl RawConfig {
             ),
             last_session_close: parse_last_session_close(self.ui.last_session_close.as_deref()),
             sidebar_focus: parse_sidebar_focus(self.ui.sidebar_focus.as_deref()),
+            search_scope: parse_search_scope(self.ui.search_scope.as_deref()),
             session_display: SessionDisplay {
                 sidebar_always: self.ui.session_display.sidebar_always.unwrap_or(false),
                 tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
@@ -2030,6 +2061,26 @@ mod tests {
     fn only_follow_moves_the_terminal() {
         assert!(!SidebarFocus::Preserve.follows());
         assert!(SidebarFocus::Follow.follows());
+    }
+
+    #[test]
+    fn search_scope_defaults_to_filtered() {
+        let ui = ui_from_toml("");
+        assert_eq!(ui.search_scope, SearchScope::Filtered);
+    }
+
+    #[test]
+    fn search_scope_parses_both_values() {
+        for (raw, expected) in [("filtered", SearchScope::Filtered), ("all", SearchScope::All)] {
+            let ui = ui_from_toml(&format!("[ui]\nsearch_scope = \"{raw}\""));
+            assert_eq!(ui.search_scope, expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn search_scope_invalid_falls_back_to_filtered() {
+        let ui = ui_from_toml("[ui]\nsearch_scope = \"everywhere\"");
+        assert_eq!(ui.search_scope, SearchScope::Filtered);
     }
 
     #[test]
