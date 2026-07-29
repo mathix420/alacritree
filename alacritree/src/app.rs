@@ -28,7 +28,7 @@ use crate::panel_filter::{self, PanelFilter};
 use crate::paste;
 use crate::path_style;
 use crate::path_style::PathStyle;
-use crate::pr_status::{PrCache, PrInfo, PrState};
+use crate::pr_status::{self, PrCache, PrInfo, PrState};
 use crate::projects::{Project, Worktree, project_json};
 use crate::scratchpad;
 use crate::session::{
@@ -316,6 +316,32 @@ fn project_toggles_pass(
         return true;
     }
     (!toggle_sessions || has_sessions) && (!toggle_attention || needs_attention)
+}
+
+/// The toggle identities the projects panel accepts.  The PR identities exist
+/// only when polling does, or every PR state would read as unknown and the
+/// filters could only ever empty the panel.
+fn project_filter_toggles(pr_status: bool) -> &'static [char] {
+    if pr_status { &['s', 'a', 'o', 'd', 'm', 'c'] } else { &['s', 'a'] }
+}
+
+/// Whether the projects panel is filtering on PR state this frame.
+fn any_pr_toggle_active(filter: &PanelFilter) -> bool {
+    ['o', 'd', 'm', 'c'].into_iter().any(|key| filter.is_toggled(key))
+}
+
+/// The cache generation the reconciler observes.  Held at `0` unless a PR
+/// filter is active, so a banked result only invalidates a row set that
+/// actually depends on PR state.
+fn pr_generation_for(generation: u64, any_pr_toggle_active: bool) -> u64 {
+    if any_pr_toggle_active { generation } else { 0 }
+}
+
+/// Whether this worktree's PR state is polled this frame.  Collapsed projects
+/// normally cost no `gh` processes, but a PR filter has to see every row or it
+/// would hide worktrees for want of a lookup it declined to start.
+fn should_poll_pr(pr_enabled: bool, expanded: bool, any_pr_toggle: bool) -> bool {
+    pr_enabled && (expanded || any_pr_toggle)
 }
 
 /// Whether a git-status row survives the git panel's toggle dimension. Unlike
@@ -691,6 +717,7 @@ impl AlacritreeApp {
             config.ui.project_name.clone(),
         );
 
+        let pr_status_concurrency = config.ui.pr_status_concurrency;
         let mut app = Self {
             show_left_sidebar: persisted.show_left_sidebar,
             show_right_sidebar: persisted.show_right_sidebar,
@@ -701,7 +728,7 @@ impl AlacritreeApp {
             reorder_mode: false,
             sidebar_auto_shown: false,
             sidebar_cursor_moved: false,
-            project_filter: PanelFilter::new(&['s', 'a']),
+            project_filter: PanelFilter::new(project_filter_toggles(config.ui.pr_status)),
             git_filter: PanelFilter::new(&['m', 'd', 'u']),
             search_scope: config.ui.search_scope,
             git_cursor: None,
@@ -759,6 +786,10 @@ impl AlacritreeApp {
             sidebar_focus_written: None,
             sidebar_deferred_close: None,
         };
+
+        // Ahead of the refreshes below, which can start lookups a cap applied
+        // afterwards would not bound.
+        app.pr_cache.set_concurrency(pr_status_concurrency);
 
         let wsl_indices: Vec<usize> = app
             .projects
@@ -1785,7 +1816,12 @@ impl AlacritreeApp {
         let apply = self.project_filter.toggles_apply(self.search_scope);
         let toggle_sessions = apply && self.project_filter.is_toggled('s');
         let toggle_attention = apply && self.project_filter.is_toggled('a');
-        let any_toggle = toggle_sessions || toggle_attention;
+        let pr_open = apply && self.project_filter.is_toggled('o');
+        let pr_draft = apply && self.project_filter.is_toggled('d');
+        let pr_merged = apply && self.project_filter.is_toggled('m');
+        let pr_closed = apply && self.project_filter.is_toggled('c');
+        let any_pr = pr_open || pr_draft || pr_merged || pr_closed;
+        let any_toggle = toggle_sessions || toggle_attention || any_pr;
 
         // Precompute every fuzzy result before building the closures: the
         // matcher needs `&mut self.project_filter`, and releasing that borrow
@@ -1806,6 +1842,25 @@ impl AlacritreeApp {
                 .map(|wt| (wt.path.clone(), filter.matches(&wt.name)))
                 .collect()
         };
+        let live_branch = self
+            .current_workspace
+            .as_deref()
+            .and_then(|p| self.git_status.get(p))
+            .and_then(|c| c.current_branch());
+        let current_workspace = self.current_workspace.as_deref();
+        let pr_matches: HashMap<PathBuf, bool> = self
+            .projects
+            .iter()
+            .flat_map(|p| p.worktrees.iter())
+            .map(|wt| {
+                let branch = pr_status::effective_branch(wt, current_workspace, live_branch);
+                let state = self.pr_cache.state(&wt.path, branch);
+                (
+                    wt.path.clone(),
+                    pr_status::pr_pass(state, pr_open, pr_draft, pr_merged, pr_closed),
+                )
+            })
+            .collect();
 
         let toggles_pass = |key: &WorkspaceKey| {
             project_toggles_pass(
@@ -1822,6 +1877,7 @@ impl AlacritreeApp {
         let mut worktree = |_p: &Project, wt: &Worktree| {
             worktree_matches.get(&wt.path).copied().unwrap_or(false)
                 && toggles_pass(&Some(wt.path.clone()))
+                && pr_matches.get(&wt.path).copied().unwrap_or(false)
         };
         sidebar_nav::filtered_rows(
             &self.projects,
@@ -1867,7 +1923,10 @@ impl AlacritreeApp {
                 query: self.project_filter.query(),
                 toggles: self.project_filter.toggle_bits(),
                 toggles_apply: self.project_filter.toggles_apply(self.search_scope),
-                pr_generation: 0,
+                pr_generation: pr_generation_for(
+                    self.pr_cache.generation(),
+                    any_pr_toggle_active(&self.project_filter),
+                ),
                 active_workspace,
                 active_branch,
             },
@@ -1914,7 +1973,10 @@ impl AlacritreeApp {
                         query: self.project_filter.query(),
                         toggles: self.project_filter.toggle_bits(),
                         toggles_apply: self.project_filter.toggles_apply(self.search_scope),
-                        pr_generation: 0,
+                        pr_generation: pr_generation_for(
+                            self.pr_cache.generation(),
+                            any_pr_toggle_active(&self.project_filter),
+                        ),
                         active_workspace,
                         active_branch,
                     },
@@ -2566,7 +2628,13 @@ impl AlacritreeApp {
                     SearchScope::All => SearchScope::Filtered,
                 };
             },
-            BindingAction::Named(NamedAction::RefreshPrStatus) => {},
+            BindingAction::Named(NamedAction::RefreshPrStatus) => {
+                self.pr_cache.invalidate_all();
+                // The poll sites run while the sidebars paint, and the palette
+                // dispatches after both have; without a wake the re-query would
+                // wait for whatever repaint happened to come next.
+                ctx.request_repaint();
+            },
             BindingAction::Named(other) => {
                 self.dispatch_scroll_or_other(other);
             },
@@ -3053,40 +3121,44 @@ impl AlacritreeApp {
         let mut shell_override_changed: Option<PathBuf> = None;
         let mut label_cleared: Option<PathBuf> = None;
         let mut rename_request: Option<RenameState> = None;
-        // Polled up front, expanded projects only: collapsed projects cost no gh
-        // processes, and the panel closure borrows `projects` mutably so the cache
-        // cannot be polled from inside it.
+        // Polled up front: the panel closure borrows `projects` mutably, so the
+        // cache cannot be polled from inside it.
         let pr_enabled = self.config.ui.pr_status;
+        let any_pr_toggle = any_pr_toggle_active(&self.project_filter);
+        let current_workspace = self.current_workspace.as_deref();
+        let live_branch = current_workspace
+            .and_then(|p| self.git_status.get(p))
+            .and_then(|cache| cache.current_branch());
+        // The same path can be a worktree of two projects, and `PrCache` is
+        // keyed by path alone, so a second poller would only invalidate the
+        // first's lookup and burn a `gh` process every frame.
+        let mut polled: HashMap<PathBuf, Option<PrInfo>> = HashMap::new();
         let mut pr_infos: Vec<Vec<Option<PrInfo>>> = Vec::with_capacity(self.projects.len());
         for project in &self.projects {
             let mut rows = Vec::with_capacity(project.worktrees.len());
             for wt in &project.worktrees {
-                let info = if pr_enabled && project.expanded {
-                    // The right sidebar polls only the active workspace's PR
-                    // cache, using the live `StatusCache` branch (recomputed
-                    // every ~1.5s). Two pollers of the same path must agree on
-                    // a branch or each drain flips `entry.branch` and they
-                    // invalidate each other's lookups forever after an
-                    // in-terminal checkout — so share the live cache there.
-                    // For every other worktree there is only one poller (this
-                    // one), and its cache is created once a workspace goes
-                    // active but never re-polled or pruned after it goes
-                    // inactive again: reading it here would freeze the branch
-                    // at whatever it was on last visit and shadow later
-                    // `refresh_project` updates to `wt.branch`. Use the
-                    // refresh-responsive snapshot instead.
-                    let is_active = self.current_workspace.as_deref() == Some(&wt.path);
-                    let branch = if is_active {
-                        self.git_status
-                            .get(&wt.path)
-                            .and_then(|cache| cache.current_branch())
-                            .or(wt.branch.as_deref())
-                    } else {
-                        wt.branch.as_deref()
-                    };
-                    self.pr_cache.poll(&wt.path, branch, ctx)
-                } else {
+                // The right sidebar polls only the active workspace's PR
+                // cache, using the live `StatusCache` branch (recomputed
+                // every ~1.5s). Two pollers of the same path must agree on
+                // a branch or each drain flips `entry.branch` and they
+                // invalidate each other's lookups forever after an
+                // in-terminal checkout — so share the live cache there.
+                // For every other worktree there is only one poller (this
+                // one), and its cache is created once a workspace goes
+                // active but never re-polled or pruned after it goes
+                // inactive again: reading it here would freeze the branch
+                // at whatever it was on last visit and shadow later
+                // `refresh_project` updates to `wt.branch`. Use the
+                // refresh-responsive snapshot instead.
+                let info = if !should_poll_pr(pr_enabled, project.expanded, any_pr_toggle) {
                     None
+                } else if let Some(cached) = polled.get(&wt.path) {
+                    cached.clone()
+                } else {
+                    let branch = pr_status::effective_branch(wt, current_workspace, live_branch);
+                    let info = self.pr_cache.poll(&wt.path, branch, ctx);
+                    polled.insert(wt.path.clone(), info.clone());
+                    info
                 };
                 rows.push(info);
             }
@@ -7468,6 +7540,9 @@ impl eframe::App for AlacritreeApp {
         self.phases.restart();
         self.glyph_cache.begin_frame(ctx);
         self.poll_project_refreshes();
+        // Unconditional: either sidebar can be hidden, and a drain hung off one
+        // of them would strand every entry the other polled.
+        self.pr_cache.drain_completed();
         self.poll_pending_deletes(ctx);
         self.poll_pending_creates(ctx);
         self.phases.mark("polls");
@@ -9260,5 +9335,80 @@ mod tests {
             snapshot.is_projected(below),
             "a row below the one being deleted must still be navigable"
         );
+    }
+
+    #[test]
+    fn the_pr_identities_exist_only_when_polling_does() {
+        assert_eq!(project_filter_toggles(false), &['s', 'a']);
+        assert_eq!(project_filter_toggles(true), &['s', 'a', 'o', 'd', 'm', 'c']);
+    }
+
+    /// Guards the staging dependency: the four PR actions already dispatch to
+    /// `project_filter.toggle`, and `toggle` silently ignores an identity the
+    /// filter does not allow — so a narrow slice here makes them dead keys.
+    #[test]
+    fn the_pr_actions_reach_a_configured_projects_filter() {
+        let mut f = PanelFilter::new(project_filter_toggles(true));
+        for key in ['o', 'd', 'm', 'c'] {
+            f.toggle(key);
+            assert!(f.is_toggled(key), "{key} must be a live identity");
+        }
+    }
+
+    #[test]
+    fn any_pr_toggle_active_ignores_the_non_pr_identities() {
+        let mut f = PanelFilter::new(project_filter_toggles(true));
+        assert!(!any_pr_toggle_active(&f));
+        f.toggle('s');
+        assert!(!any_pr_toggle_active(&f), "a session toggle is not a PR toggle");
+        f.toggle('o');
+        assert!(any_pr_toggle_active(&f));
+    }
+
+    /// The reconciler must not churn for users who never touch a PR filter:
+    /// every banked result would otherwise rebuild the row set.
+    #[test]
+    fn the_generation_reaches_the_reconciler_only_while_filtering() {
+        assert_eq!(pr_generation_for(7, false), 0);
+        assert_eq!(pr_generation_for(7, true), 7);
+    }
+
+    #[test]
+    fn a_pr_filter_reaches_into_collapsed_projects() {
+        assert!(!should_poll_pr(true, false, false), "collapsed and unfiltered: no lookup");
+        assert!(should_poll_pr(true, false, true), "a PR filter must see collapsed rows");
+        assert!(should_poll_pr(true, true, false));
+        assert!(!should_poll_pr(false, true, true), "disabled means never");
+    }
+
+    /// The same path can be a worktree of two projects, and `PrCache` is keyed
+    /// by path alone — two pollers would burn a `gh` process per frame.
+    #[test]
+    fn a_repeated_path_is_polled_once_but_rendered_everywhere() {
+        let mut polled: HashMap<PathBuf, Option<PrInfo>> = HashMap::new();
+        let mut lookups = 0;
+        let path = PathBuf::from("/repo/wt");
+
+        let mut resolve = |p: &PathBuf| {
+            if let Some(cached) = polled.get(p) {
+                return cached.clone();
+            }
+            lookups += 1;
+            let info = Some(PrInfo {
+                number: 1,
+                base_branch: "master".into(),
+                url: String::new(),
+                state: PrState::Open,
+            });
+            polled.insert(p.clone(), info.clone());
+            info
+        };
+
+        let first = resolve(&path);
+        let second = resolve(&path);
+
+        assert_eq!(lookups, 1, "one lookup per path per frame");
+        assert!(second.is_some(), "the duplicate row still renders its badge");
+        assert_eq!(first.map(|i| i.number), second.map(|i| i.number));
     }
 }
