@@ -58,7 +58,9 @@ struct Entry {
     branch: Option<String>,
     info: Option<PrInfo>,
     queried_at: Option<Instant>,
-    /// Set while a background thread is running; drained on the next poll.
+    /// Set while a background thread is running.  `poll` reads this to
+    /// avoid starting a competing lookup; `drain_completed` is what banks
+    /// the result and clears it.
     pending: Option<Receiver<LookupResult>>,
     /// A refresh landed while `pending` was already occupied.  The drain
     /// leaves `queried_at` cleared instead of stamping the fresh lookup's
@@ -280,8 +282,9 @@ fn spawn_lookup(path: PathBuf, branch: String, ctx: egui::Context) -> Receiver<L
         // concurrency slot only runs on a frame, so an exit without a repaint
         // can stall polling for good.
         let _wake = RepaintOnDrop(ctx);
+        let _tx = tx;
         let info = query_gh(&path, &branch);
-        let _ = tx.send(LookupResult { branch, info });
+        let _ = _tx.send(LookupResult { branch, info });
     });
     rx
 }
@@ -577,6 +580,9 @@ mod tests {
     #[test]
     fn generation_advances_on_a_banked_result_and_holds_still_otherwise() {
         let mut cache = PrCache::new();
+        let (_tx, rx) = mpsc::channel::<LookupResult>();
+        cache.insert_pending(PathBuf::from("/repo/wt"), rx);
+
         let before = cache.generation();
         cache.drain_completed();
         assert_eq!(cache.generation(), before, "a frame that banks nothing must not invalidate");
