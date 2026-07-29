@@ -111,7 +111,15 @@ mod tests {
     fn an_unchanged_frame_allocates_nothing() {
         let projects = tree(10, 5);
         let live = sessions(150);
-        let ui = UiInputs { session_rows_always: false, query: "", toggles: 0 };
+        let ui = UiInputs {
+            session_rows_always: false,
+            query: "",
+            toggles: 0,
+            toggles_apply: true,
+            pr_generation: 0,
+            active_workspace: None,
+            active_branch: None,
+        };
         let base = ObservedInputs::capture(&projects, inputs(&live), ui);
 
         let (same, counts) = measure(|| base.matches(&projects, inputs(&live), ui));
@@ -129,7 +137,15 @@ mod tests {
     fn an_unchanged_filtering_frame_allocates_nothing() {
         let projects = tree(10, 5);
         let live = sessions(150);
-        let ui = UiInputs { session_rows_always: false, query: "worktree-3", toggles: 0b11 };
+        let ui = UiInputs {
+            session_rows_always: false,
+            query: "worktree-3",
+            toggles: 0b11,
+            toggles_apply: true,
+            pr_generation: 0,
+            active_workspace: None,
+            active_branch: None,
+        };
         let base = ObservedInputs::capture(&projects, inputs(&live), ui);
 
         let (same, counts) = measure(|| base.matches(&projects, inputs(&live), ui));
@@ -142,7 +158,15 @@ mod tests {
     fn the_compare_is_linear_in_the_tree_size() {
         let small = tree(10, 5);
         let big = tree(50, 10);
-        let ui = UiInputs { session_rows_always: false, query: "", toggles: 0 };
+        let ui = UiInputs {
+            session_rows_always: false,
+            query: "",
+            toggles: 0,
+            toggles_apply: true,
+            pr_generation: 0,
+            active_workspace: None,
+            active_branch: None,
+        };
 
         let base_small = ObservedInputs::capture(&small, std::iter::empty(), ui);
         sidebar_focus::reset_visits();
@@ -172,7 +196,15 @@ mod tests {
         for (p, w, s) in [(10, 5, 150), (50, 10, 500)] {
             let projects = tree(p, w);
             let live = sessions(s);
-            let ui = UiInputs { session_rows_always: false, query: "", toggles: 0 };
+            let ui = UiInputs {
+                session_rows_always: false,
+                query: "",
+                toggles: 0,
+                toggles_apply: true,
+                pr_generation: 0,
+                active_workspace: None,
+                active_branch: None,
+            };
             let base = ObservedInputs::capture(&projects, inputs(&live), ui);
 
             // Warm the caches so the first iteration is not the whole sample.

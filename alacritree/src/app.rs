@@ -1822,6 +1822,9 @@ impl AlacritreeApp {
     }
 
     fn sidebar_snapshot(&mut self, skip_worktree: Option<&Path>) -> sidebar_focus::TreeSnapshot {
+        let active_workspace = self.current_workspace.as_deref();
+        let active_branch =
+            active_workspace.and_then(|p| self.git_status.get(p)).and_then(|c| c.current_branch());
         let inputs = sidebar_focus::ObservedInputs::capture(
             &self.projects,
             self.session_inputs(),
@@ -1829,6 +1832,10 @@ impl AlacritreeApp {
                 session_rows_always: self.session_rows_always,
                 query: self.project_filter.query(),
                 toggles: self.project_filter.toggle_bits(),
+                toggles_apply: true,
+                pr_generation: 0,
+                active_workspace,
+                active_branch,
             },
         );
         let rows = self.current_project_rows();
@@ -1860,6 +1867,10 @@ impl AlacritreeApp {
         let skip = deferred.as_ref().and_then(|d| d.removed_worktree.clone());
 
         if deferred.is_none() {
+            let active_workspace = self.current_workspace.as_deref();
+            let active_branch = active_workspace
+                .and_then(|p| self.git_status.get(p))
+                .and_then(|c| c.current_branch());
             if let Some(prev) = &self.sidebar_focus_prev {
                 let unchanged = prev.inputs.matches(
                     &self.projects,
@@ -1868,6 +1879,10 @@ impl AlacritreeApp {
                         session_rows_always: self.session_rows_always,
                         query: self.project_filter.query(),
                         toggles: self.project_filter.toggle_bits(),
+                        toggles_apply: true,
+                        pr_generation: 0,
+                        active_workspace,
+                        active_branch,
                     },
                 );
                 if unchanged {
