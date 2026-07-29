@@ -262,7 +262,7 @@ fn focus_move(
     origin: ActionOrigin,
     tui_running: bool,
 ) -> FocusMove {
-    if origin == ActionOrigin::Keyboard && focus == PaneFocus::Terminal && tui_running {
+    if origin != ActionOrigin::Ipc && focus == PaneFocus::Terminal && tui_running {
         return FocusMove::Passthrough;
     }
     let target = match (focus, dir) {
@@ -8416,6 +8416,23 @@ mod tests {
     fn running_tui_keeps_the_key() {
         assert_eq!(mv(PaneFocus::Terminal, FocusDir::Left, true), FocusMove::Passthrough);
         assert_eq!(mv(PaneFocus::Terminal, FocusDir::Right, true), FocusMove::Passthrough);
+    }
+
+    /// A palette-dispatched Focus Left/Right is a binding stand-in, so a
+    /// running TUI must see the same passthrough a real keypress would.
+    #[test]
+    fn palette_origin_keeps_the_key_for_a_running_tui() {
+        assert_eq!(
+            focus_move(
+                PaneFocus::Terminal,
+                FocusDir::Left,
+                true,
+                true,
+                ActionOrigin::Palette,
+                true
+            ),
+            FocusMove::Passthrough
+        );
     }
 
     #[test]
