@@ -687,6 +687,10 @@ pub struct UiTheme {
     /// no `gh` processes; when enabled it is best-effort like the diff-base
     /// lookup: no `gh`, no auth, or no PR silently paints nothing.
     pub pr_status: bool,
+    /// `[ui] pr_status_concurrency`: max `gh` lookups in flight at once.
+    /// `0` (default) is unlimited, which is how many a cold cache already
+    /// forks in one frame — one per eligible worktree.
+    pub pr_status_concurrency: usize,
     pub icons: Icons,
     pub focus_outline: FocusOutline,
     /// `[ui] scrollbar`: sidebar scrollbar style, "floating" (default) or
@@ -734,6 +738,7 @@ impl Default for UiTheme {
             search_scope: SearchScope::default(),
             session_display: SessionDisplay::default(),
             pr_status: false,
+            pr_status_concurrency: 0,
             icons: Icons::default(),
             focus_outline: FocusOutline::default(),
             scrollbar: ScrollbarStyle::Floating,
@@ -1413,6 +1418,8 @@ struct RawUi {
     /// Sidebar scrollbar style: "floating" (default) | "solid".
     scrollbar: Option<String>,
     pr_status: Option<bool>,
+    /// Max `gh` lookups in flight at once.  `0` (default) is unlimited.
+    pr_status_concurrency: Option<usize>,
     font: RawUiFont,
     worktree_name: Option<String>,
     project_name: Option<String>,
@@ -1582,6 +1589,7 @@ impl RawConfig {
                 tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
             },
             pr_status: self.ui.pr_status.unwrap_or(false),
+            pr_status_concurrency: self.ui.pr_status_concurrency.unwrap_or(0),
             icons: build_icons(self.ui.icons),
             focus_outline: FocusOutline {
                 sidebar: self.ui.focus_outline.sidebar.unwrap_or(false),
@@ -2393,6 +2401,12 @@ program = "second"
     fn pr_status_defaults_off_and_parses_on() {
         assert!(!ui_from_toml("").pr_status);
         assert!(ui_from_toml("[ui]\npr_status = true").pr_status);
+    }
+
+    #[test]
+    fn pr_status_concurrency_defaults_to_unlimited() {
+        assert_eq!(ui_from_toml("").pr_status_concurrency, 0);
+        assert_eq!(ui_from_toml("[ui]\npr_status_concurrency = 4").pr_status_concurrency, 4);
     }
 
     #[test]

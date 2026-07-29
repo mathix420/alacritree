@@ -35,7 +35,7 @@ pub enum PrState {
     Closed,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PrInfo {
     pub number: u64,
     pub base_branch: String,
@@ -46,8 +46,12 @@ pub struct PrInfo {
 #[derive(Default)]
 pub struct PrCache {
     entries: HashMap<PathBuf, Entry>,
+    in_flight: usize,
+    concurrency: usize,
+    generation: u64,
 }
 
+#[derive(Default)]
 struct Entry {
     /// Branch the cached result was queried for.  Switching branches in the
     /// same worktree invalidates the entry.
@@ -56,8 +60,13 @@ struct Entry {
     queried_at: Option<Instant>,
     /// Set while a background thread is running; drained on the next poll.
     pending: Option<Receiver<LookupResult>>,
+    /// A refresh landed while `pending` was already occupied.  The drain
+    /// leaves `queried_at` cleared instead of stamping the fresh lookup's
+    /// result as current, so the next poll re-queries.
+    refresh_requested: bool,
 }
 
+#[derive(Debug, PartialEq)]
 struct LookupResult {
     branch: String,
     info: Option<PrInfo>,
@@ -90,23 +99,7 @@ impl PrCache {
         branch: Option<&str>,
         ctx: &egui::Context,
     ) -> Option<PrInfo> {
-        let entry = self.entries.entry(path.to_path_buf()).or_insert_with(|| Entry {
-            branch: None,
-            info: None,
-            queried_at: None,
-            pending: None,
-        });
-
-        // Drain any completed background lookup before deciding whether to
-        // refresh — a result that just arrived shouldn't be ignored.
-        if let Some(rx) = entry.pending.as_ref() {
-            if let Ok(result) = rx.try_recv() {
-                entry.branch = Some(result.branch);
-                entry.info = result.info;
-                entry.queried_at = Some(Instant::now());
-                entry.pending = None;
-            }
-        }
+        let entry = self.entries.entry(path.to_path_buf()).or_default();
 
         // A `None` poll (the git-status compute hasn't produced a branch
         // yet, or never will) carries no information about the current
@@ -116,20 +109,121 @@ impl PrCache {
             return entry.info.clone();
         };
 
-        let invalidate = should_invalidate(entry.branch.as_deref(), Some(branch));
-        let fresh = entry.queried_at.map_or(false, |when| when.elapsed() < TTL);
+        let spawn = should_spawn(
+            entry.branch.as_deref(),
+            Some(branch),
+            entry.queried_at,
+            entry.pending.is_some(),
+        );
 
-        if (invalidate || !fresh) && entry.pending.is_none() {
+        if spawn && may_spawn(self.concurrency, self.in_flight) {
+            let invalidate = should_invalidate(entry.branch.as_deref(), Some(branch));
             // Clear stale data immediately on branch switch so we don't show
             // a PR base that belongs to a different branch.
             if invalidate {
                 entry.info = None;
             }
-            entry.pending = Some(spawn_lookup(path.to_path_buf(), branch.to_string(), ctx.clone()));
+            let rx = spawn_lookup(path.to_path_buf(), branch.to_string(), ctx.clone());
+            self.bank_pending(path.to_path_buf(), rx);
         }
 
-        entry.info.clone()
+        self.entries.get(path).and_then(|entry| entry.info.clone())
     }
+
+    /// Advances whenever what `state` would answer may have moved.  The sidebar
+    /// reconciler compares it to know a filtered row set needs rebuilding; a
+    /// banked result that happens to match the previous one costs one extra
+    /// rebuild, which is cheaper than diffing states to avoid it.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// `0` means unlimited, which is how many `gh` processes a cold cache
+    /// already forks: one per eligible worktree, all in one frame.
+    pub fn set_concurrency(&mut self, cap: usize) {
+        self.concurrency = cap;
+    }
+
+    /// Bank every finished lookup and free its slot.  Runs once a frame ahead
+    /// of every poll site rather than inside `poll`: an entry whose project
+    /// collapsed mid-lookup is never polled again, and a slot it still held
+    /// would never come back.
+    pub fn drain_completed(&mut self) {
+        for entry in self.entries.values_mut() {
+            let Some(rx) = entry.pending.as_ref() else {
+                continue;
+            };
+            match rx.try_recv() {
+                Ok(result) => {
+                    entry.branch = Some(result.branch);
+                    entry.info = result.info;
+                    // A refresh that arrived mid-lookup wants the *next* answer,
+                    // so leave the entry stale and let the next poll re-query.
+                    entry.queried_at =
+                        if entry.refresh_requested { None } else { Some(Instant::now()) };
+                    entry.refresh_requested = false;
+                    entry.pending = None;
+                    self.in_flight = self.in_flight.saturating_sub(1);
+                    self.generation = self.generation.wrapping_add(1);
+                },
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    entry.pending = None;
+                    entry.refresh_requested = false;
+                    self.in_flight = self.in_flight.saturating_sub(1);
+                },
+                Err(mpsc::TryRecvError::Empty) => {},
+            }
+        }
+    }
+
+    /// Mark every entry stale.  Entries with a lookup already running also get
+    /// `refresh_requested`, because clearing `queried_at` alone cannot reach
+    /// them: `poll` will not spawn while `pending` is occupied, and the drain
+    /// would stamp a fresh timestamp over the request.
+    pub fn invalidate_all(&mut self) {
+        for entry in self.entries.values_mut() {
+            entry.queried_at = None;
+            if entry.pending.is_some() {
+                entry.refresh_requested = true;
+            }
+        }
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn bank_pending(&mut self, path: PathBuf, rx: Receiver<LookupResult>) {
+        self.entries.entry(path).or_default().pending = Some(rx);
+        self.in_flight += 1;
+    }
+
+    #[cfg(test)]
+    fn in_flight(&self) -> usize {
+        self.in_flight
+    }
+
+    #[cfg(test)]
+    fn insert_pending(&mut self, path: PathBuf, rx: Receiver<LookupResult>) {
+        self.bank_pending(path, rx);
+    }
+}
+
+/// Whether another lookup may start.  `0` is unlimited.
+fn may_spawn(concurrency: usize, in_flight: usize) -> bool {
+    concurrency == 0 || in_flight < concurrency
+}
+
+/// Whether this entry is due for a lookup, ignoring the concurrency cap.
+fn should_spawn(
+    cached_branch: Option<&str>,
+    branch: Option<&str>,
+    queried_at: Option<Instant>,
+    pending: bool,
+) -> bool {
+    if pending {
+        return false;
+    }
+    let invalidate = should_invalidate(cached_branch, branch);
+    let fresh = queried_at.map_or(false, |when| when.elapsed() < TTL);
+    invalidate || !fresh
 }
 
 /// A `None` incoming branch never invalidates — the caller has nothing to
@@ -182,11 +276,22 @@ pub fn effective_branch<'a>(
 fn spawn_lookup(path: PathBuf, branch: String, ctx: egui::Context) -> Receiver<LookupResult> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
+        // Fires on a panicking unwind too: the drain that frees this lookup's
+        // concurrency slot only runs on a frame, so an exit without a repaint
+        // can stall polling for good.
+        let _wake = RepaintOnDrop(ctx);
         let info = query_gh(&path, &branch);
         let _ = tx.send(LookupResult { branch, info });
-        ctx.request_repaint();
     });
     rx
+}
+
+struct RepaintOnDrop(egui::Context);
+
+impl Drop for RepaintOnDrop {
+    fn drop(&mut self) {
+        self.0.request_repaint();
+    }
 }
 
 fn pr_state(state: &str, is_draft: bool) -> PrState {
@@ -329,6 +434,7 @@ mod tests {
                 info: Some(sample_info()),
                 queried_at: Some(Instant::now()),
                 pending: None,
+                refresh_requested: false,
             },
         );
 
@@ -427,6 +533,7 @@ mod tests {
                 }),
                 queried_at: None,
                 pending: None,
+                refresh_requested: false,
             },
         );
 
@@ -434,5 +541,155 @@ mod tests {
         assert_eq!(cache.state(p, Some("main")), Some(PrState::Open));
         assert_eq!(cache.state(p, Some("feature")), None);
         assert_eq!(cache.state(p, None), None);
+    }
+
+    /// A collapsed project stops polling its entry, so a decrement that lived
+    /// in `poll` would strand the slot forever.
+    #[test]
+    fn drain_completed_frees_a_slot_for_an_entry_nobody_polls() {
+        let mut cache = PrCache::new();
+        cache.set_concurrency(1);
+        let (tx, rx) = mpsc::channel();
+        cache.insert_pending(PathBuf::from("/repo/wt"), rx);
+        assert_eq!(cache.in_flight(), 1);
+
+        tx.send(LookupResult { branch: "main".into(), info: None }).unwrap();
+        cache.drain_completed();
+
+        assert_eq!(cache.in_flight(), 0);
+    }
+
+    /// A worker that panics never sends. Without a decrement here a capped
+    /// cache stops polling permanently.
+    #[test]
+    fn drain_completed_frees_a_slot_for_a_disconnected_worker() {
+        let mut cache = PrCache::new();
+        cache.set_concurrency(1);
+        let (tx, rx) = mpsc::channel::<LookupResult>();
+        cache.insert_pending(PathBuf::from("/repo/wt"), rx);
+        drop(tx);
+
+        cache.drain_completed();
+
+        assert_eq!(cache.in_flight(), 0);
+    }
+
+    #[test]
+    fn generation_advances_on_a_banked_result_and_holds_still_otherwise() {
+        let mut cache = PrCache::new();
+        let before = cache.generation();
+        cache.drain_completed();
+        assert_eq!(cache.generation(), before, "a frame that banks nothing must not invalidate");
+
+        let (tx, rx) = mpsc::channel();
+        cache.insert_pending(PathBuf::from("/repo/wt"), rx);
+        tx.send(LookupResult { branch: "main".into(), info: None }).unwrap();
+        cache.drain_completed();
+        assert!(cache.generation() > before);
+    }
+
+    /// A refresh that lands while a lookup is in flight must survive it: `poll`
+    /// only spawns when `pending` is empty, and the drain would otherwise stamp
+    /// a fresh `queried_at` and swallow the request.
+    #[test]
+    fn a_refresh_during_a_lookup_survives_the_drain() {
+        let mut cache = PrCache::new();
+        let (tx, rx) = mpsc::channel();
+        cache.insert_pending(PathBuf::from("/repo/wt"), rx);
+
+        cache.invalidate_all();
+
+        tx.send(LookupResult { branch: "main".into(), info: None }).unwrap();
+        cache.drain_completed();
+
+        let entry = cache.entries.get(Path::new("/repo/wt")).unwrap();
+        assert!(entry.queried_at.is_none(), "the next poll must re-query");
+        assert!(!entry.refresh_requested, "and the request is spent, not sticky");
+        // `queried_at: None` is only the precondition; assert the decision that
+        // actually re-queries, or this passes with a `poll` that never spawns.
+        assert!(
+            should_spawn(
+                entry.branch.as_deref(),
+                Some("main"),
+                entry.queried_at,
+                entry.pending.is_some()
+            ),
+            "a spent refresh must leave the entry eligible to spawn"
+        );
+    }
+
+    /// Setting the flag on idle entries too would double-poll every one of
+    /// them: the drain banks nothing, `poll` starts the lookup, and the still-set
+    /// flag then refuses to stamp `queried_at`, so a second lookup starts.
+    #[test]
+    fn a_refresh_on_an_idle_entry_does_not_set_the_flag() {
+        let mut cache = PrCache::new();
+        cache.entries.insert(
+            PathBuf::from("/repo/wt"),
+            Entry {
+                branch: Some("main".into()),
+                info: None,
+                queried_at: Some(Instant::now()),
+                pending: None,
+                refresh_requested: false,
+            },
+        );
+
+        cache.invalidate_all();
+
+        let entry = cache.entries.get(Path::new("/repo/wt")).unwrap();
+        assert!(entry.queried_at.is_none());
+        assert!(!entry.refresh_requested);
+    }
+
+    #[test]
+    fn the_cap_admits_until_it_is_reached_and_zero_never_blocks() {
+        assert!(may_spawn(0, 0));
+        assert!(may_spawn(0, 99), "0 is unlimited");
+        assert!(may_spawn(2, 0));
+        assert!(may_spawn(2, 1));
+        assert!(!may_spawn(2, 2));
+        assert!(!may_spawn(2, 3), "an over-count must not reopen the gate");
+    }
+
+    /// The drain that frees a concurrency slot only runs on a frame, so a
+    /// worker that exits without waking the app can stall polling for good.
+    #[test]
+    fn dropping_the_guard_wakes_the_app() {
+        let ctx = egui::Context::default();
+        // A fresh context always wants an initial repaint, and `run` only
+        // clears it once that first request has been consumed — hence two
+        // passes, so the assertion below can only be satisfied by the guard.
+        let _ = ctx.run(Default::default(), |_| {});
+        let _ = ctx.run(Default::default(), |_| {});
+        assert!(!ctx.has_requested_repaint(), "precondition: no repaint pending");
+
+        drop(RepaintOnDrop(ctx.clone()));
+
+        assert!(ctx.has_requested_repaint());
+    }
+
+    #[test]
+    fn a_panicking_worker_still_wakes_the_app_and_disconnects() {
+        let ctx = egui::Context::default();
+        // See `dropping_the_guard_wakes_the_app`: a fresh context needs two
+        // passes before its initial repaint request is fully consumed.
+        let _ = ctx.run(Default::default(), |_| {});
+        let _ = ctx.run(Default::default(), |_| {});
+        assert!(!ctx.has_requested_repaint(), "precondition: no repaint pending");
+        let (tx, rx) = mpsc::channel::<LookupResult>();
+
+        let worker = {
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                let _wake = RepaintOnDrop(ctx);
+                let _tx = tx;
+                panic!("worker died");
+            })
+        };
+        assert!(worker.join().is_err(), "the worker must have panicked");
+
+        assert!(ctx.has_requested_repaint(), "a panicking unwind still wakes the app");
+        assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected));
     }
 }
