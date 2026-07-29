@@ -278,6 +278,32 @@ fn focus_move(
     }
 }
 
+/// Whether a matched binding's key press should reach `action`, given which
+/// pane currently owns keyboard focus. Filter actions are scoped to the
+/// sidebar that owns them so a bare letter like `d` doesn't fire a git-panel
+/// filter while the projects sidebar (or the terminal) has focus, and vice
+/// versa. `terminal_only` actions additionally step aside for the scratchpad
+/// editor, which wants those same keys for native text editing.
+fn valid_for_focus(
+    action: &BindingAction,
+    sidebar_focused: bool,
+    git_focused: bool,
+    scratchpad_focused: bool,
+) -> bool {
+    let focus_ok = match action {
+        BindingAction::Named(n) if n.is_projects_filter_scoped() => sidebar_focused,
+        BindingAction::Named(n) if n.is_git_filter_scoped() => git_focused,
+        BindingAction::Named(n) if n.is_sidebar_scoped() => sidebar_focused,
+        _ => true,
+    };
+    let terminal_only = match action {
+        BindingAction::Chars(_) => true,
+        BindingAction::Named(n) => n.is_terminal_only(),
+        BindingAction::Unsupported(_) => false,
+    };
+    focus_ok && !(scratchpad_focused && terminal_only)
+}
+
 pub struct AlacritreeApp {
     show_left_sidebar: bool,
     show_right_sidebar: bool,
@@ -1582,23 +1608,7 @@ impl AlacritreeApp {
                     let matched: Vec<_> = matched
                         .into_iter()
                         .filter(|a| {
-                            let valid_for_focus = match a {
-                                BindingAction::Named(n) if n.is_projects_filter_scoped() => {
-                                    sidebar_focused
-                                },
-                                BindingAction::Named(n) if n.is_git_filter_scoped() => git_focused,
-                                BindingAction::Named(n) if n.is_sidebar_scoped() => sidebar_focused,
-                                _ => true,
-                            };
-                            // Terminal byte/scroll bindings would swallow
-                            // useful editor keys like Shift+Home and
-                            // Shift+PageUp. Leave those events for TextEdit.
-                            let terminal_only = match a {
-                                BindingAction::Chars(_) => true,
-                                BindingAction::Named(n) => n.is_terminal_only(),
-                                BindingAction::Unsupported(_) => false,
-                            };
-                            valid_for_focus && !(scratchpad_focused && terminal_only)
+                            valid_for_focus(a, sidebar_focused, git_focused, scratchpad_focused)
                         })
                         // Search actions are owned by the sidebar nav pass; here
                         // their default Enter/Esc/Shift+Esc must fall through to
@@ -8501,6 +8511,47 @@ mod tests {
             focus_move(PaneFocus::Terminal, FocusDir::Left, false, true, ActionOrigin::Ipc, true),
             FocusMove::Nothing
         );
+    }
+
+    #[test]
+    fn projects_filter_action_valid_when_projects_sidebar_focused() {
+        let action = BindingAction::Named(NamedAction::ToggleSessionsFilter);
+        assert!(valid_for_focus(&action, true, false, false));
+    }
+
+    #[test]
+    fn projects_filter_action_rejected_when_git_sidebar_focused() {
+        let action = BindingAction::Named(NamedAction::ToggleSessionsFilter);
+        assert!(!valid_for_focus(&action, false, true, false));
+    }
+
+    #[test]
+    fn git_filter_action_valid_when_git_sidebar_focused() {
+        let action = BindingAction::Named(NamedAction::ToggleModifiedFilter);
+        assert!(valid_for_focus(&action, false, true, false));
+    }
+
+    #[test]
+    fn git_filter_action_rejected_when_projects_sidebar_focused() {
+        let action = BindingAction::Named(NamedAction::ToggleModifiedFilter);
+        assert!(!valid_for_focus(&action, true, false, false));
+    }
+
+    #[test]
+    fn both_sidebar_filters_rejected_when_terminal_focused() {
+        let projects_action = BindingAction::Named(NamedAction::ToggleSessionsFilter);
+        let git_action = BindingAction::Named(NamedAction::ToggleModifiedFilter);
+        assert!(!valid_for_focus(&projects_action, false, false, false));
+        assert!(!valid_for_focus(&git_action, false, false, false));
+    }
+
+    /// `ScrollPageUp` is unscoped by pane focus, so only the scratchpad
+    /// editor stealing it back (via `terminal_only`) should block it.
+    #[test]
+    fn terminal_only_action_yields_to_the_scratchpad_editor() {
+        let action = BindingAction::Named(NamedAction::ScrollPageUp);
+        assert!(!valid_for_focus(&action, false, false, true));
+        assert!(valid_for_focus(&action, false, false, false));
     }
 
     fn req(file: &str, source: DiffSource) -> DiffRequest {
