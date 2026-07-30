@@ -538,6 +538,13 @@ mod tests {
         assert!(parse_gh_output(b"[]", None).is_none());
     }
 
+    /// `gh` answers errors as a bare object, so valid JSON that is not a list
+    /// must degrade the same way malformed output does.
+    #[test]
+    fn rejects_json_that_is_not_a_list() {
+        assert!(parse_gh_output(b"{}", None).is_none());
+    }
+
     /// A head branch accumulates PRs over its life. `gh pr list` answers newest
     /// first, but the open one is the live PR — a newer abandoned attempt must
     /// not shadow it.
@@ -1009,6 +1016,25 @@ mod tests {
         assert!(may_spawn(2, 1));
         assert!(!may_spawn(2, 2));
         assert!(!may_spawn(2, 3), "an over-count must not reopen the gate");
+    }
+
+    /// The cap has to hold at the `poll` entry point, not just in the helper:
+    /// a cold cache polls every eligible worktree in one frame.
+    #[test]
+    fn poll_respects_the_concurrency_cap() {
+        let mut cache = PrCache::new();
+        cache.set_concurrency(1);
+        let (_tx, rx) = mpsc::channel::<LookupResult>();
+        cache.insert_pending(PathBuf::from("/repo/busy"), "main", rx);
+
+        let capped = Path::new("/repo/capped");
+        cache.poll(capped, Some("feature"), &egui::Context::default());
+
+        assert!(
+            cache.entries.get(capped).is_none_or(|entry| entry.pending.is_none()),
+            "the cap must refuse the second lookup"
+        );
+        assert_eq!(cache.in_flight(), 1);
     }
 
     /// The drain that frees a concurrency slot only runs on a frame, so a

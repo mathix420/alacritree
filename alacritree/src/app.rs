@@ -8189,6 +8189,7 @@ mod tests {
     fn bare_delete_in_search_is_consumed_as_a_no_op() {
         let binds = crate::bindings::parse_bindings(vec![]);
         let mut f = searching_filter();
+        f.on_text("typed");
 
         let mut steps = Vec::new();
         let retain = drain_search_or_nav(
@@ -8200,7 +8201,12 @@ mod tests {
             false,
         );
 
-        assert!(!retain);
+        assert!(!retain, "Delete must not reach the cursored row");
+        assert!(
+            matches!(steps.as_slice(), [SidebarNavStep::Nav(egui::Key::Delete)]),
+            "Delete is consumed as a plain nav key, not routed into the filter"
+        );
+        assert_eq!(f.query(), "typed", "an append-only query has no delete");
     }
 
     /// Keys that produce no text keep falling through to the binding table, which
