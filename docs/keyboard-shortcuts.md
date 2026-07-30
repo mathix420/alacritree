@@ -68,6 +68,11 @@ below is hard-coded.
 | `O`                  | Sidebar focused: expand/collapse the selected project |
 | `Delete`             | Sidebar focused: close/delete/remove the selected row |
 | `Shift+R`            | Sidebar focused: rename the selected project          |
+| `S`                  | Projects sidebar focused: toggle the sessions filter  |
+| `A`                  | Projects sidebar focused: toggle the attention filter |
+| `M`                  | Git sidebar focused: toggle the modified-files filter |
+| `D`                  | Git sidebar focused: toggle the deleted-files filter  |
+| `U`                  | Git sidebar focused: toggle the untracked-files filter|
 | `Ctrl+K`             | Open the command palette                              |
 | `Home` / `End`       | Palette open: cursor to the first / last row          |
 | `PageUp` / `PageDown`| Palette open: cursor a screenful up / down            |
@@ -271,6 +276,69 @@ Rebind them to any non-text-producing key or chord (`Enter`, `Esc`, `Shift+Esc`,
 function keys, `Ctrl`/`Shift` chords). Binding a search action to a key that also
 produces text (a bare, `Shift`-, or `AltGr`-printable) is unsupported: the
 keystroke would both type into the query and fire the action.
+
+### Sidebar filters
+
+Toggle actions that narrow a sidebar's rows. Defaults act only while the
+owning sidebar has keyboard focus, the same way `R` and `O` do above.
+
+Projects sidebar — the session filter and the attention filter are
+independent dimensions that AND together; the four PR filters are one
+dimension whose active states union (an open-or-draft filter shows both):
+
+- `ToggleSessionsFilter` (default `S`) — narrow to workspaces with a live
+  session.
+- `ToggleAttentionFilter` (default `A`) — narrow to workspaces whose session
+  wants attention.
+- `TogglePrOpenFilter` / `TogglePrDraftFilter` / `TogglePrMergedFilter` /
+  `TogglePrClosedFilter` (no default key) — narrow to worktrees with an open,
+  draft, merged, or closed PR. These four exist only when `[ui] pr_status =
+  true` (default `false`); a query against `gh` runs per worktree, so
+  filtered rows fill in as each answer arrives rather than appearing all at
+  once.
+- `ClearProjectFilters` (no default key) — drop every projects-sidebar
+  toggle at once.
+
+Git sidebar — one dimension (a file only ever matches one change kind), so
+the active toggles union:
+
+- `ToggleModifiedFilter` (default `M`) — narrow to modified and renamed
+  files.
+- `ToggleDeletedFilter` (default `D`) — narrow to deleted files.
+- `ToggleUntrackedFilter` (default `U`) — narrow to untracked and added
+  files.
+- `ClearGitFilters` (no default key) — drop every git-sidebar toggle at
+  once.
+
+Not scoped to either panel:
+
+- `ToggleSearchScope` (no default key) — switch a sidebar's fuzzy-search
+  query between confined-by-the-active-toggles and reaching every row.
+  Runtime-only: restarting returns to `[ui] search_scope`.
+- `RefreshPrStatus` (no default key; acts while the projects sidebar has
+  focus) — invalidate every worktree's cached PR state and re-query `gh`.
+
+Widening PR lookups to cover a collapsed project happens only while the
+projects sidebar is painted, so hiding that sidebar stops *that* widening. It
+does not stop PR lookups altogether: the git sidebar still polls the active
+workspace's PR state, and a lookup already running still finishes and is
+still banked by the frame-start drain.
+
+A binding you write replaces the built-in binding on the same key. If you bind
+a key that a filter toggle uses by default, that toggle loses its key —
+silently. Two of your own bindings on one key both stay, and each runs only in
+the panel it belongs to, so you can give a key back its old meaning alongside
+the new one:
+
+```toml
+[[keyboard.bindings]]
+key = "D"
+action = "DeleteSelected"        # projects sidebar
+
+[[keyboard.bindings]]
+key = "D"
+action = "ToggleDeletedFilter"   # git sidebar
+```
 
 ### Misc
 

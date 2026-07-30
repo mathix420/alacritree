@@ -323,6 +323,12 @@ vsync              = true   # restart required — wait for the display's refres
                             # before showing a finished frame (default true).
                             # false presents each frame as soon as it is drawn,
                             # trading tearing for lower keystroke-to-screen delay
+search_scope       = "filtered"  # whether a sidebar search is confined by the
+                                 # active toggle filters
+                                 # "filtered" (default): a query narrows what
+                                 # the toggles already allow
+                                 # "all": a query reaches every row; the
+                                 # toggles resume when it empties
 confirm_session_close = "never"  # when the sidebar × asks before killing a PTY:
                                  # "never" (default) | "busy" | "always"
 last_session_close = "respawn"   # closing the on-screen workspace's last
@@ -330,6 +336,8 @@ last_session_close = "respawn"   # closing the on-screen workspace's last
                                  # one, "navigate" moves to another workspace
 pr_status          = false  # poll `gh` for each branch's open PR, which drives
                             # the PR row icons and $pr below (default false)
+pr_status_concurrency = 0   # cap concurrent `gh` PR lookups; 0 (default) is
+                            # unlimited
 delta_path         = "delta"     # explicit delta binary for the diff pane;
                                  # unset discovers it on PATH
 worktree_name      = "$name ${pr: }"  # template for worktree row labels:
