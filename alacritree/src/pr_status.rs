@@ -119,14 +119,8 @@ impl PrCache {
         );
 
         if spawn && may_spawn(self.concurrency, self.in_flight) {
-            let invalidate = should_invalidate(entry.branch.as_deref(), Some(branch));
-            // Clear stale data immediately on branch switch so we don't show
-            // a PR base that belongs to a different branch.
-            if invalidate {
-                entry.info = None;
-            }
             let rx = spawn_lookup(path.to_path_buf(), branch.to_string(), ctx.clone());
-            self.bank_pending(path.to_path_buf(), rx);
+            self.bank_pending(path.to_path_buf(), branch, rx);
         }
 
         self.entries.get(path).and_then(|entry| entry.info.clone())
@@ -169,6 +163,12 @@ impl PrCache {
                     self.generation = self.generation.wrapping_add(1);
                 },
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    // A worker that died without sending has no answer to bank,
+                    // so the TTL is the only thing that can back it off — and it
+                    // must do so even when a refresh was requested mid-flight,
+                    // or the entry re-spawns a thread and a `gh` process on
+                    // every frame for as long as the failure lasts.
+                    entry.queried_at = Some(Instant::now());
                     entry.pending = None;
                     entry.refresh_requested = false;
                     self.in_flight = self.in_flight.saturating_sub(1);
@@ -192,8 +192,21 @@ impl PrCache {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    fn bank_pending(&mut self, path: PathBuf, rx: Receiver<LookupResult>) {
-        self.entries.entry(path).or_default().pending = Some(rx);
+    /// Record a started lookup against its entry.  The entry is keyed to the
+    /// branch being looked up rather than to the last banked answer: a worker
+    /// that dies without sending leaves nothing for the drain to key it with,
+    /// and a mismatched branch makes the entry due again on the next frame
+    /// however recently it was queried.
+    fn bank_pending(&mut self, path: PathBuf, branch: &str, rx: Receiver<LookupResult>) {
+        let entry = self.entries.entry(path).or_default();
+        debug_assert!(entry.pending.is_none(), "a second lookup would strand the first's slot");
+        // Clear stale data immediately on branch switch so we don't show
+        // a PR base that belongs to a different branch.
+        if should_invalidate(entry.branch.as_deref(), Some(branch)) {
+            entry.info = None;
+        }
+        entry.branch = Some(branch.to_string());
+        entry.pending = Some(rx);
         self.in_flight += 1;
     }
 
@@ -203,8 +216,8 @@ impl PrCache {
     }
 
     #[cfg(test)]
-    fn insert_pending(&mut self, path: PathBuf, rx: Receiver<LookupResult>) {
-        self.bank_pending(path, rx);
+    fn insert_pending(&mut self, path: PathBuf, branch: &str, rx: Receiver<LookupResult>) {
+        self.bank_pending(path, branch, rx);
     }
 }
 
@@ -851,7 +864,7 @@ mod tests {
         let mut cache = PrCache::new();
         cache.set_concurrency(1);
         let (tx, rx) = mpsc::channel();
-        cache.insert_pending(PathBuf::from("/repo/wt"), rx);
+        cache.insert_pending(PathBuf::from("/repo/wt"), "main", rx);
         assert_eq!(cache.in_flight(), 1);
 
         tx.send(LookupResult { branch: "main".into(), info: None }).unwrap();
@@ -867,7 +880,7 @@ mod tests {
         let mut cache = PrCache::new();
         cache.set_concurrency(1);
         let (tx, rx) = mpsc::channel::<LookupResult>();
-        cache.insert_pending(PathBuf::from("/repo/wt"), rx);
+        cache.insert_pending(PathBuf::from("/repo/wt"), "main", rx);
         drop(tx);
 
         cache.drain_completed();
@@ -875,18 +888,41 @@ mod tests {
         assert_eq!(cache.in_flight(), 0);
     }
 
+    /// A dead worker banks no answer, so nothing but the TTL can hold the entry
+    /// back — and the guard's repaint delivers the frame that would re-spawn it.
+    #[test]
+    fn a_dead_worker_leaves_the_entry_ineligible_to_respawn() {
+        let mut cache = PrCache::new();
+        let (tx, rx) = mpsc::channel::<LookupResult>();
+        cache.insert_pending(PathBuf::from("/repo/wt"), "main", rx);
+        drop(tx);
+
+        cache.drain_completed();
+
+        let entry = cache.entries.get(Path::new("/repo/wt")).unwrap();
+        assert!(
+            !should_spawn(
+                entry.branch.as_deref(),
+                Some("main"),
+                entry.queried_at,
+                entry.pending.is_some()
+            ),
+            "a dead worker must not leave the entry due on the very next frame"
+        );
+    }
+
     #[test]
     fn generation_advances_on_a_banked_result_and_holds_still_otherwise() {
         let mut cache = PrCache::new();
         let (_tx, rx) = mpsc::channel::<LookupResult>();
-        cache.insert_pending(PathBuf::from("/repo/wt"), rx);
+        cache.insert_pending(PathBuf::from("/repo/pending"), "main", rx);
 
         let before = cache.generation();
         cache.drain_completed();
         assert_eq!(cache.generation(), before, "a frame that banks nothing must not invalidate");
 
         let (tx, rx) = mpsc::channel();
-        cache.insert_pending(PathBuf::from("/repo/wt"), rx);
+        cache.insert_pending(PathBuf::from("/repo/banked"), "main", rx);
         tx.send(LookupResult { branch: "main".into(), info: None }).unwrap();
         cache.drain_completed();
         assert!(cache.generation() > before);
@@ -899,7 +935,7 @@ mod tests {
     fn a_refresh_during_a_lookup_survives_the_drain() {
         let mut cache = PrCache::new();
         let (tx, rx) = mpsc::channel();
-        cache.insert_pending(PathBuf::from("/repo/wt"), rx);
+        cache.insert_pending(PathBuf::from("/repo/wt"), "main", rx);
 
         cache.invalidate_all();
 
