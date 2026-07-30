@@ -335,7 +335,8 @@ last_session_close = "respawn"   # closing the on-screen workspace's last
                                  # session: "respawn" (default) starts a fresh
                                  # one, "navigate" moves to another workspace
 pr_status          = false  # poll `gh` for each branch's open PR, which drives
-                            # the PR row icons and $pr below (default false)
+                            # the PR row icons, the PR-state filters, and $pr
+                            # below (default false)
 pr_status_concurrency = 0   # cap concurrent `gh` PR lookups; 0 (default) is
                             # unlimited
 delta_path         = "delta"     # explicit delta binary for the diff pane;

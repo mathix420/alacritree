@@ -72,7 +72,7 @@ below is hard-coded.
 | `A`                  | Projects sidebar focused: toggle the attention filter |
 | `M`                  | Git sidebar focused: toggle the modified-files filter |
 | `D`                  | Git sidebar focused: toggle the deleted-files filter  |
-| `U`                  | Git sidebar focused: toggle the untracked-files filter|
+| `U`                  | Git sidebar focused: toggle the untracked-files filter |
 | `Ctrl+K`             | Open the command palette                              |
 | `Home` / `End`       | Palette open: cursor to the first / last row          |
 | `PageUp` / `PageDown`| Palette open: cursor a screenful up / down            |
@@ -284,7 +284,10 @@ owning sidebar has keyboard focus, the same way `R` and `O` do above.
 
 Projects sidebar — the session filter and the attention filter are
 independent dimensions that AND together; the four PR filters are one
-dimension whose active states union (an open-or-draft filter shows both):
+dimension whose active states union (an open-or-draft filter shows both);
+and that PR dimension in turn ANDs with the other two, so a worktree must
+satisfy the session/attention conjunction and match one active PR state to
+survive:
 
 - `ToggleSessionsFilter` (default `S`) — narrow to workspaces with a live
   session.
@@ -298,6 +301,8 @@ dimension whose active states union (an open-or-draft filter shows both):
   once.
 - `ClearProjectFilters` (no default key) — drop every projects-sidebar
   toggle at once.
+- `RefreshPrStatus` (no default key) — invalidate every worktree's cached PR
+  state and re-query `gh`. Acts while the projects sidebar has focus.
 
 Git sidebar — one dimension (a file only ever matches one change kind), so
 the active toggles union:
@@ -315,8 +320,6 @@ Not scoped to either panel:
 - `ToggleSearchScope` (no default key) — switch a sidebar's fuzzy-search
   query between confined-by-the-active-toggles and reaching every row.
   Runtime-only: restarting returns to `[ui] search_scope`.
-- `RefreshPrStatus` (no default key; acts while the projects sidebar has
-  focus) — invalidate every worktree's cached PR state and re-query `gh`.
 
 Widening PR lookups to cover a collapsed project happens only while the
 projects sidebar is painted, so hiding that sidebar stops *that* widening. It
