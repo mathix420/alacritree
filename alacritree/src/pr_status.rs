@@ -335,13 +335,29 @@ fn pr_state(state: &str, is_draft: bool) -> PrState {
 /// the merged and closed badges that `pr list` would otherwise drop.
 fn query_gh(path: &Path, branch: &str) -> Option<PrInfo> {
     const PR_JSON_FIELDS: &str = "number,baseRefName,url,state,isDraft,headRepositoryOwner";
+    // `--head` matches the ref name in every head repository and `--state all`
+    // keeps the closed and merged ones, so a generic branch name in a busy base
+    // repo overflows `gh`'s default page of 30 and the owner preference below
+    // never sees this checkout's own PR.
+    const PR_LIMIT: &str = "100";
     match wsl::classify(path) {
         wsl::Location::Windows(p) => {
             let owner = local_origin_owner(&p);
             let output = Command::new("gh")
                 .hide_console()
                 .current_dir(p)
-                .args(["pr", "list", "--head", branch, "--state", "all", "--json", PR_JSON_FIELDS])
+                .args([
+                    "pr",
+                    "list",
+                    "--head",
+                    branch,
+                    "--state",
+                    "all",
+                    "--limit",
+                    PR_LIMIT,
+                    "--json",
+                    PR_JSON_FIELDS,
+                ])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .stdin(Stdio::null())
@@ -367,10 +383,13 @@ fn query_gh(path: &Path, branch: &str) -> Option<PrInfo> {
             // the JSON always starts after exactly one newline.
             let script = r#"cd "$1" || exit 1
 printf '%s\n' "$(git config --get remote.origin.url 2>/dev/null)"
-exec "$2" pr list --head "$3" --state all --json "$4""#;
-            let stdout =
-                wsl::run_batch(&distro, script, &[&linux_path, &gh, branch, PR_JSON_FIELDS])
-                    .ok()?;
+exec "$2" pr list --head "$3" --state all --limit "$4" --json "$5""#;
+            let stdout = wsl::run_batch(
+                &distro,
+                script,
+                &[&linux_path, &gh, branch, PR_LIMIT, PR_JSON_FIELDS],
+            )
+            .ok()?;
             let (origin_url, json) = split_origin_url_line(&stdout);
             let owner = origin_url.and_then(github_owner_from_url);
             parse_gh_output(json, owner.as_deref())
