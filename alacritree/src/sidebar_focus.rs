@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::app::WorkspaceKey;
-use crate::projects::Project;
+use crate::projects::{Project, Worktree};
 use crate::session::SessionId;
 use crate::sidebar_nav::SidebarRow;
 
@@ -344,7 +344,50 @@ struct ProjectInput {
     root: PathBuf,
     name: String,
     expanded: bool,
-    worktrees: Vec<(PathBuf, String, bool, Option<String>)>,
+    worktrees: Vec<WorktreeInput>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WorktreeInput {
+    path: PathBuf,
+    name: String,
+    prunable: bool,
+    branch: Option<String>,
+}
+
+/// A [`WorktreeInput`] and a live [`Worktree`] reduced to the same borrowed
+/// shape.  The compare path runs every frame and must not allocate, so the two
+/// are matched through this rather than by cloning one into the other's type —
+/// and a field added to `WorktreeInput` without a view of it stops compiling
+/// instead of silently dropping out of the comparison.
+#[derive(PartialEq, Eq)]
+struct WorktreeView<'a> {
+    path: &'a Path,
+    name: &'a str,
+    prunable: bool,
+    branch: Option<&'a str>,
+}
+
+impl WorktreeInput {
+    fn view(&self) -> WorktreeView<'_> {
+        WorktreeView {
+            path: &self.path,
+            name: &self.name,
+            prunable: self.prunable,
+            branch: self.branch.as_deref(),
+        }
+    }
+}
+
+impl<'a> From<&'a Worktree> for WorktreeView<'a> {
+    fn from(wt: &'a Worktree) -> Self {
+        Self {
+            path: &wt.path,
+            name: &wt.name,
+            prunable: wt.prunable,
+            branch: wt.branch.as_deref(),
+        }
+    }
 }
 
 /// Everything the snapshot is a function of.  Captured on rebuild, compared
@@ -378,8 +421,11 @@ impl ObservedInputs {
                     worktrees: p
                         .worktrees
                         .iter()
-                        .map(|wt| {
-                            (wt.path.clone(), wt.name.clone(), wt.prunable, wt.branch.clone())
+                        .map(|wt| WorktreeInput {
+                            path: wt.path.clone(),
+                            name: wt.name.clone(),
+                            prunable: wt.prunable,
+                            branch: wt.branch.clone(),
                         })
                         .collect(),
                 })
@@ -433,11 +479,7 @@ impl ObservedInputs {
             }
             for (wt_was, wt_now) in was.worktrees.iter().zip(&now.worktrees) {
                 visit();
-                if wt_was.0 != wt_now.path
-                    || wt_was.1 != wt_now.name
-                    || wt_was.2 != wt_now.prunable
-                    || wt_was.3 != wt_now.branch
-                {
+                if wt_was.view() != WorktreeView::from(wt_now) {
                     return false;
                 }
             }
