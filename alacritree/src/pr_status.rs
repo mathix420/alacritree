@@ -43,12 +43,27 @@ pub struct PrInfo {
     pub state: PrState,
 }
 
-#[derive(Default)]
+/// Cap a cache carries until one is configured.  Zero is not a usable cap —
+/// it admits no lookup at all — so the field cannot be left at its numeric
+/// default.
+pub const DEFAULT_CONCURRENCY: usize = 8;
+
 pub struct PrCache {
     entries: HashMap<PathBuf, Entry>,
     in_flight: usize,
     concurrency: usize,
     generation: u64,
+}
+
+impl Default for PrCache {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            in_flight: 0,
+            concurrency: DEFAULT_CONCURRENCY,
+            generation: 0,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -136,8 +151,10 @@ impl PrCache {
 
     /// The cap on lookups in flight at once. A cold cache is otherwise ready
     /// to fork one `gh` process per eligible worktree in a single frame.
+    /// Clamped to one, since a zero cap would wedge the cache instead of
+    /// uncapping it.
     pub fn set_concurrency(&mut self, cap: usize) {
-        self.concurrency = cap;
+        self.concurrency = cap.max(1);
     }
 
     /// Bank every finished lookup and free its slot.  Runs once a frame ahead
@@ -1029,6 +1046,23 @@ mod tests {
         assert!(may_spawn(2, 1));
         assert!(!may_spawn(2, 2));
         assert!(!may_spawn(2, 3), "an over-count must not reopen the gate");
+    }
+
+    /// A zero cap admits nothing, so the cache cannot start life holding one:
+    /// a caller that never reaches `set_concurrency` would poll every frame
+    /// and spawn nothing.
+    #[test]
+    fn a_cache_that_was_never_configured_still_admits_a_lookup() {
+        let cache = PrCache::new();
+        assert!(may_spawn(cache.concurrency, cache.in_flight));
+    }
+
+    #[test]
+    fn set_concurrency_clamps_zero_to_one() {
+        let mut cache = PrCache::new();
+        cache.set_concurrency(0);
+        assert!(may_spawn(cache.concurrency, 0));
+        assert!(!may_spawn(cache.concurrency, 1));
     }
 
     /// The cap has to hold at the `poll` entry point, not just in the helper:

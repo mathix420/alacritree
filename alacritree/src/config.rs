@@ -23,6 +23,7 @@ use serde::Deserialize;
 
 use crate::bindings::{self, KeyBinding};
 use crate::path_style::PathStyle;
+use crate::pr_status::DEFAULT_CONCURRENCY;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -739,7 +740,7 @@ impl Default for UiTheme {
             search_scope: SearchScope::default(),
             session_display: SessionDisplay::default(),
             pr_status: false,
-            pr_status_concurrency: 8,
+            pr_status_concurrency: DEFAULT_CONCURRENCY,
             icons: Icons::default(),
             focus_outline: FocusOutline::default(),
             scrollbar: ScrollbarStyle::Floating,
@@ -1590,7 +1591,7 @@ impl RawConfig {
                 tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
             },
             pr_status: self.ui.pr_status.unwrap_or(false),
-            pr_status_concurrency: self.ui.pr_status_concurrency.unwrap_or(8).max(1),
+            pr_status_concurrency: self.ui.pr_status_concurrency.unwrap_or(DEFAULT_CONCURRENCY).max(1),
             icons: build_icons(self.ui.icons),
             focus_outline: FocusOutline {
                 sidebar: self.ui.focus_outline.sidebar.unwrap_or(false),
