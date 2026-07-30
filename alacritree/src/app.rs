@@ -228,7 +228,9 @@ enum FocusDir {
 /// PTY when the inner TUI should handle it.  An IPC action has no key press
 /// to forward — the caller is typically that inner program declaring it has
 /// no window in the requested direction, and passthrough would bounce the
-/// key straight back to it.
+/// key straight back to it.  A palette action consumed a key press too, but
+/// arrives with the panel still searching over a row the query may have
+/// hidden — so actions that need a browsing cursor are refused at this origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActionOrigin {
     Keyboard,
@@ -858,8 +860,6 @@ impl AlacritreeApp {
             sidebar_deferred_close: None,
         };
 
-        // Ahead of the refreshes below, which can start lookups a cap applied
-        // afterwards would not bound.
         app.pr_cache.set_concurrency(pr_status_concurrency);
 
         let wsl_indices: Vec<usize> = app
@@ -3191,19 +3191,6 @@ impl AlacritreeApp {
         for project in &self.projects {
             let mut rows = Vec::with_capacity(project.worktrees.len());
             for wt in &project.worktrees {
-                // The right sidebar polls only the active workspace's PR
-                // cache, using the live `StatusCache` branch (recomputed
-                // every ~1.5s). Two pollers of the same path must agree on
-                // a branch or each drain flips `entry.branch` and they
-                // invalidate each other's lookups forever after an
-                // in-terminal checkout — so share the live cache there.
-                // For every other worktree there is only one poller (this
-                // one), and its cache is created once a workspace goes
-                // active but never re-polled or pruned after it goes
-                // inactive again: reading it here would freeze the branch
-                // at whatever it was on last visit and shadow later
-                // `refresh_project` updates to `wt.branch`. Use the
-                // refresh-responsive snapshot instead.
                 let info = resolve_pr_info(
                     &mut polled,
                     &wt.path,

@@ -276,6 +276,16 @@ pub fn pr_pass(
 /// The branch a worktree's PR lookup is keyed to.  The active worktree prefers
 /// its live status branch; every other worktree, and an active one whose
 /// `StatusCache` has not produced a branch yet, uses the stored snapshot.
+///
+/// The split is what keeps two pollers of one path from fighting.  [`PrCache`]
+/// is keyed by path alone, so the right sidebar — which polls the active
+/// workspace with its live `StatusCache` branch, recomputed every ~1.5 s — and
+/// the projects sidebar must agree on a branch, or each drain flips
+/// `entry.branch` and they invalidate each other's lookups forever after an
+/// in-terminal checkout.  Every other worktree has a single poller, and an
+/// inactive workspace's `StatusCache` is created once and then never re-polled
+/// or pruned: reading it would freeze the branch at whatever it was on the last
+/// visit and shadow later `refresh_project` updates to `wt.branch`.
 pub fn effective_branch<'a>(
     wt: &'a Worktree,
     current_workspace: Option<&Path>,
@@ -295,9 +305,13 @@ fn spawn_lookup(path: PathBuf, branch: String, ctx: egui::Context) -> Receiver<L
         // concurrency slot only runs on a frame, so an exit without a repaint
         // can stall polling for good.
         let _wake = RepaintOnDrop(ctx);
-        let _tx = tx;
+        // A body local rather than a capture: locals drop in reverse
+        // declaration order, so a panicking unwind disconnects the channel
+        // before the guard requests the repaint that observes it.  Closure
+        // capture drop order is unspecified and would not guarantee that.
+        let sender = tx;
         let info = query_gh(&path, &branch);
-        let _ = _tx.send(LookupResult { branch, info });
+        let _ = sender.send(LookupResult { branch, info });
     });
     rx
 }
@@ -1068,7 +1082,7 @@ mod tests {
             let ctx = ctx.clone();
             thread::spawn(move || {
                 let _wake = RepaintOnDrop(ctx);
-                let _tx = tx;
+                let _sender = tx;
                 panic!("worker died");
             })
         };

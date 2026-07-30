@@ -364,15 +364,23 @@ impl NamedAction {
             Self::ToggleAttentionFilter => {
                 "Filter the sidebar to workspaces wanting attention".into()
             },
-            Self::TogglePrOpenFilter => "Filter the sidebar to worktrees with an open PR".into(),
-            Self::TogglePrDraftFilter => "Filter the sidebar to worktrees with a draft PR".into(),
-            Self::TogglePrMergedFilter => "Filter the sidebar to worktrees with a merged PR".into(),
-            Self::TogglePrClosedFilter => "Filter the sidebar to worktrees with a closed PR".into(),
-            Self::ClearProjectFilters => "Clear every projects-sidebar filter".into(),
+            Self::TogglePrOpenFilter => {
+                "Filter to worktrees with an open PR (requires [ui] pr_status)".into()
+            },
+            Self::TogglePrDraftFilter => {
+                "Filter to worktrees with a draft PR (requires [ui] pr_status)".into()
+            },
+            Self::TogglePrMergedFilter => {
+                "Filter to worktrees with a merged PR (requires [ui] pr_status)".into()
+            },
+            Self::TogglePrClosedFilter => {
+                "Filter to worktrees with a closed PR (requires [ui] pr_status)".into()
+            },
+            Self::ClearProjectFilters => "Clear every projects-sidebar toggle".into(),
             Self::ToggleModifiedFilter => "Filter git changes to modified and renamed files".into(),
             Self::ToggleDeletedFilter => "Filter git changes to deleted files".into(),
             Self::ToggleUntrackedFilter => "Filter git changes to untracked and added files".into(),
-            Self::ClearGitFilters => "Clear every git-sidebar filter".into(),
+            Self::ClearGitFilters => "Clear every git-sidebar toggle".into(),
             Self::ToggleSearchScope => {
                 "Search inside the active filters or across every row".into()
             },
