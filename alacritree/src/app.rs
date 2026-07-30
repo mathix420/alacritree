@@ -370,9 +370,12 @@ fn worktree_pr_passes(any_pr: bool, pr_matches: &HashMap<PathBuf, bool>, path: &
     !any_pr || pr_matches.get(path).copied().unwrap_or(false)
 }
 
-/// Whether the projects panel is filtering on PR state this frame.
-fn any_pr_toggle_active(filter: &PanelFilter) -> bool {
-    ['o', 'd', 'm', 'c'].into_iter().any(|key| filter.is_toggled(key))
+/// Whether the projects panel is filtering on PR state this frame.  A toggle
+/// the scope has stood down narrows nothing, so it must not pull the cache
+/// generation into the reconciler or reach `gh` for a collapsed project.
+fn any_pr_toggle_active(filter: &PanelFilter, scope: SearchScope) -> bool {
+    filter.toggles_apply(scope)
+        && ['o', 'd', 'm', 'c'].into_iter().any(|key| filter.is_toggled(key))
 }
 
 /// The cache generation the reconciler observes.  Held at `0` unless a PR
@@ -1916,19 +1919,25 @@ impl AlacritreeApp {
             .and_then(|p| self.git_status.get(p))
             .and_then(|c| c.current_branch());
         let current_workspace = self.current_workspace.as_deref();
-        let pr_matches: HashMap<PathBuf, bool> = self
-            .projects
-            .iter()
-            .flat_map(|p| p.worktrees.iter())
-            .map(|wt| {
-                let branch = pr_status::effective_branch(wt, current_workspace, live_branch);
-                let state = self.pr_cache.state(&wt.path, branch);
-                (
-                    wt.path.clone(),
-                    pr_status::pr_pass(state, pr_open, pr_draft, pr_merged, pr_closed),
-                )
-            })
-            .collect();
+        // Skipped outright while the PR dimension is inert: `worktree_pr_passes`
+        // would not read the map, and building it costs a path clone per
+        // worktree on a call that runs whenever the panel is filtering at all.
+        let pr_matches: HashMap<PathBuf, bool> = if any_pr {
+            self.projects
+                .iter()
+                .flat_map(|p| p.worktrees.iter())
+                .map(|wt| {
+                    let branch = pr_status::effective_branch(wt, current_workspace, live_branch);
+                    let state = self.pr_cache.state(&wt.path, branch);
+                    (
+                        wt.path.clone(),
+                        pr_status::pr_pass(state, pr_open, pr_draft, pr_merged, pr_closed),
+                    )
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
 
         let toggles_pass = |key: &WorkspaceKey| {
             project_toggles_pass(
@@ -1993,7 +2002,7 @@ impl AlacritreeApp {
                 toggles_apply: self.project_filter.toggles_apply(self.search_scope),
                 pr_generation: pr_generation_for(
                     self.pr_cache.generation(),
-                    any_pr_toggle_active(&self.project_filter),
+                    any_pr_toggle_active(&self.project_filter, self.search_scope),
                 ),
                 active_workspace,
                 active_branch,
@@ -2043,7 +2052,7 @@ impl AlacritreeApp {
                         toggles_apply: self.project_filter.toggles_apply(self.search_scope),
                         pr_generation: pr_generation_for(
                             self.pr_cache.generation(),
-                            any_pr_toggle_active(&self.project_filter),
+                            any_pr_toggle_active(&self.project_filter, self.search_scope),
                         ),
                         active_workspace,
                         active_branch,
@@ -3169,7 +3178,7 @@ impl AlacritreeApp {
         // Polled up front: the panel closure borrows `projects` mutably, so the
         // cache cannot be polled from inside it.
         let pr_enabled = self.config.ui.pr_status;
-        let any_pr_toggle = any_pr_toggle_active(&self.project_filter);
+        let any_pr_toggle = any_pr_toggle_active(&self.project_filter, self.search_scope);
         let current_workspace = self.current_workspace.as_deref();
         let live_branch = current_workspace
             .and_then(|p| self.git_status.get(p))
@@ -9489,11 +9498,28 @@ mod tests {
     #[test]
     fn any_pr_toggle_active_ignores_the_non_pr_identities() {
         let mut f = PanelFilter::new(project_filter_toggles(true));
-        assert!(!any_pr_toggle_active(&f));
+        assert!(!any_pr_toggle_active(&f, SearchScope::Filtered));
         f.toggle('s');
-        assert!(!any_pr_toggle_active(&f), "a session toggle is not a PR toggle");
+        assert!(
+            !any_pr_toggle_active(&f, SearchScope::Filtered),
+            "a session toggle is not a PR toggle"
+        );
         f.toggle('o');
-        assert!(any_pr_toggle_active(&f));
+        assert!(any_pr_toggle_active(&f, SearchScope::Filtered));
+    }
+
+    /// A search under `All` stands the toggles down for row selection, so the
+    /// PR dimension narrows nothing — polling collapsed projects for it and
+    /// rebuilding on every banked result would both be pure cost.
+    #[test]
+    fn a_stood_down_pr_toggle_does_not_read_as_active() {
+        let mut f = PanelFilter::new(project_filter_toggles(true));
+        f.toggle('o');
+        f.on_text("/");
+        f.on_text("a");
+
+        assert!(any_pr_toggle_active(&f, SearchScope::Filtered));
+        assert!(!any_pr_toggle_active(&f, SearchScope::All));
     }
 
     /// The reconciler must not churn for users who never touch a PR filter:
