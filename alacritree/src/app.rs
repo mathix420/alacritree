@@ -325,6 +325,36 @@ fn project_filter_toggles(pr_status: bool) -> &'static [char] {
     if pr_status { &['s', 'a', 'o', 'd', 'm', 'c'] } else { &['s', 'a'] }
 }
 
+/// The toggle identities the git panel accepts: modified, deleted, untracked.
+const GIT_FILTER_TOGGLES: &[char] = &['m', 'd', 'u'];
+
+/// The projects-panel toggle a named action flips, or `None` for an action that
+/// is not one of its filters.  `PanelFilter::toggle` ignores an identity it does
+/// not allow and dispatch falls through on an unmatched action, so nothing at
+/// the call site can catch a wrong pairing — assert it here instead.
+fn project_filter_identity(action: NamedAction) -> Option<char> {
+    match action {
+        NamedAction::ToggleSessionsFilter => Some('s'),
+        NamedAction::ToggleAttentionFilter => Some('a'),
+        NamedAction::TogglePrOpenFilter => Some('o'),
+        NamedAction::TogglePrDraftFilter => Some('d'),
+        NamedAction::TogglePrMergedFilter => Some('m'),
+        NamedAction::TogglePrClosedFilter => Some('c'),
+        _ => None,
+    }
+}
+
+/// The git-panel toggle a named action flips, or `None` for an action that is
+/// not one of its filters.
+fn git_filter_identity(action: NamedAction) -> Option<char> {
+    match action {
+        NamedAction::ToggleModifiedFilter => Some('m'),
+        NamedAction::ToggleDeletedFilter => Some('d'),
+        NamedAction::ToggleUntrackedFilter => Some('u'),
+        _ => None,
+    }
+}
+
 /// Whether any toggle dimension narrows the projects panel this frame —
 /// session presence, attention, or PR state. `project_self` falls back to
 /// plain fuzzy matching only when this is false.
@@ -767,7 +797,7 @@ impl AlacritreeApp {
             sidebar_auto_shown: false,
             sidebar_cursor_moved: false,
             project_filter: PanelFilter::new(project_filter_toggles(config.ui.pr_status)),
-            git_filter: PanelFilter::new(&['m', 'd', 'u']),
+            git_filter: PanelFilter::new(GIT_FILTER_TOGGLES),
             search_scope: config.ui.search_scope,
             git_cursor: None,
             git_cursor_moved: false,
@@ -2623,38 +2653,8 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::SidebarSearchCancelToTerminal) => {
                 self.sidebar_search_cancel_to_terminal();
             },
-            BindingAction::Named(NamedAction::ToggleSessionsFilter) => {
-                self.project_filter.toggle('s');
-            },
-            BindingAction::Named(NamedAction::ToggleAttentionFilter) => {
-                self.project_filter.toggle('a');
-            },
-            BindingAction::Named(NamedAction::TogglePrOpenFilter) => {
-                self.project_filter.toggle('o');
-            },
-            BindingAction::Named(NamedAction::TogglePrDraftFilter) => {
-                self.project_filter.toggle('d');
-            },
-            BindingAction::Named(NamedAction::TogglePrMergedFilter) => {
-                self.project_filter.toggle('m');
-            },
-            BindingAction::Named(NamedAction::TogglePrClosedFilter) => {
-                self.project_filter.toggle('c');
-            },
             BindingAction::Named(NamedAction::ClearProjectFilters) => {
                 self.project_filter.clear_toggles();
-            },
-            BindingAction::Named(NamedAction::ToggleModifiedFilter) => {
-                self.git_filter.toggle('m');
-                self.after_git_filter_changed();
-            },
-            BindingAction::Named(NamedAction::ToggleDeletedFilter) => {
-                self.git_filter.toggle('d');
-                self.after_git_filter_changed();
-            },
-            BindingAction::Named(NamedAction::ToggleUntrackedFilter) => {
-                self.git_filter.toggle('u');
-                self.after_git_filter_changed();
             },
             BindingAction::Named(NamedAction::ClearGitFilters) => {
                 self.git_filter.clear_toggles();
@@ -2674,7 +2674,14 @@ impl AlacritreeApp {
                 ctx.request_repaint();
             },
             BindingAction::Named(other) => {
-                self.dispatch_scroll_or_other(other);
+                if let Some(key) = project_filter_identity(other) {
+                    self.project_filter.toggle(key);
+                } else if let Some(key) = git_filter_identity(other) {
+                    self.git_filter.toggle(key);
+                    self.after_git_filter_changed();
+                } else {
+                    self.dispatch_scroll_or_other(other);
+                }
             },
             BindingAction::Unsupported(name) => {
                 log::debug!("unsupported keyboard binding action: {name}");
@@ -9404,6 +9411,61 @@ mod tests {
             snapshot.is_projected(below),
             "a row below the one being deleted must still be navigable"
         );
+    }
+
+    /// Dispatch cannot catch a wrong pairing: `toggle` drops an identity the
+    /// panel does not allow, and an action with no arm falls through to the
+    /// scroll handler.  Swapping two identities here is otherwise invisible.
+    #[test]
+    fn the_projects_filter_actions_map_to_their_identities() {
+        for (action, identity) in [
+            (NamedAction::ToggleSessionsFilter, Some('s')),
+            (NamedAction::ToggleAttentionFilter, Some('a')),
+            (NamedAction::TogglePrOpenFilter, Some('o')),
+            (NamedAction::TogglePrDraftFilter, Some('d')),
+            (NamedAction::TogglePrMergedFilter, Some('m')),
+            (NamedAction::TogglePrClosedFilter, Some('c')),
+            (NamedAction::ClearProjectFilters, None),
+            (NamedAction::ToggleModifiedFilter, None),
+            (NamedAction::ToggleDeletedFilter, None),
+            (NamedAction::ToggleUntrackedFilter, None),
+            (NamedAction::ToggleSearchScope, None),
+            (NamedAction::RefreshPrStatus, None),
+            (NamedAction::Paste, None),
+        ] {
+            assert_eq!(project_filter_identity(action), identity, "{action:?}");
+            if let Some(key) = identity {
+                assert!(
+                    project_filter_toggles(true).contains(&key),
+                    "{action:?} maps to {key}, which the panel would drop"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_git_filter_actions_map_to_their_identities() {
+        for (action, identity) in [
+            (NamedAction::ToggleModifiedFilter, Some('m')),
+            (NamedAction::ToggleDeletedFilter, Some('d')),
+            (NamedAction::ToggleUntrackedFilter, Some('u')),
+            (NamedAction::ClearGitFilters, None),
+            (NamedAction::ToggleSessionsFilter, None),
+            (NamedAction::ToggleAttentionFilter, None),
+            (NamedAction::TogglePrOpenFilter, None),
+            (NamedAction::TogglePrDraftFilter, None),
+            (NamedAction::TogglePrMergedFilter, None),
+            (NamedAction::TogglePrClosedFilter, None),
+            (NamedAction::Paste, None),
+        ] {
+            assert_eq!(git_filter_identity(action), identity, "{action:?}");
+            if let Some(key) = identity {
+                assert!(
+                    GIT_FILTER_TOGGLES.contains(&key),
+                    "{action:?} maps to {key}, which the panel would drop"
+                );
+            }
+        }
     }
 
     #[test]
