@@ -688,8 +688,9 @@ pub struct UiTheme {
     /// lookup: no `gh`, no auth, or no PR silently paints nothing.
     pub pr_status: bool,
     /// `[ui] pr_status_concurrency`: max `gh` lookups in flight at once.
-    /// `0` (default) is unlimited, which is how many a cold cache already
-    /// forks in one frame — one per eligible worktree.
+    /// Defaults to 8; clamped to ≥ 1, since a cold cache spawns one lookup
+    /// per eligible worktree in a single frame and an unbounded cap would
+    /// fork a thread and a `gh` process for every one of them at once.
     pub pr_status_concurrency: usize,
     pub icons: Icons,
     pub focus_outline: FocusOutline,
@@ -738,7 +739,7 @@ impl Default for UiTheme {
             search_scope: SearchScope::default(),
             session_display: SessionDisplay::default(),
             pr_status: false,
-            pr_status_concurrency: 0,
+            pr_status_concurrency: 8,
             icons: Icons::default(),
             focus_outline: FocusOutline::default(),
             scrollbar: ScrollbarStyle::Floating,
@@ -1418,7 +1419,7 @@ struct RawUi {
     /// Sidebar scrollbar style: "floating" (default) | "solid".
     scrollbar: Option<String>,
     pr_status: Option<bool>,
-    /// Max `gh` lookups in flight at once.  `0` (default) is unlimited.
+    /// Max `gh` lookups in flight at once.  Defaults to 8; clamped to ≥ 1.
     pr_status_concurrency: Option<usize>,
     font: RawUiFont,
     worktree_name: Option<String>,
@@ -1589,7 +1590,7 @@ impl RawConfig {
                 tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
             },
             pr_status: self.ui.pr_status.unwrap_or(false),
-            pr_status_concurrency: self.ui.pr_status_concurrency.unwrap_or(0),
+            pr_status_concurrency: self.ui.pr_status_concurrency.unwrap_or(8).max(1),
             icons: build_icons(self.ui.icons),
             focus_outline: FocusOutline {
                 sidebar: self.ui.focus_outline.sidebar.unwrap_or(false),
@@ -2404,9 +2405,14 @@ program = "second"
     }
 
     #[test]
-    fn pr_status_concurrency_defaults_to_unlimited() {
-        assert_eq!(ui_from_toml("").pr_status_concurrency, 0);
+    fn pr_status_concurrency_defaults_to_eight() {
+        assert_eq!(ui_from_toml("").pr_status_concurrency, 8);
         assert_eq!(ui_from_toml("[ui]\npr_status_concurrency = 4").pr_status_concurrency, 4);
+    }
+
+    #[test]
+    fn pr_status_concurrency_clamps_to_one() {
+        assert_eq!(ui_from_toml("[ui]\npr_status_concurrency = 0").pr_status_concurrency, 1);
     }
 
     #[test]

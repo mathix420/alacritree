@@ -134,8 +134,8 @@ impl PrCache {
         self.generation
     }
 
-    /// `0` means unlimited, which is how many `gh` processes a cold cache
-    /// already forks: one per eligible worktree, all in one frame.
+    /// The cap on lookups in flight at once. A cold cache is otherwise ready
+    /// to fork one `gh` process per eligible worktree in a single frame.
     pub fn set_concurrency(&mut self, cap: usize) {
         self.concurrency = cap;
     }
@@ -221,9 +221,9 @@ impl PrCache {
     }
 }
 
-/// Whether another lookup may start.  `0` is unlimited.
+/// Whether another lookup may start.
 fn may_spawn(concurrency: usize, in_flight: usize) -> bool {
-    concurrency == 0 || in_flight < concurrency
+    in_flight < concurrency
 }
 
 /// Whether this entry is due for a lookup, ignoring the concurrency cap.
@@ -1023,9 +1023,8 @@ mod tests {
     }
 
     #[test]
-    fn the_cap_admits_until_it_is_reached_and_zero_never_blocks() {
-        assert!(may_spawn(0, 0));
-        assert!(may_spawn(0, 99), "0 is unlimited");
+    fn the_cap_admits_until_it_is_reached() {
+        assert!(!may_spawn(0, 0), "a zero cap never admits a lookup");
         assert!(may_spawn(2, 0));
         assert!(may_spawn(2, 1));
         assert!(!may_spawn(2, 2));

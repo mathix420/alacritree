@@ -337,8 +337,8 @@ last_session_close = "respawn"   # closing the on-screen workspace's last
 pr_status          = false  # poll `gh` for each branch's open PR, which drives
                             # the PR row icons, the PR-state filters, and $pr
                             # below (default false)
-pr_status_concurrency = 0   # cap concurrent `gh` PR lookups; 0 (default) is
-                            # unlimited
+pr_status_concurrency = 8   # cap concurrent `gh` PR lookups; default 8,
+                            # clamped to a minimum of 1
 delta_path         = "delta"     # explicit delta binary for the diff pane;
                                  # unset discovers it on PATH
 worktree_name      = "$name ${pr: }"  # template for worktree row labels:
