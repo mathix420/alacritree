@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/mathix420/alacritree/compare/v0.8.0...v0.8.1) (2026-08-03)
+
+
+### Bug Fixes
+
+* **mcp:** find socket without XDG_RUNTIME_DIR ([#169](https://github.com/mathix420/alacritree/issues/169)) ([1abb0f6](https://github.com/mathix420/alacritree/commit/1abb0f65cb5c6604cead163e2c8fd1c7e1063259))
+
 ## [0.8.0](https://github.com/mathix420/alacritree/compare/v0.7.1...v0.8.0) (2026-07-28)
 
 
