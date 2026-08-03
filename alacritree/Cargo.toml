@@ -65,6 +65,9 @@ nucleo-matcher = "0.3"
 tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
+# Linux socket discovery uses the effective uid when a GUI launcher omits
+# XDG_RUNTIME_DIR. macOS uses libc for foreground-agent detection.
+libc = "0.2"
 # Used for font matching: matches what alacritty does via crossfont so that
 # fontconfig <alias> rules and weight/slant substitution behave identically
 # in both terminals.  Pinned to 0.8 because that's the latest line that links
@@ -105,10 +108,6 @@ tauri-winrt-notification = "0.7"
 # Cargo unions target features, so this enables dlopen only on macOS, leaving the
 # `cfg(unix)` fontconfig dep above to link normally on Linux.
 fontconfig = { version = "0.8", features = ["dlopen"] }
-# Foreground-agent detection: `proc_pidinfo` supplies the process group,
-# foreground group, and command name Linux reads from /proc, and
-# `sysctl(KERN_PROCARGS2)` the command line.
-libc = "0.2"
 # UserNotifications framework, used instead of notify-rust because its
 # NSUserNotification backend is defunct on modern macOS: delivery silently
 # fails for unbundled processes and clicks are never surfaced.  Requires

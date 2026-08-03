@@ -500,10 +500,31 @@ fn socket_path() -> PathBuf {
 /// `socket_dir` (which also falls back to tmp on macOS).
 #[cfg(unix)]
 pub fn socket_dir() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(|dir| PathBuf::from(dir).join("alacritree"))
+    runtime_dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref())
+        .map(|dir| dir.join("alacritree"))
         .and_then(|path| std::fs::create_dir_all(&path).ok().map(|_| path))
         .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Resolve the runtime directory even when a GUI launcher strips the XDG
+/// environment. Linux defines the default as `/run/user/$UID`; using the
+/// effective uid keeps a desktop-launched MCP bridge in the same socket
+/// directory as an alacritree window launched from a shell.
+#[cfg(unix)]
+fn runtime_dir(xdg_runtime_dir: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    xdg_runtime_dir.filter(|dir| !dir.is_empty()).map(PathBuf::from).or_else(platform_runtime_dir)
+}
+
+#[cfg(target_os = "linux")]
+fn platform_runtime_dir() -> Option<PathBuf> {
+    // SAFETY: `geteuid` takes no arguments and has no safety preconditions.
+    let uid = unsafe { libc::geteuid() };
+    Some(PathBuf::from("/run/user").join(uid.to_string()))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn platform_runtime_dir() -> Option<PathBuf> {
+    None
 }
 
 /// The named-pipe filesystem, which is also a directory: listing it is how a
@@ -527,6 +548,16 @@ mod tests {
     use super::*;
 
     use crate::session::SESSION_ID_ENV;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn socket_discovery_survives_a_missing_xdg_runtime_dir() {
+        // A GUI-launched MCP client does not necessarily forward
+        // XDG_RUNTIME_DIR to stdio servers. Both processes must still derive
+        // the conventional per-user directory.
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(runtime_dir(None), Some(PathBuf::from(format!("/run/user/{uid}"))));
+    }
 
     #[test]
     fn wslenv_gains_the_socket_exactly_once() {
