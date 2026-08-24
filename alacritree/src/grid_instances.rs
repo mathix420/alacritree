@@ -229,10 +229,15 @@ impl GridInstances {
 
     /// Write every run in `runs` into the rows it covers, clearing those rows
     /// first.  `runs` must be confined to `rows_touched`.
-    pub fn write_rows(
+    ///
+    /// Runs arrive as an iterator rather than a slice because the caller's come
+    /// out of a `flat_map`, whose `size_hint` floors at zero: collecting them
+    /// grows a vector by doubling, which on a full-screen redraw of a colour
+    /// per cell allocates megabytes per frame for a sequence read once.
+    pub fn write_rows<'a>(
         &mut self,
         rows_touched: impl IntoIterator<Item = usize>,
-        runs: &[RunView<'_>],
+        runs: impl IntoIterator<Item = RunView<'a>>,
         default_bg: Color32,
         mut slot_for: impl FnMut(char, Face) -> u16,
     ) {
@@ -275,6 +280,7 @@ impl GridInstances {
 
 /// What `write_rows` needs from a snapshot run, without borrowing the snapshot
 /// itself — the caller resolves the text slice and the face once.
+#[derive(Clone, Copy)]
 pub struct RunView<'a> {
     pub text: &'a str,
     pub start_col: usize,
@@ -439,7 +445,7 @@ mod tests {
             bg: Color32::BLACK,
         }];
 
-        grid.write_rows([2], &runs, Color32::BLACK, |_, _| 7);
+        grid.write_rows([2], runs, Color32::BLACK, |_, _| 7);
 
         assert_eq!(grid.glyphs[8].slot, 7);
         assert_eq!(grid.glyphs[9].slot, 7);
@@ -462,9 +468,9 @@ mod tests {
                 bg: Color32::BLACK,
             }]
         };
-        grid.write_rows([0], &row0("abcd"), Color32::BLACK, |_, _| 7);
+        grid.write_rows([0], row0("abcd"), Color32::BLACK, |_, _| 7);
 
-        grid.write_rows([0], &row0("ab"), Color32::BLACK, |_, _| 7);
+        grid.write_rows([0], row0("ab"), Color32::BLACK, |_, _| 7);
 
         assert_eq!(grid.glyphs[2].slot, BLANK_SLOT, "the tail of the old run survived");
     }
@@ -485,7 +491,7 @@ mod tests {
             bg: Color32::RED,
         }];
 
-        grid.write_rows([0], &runs, Color32::BLACK, |_, _| 1);
+        grid.write_rows([0], runs, Color32::BLACK, |_, _| 1);
 
         assert_eq!(grid.glyphs[1].bg, Color32::RED.to_array());
         assert_eq!(grid.glyphs[2].bg, Color32::RED.to_array());

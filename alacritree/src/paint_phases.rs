@@ -45,8 +45,6 @@ mod recording {
     pub enum Phase {
         /// Walking the damaged rows and splitting them into styled runs.
         Capture,
-        /// Materialising the run vector the record writer reads.
-        Collect,
         /// Clearing and rewriting the damaged rows' cell records.
         WriteRows,
         /// Re-emitting underlines and strikeouts as egui shapes.
@@ -54,13 +52,11 @@ mod recording {
     }
 
     impl Phase {
-        pub const ALL: [Phase; 4] =
-            [Phase::Capture, Phase::Collect, Phase::WriteRows, Phase::Decorations];
+        pub const ALL: [Phase; 3] = [Phase::Capture, Phase::WriteRows, Phase::Decorations];
 
         pub fn name(self) -> &'static str {
             match self {
                 Phase::Capture => "capture",
-                Phase::Collect => "collect",
                 Phase::WriteRows => "write",
                 Phase::Decorations => "decor",
             }
