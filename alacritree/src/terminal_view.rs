@@ -1248,14 +1248,12 @@ fn paint_grid_gpu(
             flags: 0,
             fg: run.fg,
             bg: run.bg,
-            selected: run.selected,
         })
         .collect();
 
     {
         let mut state = gpu.state.lock().expect("grid state");
         state.instances.resize(cols, rows, default_bg);
-        state.instances.clear_backgrounds();
         state.frame = GridFrame {
             // egui sets the GL viewport to the callback's rect, so the grid
             // starts at its own corner rather than the window's.
@@ -1264,6 +1262,7 @@ fn paint_grid_gpu(
             grid: [cols as u32, rows as u32],
             atlas: [atlas[0] as f32, atlas[1] as f32],
             line_thickness: 1.0,
+            default_bg: default_bg.to_array().map(|c| c as f32 / 255.0),
         };
         let (instances, table) = state.buffers();
         instances.write_rows(dirty.clone(), &runs, default_bg, |ch, face| {
@@ -2934,7 +2933,6 @@ mod tests {
                         | u16::from(r.flags.contains(Flags::STRIKEOUT)) * cell_flags::STRIKEOUT,
                     fg: r.fg,
                     bg: r.bg,
-                    selected: r.selected,
                 })
                 .collect()
         }
@@ -2963,12 +2961,11 @@ mod tests {
         println!(
             "  reading one row costs {} B of grid, writing it {} B of records",
             cols * size_of::<Cell>(),
-            cols * (size_of::<crate::grid_instances::GlyphInstance>() + size_of::<u32>()),
+            cols * size_of::<crate::grid_instances::GlyphInstance>(),
         );
         for damaged in [rows, rows / 2, 8, 3, 1] {
             let touched = views(&snapshot, &|row| row < damaged);
             let build = time(iterations, || {
-                grid.clear_backgrounds();
                 grid.write_rows(0..damaged, &touched, default_bg, |ch, face| {
                     table.slot(ch, face, size, || caches.glyphs.get(&ctx, ch, face, size))
                 });
@@ -3001,6 +2998,136 @@ mod tests {
             std::hint::black_box(snapshot.runs().count());
         });
         println!("  capture the grid under the lock      : {capture:?}");
+    }
+
+    /// Not a gate — run it by hand:
+    /// `cargo test -p alacritree --release -- --ignored --nocapture report_record_shapes`
+    ///
+    /// Three ways to lay out a cell's record.  Twelve bytes does not divide a
+    /// cache line, so a row's records straddle lines arbitrarily; sixteen puts
+    /// exactly four per line and starts every row on one.  The padding is only
+    /// worth its extra bytes if it carries something, so the third shape moves
+    /// the background colour out of its own buffer and into the record.
+    #[test]
+    #[ignore = "timing harness, not an assertion"]
+    fn report_record_shapes() {
+        #[cfg(windows)]
+        crate::harden_dll_search_path();
+
+        #[derive(Clone, Copy, Default)]
+        #[repr(C)]
+        struct Narrow {
+            cell: [u16; 2],
+            slot: u16,
+            flags: u16,
+            fg: [u8; 4],
+        }
+
+        #[derive(Clone, Copy, Default)]
+        #[repr(C)]
+        struct Padded {
+            cell: [u16; 2],
+            slot: u16,
+            flags: u16,
+            fg: [u8; 4],
+            _pad: u32,
+        }
+
+        #[derive(Clone, Copy, Default)]
+        #[repr(C)]
+        struct WithBackground {
+            cell: [u16; 2],
+            slot: u16,
+            flags: u16,
+            fg: [u8; 4],
+            bg: [u8; 4],
+        }
+
+        let config = Config::default();
+        let screen = Vec2::new(2560.0, 1440.0);
+        let ctx = egui::Context::default();
+        let (mut session, _dir) = headless_session(&ctx, &config);
+        let mut caches = Caches::new();
+        paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
+        let (cols, rows) = (session.size.columns, session.size.screen_lines);
+        {
+            let mut term = session.term.lock();
+            term.resize(TermSize::new(cols, rows));
+            Processor::<StdSyncHandler>::new().advance(&mut *term, &dense_screen(cols, rows));
+        }
+        for _ in 0..10 {
+            paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
+        }
+        let mut snapshot = GridSnapshot::new();
+        {
+            let mut term = session.term.lock();
+            snapshot.capture(&mut term, &config, 0, None, false);
+        }
+
+        // Every cell the frame writes, as (row, column, foreground, background).
+        let mut cells: Vec<(usize, usize, [u8; 4], [u8; 4])> = Vec::new();
+        for (text, run) in snapshot.runs() {
+            for (offset, _) in text.chars().enumerate() {
+                let col = run.start_col + offset;
+                if col < cols {
+                    cells.push((run.row as usize, col, run.fg.to_array(), run.bg.to_array()));
+                }
+            }
+        }
+
+        let iterations = 60u32;
+        fn time(iterations: u32, mut body: impl FnMut()) -> std::time::Duration {
+            for _ in 0..5 {
+                body();
+            }
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                body();
+            }
+            start.elapsed() / iterations
+        }
+
+        let mut twelve = vec![Narrow::default(); cols * rows];
+        let mut padded = vec![Padded::default(); cols * rows];
+        let mut merged = vec![WithBackground::default(); cols * rows];
+        let mut background = vec![0u32; cols * rows];
+
+        let narrow = time(iterations, || {
+            for &(row, col, fg, bg) in &cells {
+                twelve[row * cols + col] =
+                    Narrow { cell: [col as u16, row as u16], slot: 1, flags: 0, fg };
+                background[row * cols + col] = u32::from_le_bytes(bg);
+            }
+            std::hint::black_box((&twelve, &background));
+        });
+        let wide = time(iterations, || {
+            for &(row, col, fg, bg) in &cells {
+                padded[row * cols + col] =
+                    Padded { cell: [col as u16, row as u16], slot: 1, flags: 0, fg, _pad: 0 };
+                background[row * cols + col] = u32::from_le_bytes(bg);
+            }
+            std::hint::black_box((&padded, &background));
+        });
+        let one = time(iterations, || {
+            for &(row, col, fg, bg) in &cells {
+                merged[row * cols + col] =
+                    WithBackground { cell: [col as u16, row as u16], slot: 1, flags: 0, fg, bg };
+            }
+            std::hint::black_box(&merged);
+        });
+
+        println!("{cols}x{rows} cells, {} written", cells.len());
+        for (name, taken, bytes) in [
+            ("12 B record + 4 B background", narrow, 16),
+            ("16 B padded + 4 B background", wide, 20),
+            ("16 B record carrying the bg ", one, 16),
+        ] {
+            println!(
+                "  {name}: {taken:?}, {} KiB per screen, {:.2} ns/cell",
+                cells.len() * bytes / 1024,
+                taken.as_nanos() as f64 / cells.len() as f64,
+            );
+        }
     }
 
     /// Not a gate — run it by hand:

@@ -1,8 +1,8 @@
 //! Per-cell instance records for the GPU grid path.
 //!
 //! The mesh path writes four 20-byte vertices per cell, and almost all of that
-//! is position arithmetic a vertex shader does for free.  One 12-byte record
-//! per cell carries the same information, so the CPU writes a sixth of the
+//! is position arithmetic a vertex shader does for free.  One 16-byte record
+//! per cell carries the same information, so the CPU writes a fifth of the
 //! bytes and no geometry at all.
 //!
 //! Records are laid out at a fixed `cols` stride with a blank slot for empty
@@ -44,27 +44,24 @@ pub mod cell_flags {
     pub const STRIKEOUT: u16 = 1 << 1;
 }
 
-/// One cell's glyph. Twelve bytes against the mesh path's eighty.
+/// One cell, glyph and background together. Twelve bytes against the mesh
+/// path's eighty.
+///
+/// It carries no coordinates: records sit at a fixed row stride, so the cell a
+/// record belongs to is its own index, which the vertex shader reads from
+/// `gl_InstanceID`.  That also leaves every blank cell holding the same twelve
+/// bytes as every other, which is what lets a row be cleared with a fill.
+///
+/// The background lives here rather than in a buffer of its own, so a frame is
+/// one upload rather than two and a cell's colours share a cache line.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[repr(C)]
 pub struct GlyphInstance {
-    /// Column and row, which the vertex shader turns into a position.
-    pub cell: [u16; 2],
     pub slot: u16,
     pub flags: u16,
     /// Premultiplied sRGB, the same convention epaint's vertices use.
     pub fg: [u8; 4],
-}
-
-/// One run's background, for the variant that draws backgrounds as quads
-/// rather than by indexing a per-cell buffer.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-#[repr(C)]
-pub struct BackgroundInstance {
-    pub cell: [u16; 2],
-    pub span: u16,
-    pub _pad: u16,
-    pub color: [u8; 4],
+    pub bg: [u8; 4],
 }
 
 /// The four corners of a single-character galley, as the atlas holds them.
@@ -195,12 +192,6 @@ impl GlyphTable {
 #[derive(Default)]
 pub struct GridInstances {
     pub glyphs: Vec<GlyphInstance>,
-    /// One premultiplied sRGB colour per cell, for the variant that draws the
-    /// background layer as a single triangle indexing this buffer.
-    pub bg_cells: Vec<u32>,
-    /// One quad per non-default run, for the variant that draws backgrounds as
-    /// geometry.  Cheaper on a screen that mostly keeps the default colour.
-    pub bg_runs: Vec<BackgroundInstance>,
     cols: usize,
     rows: usize,
 }
@@ -224,20 +215,16 @@ impl GridInstances {
         self.rows = rows;
         self.glyphs.clear();
         self.glyphs.resize(cols * rows, GlyphInstance::default());
-        self.bg_cells.clear();
-        self.bg_cells.resize(cols * rows, pack(default_bg));
+        for row in 0..rows {
+            self.clear_row(row, default_bg.to_array());
+        }
     }
 
     /// Clear `row` back to blank cells and the default background, ready for
     /// the runs that cover it to write over.
-    fn clear_row(&mut self, row: usize, default_bg: u32) {
-        let span = row * self.cols..(row + 1) * self.cols;
-        for cell in &mut self.glyphs[span.clone()] {
-            *cell = GlyphInstance::default();
-        }
-        for cell in &mut self.bg_cells[span] {
-            *cell = default_bg;
-        }
+    fn clear_row(&mut self, row: usize, default_bg: [u8; 4]) {
+        let blank = GlyphInstance { slot: BLANK_SLOT, flags: 0, fg: [0; 4], bg: default_bg };
+        self.glyphs[row * self.cols..(row + 1) * self.cols].fill(blank);
     }
 
     /// Write every run in `runs` into the rows it covers, clearing those rows
@@ -249,10 +236,10 @@ impl GridInstances {
         default_bg: Color32,
         mut slot_for: impl FnMut(char, Face) -> u16,
     ) {
-        let packed_bg = pack(default_bg);
+        let blank = default_bg.to_array();
         for row in rows_touched {
             if row < self.rows {
-                self.clear_row(row, packed_bg);
+                self.clear_row(row, blank);
             }
         }
         for run in runs {
@@ -261,38 +248,28 @@ impl GridInstances {
             }
             let base = run.row * self.cols;
             let fg = run.fg.to_array();
+            let bg = run.bg.to_array();
+            // A blank on the default background is exactly what `clear_row`
+            // already left behind, so its whole record can be skipped.
+            let keeps_background = bg == blank;
             let mut col = run.start_col;
-            if run.bg != default_bg || run.selected {
-                let span = run.text.chars().count().min(self.cols - col);
-                self.bg_runs.push(BackgroundInstance {
-                    cell: [col as u16, run.row as u16],
-                    span: span as u16,
-                    _pad: 0,
-                    color: run.bg.to_array(),
-                });
-                for cell in &mut self.bg_cells[base + col..base + col + span] {
-                    *cell = pack(run.bg);
-                }
-            }
             for ch in run.text.chars() {
                 if col >= self.cols {
                     break;
                 }
-                if ch != ' ' {
-                    self.glyphs[base + col] = GlyphInstance {
-                        cell: [col as u16, run.row as u16],
-                        slot: slot_for(ch, run.face),
-                        flags: run.flags,
-                        fg,
-                    };
+                if ch == ' ' && keeps_background {
+                    col += 1;
+                    continue;
                 }
+                self.glyphs[base + col] = GlyphInstance {
+                    slot: if ch == ' ' { BLANK_SLOT } else { slot_for(ch, run.face) },
+                    flags: run.flags,
+                    fg,
+                    bg,
+                };
                 col += 1;
             }
         }
-    }
-
-    pub fn clear_backgrounds(&mut self) {
-        self.bg_runs.clear();
     }
 }
 
@@ -306,11 +283,6 @@ pub struct RunView<'a> {
     pub flags: u16,
     pub fg: Color32,
     pub bg: Color32,
-    pub selected: bool,
-}
-
-fn pack(c: Color32) -> u32 {
-    u32::from_le_bytes(c.to_array())
 }
 
 #[cfg(test)]
@@ -326,12 +298,11 @@ mod tests {
         ctx.fonts(|f| f.layout_job(job))
     }
 
-    /// The whole point of the instance record: a cell costs twelve bytes where
-    /// the mesh path spends four twenty-byte vertices on the same cell.
+    /// The whole point of the instance record: a cell costs twelve bytes
+    /// where the mesh path spends four twenty-byte vertices on the same cell.
     #[test]
     fn a_cell_costs_twelve_bytes() {
         assert_eq!(size_of::<GlyphInstance>(), 12);
-        assert_eq!(size_of::<GlyphInstance>() * 4, size_of::<GlyphSlot>() + 16);
     }
 
     /// Not a gate — run it by hand:
@@ -466,7 +437,6 @@ mod tests {
             flags: 0,
             fg: Color32::WHITE,
             bg: Color32::BLACK,
-            selected: false,
         }];
 
         grid.write_rows([2], &runs, Color32::BLACK, |_, _| 7);
@@ -490,7 +460,6 @@ mod tests {
                 flags: 0,
                 fg: Color32::WHITE,
                 bg: Color32::BLACK,
-                selected: false,
             }]
         };
         grid.write_rows([0], &row0("abcd"), Color32::BLACK, |_, _| 7);
@@ -500,31 +469,10 @@ mod tests {
         assert_eq!(grid.glyphs[2].slot, BLANK_SLOT, "the tail of the old run survived");
     }
 
-    /// A run keeping the terminal's own background emits no quad: the window
-    /// is already that colour, and a quad per run would put the grid's cell
-    /// count back into the geometry the instancing removed.
+    /// The background belongs to the cell's own record, so a coloured run
+    /// paints its own cells and leaves its neighbours on the default.
     #[test]
-    fn a_default_background_run_emits_no_quad() {
-        let mut grid = GridInstances::default();
-        grid.resize(4, 1, Color32::BLACK);
-        let runs = [RunView {
-            text: "ab",
-            start_col: 0,
-            row: 0,
-            face: Face::Normal,
-            flags: 0,
-            fg: Color32::WHITE,
-            bg: Color32::BLACK,
-            selected: false,
-        }];
-
-        grid.write_rows([0], &runs, Color32::BLACK, |_, _| 1);
-
-        assert!(grid.bg_runs.is_empty());
-    }
-
-    #[test]
-    fn a_coloured_run_emits_one_quad_and_fills_its_cells() {
+    fn a_coloured_run_fills_only_its_own_cells() {
         let mut grid = GridInstances::default();
         grid.resize(4, 1, Color32::BLACK);
         let runs = [RunView {
@@ -535,14 +483,12 @@ mod tests {
             flags: 0,
             fg: Color32::WHITE,
             bg: Color32::RED,
-            selected: false,
         }];
 
         grid.write_rows([0], &runs, Color32::BLACK, |_, _| 1);
 
-        assert_eq!(grid.bg_runs.len(), 1);
-        assert_eq!(grid.bg_runs[0].span, 2);
-        assert_eq!(grid.bg_cells[1], u32::from_le_bytes(Color32::RED.to_array()));
-        assert_eq!(grid.bg_cells[3], u32::from_le_bytes(Color32::BLACK.to_array()));
+        assert_eq!(grid.glyphs[1].bg, Color32::RED.to_array());
+        assert_eq!(grid.glyphs[2].bg, Color32::RED.to_array());
+        assert_eq!(grid.glyphs[3].bg, Color32::BLACK.to_array());
     }
 }
