@@ -1241,21 +1241,18 @@ fn paint_grid_gpu(
     // Only the rows this frame's capture rewrote need new records; the rest of
     // the buffer still holds what the GPU already has.
     let dirty = snapshot.dirty_rows();
-    let runs: Vec<RunView<'_>> = phase!(Collect, {
-        snapshot
-            .runs_in(dirty.clone())
-            .filter(|(_, run)| !run.flags.contains(Flags::HIDDEN))
-            .map(|(text, run)| RunView {
-                text,
-                start_col: run.start_col,
-                row: run.row as usize,
-                face: Face::new(run.flags.contains(Flags::BOLD), run.flags.contains(Flags::ITALIC)),
-                flags: 0,
-                fg: run.fg,
-                bg: run.bg,
-            })
-            .collect()
-    });
+    let runs = snapshot
+        .runs_in(dirty.clone())
+        .filter(|(_, run)| !run.flags.contains(Flags::HIDDEN))
+        .map(|(text, run)| RunView {
+            text,
+            start_col: run.start_col,
+            row: run.row as usize,
+            face: Face::new(run.flags.contains(Flags::BOLD), run.flags.contains(Flags::ITALIC)),
+            flags: 0,
+            fg: run.fg,
+            bg: run.bg,
+        });
 
     {
         let mut state = gpu.state.lock().expect("grid state");
@@ -1272,7 +1269,7 @@ fn paint_grid_gpu(
         };
         let (instances, table) = state.buffers();
         phase!(WriteRows, {
-            instances.write_rows(dirty.clone(), &runs, default_bg, |ch, face| {
+            instances.write_rows(dirty.clone(), runs, default_bg, |ch, face| {
                 table.slot(ch, face, size, || {
                     crate::paint_phases::record_glyph_miss();
                     glyphs.get(ctx, ch, face, size)
@@ -3220,7 +3217,7 @@ mod tests {
         // Warm the glyph table so the timed loop measures writing records, not
         // laying characters out for the first time.
         let all = views(&snapshot, &|_| true);
-        grid.write_rows(0..rows, &all, default_bg, |ch, face| {
+        grid.write_rows(0..rows, all, default_bg, |ch, face| {
             table.slot(ch, face, size, || caches.glyphs.get(&ctx, ch, face, size))
         });
         let slots = table.slots().len();
@@ -3234,7 +3231,7 @@ mod tests {
         for damaged in [rows, rows / 2, 8, 3, 1] {
             let touched = views(&snapshot, &|row| row < damaged);
             let build = time(iterations, || {
-                grid.write_rows(0..damaged, &touched, default_bg, |ch, face| {
+                grid.write_rows(0..damaged, touched.iter().copied(), default_bg, |ch, face| {
                     table.slot(ch, face, size, || caches.glyphs.get(&ctx, ch, face, size))
                 });
                 std::hint::black_box(grid.glyphs.len());
