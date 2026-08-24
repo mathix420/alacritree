@@ -1,0 +1,474 @@
+//! Per-cell instance records for the GPU grid path.
+//!
+//! The mesh path writes four 20-byte vertices per cell, and almost all of that
+//! is position arithmetic a vertex shader does for free.  One 12-byte record
+//! per cell carries the same information, so the CPU writes a sixth of the
+//! bytes and no geometry at all.
+//!
+//! Records are laid out at a fixed `cols` stride with a blank slot for empty
+//! cells, so row `r` always occupies `[r * cols, (r + 1) * cols)`.  That is
+//! what lets a frame rebuild and upload only the rows the terminal reported
+//! damaged instead of the whole grid.
+
+use std::collections::HashMap;
+
+use egui::{Color32, Galley};
+
+use crate::glyph_cache::Face;
+
+/// Slot 0 is reserved for a cell with nothing to draw.  Its size is zero, so
+/// the vertex shader collapses the quad and the rasterizer discards it.
+pub const BLANK_SLOT: u16 = 0;
+
+/// Where one character's artwork sits in egui's font atlas and where it is
+/// drawn relative to its cell.  Read off a galley epaint laid out, so the
+/// atlas stays epaint's and nothing here rasterizes a glyph.
+///
+/// Lives in the glyph table rather than in the per-cell record: a screen shows
+/// tens of thousands of cells drawn from a few hundred distinct characters.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+#[repr(C)]
+pub struct GlyphSlot {
+    /// Atlas rectangle in texels, as the galley's vertices carry it.
+    pub uv_min: [f32; 2],
+    pub uv_max: [f32; 2],
+    /// Offset from the cell's top-left corner, in points.
+    pub offset: [f32; 2],
+    /// Drawn size in points.
+    pub size: [f32; 2],
+}
+
+/// Decorations the fragment shader draws itself, so an underlined run costs no
+/// extra geometry.  The mesh path emits a `Shape::LineSegment` per run for
+/// these, which epaint tessellates as a feathered path.
+pub mod cell_flags {
+    pub const UNDERLINE: u16 = 1 << 0;
+    pub const STRIKEOUT: u16 = 1 << 1;
+}
+
+/// One cell's glyph. Twelve bytes against the mesh path's eighty.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[repr(C)]
+pub struct GlyphInstance {
+    /// Column and row, which the vertex shader turns into a position.
+    pub cell: [u16; 2],
+    pub slot: u16,
+    pub flags: u16,
+    /// Premultiplied sRGB, the same convention epaint's vertices use.
+    pub fg: [u8; 4],
+}
+
+/// One run's background, for the variant that draws backgrounds as quads
+/// rather than by indexing a per-cell buffer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[repr(C)]
+pub struct BackgroundInstance {
+    pub cell: [u16; 2],
+    pub span: u16,
+    pub _pad: u16,
+    pub color: [u8; 4],
+}
+
+/// The four corners of a single-character galley, as the atlas holds them.
+///
+/// egui lays a one-character galley out as exactly one quad; anything else
+/// (a character with no ink, a fallback that produced nothing) has no slot and
+/// draws as blank.
+pub fn slot_from_galley(galley: &Galley) -> Option<GlyphSlot> {
+    let row = galley.rows.first()?;
+    let v = &row.visuals.mesh.vertices;
+    if v.len() != 4 {
+        return None;
+    }
+    Some(GlyphSlot {
+        uv_min: [v[0].uv.x, v[0].uv.y],
+        uv_max: [v[3].uv.x, v[3].uv.y],
+        offset: [v[0].pos.x, v[0].pos.y],
+        size: [v[3].pos.x - v[0].pos.x, v[3].pos.y - v[0].pos.y],
+    })
+}
+
+/// Character-and-face to slot index, plus the slot table itself.
+///
+/// ASCII resolves through a flat array rather than a hash: a hashed
+/// `(char, Face)` key costs about 18 ns per cell where an array index costs
+/// half a nanosecond, and a terminal asks tens of thousands of times a frame.
+pub struct GlyphTable {
+    size: f32,
+    ascii: Vec<u16>,
+    rest: HashMap<(char, Face), u16>,
+    slots: Vec<GlyphSlot>,
+    /// Bumped whenever `slots` grows, so a renderer holding an uploaded copy
+    /// knows to send the new entries without diffing the table.
+    generation: u32,
+}
+
+const ASCII_SLOTS: usize = 128 * 4;
+const EMPTY: u16 = u16::MAX;
+
+impl Default for GlyphTable {
+    fn default() -> Self {
+        Self {
+            size: 0.0,
+            ascii: vec![EMPTY; ASCII_SLOTS],
+            rest: HashMap::new(),
+            // Slot 0 is the blank cell; it is never looked up by character.
+            slots: vec![GlyphSlot::default()],
+            generation: 0,
+        }
+    }
+}
+
+impl GlyphTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn slots(&self) -> &[GlyphSlot] {
+        &self.slots
+    }
+
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// Drop every slot when the atlas or the font size moves under us.  A slot
+    /// holds texel coordinates, so a repacked atlas leaves every one of them
+    /// pointing at whatever landed in its place.
+    pub fn clear(&mut self, size: f32) {
+        self.size = size;
+        self.ascii.clear();
+        self.ascii.resize(ASCII_SLOTS, EMPTY);
+        self.rest.clear();
+        self.slots.truncate(1);
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// The slot for `ch`, laying it out through `galley` only on a miss.
+    pub fn slot(
+        &mut self,
+        ch: char,
+        face: Face,
+        size: f32,
+        galley: impl FnOnce() -> std::sync::Arc<Galley>,
+    ) -> u16 {
+        if self.size != size {
+            self.clear(size);
+        }
+        let ascii = (ch as u32) < 128;
+        let idx = face as usize * 128 + ch as usize;
+        if ascii && self.ascii[idx] != EMPTY {
+            return self.ascii[idx];
+        }
+        if !ascii && let Some(&slot) = self.rest.get(&(ch, face)) {
+            return slot;
+        }
+
+        let slot = match slot_from_galley(&galley()) {
+            Some(s) if self.slots.len() < EMPTY as usize => {
+                self.slots.push(s);
+                self.generation = self.generation.wrapping_add(1);
+                (self.slots.len() - 1) as u16
+            },
+            _ => BLANK_SLOT,
+        };
+        if ascii {
+            self.ascii[idx] = slot;
+        } else {
+            self.rest.insert((ch, face), slot);
+        }
+        slot
+    }
+}
+
+/// A frame's instance buffers, reused across frames.
+///
+/// `glyphs` is `cols * rows` long at all times so a row's records never move,
+/// which is what makes a damage-driven partial upload possible.
+#[derive(Default)]
+pub struct GridInstances {
+    pub glyphs: Vec<GlyphInstance>,
+    /// One premultiplied sRGB colour per cell, for the variant that draws the
+    /// background layer as a single triangle indexing this buffer.
+    pub bg_cells: Vec<u32>,
+    /// One quad per non-default run, for the variant that draws backgrounds as
+    /// geometry.  Cheaper on a screen that mostly keeps the default colour.
+    pub bg_runs: Vec<BackgroundInstance>,
+    cols: usize,
+    rows: usize,
+}
+
+impl GridInstances {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn dimensions(&self) -> (usize, usize) {
+        (self.cols, self.rows)
+    }
+
+    /// Byte range covering `rows`, for a partial buffer upload.
+    pub fn row_bytes(&self, first: usize, count: usize) -> std::ops::Range<usize> {
+        let stride = self.cols * size_of::<GlyphInstance>();
+        first * stride..(first + count) * stride
+    }
+
+    pub fn resize(&mut self, cols: usize, rows: usize, default_bg: Color32) {
+        if (self.cols, self.rows) == (cols, rows) {
+            return;
+        }
+        self.cols = cols;
+        self.rows = rows;
+        self.glyphs.clear();
+        self.glyphs.resize(cols * rows, GlyphInstance::default());
+        self.bg_cells.clear();
+        self.bg_cells.resize(cols * rows, pack(default_bg));
+    }
+
+    /// Clear `row` back to blank cells and the default background, ready for
+    /// the runs that cover it to write over.
+    fn clear_row(&mut self, row: usize, default_bg: u32) {
+        let span = row * self.cols..(row + 1) * self.cols;
+        for cell in &mut self.glyphs[span.clone()] {
+            *cell = GlyphInstance::default();
+        }
+        for cell in &mut self.bg_cells[span] {
+            *cell = default_bg;
+        }
+    }
+
+    /// Write every run in `runs` into the rows it covers, clearing those rows
+    /// first.  `runs` must be confined to `rows_touched`.
+    pub fn write_rows(
+        &mut self,
+        rows_touched: impl IntoIterator<Item = usize>,
+        runs: &[RunView<'_>],
+        default_bg: Color32,
+        mut slot_for: impl FnMut(char, Face) -> u16,
+    ) {
+        let packed_bg = pack(default_bg);
+        for row in rows_touched {
+            if row < self.rows {
+                self.clear_row(row, packed_bg);
+            }
+        }
+        for run in runs {
+            if run.row >= self.rows {
+                continue;
+            }
+            let base = run.row * self.cols;
+            let fg = run.fg.to_array();
+            let mut col = run.start_col;
+            if run.bg != default_bg || run.selected {
+                let span = run.text.chars().count().min(self.cols - col);
+                self.bg_runs.push(BackgroundInstance {
+                    cell: [col as u16, run.row as u16],
+                    span: span as u16,
+                    _pad: 0,
+                    color: run.bg.to_array(),
+                });
+                for cell in &mut self.bg_cells[base + col..base + col + span] {
+                    *cell = pack(run.bg);
+                }
+            }
+            for ch in run.text.chars() {
+                if col >= self.cols {
+                    break;
+                }
+                if ch != ' ' {
+                    self.glyphs[base + col] = GlyphInstance {
+                        cell: [col as u16, run.row as u16],
+                        slot: slot_for(ch, run.face),
+                        flags: run.flags,
+                        fg,
+                    };
+                }
+                col += 1;
+            }
+        }
+    }
+
+    pub fn clear_backgrounds(&mut self) {
+        self.bg_runs.clear();
+    }
+}
+
+/// What `write_rows` needs from a snapshot run, without borrowing the snapshot
+/// itself — the caller resolves the text slice and the face once.
+pub struct RunView<'a> {
+    pub text: &'a str,
+    pub start_col: usize,
+    pub row: usize,
+    pub face: Face,
+    pub flags: u16,
+    pub fg: Color32,
+    pub bg: Color32,
+    pub selected: bool,
+}
+
+fn pack(c: Color32) -> u32 {
+    u32::from_le_bytes(c.to_array())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn galley(ctx: &egui::Context, ch: char) -> std::sync::Arc<Galley> {
+        let mut job = egui::text::LayoutJob::single_section(
+            ch.to_string(),
+            egui::TextFormat::simple(egui::FontId::monospace(14.0), Color32::PLACEHOLDER),
+        );
+        job.wrap.max_width = f32::INFINITY;
+        ctx.fonts(|f| f.layout_job(job))
+    }
+
+    /// The whole point of the instance record: a cell costs twelve bytes where
+    /// the mesh path spends four twenty-byte vertices on the same cell.
+    #[test]
+    fn a_cell_costs_twelve_bytes() {
+        assert_eq!(size_of::<GlyphInstance>(), 12);
+        assert_eq!(size_of::<GlyphInstance>() * 4, size_of::<GlyphSlot>() + 16);
+    }
+
+    #[test]
+    fn a_blank_cell_resolves_to_the_reserved_slot() {
+        let table = GlyphTable::new();
+        assert_eq!(table.slots()[BLANK_SLOT as usize].size, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn the_same_character_interns_once() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let mut table = GlyphTable::new();
+
+        let first = table.slot('a', Face::Normal, 14.0, || galley(&ctx, 'a'));
+        let before = table.generation();
+        let again = table.slot('a', Face::Normal, 14.0, || galley(&ctx, 'a'));
+
+        assert_eq!(first, again);
+        assert_eq!(table.generation(), before, "a hit must not grow the table");
+    }
+
+    #[test]
+    fn the_same_character_in_two_faces_takes_two_slots() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let mut table = GlyphTable::new();
+
+        let normal = table.slot('a', Face::Normal, 14.0, || galley(&ctx, 'a'));
+        let bold = table.slot('a', Face::Bold, 14.0, || galley(&ctx, 'a'));
+
+        assert_ne!(normal, bold);
+    }
+
+    /// A slot holds texel coordinates into whatever atlas was live when it was
+    /// read.  A font-size change relays out every glyph, so keeping the old
+    /// slots would paint from the wrong part of the atlas.
+    #[test]
+    fn a_font_size_change_drops_every_slot() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let mut table = GlyphTable::new();
+        table.slot('a', Face::Normal, 14.0, || galley(&ctx, 'a'));
+
+        table.slot('a', Face::Normal, 20.0, || galley(&ctx, 'a'));
+
+        assert_eq!(table.slots().len(), 2, "one blank slot plus the re-laid glyph");
+    }
+
+    /// Rows sit at a fixed stride so a damaged row can be rewritten and
+    /// uploaded without touching its neighbours.
+    #[test]
+    fn a_row_keeps_its_place_when_a_neighbour_changes() {
+        let mut grid = GridInstances::new();
+        grid.resize(4, 3, Color32::BLACK);
+        let runs = [RunView {
+            text: "ab",
+            start_col: 0,
+            row: 2,
+            face: Face::Normal,
+            flags: 0,
+            fg: Color32::WHITE,
+            bg: Color32::BLACK,
+            selected: false,
+        }];
+
+        grid.write_rows([2], &runs, Color32::BLACK, |_, _| 7);
+
+        assert_eq!(grid.glyphs[8].slot, 7);
+        assert_eq!(grid.glyphs[9].slot, 7);
+        assert_eq!(grid.glyphs[10].slot, BLANK_SLOT);
+        assert_eq!(grid.row_bytes(2, 1), 96..144);
+    }
+
+    #[test]
+    fn rewriting_a_row_clears_what_the_last_frame_left() {
+        let mut grid = GridInstances::new();
+        grid.resize(4, 2, Color32::BLACK);
+        let row0 = |text| {
+            [RunView {
+                text,
+                start_col: 0,
+                row: 0,
+                face: Face::Normal,
+                flags: 0,
+                fg: Color32::WHITE,
+                bg: Color32::BLACK,
+                selected: false,
+            }]
+        };
+        grid.write_rows([0], &row0("abcd"), Color32::BLACK, |_, _| 7);
+
+        grid.write_rows([0], &row0("ab"), Color32::BLACK, |_, _| 7);
+
+        assert_eq!(grid.glyphs[2].slot, BLANK_SLOT, "the tail of the old run survived");
+    }
+
+    /// A run keeping the terminal's own background emits no quad: the window
+    /// is already that colour, and a quad per run would put the grid's cell
+    /// count back into the geometry the instancing removed.
+    #[test]
+    fn a_default_background_run_emits_no_quad() {
+        let mut grid = GridInstances::new();
+        grid.resize(4, 1, Color32::BLACK);
+        let runs = [RunView {
+            text: "ab",
+            start_col: 0,
+            row: 0,
+            face: Face::Normal,
+            flags: 0,
+            fg: Color32::WHITE,
+            bg: Color32::BLACK,
+            selected: false,
+        }];
+
+        grid.write_rows([0], &runs, Color32::BLACK, |_, _| 1);
+
+        assert!(grid.bg_runs.is_empty());
+    }
+
+    #[test]
+    fn a_coloured_run_emits_one_quad_and_fills_its_cells() {
+        let mut grid = GridInstances::new();
+        grid.resize(4, 1, Color32::BLACK);
+        let runs = [RunView {
+            text: "ab",
+            start_col: 1,
+            row: 0,
+            face: Face::Normal,
+            flags: 0,
+            fg: Color32::WHITE,
+            bg: Color32::RED,
+            selected: false,
+        }];
+
+        grid.write_rows([0], &runs, Color32::BLACK, |_, _| 1);
+
+        assert_eq!(grid.bg_runs.len(), 1);
+        assert_eq!(grid.bg_runs[0].span, 2);
+        assert_eq!(grid.bg_cells[1], u32::from_le_bytes(Color32::RED.to_array()));
+        assert_eq!(grid.bg_cells[3], u32::from_le_bytes(Color32::BLACK.to_array()));
+    }
+}
