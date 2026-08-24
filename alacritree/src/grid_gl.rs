@@ -10,11 +10,11 @@
 //! the raw texture epaint already packed its glyphs into, so the shader samples
 //! the same artwork the mesh path would have.
 //!
-//! Two draws, neither of whose geometry grows with the grid: backgrounds
-//! are a single triangle over the viewport indexing a cell-sized texture,
-//! and glyphs are one quad instanced once per cell.  Underlines, emoji and
-//! box-drawing glyphs stay on egui's painter — they carry their own
-//! textures or their own geometry, and they are rare enough to leave.
+//! Two draws over one buffer, neither carrying any geometry: a quad instanced
+//! once per cell for the backgrounds, then the same again for the glyphs.
+//! Underlines, emoji and box-drawing glyphs stay on egui's painter — they
+//! carry their own textures or their own geometry, and they are rare enough
+//! to leave.
 
 use std::sync::{Arc, Mutex};
 
@@ -23,6 +23,11 @@ use eframe::glow::{self, HasContext};
 use egui::Rect;
 
 use crate::grid_instances::{GlyphInstance, GlyphTable, GridInstances};
+
+/// Attribute locations, bound before linking so both programs read the same
+/// record the same way.  `#version 140` has no `layout(location = ...)`, so
+/// the binding has to come from this side.
+const ATTRIBUTES: [(u32, &str); 3] = [(0, "a_slot"), (1, "a_fg"), (2, "a_bg")];
 
 /// Ceiling on distinct characters on screen at once.  The slot table is a
 /// texture one row per slot, and every driver guarantees at least 2048 rows.
@@ -38,6 +43,11 @@ pub struct Frame {
     pub atlas: [f32; 2],
     /// Height of an underline and a strikeout, in points.
     pub line_thickness: f32,
+    /// The terminal's own background, as the clear colour.  A grid rect is
+    /// rarely an exact multiple of a cell, and the cell quads stop at the last
+    /// whole one, so the strip past it is filled by clearing rather than by a
+    /// shape epaint would have to tessellate every frame.
+    pub default_bg: [f32; 4],
 }
 
 /// The CPU half, written by the UI thread and read by the paint callback.
@@ -145,8 +155,6 @@ struct GlResources {
     instances: glow::Buffer,
     instance_capacity: usize,
     slot_texture: glow::Texture,
-    bg_texture: glow::Texture,
-    bg_dims: (usize, usize),
 }
 
 struct Program {
@@ -196,28 +204,16 @@ impl GlResources {
             let vao = gl.create_vertex_array()?;
             let instances = gl.create_buffer()?;
             let slot_texture = gl.create_texture()?;
-            let bg_texture = gl.create_texture()?;
-            for texture in [slot_texture, bg_texture] {
-                gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-                for (name, value) in [
-                    (glow::TEXTURE_MIN_FILTER, glow::NEAREST),
-                    (glow::TEXTURE_MAG_FILTER, glow::NEAREST),
-                    (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
-                    (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
-                ] {
-                    gl.tex_parameter_i32(glow::TEXTURE_2D, name, value as i32);
-                }
+            gl.bind_texture(glow::TEXTURE_2D, Some(slot_texture));
+            for (name, value) in [
+                (glow::TEXTURE_MIN_FILTER, glow::NEAREST),
+                (glow::TEXTURE_MAG_FILTER, glow::NEAREST),
+                (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
+                (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
+            ] {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, name, value as i32);
             }
-            Ok(Self {
-                glyph,
-                background,
-                vao,
-                instances,
-                instance_capacity: 0,
-                slot_texture,
-                bg_texture,
-                bg_dims: (0, 0),
-            })
+            Ok(Self { glyph, background, vao, instances, instance_capacity: 0, slot_texture })
         }
     }
 
@@ -227,25 +223,29 @@ impl GlResources {
             return;
         }
         unsafe {
-            self.upload(gl, state, cols, rows);
-            gl.bind_vertex_array(Some(self.vao));
+            // egui scissors the callback to its clip rect before handing over,
+            // so this reaches the grid and nothing around it.
+            let [r, g, b, a] = state.frame.default_bg;
+            gl.clear_color(r, g, b, a);
+            gl.clear(glow::COLOR_BUFFER_BIT);
 
-            self.draw_backgrounds(gl, state, cols, rows);
+            self.upload(gl, state);
+            gl.bind_vertex_array(Some(self.vao));
+            self.bind_records(gl);
+
+            self.draw_backgrounds(gl, state, cols * rows);
             if let Some(atlas) = atlas {
-                self.draw_glyphs(gl, state, atlas, cols, rows);
+                self.draw_glyphs(gl, state, atlas, cols * rows);
             }
 
+            for (index, _) in ATTRIBUTES {
+                gl.disable_vertex_attrib_array(index);
+            }
             gl.bind_vertex_array(None);
         }
     }
 
-    unsafe fn upload(
-        &mut self,
-        gl: &glow::Context,
-        state: &mut GridState,
-        cols: usize,
-        rows: usize,
-    ) {
+    unsafe fn upload(&mut self, gl: &glow::Context, state: &mut GridState) {
         unsafe {
             let generation = state.table.generation();
             if generation != state.uploaded_generation {
@@ -267,9 +267,9 @@ impl GlResources {
                 state.uploaded_generation = generation;
             }
 
-            let resized = state.uploaded_dims != (cols, rows);
-            if resized {
-                state.uploaded_dims = (cols, rows);
+            let dims = state.instances.dimensions();
+            if state.uploaded_dims != dims {
+                state.uploaded_dims = dims;
                 state.mark_all_dirty();
             }
 
@@ -290,60 +290,37 @@ impl GlResources {
                 );
             }
 
-            gl.bind_texture(glow::TEXTURE_2D, Some(self.bg_texture));
-            let bg = bytemuck_cast(&state.instances.bg_cells);
-            if self.bg_dims != (cols, rows) {
-                gl.tex_image_2d(
-                    glow::TEXTURE_2D,
-                    0,
-                    glow::RGBA8 as i32,
-                    cols as i32,
-                    rows as i32,
-                    0,
-                    glow::RGBA,
-                    glow::UNSIGNED_BYTE,
-                    glow::PixelUnpackData::Slice(Some(bg)),
-                );
-                self.bg_dims = (cols, rows);
-            } else if !state.dirty_rows.is_empty() {
-                let first = state.dirty_rows.start;
-                let count = state.dirty_rows.len();
-                gl.tex_sub_image_2d(
-                    glow::TEXTURE_2D,
-                    0,
-                    0,
-                    first as i32,
-                    cols as i32,
-                    count as i32,
-                    glow::RGBA,
-                    glow::UNSIGNED_BYTE,
-                    glow::PixelUnpackData::Slice(Some(
-                        &bg[first * cols * 4..(first + count) * cols * 4],
-                    )),
-                );
-            }
             state.dirty_rows = 0..0;
         }
     }
 
-    unsafe fn draw_backgrounds(
-        &self,
-        gl: &glow::Context,
-        state: &GridState,
-        cols: usize,
-        rows: usize,
-    ) {
+    /// Point every attribute at the one record buffer, advancing once per
+    /// cell.  Both programs read from here; each ignores the fields it has no
+    /// input for.
+    unsafe fn bind_records(&self, gl: &glow::Context) {
+        unsafe {
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.instances));
+            let stride = size_of::<GlyphInstance>() as i32;
+            gl.enable_vertex_attrib_array(0);
+            gl.vertex_attrib_pointer_i32(0, 1, glow::UNSIGNED_SHORT, stride, 0);
+            gl.enable_vertex_attrib_array(1);
+            gl.vertex_attrib_pointer_f32(1, 4, glow::UNSIGNED_BYTE, true, stride, 4);
+            gl.enable_vertex_attrib_array(2);
+            gl.vertex_attrib_pointer_f32(2, 4, glow::UNSIGNED_BYTE, true, stride, 8);
+            for (index, _) in ATTRIBUTES {
+                gl.vertex_attrib_divisor(index, 1);
+            }
+        }
+    }
+
+    unsafe fn draw_backgrounds(&self, gl: &glow::Context, state: &GridState, cells: usize) {
         unsafe {
             gl.use_program(Some(self.background.program));
-            gl.active_texture(glow::TEXTURE0);
-            gl.bind_texture(glow::TEXTURE_2D, Some(self.bg_texture));
-            set_i32(gl, &self.background, "u_cells", 0);
-            set_vec2(gl, &self.background, "u_grid", [cols as f32, rows as f32]);
+            set_i32(gl, &self.background, "u_cols", state.frame.grid[0] as i32);
             set_vec2(gl, &self.background, "u_origin", state.frame.origin);
             set_vec2(gl, &self.background, "u_cell", state.frame.cell);
-            // One triangle large enough to cover the viewport; the grid rect
-            // *is* the viewport, so nothing outside it is ever shaded.
-            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            set_vec2(gl, &self.background, "u_viewport", viewport_points(state));
+            gl.draw_arrays_instanced(glow::TRIANGLE_STRIP, 0, 4, cells as i32);
         }
     }
 
@@ -352,8 +329,7 @@ impl GlResources {
         gl: &glow::Context,
         state: &GridState,
         atlas: glow::Texture,
-        cols: usize,
-        rows: usize,
+        cells: usize,
     ) {
         unsafe {
             gl.use_program(Some(self.glyph.program));
@@ -363,28 +339,13 @@ impl GlResources {
             gl.bind_texture(glow::TEXTURE_2D, Some(self.slot_texture));
             set_i32(gl, &self.glyph, "u_atlas", 0);
             set_i32(gl, &self.glyph, "u_slots", 1);
+            set_i32(gl, &self.glyph, "u_cols", state.frame.grid[0] as i32);
             set_vec2(gl, &self.glyph, "u_origin", state.frame.origin);
             set_vec2(gl, &self.glyph, "u_cell", state.frame.cell);
             set_vec2(gl, &self.glyph, "u_atlas_size", state.frame.atlas);
             set_vec2(gl, &self.glyph, "u_viewport", viewport_points(state));
 
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.instances));
-            let stride = size_of::<GlyphInstance>() as i32;
-            gl.enable_vertex_attrib_array(0);
-            gl.vertex_attrib_pointer_i32(0, 2, glow::UNSIGNED_SHORT, stride, 0);
-            gl.vertex_attrib_divisor(0, 1);
-            gl.enable_vertex_attrib_array(1);
-            gl.vertex_attrib_pointer_i32(1, 1, glow::UNSIGNED_SHORT, stride, 4);
-            gl.vertex_attrib_divisor(1, 1);
-            gl.enable_vertex_attrib_array(2);
-            gl.vertex_attrib_pointer_f32(2, 4, glow::UNSIGNED_BYTE, true, stride, 8);
-            gl.vertex_attrib_divisor(2, 1);
-
-            gl.draw_arrays_instanced(glow::TRIANGLE_STRIP, 0, 4, (cols * rows) as i32);
-
-            for index in 0..3 {
-                gl.disable_vertex_attrib_array(index);
-            }
+            gl.draw_arrays_instanced(glow::TRIANGLE_STRIP, 0, 4, cells as i32);
         }
     }
 }
@@ -435,6 +396,9 @@ unsafe fn link(
     unsafe {
         let defines = format!("#define SRGB_TEXTURES {}\n", srgb_atlas as i32);
         let program = gl.create_program()?;
+        for (index, name) in ATTRIBUTES {
+            gl.bind_attrib_location(program, index, name);
+        }
         let mut shaders = Vec::new();
         for (kind, body) in [(glow::VERTEX_SHADER, vertex), (glow::FRAGMENT_SHADER, fragment)] {
             let shader = match gl.create_shader(kind) {
@@ -482,9 +446,9 @@ uniform vec2 u_origin;
 uniform vec2 u_cell;
 uniform vec2 u_viewport;
 uniform vec2 u_atlas_size;
+uniform int u_cols;
 uniform sampler2D u_slots;
 
-in uvec2 a_cell;
 in uint a_slot;
 in vec4 a_fg;
 
@@ -495,9 +459,11 @@ void main() {
     vec4 rect = texelFetch(u_slots, ivec2(0, int(a_slot)), 0);
     vec4 geom = texelFetch(u_slots, ivec2(1, int(a_slot)), 0);
 
+    // Records sit at a fixed row stride, so the instance index is the cell.
+    vec2 grid_cell = vec2(gl_InstanceID % u_cols, gl_InstanceID / u_cols);
     // 0 = top-left, 1 = top-right, 2 = bottom-left, 3 = bottom-right.
     vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));
-    vec2 pos = u_origin + vec2(a_cell) * u_cell + geom.xy + corner * geom.zw;
+    vec2 pos = u_origin + grid_cell * u_cell + geom.xy + corner * geom.zw;
 
     gl_Position = vec4(
         2.0 * pos.x / u_viewport.x - 1.0,
@@ -534,27 +500,35 @@ void main() {
 "#;
 
 const BACKGROUND_VERT: &str = r#"
-uniform vec2 u_grid;
-out vec2 v_grid_uv;
+uniform vec2 u_origin;
+uniform vec2 u_cell;
+uniform vec2 u_viewport;
+uniform int u_cols;
+
+in vec4 a_bg;
+
+out vec4 v_bg;
 
 void main() {
-    // One oversized triangle rather than two: no shared edge for the
-    // rasterizer to shade twice, and no vertex buffer to bind.
-    vec2 corner = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
-    gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);
-    v_grid_uv = vec2(corner.x, 1.0 - corner.y);
+    vec2 grid_cell = vec2(gl_InstanceID % u_cols, gl_InstanceID / u_cols);
+    vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));
+    vec2 pos = u_origin + (grid_cell + corner) * u_cell;
+
+    gl_Position = vec4(
+        2.0 * pos.x / u_viewport.x - 1.0,
+        1.0 - 2.0 * pos.y / u_viewport.y,
+        0.0,
+        1.0);
+    v_bg = a_bg;
 }
 "#;
 
 const BACKGROUND_FRAG: &str = r#"
-uniform sampler2D u_cells;
-uniform vec2 u_grid;
-in vec2 v_grid_uv;
+in vec4 v_bg;
 out vec4 f_color;
 
 void main() {
-    ivec2 cell = ivec2(clamp(floor(v_grid_uv * u_grid), vec2(0.0), u_grid - 1.0));
-    f_color = texelFetch(u_cells, cell, 0);
+    f_color = v_bg;
 }
 "#;
 
