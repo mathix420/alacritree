@@ -2795,6 +2795,11 @@ mod tests {
     /// Dense output that fills every visible cell, with a colour change every
     /// few columns so the run-splitting in `paint_grid` behaves like it does
     /// under real program output rather than collapsing to one run per line.
+    ///
+    /// Written once, this screen never changes again, so every frame after the
+    /// first finds the terminal undamaged.  That is the wrong shape for
+    /// anything measuring a renderer that skips clean rows — use
+    /// `termbench_frame` there, which moves every cell every frame.
     fn dense_screen(cols: usize, rows: usize) -> Vec<u8> {
         let mut out = Vec::new();
         for row in 0..rows {
@@ -2807,6 +2812,130 @@ mod tests {
             }
         }
         out
+    }
+
+    /// One frame of termbench's `FGPerChar` (`backgrounds` false) or
+    /// `FGBGPerChar` (true), transcribed from `termbench.cpp`: a truecolour
+    /// SGR on every cell, colours derived from the frame index, background
+    /// written before foreground.
+    ///
+    /// The frame index is the part that matters.  Every colour on screen moves
+    /// between frames, so the terminal reports full damage each time — the
+    /// same thing a real run of termbench does, and the reason a harness that
+    /// paints one fixed screen repeatedly measures nothing useful for a
+    /// renderer that skips clean rows.
+    fn termbench_frame(cols: usize, rows: usize, frame: usize, backgrounds: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        for y in 0..rows {
+            out.extend_from_slice(format!("\x1b[{};1H", y + 1).as_bytes());
+            for x in 0..cols {
+                if backgrounds {
+                    let (r, g, b) = (frame + y + x, frame + y, frame);
+                    let sgr = format!("\x1b[48;2;{};{};{}m", r & 0xff, g & 0xff, b & 0xff);
+                    out.extend_from_slice(sgr.as_bytes());
+                }
+                let (r, g, b) = (frame, frame + y, frame + y + x);
+                let sgr = format!("\x1b[38;2;{};{};{}m", r & 0xff, g & 0xff, b & 0xff);
+                out.extend_from_slice(sgr.as_bytes());
+                out.push(b'a' + ((frame + x + y) % 25) as u8);
+            }
+        }
+        out
+    }
+
+    /// Not a gate — run it by hand:
+    /// `cargo test -p alacritree --release -- --ignored --nocapture --test-threads=1
+    /// report_colored_frame`
+    ///
+    /// Frame cost under termbench's two colour tests, mesh path against GL
+    /// path.  Every other harness here runs `dense_screen`, which holds the
+    /// default background, changes colour every seventh column, and never
+    /// changes between frames: the one shape where neither run count nor
+    /// damage tracking costs anything.
+    ///
+    /// Parsing happens outside the timed region, so what is reported is paint
+    /// alone; both paths see byte-identical frames.
+    ///
+    /// There is no GL context here, so the GL path's callback is emitted and
+    /// never invoked.  Both rows are therefore the CPU half only, which is the
+    /// half that runs on the UI thread ahead of the next keystroke.
+    #[test]
+    #[ignore = "timing harness, not an assertion"]
+    fn report_colored_frame() {
+        #[cfg(windows)]
+        crate::harden_dll_search_path();
+
+        let grid = crate::grid_gl::GpuGrid::new();
+        let iterations = 60;
+
+        for screen in [Vec2::new(1280.0, 720.0), Vec2::new(2560.0, 1440.0)] {
+            let mut printed_header = false;
+            for (label, backgrounds) in [("FGPerChar", false), ("FGBGPerChar", true)] {
+                for (path, gpu) in [("mesh", None::<&crate::grid_gl::GpuGrid>), ("gl", Some(&grid))]
+                {
+                    let mut config = Config::default();
+                    config.ui.gpu_grid = gpu.is_some();
+                    let ctx = egui::Context::default();
+                    let (mut session, _dir) = headless_session(&ctx, &config);
+                    let mut caches = Caches::new();
+                    paint_one_frame_on(&ctx, &mut session, &config, &mut caches, screen, gpu);
+                    let (cols, rows) = (session.size.columns, session.size.screen_lines);
+                    session.term.lock().resize(TermSize::new(cols, rows));
+
+                    // Generating the escapes is the benchmark's cost, not the
+                    // painter's, so it happens up front and off the clock.
+                    let frames: Vec<Vec<u8>> = (0..iterations + 10)
+                        .map(|frame| termbench_frame(cols, rows, frame, backgrounds))
+                        .collect();
+                    let mut parser = Processor::<StdSyncHandler>::new();
+                    let mut advance = |session: &mut Session, bytes: &[u8]| {
+                        let mut term = session.term.lock();
+                        parser.advance(&mut *term, bytes);
+                    };
+
+                    for frame in frames.iter().take(10) {
+                        advance(&mut session, frame);
+                        paint_one_frame_on(&ctx, &mut session, &config, &mut caches, screen, gpu);
+                    }
+
+                    let mut painted = std::time::Duration::ZERO;
+                    let mut total = FrameCost::default();
+                    for frame in frames.iter().skip(10) {
+                        advance(&mut session, frame);
+                        let started = std::time::Instant::now();
+                        let cost = std::hint::black_box(paint_one_frame_on(
+                            &ctx,
+                            &mut session,
+                            &config,
+                            &mut caches,
+                            screen,
+                            gpu,
+                        ));
+                        painted += started.elapsed();
+                        total.build += cost.build;
+                        total.tessellate += cost.tessellate;
+                        total.vertices = cost.vertices;
+                    }
+                    let runs = iterations as u32;
+                    let each = painted / runs;
+                    let cost = FrameCost {
+                        build: total.build / runs,
+                        tessellate: total.tessellate / runs,
+                        vertices: total.vertices,
+                    };
+
+                    if !printed_header {
+                        println!("{}x{} logical px = {cols}x{rows} cells", screen.x, screen.y);
+                        printed_header = true;
+                    }
+                    println!(
+                        "  {label:<12} {path:<4} {each:>12?} per frame, build {:?} + tessellate \
+                         {:?}, {} vertices",
+                        cost.build, cost.tessellate, cost.vertices,
+                    );
+                }
+            }
+        }
     }
 
     /// Not a gate — run it by hand:
