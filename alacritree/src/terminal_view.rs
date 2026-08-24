@@ -17,6 +17,8 @@ use crate::color_glyph::{CachedColorGlyph, ColorGlyphCache};
 use crate::colors::{background, foreground, resolve, rgb_to_color32};
 use crate::config::Config;
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
+use crate::grid_gl::{Frame as GridFrame, GpuGrid};
+use crate::grid_instances::RunView;
 use crate::glyph_cache::{Face, GlyphCache, MAX_EXTRA_CELLS, growth_offset, may_grow};
 use crate::input::{associated_text, event_to_bytes};
 use crate::links::{self, Link};
@@ -35,6 +37,7 @@ pub fn show(
     color_glyphs: &mut ColorGlyphCache,
     glyphs: &mut GlyphCache,
     snapshot: &mut GridSnapshot,
+    gpu: Option<&GpuGrid>,
 ) -> Response {
     let font_id = FontId::monospace(config.font.egui_size());
     let (cell_w_pt, cell_h_pt) = ui.ctx().fonts(|f| {
@@ -134,21 +137,32 @@ pub fn show(
         // (alacritty hides it the same way, display/content.rs).
         ime.preedit().is_some(),
     );
-    paint_grid(
-        &painter,
-        rect,
-        snapshot,
-        config,
-        &font_id,
-        cell_w,
-        cell_h,
-        ppp,
-        &metrics,
-        builtin_glyphs,
-        color_glyphs,
-        glyphs,
-        ui.ctx(),
-    );
+    match gpu.filter(|_| config.ui.gpu_grid) {
+        Some(gpu) => {
+            paint_grid_gpu(
+                gpu, &painter, rect, snapshot, config, cell_w, cell_h, cols, rows, glyphs,
+                ui.ctx(),
+            );
+            if let Some(cursor) = &snapshot.cursor {
+                paint_cursor(&painter, rect, cursor, cell_w, cell_h, &font_id);
+            }
+        },
+        None => paint_grid(
+            &painter,
+            rect,
+            snapshot,
+            config,
+            &font_id,
+            cell_w,
+            cell_h,
+            ppp,
+            &metrics,
+            builtin_glyphs,
+            color_glyphs,
+            glyphs,
+            ui.ctx(),
+        ),
+    }
 
     let preedit_caret = ime
         .preedit()
@@ -1010,6 +1024,92 @@ fn run_colors(
     (sel_fg, sel_bg)
 }
 
+/// Fill the GPU grid's buffers from this frame's snapshot and hand egui the
+/// callback that draws them.
+///
+/// Only the glyph and background layers move to the GPU.  Emoji and
+/// box-drawing glyphs carry their own textures and underlines are their own
+/// geometry, so those stay ordinary shapes emitted after the callback — which
+/// also keeps them above every background, the order `paint_grid` enforces by
+/// running its two passes separately.
+#[allow(clippy::too_many_arguments)]
+fn paint_grid_gpu(
+    gpu: &GpuGrid,
+    painter: &egui::Painter,
+    rect: Rect,
+    snapshot: &GridSnapshot,
+    config: &Config,
+    cell_w: f32,
+    cell_h: f32,
+    cols: usize,
+    rows: usize,
+    glyphs: &mut GlyphCache,
+    ctx: &egui::Context,
+) {
+    let default_bg = background(&config.palette);
+    let size = config.font.egui_size();
+    let atlas = ctx.fonts(|f| f.font_image_size());
+
+    let runs: Vec<RunView<'_>> = snapshot
+        .runs
+        .iter()
+        .filter(|run| !run.flags.contains(Flags::HIDDEN))
+        .map(|run| RunView {
+            text: &snapshot.text[run.text.clone()],
+            start_col: run.start_col,
+            row: run.row as usize,
+            face: Face::new(run.flags.contains(Flags::BOLD), run.flags.contains(Flags::ITALIC)),
+            flags: 0,
+            fg: run.fg,
+            bg: run.bg,
+            selected: run.selected,
+        })
+        .collect();
+
+    {
+        let mut state = gpu.state.lock().expect("grid state");
+        state.instances.resize(cols, rows, default_bg);
+        state.instances.clear_backgrounds();
+        state.frame = GridFrame {
+            // egui sets the GL viewport to the callback's rect, so the grid
+            // starts at its own corner rather than the window's.
+            origin: [0.0, 0.0],
+            cell: [cell_w, cell_h],
+            grid: [cols as u32, rows as u32],
+            atlas: [atlas[0] as f32, atlas[1] as f32],
+            line_thickness: 1.0,
+        };
+        let (instances, table) = state.buffers();
+        instances.write_rows(0..rows, &runs, default_bg, |ch, face| {
+            table.slot(ch, face, size, || glyphs.get(ctx, ch, face, size))
+        });
+        state.mark_all_dirty();
+    }
+    painter.add(gpu.callback(rect));
+
+    for run in &snapshot.runs {
+        if !run.flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT) {
+            continue;
+        }
+        let cells = run_rect(rect, &snapshot.text[run.text.clone()], run, cell_w, cell_h);
+        let (x, y, width) = (cells.min.x, cells.min.y, cells.width());
+        if run.flags.intersects(Flags::ALL_UNDERLINES) {
+            let uy = y + cell_h - 1.5;
+            painter.line_segment(
+                [Pos2::new(x, uy), Pos2::new(x + width, uy)],
+                Stroke::new(1.0_f32, run.fg),
+            );
+        }
+        if run.flags.contains(Flags::STRIKEOUT) {
+            let sy = y + cell_h * 0.5;
+            painter.line_segment(
+                [Pos2::new(x, sy), Pos2::new(x + width, sy)],
+                Stroke::new(1.0_f32, run.fg),
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_grid(
     painter: &egui::Painter,
@@ -1444,6 +1544,21 @@ mod tests {
         caches: &mut Caches,
         screen: Vec2,
     ) -> FrameCost {
+        paint_one_frame_on(ctx, session, config, caches, screen, None)
+    }
+
+    /// The same frame with the grid routed to `gpu`.  With no GL context the
+    /// callback is emitted and never invoked, so what this times is exactly the
+    /// CPU half — which is the half that runs on the UI thread and delays a
+    /// keystroke.
+    fn paint_one_frame_on(
+        ctx: &egui::Context,
+        session: &mut Session,
+        config: &Config,
+        caches: &mut Caches,
+        screen: Vec2,
+        gpu: Option<&crate::grid_gl::GpuGrid>,
+    ) -> FrameCost {
         let raw = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, screen)),
             ..Default::default()
@@ -1461,6 +1576,7 @@ mod tests {
                     &mut caches.colors,
                     &mut caches.glyphs,
                     &mut caches.snapshot,
+                    gpu,
                 );
             });
         });
@@ -1508,6 +1624,7 @@ mod tests {
                     &mut caches.colors,
                     &mut caches.glyphs,
                     &mut caches.snapshot,
+                    None,
                 );
             });
         });
@@ -1580,6 +1697,7 @@ mod tests {
                     &mut caches.colors,
                     &mut caches.glyphs,
                     &mut caches.snapshot,
+                    None,
                 );
             });
         });
@@ -1699,6 +1817,7 @@ mod tests {
                     &mut caches.colors,
                     &mut caches.glyphs,
                     &mut caches.snapshot,
+                    None,
                 );
             });
         });
@@ -1868,6 +1987,7 @@ mod tests {
                     &mut caches.colors,
                     &mut caches.glyphs,
                     &mut caches.snapshot,
+                    None,
                 );
             });
         });
@@ -2479,6 +2599,204 @@ mod tests {
     }
 
     /// Not a gate — run it by hand:
+    /// `cargo test -p alacritree --release -- --ignored --nocapture report_instance_frame`
+    ///
+    /// The same frame `report_paint_cost` and `report_mesh_frame` measure,
+    /// built as one twelve-byte record per cell for a GPU that derives the
+    /// quad itself.  The rows list is the point of the fixed stride: a frame
+    /// that rewrites only the rows the terminal reported damaged pays for
+    /// those rows and nothing else.
+    #[test]
+    #[ignore = "timing harness, not an assertion"]
+    fn report_instance_frame() {
+        #[cfg(windows)]
+        crate::harden_dll_search_path();
+
+        use std::sync::Arc;
+
+        use crate::grid_instances::{GlyphTable, GridInstances, RunView, cell_flags};
+
+        let config = Config::default();
+        let screen = Vec2::new(2560.0, 1440.0);
+        let ctx = egui::Context::default();
+        let (mut session, _dir) = headless_session(&ctx, &config);
+        let mut caches = Caches::new();
+        paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
+        let (cols, rows) = (session.size.columns, session.size.screen_lines);
+        {
+            let mut term = session.term.lock();
+            term.resize(TermSize::new(cols, rows));
+            Processor::<StdSyncHandler>::new().advance(&mut *term, &dense_screen(cols, rows));
+        }
+        for _ in 0..10 {
+            paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
+        }
+
+        let mut snapshot = GridSnapshot::new();
+        {
+            let term = session.term.lock();
+            snapshot.capture(&term, &config, None, false);
+        }
+        let size = config.font.egui_size();
+        let default_bg = background(&config.palette);
+        let mut table = GlyphTable::new();
+        let mut grid = GridInstances::new();
+        grid.resize(cols, rows, default_bg);
+
+        fn views<'a>(
+            snapshot: &'a GridSnapshot,
+            want: &dyn Fn(usize) -> bool,
+        ) -> Vec<RunView<'a>> {
+            snapshot
+                .runs
+                .iter()
+                .filter(|r| want(r.row as usize))
+                .map(|r| RunView {
+                    text: &snapshot.text[r.text.clone()],
+                    start_col: r.start_col,
+                    row: r.row as usize,
+                    face: Face::new(
+                        r.flags.contains(Flags::BOLD),
+                        r.flags.contains(Flags::ITALIC),
+                    ),
+                    flags: u16::from(r.flags.intersects(Flags::ALL_UNDERLINES))
+                        * cell_flags::UNDERLINE
+                        | u16::from(r.flags.contains(Flags::STRIKEOUT)) * cell_flags::STRIKEOUT,
+                    fg: r.fg,
+                    bg: r.bg,
+                    selected: r.selected,
+                })
+                .collect()
+        }
+
+        let iterations = 60u32;
+        fn time(iterations: u32, mut body: impl FnMut()) -> std::time::Duration {
+            for _ in 0..5 {
+                body();
+            }
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                body();
+            }
+            start.elapsed() / iterations
+        }
+
+        // Warm the glyph table so the timed loop measures writing records, not
+        // laying characters out for the first time.
+        let all = views(&snapshot, &|_| true);
+        grid.write_rows(0..rows, &all, default_bg, |ch, face| {
+            table.slot(ch, face, size, || caches.glyphs.get(&ctx, ch, face, size))
+        });
+        let slots = table.slots().len();
+
+        println!("{cols}x{rows} cells, {} runs, {slots} distinct glyphs", snapshot.runs.len());
+        for damaged in [rows, rows / 2, 8, 3, 1] {
+            let touched = views(&snapshot, &|row| row < damaged);
+            let build = time(iterations, || {
+                grid.clear_backgrounds();
+                grid.write_rows(0..damaged, &touched, default_bg, |ch, face| {
+                    table.slot(ch, face, size, || caches.glyphs.get(&ctx, ch, face, size))
+                });
+                std::hint::black_box(grid.glyphs.len());
+            });
+            let bytes = grid.row_bytes(0, damaged).len();
+            println!(
+                "  rewrite {damaged:>3} of {rows} rows: {build:?}, {} KiB to upload",
+                bytes / 1024,
+            );
+        }
+
+        // What epaint charges for a grid it never sees the geometry of.
+        let callback = vec![egui::epaint::ClippedShape {
+            clip_rect: Rect::from_min_size(Pos2::ZERO, screen),
+            shape: egui::Shape::Callback(egui::epaint::PaintCallback {
+                rect: Rect::from_min_size(Pos2::ZERO, screen),
+                callback: Arc::new(()),
+            }),
+        }];
+        let ppp = 1.0;
+        let tessellate = time(iterations, || {
+            std::hint::black_box(ctx.tessellate(callback.clone(), ppp));
+        });
+        println!("  tessellate a callback-only shape list: {tessellate:?}");
+
+        let capture = time(iterations, || {
+            let term = session.term.lock();
+            snapshot.capture(&term, &config, None, false);
+            std::hint::black_box(snapshot.runs.len());
+        });
+        println!("  capture the grid under the lock      : {capture:?}");
+    }
+
+    /// Not a gate — run it by hand:
+    /// `cargo test -p alacritree --release -- --ignored --nocapture report_gpu_frame`
+    ///
+    /// The frame `report_paint_cost` measures, routed through `[ui] gpu_grid`.
+    /// There is no GL context here, so the callback is emitted and never
+    /// invoked: what this reports is the CPU half, which is the half that runs
+    /// on the UI thread ahead of the next keystroke.
+    #[test]
+    #[ignore = "timing harness, not an assertion"]
+    fn report_gpu_frame() {
+        #[cfg(windows)]
+        crate::harden_dll_search_path();
+
+        let mut config = Config::default();
+        config.ui.gpu_grid = true;
+        let gpu = crate::grid_gl::GpuGrid::new();
+
+        for screen in [Vec2::new(1280.0, 720.0), Vec2::new(2560.0, 1440.0)] {
+            let ctx = egui::Context::default();
+            let (mut session, _dir) = headless_session(&ctx, &config);
+            let mut caches = Caches::new();
+            paint_one_frame_on(&ctx, &mut session, &config, &mut caches, screen, Some(&gpu));
+            let (cols, rows) = (session.size.columns, session.size.screen_lines);
+            {
+                let mut term = session.term.lock();
+                term.resize(TermSize::new(cols, rows));
+                Processor::<StdSyncHandler>::new().advance(&mut *term, &dense_screen(cols, rows));
+            }
+            for _ in 0..10 {
+                paint_one_frame_on(&ctx, &mut session, &config, &mut caches, screen, Some(&gpu));
+            }
+
+            let iterations = 60;
+            let start = std::time::Instant::now();
+            let (mut build, mut tessellate) =
+                (std::time::Duration::ZERO, std::time::Duration::ZERO);
+            let mut cost = FrameCost::default();
+            for _ in 0..iterations {
+                cost = std::hint::black_box(paint_one_frame_on(
+                    &ctx,
+                    &mut session,
+                    &config,
+                    &mut caches,
+                    screen,
+                    Some(&gpu),
+                ));
+                build += cost.build;
+                tessellate += cost.tessellate;
+            }
+            let each = start.elapsed() / iterations;
+            let (build, tessellate) = (build / iterations, tessellate / iterations);
+            let uploaded = {
+                let state = gpu.state.lock().expect("grid state");
+                state.instances.row_bytes(0, rows).len()
+            };
+
+            println!(
+                "{}x{} logical px = {cols}x{rows} cells: {each:?} per frame",
+                screen.x, screen.y,
+            );
+            println!(
+                "  build {build:?} + tessellate {tessellate:?}, {} vertices to epaint",
+                cost.vertices,
+            );
+            println!("  {} KiB of cell records", uploaded / 1024);
+        }
+    }
+
+    /// Not a gate — run it by hand:
     /// `cargo test -p alacritree --release -- --ignored --nocapture report_fill_variants`
     ///
     /// Four ways to write the same 105k vertices, from the galley walk the
@@ -2527,6 +2845,7 @@ mod tests {
                         &mut caches.colors,
                         &mut caches.glyphs,
                         &mut caches.snapshot,
+                        None,
                     );
                 });
             },
