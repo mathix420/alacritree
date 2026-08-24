@@ -3996,6 +3996,31 @@ mod tests {
         assert!(consumed_event(&Event::Paste("hi".into()), None, TermMode::empty()).is_none());
     }
 
+    /// egui-winit raises `Event::Copy` for Ctrl+C alongside the key press.
+    /// The whole event stream has to yield ETX, or a program whose only exit
+    /// is the interrupt cannot be stopped.
+    #[test]
+    fn ctrl_c_sends_the_interrupt_through_the_whole_event_stream() {
+        let press = Event::Key {
+            key: Key::C,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::CTRL,
+        };
+        let stream = [Event::Copy, press];
+
+        let bytes: Vec<u8> = consume_events(&stream, TermMode::empty())
+            .into_iter()
+            .flat_map(|e| match e {
+                ConsumedEvent::Bytes(b) => b,
+                _ => Vec::new(),
+            })
+            .collect();
+
+        assert_eq!(bytes, vec![0x03], "Ctrl+C must reach the PTY as 0x03");
+    }
+
     /// Alacritty sends SYN on Ctrl+V; paste is a Ctrl+Shift+V binding.
     #[test]
     fn ctrl_v_sends_the_control_byte() {
