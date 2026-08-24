@@ -31,8 +31,9 @@ jobs:
 
       - name: Check for upstream updates
         env:
-          # The explicit permissions above and the repository setting allow
-          # this short-lived, repository-scoped token to push and open PRs.
+          # Keep the credential short-lived and scoped to this repository.
+          # PR writes use REST below because GitHub rejects gh's GraphQL
+          # createPullRequest mutation for this integration token.
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -109,15 +110,27 @@ jobs:
           EOF
           )
 
-          # Reuse the existing PR if there's one open; otherwise create.
-          if gh pr view "$branch" --json number >/dev/null 2>&1; then
-            gh pr edit "$branch" \
-              --title "chore: sync upstream alacritty marker to ${short}" \
-              --body "$body"
+          title="chore: sync upstream alacritty marker to ${short}"
+
+          # Stay on the REST API: gh pr create uses a GraphQL mutation that
+          # GitHub rejects for the otherwise correctly scoped Actions token.
+          pr_number=$(gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
+            -f state=open \
+            -f head="${GITHUB_REPOSITORY_OWNER}:${branch}" \
+            -f base=master \
+            --jq '.[0].number // empty')
+
+          if [[ -n "$pr_number" ]]; then
+            gh api --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" \
+              -f title="$title" \
+              -f body="$body" \
+              --jq .html_url
           else
-            gh pr create \
-              --title "chore: sync upstream alacritty marker to ${short}" \
-              --body "$body" \
-              --base master \
-              --head "$branch"
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/pulls" \
+              -f title="$title" \
+              -f body="$body" \
+              -f base=master \
+              -f head="$branch" \
+              --jq .html_url
           fi
