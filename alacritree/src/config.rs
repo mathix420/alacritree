@@ -223,7 +223,7 @@ pub fn profile_command(p: &Profile) -> String {
         .join(" ")
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Palette {
     pub fg: Rgb,
     pub bg: Rgb,
