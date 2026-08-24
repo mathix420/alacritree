@@ -2000,13 +2000,11 @@ mod tests {
     /// walk has to stop at the damaged span rather than filter after the fact.
     #[test]
     fn only_the_dirty_rows_are_re_read_for_the_upload() {
-        let mut term = term_running(b"first
-second
-third");
+        let mut term = term_running(b"first\r\nsecond\r\nthird");
         let mut snapshot = GridSnapshot::new();
         snapshot.capture(&mut term, &Config::default(), 0, None, false);
 
-        Processor::<StdSyncHandler>::new().advance(&mut term, b"[2;1Hrewritten");
+        Processor::<StdSyncHandler>::new().advance(&mut term, b"\x1b[2;1Hrewritten");
         snapshot.capture(&mut term, &Config::default(), 0, None, false);
 
         let read: Vec<&str> = snapshot.runs_in(snapshot.dirty_rows()).map(|(t, _)| t).collect();
@@ -2018,12 +2016,11 @@ third");
     /// underline outside this frame's damage still has to be re-emitted.
     #[test]
     fn an_underline_outside_the_damage_is_still_emitted() {
-        let mut term = term_running(b"[4mlinked[0m
-plain");
+        let mut term = term_running(b"\x1b[4mlinked\x1b[0m\r\nplain");
         let mut snapshot = GridSnapshot::new();
         snapshot.capture(&mut term, &Config::default(), 0, None, false);
 
-        Processor::<StdSyncHandler>::new().advance(&mut term, b"[2;1Hrewritten");
+        Processor::<StdSyncHandler>::new().advance(&mut term, b"\x1b[2;1Hrewritten");
         snapshot.capture(&mut term, &Config::default(), 0, None, false);
 
         let decorated: Vec<&str> = snapshot.decorated_runs().map(|(t, _)| t).collect();

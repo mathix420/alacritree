@@ -10,9 +10,6 @@
 //! what lets a frame rebuild and upload only the rows the terminal reported
 //! damaged instead of the whole grid.
 
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
-
 use egui::{Color32, Galley};
 
 use crate::glyph_cache::Face;
@@ -89,63 +86,43 @@ pub fn slot_from_galley(galley: &Galley) -> Option<GlyphSlot> {
     })
 }
 
-/// Multiply-shift over a key that is already one integer.  `HashMap`'s
-/// default is SipHash, built to survive keys an attacker chose; a glyph
-/// lookup has no such keys and a terminal asks tens of thousands of times a
-/// frame, so it pays for the protection in the paint path.
-#[derive(Default)]
-struct KeyHasher(u64);
-
-impl Hasher for KeyHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.write_u64(byte as u64);
-        }
-    }
-
-    fn write_u32(&mut self, value: u32) {
-        self.write_u64(value as u64);
-    }
-
-    fn write_u64(&mut self, value: u64) {
-        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95);
-    }
-}
-
-/// Face and character in one integer, so the map hashes a single word instead
-/// of walking a tuple's fields.  A `char` is at most 21 bits wide.
-fn key(ch: char, face: Face) -> u32 {
-    (face as u32) << 21 | ch as u32
-}
-
 /// Character-and-face to slot index, plus the slot table itself.
 ///
-/// ASCII resolves through a flat array rather than a hash: a hashed key costs
-/// about twice what an array index does, and a terminal asks tens of thousands
-/// of times a frame.
+/// The index is a two-level table rather than a map: a terminal asks tens of
+/// thousands of times a frame, and two array loads cost a fraction of a hash
+/// and a probe.  A flat array over every codepoint and face would be megabytes
+/// of mostly-untouched memory, so the low byte of the character picks an entry
+/// within a page and the rest picks the page, which is allocated the first
+/// time a character on it is asked for.
 pub struct GlyphTable {
     size: f32,
-    ascii: Vec<u16>,
-    rest: HashMap<u32, u16, BuildHasherDefault<KeyHasher>>,
+    /// Where each page starts in `entries`.  Offset zero is the shared page of
+    /// blanks every untouched page points at, so a lookup is two loads with
+    /// nothing to branch on.
+    page_offset: Vec<u32>,
+    entries: Vec<u16>,
     slots: Vec<GlyphSlot>,
     /// Bumped whenever `slots` grows, so a renderer holding an uploaded copy
     /// knows to send the new entries without diffing the table.
     generation: u32,
 }
 
-const ASCII_SLOTS: usize = 128 * 4;
+/// One page covers the 256 characters sharing a high byte, in all four faces.
+const PAGE_ENTRIES: usize = 256 * 4;
+const PAGES: usize = (char::MAX as usize + 1).div_ceil(256);
 const EMPTY: u16 = u16::MAX;
+
+/// Which page a character lives on, and where on that page it and `face` sit.
+fn page_index(ch: char, face: Face) -> (usize, usize) {
+    (ch as usize >> 8, (face as usize) << 8 | (ch as usize & 0xFF))
+}
 
 impl Default for GlyphTable {
     fn default() -> Self {
         Self {
             size: 0.0,
-            ascii: vec![EMPTY; ASCII_SLOTS],
-            rest: HashMap::default(),
+            page_offset: vec![0; PAGES],
+            entries: vec![EMPTY; PAGE_ENTRIES],
             // Slot 0 is the blank cell; it is never looked up by character.
             slots: vec![GlyphSlot::default()],
             generation: 0,
@@ -167,9 +144,12 @@ impl GlyphTable {
     /// pointing at whatever landed in its place.
     pub fn clear(&mut self, size: f32) {
         self.size = size;
-        self.ascii.clear();
-        self.ascii.resize(ASCII_SLOTS, EMPTY);
-        self.rest.clear();
+        self.page_offset.clear();
+        self.page_offset.resize(PAGES, 0);
+        self.entries.truncate(PAGE_ENTRIES);
+        // A session that showed a wide spread of scripts leaves a page per
+        // block behind, and nothing after this will ask for them again.
+        self.entries.shrink_to_fit();
         self.slots.truncate(1);
         self.generation = self.generation.wrapping_add(1);
     }
@@ -185,13 +165,10 @@ impl GlyphTable {
         if self.size != size {
             self.clear(size);
         }
-        let ascii = (ch as u32) < 128;
-        let idx = face as usize * 128 + ch as usize;
-        if ascii && self.ascii[idx] != EMPTY {
-            return self.ascii[idx];
-        }
-        if !ascii && let Some(&slot) = self.rest.get(&key(ch, face)) {
-            return slot;
+        let (page, entry) = page_index(ch, face);
+        let at = self.page_offset[page] as usize + entry;
+        if self.entries[at] != EMPTY {
+            return self.entries[at];
         }
 
         let slot = match slot_from_galley(&galley()) {
@@ -202,11 +179,11 @@ impl GlyphTable {
             },
             _ => BLANK_SLOT,
         };
-        if ascii {
-            self.ascii[idx] = slot;
-        } else {
-            self.rest.insert(key(ch, face), slot);
+        if self.page_offset[page] == 0 {
+            self.page_offset[page] = self.entries.len() as u32;
+            self.entries.resize(self.entries.len() + PAGE_ENTRIES, EMPTY);
         }
+        self.entries[self.page_offset[page] as usize + entry] = slot;
         slot
     }
 }
@@ -390,9 +367,9 @@ mod tests {
 
             let mut body = || {
                 for &ch in &asks {
-                    std::hint::black_box(table.slot(ch, Face::Normal, 14.0, || {
-                        unreachable!("the table is warm")
-                    }));
+                    std::hint::black_box(
+                        table.slot(ch, Face::Normal, 14.0, || unreachable!("the table is warm")),
+                    );
                 }
             };
             for _ in 0..3 {
@@ -430,19 +407,22 @@ mod tests {
         assert_eq!(table.generation(), before, "a hit must not grow the table");
     }
 
-    /// The packed key leaves the top bits to the face, so the highest
-    /// codepoint in one face must not land on a low one in the next.
+    /// The face lives in the high half of a page entry, so the last character
+    /// on a page in one face must not land on the first character in the next.
     #[test]
-    fn the_packed_key_separates_every_face() {
-        let highest = char::MAX;
+    fn a_page_entry_separates_every_face() {
         let faces = [Face::Normal, Face::Bold, Face::Italic, Face::BoldItalic];
+        let edges = [0x4E00u32, 0x4EFF];
 
-        let keys: Vec<u32> = faces.iter().map(|&f| key(highest, f)).collect();
-        let lowest: Vec<u32> = faces.iter().map(|&f| key(' ', f)).collect();
+        let entries: Vec<usize> = faces
+            .iter()
+            .flat_map(|&f| edges.map(|c| page_index(char::from_u32(c).expect("valid"), f).1))
+            .collect();
 
-        for (index, &k) in keys.iter().enumerate() {
-            assert!(!lowest[index + 1..].contains(&k), "{:?} collides", faces[index]);
-        }
+        let mut sorted = entries.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), entries.len(), "two faces share an entry: {entries:?}");
     }
 
     #[test]
