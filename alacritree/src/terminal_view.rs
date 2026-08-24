@@ -863,6 +863,11 @@ pub struct GridSnapshot {
 struct RowSnapshot {
     text: String,
     runs: Vec<Run>,
+    /// Whether any run here carries an underline or a strikeout.  Those are
+    /// egui shapes, and egui retains nothing between frames, so they have to
+    /// be re-emitted for the whole screen; a flag per row is what keeps that
+    /// from walking every run on a screen that has no decorations at all.
+    decorated: bool,
 }
 
 /// What a capture depends on that the terminal's own damage tracking does not
@@ -907,9 +912,24 @@ impl GridSnapshot {
 
     /// Every run in the snapshot, paired with the text it covers.
     fn runs(&self) -> impl Iterator<Item = (&str, &Run)> {
+        self.rows.iter().flat_map(row_runs)
+    }
+
+    /// Every run in `rows`.  A frame that rewrote three rows reads three rows:
+    /// walking the runs of a full screen costs more than writing the records
+    /// of the one row that changed.
+    fn runs_in(&self, rows: std::ops::Range<usize>) -> impl Iterator<Item = (&str, &Run)> {
+        let end = rows.end.min(self.rows.len());
+        self.rows[rows.start.min(end)..end].iter().flat_map(row_runs)
+    }
+
+    /// Runs carrying an underline or a strikeout, wherever they are on screen.
+    fn decorated_runs(&self) -> impl Iterator<Item = (&str, &Run)> {
         self.rows
             .iter()
-            .flat_map(|row| row.runs.iter().map(move |run| (&row.text[run.text.clone()], run)))
+            .filter(|row| row.decorated)
+            .flat_map(row_runs)
+            .filter(|(_, run)| run.flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT))
     }
 
     /// Rows the last capture rewrote, merged into one span.  The GPU path
@@ -1038,6 +1058,7 @@ impl GridSnapshot {
             let dest = &mut self.rows[row];
             dest.text.clear();
             dest.runs.clear();
+            dest.decorated = false;
 
             let mut col = 0;
             while col < cols {
@@ -1070,6 +1091,7 @@ impl GridSnapshot {
                     continue;
                 }
                 let (fg, bg) = run_colors(style, selected, runtime_palette, config);
+                dest.decorated |= style.flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT);
                 dest.runs.push(Run {
                     text: text_start..dest.text.len(),
                     start_col: start,
@@ -1124,6 +1146,10 @@ impl GridSnapshot {
             glyph,
         });
     }
+}
+
+fn row_runs(row: &RowSnapshot) -> impl Iterator<Item = (&str, &Run)> {
+    row.runs.iter().map(move |run| (&row.text[run.text.clone()], run))
 }
 
 /// Viewport rows a buffer-coordinate span covers, clipped to what is on
@@ -1212,10 +1238,8 @@ fn paint_grid_gpu(
     // the buffer still holds what the GPU already has.
     let dirty = snapshot.dirty_rows();
     let runs: Vec<RunView<'_>> = snapshot
-        .runs()
-        .filter(|(_, run)| {
-            !run.flags.contains(Flags::HIDDEN) && dirty.contains(&(run.row as usize))
-        })
+        .runs_in(dirty.clone())
+        .filter(|(_, run)| !run.flags.contains(Flags::HIDDEN))
         .map(|(text, run)| RunView {
             text,
             start_col: run.start_col,
@@ -1251,10 +1275,7 @@ fn paint_grid_gpu(
 
     // Underlines are egui shapes, and egui retains nothing between frames, so
     // these are re-emitted for every row whether or not it changed.
-    for (text, run) in snapshot.runs() {
-        if !run.flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT) {
-            continue;
-        }
+    for (text, run) in snapshot.decorated_runs() {
         let cells = run_rect(rect, text, run, cell_w, cell_h);
         let (x, y, width) = (cells.min.x, cells.min.y, cells.width());
         if run.flags.intersects(Flags::ALL_UNDERLINES) {
@@ -1972,6 +1993,41 @@ mod tests {
 
         let dirty = snapshot.dirty_rows();
         assert!(dirty.start <= 1 && dirty.end >= 3, "selection rows 1..3 missing from {dirty:?}");
+    }
+
+    /// What the GPU path reads to rebuild records.  Reading the runs of a
+    /// clean row costs more than writing the records of the dirty one, so the
+    /// walk has to stop at the damaged span rather than filter after the fact.
+    #[test]
+    fn only_the_dirty_rows_are_re_read_for_the_upload() {
+        let mut term = term_running(b"first
+second
+third");
+        let mut snapshot = GridSnapshot::new();
+        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+
+        Processor::<StdSyncHandler>::new().advance(&mut term, b"[2;1Hrewritten");
+        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+
+        let read: Vec<&str> = snapshot.runs_in(snapshot.dirty_rows()).map(|(t, _)| t).collect();
+        assert!(read.iter().any(|t| t.starts_with("rewritten")), "{read:?}");
+        assert!(!read.iter().any(|t| t.starts_with("first")), "a clean row was re-read: {read:?}");
+    }
+
+    /// Underlines are egui shapes and egui keeps nothing between frames, so an
+    /// underline outside this frame's damage still has to be re-emitted.
+    #[test]
+    fn an_underline_outside_the_damage_is_still_emitted() {
+        let mut term = term_running(b"[4mlinked[0m
+plain");
+        let mut snapshot = GridSnapshot::new();
+        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+
+        Processor::<StdSyncHandler>::new().advance(&mut term, b"[2;1Hrewritten");
+        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+
+        let decorated: Vec<&str> = snapshot.decorated_runs().map(|(t, _)| t).collect();
+        assert_eq!(decorated, ["linked"]);
     }
 
     /// An underline spans the whole run and is drawn in the run's foreground,
