@@ -11,6 +11,7 @@
 //! damaged instead of the whole grid.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 use egui::{Color32, Galley};
 
@@ -88,15 +89,48 @@ pub fn slot_from_galley(galley: &Galley) -> Option<GlyphSlot> {
     })
 }
 
+/// Multiply-shift over a key that is already one integer.  `HashMap`'s
+/// default is SipHash, built to survive keys an attacker chose; a glyph
+/// lookup has no such keys and a terminal asks tens of thousands of times a
+/// frame, so it pays for the protection in the paint path.
+#[derive(Default)]
+struct KeyHasher(u64);
+
+impl Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(byte as u64);
+        }
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.write_u64(value as u64);
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+/// Face and character in one integer, so the map hashes a single word instead
+/// of walking a tuple's fields.  A `char` is at most 21 bits wide.
+fn key(ch: char, face: Face) -> u32 {
+    (face as u32) << 21 | ch as u32
+}
+
 /// Character-and-face to slot index, plus the slot table itself.
 ///
-/// ASCII resolves through a flat array rather than a hash: a hashed
-/// `(char, Face)` key costs about 18 ns per cell where an array index costs
-/// half a nanosecond, and a terminal asks tens of thousands of times a frame.
+/// ASCII resolves through a flat array rather than a hash: a hashed key costs
+/// about twice what an array index does, and a terminal asks tens of thousands
+/// of times a frame.
 pub struct GlyphTable {
     size: f32,
     ascii: Vec<u16>,
-    rest: HashMap<(char, Face), u16>,
+    rest: HashMap<u32, u16, BuildHasherDefault<KeyHasher>>,
     slots: Vec<GlyphSlot>,
     /// Bumped whenever `slots` grows, so a renderer holding an uploaded copy
     /// knows to send the new entries without diffing the table.
@@ -111,7 +145,7 @@ impl Default for GlyphTable {
         Self {
             size: 0.0,
             ascii: vec![EMPTY; ASCII_SLOTS],
-            rest: HashMap::new(),
+            rest: HashMap::default(),
             // Slot 0 is the blank cell; it is never looked up by character.
             slots: vec![GlyphSlot::default()],
             generation: 0,
@@ -156,7 +190,7 @@ impl GlyphTable {
         if ascii && self.ascii[idx] != EMPTY {
             return self.ascii[idx];
         }
-        if !ascii && let Some(&slot) = self.rest.get(&(ch, face)) {
+        if !ascii && let Some(&slot) = self.rest.get(&key(ch, face)) {
             return slot;
         }
 
@@ -171,7 +205,7 @@ impl GlyphTable {
         if ascii {
             self.ascii[idx] = slot;
         } else {
-            self.rest.insert((ch, face), slot);
+            self.rest.insert(key(ch, face), slot);
         }
         slot
     }
@@ -323,6 +357,59 @@ mod tests {
         assert_eq!(size_of::<GlyphInstance>() * 4, size_of::<GlyphSlot>() + 16);
     }
 
+    /// Not a gate — run it by hand:
+    /// `cargo test -p alacritree --release -- --ignored --nocapture report_slot_lookup`
+    ///
+    /// What one screen's worth of slot lookups costs, split by how many
+    /// distinct characters are on it.  ASCII resolves through a flat array;
+    /// everything else takes the general path, which is what a CJK or
+    /// Nerd-Font-heavy screen spends its whole frame in.
+    #[test]
+    #[ignore = "timing harness, not an assertion"]
+    fn report_slot_lookup() {
+        #[cfg(windows)]
+        crate::harden_dll_search_path();
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let cells = 318 * 83;
+
+        for (name, base, distinct) in [
+            ("ascii", ' ' as u32, 95u32),
+            ("cjk, 256 distinct", 0x4E00, 256),
+            ("cjk, 1024 distinct", 0x4E00, 1024),
+            ("cjk, 4096 distinct", 0x4E00, 4096),
+        ] {
+            let asks: Vec<char> = (0..cells as u32)
+                .map(|i| char::from_u32(base + i % distinct).expect("in range"))
+                .collect();
+            let mut table = GlyphTable::default();
+            for &ch in &asks {
+                table.slot(ch, Face::Normal, 14.0, || galley(&ctx, ch));
+            }
+
+            let mut body = || {
+                for &ch in &asks {
+                    std::hint::black_box(table.slot(ch, Face::Normal, 14.0, || {
+                        unreachable!("the table is warm")
+                    }));
+                }
+            };
+            for _ in 0..3 {
+                body();
+            }
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                body();
+            }
+            let each = start.elapsed() / 20;
+            println!(
+                "  {name:<19}: {each:?} for {cells} cells, {:.2} ns/cell",
+                each.as_nanos() as f64 / cells as f64,
+            );
+        }
+    }
+
     #[test]
     fn a_blank_cell_resolves_to_the_reserved_slot() {
         let table = GlyphTable::default();
@@ -341,6 +428,21 @@ mod tests {
 
         assert_eq!(first, again);
         assert_eq!(table.generation(), before, "a hit must not grow the table");
+    }
+
+    /// The packed key leaves the top bits to the face, so the highest
+    /// codepoint in one face must not land on a low one in the next.
+    #[test]
+    fn the_packed_key_separates_every_face() {
+        let highest = char::MAX;
+        let faces = [Face::Normal, Face::Bold, Face::Italic, Face::BoldItalic];
+
+        let keys: Vec<u32> = faces.iter().map(|&f| key(highest, f)).collect();
+        let lowest: Vec<u32> = faces.iter().map(|&f| key(' ', f)).collect();
+
+        for (index, &k) in keys.iter().enumerate() {
+            assert!(!lowest[index + 1..].contains(&k), "{:?} collides", faces[index]);
+        }
     }
 
     #[test]
