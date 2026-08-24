@@ -83,12 +83,24 @@ impl GridState {
 /// the first paint because that is the first time a `glow::Context` exists.
 pub struct GpuGrid {
     pub state: Arc<Mutex<GridState>>,
-    gl: Arc<Mutex<Option<GlResources>>>,
+    gl: Arc<Mutex<GlSlot>>,
+}
+
+/// Building the GL side is attempted exactly once.  A driver that rejects the
+/// shaders rejects them every frame, and each attempt allocates before it
+/// discovers that, so a retrying build is a leak with no visible cause.
+enum GlSlot {
+    Unbuilt,
+    Ready(GlResources),
+    Failed,
 }
 
 impl GpuGrid {
     pub fn new() -> Self {
-        Self { state: Arc::new(Mutex::new(GridState::default())), gl: Arc::new(Mutex::new(None)) }
+        Self {
+            state: Arc::new(Mutex::new(GridState::default())),
+            gl: Arc::new(Mutex::new(GlSlot::Unbuilt)),
+        }
     }
 
     /// The shape to hand egui.  Everything it draws comes from `state`, which
@@ -100,15 +112,17 @@ impl GpuGrid {
             callback: Arc::new(eframe::egui_glow::CallbackFn::new(move |_info, painter| {
                 let mut held = resources.lock().expect("gl resources");
                 let gl = painter.gl().clone();
-                let resources = match held.as_mut() {
-                    Some(r) => r,
-                    None => match GlResources::new(&gl) {
-                        Ok(r) => held.insert(r),
+                if let GlSlot::Unbuilt = *held {
+                    *held = match GlResources::new(&gl) {
+                        Ok(resources) => GlSlot::Ready(resources),
                         Err(err) => {
                             log::error!("gpu grid disabled: {err}");
-                            return;
+                            GlSlot::Failed
                         },
-                    },
+                    };
+                }
+                let GlSlot::Ready(resources) = &mut *held else {
+                    return;
                 };
                 let mut state = state.lock().expect("grid state");
                 let atlas = painter.texture(egui::TextureId::default());
@@ -169,7 +183,16 @@ impl GlResources {
 
         unsafe {
             let glyph = link(gl, header, GLYPH_VERT, GLYPH_FRAG, srgb_atlas)?;
-            let background = link(gl, header, BACKGROUND_VERT, BACKGROUND_FRAG, srgb_atlas)?;
+            let background = match link(gl, header, BACKGROUND_VERT, BACKGROUND_FRAG, srgb_atlas) {
+                Ok(program) => program,
+                Err(err) => {
+                    gl.delete_program(glyph.program);
+                    return Err(err);
+                },
+            };
+            // `glGen*` returns zero only on a context that is already dead, and
+            // the caller latches the failure, so the objects a partial run
+            // leaves behind are made at most once.
             let vao = gl.create_vertex_array()?;
             let instances = gl.create_buffer()?;
             let slot_texture = gl.create_texture()?;
@@ -390,6 +413,18 @@ fn bytemuck_cast<T>(slice: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), std::mem::size_of_val(slice)) }
 }
 
+/// Give back everything a failed `link` created.  Deleting the program
+/// detaches whatever is still attached to it, so the shaders flagged here are
+/// released either way.
+unsafe fn discard(gl: &glow::Context, program: glow::Program, shaders: &[glow::Shader]) {
+    unsafe {
+        for &shader in shaders {
+            gl.delete_shader(shader);
+        }
+        gl.delete_program(program);
+    }
+}
+
 unsafe fn link(
     gl: &glow::Context,
     header: &str,
@@ -402,18 +437,28 @@ unsafe fn link(
         let program = gl.create_program()?;
         let mut shaders = Vec::new();
         for (kind, body) in [(glow::VERTEX_SHADER, vertex), (glow::FRAGMENT_SHADER, fragment)] {
-            let shader = gl.create_shader(kind)?;
+            let shader = match gl.create_shader(kind) {
+                Ok(shader) => shader,
+                Err(err) => {
+                    discard(gl, program, &shaders);
+                    return Err(err);
+                },
+            };
+            shaders.push(shader);
             gl.shader_source(shader, &format!("{header}{defines}{body}"));
             gl.compile_shader(shader);
             if !gl.get_shader_compile_status(shader) {
-                return Err(gl.get_shader_info_log(shader));
+                let log = gl.get_shader_info_log(shader);
+                discard(gl, program, &shaders);
+                return Err(log);
             }
             gl.attach_shader(program, shader);
-            shaders.push(shader);
         }
         gl.link_program(program);
         if !gl.get_program_link_status(program) {
-            return Err(gl.get_program_info_log(program));
+            let log = gl.get_program_info_log(program);
+            discard(gl, program, &shaders);
+            return Err(log);
         }
         for shader in shaders {
             gl.detach_shader(program, shader);
