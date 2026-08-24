@@ -25,14 +25,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          token: ${{ secrets.ALACRITREE_BOT_TOKEN }}
           # We rev-parse upstream/master to compare commit ranges, which
           # needs the full history rather than the shallow default.
           fetch-depth: 0
 
       - name: Check for upstream updates
         env:
-          GH_TOKEN: ${{ secrets.ALACRITREE_BOT_TOKEN }}
+          # The explicit permissions above and the repository setting allow
+          # this short-lived, repository-scoped token to push and open PRs.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           marker=.github/upstream-sync.toml
