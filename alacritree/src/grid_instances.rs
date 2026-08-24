@@ -120,10 +120,6 @@ impl Default for GlyphTable {
 }
 
 impl GlyphTable {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn slots(&self) -> &[GlyphSlot] {
         &self.slots
     }
@@ -199,10 +195,6 @@ pub struct GridInstances {
 }
 
 impl GridInstances {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn dimensions(&self) -> (usize, usize) {
         (self.cols, self.rows)
     }
@@ -333,7 +325,7 @@ mod tests {
 
     #[test]
     fn a_blank_cell_resolves_to_the_reserved_slot() {
-        let table = GlyphTable::new();
+        let table = GlyphTable::default();
         assert_eq!(table.slots()[BLANK_SLOT as usize].size, [0.0, 0.0]);
     }
 
@@ -341,7 +333,7 @@ mod tests {
     fn the_same_character_interns_once() {
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |_| {});
-        let mut table = GlyphTable::new();
+        let mut table = GlyphTable::default();
 
         let first = table.slot('a', Face::Normal, 14.0, || galley(&ctx, 'a'));
         let before = table.generation();
@@ -355,7 +347,7 @@ mod tests {
     fn the_same_character_in_two_faces_takes_two_slots() {
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |_| {});
-        let mut table = GlyphTable::new();
+        let mut table = GlyphTable::default();
 
         let normal = table.slot('a', Face::Normal, 14.0, || galley(&ctx, 'a'));
         let bold = table.slot('a', Face::Bold, 14.0, || galley(&ctx, 'a'));
@@ -370,7 +362,7 @@ mod tests {
     fn a_font_size_change_drops_every_slot() {
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |_| {});
-        let mut table = GlyphTable::new();
+        let mut table = GlyphTable::default();
         table.slot('a', Face::Normal, 14.0, || galley(&ctx, 'a'));
 
         table.slot('a', Face::Normal, 20.0, || galley(&ctx, 'a'));
@@ -382,7 +374,7 @@ mod tests {
     /// uploaded without touching its neighbours.
     #[test]
     fn a_row_keeps_its_place_when_a_neighbour_changes() {
-        let mut grid = GridInstances::new();
+        let mut grid = GridInstances::default();
         grid.resize(4, 3, Color32::BLACK);
         let runs = [RunView {
             text: "ab",
@@ -405,7 +397,7 @@ mod tests {
 
     #[test]
     fn rewriting_a_row_clears_what_the_last_frame_left() {
-        let mut grid = GridInstances::new();
+        let mut grid = GridInstances::default();
         grid.resize(4, 2, Color32::BLACK);
         let row0 = |text| {
             [RunView {
@@ -431,7 +423,7 @@ mod tests {
     /// count back into the geometry the instancing removed.
     #[test]
     fn a_default_background_run_emits_no_quad() {
-        let mut grid = GridInstances::new();
+        let mut grid = GridInstances::default();
         grid.resize(4, 1, Color32::BLACK);
         let runs = [RunView {
             text: "ab",
@@ -451,7 +443,7 @@ mod tests {
 
     #[test]
     fn a_coloured_run_emits_one_quad_and_fills_its_cells() {
-        let mut grid = GridInstances::new();
+        let mut grid = GridInstances::default();
         grid.resize(4, 1, Color32::BLACK);
         let runs = [RunView {
             text: "ab",

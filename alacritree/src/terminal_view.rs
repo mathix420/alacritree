@@ -1,10 +1,10 @@
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
-use alacritty_terminal::term::Term;
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::search::Match;
+use alacritty_terminal::term::{Term, TermDamage};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape};
 use egui::{
     Color32, CursorIcon, Event, FontFamily, FontId, ImeEvent, Modifiers, MouseWheelUnit,
@@ -15,16 +15,16 @@ use crate::builtin_font::{BuiltinGlyphCache, Metrics, is_builtin_glyph};
 use crate::clipboard::{self, Target};
 use crate::color_glyph::{CachedColorGlyph, ColorGlyphCache};
 use crate::colors::{background, foreground, resolve, rgb_to_color32};
-use crate::config::Config;
+use crate::config::{Config, Palette};
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
+use crate::glyph_cache::{Face, GlyphCache, MAX_EXTRA_CELLS, growth_offset, may_grow};
 use crate::grid_gl::{Frame as GridFrame, GpuGrid};
 use crate::grid_instances::RunView;
-use crate::glyph_cache::{Face, GlyphCache, MAX_EXTRA_CELLS, growth_offset, may_grow};
 use crate::input::{associated_text, event_to_bytes};
 use crate::links::{self, Link};
 use crate::mouse;
 use crate::paste;
-use crate::session::{EventProxy, Session, SessionKind, TermSize};
+use crate::session::{EventProxy, Session, SessionId, SessionKind, TermSize};
 
 #[allow(clippy::too_many_arguments)]
 pub fn show(
@@ -130,8 +130,9 @@ pub fn show(
     // The guard is a temporary so it is dropped at the end of this statement:
     // nothing below may run while the terminal is locked.
     snapshot.capture(
-        &session.term.lock(),
+        &mut session.term.lock(),
         config,
+        session.id,
         peek.link.as_ref().map(|l| &l.bounds),
         // The preedit overlay replaces the cursor while composing
         // (alacritty hides it the same way, display/content.rs).
@@ -140,7 +141,16 @@ pub fn show(
     match gpu.filter(|_| config.ui.gpu_grid) {
         Some(gpu) => {
             paint_grid_gpu(
-                gpu, &painter, rect, snapshot, config, cell_w, cell_h, cols, rows, glyphs,
+                gpu,
+                &painter,
+                rect,
+                snapshot,
+                config,
+                cell_w,
+                cell_h,
+                cols,
+                rows,
+                glyphs,
                 ui.ctx(),
             );
             if let Some(cursor) = &snapshot.cursor {
@@ -832,17 +842,45 @@ impl Style {
 /// copy, so painting from a snapshot needs neither the lock nor the palette.
 #[derive(Default)]
 pub struct GridSnapshot {
-    text: String,
-    runs: Vec<Run>,
+    /// One entry per viewport row.  Each row owns its bytes so re-walking one
+    /// row never moves another's, which is what lets a capture skip the rows
+    /// the terminal reports as clean.
+    rows: Vec<RowSnapshot>,
     cursor: Option<CursorSnapshot>,
     /// Viewport cell holding the terminal cursor, recorded whether or not the
     /// cursor is drawn: the IME candidate window follows the caret even while
     /// the running app keeps the cursor hidden.
     caret: Option<(usize, i32)>,
+    /// Rows the last capture rewrote, merged into one span.
+    dirty_rows: std::ops::Range<usize>,
+    /// Scratch for the rows a capture is about to walk, reused so reading
+    /// damage costs no allocation.
+    damaged: Vec<usize>,
+    context: CaptureContext,
 }
 
-/// A span of cells sharing one resolved style, indexing into
-/// `GridSnapshot::text`.
+#[derive(Default)]
+struct RowSnapshot {
+    text: String,
+    runs: Vec<Run>,
+}
+
+/// What a capture depends on that the terminal's own damage tracking does not
+/// cover.  `Term::damage` documents the selection as caller-tracked, and it
+/// knows nothing about link highlighting or our configured palette, so a
+/// change to any of these invalidates rows the terminal calls clean.
+#[derive(Default, PartialEq)]
+struct CaptureContext {
+    /// One snapshot is reused for every session, so the rows it holds belong
+    /// to whichever terminal filled them last.
+    session: Option<SessionId>,
+    selection: Option<SelectionRange>,
+    link: Option<Match>,
+    palette: Option<Palette>,
+    dimensions: (usize, usize),
+}
+
+/// A span of cells sharing one resolved style, indexing into its row's text.
 struct Run {
     text: std::ops::Range<usize>,
     start_col: usize,
@@ -867,41 +905,146 @@ impl GridSnapshot {
         Self::default()
     }
 
+    /// Every run in the snapshot, paired with the text it covers.
+    fn runs(&self) -> impl Iterator<Item = (&str, &Run)> {
+        self.rows
+            .iter()
+            .flat_map(|row| row.runs.iter().map(move |run| (&row.text[run.text.clone()], run)))
+    }
+
+    /// Rows the last capture rewrote, merged into one span.  The GPU path
+    /// uploads exactly this much.
+    fn dirty_rows(&self) -> std::ops::Range<usize> {
+        self.dirty_rows.clone()
+    }
+
+    /// Fill `damaged` with the viewport rows this capture has to re-walk, and
+    /// `dirty_rows` with the span covering them.
+    ///
+    /// Mirrors `Display::update_damage` in alacritty: take the terminal's own
+    /// damage, then add what it documents as the caller's to track.  Anything
+    /// that moves every row — a resize, a scroll, a palette change, the first
+    /// capture — comes back as the full range.
+    fn collect_damage(
+        &mut self,
+        term: &mut Term<EventProxy>,
+        config: &Config,
+        session: SessionId,
+        link_bounds: Option<&Match>,
+        selection: Option<SelectionRange>,
+        cols: usize,
+        screen_lines: usize,
+    ) {
+        self.damaged.clear();
+
+        let context = CaptureContext {
+            session: Some(session),
+            selection,
+            link: link_bounds.cloned(),
+            palette: Some(config.palette.clone()),
+            dimensions: (cols, screen_lines),
+        };
+        let rebuilt = self.rows.len() != screen_lines
+            || self.context.session != context.session
+            || self.context.dimensions != context.dimensions
+            || self.context.palette != context.palette;
+        if rebuilt {
+            self.rows.clear();
+            self.rows.resize_with(screen_lines, RowSnapshot::default);
+        }
+
+        let display_offset = term.grid().display_offset() as i32;
+        let mut full = rebuilt;
+        match term.damage() {
+            TermDamage::Full => full = true,
+            TermDamage::Partial(lines) => {
+                self.damaged.extend(lines.map(|line| line.line).filter(|&l| l < screen_lines));
+            },
+        }
+        term.reset_damage();
+
+        // A selection or a link highlight restyles cells the terminal never
+        // wrote to, so both edges of the change have to be re-walked.
+        for range in [self.context.selection, context.selection] {
+            if let Some(range) = range {
+                self.damaged.extend(viewport_rows(
+                    range.start,
+                    range.end,
+                    display_offset,
+                    screen_lines,
+                ));
+            }
+        }
+        for link in [self.context.link.as_ref(), context.link.as_ref()] {
+            if let Some(link) = link {
+                self.damaged.extend(viewport_rows(
+                    *link.start(),
+                    *link.end(),
+                    display_offset,
+                    screen_lines,
+                ));
+            }
+        }
+        self.context = context;
+
+        if full {
+            self.damaged.clear();
+            self.damaged.extend(0..screen_lines);
+        } else {
+            self.damaged.sort_unstable();
+            self.damaged.dedup();
+        }
+        self.dirty_rows = match (self.damaged.first(), self.damaged.last()) {
+            (Some(&first), Some(&last)) => first..last + 1,
+            _ => 0..0,
+        };
+    }
+
     fn capture(
         &mut self,
-        term: &Term<EventProxy>,
+        term: &mut Term<EventProxy>,
         config: &Config,
+        session: SessionId,
         link_bounds: Option<&Match>,
         cursor_hidden: bool,
     ) {
-        self.text.clear();
-        self.runs.clear();
         self.cursor = None;
         self.caret = None;
 
+        let display_offset = term.grid().display_offset() as i32;
+        let screen_lines = term.grid().screen_lines();
+        let cols = term.grid().columns();
+        let selection_range = term.selection.as_ref().and_then(|s| s.to_range(term));
+
+        self.collect_damage(
+            term,
+            config,
+            session,
+            link_bounds,
+            selection_range,
+            cols,
+            screen_lines,
+        );
+
         let runtime_palette = term.colors();
         let grid = term.grid();
-        let display_offset = grid.display_offset() as i32;
-        let screen_lines = grid.screen_lines() as i32;
-        let cols = grid.columns();
-
-        // Resolve the active selection once per frame; the per-cell range checks
-        // are cheap and avoid re-deriving it for every run.
-        let selection_range = term.selection.as_ref().and_then(|s| s.to_range(term));
         let in_link = |line: Line, column: Column| {
             link_bounds.is_some_and(|b| b.contains(&Point::new(line, column)))
         };
 
-        for row in 0..screen_lines {
-            let line = Line(row - display_offset);
+        for &row in &self.damaged {
+            let line = Line(row as i32 - display_offset);
             let cells = &grid[line];
+            let dest = &mut self.rows[row];
+            dest.text.clear();
+            dest.runs.clear();
 
             let mut col = 0;
             while col < cols {
                 let start = col;
                 let style = Style::from_cell(&cells[Column(col)], in_link(line, Column(col)));
                 let selected = is_selected(selection_range.as_ref(), line, Column(col));
-                let text_start = self.text.len();
+                let text_start = dest.text.len();
                 while col < cols {
                     let cell = &cells[Column(col)];
                     let cell_style = Style::from_cell(cell, in_link(line, Column(col)));
@@ -920,17 +1063,17 @@ impl GridSnapshot {
                     } else {
                         cell.c
                     };
-                    self.text.push(ch);
+                    dest.text.push(ch);
                     col += 1;
                 }
-                if self.text.len() == text_start {
+                if dest.text.len() == text_start {
                     continue;
                 }
                 let (fg, bg) = run_colors(style, selected, runtime_palette, config);
-                self.runs.push(Run {
-                    text: text_start..self.text.len(),
+                dest.runs.push(Run {
+                    text: text_start..dest.text.len(),
                     start_col: start,
-                    row,
+                    row: row as i32,
                     flags: style.flags,
                     fg,
                     bg,
@@ -941,7 +1084,7 @@ impl GridSnapshot {
 
         let cursor_point: Point = grid.cursor.point;
         let cursor_row = cursor_point.line.0 + display_offset;
-        let in_view = cursor_row >= 0 && cursor_row < screen_lines;
+        let in_view = cursor_row >= 0 && cursor_row < screen_lines as i32;
         self.caret = in_view.then_some((cursor_point.column.0, cursor_row));
 
         let shape = cursor_shape(term);
@@ -981,6 +1124,21 @@ impl GridSnapshot {
             glyph,
         });
     }
+}
+
+/// Viewport rows a buffer-coordinate span covers, clipped to what is on
+/// screen.  A span entirely in scrollback comes back empty.
+fn viewport_rows(
+    start: Point,
+    end: Point,
+    display_offset: i32,
+    screen_lines: usize,
+) -> std::ops::Range<usize> {
+    let (first, last) = (start.line.0 + display_offset, end.line.0 + display_offset);
+    if last < 0 || first >= screen_lines as i32 {
+        return 0..0;
+    }
+    first.max(0) as usize..(last as usize + 1).min(screen_lines)
 }
 
 /// Foreground and background a run is drawn with, after INVERSE and the
@@ -1050,12 +1208,16 @@ fn paint_grid_gpu(
     let size = config.font.egui_size();
     let atlas = ctx.fonts(|f| f.font_image_size());
 
+    // Only the rows this frame's capture rewrote need new records; the rest of
+    // the buffer still holds what the GPU already has.
+    let dirty = snapshot.dirty_rows();
     let runs: Vec<RunView<'_>> = snapshot
-        .runs
-        .iter()
-        .filter(|run| !run.flags.contains(Flags::HIDDEN))
-        .map(|run| RunView {
-            text: &snapshot.text[run.text.clone()],
+        .runs()
+        .filter(|(_, run)| {
+            !run.flags.contains(Flags::HIDDEN) && dirty.contains(&(run.row as usize))
+        })
+        .map(|(text, run)| RunView {
+            text,
             start_col: run.start_col,
             row: run.row as usize,
             face: Face::new(run.flags.contains(Flags::BOLD), run.flags.contains(Flags::ITALIC)),
@@ -1080,18 +1242,20 @@ fn paint_grid_gpu(
             line_thickness: 1.0,
         };
         let (instances, table) = state.buffers();
-        instances.write_rows(0..rows, &runs, default_bg, |ch, face| {
+        instances.write_rows(dirty.clone(), &runs, default_bg, |ch, face| {
             table.slot(ch, face, size, || glyphs.get(ctx, ch, face, size))
         });
-        state.mark_all_dirty();
+        state.mark_rows_dirty(dirty);
     }
     painter.add(gpu.callback(rect));
 
-    for run in &snapshot.runs {
+    // Underlines are egui shapes, and egui retains nothing between frames, so
+    // these are re-emitted for every row whether or not it changed.
+    for (text, run) in snapshot.runs() {
         if !run.flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT) {
             continue;
         }
-        let cells = run_rect(rect, &snapshot.text[run.text.clone()], run, cell_w, cell_h);
+        let cells = run_rect(rect, text, run, cell_w, cell_h);
         let (x, y, width) = (cells.min.x, cells.min.y, cells.width());
         if run.flags.intersects(Flags::ALL_UNDERLINES) {
             let uy = y + cell_h - 1.5;
@@ -1133,22 +1297,14 @@ fn paint_grid(
     // Nerd Font icon a shade wider than its cell loses its right edge.
     // Alacritty's renderer already works this way: one background pass over
     // the whole batch, then the text passes (`renderer/text/gles2.rs`).
-    for run in &snapshot.runs {
-        paint_run_background(
-            painter,
-            rect,
-            &snapshot.text[run.text.clone()],
-            run,
-            cell_w,
-            cell_h,
-            bg_color,
-        );
+    for (text, run) in snapshot.runs() {
+        paint_run_background(painter, rect, text, run, cell_w, cell_h, bg_color);
     }
-    for run in &snapshot.runs {
+    for (text, run) in snapshot.runs() {
         paint_run_glyphs(
             painter,
             rect,
-            &snapshot.text[run.text.clone()],
+            text,
             run,
             config,
             font_id,
@@ -1731,20 +1887,91 @@ mod tests {
     /// glyph can only grow into blanks its own run holds.
     #[test]
     fn a_blank_in_another_foreground_joins_the_run() {
-        let term = term_running(b"\x1b[31mA\x1b[39m \x1b[31mB");
+        let mut term = term_running(b"\x1b[31mA\x1b[39m \x1b[31mB");
         let mut snapshot = GridSnapshot::new();
 
-        snapshot.capture(&term, &Config::default(), None, true);
+        snapshot.capture(&mut term, &Config::default(), 0, None, true);
 
-        let run = snapshot
-            .runs
-            .iter()
-            .find(|r| snapshot.text[r.text.clone()].starts_with('A'))
-            .expect("a run holding 'A'");
+        let (text, _) =
+            snapshot.runs().find(|(text, _)| text.starts_with('A')).expect("a run holding 'A'");
+        assert!(text.starts_with("A "), "the blank after 'A' left the run");
+    }
+
+    /// The first capture has nothing to reuse, so it walks the whole viewport
+    /// however little the terminal reports as damaged.
+    #[test]
+    fn the_first_capture_covers_every_row() {
+        let mut term = term_running(b"hello");
+        let mut snapshot = GridSnapshot::new();
+
+        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+
+        assert_eq!(snapshot.dirty_rows(), 0..24);
+    }
+
+    /// The whole point of reading damage: a frame that changed one row rewrites
+    /// one row.  The cursor stays on the line being written and `Term::damage`
+    /// always reports its line, so this is the narrowest span a frame produces.
+    #[test]
+    fn writing_one_line_dirties_only_that_line() {
+        let mut term = term_running(b"first\r\nsecond");
+        let mut snapshot = GridSnapshot::new();
+        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+
+        Processor::<StdSyncHandler>::new().advance(&mut term, b"!");
+        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+
+        assert_eq!(snapshot.dirty_rows(), 1..2);
+    }
+
+    /// Rows the terminal never touched keep the text the last capture gave
+    /// them, so a partial capture still describes the whole screen.
+    #[test]
+    fn an_undamaged_row_keeps_its_text() {
+        let mut term = term_running(b"first\r\nsecond");
+        let mut snapshot = GridSnapshot::new();
+        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+
+        Processor::<StdSyncHandler>::new().advance(&mut term, b"!");
+        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+
         assert!(
-            snapshot.text[run.text.clone()].starts_with("A "),
-            "the blank after 'A' left the run"
+            snapshot.runs().any(|(text, run)| run.row == 0 && text.starts_with("first")),
+            "row 0 lost its text when only row 1 was damaged"
         );
+    }
+
+    /// One snapshot serves every session, so rows left over from the terminal
+    /// it captured last must not survive into the next one.
+    #[test]
+    fn switching_session_rewrites_every_row() {
+        let mut term = term_running(b"first\r\nsecond");
+        let mut snapshot = GridSnapshot::new();
+        snapshot.capture(&mut term, &Config::default(), 7, None, false);
+        Processor::<StdSyncHandler>::new().advance(&mut term, b"!");
+
+        snapshot.capture(&mut term, &Config::default(), 9, None, false);
+
+        assert_eq!(snapshot.dirty_rows(), 0..24);
+    }
+
+    /// `Term::damage` documents the selection as the caller's to track, so a
+    /// selection appearing over cells the terminal never rewrote has to dirty
+    /// them itself.
+    #[test]
+    fn a_new_selection_dirties_the_rows_it_covers() {
+        let mut term = term_running(b"first\r\nsecond\r\nthird\r\nfourth");
+        let mut snapshot = GridSnapshot::new();
+        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+
+        let mut selection =
+            Selection::new(SelectionType::Simple, Point::new(Line(1), Column(0)), Side::Left);
+        selection.update(Point::new(Line(2), Column(3)), Side::Right);
+        term.selection = Some(selection);
+        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+
+        let dirty = snapshot.dirty_rows();
+        assert!(dirty.start <= 1 && dirty.end >= 3, "selection rows 1..3 missing from {dirty:?}");
     }
 
     /// An underline spans the whole run and is drawn in the run's foreground,
@@ -1752,17 +1979,14 @@ mod tests {
     /// wrong colour.
     #[test]
     fn an_underlined_blank_in_another_foreground_keeps_its_own_run() {
-        let term = term_running(b"\x1b[4;31mA\x1b[39m \x1b[31mB");
+        let mut term = term_running(b"\x1b[4;31mA\x1b[39m \x1b[31mB");
         let mut snapshot = GridSnapshot::new();
 
-        snapshot.capture(&term, &Config::default(), None, true);
+        snapshot.capture(&mut term, &Config::default(), 0, None, true);
 
-        let run = snapshot
-            .runs
-            .iter()
-            .find(|r| snapshot.text[r.text.clone()].starts_with('A'))
-            .expect("a run holding 'A'");
-        assert_eq!(&snapshot.text[run.text.clone()], "A", "an underlined blank was absorbed");
+        let (text, _) =
+            snapshot.runs().find(|(text, _)| text.starts_with('A')).expect("a run holding 'A'");
+        assert_eq!(text, "A", "an underlined blank was absorbed");
     }
 
     /// The IME candidate window is placed from the caret, so the caret has to
@@ -1771,10 +1995,10 @@ mod tests {
     /// too would pin the candidate popup to the corner of the grid.
     #[test]
     fn a_hidden_cursor_still_leaves_a_caret() {
-        let term = term_running(b"\x1b[?25labc");
+        let mut term = term_running(b"\x1b[?25labc");
         let mut snapshot = GridSnapshot::new();
 
-        snapshot.capture(&term, &Config::default(), None, false);
+        snapshot.capture(&mut term, &Config::default(), 0, None, false);
 
         assert!(snapshot.cursor.is_none(), "a hidden cursor was drawn");
         assert_eq!(snapshot.caret, Some((3, 0)), "the caret lost the cursor cell");
@@ -2634,31 +2858,24 @@ mod tests {
 
         let mut snapshot = GridSnapshot::new();
         {
-            let term = session.term.lock();
-            snapshot.capture(&term, &config, None, false);
+            let mut term = session.term.lock();
+            snapshot.capture(&mut term, &config, 0, None, false);
         }
         let size = config.font.egui_size();
         let default_bg = background(&config.palette);
-        let mut table = GlyphTable::new();
-        let mut grid = GridInstances::new();
+        let mut table = GlyphTable::default();
+        let mut grid = GridInstances::default();
         grid.resize(cols, rows, default_bg);
 
-        fn views<'a>(
-            snapshot: &'a GridSnapshot,
-            want: &dyn Fn(usize) -> bool,
-        ) -> Vec<RunView<'a>> {
+        fn views<'a>(snapshot: &'a GridSnapshot, want: &dyn Fn(usize) -> bool) -> Vec<RunView<'a>> {
             snapshot
-                .runs
-                .iter()
-                .filter(|r| want(r.row as usize))
-                .map(|r| RunView {
-                    text: &snapshot.text[r.text.clone()],
+                .runs()
+                .filter(|(_, r)| want(r.row as usize))
+                .map(|(text, r)| RunView {
+                    text,
                     start_col: r.start_col,
                     row: r.row as usize,
-                    face: Face::new(
-                        r.flags.contains(Flags::BOLD),
-                        r.flags.contains(Flags::ITALIC),
-                    ),
+                    face: Face::new(r.flags.contains(Flags::BOLD), r.flags.contains(Flags::ITALIC)),
                     flags: u16::from(r.flags.intersects(Flags::ALL_UNDERLINES))
                         * cell_flags::UNDERLINE
                         | u16::from(r.flags.contains(Flags::STRIKEOUT)) * cell_flags::STRIKEOUT,
@@ -2689,7 +2906,12 @@ mod tests {
         });
         let slots = table.slots().len();
 
-        println!("{cols}x{rows} cells, {} runs, {slots} distinct glyphs", snapshot.runs.len());
+        println!("{cols}x{rows} cells, {} runs, {slots} distinct glyphs", snapshot.runs().count());
+        println!(
+            "  reading one row costs {} B of grid, writing it {} B of records",
+            cols * size_of::<Cell>(),
+            cols * (size_of::<crate::grid_instances::GlyphInstance>() + size_of::<u32>()),
+        );
         for damaged in [rows, rows / 2, 8, 3, 1] {
             let touched = views(&snapshot, &|row| row < damaged);
             let build = time(iterations, || {
@@ -2721,9 +2943,9 @@ mod tests {
         println!("  tessellate a callback-only shape list: {tessellate:?}");
 
         let capture = time(iterations, || {
-            let term = session.term.lock();
-            snapshot.capture(&term, &config, None, false);
-            std::hint::black_box(snapshot.runs.len());
+            let mut term = session.term.lock();
+            snapshot.capture(&mut term, &config, 0, None, false);
+            std::hint::black_box(snapshot.runs().count());
         });
         println!("  capture the grid under the lock      : {capture:?}");
     }
@@ -3064,7 +3286,13 @@ mod tests {
                         let painter = ui.painter_at(rect);
 
                         glyph_cache.begin_frame(ui.ctx());
-                        snapshot.capture(&session.term.lock(), &config, None, false);
+                        snapshot.capture(
+                            &mut session.term.lock(),
+                            &config,
+                            session.id,
+                            None,
+                            false,
+                        );
 
                         let tex = ui.ctx().fonts(|f| f.font_image_size());
                         let inv = Vec2::new(1.0 / tex[0] as f32, 1.0 / tex[1] as f32);
@@ -3080,16 +3308,15 @@ mod tests {
                         mesh.vertices.clear();
                         mesh.indices.clear();
 
-                        for run in &snapshot.runs {
+                        for (text, run) in snapshot.runs() {
                             if run.bg != default_bg || run.selected {
-                                let text = &snapshot.text[run.text.clone()];
                                 mesh.add_colored_rect(
                                     run_rect(rect, text, run, cell_w, cell_h),
                                     run.bg,
                                 );
                             }
                         }
-                        for run in &snapshot.runs {
+                        for (text, run) in snapshot.runs() {
                             if run.flags.contains(Flags::HIDDEN) {
                                 continue;
                             }
@@ -3097,7 +3324,6 @@ mod tests {
                                 run.flags.contains(Flags::BOLD),
                                 run.flags.contains(Flags::ITALIC),
                             );
-                            let text = &snapshot.text[run.text.clone()];
                             let x = rect.min.x + run.start_col as f32 * cell_w;
                             let y = rect.min.y + run.row as f32 * cell_h;
                             for (i, ch) in text.chars().enumerate() {
@@ -3219,16 +3445,16 @@ mod tests {
 
         let mut snapshot = GridSnapshot::new();
         {
-            let term = session.term.lock();
-            snapshot.capture(&term, &config, None, false);
+            let mut term = session.term.lock();
+            snapshot.capture(&mut term, &config, 0, None, false);
         }
 
         // Every (char, face) the frame asks for, in paint order.
         let mut asks: Vec<(char, Face)> = Vec::new();
-        for run in &snapshot.runs {
+        for (text, run) in snapshot.runs() {
             let face =
                 Face::new(run.flags.contains(Flags::BOLD), run.flags.contains(Flags::ITALIC));
-            for ch in snapshot.text[run.text.clone()].chars() {
+            for ch in text.chars() {
                 if ch != ' ' {
                     asks.push((ch, face));
                 }
@@ -3325,30 +3551,29 @@ mod tests {
         let capture = {
             let mut snapshot = GridSnapshot::new();
             time(iterations, || {
-                let term = session.term.lock();
-                snapshot.capture(&term, &config, None, false);
-                std::hint::black_box(snapshot.runs.len());
+                let mut term = session.term.lock();
+                snapshot.capture(&mut term, &config, 0, None, false);
+                std::hint::black_box(snapshot.runs().count());
             })
         };
 
         let mut snapshot = GridSnapshot::new();
         {
-            let term = session.term.lock();
-            snapshot.capture(&term, &config, None, false);
+            let mut term = session.term.lock();
+            snapshot.capture(&mut term, &config, 0, None, false);
         }
-        let cells: usize =
-            snapshot.runs.iter().map(|r| snapshot.text[r.text.clone()].chars().count()).sum();
+        let cells: usize = snapshot.runs().map(|(text, _)| text.chars().count()).sum();
 
         let font_size = config.font.size as f32;
         let lookup = {
             let glyphs = &mut caches.glyphs;
             time(iterations, || {
-                for run in &snapshot.runs {
+                for (text, run) in snapshot.runs() {
                     let face = Face::new(
                         run.flags.contains(Flags::BOLD),
                         run.flags.contains(Flags::ITALIC),
                     );
-                    for ch in snapshot.text[run.text.clone()].chars() {
+                    for ch in text.chars() {
                         if ch == ' ' {
                             continue;
                         }
@@ -3361,23 +3586,22 @@ mod tests {
         // The same walk with the galley lookup removed, so the loop overhead
         // the lookup number carries can be subtracted out.
         let walk = time(iterations, || {
-            for run in &snapshot.runs {
+            for (text, run) in snapshot.runs() {
                 let face =
                     Face::new(run.flags.contains(Flags::BOLD), run.flags.contains(Flags::ITALIC));
                 std::hint::black_box(face);
-                for ch in snapshot.text[run.text.clone()].chars() {
+                for ch in text.chars() {
                     std::hint::black_box(ch);
                 }
             }
         });
 
-        println!("{cols}x{rows} cells, {} runs, {cells} non-blank cells", snapshot.runs.len());
+        println!("{cols}x{rows} cells, {} runs, {cells} non-blank cells", snapshot.runs().count());
         println!("  capture the grid under the lock : {capture:?}");
         println!("  walk runs and chars, no lookup  : {walk:?}");
         println!("  same walk with GlyphCache::get  : {lookup:?}");
         println!("  net galley lookup               : {:?}", lookup.saturating_sub(walk));
     }
-
 
     /// Full-screen apps hide the cursor with DECTCEM while they repaint, then
     /// leave it parked wherever their last write landed.  Drawing it anyway
