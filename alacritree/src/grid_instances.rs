@@ -12,7 +12,7 @@
 
 use egui::{Color32, Galley};
 
-use crate::glyph_cache::Face;
+use crate::glyph_cache::{AtlasState, Face};
 
 /// Slot 0 is reserved for a cell with nothing to draw.  Its size is zero, so
 /// the vertex shader collapses the quad and the rasterizer discards it.
@@ -99,6 +99,9 @@ pub struct GlyphTable {
     page_offset: Vec<u32>,
     entries: Vec<u16>,
     slots: Vec<GlyphSlot>,
+    /// The atlas the live slots were read against, once a frame has observed
+    /// one.  `None` before the first `begin_frame`, when nothing is cached.
+    atlas: Option<AtlasState>,
     /// Bumped whenever `slots` grows, so a renderer holding an uploaded copy
     /// knows to send the new entries without diffing the table.
     generation: u32,
@@ -122,6 +125,7 @@ impl Default for GlyphTable {
             entries: vec![EMPTY; PAGE_ENTRIES],
             // Slot 0 is the blank cell; it is never looked up by character.
             slots: vec![GlyphSlot::default()],
+            atlas: None,
             generation: 0,
         }
     }
@@ -134,6 +138,22 @@ impl GlyphTable {
 
     pub fn generation(&self) -> u32 {
         self.generation
+    }
+
+    /// Drop every slot epaint's atlas has outlived.  Call once per frame ahead
+    /// of any `slot`.
+    ///
+    /// A hit returns the cached index without laying the character out again,
+    /// so the relayout that `GlyphCache` does on a repack never reaches here.
+    /// Without this the stale texels survive for the life of the process and
+    /// the cell paints from whatever landed in their place.
+    pub fn begin_frame(&mut self, ctx: &egui::Context) {
+        let now = AtlasState::read(ctx);
+        if self.atlas.is_some_and(|prev| prev.outlived_by(now)) {
+            let size = self.size;
+            self.clear(size);
+        }
+        self.atlas = Some(now);
     }
 
     /// Drop every slot when the atlas or the font size moves under us.  A slot
@@ -427,6 +447,31 @@ mod tests {
         table.slot('a', Face::Normal, 20.0, || galley(&ctx, 'a'));
 
         assert_eq!(table.slots().len(), 2, "one blank slot plus the re-laid glyph");
+    }
+
+    /// A slot is texel coordinates into whatever atlas epaint had packed when
+    /// the glyph was laid out.  Rebuilding the fonts repacks that atlas, so a
+    /// slot that outlives the rebuild samples whatever landed in its place.
+    #[test]
+    fn an_atlas_rebuild_drops_every_slot() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let mut table = GlyphTable::default();
+        table.begin_frame(&ctx);
+        table.slot('a', Face::Normal, 14.0, || galley(&ctx, 'a'));
+
+        ctx.set_pixels_per_point(2.0);
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let repacked = slot_from_galley(&galley(&ctx, 'a')).expect("'a' has ink");
+
+        table.begin_frame(&ctx);
+        let slot = table.slot('a', Face::Normal, 14.0, || galley(&ctx, 'a'));
+
+        assert_eq!(
+            table.slots()[slot as usize],
+            repacked,
+            "the slot outlived the atlas it was read against"
+        );
     }
 
     /// Rows sit at a fixed stride so a damaged row can be rewritten and

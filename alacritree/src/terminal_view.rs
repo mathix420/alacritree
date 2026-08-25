@@ -1268,6 +1268,7 @@ fn paint_grid_gpu(
             default_bg: default_bg.to_array().map(|c| c as f32 / 255.0),
         };
         let (instances, table) = state.buffers();
+        table.begin_frame(ctx);
         phase!(WriteRows, {
             instances.write_rows(dirty.clone(), runs, default_bg, |ch, face| {
                 table.slot(ch, face, size, || {
