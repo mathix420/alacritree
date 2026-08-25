@@ -22,16 +22,18 @@ use eframe::egui_glow::ShaderVersion;
 use eframe::glow::{self, HasContext};
 use egui::Rect;
 
-use crate::grid_instances::{GlyphInstance, GlyphTable, GridInstances};
+use crate::grid_instances::{GlyphInstance, GlyphSlot, GlyphTable, GridInstances};
 
 /// Attribute locations, bound before linking so both programs read the same
 /// record the same way.  `#version 140` has no `layout(location = ...)`, so
 /// the binding has to come from this side.
 const ATTRIBUTES: [(u32, &str); 3] = [(0, "a_slot"), (1, "a_fg"), (2, "a_bg")];
 
-/// Ceiling on distinct characters on screen at once.  The slot table is a
-/// texture one row per slot, and every driver guarantees at least 2048 rows.
-const MAX_SLOTS: usize = 2048;
+/// Slots packed across a texture row, two RGBA32F texels each.  A row per
+/// slot would cap the table at the 2048 rows a driver is obliged to offer,
+/// which a screen of CJK or Nerd Font icons reaches; packing sideways puts the
+/// ceiling back on the u16 slot index, where the table already enforces it.
+const SLOTS_PER_ROW: usize = 256;
 
 /// What the shaders need that is not in a per-cell record.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -40,7 +42,6 @@ pub struct Frame {
     pub origin: [f32; 2],
     pub cell: [f32; 2],
     pub grid: [u32; 2],
-    pub atlas: [f32; 2],
     /// Height of an underline and a strikeout, in points.
     pub line_thickness: f32,
     /// The terminal's own background, as the clear colour.  A grid rect is
@@ -114,9 +115,10 @@ impl GpuGrid {
     }
 
     /// The shape to hand egui.  Everything it draws comes from `state`, which
-    /// the caller has already written this frame.
-    pub fn callback(&self, rect: Rect) -> egui::Shape {
-        let (state, resources) = (self.state.clone(), self.gl.clone());
+    /// the caller has already written this frame — except the atlas size,
+    /// which only the atlas live at paint time can give.
+    pub fn callback(&self, rect: Rect, ctx: &egui::Context) -> egui::Shape {
+        let (state, resources, ctx) = (self.state.clone(), self.gl.clone(), ctx.clone());
         egui::Shape::Callback(egui::epaint::PaintCallback {
             rect,
             callback: Arc::new(eframe::egui_glow::CallbackFn::new(move |_info, painter| {
@@ -136,7 +138,13 @@ impl GpuGrid {
                 };
                 let mut state = state.lock().expect("grid state");
                 let atlas = painter.texture(egui::TextureId::default());
-                resources.draw(&gl, &mut state, atlas);
+                // A slot holds texels, and egui normalizes every uv against
+                // the size the atlas ended the frame at.  Laying a glyph out
+                // doubles that atlas when it runs out of room, so a size read
+                // while the frame was still being built leaves the shader
+                // dividing texels by half an atlas.
+                let size = ctx.fonts(|f| f.font_image_size());
+                resources.draw(&gl, &mut state, atlas, size.map(|side| side as f32));
             })),
         })
     }
@@ -155,6 +163,9 @@ struct GlResources {
     instances: glow::Buffer,
     instance_capacity: usize,
     slot_texture: glow::Texture,
+    /// The slot table padded to whole texture rows, kept across uploads so a
+    /// table that grew by one glyph does not allocate to send itself.
+    slot_scratch: Vec<GlyphSlot>,
 }
 
 struct Program {
@@ -213,11 +224,25 @@ impl GlResources {
             ] {
                 gl.tex_parameter_i32(glow::TEXTURE_2D, name, value as i32);
             }
-            Ok(Self { glyph, background, vao, instances, instance_capacity: 0, slot_texture })
+            Ok(Self {
+                glyph,
+                background,
+                vao,
+                instances,
+                instance_capacity: 0,
+                slot_texture,
+                slot_scratch: Vec::new(),
+            })
         }
     }
 
-    fn draw(&mut self, gl: &glow::Context, state: &mut GridState, atlas: Option<glow::Texture>) {
+    fn draw(
+        &mut self,
+        gl: &glow::Context,
+        state: &mut GridState,
+        atlas: Option<glow::Texture>,
+        atlas_size: [f32; 2],
+    ) {
         let (cols, rows) = state.instances.dimensions();
         if cols == 0 || rows == 0 {
             return;
@@ -235,7 +260,7 @@ impl GlResources {
 
             self.draw_backgrounds(gl, state, cols * rows);
             if let Some(atlas) = atlas {
-                self.draw_glyphs(gl, state, atlas, cols * rows);
+                self.draw_glyphs(gl, state, atlas, atlas_size, cols * rows);
             }
 
             for (index, _) in ATTRIBUTES {
@@ -249,20 +274,22 @@ impl GlResources {
         unsafe {
             let generation = state.table.generation();
             if generation != state.uploaded_generation {
-                let slots = &state.table.slots()[..state.table.slots().len().min(MAX_SLOTS)];
                 // Two RGBA32F texels per slot: the atlas rectangle, then where
-                // it sits in the cell and how big it is drawn.
+                // it sits in the cell and how big it is drawn.  The tail of the
+                // last row is padded out because a texture upload wants every
+                // texel it declared; the shader never reads it.
+                let rows = pad_slots(state.table.slots(), &mut self.slot_scratch);
                 gl.bind_texture(glow::TEXTURE_2D, Some(self.slot_texture));
                 gl.tex_image_2d(
                     glow::TEXTURE_2D,
                     0,
                     glow::RGBA32F as i32,
-                    2,
-                    slots.len() as i32,
+                    (SLOTS_PER_ROW * 2) as i32,
+                    rows as i32,
                     0,
                     glow::RGBA,
                     glow::FLOAT,
-                    glow::PixelUnpackData::Slice(Some(bytemuck_cast(slots))),
+                    glow::PixelUnpackData::Slice(Some(bytemuck_cast(&self.slot_scratch))),
                 );
                 state.uploaded_generation = generation;
             }
@@ -329,6 +356,7 @@ impl GlResources {
         gl: &glow::Context,
         state: &GridState,
         atlas: glow::Texture,
+        atlas_size: [f32; 2],
         cells: usize,
     ) {
         unsafe {
@@ -339,10 +367,11 @@ impl GlResources {
             gl.bind_texture(glow::TEXTURE_2D, Some(self.slot_texture));
             set_i32(gl, &self.glyph, "u_atlas", 0);
             set_i32(gl, &self.glyph, "u_slots", 1);
+            set_i32(gl, &self.glyph, "u_slots_per_row", SLOTS_PER_ROW as i32);
             set_i32(gl, &self.glyph, "u_cols", state.frame.grid[0] as i32);
             set_vec2(gl, &self.glyph, "u_origin", state.frame.origin);
             set_vec2(gl, &self.glyph, "u_cell", state.frame.cell);
-            set_vec2(gl, &self.glyph, "u_atlas_size", state.frame.atlas);
+            set_vec2(gl, &self.glyph, "u_atlas_size", atlas_size);
             set_vec2(gl, &self.glyph, "u_viewport", viewport_points(state));
 
             gl.draw_arrays_instanced(glow::TRIANGLE_STRIP, 0, 4, cells as i32);
@@ -365,6 +394,19 @@ unsafe fn set_vec2(gl: &glow::Context, program: &Program, name: &str, value: [f3
     if let Some(location) = program.location(name) {
         unsafe { gl.uniform_2_f32(Some(location), value[0], value[1]) };
     }
+}
+
+/// Copy the slot table into `into`, padded to whole texture rows, and say how
+/// many rows that is.
+///
+/// Texels run row-major, so slot `i` lands at `(i % SLOTS_PER_ROW, i /
+/// SLOTS_PER_ROW)` — the address the vertex shader computes for it.
+fn pad_slots(slots: &[GlyphSlot], into: &mut Vec<GlyphSlot>) -> usize {
+    let rows = slots.len().div_ceil(SLOTS_PER_ROW);
+    into.clear();
+    into.extend_from_slice(slots);
+    into.resize(rows * SLOTS_PER_ROW, GlyphSlot::default());
+    rows
 }
 
 /// `&[T]` as bytes, for types that are plain data by construction.
@@ -447,6 +489,7 @@ uniform vec2 u_cell;
 uniform vec2 u_viewport;
 uniform vec2 u_atlas_size;
 uniform int u_cols;
+uniform int u_slots_per_row;
 uniform sampler2D u_slots;
 
 in uint a_slot;
@@ -456,8 +499,10 @@ out vec2 v_uv;
 out vec4 v_fg;
 
 void main() {
-    vec4 rect = texelFetch(u_slots, ivec2(0, int(a_slot)), 0);
-    vec4 geom = texelFetch(u_slots, ivec2(1, int(a_slot)), 0);
+    int slot = int(a_slot);
+    ivec2 at = ivec2((slot % u_slots_per_row) * 2, slot / u_slots_per_row);
+    vec4 rect = texelFetch(u_slots, at, 0);
+    vec4 geom = texelFetch(u_slots, at + ivec2(1, 0), 0);
 
     // Records sit at a fixed row stride, so the instance index is the cell.
     vec2 grid_cell = vec2(gl_InstanceID % u_cols, gl_InstanceID / u_cols);
@@ -567,5 +612,47 @@ mod tests {
         let state = GridState::default();
 
         assert!(state.dirty_rows.is_empty());
+    }
+
+    /// The shader reads slot `i` at `(i % SLOTS_PER_ROW, i / SLOTS_PER_ROW)`,
+    /// which only finds it if the padding leaves every slot at its own index.
+    #[test]
+    fn padding_leaves_each_slot_at_its_own_index() {
+        let marked = |n: usize| GlyphSlot { size: [n as f32, 0.0], ..GlyphSlot::default() };
+        let slots: Vec<GlyphSlot> = (0..SLOTS_PER_ROW + 44).map(marked).collect();
+        let mut padded = Vec::new();
+
+        let rows = pad_slots(&slots, &mut padded);
+
+        assert_eq!(rows, 2);
+        assert_eq!(padded.len(), 2 * SLOTS_PER_ROW, "a row was left short of texels");
+        assert_eq!(padded[SLOTS_PER_ROW + 43], marked(SLOTS_PER_ROW + 43));
+        assert_eq!(padded[SLOTS_PER_ROW + 44], GlyphSlot::default(), "the tail carries data");
+    }
+
+    /// Why the atlas size is read in the paint callback and not while the
+    /// frame is built: laying glyphs out doubles the atlas when it runs out of
+    /// room, and egui normalizes every uv against the size the atlas ended the
+    /// frame at.  A size read before the grid's own layout would be half the
+    /// truth, and every glyph would sample from the wrong place.
+    #[test]
+    fn laying_glyphs_out_can_grow_the_atlas_mid_frame() {
+        #[cfg(windows)]
+        crate::harden_dll_search_path();
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let before = ctx.fonts(|f| f.font_image_size());
+
+        for ch in ('\u{20}'..='\u{4ff}').filter(|c| !c.is_control()) {
+            let mut job = egui::text::LayoutJob::single_section(
+                ch.to_string(),
+                egui::TextFormat::simple(egui::FontId::monospace(72.0), Color32::WHITE),
+            );
+            job.wrap.max_width = f32::INFINITY;
+            let _ = ctx.fonts(|f| f.layout_job(job));
+        }
+
+        assert_ne!(before, ctx.fonts(|f| f.font_image_size()));
     }
 }
