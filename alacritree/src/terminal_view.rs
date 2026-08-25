@@ -3267,10 +3267,12 @@ mod tests {
         let mut caches = Caches::new();
         paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
         let (cols, rows) = (session.size.columns, session.size.screen_lines);
+        let feed = dense_screen(cols, rows);
+        let mut parser = Processor::<StdSyncHandler>::new();
         {
             let mut term = session.term.lock();
             term.resize(TermSize::new(cols, rows));
-            Processor::<StdSyncHandler>::new().advance(&mut *term, &dense_screen(cols, rows));
+            parser.advance(&mut *term, &feed);
         }
         for _ in 0..10 {
             paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
@@ -3360,11 +3362,30 @@ mod tests {
         });
         println!("  tessellate a callback-only shape list: {tessellate:?}");
 
-        let capture = time(iterations, || {
-            let mut term = session.term.lock();
-            snapshot.capture(&mut term, &config, 0, None, false);
-            std::hint::black_box(snapshot.runs().count());
-        });
+        // The rewrite between captures is what gives the next one anything to
+        // read: `capture` drains the damage it is handed, so a second one
+        // against an untouched terminal walks the cursor line and stops.  It
+        // stays outside the clock — damage is marked per line written, not per
+        // line changed, so re-feeding the same bytes is enough.
+        let capture = {
+            let mut total = std::time::Duration::ZERO;
+            for i in 0..iterations + 5 {
+                {
+                    let mut term = session.term.lock();
+                    parser.advance(&mut *term, &feed);
+                }
+                let started = std::time::Instant::now();
+                {
+                    let mut term = session.term.lock();
+                    snapshot.capture(&mut term, &config, 0, None, false);
+                    std::hint::black_box(snapshot.runs().count());
+                }
+                if i >= 5 {
+                    total += started.elapsed();
+                }
+            }
+            total / iterations
+        };
         println!("  capture the grid under the lock      : {capture:?}");
     }
 
@@ -4075,10 +4096,12 @@ mod tests {
         let mut caches = Caches::new();
         paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
         let (cols, rows) = (session.size.columns, session.size.screen_lines);
+        let feed = dense_screen(cols, rows);
+        let mut parser = Processor::<StdSyncHandler>::new();
         {
             let mut term = session.term.lock();
             term.resize(TermSize::new(cols, rows));
-            Processor::<StdSyncHandler>::new().advance(&mut *term, &dense_screen(cols, rows));
+            parser.advance(&mut *term, &feed);
         }
         for _ in 0..10 {
             paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
@@ -4096,13 +4119,30 @@ mod tests {
             start.elapsed() / iterations
         }
 
+        // Rewriting the screen between captures is what makes this a capture
+        // at all: `capture` drains the damage it is given, so a second one
+        // against an untouched terminal walks the cursor line and stops.  The
+        // rewrite is identical every time and stays outside the clock —
+        // damage is marked per line written, not per line changed.
         let capture = {
             let mut snapshot = GridSnapshot::new();
-            time(iterations, || {
-                let mut term = session.term.lock();
-                snapshot.capture(&mut term, &config, 0, None, false);
-                std::hint::black_box(snapshot.runs().count());
-            })
+            let mut total = std::time::Duration::ZERO;
+            for i in 0..iterations + 5 {
+                {
+                    let mut term = session.term.lock();
+                    parser.advance(&mut *term, &feed);
+                }
+                let started = std::time::Instant::now();
+                {
+                    let mut term = session.term.lock();
+                    snapshot.capture(&mut term, &config, 0, None, false);
+                    std::hint::black_box(snapshot.runs().count());
+                }
+                if i >= 5 {
+                    total += started.elapsed();
+                }
+            }
+            total / iterations
         };
 
         let mut snapshot = GridSnapshot::new();
