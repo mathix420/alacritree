@@ -140,26 +140,31 @@ impl GlyphTable {
         self.generation
     }
 
-    /// Drop every slot epaint's atlas has outlived.  Call once per frame ahead
-    /// of any `slot`.
+    /// Drop every slot the atlas or the font size has outlived, and say
+    /// whether that happened.  Call once per frame ahead of any `slot`.
     ///
     /// A hit returns the cached index without laying the character out again,
     /// so the relayout that `GlyphCache` does on a repack never reaches here.
     /// Without this the stale texels survive for the life of the process and
     /// the cell paints from whatever landed in their place.
-    pub fn begin_frame(&mut self, ctx: &egui::Context) {
+    ///
+    /// A `true` obliges the caller to rewrite every cell it has outstanding.
+    /// Clearing renumbers the table from nothing, so a record written against
+    /// the old numbering addresses some other character, or none at all.
+    pub fn begin_frame(&mut self, ctx: &egui::Context, size: f32) -> bool {
         let now = AtlasState::read(ctx);
-        if self.atlas.is_some_and(|prev| prev.outlived_by(now)) {
-            let size = self.size;
+        let stale = self.size != size || self.atlas.is_some_and(|prev| prev.outlived_by(now));
+        if stale {
             self.clear(size);
         }
         self.atlas = Some(now);
+        stale
     }
 
     /// Drop every slot when the atlas or the font size moves under us.  A slot
     /// holds texel coordinates, so a repacked atlas leaves every one of them
     /// pointing at whatever landed in its place.
-    pub fn clear(&mut self, size: f32) {
+    fn clear(&mut self, size: f32) {
         self.size = size;
         self.page_offset.clear();
         self.page_offset.resize(PAGES, 0);
@@ -172,16 +177,16 @@ impl GlyphTable {
     }
 
     /// The slot for `ch`, laying it out through `galley` only on a miss.
+    ///
+    /// Whether the table is still valid is `begin_frame`'s to decide: clearing
+    /// part-way through a frame would renumber slots the frame had already
+    /// written into cells it is not going to revisit.
     pub fn slot(
         &mut self,
         ch: char,
         face: Face,
-        size: f32,
         galley: impl FnOnce() -> std::sync::Arc<Galley>,
     ) -> u16 {
-        if self.size != size {
-            self.clear(size);
-        }
         let (page, entry) = page_index(ch, face);
         let at = self.page_offset[page] as usize + entry;
         if self.entries[at] != EMPTY {
@@ -359,13 +364,13 @@ mod tests {
                 .collect();
             let mut table = GlyphTable::default();
             for &ch in &asks {
-                table.slot(ch, Face::Normal, 14.0, || galley(&ctx, ch));
+                table.slot(ch, Face::Normal, || galley(&ctx, ch));
             }
 
             let mut body = || {
                 for &ch in &asks {
                     std::hint::black_box(
-                        table.slot(ch, Face::Normal, 14.0, || unreachable!("the table is warm")),
+                        table.slot(ch, Face::Normal, || unreachable!("the table is warm")),
                     );
                 }
             };
@@ -396,9 +401,9 @@ mod tests {
         let _ = ctx.run(egui::RawInput::default(), |_| {});
         let mut table = GlyphTable::default();
 
-        let first = table.slot('a', Face::Normal, 14.0, || galley(&ctx, 'a'));
+        let first = table.slot('a', Face::Normal, || galley(&ctx, 'a'));
         let before = table.generation();
-        let again = table.slot('a', Face::Normal, 14.0, || galley(&ctx, 'a'));
+        let again = table.slot('a', Face::Normal, || galley(&ctx, 'a'));
 
         assert_eq!(first, again);
         assert_eq!(table.generation(), before, "a hit must not grow the table");
@@ -428,8 +433,8 @@ mod tests {
         let _ = ctx.run(egui::RawInput::default(), |_| {});
         let mut table = GlyphTable::default();
 
-        let normal = table.slot('a', Face::Normal, 14.0, || galley(&ctx, 'a'));
-        let bold = table.slot('a', Face::Bold, 14.0, || galley(&ctx, 'a'));
+        let normal = table.slot('a', Face::Normal, || galley(&ctx, 'a'));
+        let bold = table.slot('a', Face::Bold, || galley(&ctx, 'a'));
 
         assert_ne!(normal, bold);
     }
@@ -442,11 +447,29 @@ mod tests {
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |_| {});
         let mut table = GlyphTable::default();
-        table.slot('a', Face::Normal, 14.0, || galley(&ctx, 'a'));
+        table.begin_frame(&ctx, 14.0);
+        table.slot('a', Face::Normal, || galley(&ctx, 'a'));
 
-        table.slot('a', Face::Normal, 20.0, || galley(&ctx, 'a'));
+        let reset = table.begin_frame(&ctx, 20.0);
+        table.slot('a', Face::Normal, || galley(&ctx, 'a'));
 
+        assert!(reset, "the caller was not told its records were renumbered");
         assert_eq!(table.slots().len(), 2, "one blank slot plus the re-laid glyph");
+    }
+
+    /// Every cell the caller holds addresses the table by index, and only the
+    /// frames it is told about get rewritten.  A clear the caller never hears
+    /// of leaves those cells drawing whatever took over their index.
+    #[test]
+    fn a_frame_that_changes_nothing_keeps_the_numbering() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let mut table = GlyphTable::default();
+        table.begin_frame(&ctx, 14.0);
+        let before = table.slot('a', Face::Normal, || galley(&ctx, 'a'));
+
+        assert!(!table.begin_frame(&ctx, 14.0));
+        assert_eq!(table.slot('a', Face::Normal, || unreachable!("the table is warm")), before);
     }
 
     /// A slot is texel coordinates into whatever atlas epaint had packed when
@@ -457,15 +480,15 @@ mod tests {
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |_| {});
         let mut table = GlyphTable::default();
-        table.begin_frame(&ctx);
-        table.slot('a', Face::Normal, 14.0, || galley(&ctx, 'a'));
+        table.begin_frame(&ctx, 14.0);
+        table.slot('a', Face::Normal, || galley(&ctx, 'a'));
 
         ctx.set_pixels_per_point(2.0);
         let _ = ctx.run(egui::RawInput::default(), |_| {});
         let repacked = slot_from_galley(&galley(&ctx, 'a')).expect("'a' has ink");
 
-        table.begin_frame(&ctx);
-        let slot = table.slot('a', Face::Normal, 14.0, || galley(&ctx, 'a'));
+        assert!(table.begin_frame(&ctx, 14.0), "a repack must renumber the table");
+        let slot = table.slot('a', Face::Normal, || galley(&ctx, 'a'));
 
         assert_eq!(
             table.slots()[slot as usize],

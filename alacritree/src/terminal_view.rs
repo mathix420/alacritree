@@ -1236,23 +1236,6 @@ fn paint_grid_gpu(
 ) {
     let default_bg = background(&config.palette);
     let size = config.font.egui_size();
-    let atlas = ctx.fonts(|f| f.font_image_size());
-
-    // Only the rows this frame's capture rewrote need new records; the rest of
-    // the buffer still holds what the GPU already has.
-    let dirty = snapshot.dirty_rows();
-    let runs = snapshot
-        .runs_in(dirty.clone())
-        .filter(|(_, run)| !run.flags.contains(Flags::HIDDEN))
-        .map(|(text, run)| RunView {
-            text,
-            start_col: run.start_col,
-            row: run.row as usize,
-            face: Face::new(run.flags.contains(Flags::BOLD), run.flags.contains(Flags::ITALIC)),
-            flags: 0,
-            fg: run.fg,
-            bg: run.bg,
-        });
 
     {
         let mut state = gpu.state.lock().expect("grid state");
@@ -1263,15 +1246,30 @@ fn paint_grid_gpu(
             origin: [0.0, 0.0],
             cell: [cell_w, cell_h],
             grid: [cols as u32, rows as u32],
-            atlas: [atlas[0] as f32, atlas[1] as f32],
             line_thickness: 1.0,
             default_bg: default_bg.to_array().map(|c| c as f32 / 255.0),
         };
         let (instances, table) = state.buffers();
-        table.begin_frame(ctx);
+        // Only the rows this frame's capture rewrote need new records; the
+        // rest of the buffer still holds what the GPU already has — unless the
+        // table just renumbered itself, which leaves those records pointing at
+        // whatever character now holds their old index.
+        let dirty = if table.begin_frame(ctx, size) { 0..rows } else { snapshot.dirty_rows() };
+        let runs = snapshot
+            .runs_in(dirty.clone())
+            .filter(|(_, run)| !run.flags.contains(Flags::HIDDEN))
+            .map(|(text, run)| RunView {
+                text,
+                start_col: run.start_col,
+                row: run.row as usize,
+                face: Face::new(run.flags.contains(Flags::BOLD), run.flags.contains(Flags::ITALIC)),
+                flags: 0,
+                fg: run.fg,
+                bg: run.bg,
+            });
         phase!(WriteRows, {
             instances.write_rows(dirty.clone(), runs, default_bg, |ch, face| {
-                table.slot(ch, face, size, || {
+                table.slot(ch, face, || {
                     crate::paint_phases::record_glyph_miss();
                     glyphs.get(ctx, ch, face, size)
                 })
@@ -1279,7 +1277,7 @@ fn paint_grid_gpu(
         });
         state.mark_rows_dirty(dirty);
     }
-    painter.add(gpu.callback(rect));
+    painter.add(gpu.callback(rect, ctx));
 
     // Underlines are egui shapes, and egui retains nothing between frames, so
     // these are re-emitted for every row whether or not it changed.
@@ -3219,7 +3217,7 @@ mod tests {
         // laying characters out for the first time.
         let all = views(&snapshot, &|_| true);
         grid.write_rows(0..rows, all, default_bg, |ch, face| {
-            table.slot(ch, face, size, || caches.glyphs.get(&ctx, ch, face, size))
+            table.slot(ch, face, || caches.glyphs.get(&ctx, ch, face, size))
         });
         let slots = table.slots().len();
 
@@ -3233,7 +3231,7 @@ mod tests {
             let touched = views(&snapshot, &|row| row < damaged);
             let build = time(iterations, || {
                 grid.write_rows(0..damaged, touched.iter().copied(), default_bg, |ch, face| {
-                    table.slot(ch, face, size, || caches.glyphs.get(&ctx, ch, face, size))
+                    table.slot(ch, face, || caches.glyphs.get(&ctx, ch, face, size))
                 });
                 std::hint::black_box(grid.glyphs.len());
             });
