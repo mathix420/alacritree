@@ -16,6 +16,7 @@
 //! carry their own textures or their own geometry, and they are rare enough
 //! to leave.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui_glow::ShaderVersion;
@@ -95,6 +96,11 @@ impl GridState {
 pub struct GpuGrid {
     pub state: Arc<Mutex<GridState>>,
     gl: Arc<Mutex<GlSlot>>,
+    /// Set by the paint callback when the GL side will not build.  Only the
+    /// callback holds a `glow::Context`, so the caller cannot learn this
+    /// before it has asked for one frame it will not get; from the next frame
+    /// on it paints the mesh instead.
+    failed: Arc<AtomicBool>,
 }
 
 /// Building the GL side is attempted exactly once.  A driver that rejects the
@@ -111,7 +117,22 @@ impl GpuGrid {
         Self {
             state: Arc::new(Mutex::new(GridState::default())),
             gl: Arc::new(Mutex::new(GlSlot::Unbuilt)),
+            failed: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Whether the GL side is known not to build, so the caller can paint the
+    /// mesh instead of a shape that draws nothing.
+    pub fn unavailable(&self) -> bool {
+        self.failed.load(Ordering::Relaxed)
+    }
+
+    /// Stand in for a driver that rejects the shaders.  Nothing headless has a
+    /// `glow::Context` for the callback to fail against, so the state it would
+    /// have reached has to be set from outside.
+    #[cfg(test)]
+    pub fn mark_unavailable(&self) {
+        self.failed.store(true, Ordering::Relaxed);
     }
 
     /// The shape to hand egui.  Everything it draws comes from `state`, which
@@ -119,6 +140,7 @@ impl GpuGrid {
     /// which only the atlas live at paint time can give.
     pub fn callback(&self, rect: Rect, ctx: &egui::Context) -> egui::Shape {
         let (state, resources, ctx) = (self.state.clone(), self.gl.clone(), ctx.clone());
+        let failed = self.failed.clone();
         egui::Shape::Callback(egui::epaint::PaintCallback {
             rect,
             callback: Arc::new(eframe::egui_glow::CallbackFn::new(move |_info, painter| {
@@ -129,6 +151,7 @@ impl GpuGrid {
                         Ok(resources) => GlSlot::Ready(resources),
                         Err(err) => {
                             log::error!("gpu grid disabled: {err}");
+                            failed.store(true, Ordering::Relaxed);
                             GlSlot::Failed
                         },
                     };

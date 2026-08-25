@@ -901,17 +901,18 @@ pub struct UiTheme {
     pub icon_tooltips: bool,
     /// Show single-session sidebar rows / tab segments ([`SessionDisplay`]).
     pub session_display: SessionDisplay,
-    /// Paint PR-status badges on worktree rows (and poll `gh` for expanded
-    /// projects' worktrees).  Off by default so an unmodified config spawns
-    /// no `gh` processes; when enabled it is best-effort like the diff-base
-    /// lookup: no `gh`, no auth, or no PR silently paints nothing.
     /// Draw the terminal grid through an OpenGL paint callback instead of
     /// handing epaint a mesh: one twelve-byte record per cell, and the vertex
     /// shader derives the quads.  Off by default — it needs a GL 3 context and
     /// bypasses the renderer every other panel goes through, so an unmodified
     /// config keeps the path that has always drawn the grid.  A context too
-    /// old for instanced arrays logs once and falls back on its own.
+    /// old for instanced arrays logs once, costs the frame it was found on,
+    /// and paints the mesh from the next one.
     pub gpu_grid: bool,
+    /// Paint PR-status badges on worktree rows (and poll `gh` for expanded
+    /// projects' worktrees).  Off by default so an unmodified config spawns
+    /// no `gh` processes; when enabled it is best-effort like the diff-base
+    /// lookup: no `gh`, no auth, or no PR silently paints nothing.
     pub pr_status: bool,
     /// Paint a badge showing each worktree branch's upstream state.  Off by
     /// default so an unmodified config does no extra ref work.  The state comes
