@@ -916,12 +916,16 @@ impl GridSnapshot {
         self.rows.iter().flat_map(row_runs)
     }
 
-    /// Every run in `rows`.  A frame that rewrote three rows reads three rows:
-    /// walking the runs of a full screen costs more than writing the records
-    /// of the one row that changed.
-    fn runs_in(&self, rows: std::ops::Range<usize>) -> impl Iterator<Item = (&str, &Run)> {
-        let end = rows.end.min(self.rows.len());
-        self.rows[rows.start.min(end)..end].iter().flat_map(row_runs)
+    /// Every run on exactly these rows, in the order given.  A frame that
+    /// rewrote three rows reads three rows: walking the runs of a full screen
+    /// costs more than writing the records of the ones that changed, and two
+    /// damaged rows far apart span every clean row between them.
+    fn runs_in_rows(
+        &self,
+        rows: impl IntoIterator<Item = usize>,
+    ) -> impl Iterator<Item = (&str, &Run)> {
+        let len = self.rows.len();
+        rows.into_iter().filter(move |&row| row < len).flat_map(|row| row_runs(&self.rows[row]))
     }
 
     /// Runs carrying an underline or a strikeout, wherever they are on screen.
@@ -937,6 +941,11 @@ impl GridSnapshot {
     /// uploads exactly this much.
     fn dirty_rows(&self) -> std::ops::Range<usize> {
         self.dirty_rows.clone()
+    }
+
+    /// The viewport rows this capture re-walked, sorted and without repeats.
+    fn damaged_rows(&self) -> &[usize] {
+        &self.damaged
     }
 
     /// Fill `damaged` with the viewport rows this capture has to re-walk, and
@@ -1220,6 +1229,21 @@ fn run_colors(
 /// geometry, so those stay ordinary shapes emitted after the callback — which
 /// also keeps them above every background, the order `paint_grid` enforces by
 /// running its two passes separately.
+/// The rows a frame owes new records: the ones the terminal damaged, or
+/// every row when the glyph table renumbered under records already written.
+///
+/// Allocates nothing, because `steady_state` holds a quiet frame to no
+/// allocations at all and this runs on every frame that paints.
+fn rows_to_rewrite(
+    damaged: &[usize],
+    rows: usize,
+    renumbered: bool,
+) -> impl Iterator<Item = usize> + Clone + '_ {
+    let all = if renumbered { 0..rows } else { 0..0 };
+    let some = if renumbered { &[][..] } else { damaged };
+    all.chain(some.iter().copied())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_grid_gpu(
     gpu: &GpuGrid,
@@ -1254,9 +1278,14 @@ fn paint_grid_gpu(
         // rest of the buffer still holds what the GPU already has — unless the
         // table just renumbered itself, which leaves those records pointing at
         // whatever character now holds their old index.
-        let dirty = if table.begin_frame(ctx, size) { 0..rows } else { snapshot.dirty_rows() };
+        let renumbered = table.begin_frame(ctx, size);
+        let touched = rows_to_rewrite(snapshot.damaged_rows(), rows, renumbered);
+        // The upload stays the span covering them: it goes out as one
+        // `glBufferSubData`, and the rows it carries between two damaged ones
+        // hold records nothing has invalidated.
+        let upload = if renumbered { 0..rows } else { snapshot.dirty_rows() };
         let runs = snapshot
-            .runs_in(dirty.clone())
+            .runs_in_rows(touched.clone())
             .filter(|(_, run)| !run.flags.contains(Flags::HIDDEN))
             .map(|(text, run)| RunView {
                 text,
@@ -1268,14 +1297,14 @@ fn paint_grid_gpu(
                 bg: run.bg,
             });
         phase!(WriteRows, {
-            instances.write_rows(dirty.clone(), runs, default_bg, |ch, face| {
+            instances.write_rows(touched, runs, default_bg, |ch, face| {
                 table.slot(ch, face, || {
                     crate::paint_phases::record_glyph_miss();
                     glyphs.get(ctx, ch, face, size)
                 })
             })
         });
-        state.mark_rows_dirty(dirty);
+        state.mark_rows_dirty(upload);
     }
     painter.add(gpu.callback(rect, ctx));
 
@@ -2004,20 +2033,27 @@ mod tests {
     }
 
     /// What the GPU path reads to rebuild records.  Reading the runs of a
-    /// clean row costs more than writing the records of the dirty one, so the
-    /// walk has to stop at the damaged span rather than filter after the fact.
+    /// clean row costs more than writing the records of the dirty one, and a
+    /// row between two damaged ones is exactly as clean as one outside them.
     #[test]
-    fn only_the_dirty_rows_are_re_read_for_the_upload() {
+    fn only_the_damaged_rows_are_re_read_for_the_upload() {
         let mut term = term_running(b"first\r\nsecond\r\nthird");
         let mut snapshot = GridSnapshot::new();
         snapshot.capture(&mut term, &Config::default(), 0, None, false);
 
-        Processor::<StdSyncHandler>::new().advance(&mut term, b"\x1b[2;1Hrewritten");
+        Processor::<StdSyncHandler>::new().advance(&mut term, b"\x1b[1;1Hone\x1b[3;1Hthree");
         snapshot.capture(&mut term, &Config::default(), 0, None, false);
 
-        let read: Vec<&str> = snapshot.runs_in(snapshot.dirty_rows()).map(|(t, _)| t).collect();
-        assert!(read.iter().any(|t| t.starts_with("rewritten")), "{read:?}");
-        assert!(!read.iter().any(|t| t.starts_with("first")), "a clean row was re-read: {read:?}");
+        let read: Vec<&str> = snapshot
+            .runs_in_rows(snapshot.damaged_rows().iter().copied())
+            .map(|(t, _)| t)
+            .collect();
+        assert!(read.iter().any(|t| t.starts_with("one")), "{read:?}");
+        assert!(read.iter().any(|t| t.starts_with("three")), "{read:?}");
+        assert!(
+            !read.iter().any(|t| t.starts_with("second")),
+            "a clean row between two damaged ones was re-read: {read:?}"
+        );
     }
 
     /// Underlines are egui shapes and egui keeps nothing between frames, so an
@@ -3039,6 +3075,23 @@ mod tests {
         }
     }
 
+    /// A row between two damaged ones holds records nothing invalidated, so
+    /// the frame owes it nothing.  Handing the painter the span instead makes
+    /// one edited line and one repainted status bar cost the whole screen.
+    #[test]
+    fn a_frame_rewrites_only_the_rows_the_terminal_damaged() {
+        let scattered = [0, 82];
+        assert_eq!(rows_to_rewrite(&scattered, 83, false).collect::<Vec<_>>(), scattered);
+    }
+
+    /// Clearing renumbers the table from nothing, so every record written
+    /// against the old numbering now addresses some other character.  Nothing
+    /// on screen is still correct, whatever the terminal reports as damaged.
+    #[test]
+    fn a_renumbered_glyph_table_rewrites_every_row() {
+        assert_eq!(rows_to_rewrite(&[1], 3, true).collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
+
     /// A driver that rejects the shaders leaves the paint callback with
     /// nothing to draw, and the callback is the only thing that knows.  Unless
     /// the grid goes back to the mesh from the next frame on, the terminal is
@@ -3347,6 +3400,23 @@ mod tests {
                 bytes / 1024,
             );
         }
+
+        // The shape a real TUI produces: an edited line and a status bar, with
+        // the untouched screen between them.  The upload still has to carry
+        // the span, so the two numbers on this line diverge.
+        let ends = [0, rows - 1];
+        let touched = views(&snapshot, &|row| ends.contains(&row));
+        let build = time(iterations, || {
+            grid.write_rows(ends, touched.iter().copied(), default_bg, |ch, face| {
+                table.slot(ch, face, || caches.glyphs.get(&ctx, ch, face, size))
+            });
+            std::hint::black_box(grid.glyphs.len());
+        });
+        println!(
+            "  rewrite rows 0 and {} only: {build:?}, {} KiB to upload",
+            rows - 1,
+            grid.row_bytes(0, rows).len() / 1024,
+        );
 
         // What epaint charges for a grid it never sees the geometry of.
         let callback = vec![egui::epaint::ClippedShape {
