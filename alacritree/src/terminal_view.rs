@@ -139,7 +139,7 @@ pub fn show(
         // (alacritty hides it the same way, display/content.rs).
         ime.preedit().is_some(),
     );
-    match gpu.filter(|_| config.ui.gpu_grid) {
+    match gpu.filter(|gpu| config.ui.gpu_grid && !gpu.unavailable()) {
         Some(gpu) => {
             paint_grid_gpu(
                 gpu,
@@ -3037,6 +3037,30 @@ mod tests {
             );
             println!("       {}", crate::paint_phases::totals().per_frame(n).summary());
         }
+    }
+
+    /// A driver that rejects the shaders leaves the paint callback with
+    /// nothing to draw, and the callback is the only thing that knows.  Unless
+    /// the grid goes back to the mesh from the next frame on, the terminal is
+    /// a blank rectangle for the life of the process.
+    #[test]
+    fn a_gpu_grid_that_will_not_build_paints_the_mesh() {
+        let grid = crate::grid_gl::GpuGrid::new();
+        let mut case = Case::new("gl", Some(&grid));
+        let screen = Vec2::new(1280.0, 720.0);
+        case.advance(b"hello");
+
+        let gpu = case.paint(screen);
+        grid.mark_unavailable();
+        let mesh = case.paint(screen);
+
+        assert!(
+            mesh.vertices > gpu.vertices,
+            "a grid that cannot build GL painted {} vertices, no more than the {} the GL path \
+             emits for its one geometry-free shape",
+            mesh.vertices,
+            gpu.vertices,
+        );
     }
 
     const ROUNDS: usize = 11;
