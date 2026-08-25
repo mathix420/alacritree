@@ -2869,6 +2869,26 @@ mod tests {
         FgBg,
     }
 
+    /// What decoration a generated frame carries.  Set once at the top of a
+    /// frame, so every run on screen inherits it: the cost under test is what
+    /// painting decorations charges, not what parsing the escape charges.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Decoration {
+        None,
+        Underline,
+        UnderlineAndStrikeout,
+    }
+
+    impl Decoration {
+        fn sgr(self) -> &'static str {
+            match self {
+                Decoration::None => "",
+                Decoration::Underline => "\x1b[4m",
+                Decoration::UnderlineAndStrikeout => "\x1b[4;9m",
+            }
+        }
+    }
+
     /// One frame of termbench's `FGPerChar` (`Colors::Fg`) or `FGBGPerChar`
     /// (`Colors::FgBg`), transcribed from `termbench.cpp`: a truecolour SGR on
     /// every cell, colours derived from the frame index, background written
@@ -2890,9 +2910,10 @@ mod tests {
         rows: usize,
         frame: usize,
         colors: Colors,
+        decoration: Decoration,
         stride: usize,
     ) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = Vec::from(decoration.sgr());
         for y in 0..rows {
             out.extend_from_slice(format!("\x1b[{};1H", y + 1).as_bytes());
             for x in 0..cols {
@@ -2946,10 +2967,12 @@ mod tests {
 
         for screen in [Vec2::new(1280.0, 720.0), Vec2::new(2560.0, 1440.0)] {
             let mut printed_header = false;
-            for (label, colors, stride) in [
-                ("FGPerChar", Colors::Fg, 1),
-                ("FGBGPerChar", Colors::FgBg, 1),
-                ("FGBG stride 8", Colors::FgBg, 8),
+            for (label, colors, decoration, stride) in [
+                ("FGPerChar", Colors::Fg, Decoration::None, 1),
+                ("FGBGPerChar", Colors::FgBg, Decoration::None, 1),
+                ("FGBG stride 8", Colors::FgBg, Decoration::None, 8),
+                ("FG underlined", Colors::Fg, Decoration::Underline, 1),
+                ("FG under+strike", Colors::Fg, Decoration::UnderlineAndStrikeout, 1),
             ] {
                 let mut cases: Vec<Case<'_>> = ["mesh", "gl"]
                     .into_iter()
@@ -2970,7 +2993,7 @@ mod tests {
                 // round every RING frames, and only consecutive frames have to
                 // differ for damage to stay full.
                 let ring: Vec<Vec<u8>> = (0..RING)
-                    .map(|frame| colored_frame(cols, rows, frame, colors, stride))
+                    .map(|frame| colored_frame(cols, rows, frame, colors, decoration, stride))
                     .collect();
 
                 for i in 0..WARMUP {
@@ -3030,8 +3053,12 @@ mod tests {
         let only = std::env::var("ALACRITREE_BENCH_WORKLOAD").ok();
         let screen = Vec2::new(2560.0, 1440.0);
 
-        for (label, colors) in [("fgbg", Colors::FgBg), ("fg", Colors::Fg), ("plain", Colors::None)]
-        {
+        for (label, colors, decoration) in [
+            ("fgbg", Colors::FgBg, Decoration::None),
+            ("fg", Colors::Fg, Decoration::None),
+            ("plain", Colors::None, Decoration::None),
+            ("under", Colors::Fg, Decoration::Underline),
+        ] {
             if only.as_deref().is_some_and(|want| want != label) {
                 continue;
             }
@@ -3041,8 +3068,9 @@ mod tests {
             let (cols, rows) = (case.session.size.columns, case.session.size.screen_lines);
             case.session.term.lock().resize(TermSize::new(cols, rows));
 
-            let ring: Vec<Vec<u8>> =
-                (0..RING).map(|frame| colored_frame(cols, rows, frame, colors, 1)).collect();
+            let ring: Vec<Vec<u8>> = (0..RING)
+                .map(|frame| colored_frame(cols, rows, frame, colors, decoration, 1))
+                .collect();
             let bytes = ring.iter().map(Vec::len).sum::<usize>() / RING;
 
             for i in 0..WARMUP {
