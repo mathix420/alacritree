@@ -2823,10 +2823,20 @@ mod tests {
         out
     }
 
-    /// One frame of termbench's `FGPerChar` (`backgrounds` false) or
-    /// `FGBGPerChar` (true), transcribed from `termbench.cpp`: a truecolour
-    /// SGR on every cell, colours derived from the frame index, background
-    /// written before foreground.
+    /// How much colour a generated frame carries.  `None` is the floor the
+    /// colour workloads are read against: the same characters and the same
+    /// full damage, with no SGR for the parser to decode.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Colors {
+        None,
+        Fg,
+        FgBg,
+    }
+
+    /// One frame of termbench's `FGPerChar` (`Colors::Fg`) or `FGBGPerChar`
+    /// (`Colors::FgBg`), transcribed from `termbench.cpp`: a truecolour SGR on
+    /// every cell, colours derived from the frame index, background written
+    /// before foreground.
     ///
     /// The frame index is the part that matters.  Every colour on screen moves
     /// between frames, so the terminal reports full damage each time — the
@@ -2843,7 +2853,7 @@ mod tests {
         cols: usize,
         rows: usize,
         frame: usize,
-        backgrounds: bool,
+        colors: Colors,
         stride: usize,
     ) -> Vec<u8> {
         let mut out = Vec::new();
@@ -2851,8 +2861,8 @@ mod tests {
             out.extend_from_slice(format!("\x1b[{};1H", y + 1).as_bytes());
             for x in 0..cols {
                 let c = x - x % stride;
-                if x % stride == 0 {
-                    if backgrounds {
+                if x % stride == 0 && colors != Colors::None {
+                    if colors == Colors::FgBg {
                         let (r, g, b) = (frame + y + c, frame + y, frame);
                         let sgr = format!("\x1b[48;2;{};{};{}m", r & 0xff, g & 0xff, b & 0xff);
                         out.extend_from_slice(sgr.as_bytes());
@@ -2900,9 +2910,11 @@ mod tests {
 
         for screen in [Vec2::new(1280.0, 720.0), Vec2::new(2560.0, 1440.0)] {
             let mut printed_header = false;
-            for (label, backgrounds, stride) in
-                [("FGPerChar", false, 1), ("FGBGPerChar", true, 1), ("FGBG stride 8", true, 8)]
-            {
+            for (label, colors, stride) in [
+                ("FGPerChar", Colors::Fg, 1),
+                ("FGBGPerChar", Colors::FgBg, 1),
+                ("FGBG stride 8", Colors::FgBg, 8),
+            ] {
                 let mut cases: Vec<Case<'_>> = ["mesh", "gl"]
                     .into_iter()
                     .map(|path| Case::new(path, (path == "gl").then_some(&grid)))
@@ -2922,7 +2934,7 @@ mod tests {
                 // round every RING frames, and only consecutive frames have to
                 // differ for damage to stay full.
                 let ring: Vec<Vec<u8>> = (0..RING)
-                    .map(|frame| colored_frame(cols, rows, frame, backgrounds, stride))
+                    .map(|frame| colored_frame(cols, rows, frame, colors, stride))
                     .collect();
 
                 for i in 0..WARMUP {
@@ -2956,6 +2968,74 @@ mod tests {
                     case.report(label);
                 }
             }
+        }
+    }
+
+    /// Not a gate — run it by hand:
+    /// `cargo test -p alacritree --release -- --ignored --nocapture --test-threads=1
+    /// report_parse_share`
+    ///
+    /// What the VT parser costs beside the painter it feeds, on the GL path
+    /// alone.  Every other harness here times painting and leaves `advance`
+    /// outside the measured region, which reads as though parsing were free.
+    ///
+    /// The three workloads bracket real output rather than describing it: an
+    /// SGR pair per cell is termbench's worst case, no SGR at all is the
+    /// floor, and the byte count printed beside each says how far apart they
+    /// are.  `ALACRITREE_BENCH_WORKLOAD=plain` narrows the run to one of them,
+    /// which is what makes a sampled profile attributable.
+    #[test]
+    #[ignore = "timing harness, not an assertion"]
+    fn report_parse_share() {
+        #[cfg(windows)]
+        crate::harden_dll_search_path();
+
+        let grid = crate::grid_gl::GpuGrid::new();
+        let only = std::env::var("ALACRITREE_BENCH_WORKLOAD").ok();
+        let screen = Vec2::new(2560.0, 1440.0);
+
+        for (label, colors) in [("fgbg", Colors::FgBg), ("fg", Colors::Fg), ("plain", Colors::None)]
+        {
+            if only.as_deref().is_some_and(|want| want != label) {
+                continue;
+            }
+
+            let mut case = Case::new("gl", Some(&grid));
+            case.paint(screen);
+            let (cols, rows) = (case.session.size.columns, case.session.size.screen_lines);
+            case.session.term.lock().resize(TermSize::new(cols, rows));
+
+            let ring: Vec<Vec<u8>> =
+                (0..RING).map(|frame| colored_frame(cols, rows, frame, colors, 1)).collect();
+            let bytes = ring.iter().map(Vec::len).sum::<usize>() / RING;
+
+            for i in 0..WARMUP {
+                case.advance(&ring[i % RING]);
+                case.paint(screen);
+            }
+
+            crate::paint_phases::reset();
+            let (mut parse, mut paint) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+            let frames = ROUNDS * BATCH;
+            for f in 0..frames {
+                let feed = &ring[(WARMUP + f) % RING];
+                let started = std::time::Instant::now();
+                case.advance(feed);
+                parse += started.elapsed();
+                let started = std::time::Instant::now();
+                std::hint::black_box(case.paint(screen));
+                paint += started.elapsed();
+            }
+
+            let n = frames as u32;
+            let share = 100.0 * parse.as_secs_f64() / (parse + paint).as_secs_f64();
+            println!(
+                "  {label:<6} {cols}x{rows}  {bytes:>7} B/frame  parse {:>10?}  paint {:>10?}  \
+                 parse {share:>3.0}% of the two",
+                parse / n,
+                paint / n,
+            );
+            println!("       {}", crate::paint_phases::totals().per_frame(n).summary());
         }
     }
 
