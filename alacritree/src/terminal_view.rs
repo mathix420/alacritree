@@ -1274,7 +1274,10 @@ fn paint_grid_gpu(
         let ppp = ctx.pixels_per_point();
         let geometry = decoration_sprites::Geometry {
             cell: [(cell_w * ppp) as usize, (cell_h * ppp) as usize],
-            thickness: ppp.max(1.0),
+            // Scaled off the cell rather than fixed at a point: a hairline is
+            // what makes a double underline read as one thick rule and dots
+            // blur into a solid line.
+            thickness: (cell_h * ppp / 14.0).round().max(1.0),
             // Where `paint_grid` puts the same two lines, so a decorated run
             // comes out in the same place whichever path drew it.
             underline_y: (cell_h - 1.5) * ppp,
