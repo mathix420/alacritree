@@ -1327,7 +1327,7 @@ fn paint_grid_gpu(
         });
         state.mark_rows_dirty(upload);
     }
-    painter.add(gpu.callback(rect, ctx));
+    painter.add(gpu.callback(rect, ctx, config.debug.gpu_timing));
 }
 
 #[allow(clippy::too_many_arguments)]

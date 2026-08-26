@@ -22,6 +22,7 @@ mod frame_log;
 mod git_nav;
 mod git_status;
 mod glyph_cache;
+mod gpu_timing;
 mod grid_gl;
 mod grid_instances;
 mod ime;

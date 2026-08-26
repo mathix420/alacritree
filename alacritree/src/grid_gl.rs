@@ -26,6 +26,7 @@ use eframe::glow::{self, HasContext};
 use egui::Rect;
 
 use crate::decoration_sprites::DecorationAtlas;
+use crate::gpu_timing::{self, GpuTimers};
 use crate::grid_instances::{GlyphInstance, GlyphSlot, GlyphTable, GridInstances};
 
 /// Attribute locations, bound before linking so every program reads the same
@@ -145,7 +146,7 @@ impl GpuGrid {
     /// The shape to hand egui.  Everything it draws comes from `state`, which
     /// the caller has already written this frame — except the atlas size,
     /// which only the atlas live at paint time can give.
-    pub fn callback(&self, rect: Rect, ctx: &egui::Context) -> egui::Shape {
+    pub fn callback(&self, rect: Rect, ctx: &egui::Context, timing: bool) -> egui::Shape {
         let (state, resources, ctx) = (self.state.clone(), self.gl.clone(), ctx.clone());
         let failed = self.failed.clone();
         egui::Shape::Callback(egui::epaint::PaintCallback {
@@ -154,7 +155,7 @@ impl GpuGrid {
                 let mut held = resources.lock().expect("gl resources");
                 let gl = painter.gl().clone();
                 if let GlSlot::Unbuilt = *held {
-                    *held = match GlResources::new(&gl) {
+                    *held = match GlResources::new(&gl, timing) {
                         Ok(resources) => GlSlot::Ready(resources),
                         Err(err) => {
                             log::error!("gpu grid disabled: {err}");
@@ -198,6 +199,9 @@ struct GlResources {
     /// The slot table padded to whole texture rows, kept across uploads so a
     /// table that grew by one glyph does not allocate to send itself.
     slot_scratch: Vec<GlyphSlot>,
+    /// `None` unless `[debug] gpu_timing` asked for it and the context can
+    /// answer.
+    timers: Option<GpuTimers>,
 }
 
 struct Program {
@@ -212,7 +216,7 @@ impl Program {
 }
 
 impl GlResources {
-    fn new(gl: &glow::Context) -> Result<Self, String> {
+    fn new(gl: &glow::Context, timing: bool) -> Result<Self, String> {
         let version = ShaderVersion::get(gl);
         // Instanced arrays, `texelFetch` and integer vertex attributes all
         // arrive together in GL 3 / GLES 3.  Older contexts keep the mesh path.
@@ -275,6 +279,7 @@ impl GlResources {
                 instance_capacity: 0,
                 slot_texture,
                 slot_scratch: Vec::new(),
+                timers: timing.then(|| GpuTimers::new(gl)).flatten(),
             })
         }
     }
@@ -291,6 +296,14 @@ impl GlResources {
         if cols == 0 || rows == 0 {
             return;
         }
+        let issued = std::time::Instant::now();
+        // Held apart from `self` for the frame: the stages it wraps all take
+        // `&mut self`, and a timer borrowed out of the same struct would keep
+        // them from being called at all.
+        let mut timers = self.timers.take();
+        if let Some(timers) = &mut timers {
+            timers.begin_frame(gl);
+        }
         unsafe {
             // egui scissors the callback to its clip rect before handing over,
             // so this reaches the grid and nothing around it.
@@ -298,16 +311,40 @@ impl GlResources {
             gl.clear_color(r, g, b, a);
             gl.clear(glow::COLOR_BUFFER_BIT);
 
+            if let Some(timers) = &mut timers {
+                timers.begin(gl, gpu_timing::UPLOAD);
+            }
             self.upload(gl, state);
+            if let Some(timers) = &timers {
+                timers.end(gl);
+            }
             gl.bind_vertex_array(Some(self.vao));
             self.bind_records(gl);
 
+            if let Some(timers) = &mut timers {
+                timers.begin(gl, gpu_timing::BACKGROUNDS);
+            }
             self.draw_backgrounds(gl, state, cols * rows);
+            if let Some(timers) = &timers {
+                timers.end(gl);
+            }
             if let Some(atlas) = atlas {
+                if let Some(timers) = &mut timers {
+                    timers.begin(gl, gpu_timing::GLYPHS);
+                }
                 self.draw_glyphs(gl, state, atlas, atlas_size, cols * rows);
+                if let Some(timers) = &timers {
+                    timers.end(gl);
+                }
             }
             if let Some(strip) = decorations {
+                if let Some(timers) = &mut timers {
+                    timers.begin(gl, gpu_timing::DECORATIONS);
+                }
                 self.draw_decorations(gl, state, strip, cols * rows);
+                if let Some(timers) = &timers {
+                    timers.end(gl);
+                }
             }
 
             for (index, _) in ATTRIBUTES {
@@ -315,6 +352,10 @@ impl GlResources {
             }
             gl.bind_vertex_array(None);
         }
+        if let Some(timers) = &mut timers {
+            timers.end_frame(issued.elapsed());
+        }
+        self.timers = timers;
     }
 
     unsafe fn upload(&mut self, gl: &glow::Context, state: &mut GridState) {
