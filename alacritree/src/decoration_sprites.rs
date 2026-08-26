@@ -117,14 +117,18 @@ fn rasterize(geometry: Geometry) -> ColorImage {
 }
 
 fn draw_underline(buf: &mut [f32], stride: usize, x0: usize, kind: u16, geometry: Geometry) {
-    let [w, _] = geometry.cell;
+    let [w, h] = geometry.cell;
     let t = geometry.thickness;
-    let y = geometry.underline_y;
+    // Styles taller than one stem are pulled up until they fit, so a thick
+    // line on a short cell loses its lower half to the cell edge instead of
+    // its shape.
+    let fit = |extent: f32| geometry.underline_y.min(h as f32 - extent);
     match kind {
-        STRAIGHT => rect(buf, stride, x0, w, y - t / 2.0, t),
-        // One stem above the single underline's position and one below, so the
-        // pair straddles where a straight rule would have been.
+        STRAIGHT => rect(buf, stride, x0, w, fit(t / 2.0) - t / 2.0, t),
+        // One stem above the single underline's position and one below, with a
+        // stem's worth of gap: any less and the pair reads as one thick rule.
         DOUBLE => {
+            let y = fit(t * 1.5);
             rect(buf, stride, x0, w, y - t * 1.5, t);
             rect(buf, stride, x0, w, y + t * 0.5, t);
         },
@@ -132,13 +136,16 @@ fn draw_underline(buf: &mut [f32], stride: usize, x0: usize, kind: u16, geometry
         // Both patterns repeat a whole number of times per cell, which is what
         // makes a run of them read as one continuous dotted or dashed line.
         DOTTED => {
-            let period = (w as f32 / (2.0 * t).max(2.0)).round().max(1.0);
-            let step = w as f32 / period;
-            for i in 0..period as usize {
-                rect_x(buf, stride, x0, i as f32 * step, step / 2.0, y - t / 2.0, t);
+            let y = fit(t / 2.0) - t / 2.0;
+            // Dots as wide as they are tall, with a gap to match, so the
+            // pattern survives the filtering that samples the tile.
+            let dots = (w as f32 / (2.0 * t)).round().max(1.0);
+            let step = w as f32 / dots;
+            for i in 0..dots as usize {
+                rect_x(buf, stride, x0, i as f32 * step, step / 2.0, y, t);
             }
         },
-        DASHED => rect_x(buf, stride, x0, 0.0, w as f32 * 0.6, y - t / 2.0, t),
+        DASHED => rect_x(buf, stride, x0, 0.0, w as f32 * 0.6, fit(t / 2.0) - t / 2.0, t),
         _ => {},
     }
 }
@@ -175,12 +182,14 @@ fn rect_x(buf: &mut [f32], stride: usize, x0: usize, left: f32, width: f32, top:
 fn curl(buf: &mut [f32], stride: usize, x0: usize, geometry: Geometry) {
     let [w, h] = geometry.cell;
     let t = geometry.thickness;
-    // The wave has to stay inside the cell, so the amplitude is whatever the
-    // room below the underline position allows, capped at a shape that still
-    // reads as a curl rather than a ripple.
-    let room = (h as f32 - geometry.underline_y - t / 2.0).max(0.0);
-    let amplitude = t.min(room).max(0.5);
-    let centre = geometry.underline_y - amplitude / 2.0;
+    // The wave hangs from the underline position rather than sitting on it:
+    // anchoring the lowest ink there and claiming the room above is what keeps
+    // the amplitude off zero on a cell whose underline sits near the bottom,
+    // where a slope-limited curl degrades into a straight line.
+    let bottom = (geometry.underline_y + t).min(h as f32 - 1.0);
+    let top = (bottom - 3.0 * t).max(0.0);
+    let amplitude = ((bottom - top - t) / 2.0).max(0.5);
+    let centre = (top + bottom) / 2.0;
     let two_pi = std::f32::consts::TAU;
 
     for px in 0..w {
@@ -282,6 +291,17 @@ mod tests {
         let row: Vec<u8> = (0..geometry().cell[0]).map(|x| alpha(&image, DOTTED, x, 17)).collect();
         assert!(row.iter().any(|&a| a > 128), "no dots: {row:?}");
         assert!(row.iter().any(|&a| a < 128), "no gaps: {row:?}");
+    }
+
+    /// The two stems have to be separated by a blank row, or the pair reads as
+    /// one thick rule and the style is indistinguishable from a straight one.
+    #[test]
+    fn a_double_underline_has_two_separated_stems() {
+        let image = rasterize(geometry());
+        let column: Vec<bool> =
+            (0..geometry().cell[1]).map(|y| alpha(&image, DOUBLE, 5, y) > 128).collect();
+        let stems = column.windows(2).filter(|w| !w[0] && w[1]).count();
+        assert_eq!(stems, 2, "not two stems: {column:?}");
     }
 
     /// A curl leaves ink on more than one row, which is what separates it from
