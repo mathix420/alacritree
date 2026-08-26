@@ -179,6 +179,10 @@
           "description": "Write an artifact when the process panics.  alacritree-only, so it\nbelongs in `alacritree.toml`.  Default `true`: a crash that leaves no\nrecord is the failure this exists to prevent.",
           "type": "boolean"
         },
+        "gpu_timing": {
+          "description": "Log what the GPU grid's paint callback costs: the wall time of\nissuing a frame, and the GPU's own time for the upload and each of\nthe three draws.  alacritree-only, so it belongs in\n`alacritree.toml`.  Default `false`; timer queries are cheap but not\nfree, and the line is only meaningful to someone reading it.  Needs\n`[ui] gpu_grid` and a GL 3.3 context.",
+          "type": "boolean"
+        },
         "persistent_logging": {
           "description": "Keep the log file after quitting.  Upstream's name and upstream's\ndefault (`false`).",
           "type": "boolean"
@@ -944,6 +948,10 @@
         "font": {
           "$ref": "#/$defs/RawUiFont",
           "description": "The font sidebars, tabs and dialogs are drawn with."
+        },
+        "gpu_grid": {
+          "description": "Draw the terminal grid through an OpenGL paint callback instead of\nhanding epaint a mesh.  Default `false`: it needs a GL 3 context and\nbypasses the renderer every other panel goes through, so an\nunmodified config keeps the path that has always drawn the grid.  A\ncontext too old for instanced arrays logs once and paints the mesh\nfrom the next frame on.",
+          "type": "boolean"
         },
         "icon_tooltips": {
           "description": "Whether a sidebar icon explains itself on hover: `true` (default).",

@@ -1457,6 +1457,12 @@ struct RawDebug {
     /// Keep the log file after quitting.  Upstream's name and upstream's
     /// default (`false`).
     persistent_logging: Option<bool>,
+    /// Log what the GPU grid's paint callback costs: the wall time of
+    /// issuing a frame, and the GPU's own time for the upload and each of
+    /// the three draws.  alacritree-only, so it belongs in
+    /// `alacritree.toml`.  Default `false`; timer queries are cheap but not
+    /// free, and the line is only meaningful to someone reading it.  Needs
+    /// `[ui] gpu_grid` and a GL 3.3 context.
     gpu_timing: Option<bool>,
 }
 
@@ -2011,6 +2017,12 @@ struct RawUi {
     /// Sidebar scrollbar style: "floating" (default) | "solid".
     #[schemars(extend("enum" = ["floating", "solid"]))]
     scrollbar: Option<String>,
+    /// Draw the terminal grid through an OpenGL paint callback instead of
+    /// handing epaint a mesh.  Default `false`: it needs a GL 3 context and
+    /// bypasses the renderer every other panel goes through, so an
+    /// unmodified config keeps the path that has always drawn the grid.  A
+    /// context too old for instanced arrays logs once and paints the mesh
+    /// from the next frame on.
     gpu_grid: Option<bool>,
     /// Poll `gh` for each branch's open pull request, which drives the PR row
     /// icons, the PR-state filters, and `$pr` in row templates.
