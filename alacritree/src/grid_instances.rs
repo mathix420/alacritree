@@ -1,9 +1,9 @@
 //! Per-cell instance records for the GPU grid path.
 //!
 //! The mesh path writes four 20-byte vertices per cell, and almost all of that
-//! is position arithmetic a vertex shader does for free.  One 16-byte record
-//! per cell carries the same information, so the CPU writes a fifth of the
-//! bytes and no geometry at all.
+//! is position arithmetic a vertex shader does for free.  One [`GlyphInstance`]
+//! per cell carries the same information in twelve bytes, so the CPU writes
+//! under a sixth of them and no geometry at all.
 //!
 //! Records are laid out at a fixed `cols` stride with a blank slot for empty
 //! cells, so row `r` always occupies `[r * cols, (r + 1) * cols)`.  That is
