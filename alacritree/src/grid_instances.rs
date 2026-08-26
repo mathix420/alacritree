@@ -298,6 +298,47 @@ impl GridInstances {
     }
 }
 
+/// An alternative writer body, kept beside the shipped one so a benchmark can
+/// run the two against a single captured snapshot in one process.  Comparing
+/// across separate binaries makes the machine's drift and each build's capture
+/// phase part of the measurement; comparing here does not.
+#[cfg(test)]
+impl GridInstances {
+    /// Every cell gets a record, so the loop carries no per-run predicate.
+    /// Blank-heavy rows pay stores that `clear_row` already made redundant.
+    pub fn write_rows_noskip<'a>(
+        &mut self,
+        rows_touched: impl IntoIterator<Item = usize>,
+        runs: impl IntoIterator<Item = RunView<'a>>,
+        default_bg: Color32,
+        mut slot_for: impl FnMut(char, Face) -> u16,
+    ) {
+        let blank = default_bg.to_array();
+        for row in rows_touched {
+            if row < self.rows {
+                self.clear_row(row, blank);
+            }
+        }
+        for run in runs {
+            if run.row >= self.rows {
+                continue;
+            }
+            let base = run.row * self.cols;
+            let fg = run.fg.to_array();
+            let bg = run.bg.to_array();
+            let mut col = run.start_col;
+            for ch in run.text.chars() {
+                if col >= self.cols {
+                    break;
+                }
+                let slot = if ch == ' ' { BLANK_SLOT } else { slot_for(ch, run.face) };
+                self.glyphs[base + col] = GlyphInstance { slot, deco: run.deco, fg, bg };
+                col += 1;
+            }
+        }
+    }
+}
+
 /// What `write_rows` needs from a snapshot run, without borrowing the snapshot
 /// itself — the caller resolves the text slice and the face once.
 #[derive(Clone, Copy)]

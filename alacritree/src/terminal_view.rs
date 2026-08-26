@@ -3036,6 +3036,215 @@ mod tests {
         }
     }
 
+    /// A shell-like screen: a short coloured run at the start of each line and
+    /// blanks to the right margin.
+    ///
+    /// The decorated workloads fill every cell, so they cannot price the blank
+    /// fast path in `write_rows` at all: a screen with no spaces never takes
+    /// it. Real terminal output is mostly blank, which is the case that path
+    /// exists for, and the case where writing a record per cell has to pay.
+    fn sparse_frame(cols: usize, rows: usize, frame: usize) -> Vec<u8> {
+        let mut out = Vec::from(&b"\x1b[2J"[..]);
+        for y in 0..rows {
+            out.extend_from_slice(format!("\x1b[{};1H", y + 1).as_bytes());
+            let sgr = format!("\x1b[38;2;{};128;64m", (frame + y) & 0xff);
+            out.extend_from_slice(sgr.as_bytes());
+            // Varying the width keeps every row from sharing one run shape.
+            let width = (8 + (frame * 7 + y * 3) % 48).min(cols);
+            for x in 0..width {
+                out.push(b'a' + ((x + y) % 26) as u8);
+            }
+            out.extend_from_slice(b"\x1b[0m");
+        }
+        out
+    }
+
+    /// Not a gate. Run it by hand:
+    /// `cargo test -p alacritree --release -- --ignored --nocapture --test-threads=1
+    /// report_writer_variants`
+    ///
+    /// What each candidate write loop costs, measured against one captured
+    /// snapshot inside one process.
+    ///
+    /// Comparing writers by building a binary per candidate makes two things
+    /// part of the result that have nothing to do with the writer: the
+    /// machine's drift between runs, and the capture phase, which is not the
+    /// same code in every candidate once a candidate moves work into it.
+    /// Capturing once here and replaying it leaves only the loop under test.
+    ///
+    /// `slot_for` is a plain arithmetic map rather than the interning table
+    /// the painter uses, so a cache lookup does not sit between the loop and
+    /// the numbers.  That makes these figures a comparison between loops, not
+    /// a prediction of the painter's write phase.
+    #[test]
+    #[ignore = "timing harness, not an assertion"]
+    fn report_writer_variants() {
+        use crate::grid_instances::GridInstances;
+        const COLS: usize = 318;
+        const ROWS: usize = 83;
+        let rounds: usize = std::env::var("ALACRITREE_BENCH_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(400);
+        const REPS: usize = 6;
+
+        println!("{COLS}x{ROWS} cells, {rounds} rounds of {REPS} writes per variant");
+
+        for (label, colors, decoration, stride, sparse) in [
+            ("FGPerChar", Colors::Fg, Decoration::None, 1, false),
+            ("FGBGPerChar", Colors::FgBg, Decoration::None, 1, false),
+            ("FGBG stride 8", Colors::FgBg, Decoration::None, 8, false),
+            ("FG underlined", Colors::Fg, Decoration::Underline, 1, false),
+            ("FG under+strike", Colors::Fg, Decoration::UnderlineAndStrikeout, 1, false),
+            ("sparse shell", Colors::Fg, Decoration::None, 1, true),
+        ] {
+            let (proxy, _events) = EventProxy::new(egui::Context::default());
+            let mut term = Term::new(TermConfig::default(), &TermSize::new(COLS, ROWS), proxy);
+            let mut parser = Processor::<StdSyncHandler>::new();
+            let config = Config::default();
+            let mut snapshot = GridSnapshot::new();
+            // Two frames: the first capture has no damage history to read, so
+            // the second is the one a steady-state frame produces.
+            for frame in 0..2 {
+                let bytes = if sparse {
+                    sparse_frame(COLS, ROWS, frame)
+                } else {
+                    colored_frame(COLS, ROWS, frame, colors, decoration, stride)
+                };
+                parser.advance(&mut term, &bytes);
+                snapshot.capture(&mut term, &config, 0, None, true);
+            }
+
+            // The painter resolves the default background from the palette, and
+            // the blank fast path compares a run's background against exactly
+            // that.  A hardcoded colour here makes that comparison fail for
+            // every run, so the path under test would never run.
+            let bg = background(&config.palette);
+
+            // A workload that means to price the blank fast path has to contain
+            // blanks that path would take: a space on the default background
+            // in an undecorated run.  Printed so a workload cannot claim to
+            // exercise it while capture emits no such cell.
+            let (mut runs, mut cells, mut skippable) = (0usize, 0usize, 0usize);
+            for (text, run) in snapshot.runs_in_rows(0..ROWS) {
+                runs += 1;
+                cells += text.chars().count();
+                if run.bg == bg && decoration_tile(run.flags) == 0 {
+                    skippable += text.chars().filter(|c| *c == ' ').count();
+                }
+            }
+            let mut instances = GridInstances::default();
+            instances.resize(COLS, ROWS, bg);
+
+            // Each entry writes the whole grid once, except the probes, which
+            // walk the runs and write nothing.  Their difference prices the
+            // per-run tile computation on its own, which is what any proposal
+            // to resolve the tile somewhere else trades against.
+            let variants: [(&str, fn(&mut GridInstances, &GridSnapshot, usize, Color32)); 4] = [
+                ("ship", |g, s, rows, bg| {
+                    g.write_rows(0..rows, run_views(s, rows), bg, |ch, _| ch as u16)
+                }),
+                ("noskip", |g, s, rows, bg| {
+                    g.write_rows_noskip(0..rows, run_views(s, rows), bg, |ch, _| ch as u16)
+                }),
+                ("probe: walk runs, no tile", |_g, s, rows, _bg| {
+                    let mut acc = 0u32;
+                    for (_, run) in s.runs_in_rows(0..rows) {
+                        acc ^= run.start_col as u32;
+                    }
+                    std::hint::black_box(acc);
+                }),
+                ("probe: walk runs + tile", |_g, s, rows, _bg| {
+                    let mut acc = 0u32;
+                    for (_, run) in s.runs_in_rows(0..rows) {
+                        acc ^= run.start_col as u32 ^ decoration_tile(run.flags) as u32;
+                    }
+                    std::hint::black_box(acc);
+                }),
+            ];
+            // A faster loop that renders differently is not a candidate.  The
+            // one legitimate difference is the foreground byte of an
+            // undecorated blank: `clear_row` leaves it zeroed and `noskip`
+            // writes the run's, and nothing samples it because that cell draws
+            // no glyph and no decoration.
+            let reference = {
+                (variants[0].1)(&mut instances, &snapshot, ROWS, bg);
+                instances.glyphs.clone()
+            };
+            for (name, run) in &variants {
+                // Probes measure a walk, not a write, and leave the buffer alone.
+                if name.starts_with("probe") {
+                    continue;
+                }
+                run(&mut instances, &snapshot, ROWS, bg);
+                for (i, (a, b)) in reference.iter().zip(&instances.glyphs).enumerate() {
+                    let blank = a.slot == crate::grid_instances::BLANK_SLOT && a.deco == 0;
+                    let same = a.slot == b.slot && a.deco == b.deco && a.bg == b.bg;
+                    assert!(
+                        same && (blank || a.fg == b.fg),
+                        "{name} disagrees with ship at cell {i} on {label}"
+                    );
+                }
+            }
+
+            let mut samples: Vec<Vec<f64>> = vec![Vec::new(); variants.len()];
+            for _ in 0..8 {
+                for (_, run) in &variants {
+                    run(&mut instances, &snapshot, ROWS, bg);
+                }
+            }
+            for round in 0..rounds {
+                // Rotate the order so no variant always runs first.
+                for i in 0..variants.len() {
+                    let v = (i + round) % variants.len();
+                    let started = std::time::Instant::now();
+                    for _ in 0..REPS {
+                        (variants[v].1)(&mut instances, &snapshot, ROWS, bg);
+                        std::hint::black_box(&instances.glyphs[0]);
+                    }
+                    samples[v].push(started.elapsed().as_secs_f64() * 1e6 / REPS as f64);
+                }
+            }
+
+            println!(
+                "\n  {label}  ({runs} runs, {cells} cells, {skippable} skippable blanks = {:.0}%)",
+                100.0 * skippable as f64 / cells.max(1) as f64,
+            );
+            // Paired per-round ratios rather than a ratio of two medians: the
+            // rounds interleave, so a round's own load cancels inside the
+            // ratio, and the count above parity says whether a difference
+            // smaller than the noise is a real ordering or a coin flip.
+            for (i, (name, _)) in variants.iter().enumerate() {
+                let med = median(&mut samples[i].clone());
+                let mut paired: Vec<f64> =
+                    samples[i].iter().zip(&samples[0]).map(|(a, b)| a / b).collect();
+                let above = paired.iter().filter(|r| **r > 1.0).count();
+                println!(
+                    "    {name:<26} {med:8.1}us  paired vs ship {:.3}  above parity {above}/{rounds}",
+                    median(&mut paired),
+                );
+            }
+        }
+    }
+
+    /// The run views the shipped painter builds.
+    fn run_views<'a>(snapshot: &'a GridSnapshot, rows: usize) -> impl Iterator<Item = RunView<'a>> {
+        snapshot.runs_in_rows(0..rows).map(|(text, run)| RunView {
+            text,
+            start_col: run.start_col,
+            row: run.row as usize,
+            face: Face::new(run.flags.contains(Flags::BOLD), run.flags.contains(Flags::ITALIC)),
+            deco: decoration_tile(run.flags),
+            fg: run.fg,
+            bg: run.bg,
+        })
+    }
+
+    fn median(v: &mut Vec<f64>) -> f64 {
+        v.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+        v[v.len() / 2]
+    }
+
     /// Not a gate — run it by hand:
     /// `cargo test -p alacritree --release -- --ignored --nocapture --test-threads=1
     /// report_parse_share`
