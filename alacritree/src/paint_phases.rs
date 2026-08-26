@@ -47,18 +47,15 @@ mod recording {
         Capture,
         /// Clearing and rewriting the damaged rows' cell records.
         WriteRows,
-        /// Re-emitting underlines and strikeouts as egui shapes.
-        Decorations,
     }
 
     impl Phase {
-        pub const ALL: [Phase; 3] = [Phase::Capture, Phase::WriteRows, Phase::Decorations];
+        pub const ALL: [Phase; 2] = [Phase::Capture, Phase::WriteRows];
 
         pub fn name(self) -> &'static str {
             match self {
                 Phase::Capture => "capture",
                 Phase::WriteRows => "write",
-                Phase::Decorations => "decor",
             }
         }
     }

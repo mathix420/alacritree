@@ -10,11 +10,13 @@
 //! the raw texture epaint already packed its glyphs into, so the shader samples
 //! the same artwork the mesh path would have.
 //!
-//! Two draws over one buffer, neither carrying any geometry: a quad instanced
-//! once per cell for the backgrounds, then the same again for the glyphs.
-//! Underlines, emoji and box-drawing glyphs stay on egui's painter — they
-//! carry their own textures or their own geometry, and they are rare enough
-//! to leave.
+//! Three draws over one buffer, none of them carrying any geometry: a quad
+//! instanced once per cell for the backgrounds, the same again for the glyphs,
+//! then a band per cell for underlines and strikeouts.  Decorations go last
+//! because alacritty draws its rects over the text (`display::draw`), so a
+//! descender crossing an underline has to come out the same way here.
+//! Emoji and box-drawing glyphs stay on egui's painter — they carry their own
+//! textures or their own geometry, and they are rare enough to leave.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -23,12 +25,13 @@ use eframe::egui_glow::ShaderVersion;
 use eframe::glow::{self, HasContext};
 use egui::Rect;
 
+use crate::decoration_sprites::DecorationAtlas;
 use crate::grid_instances::{GlyphInstance, GlyphSlot, GlyphTable, GridInstances};
 
-/// Attribute locations, bound before linking so both programs read the same
+/// Attribute locations, bound before linking so every program reads the same
 /// record the same way.  `#version 140` has no `layout(location = ...)`, so
 /// the binding has to come from this side.
-const ATTRIBUTES: [(u32, &str); 3] = [(0, "a_slot"), (1, "a_fg"), (2, "a_bg")];
+const ATTRIBUTES: [(u32, &str); 4] = [(0, "a_slot"), (1, "a_fg"), (2, "a_bg"), (3, "a_deco")];
 
 /// Slots packed across a texture row, two RGBA32F texels each.  A row per
 /// slot would cap the table at the 2048 rows a driver is obliged to offer,
@@ -43,8 +46,10 @@ pub struct Frame {
     pub origin: [f32; 2],
     pub cell: [f32; 2],
     pub grid: [u32; 2],
-    /// Height of an underline and a strikeout, in points.
-    pub line_thickness: f32,
+    /// The decoration strip, and how many tiles wide it is.  `None` leaves
+    /// the decoration pass unrun, which is what a grid with no font yet has.
+    pub decorations: Option<egui::TextureId>,
+    pub decoration_tiles: u32,
     /// The terminal's own background, as the clear colour.  A grid rect is
     /// rarely an exact multiple of a cell, and the cell quads stop at the last
     /// whole one, so the strip past it is filled by clearing rather than by a
@@ -60,6 +65,8 @@ pub struct Frame {
 pub struct GridState {
     pub instances: GridInstances,
     pub table: GlyphTable,
+    /// The rasterized decoration styles, rebuilt when the cell changes size.
+    pub decorations: DecorationAtlas,
     pub frame: Frame,
     /// Rows rewritten since the last upload, as a half-open range.  Empty
     /// means the GPU copy is already current and only uniforms need sending.
@@ -167,7 +174,8 @@ impl GpuGrid {
                 // while the frame was still being built leaves the shader
                 // dividing texels by half an atlas.
                 let size = ctx.fonts(|f| f.font_image_size());
-                resources.draw(&gl, &mut state, atlas, size.map(|side| side as f32));
+                let decorations = state.frame.decorations.and_then(|id| painter.texture(id));
+                resources.draw(&gl, &mut state, atlas, size.map(|side| side as f32), decorations);
             })),
         })
     }
@@ -182,6 +190,7 @@ impl Default for GpuGrid {
 struct GlResources {
     glyph: Program,
     background: Program,
+    decoration: Program,
     vao: glow::VertexArray,
     instances: glow::Buffer,
     instance_capacity: usize,
@@ -224,14 +233,24 @@ impl GlResources {
                 || version == ShaderVersion::Es300;
 
         unsafe {
-            let glyph = link(gl, header, GLYPH_VERT, GLYPH_FRAG, srgb_atlas)?;
-            let background = match link(gl, header, BACKGROUND_VERT, BACKGROUND_FRAG, srgb_atlas) {
-                Ok(program) => program,
-                Err(err) => {
-                    gl.delete_program(glyph.program);
-                    return Err(err);
-                },
-            };
+            let mut programs = Vec::new();
+            for (vertex, fragment) in [
+                (GLYPH_VERT, GLYPH_FRAG),
+                (BACKGROUND_VERT, BACKGROUND_FRAG),
+                (DECORATION_VERT, DECORATION_FRAG),
+            ] {
+                match link(gl, header, vertex, fragment, srgb_atlas) {
+                    Ok(program) => programs.push(program),
+                    Err(err) => {
+                        for spent in programs {
+                            gl.delete_program(spent.program);
+                        }
+                        return Err(err);
+                    },
+                }
+            }
+            let [glyph, background, decoration]: [Program; 3] =
+                programs.try_into().unwrap_or_else(|_| unreachable!("one program per pair"));
             // `glGen*` returns zero only on a context that is already dead, and
             // the caller latches the failure, so the objects a partial run
             // leaves behind are made at most once.
@@ -250,6 +269,7 @@ impl GlResources {
             Ok(Self {
                 glyph,
                 background,
+                decoration,
                 vao,
                 instances,
                 instance_capacity: 0,
@@ -265,6 +285,7 @@ impl GlResources {
         state: &mut GridState,
         atlas: Option<glow::Texture>,
         atlas_size: [f32; 2],
+        decorations: Option<glow::Texture>,
     ) {
         let (cols, rows) = state.instances.dimensions();
         if cols == 0 || rows == 0 {
@@ -284,6 +305,9 @@ impl GlResources {
             self.draw_backgrounds(gl, state, cols * rows);
             if let Some(atlas) = atlas {
                 self.draw_glyphs(gl, state, atlas, atlas_size, cols * rows);
+            }
+            if let Some(strip) = decorations {
+                self.draw_decorations(gl, state, strip, cols * rows);
             }
 
             for (index, _) in ATTRIBUTES {
@@ -357,6 +381,8 @@ impl GlResources {
             gl.vertex_attrib_pointer_f32(1, 4, glow::UNSIGNED_BYTE, true, stride, 4);
             gl.enable_vertex_attrib_array(2);
             gl.vertex_attrib_pointer_f32(2, 4, glow::UNSIGNED_BYTE, true, stride, 8);
+            gl.enable_vertex_attrib_array(3);
+            gl.vertex_attrib_pointer_i32(3, 1, glow::UNSIGNED_SHORT, stride, 2);
             for (index, _) in ATTRIBUTES {
                 gl.vertex_attrib_divisor(index, 1);
             }
@@ -370,6 +396,30 @@ impl GlResources {
             set_vec2(gl, &self.background, "u_origin", state.frame.origin);
             set_vec2(gl, &self.background, "u_cell", state.frame.cell);
             set_vec2(gl, &self.background, "u_viewport", viewport_points(state));
+            gl.draw_arrays_instanced(glow::TRIANGLE_STRIP, 0, 4, cells as i32);
+        }
+    }
+
+    /// Underlines and strikeouts, one instance per cell.  An undecorated cell
+    /// collapses in the vertex shader, so the draw costs the instance count
+    /// and nothing else on a screen carrying no decorations.
+    unsafe fn draw_decorations(
+        &self,
+        gl: &glow::Context,
+        state: &GridState,
+        strip: glow::Texture,
+        cells: usize,
+    ) {
+        unsafe {
+            gl.use_program(Some(self.decoration.program));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(strip));
+            set_i32(gl, &self.decoration, "u_decorations", 0);
+            set_i32(gl, &self.decoration, "u_cols", state.frame.grid[0] as i32);
+            set_i32(gl, &self.decoration, "u_tiles", state.frame.decoration_tiles as i32);
+            set_vec2(gl, &self.decoration, "u_origin", state.frame.origin);
+            set_vec2(gl, &self.decoration, "u_cell", state.frame.cell);
+            set_vec2(gl, &self.decoration, "u_viewport", viewport_points(state));
             gl.draw_arrays_instanced(glow::TRIANGLE_STRIP, 0, 4, cells as i32);
         }
     }
@@ -597,6 +647,53 @@ out vec4 f_color;
 
 void main() {
     f_color = v_bg;
+}
+"#;
+
+const DECORATION_VERT: &str = r#"
+uniform vec2 u_origin;
+uniform vec2 u_cell;
+uniform vec2 u_viewport;
+uniform int u_cols;
+uniform int u_tiles;
+
+in vec4 a_fg;
+in uint a_deco;
+
+out vec2 v_uv;
+out vec4 v_fg;
+
+void main() {
+    // An undecorated cell collapses to a point rather than reaching the
+    // rasterizer with a cell of fragments that all sample an empty tile.
+    vec2 size = a_deco == 0u ? vec2(0.0) : u_cell;
+
+    vec2 grid_cell = vec2(gl_InstanceID % u_cols, gl_InstanceID / u_cols);
+    // 0 = top-left, 1 = top-right, 2 = bottom-left, 3 = bottom-right.
+    vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));
+    vec2 pos = u_origin + grid_cell * u_cell + corner * size;
+
+    gl_Position = vec4(
+        2.0 * pos.x / u_viewport.x - 1.0,
+        1.0 - 2.0 * pos.y / u_viewport.y,
+        0.0,
+        1.0);
+    // Tiles sit side by side in one row, each a cell wide.
+    v_uv = vec2((float(a_deco) + corner.x) / float(u_tiles), corner.y);
+    v_fg = a_fg;
+}
+"#;
+
+const DECORATION_FRAG: &str = r#"
+uniform sampler2D u_decorations;
+in vec2 v_uv;
+in vec4 v_fg;
+out vec4 f_color;
+
+void main() {
+    // The strip is a coverage mask, so only alpha carries shape: it is stored
+    // linearly whatever the driver did to the colour channels.
+    f_color = v_fg * texture(u_decorations, v_uv).a;
 }
 "#;
 
