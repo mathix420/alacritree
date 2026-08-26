@@ -282,16 +282,16 @@ impl GridInstances {
                 if col >= self.cols {
                     break;
                 }
-                if ch == ' ' && keeps_background {
-                    col += 1;
-                    continue;
-                }
-                self.glyphs[base + col] = GlyphInstance {
-                    slot: if ch == ' ' { BLANK_SLOT } else { slot_for(ch, run.face) },
-                    deco: run.deco,
-                    fg,
-                    bg,
+                let slot = if ch == ' ' {
+                    if keeps_background {
+                        col += 1;
+                        continue;
+                    }
+                    BLANK_SLOT
+                } else {
+                    slot_for(ch, run.face)
                 };
+                self.glyphs[base + col] = GlyphInstance { slot, deco: run.deco, fg, bg };
                 col += 1;
             }
         }
