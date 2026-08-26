@@ -2595,10 +2595,31 @@ mod tests {
                 std::thread::spawn(move || {
                     let (mut waits, mut total, mut worst) =
                         (0u32, std::time::Duration::ZERO, std::time::Duration::ZERO);
+                    // The PTY thread does not just take the lock, it writes
+                    // under it.  A locker that only acquires and releases
+                    // leaves the terminal unchanged, so every frame after the
+                    // first captures the empty-damage path and holds the lock
+                    // for a fraction of what a real frame holds it for.  One
+                    // line per acquisition is the shape of a PTY read, and
+                    // damage accumulates across the frames it spans.
+                    let mut parser = Processor::<StdSyncHandler>::new();
+                    let mut line = 0usize;
                     while !stop.load(Ordering::Relaxed) {
+                        let output = format!(
+                            "\x1b[{};1H\x1b[38;5;{}m{}",
+                            line % rows + 1,
+                            line % 256,
+                            "sample output "
+                                .repeat(cols / 14)
+                                .chars()
+                                .take(cols)
+                                .collect::<String>(),
+                        );
+                        line += 1;
                         let started = std::time::Instant::now();
-                        let guard = term.lock();
+                        let mut guard = term.lock();
                         let waited = started.elapsed();
+                        parser.advance(&mut *guard, output.as_bytes());
                         drop(guard);
                         waits += 1;
                         total += waited;
