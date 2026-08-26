@@ -36,14 +36,6 @@ pub struct GlyphSlot {
     pub size: [f32; 2],
 }
 
-/// Decorations the fragment shader draws itself, so an underlined run costs no
-/// extra geometry.  The mesh path emits a `Shape::LineSegment` per run for
-/// these, which epaint tessellates as a feathered path.
-pub mod cell_flags {
-    pub const UNDERLINE: u16 = 1 << 0;
-    pub const STRIKEOUT: u16 = 1 << 1;
-}
-
 /// One cell, glyph and background together. Twelve bytes against the mesh
 /// path's eighty.
 ///
@@ -58,7 +50,8 @@ pub mod cell_flags {
 #[repr(C)]
 pub struct GlyphInstance {
     pub slot: u16,
-    pub flags: u16,
+    /// Tile in the decoration strip; zero is an undecorated cell.
+    pub deco: u16,
     /// Premultiplied sRGB, the same convention epaint's vertices use.
     pub fg: [u8; 4],
     pub bg: [u8; 4],
@@ -248,7 +241,7 @@ impl GridInstances {
     /// Clear `row` back to blank cells and the default background, ready for
     /// the runs that cover it to write over.
     fn clear_row(&mut self, row: usize, default_bg: [u8; 4]) {
-        let blank = GlyphInstance { slot: BLANK_SLOT, flags: 0, fg: [0; 4], bg: default_bg };
+        let blank = GlyphInstance { slot: BLANK_SLOT, deco: 0, fg: [0; 4], bg: default_bg };
         self.glyphs[row * self.cols..(row + 1) * self.cols].fill(blank);
     }
 
@@ -280,8 +273,10 @@ impl GridInstances {
             let fg = run.fg.to_array();
             let bg = run.bg.to_array();
             // A blank on the default background is exactly what `clear_row`
-            // already left behind, so its whole record can be skipped.
-            let keeps_background = bg == blank;
+            // already left behind, so its whole record can be skipped — unless
+            // the run is decorated, since the line the shader draws across the
+            // cell comes from the record and nowhere else.
+            let keeps_background = bg == blank && run.deco == 0;
             let mut col = run.start_col;
             for ch in run.text.chars() {
                 if col >= self.cols {
@@ -293,7 +288,7 @@ impl GridInstances {
                 }
                 self.glyphs[base + col] = GlyphInstance {
                     slot: if ch == ' ' { BLANK_SLOT } else { slot_for(ch, run.face) },
-                    flags: run.flags,
+                    deco: run.deco,
                     fg,
                     bg,
                 };
@@ -311,7 +306,7 @@ pub struct RunView<'a> {
     pub start_col: usize,
     pub row: usize,
     pub face: Face,
-    pub flags: u16,
+    pub deco: u16,
     pub fg: Color32,
     pub bg: Color32,
 }
@@ -319,6 +314,7 @@ pub struct RunView<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decoration_sprites;
 
     fn galley(ctx: &egui::Context, ch: char) -> std::sync::Arc<Galley> {
         let mut job = egui::text::LayoutJob::single_section(
@@ -508,7 +504,7 @@ mod tests {
             start_col: 0,
             row: 2,
             face: Face::Normal,
-            flags: 0,
+            deco: 0,
             fg: Color32::WHITE,
             bg: Color32::BLACK,
         }];
@@ -531,7 +527,7 @@ mod tests {
                 start_col: 0,
                 row: 0,
                 face: Face::Normal,
-                flags: 0,
+                deco: 0,
                 fg: Color32::WHITE,
                 bg: Color32::BLACK,
             }]
@@ -541,6 +537,30 @@ mod tests {
         grid.write_rows([0], row0("ab"), Color32::BLACK, |_, _| 7);
 
         assert_eq!(grid.glyphs[2].slot, BLANK_SLOT, "the tail of the old run survived");
+    }
+
+    /// A blank on the default background is what the row was cleared to, so
+    /// its record is normally skipped — but a decorated one has to be written,
+    /// since the line the shader draws across it comes from that record.
+    #[test]
+    fn an_underlined_blank_still_writes_its_record() {
+        let mut grid = GridInstances::default();
+        grid.resize(2, 1, Color32::BLACK);
+        let runs = [RunView {
+            text: " ",
+            start_col: 0,
+            row: 0,
+            face: Face::Normal,
+            deco: decoration_sprites::STRAIGHT,
+            fg: Color32::WHITE,
+            bg: Color32::BLACK,
+        }];
+
+        grid.write_rows([0], runs, Color32::BLACK, |_, _| 1);
+
+        assert_eq!(grid.glyphs[0].deco, decoration_sprites::STRAIGHT);
+        assert_eq!(grid.glyphs[0].slot, BLANK_SLOT, "a blank was given a glyph");
+        assert_eq!(grid.glyphs[0].fg, Color32::WHITE.to_array());
     }
 
     /// The background belongs to the cell's own record, so a coloured run
@@ -554,7 +574,7 @@ mod tests {
             start_col: 1,
             row: 0,
             face: Face::Normal,
-            flags: 0,
+            deco: 0,
             fg: Color32::WHITE,
             bg: Color32::RED,
         }];

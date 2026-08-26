@@ -16,6 +16,7 @@ use crate::clipboard::{self, Target};
 use crate::color_glyph::{CachedColorGlyph, ColorGlyphCache};
 use crate::colors::{background, foreground, resolve, rgb_to_color32};
 use crate::config::{Config, Palette};
+use crate::decoration_sprites;
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
 use crate::glyph_cache::{Face, GlyphCache, MAX_EXTRA_CELLS, growth_offset, may_grow};
 use crate::grid_gl::{Frame as GridFrame, GpuGrid};
@@ -864,11 +865,6 @@ pub struct GridSnapshot {
 struct RowSnapshot {
     text: String,
     runs: Vec<Run>,
-    /// Whether any run here carries an underline or a strikeout.  Those are
-    /// egui shapes, and egui retains nothing between frames, so they have to
-    /// be re-emitted for the whole screen; a flag per row is what keeps that
-    /// from walking every run on a screen that has no decorations at all.
-    decorated: bool,
 }
 
 /// What a capture depends on that the terminal's own damage tracking does not
@@ -926,15 +922,6 @@ impl GridSnapshot {
     ) -> impl Iterator<Item = (&str, &Run)> {
         let len = self.rows.len();
         rows.into_iter().filter(move |&row| row < len).flat_map(|row| row_runs(&self.rows[row]))
-    }
-
-    /// Runs carrying an underline or a strikeout, wherever they are on screen.
-    fn decorated_runs(&self) -> impl Iterator<Item = (&str, &Run)> {
-        self.rows
-            .iter()
-            .filter(|row| row.decorated)
-            .flat_map(row_runs)
-            .filter(|(_, run)| run.flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT))
     }
 
     /// Rows the last capture rewrote, merged into one span.  The GPU path
@@ -1069,7 +1056,6 @@ impl GridSnapshot {
                 let dest = &mut self.rows[row];
                 dest.text.clear();
                 dest.runs.clear();
-                dest.decorated = false;
 
                 let mut col = 0;
                 while col < cols {
@@ -1102,8 +1088,6 @@ impl GridSnapshot {
                         continue;
                     }
                     let (fg, bg) = run_colors(style, selected, runtime_palette, config);
-                    dest.decorated |=
-                        style.flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT);
                     dest.runs.push(Run {
                         text: text_start..dest.text.len(),
                         start_col: start,
@@ -1244,6 +1228,27 @@ fn rows_to_rewrite(
     all.chain(some.iter().copied())
 }
 
+/// The decoration tile a cell carrying `flags` samples.
+///
+/// Each underline style keeps its own shape, so a curl stays a curl rather
+/// than degrading to the straight rule an arithmetic shader can describe.
+fn decoration_tile(flags: Flags) -> u16 {
+    let underline = if flags.contains(Flags::DOUBLE_UNDERLINE) {
+        decoration_sprites::DOUBLE
+    } else if flags.contains(Flags::UNDERCURL) {
+        decoration_sprites::CURLY
+    } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+        decoration_sprites::DOTTED
+    } else if flags.contains(Flags::DASHED_UNDERLINE) {
+        decoration_sprites::DASHED
+    } else if flags.intersects(Flags::ALL_UNDERLINES) {
+        decoration_sprites::STRAIGHT
+    } else {
+        decoration_sprites::NONE
+    };
+    decoration_sprites::tile(underline, flags.contains(Flags::STRIKEOUT))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_grid_gpu(
     gpu: &GpuGrid,
@@ -1264,13 +1269,26 @@ fn paint_grid_gpu(
     {
         let mut state = gpu.state.lock().expect("grid state");
         state.instances.resize(cols, rows, default_bg);
+        // The strip is rasterized in physical pixels so its lines land on whole
+        // ones; the quad sampling it is a cell in points, as everything else is.
+        let ppp = ctx.pixels_per_point();
+        let geometry = decoration_sprites::Geometry {
+            cell: [(cell_w * ppp) as usize, (cell_h * ppp) as usize],
+            thickness: ppp.max(1.0),
+            // Where `paint_grid` puts the same two lines, so a decorated run
+            // comes out in the same place whichever path drew it.
+            underline_y: (cell_h - 1.5) * ppp,
+            strikeout_y: cell_h * 0.5 * ppp,
+        };
+        let strip = state.decorations.texture(ctx, geometry);
         state.frame = GridFrame {
             // egui sets the GL viewport to the callback's rect, so the grid
             // starts at its own corner rather than the window's.
             origin: [0.0, 0.0],
             cell: [cell_w, cell_h],
             grid: [cols as u32, rows as u32],
-            line_thickness: 1.0,
+            decorations: strip,
+            decoration_tiles: decoration_sprites::TILES as u32,
             default_bg: default_bg.to_array().map(|c| c as f32 / 255.0),
         };
         let (instances, table) = state.buffers();
@@ -1284,18 +1302,18 @@ fn paint_grid_gpu(
         // `glBufferSubData`, and the rows it carries between two damaged ones
         // hold records nothing has invalidated.
         let upload = if renumbered { 0..rows } else { snapshot.dirty_rows() };
-        let runs = snapshot
-            .runs_in_rows(touched.clone())
-            .filter(|(_, run)| !run.flags.contains(Flags::HIDDEN))
-            .map(|(text, run)| RunView {
-                text,
-                start_col: run.start_col,
-                row: run.row as usize,
-                face: Face::new(run.flags.contains(Flags::BOLD), run.flags.contains(Flags::ITALIC)),
-                flags: 0,
-                fg: run.fg,
-                bg: run.bg,
-            });
+        // Hidden runs are not filtered out: `capture` already replaced their
+        // characters with blanks, and their background and decorations are
+        // drawn the same as any other run's, as alacritty's `draw_cell` does.
+        let runs = snapshot.runs_in_rows(touched.clone()).map(|(text, run)| RunView {
+            text,
+            start_col: run.start_col,
+            row: run.row as usize,
+            face: Face::new(run.flags.contains(Flags::BOLD), run.flags.contains(Flags::ITALIC)),
+            deco: decoration_tile(run.flags),
+            fg: run.fg,
+            bg: run.bg,
+        });
         phase!(WriteRows, {
             instances.write_rows(touched, runs, default_bg, |ch, face| {
                 table.slot(ch, face, || {
@@ -1307,29 +1325,6 @@ fn paint_grid_gpu(
         state.mark_rows_dirty(upload);
     }
     painter.add(gpu.callback(rect, ctx));
-
-    // Underlines are egui shapes, and egui retains nothing between frames, so
-    // these are re-emitted for every row whether or not it changed.
-    phase!(Decorations, {
-        for (text, run) in snapshot.decorated_runs() {
-            let cells = run_rect(rect, text, run, cell_w, cell_h);
-            let (x, y, width) = (cells.min.x, cells.min.y, cells.width());
-            if run.flags.intersects(Flags::ALL_UNDERLINES) {
-                let uy = y + cell_h - 1.5;
-                painter.line_segment(
-                    [Pos2::new(x, uy), Pos2::new(x + width, uy)],
-                    Stroke::new(1.0_f32, run.fg),
-                );
-            }
-            if run.flags.contains(Flags::STRIKEOUT) {
-                let sy = y + cell_h * 0.5;
-                painter.line_segment(
-                    [Pos2::new(x, sy), Pos2::new(x + width, sy)],
-                    Stroke::new(1.0_f32, run.fg),
-                );
-            }
-        }
-    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2056,19 +2051,27 @@ mod tests {
         );
     }
 
-    /// Underlines are egui shapes and egui keeps nothing between frames, so an
-    /// underline outside this frame's damage still has to be re-emitted.
+    /// A decoration lives in its cells' records, which the GPU holds between
+    /// frames, so a frame that rewrites only the rows it was told changed
+    /// leaves an underline elsewhere on screen standing.
     #[test]
-    fn an_underline_outside_the_damage_is_still_emitted() {
-        let mut term = term_running(b"\x1b[4mlinked\x1b[0m\r\nplain");
-        let mut snapshot = GridSnapshot::new();
-        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+    fn an_underline_outside_the_damage_survives_the_frame() {
+        let grid = crate::grid_gl::GpuGrid::new();
+        let mut case = Case::new("gl", Some(&grid));
+        let screen = Vec2::new(1280.0, 720.0);
+        case.paint(screen);
+        case.advance(b"\x1b[4mlinked\x1b[0m\r\nplain");
+        case.paint(screen);
 
-        Processor::<StdSyncHandler>::new().advance(&mut term, b"\x1b[2;1Hrewritten");
-        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+        case.advance(b"\x1b[2;1Hrewritten");
+        case.paint(screen);
 
-        let decorated: Vec<&str> = snapshot.decorated_runs().map(|(t, _)| t).collect();
-        assert_eq!(decorated, ["linked"]);
+        let state = grid.state.lock().expect("grid state");
+        assert_eq!(
+            state.instances.glyphs[0].deco,
+            decoration_sprites::STRAIGHT,
+            "an undamaged row lost its underline",
+        );
     }
 
     /// An underline spans the whole run and is drawn in the run's foreground,
@@ -3144,6 +3147,39 @@ mod tests {
         );
     }
 
+    /// A decoration is a flag on the cells it covers, and the fragment shader
+    /// draws it from there.  Left to the painter it is a shape per run, which
+    /// on a screen of underlined text is more geometry than the whole grid.
+    #[test]
+    fn a_decorated_run_costs_no_geometry() {
+        let (plain_grid, decorated_grid) =
+            (crate::grid_gl::GpuGrid::new(), crate::grid_gl::GpuGrid::new());
+        let mut plain = Case::new("gl", Some(&plain_grid));
+        let mut decorated = Case::new("gl", Some(&decorated_grid));
+        let screen = Vec2::new(1280.0, 720.0);
+        // The first frame is what tells the session how big its grid is.
+        plain.paint(screen);
+        decorated.paint(screen);
+
+        plain.advance(b"struck");
+        decorated.advance(b"\x1b[4;9mstruck");
+        let without = plain.paint(screen);
+        let with = decorated.paint(screen);
+
+        let state = decorated_grid.state.lock().expect("grid state");
+        assert_eq!(
+            state.instances.glyphs[0].deco,
+            decoration_sprites::tile(decoration_sprites::STRAIGHT, true),
+            "the decoration never reached the cell's record",
+        );
+        assert_eq!(
+            with.vertices,
+            without.vertices,
+            "a decorated run tessellated {} vertices the undecorated one did not",
+            with.vertices - without.vertices,
+        );
+    }
+
     const ROUNDS: usize = 11;
     const BATCH: usize = 20;
     const RING: usize = 32;
@@ -3339,7 +3375,7 @@ mod tests {
 
         use std::sync::Arc;
 
-        use crate::grid_instances::{GlyphTable, GridInstances, RunView, cell_flags};
+        use crate::grid_instances::{GlyphTable, GridInstances, RunView};
 
         let config = Config::default();
         let screen = Vec2::new(2560.0, 1440.0);
@@ -3379,9 +3415,7 @@ mod tests {
                     start_col: r.start_col,
                     row: r.row as usize,
                     face: Face::new(r.flags.contains(Flags::BOLD), r.flags.contains(Flags::ITALIC)),
-                    flags: u16::from(r.flags.intersects(Flags::ALL_UNDERLINES))
-                        * cell_flags::UNDERLINE
-                        | u16::from(r.flags.contains(Flags::STRIKEOUT)) * cell_flags::STRIKEOUT,
+                    deco: decoration_tile(r.flags),
                     fg: r.fg,
                     bg: r.bg,
                 })
