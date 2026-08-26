@@ -159,7 +159,10 @@ fn main() -> eframe::Result<()> {
     if let Some(dir) = &log_dir {
         logging::prune_session_logs(dir);
     }
-    if config.debug.persistent_logging
+    // `gpu_timing` reports through the log stream, and a GUI-subsystem binary
+    // has no console for stderr to reach.  Asking for the report has to open
+    // the file it lands in, or it is written where nothing can read it.
+    if (config.debug.persistent_logging || config.debug.gpu_timing)
         && let Some(dir) = &log_dir
     {
         *log_sink.lock().unwrap_or_else(|e| e.into_inner()) = logging::open_session_log(dir);
