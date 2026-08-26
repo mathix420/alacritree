@@ -70,11 +70,17 @@ pub struct DebugConfig {
     pub crash_log: bool,
     /// Upstream's name and upstream's default.
     pub persistent_logging: bool,
+    /// alacritree-only, set in `alacritree.toml`.  Log what the GPU grid's
+    /// paint callback costs: the wall time of issuing a frame, and the GPU's
+    /// own time for the upload and each of the three draws.  Off by default;
+    /// timer queries are cheap but not free, and the line is only meaningful
+    /// to someone reading it.  Needs `[ui] gpu_grid` and a GL 3.3 context.
+    pub gpu_timing: bool,
 }
 
 impl Default for DebugConfig {
     fn default() -> Self {
-        Self { crash_log: true, persistent_logging: false }
+        Self { crash_log: true, persistent_logging: false, gpu_timing: false }
     }
 }
 
@@ -1451,6 +1457,7 @@ struct RawDebug {
     /// Keep the log file after quitting.  Upstream's name and upstream's
     /// default (`false`).
     persistent_logging: Option<bool>,
+    gpu_timing: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -2461,6 +2468,7 @@ impl RawConfig {
             debug: DebugConfig {
                 crash_log: self.debug.crash_log.unwrap_or(true),
                 persistent_logging: self.debug.persistent_logging.unwrap_or(false),
+                gpu_timing: self.debug.gpu_timing.unwrap_or(false),
             },
             working_directory: self
                 .general
@@ -3655,6 +3663,15 @@ program = "second"
         let raw: RawConfig = toml::from_str("[debug]\npersistent_logging = true").unwrap();
 
         assert!(raw.into_config().debug.persistent_logging);
+    }
+
+    #[test]
+    fn gpu_timing_is_off_unless_asked_for() {
+        let off: RawConfig = toml::from_str("").unwrap();
+        let on: RawConfig = toml::from_str("[debug]\ngpu_timing = true").unwrap();
+
+        assert!(!off.into_config().debug.gpu_timing);
+        assert!(on.into_config().debug.gpu_timing);
     }
 
     /// `[debug]` in both files merges key by key rather than the later table
