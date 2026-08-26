@@ -75,6 +75,8 @@ pub struct DebugConfig {
     /// own time for the upload and each of the three draws.  Off by default;
     /// timer queries are cheap but not free, and the line is only meaningful
     /// to someone reading it.  Needs `[ui] gpu_grid` and a GL 3.3 context.
+    /// Keeps this session's log file for as long as it is on, since the
+    /// report has nowhere else to go.
     pub gpu_timing: bool,
 }
 
@@ -1462,7 +1464,8 @@ struct RawDebug {
     /// the three draws.  alacritree-only, so it belongs in
     /// `alacritree.toml`.  Default `false`; timer queries are cheap but not
     /// free, and the line is only meaningful to someone reading it.  Needs
-    /// `[ui] gpu_grid` and a GL 3.3 context.
+    /// `[ui] gpu_grid` and a GL 3.3 context.  Keeps this session's log file
+    /// for as long as it is on, since the report has nowhere else to go.
     gpu_timing: Option<bool>,
 }
 
