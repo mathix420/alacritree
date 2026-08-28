@@ -1327,7 +1327,7 @@ fn paint_grid_gpu(
         });
         state.mark_rows_dirty(upload);
     }
-    let timing = GpuTiming { enabled: config.debug.gpu_timing, deco_ab: config.debug.gpu_deco_ab };
+    let timing = GpuTiming { enabled: config.debug.gpu_timing, ab: config.debug.gpu_ab };
     painter.add(gpu.callback(rect, ctx, timing));
 }
 

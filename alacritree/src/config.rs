@@ -23,6 +23,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::bindings::{self, KeyBinding};
+use crate::gpu_timing::Ab;
 use crate::path_style::PathStyle;
 use crate::pr_status::DEFAULT_CONCURRENCY;
 
@@ -85,17 +86,22 @@ pub struct DebugConfig {
     /// Keeps this session's log file for as long as it is on, since the
     /// report has nowhere else to go.
     pub gpu_timing: bool,
-    /// alacritree-only, set in `alacritree.toml`.  Alternate the decoration
-    /// pass between gated and always-drawn every timing report, so the two
-    /// arms are measured against one driver and one grid.  Off by default;
-    /// the always-drawn arm exists to be compared against, not to ship.
-    /// Needs `[debug] gpu_timing`.
-    pub gpu_deco_ab: bool,
+    /// alacritree-only, set in `alacritree.toml`.  Alternate one of the paint
+    /// callback's skips between gated and always-drawn every timing report, so
+    /// the two arms are measured against one driver and one grid.  `off` by
+    /// default; the always-drawn arm exists to be compared against, not to
+    /// ship.  Needs `[debug] gpu_timing`.
+    pub gpu_ab: Ab,
 }
 
 impl Default for DebugConfig {
     fn default() -> Self {
-        Self { crash_log: true, persistent_logging: false, gpu_timing: false, gpu_deco_ab: false }
+        Self {
+            crash_log: true,
+            persistent_logging: false,
+            gpu_timing: false,
+            gpu_ab: Ab::default(),
+        }
     }
 }
 
@@ -1487,12 +1493,13 @@ struct RawDebug {
     /// `[ui] gpu_grid` and a GL 3.3 context.  Keeps this session's log file
     /// for as long as it is on, since the report has nowhere else to go.
     gpu_timing: Option<bool>,
-    /// Alternate the decoration pass between gated and always-drawn every
-    /// timing report, so a change to that gate is measured inside one
-    /// process instead of across two launches.  alacritree-only, so it
-    /// belongs in `alacritree.toml`.  Default `false`; needs
-    /// `[debug] gpu_timing`, whose report line names the arm.
-    gpu_deco_ab: Option<bool>,
+    /// Alternate one of the paint callback's skips between gated and
+    /// always-drawn every timing report, so a change to that skip is measured
+    /// inside one process instead of across two launches.  `decorations`
+    /// flips the decoration pass, `backgrounds` flips the per-cell background
+    /// quad.  alacritree-only, so it belongs in `alacritree.toml`.  Default
+    /// `off`; needs `[debug] gpu_timing`, whose report line names the arm.
+    gpu_ab: Option<Ab>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -2510,7 +2517,7 @@ impl RawConfig {
                 crash_log: self.debug.crash_log.unwrap_or(true),
                 persistent_logging: self.debug.persistent_logging.unwrap_or(false),
                 gpu_timing: self.debug.gpu_timing.unwrap_or(false),
-                gpu_deco_ab: self.debug.gpu_deco_ab.unwrap_or(false),
+                gpu_ab: self.debug.gpu_ab.unwrap_or_default(),
             },
             working_directory: self
                 .general

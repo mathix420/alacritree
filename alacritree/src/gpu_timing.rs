@@ -16,15 +16,33 @@
 //! issued it blocks until the GPU catches up, which would make the instrument
 //! the slowest thing in the frame it is measuring.
 //!
-//! The timers also drive the decoration gate's A/B.  Two builds launched in
-//! turn cannot resolve a few microseconds on a loaded machine, because the
-//! round-to-round spread swamps it; alternating the two arms between report
-//! windows of one process puts them in front of the same driver, the same grid
-//! and the same minute, and leaves the reader a pair of adjacent lines.
+//! The timers also drive the A/B for the callback's skips.  Two builds
+//! launched in turn cannot resolve a few microseconds on a loaded machine,
+//! because the round-to-round spread swamps it; alternating the arms between
+//! report windows of one process puts them in front of the same driver, the
+//! same grid and the same minute, and leaves the reader a pair of adjacent
+//! lines.
 
 use std::time::Duration;
 
 use eframe::glow::{self, HasContext};
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// Which of the paint callback's skips the A/B alternates between report
+/// windows.  One at a time: two flipping together would leave a pair differing
+/// in two things, and neither difference attributable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Ab {
+    /// Every window runs the shipped path.
+    #[default]
+    Off,
+    /// Drawing the decoration pass over a grid that carries no decoration.
+    Decorations,
+    /// Drawing a background quad over a cell already cleared to its colour.
+    Backgrounds,
+}
 
 /// The command ranges timed separately, in the order the callback issues them.
 const STAGES: [&str; 4] = ["upload", "backgrounds", "glyphs", "decorations"];
@@ -50,13 +68,13 @@ pub struct GpuTimers {
     total: Vec<f64>,
     /// Wall time inside the callback, which no query can see.
     submit: Vec<f64>,
-    /// Whether the decoration gate is being A/B'd.  Alternating the two arms
-    /// between report windows of one process is what makes them comparable:
-    /// they meet the same driver, the same grid and the same minute, where two
-    /// binaries launched in turn meet neither.
-    ab: bool,
-    /// The arm this window is running.  `true` draws the decoration pass on
-    /// every frame, the way the code did before the gate.
+    /// Which skip is being A/B'd, if any.  Alternating the two arms between
+    /// report windows of one process is what makes them comparable: they meet
+    /// the same driver, the same grid and the same minute, where two binaries
+    /// launched in turn meet neither.
+    ab: Ab,
+    /// The arm this window is running.  `true` is the baseline, drawing the
+    /// pass under test the way the code did before its skip.
     arm: bool,
     /// Frames this window that skipped the decoration pass.  Without it the
     /// report cannot tell a gate that fired on every frame from one that never
@@ -73,7 +91,7 @@ impl GpuTimers {
     /// `None` on a context that cannot time itself.  The grid runs on anything
     /// from GL 3 up and timer queries arrive in 3.3, so this is a real case
     /// rather than a defensive one.
-    pub fn new(gl: &glow::Context, ab: bool) -> Option<Self> {
+    pub fn new(gl: &glow::Context, ab: Ab) -> Option<Self> {
         let version = gl.version();
         let core = !version.is_embedded && (version.major, version.minor) >= (3, 3);
         let extension = gl.supported_extensions().iter().any(|name| name.contains("timer_query"));
@@ -104,10 +122,16 @@ impl GpuTimers {
         })
     }
 
-    /// True while the A/B is running its ungated arm, which draws the
+    /// True while the A/B is running its baseline arm, which draws the
     /// decoration pass whether or not any cell carries one.
     pub fn forces_decorations(&self) -> bool {
-        self.ab && self.arm
+        self.ab == Ab::Decorations && self.arm
+    }
+
+    /// True while the A/B is running its baseline arm, which draws a quad for
+    /// every cell whether or not its background differs from the clear.
+    pub fn forces_backgrounds(&self) -> bool {
+        self.ab == Ab::Backgrounds && self.arm
     }
 
     /// Record that this frame drew no decorations, so the report can say how
@@ -176,9 +200,11 @@ impl GpuTimers {
         // Windows are the unit of comparison when the A/B runs, so the arm has
         // to be on the line: two adjacent windows are the pair.
         let arm = match (self.ab, self.arm) {
-            (false, _) => String::new(),
-            (true, true) => " [deco always]".into(),
-            (true, false) => " [deco gated]".into(),
+            (Ab::Off, _) => "",
+            (Ab::Decorations, true) => " [deco always]",
+            (Ab::Decorations, false) => " [deco gated]",
+            (Ab::Backgrounds, true) => " [bg always]",
+            (Ab::Backgrounds, false) => " [bg gated]",
         };
         let mut line = format!(
             "gpu grid{arm}, {} frames: submit {:.0}us",
@@ -203,7 +229,7 @@ impl GpuTimers {
         self.skipped = 0;
         // Only the A/B moves the arm, so only the A/B has a boundary to settle
         // across; a steady run would throw away good samples every window.
-        if self.ab {
+        if self.ab != Ab::Off {
             self.settling = DEPTH;
         }
         self.submit.clear();
