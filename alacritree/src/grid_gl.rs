@@ -453,9 +453,15 @@ impl GlResources {
         }
     }
 
+    /// The cell backgrounds, one instance per cell.  A cell still carrying
+    /// `default_bg` collapses in the vertex shader, because the clear already
+    /// painted the whole grid rect that colour; alacritty reaches the same end
+    /// by giving such a cell zero alpha and discarding it in the fragment
+    /// shader (`compute_bg_alpha`, `text.f.glsl`).
     unsafe fn draw_backgrounds(&self, gl: &glow::Context, state: &GridState, cells: usize) {
         unsafe {
             gl.use_program(Some(self.background.program));
+            set_vec4(gl, &self.background, "u_default_bg", state.frame.default_bg);
             set_i32(gl, &self.background, "u_cols", state.frame.grid[0] as i32);
             set_vec2(gl, &self.background, "u_origin", state.frame.origin);
             set_vec2(gl, &self.background, "u_cell", state.frame.cell);
@@ -531,6 +537,12 @@ unsafe fn set_i32(gl: &glow::Context, program: &Program, name: &str, value: i32)
 unsafe fn set_vec2(gl: &glow::Context, program: &Program, name: &str, value: [f32; 2]) {
     if let Some(location) = program.location(name) {
         unsafe { gl.uniform_2_f32(Some(location), value[0], value[1]) };
+    }
+}
+
+unsafe fn set_vec4(gl: &glow::Context, program: &Program, name: &str, value: [f32; 4]) {
+    if let Some(location) = program.location(name) {
+        unsafe { gl.uniform_4_f32(Some(location), value[0], value[1], value[2], value[3]) };
     }
 }
 
@@ -687,15 +699,21 @@ uniform vec2 u_origin;
 uniform vec2 u_cell;
 uniform vec2 u_viewport;
 uniform int u_cols;
+uniform vec4 u_default_bg;
 
 in vec4 a_bg;
 
 out vec4 v_bg;
 
 void main() {
+    // The whole grid rect was cleared to the default background, so a cell
+    // still carrying it would repaint what is already there.  Collapsing to a
+    // point costs one compare instead of a cell of fragments.
+    vec2 size = a_bg == u_default_bg ? vec2(0.0) : u_cell;
+
     vec2 grid_cell = vec2(gl_InstanceID % u_cols, gl_InstanceID / u_cols);
     vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));
-    vec2 pos = u_origin + (grid_cell + corner) * u_cell;
+    vec2 pos = u_origin + grid_cell * u_cell + corner * size;
 
     gl_Position = vec4(
         2.0 * pos.x / u_viewport.x - 1.0,
