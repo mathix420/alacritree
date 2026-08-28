@@ -152,6 +152,10 @@ pub fn show(
                 cell_h,
                 cols,
                 rows,
+                ppp,
+                &metrics,
+                builtin_glyphs,
+                color_glyphs,
                 glyphs,
                 ui.ctx(),
             );
@@ -1260,11 +1264,18 @@ fn paint_grid_gpu(
     cell_h: f32,
     cols: usize,
     rows: usize,
+    ppp: f32,
+    metrics: &Metrics,
+    builtin_glyphs: &mut BuiltinGlyphCache,
+    color_glyphs: &mut ColorGlyphCache,
     glyphs: &mut GlyphCache,
     ctx: &egui::Context,
 ) {
     let default_bg = background(&config.palette);
     let size = config.font.egui_size();
+    // Collected under the lock and drawn after it: painting needs the glyph
+    // caches, and the grid state has no business being held while they work.
+    let mut overlays = Vec::new();
 
     {
         let mut state = gpu.state.lock().expect("grid state");
@@ -1319,16 +1330,61 @@ fn paint_grid_gpu(
         });
         phase!(WriteRows, {
             instances.write_rows(touched, runs, default_bg, |ch, face| {
-                table.slot(ch, face, || {
+                // ASCII is neither box drawing nor emoji, and it is most of
+                // what a terminal holds, so it never reaches the caches.
+                if !ch.is_ascii() {
+                    if config.font.builtin_box_drawing && is_builtin_glyph(ch) {
+                        return None;
+                    }
+                    if config.font.color_glyphs
+                        && color_glyphs.get(ctx, ch, metrics, char_cells(ch)).is_some()
+                    {
+                        return None;
+                    }
+                }
+                Some(table.slot(ch, face, || {
                     crate::paint_phases::record_glyph_miss();
                     glyphs.get(ctx, ch, face, size)
-                })
+                }))
             })
         });
+        overlays.extend(instances.overlays());
         state.mark_rows_dirty(upload);
     }
     let timing = GpuTiming { enabled: config.debug.gpu_timing, ab: config.debug.gpu_ab };
     painter.add(gpu.callback(rect, ctx, timing));
+    // After the callback, so they land over the grid the way the mesh path
+    // draws them over its own backgrounds.  Both caches are consulted again
+    // rather than held across the lock; every lookup here is a cache hit,
+    // because deciding to overlay the cell is what put it in the atlas.
+    for (row, cell) in overlays {
+        let (cell_x, cell_y) =
+            (rect.min.x + cell.col as f32 * cell_w, rect.min.y + row as f32 * cell_h);
+        if config.font.builtin_box_drawing
+            && is_builtin_glyph(cell.ch)
+            && let Some(cached) = builtin_glyphs.get(
+                ctx,
+                cell.ch,
+                metrics,
+                &config.font.offset,
+                &config.font.glyph_offset,
+            )
+        {
+            paint_builtin_glyph(
+                painter,
+                cached,
+                cell_x,
+                cell_y,
+                cell_h,
+                ppp,
+                Color32::from_rgba_premultiplied(cell.fg[0], cell.fg[1], cell.fg[2], cell.fg[3]),
+            );
+            continue;
+        }
+        if let Some(cached) = color_glyphs.get(ctx, cell.ch, metrics, char_cells(cell.ch)) {
+            paint_color_glyph(painter, cached, cell_x, cell_y, ppp);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3164,10 +3220,10 @@ mod tests {
             // to resolve the tile somewhere else trades against.
             let variants: [(&str, fn(&mut GridInstances, &GridSnapshot, usize, Color32)); 5] = [
                 ("ship", |g, s, rows, bg| {
-                    g.write_rows(0..rows, run_views(s, rows), bg, |ch, _| ch as u16)
+                    g.write_rows(0..rows, run_views(s, rows), bg, |ch, _| Some(ch as u16))
                 }),
                 ("noskip", |g, s, rows, bg| {
-                    g.write_rows_noskip(0..rows, run_views(s, rows), bg, |ch, _| ch as u16)
+                    g.write_rows_noskip(0..rows, run_views(s, rows), bg, |ch, _| Some(ch as u16))
                 }),
                 ("nocount", |g, s, rows, bg| {
                     g.write_rows_nocount(0..rows, run_views(s, rows), bg, |ch, _| ch as u16)
@@ -3675,7 +3731,7 @@ mod tests {
         // laying characters out for the first time.
         let all = views(&snapshot, &|_| true);
         grid.write_rows(0..rows, all, default_bg, |ch, face| {
-            table.slot(ch, face, || caches.glyphs.get(&ctx, ch, face, size))
+            Some(table.slot(ch, face, || caches.glyphs.get(&ctx, ch, face, size)))
         });
         let slots = table.slots().len();
 
@@ -3689,7 +3745,7 @@ mod tests {
             let touched = views(&snapshot, &|row| row < damaged);
             let build = time(iterations, || {
                 grid.write_rows(0..damaged, touched.iter().copied(), default_bg, |ch, face| {
-                    table.slot(ch, face, || caches.glyphs.get(&ctx, ch, face, size))
+                    Some(table.slot(ch, face, || caches.glyphs.get(&ctx, ch, face, size)))
                 });
                 std::hint::black_box(grid.glyphs.len());
             });
@@ -3707,7 +3763,7 @@ mod tests {
         let touched = views(&snapshot, &|row| ends.contains(&row));
         let build = time(iterations, || {
             grid.write_rows(ends, touched.iter().copied(), default_bg, |ch, face| {
-                table.slot(ch, face, || caches.glyphs.get(&ctx, ch, face, size))
+                Some(table.slot(ch, face, || caches.glyphs.get(&ctx, ch, face, size)))
             });
             std::hint::black_box(grid.glyphs.len());
         });

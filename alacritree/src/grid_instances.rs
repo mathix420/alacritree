@@ -203,6 +203,19 @@ impl GlyphTable {
     }
 }
 
+/// A cell the grid deliberately leaves blank because something else draws it.
+///
+/// Colour emoji and built-in box-drawing shapes carry their own textures, so
+/// they go on egui's painter over the callback rather than through the atlas.
+/// The character and colour are kept here because the overlay is repainted
+/// every frame while the records behind it are only rewritten on damage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Overlay {
+    pub col: usize,
+    pub ch: char,
+    pub fg: [u8; 4],
+}
+
 /// A frame's instance buffers, reused across frames.
 ///
 /// `glyphs` is `cols * rows` long at all times so a row's records never move,
@@ -210,6 +223,9 @@ impl GlyphTable {
 #[derive(Default)]
 pub struct GridInstances {
     pub glyphs: Vec<GlyphInstance>,
+    /// Per row, so rewriting three rows rescans three rows rather than the
+    /// screen.  Almost always empty: a terminal of text has no emoji in it.
+    overlays: Vec<Vec<Overlay>>,
     cols: usize,
     rows: usize,
     /// Whether each row was written a decorated run, so a frame can answer
@@ -247,6 +263,8 @@ impl GridInstances {
         self.glyphs.resize(cols * rows, GlyphInstance::default());
         self.deco_rows.clear();
         self.deco_rows.resize(rows, false);
+        self.overlays.clear();
+        self.overlays.resize_with(rows, Vec::new);
         for row in 0..rows {
             self.clear_row(row, default_bg.to_array());
         }
@@ -258,6 +276,7 @@ impl GridInstances {
         let blank = GlyphInstance { slot: BLANK_SLOT, deco: 0, fg: [0; 4], bg: default_bg };
         self.glyphs[row * self.cols..(row + 1) * self.cols].fill(blank);
         self.deco_rows[row] = false;
+        self.overlays[row].clear();
     }
 
     /// `clear_row` without the decorated-row bookkeeping, so the benchmark's
@@ -266,6 +285,15 @@ impl GridInstances {
     fn clear_row_uncounted(&mut self, row: usize, default_bg: [u8; 4]) {
         let blank = GlyphInstance { slot: BLANK_SLOT, deco: 0, fg: [0; 4], bg: default_bg };
         self.glyphs[row * self.cols..(row + 1) * self.cols].fill(blank);
+        self.overlays[row].clear();
+    }
+
+    /// Every cell an overlay owns, with the row it sits on.
+    pub fn overlays(&self) -> impl Iterator<Item = (usize, Overlay)> + '_ {
+        self.overlays
+            .iter()
+            .enumerate()
+            .flat_map(|(row, cells)| cells.iter().map(move |overlay| (row, *overlay)))
     }
 
     /// Write every run in `runs` into the rows it covers, clearing those rows
@@ -280,7 +308,7 @@ impl GridInstances {
         rows_touched: impl IntoIterator<Item = usize>,
         runs: impl IntoIterator<Item = RunView<'a>>,
         default_bg: Color32,
-        mut slot_for: impl FnMut(char, Face) -> u16,
+        mut slot_for: impl FnMut(char, Face) -> Option<u16>,
     ) {
         let blank = default_bg.to_array();
         for row in rows_touched {
@@ -318,7 +346,13 @@ impl GridInstances {
                     }
                     BLANK_SLOT
                 } else {
-                    slot_for(ch, run.face)
+                    match slot_for(ch, run.face) {
+                        Some(slot) => slot,
+                        None => {
+                            self.overlays[run.row].push(Overlay { col, ch, fg });
+                            BLANK_SLOT
+                        },
+                    }
                 };
                 self.glyphs[base + col] = GlyphInstance { slot, deco: run.deco, fg, bg };
                 col += 1;
@@ -340,7 +374,7 @@ impl GridInstances {
         rows_touched: impl IntoIterator<Item = usize>,
         runs: impl IntoIterator<Item = RunView<'a>>,
         default_bg: Color32,
-        mut slot_for: impl FnMut(char, Face) -> u16,
+        mut slot_for: impl FnMut(char, Face) -> Option<u16>,
     ) {
         let blank = default_bg.to_array();
         for row in rows_touched {
@@ -363,7 +397,11 @@ impl GridInstances {
                 if col >= self.cols {
                     break;
                 }
-                let slot = if ch == ' ' { BLANK_SLOT } else { slot_for(ch, run.face) };
+                let slot = if ch == ' ' {
+                    BLANK_SLOT
+                } else {
+                    slot_for(ch, run.face).unwrap_or(BLANK_SLOT)
+                };
                 self.glyphs[base + col] = GlyphInstance { slot, deco: run.deco, fg, bg };
                 col += 1;
             }
@@ -626,12 +664,67 @@ mod tests {
             bg: Color32::BLACK,
         }];
 
-        grid.write_rows([2], runs, Color32::BLACK, |_, _| 7);
+        grid.write_rows([2], runs, Color32::BLACK, |_, _| Some(7));
 
         assert_eq!(grid.glyphs[8].slot, 7);
         assert_eq!(grid.glyphs[9].slot, 7);
         assert_eq!(grid.glyphs[10].slot, BLANK_SLOT);
         assert_eq!(grid.row_bytes(2, 1), 96..144);
+    }
+
+    /// An emoji has to leave no glyph behind: the atlas holds a monochrome
+    /// silhouette for it, and drawing that under the overlay would show through
+    /// wherever the colour artwork is transparent.
+    #[test]
+    fn an_overlaid_cell_keeps_its_position_and_no_glyph() {
+        let mut grid = GridInstances::default();
+        grid.resize(4, 2, Color32::BLACK);
+        let runs = [RunView {
+            text: "a\u{1f600}b",
+            start_col: 1,
+            row: 1,
+            face: Face::Normal,
+            deco: 0,
+            fg: Color32::WHITE,
+            bg: Color32::BLACK,
+        }];
+
+        grid.write_rows([1], runs, Color32::BLACK, |ch, _| (ch != '\u{1f600}').then_some(7));
+
+        assert_eq!(grid.glyphs[5].slot, 7);
+        assert_eq!(grid.glyphs[6].slot, BLANK_SLOT, "the overlay drew a glyph as well");
+        assert_eq!(grid.glyphs[7].slot, 7);
+        let overlays: Vec<_> = grid.overlays().collect();
+        assert_eq!(
+            overlays,
+            [(1, Overlay { col: 2, ch: '\u{1f600}', fg: Color32::WHITE.to_array() })]
+        );
+    }
+
+    /// Overlays live as long as the records they stand in for, so a row that is
+    /// rewritten without the emoji must not keep painting it.
+    #[test]
+    fn rewriting_a_row_drops_the_overlays_it_had() {
+        let mut grid = GridInstances::default();
+        grid.resize(4, 2, Color32::BLACK);
+        let run = |text: &'static str| {
+            [RunView {
+                text,
+                start_col: 0,
+                row: 0,
+                face: Face::Normal,
+                deco: 0,
+                fg: Color32::WHITE,
+                bg: Color32::BLACK,
+            }]
+        };
+        grid.write_rows([0], run("\u{1f600}"), Color32::BLACK, |ch, _| {
+            (ch != '\u{1f600}').then_some(7)
+        });
+
+        grid.write_rows([0], run("ab"), Color32::BLACK, |_, _| Some(7));
+
+        assert_eq!(grid.overlays().count(), 0);
     }
 
     #[test]
@@ -649,9 +742,9 @@ mod tests {
                 bg: Color32::BLACK,
             }]
         };
-        grid.write_rows([0], row0("abcd"), Color32::BLACK, |_, _| 7);
+        grid.write_rows([0], row0("abcd"), Color32::BLACK, |_, _| Some(7));
 
-        grid.write_rows([0], row0("ab"), Color32::BLACK, |_, _| 7);
+        grid.write_rows([0], row0("ab"), Color32::BLACK, |_, _| Some(7));
 
         assert_eq!(grid.glyphs[2].slot, BLANK_SLOT, "the tail of the old run survived");
     }
@@ -673,7 +766,7 @@ mod tests {
             bg: Color32::BLACK,
         }];
 
-        grid.write_rows([0], runs, Color32::BLACK, |_, _| 1);
+        grid.write_rows([0], runs, Color32::BLACK, |_, _| Some(1));
 
         assert_eq!(grid.glyphs[0].deco, decoration_sprites::STRAIGHT);
         assert_eq!(grid.glyphs[0].slot, BLANK_SLOT, "a blank was given a glyph");
@@ -696,7 +789,7 @@ mod tests {
             bg: Color32::RED,
         }];
 
-        grid.write_rows([0], runs, Color32::BLACK, |_, _| 1);
+        grid.write_rows([0], runs, Color32::BLACK, |_, _| Some(1));
 
         assert_eq!(grid.glyphs[1].bg, Color32::RED.to_array());
         assert_eq!(grid.glyphs[2].bg, Color32::RED.to_array());
@@ -724,8 +817,10 @@ mod tests {
         grid.resize(4, 3, Color32::BLACK);
         assert!(!grid.any_decorated(), "a fresh grid claims a decoration");
 
-        grid.write_rows([2], [run(2, decoration_sprites::STRAIGHT)], Color32::BLACK, |_, _| 1);
-        grid.write_rows([0], [run(0, 0)], Color32::BLACK, |_, _| 1);
+        grid.write_rows([2], [run(2, decoration_sprites::STRAIGHT)], Color32::BLACK, |_, _| {
+            Some(1)
+        });
+        grid.write_rows([0], [run(0, 0)], Color32::BLACK, |_, _| Some(1));
 
         assert!(grid.any_decorated());
     }
@@ -737,8 +832,10 @@ mod tests {
         let mut grid = GridInstances::default();
         grid.resize(4, 3, Color32::BLACK);
 
-        grid.write_rows([1], [run(1, decoration_sprites::STRAIGHT)], Color32::BLACK, |_, _| 1);
-        grid.write_rows([1], [run(1, 0)], Color32::BLACK, |_, _| 1);
+        grid.write_rows([1], [run(1, decoration_sprites::STRAIGHT)], Color32::BLACK, |_, _| {
+            Some(1)
+        });
+        grid.write_rows([1], [run(1, 0)], Color32::BLACK, |_, _| Some(1));
 
         assert!(!grid.any_decorated());
     }
