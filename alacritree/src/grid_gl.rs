@@ -204,6 +204,9 @@ struct GlResources {
     /// colour-channel conversion against reading coverage from alpha.  It
     /// exists to be compared against, not to ship.
     glyph_gamma: Option<Program>,
+    /// The glyph shader that discards fragments the atlas gives no coverage,
+    /// built only while the A/B is pricing that against blending them.
+    glyph_discard: Option<Program>,
     background: Program,
     decoration: Program,
     vao: glow::VertexArray,
@@ -289,9 +292,14 @@ impl GlResources {
                 true => Some(link(gl, header, GLYPH_VERT, GLYPH_FRAG_GAMMA)?),
                 false => None,
             };
+            let glyph_discard = match timers.as_ref().is_some_and(GpuTimers::wants_glyph_discard) {
+                true => Some(link(gl, header, GLYPH_VERT, GLYPH_FRAG_DISCARD)?),
+                false => None,
+            };
             Ok(Self {
                 glyph,
                 glyph_gamma,
+                glyph_discard,
                 background,
                 decoration,
                 vao,
@@ -354,7 +362,18 @@ impl GlResources {
                 true => [-1.0; 4],
                 false => state.frame.default_bg,
             };
+            // egui_glow leaves premultiplied blending on before handing over,
+            // and every terminal colour is opaque, so blending this pass
+            // computes the source it already had.  The A/B's other arm pays
+            // for it the way the shipped path does.
+            let unblended = timers.as_ref().is_some_and(GpuTimers::skips_background_blend);
+            if unblended {
+                gl.disable(glow::BLEND);
+            }
             self.draw_backgrounds(gl, state, cols * rows, default_bg);
+            if unblended {
+                gl.enable(glow::BLEND);
+            }
             if let Some(timers) = &timers {
                 timers.end(gl);
             }
@@ -365,9 +384,13 @@ impl GlResources {
                 // The A/B's other arm recovers coverage from the colour
                 // channels, which needs its own program: the two shaders
                 // differ at compile time, not in a uniform.
-                let glyph = match timers.as_ref().is_some_and(GpuTimers::forces_glyph_gamma) {
-                    true => self.glyph_gamma.as_ref().unwrap_or(&self.glyph),
-                    false => &self.glyph,
+                let timing = timers.as_ref();
+                let glyph = if timing.is_some_and(GpuTimers::forces_glyph_gamma) {
+                    self.glyph_gamma.as_ref().unwrap_or(&self.glyph)
+                } else if timing.is_some_and(GpuTimers::discards_blank_coverage) {
+                    self.glyph_discard.as_ref().unwrap_or(&self.glyph)
+                } else {
+                    &self.glyph
                 };
                 self.draw_glyphs(gl, state, atlas, atlas_size, cols * rows, glyph);
                 if let Some(timers) = &timers {
@@ -679,7 +702,10 @@ in uint a_slot;
 in vec4 a_fg;
 
 out vec2 v_uv;
-out vec4 v_fg;
+// Per-instance, so every vertex of the quad carries the same colour and
+// interpolating it would compute a constant.  Alacritty qualifies the same
+// values the same way (`res/glsl3/text.v.glsl`).
+flat out vec4 v_fg;
 
 void main() {
     int slot = int(a_slot);
@@ -706,7 +732,7 @@ void main() {
 const GLYPH_FRAG: &str = r#"
 uniform sampler2D u_atlas;
 in vec2 v_uv;
-in vec4 v_fg;
+flat in vec4 v_fg;
 out vec4 f_color;
 
 void main() {
@@ -732,7 +758,7 @@ uniform vec4 u_default_bg;
 
 in vec4 a_bg;
 
-out vec4 v_bg;
+flat out vec4 v_bg;
 
 void main() {
     // The whole grid rect was cleared to the default background, so a cell
@@ -754,7 +780,7 @@ void main() {
 "#;
 
 const BACKGROUND_FRAG: &str = r#"
-in vec4 v_bg;
+flat in vec4 v_bg;
 out vec4 f_color;
 
 void main() {
@@ -773,7 +799,7 @@ in vec4 a_fg;
 in uint a_deco;
 
 out vec2 v_uv;
-out vec4 v_fg;
+flat out vec4 v_fg;
 
 void main() {
     // An undecorated cell collapses to a point rather than reaching the
@@ -799,7 +825,7 @@ void main() {
 const DECORATION_FRAG: &str = r#"
 uniform sampler2D u_decorations;
 in vec2 v_uv;
-in vec4 v_fg;
+flat in vec4 v_fg;
 out vec4 f_color;
 
 void main() {
@@ -889,6 +915,27 @@ mod tests {
     }
 }
 
+/// The glyph shader with the blank half of every atlas rectangle thrown away
+/// rather than blended.  Built only when `[debug] gpu_ab = "fill"` asks to
+/// price it, and never on the path a release paints with.
+const GLYPH_FRAG_DISCARD: &str = r#"
+uniform sampler2D u_atlas;
+in vec2 v_uv;
+flat in vec4 v_fg;
+out vec4 f_color;
+
+void main() {
+    float coverage = texture(u_atlas, v_uv).a;
+    // A glyph's rectangle is a box around its ink, and most of that box is
+    // empty.  Blending a fragment at zero coverage produces the destination it
+    // is about to overwrite, so the write can be dropped instead of made.
+    if (coverage == 0.0) {
+        discard;
+    }
+    f_color = v_fg * coverage;
+}
+"#;
+
 /// The glyph shader as it stood before coverage was read from alpha: egui's
 /// general conversion, which recovers it from the colour channels instead.
 /// Built only when `[debug] gpu_ab = "glyphs"` asks to price the difference,
@@ -896,7 +943,7 @@ mod tests {
 const GLYPH_FRAG_GAMMA: &str = r#"
 uniform sampler2D u_atlas;
 in vec2 v_uv;
-in vec4 v_fg;
+flat in vec4 v_fg;
 out vec4 f_color;
 
 vec3 srgb_gamma_from_linear(vec3 rgb) {

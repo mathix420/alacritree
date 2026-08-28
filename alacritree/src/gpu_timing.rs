@@ -44,6 +44,11 @@ pub enum Ab {
     Backgrounds,
     /// Recovering glyph coverage from the colour channels rather than alpha.
     Glyphs,
+    /// Blending a glyph fragment the atlas gives no coverage at all, whose
+    /// blended result is the destination it overwrites.
+    Fill,
+    /// Blending the background pass, every colour of which is opaque.
+    Blend,
 }
 
 /// The command ranges timed separately, in the order the callback issues them.
@@ -166,6 +171,24 @@ impl GpuTimers {
         self.ab == Ab::Glyphs && self.arm
     }
 
+    /// True while the A/B is running the arm that throws away glyph fragments
+    /// the atlas gives no coverage, instead of blending them into a result
+    /// equal to what is already there.
+    pub fn discards_blank_coverage(&self) -> bool {
+        self.ab == Ab::Fill && !self.arm
+    }
+
+    /// True while the A/B is running the arm that leaves blending off across
+    /// the background pass.
+    pub fn skips_background_blend(&self) -> bool {
+        self.ab == Ab::Blend && !self.arm
+    }
+
+    /// Whether a glyph program that discards blank coverage has to be built.
+    pub fn wants_glyph_discard(&self) -> bool {
+        self.ab == Ab::Fill
+    }
+
     /// Whether a second glyph program has to be built for the baseline arm.
     /// The two shaders differ at compile time, so one program cannot serve
     /// both the way a uniform serves the background arms.
@@ -285,6 +308,10 @@ impl GpuTimers {
             (Ab::Backgrounds, false) => " [bg gated]",
             (Ab::Glyphs, true) => " [glyph always]",
             (Ab::Glyphs, false) => " [glyph gated]",
+            (Ab::Fill, true) => " [fill always]",
+            (Ab::Fill, false) => " [fill gated]",
+            (Ab::Blend, true) => " [blend always]",
+            (Ab::Blend, false) => " [blend gated]",
         };
         let mut line = format!(
             "gpu grid{arm}, {} frames: submit {:.0}us",

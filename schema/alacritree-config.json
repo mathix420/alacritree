@@ -22,6 +22,16 @@
           "const": "glyphs",
           "description": "Recovering glyph coverage from the colour channels rather than alpha.",
           "type": "string"
+        },
+        {
+          "const": "fill",
+          "description": "Blending a glyph fragment the atlas gives no coverage at all, whose\nblended result is the destination it overwrites.",
+          "type": "string"
+        },
+        {
+          "const": "blend",
+          "description": "Blending the background pass, every colour of which is opaque.",
+          "type": "string"
         }
       ]
     },
