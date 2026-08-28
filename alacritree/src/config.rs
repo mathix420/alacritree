@@ -77,12 +77,25 @@ pub struct DebugConfig {
     /// to someone reading it.  Needs `[ui] gpu_grid` and a GL 3.3 context.
     /// Keeps this session's log file for as long as it is on, since the
     /// report has nowhere else to go.
+    /// alacritree-only, set in `alacritree.toml`.  Log what the GPU grid's
+    /// paint callback costs: the wall time of issuing a frame, and the GPU's
+    /// own time for the upload and each of the three draws.  Off by default;
+    /// timer queries are cheap but not free, and the line is only meaningful
+    /// to someone reading it.  Needs `[ui] gpu_grid` and a GL 3.3 context.
+    /// Keeps this session's log file for as long as it is on, since the
+    /// report has nowhere else to go.
     pub gpu_timing: bool,
+    /// alacritree-only, set in `alacritree.toml`.  Alternate the decoration
+    /// pass between gated and always-drawn every timing report, so the two
+    /// arms are measured against one driver and one grid.  Off by default;
+    /// the always-drawn arm exists to be compared against, not to ship.
+    /// Needs `[debug] gpu_timing`.
+    pub gpu_deco_ab: bool,
 }
 
 impl Default for DebugConfig {
     fn default() -> Self {
-        Self { crash_log: true, persistent_logging: false, gpu_timing: false }
+        Self { crash_log: true, persistent_logging: false, gpu_timing: false, gpu_deco_ab: false }
     }
 }
 
@@ -1466,7 +1479,20 @@ struct RawDebug {
     /// free, and the line is only meaningful to someone reading it.  Needs
     /// `[ui] gpu_grid` and a GL 3.3 context.  Keeps this session's log file
     /// for as long as it is on, since the report has nowhere else to go.
+    /// Log what the GPU grid's paint callback costs: the wall time of
+    /// issuing a frame, and the GPU's own time for the upload and each of
+    /// the three draws.  alacritree-only, so it belongs in
+    /// `alacritree.toml`.  Default `false`; timer queries are cheap but not
+    /// free, and the line is only meaningful to someone reading it.  Needs
+    /// `[ui] gpu_grid` and a GL 3.3 context.  Keeps this session's log file
+    /// for as long as it is on, since the report has nowhere else to go.
     gpu_timing: Option<bool>,
+    /// Alternate the decoration pass between gated and always-drawn every
+    /// timing report, so a change to that gate is measured inside one
+    /// process instead of across two launches.  alacritree-only, so it
+    /// belongs in `alacritree.toml`.  Default `false`; needs
+    /// `[debug] gpu_timing`, whose report line names the arm.
+    gpu_deco_ab: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -2484,6 +2510,7 @@ impl RawConfig {
                 crash_log: self.debug.crash_log.unwrap_or(true),
                 persistent_logging: self.debug.persistent_logging.unwrap_or(false),
                 gpu_timing: self.debug.gpu_timing.unwrap_or(false),
+                gpu_deco_ab: self.debug.gpu_deco_ab.unwrap_or(false),
             },
             working_directory: self
                 .general

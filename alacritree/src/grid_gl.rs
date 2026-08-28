@@ -58,6 +58,16 @@ pub struct Frame {
     pub default_bg: [f32; 4],
 }
 
+/// What the paint callback is asked to measure.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Timing {
+    /// `[debug] gpu_timing`: time the upload and each draw on the GPU.
+    pub enabled: bool,
+    /// `[debug] gpu_deco_ab`: alternate the decoration gate between report
+    /// windows so both arms are timed against one driver and one grid.
+    pub deco_ab: bool,
+}
+
 /// The CPU half, written by the UI thread and read by the paint callback.
 ///
 /// Both run on the same thread under eframe, so the lock is never contended;
@@ -146,7 +156,7 @@ impl GpuGrid {
     /// The shape to hand egui.  Everything it draws comes from `state`, which
     /// the caller has already written this frame — except the atlas size,
     /// which only the atlas live at paint time can give.
-    pub fn callback(&self, rect: Rect, ctx: &egui::Context, timing: bool) -> egui::Shape {
+    pub fn callback(&self, rect: Rect, ctx: &egui::Context, timing: Timing) -> egui::Shape {
         let (state, resources, ctx) = (self.state.clone(), self.gl.clone(), ctx.clone());
         let failed = self.failed.clone();
         egui::Shape::Callback(egui::epaint::PaintCallback {
@@ -216,7 +226,7 @@ impl Program {
 }
 
 impl GlResources {
-    fn new(gl: &glow::Context, timing: bool) -> Result<Self, String> {
+    fn new(gl: &glow::Context, timing: Timing) -> Result<Self, String> {
         let version = ShaderVersion::get(gl);
         // Instanced arrays, `texelFetch` and integer vertex attributes all
         // arrive together in GL 3 / GLES 3.  Older contexts keep the mesh path.
@@ -279,7 +289,7 @@ impl GlResources {
                 instance_capacity: 0,
                 slot_texture,
                 slot_scratch: Vec::new(),
-                timers: timing.then(|| GpuTimers::new(gl)).flatten(),
+                timers: timing.enabled.then(|| GpuTimers::new(gl, timing.deco_ab)).flatten(),
             })
         }
     }
@@ -337,17 +347,27 @@ impl GlResources {
                     timers.end(gl);
                 }
             }
-            // Holding a strip only says the atlas exists.  Every cell still gets
-            // an instance, so an undecorated screen was paying a full-grid
-            // instanced draw to collapse every quad in the vertex shader.
-            if let Some(strip) = decorations.filter(|_| state.instances.any_decorated()) {
-                if let Some(timers) = &mut timers {
-                    timers.begin(gl, gpu_timing::DECORATIONS);
-                }
-                self.draw_decorations(gl, state, strip, cols * rows);
-                if let Some(timers) = &timers {
-                    timers.end(gl);
-                }
+            // Holding a strip only says the atlas exists.  Every cell still
+            // gets an instance, so an undecorated screen was paying a
+            // full-grid instanced draw to collapse every quad in the vertex
+            // shader.  The A/B's other arm skips this test to price it.
+            let decorated = state.instances.any_decorated()
+                || timers.as_ref().is_some_and(GpuTimers::forces_decorations);
+            match decorations.filter(|_| decorated) {
+                Some(strip) => {
+                    if let Some(timers) = &mut timers {
+                        timers.begin(gl, gpu_timing::DECORATIONS);
+                    }
+                    self.draw_decorations(gl, state, strip, cols * rows);
+                    if let Some(timers) = &timers {
+                        timers.end(gl);
+                    }
+                },
+                None => {
+                    if let Some(timers) = &mut timers {
+                        timers.skipped_decorations();
+                    }
+                },
             }
 
             for (index, _) in ATTRIBUTES {

@@ -19,7 +19,7 @@ use crate::config::{Config, Palette};
 use crate::decoration_sprites;
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
 use crate::glyph_cache::{Face, GlyphCache, MAX_EXTRA_CELLS, growth_offset, may_grow};
-use crate::grid_gl::{Frame as GridFrame, GpuGrid};
+use crate::grid_gl::{Frame as GridFrame, GpuGrid, Timing as GpuTiming};
 use crate::grid_instances::RunView;
 use crate::input::{associated_text, event_to_bytes};
 use crate::links::{self, Link};
@@ -1327,7 +1327,8 @@ fn paint_grid_gpu(
         });
         state.mark_rows_dirty(upload);
     }
-    painter.add(gpu.callback(rect, ctx, config.debug.gpu_timing));
+    let timing = GpuTiming { enabled: config.debug.gpu_timing, deco_ab: config.debug.gpu_deco_ab };
+    painter.add(gpu.callback(rect, ctx, timing));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3161,12 +3162,15 @@ mod tests {
             // walk the runs and write nothing.  Their difference prices the
             // per-run tile computation on its own, which is what any proposal
             // to resolve the tile somewhere else trades against.
-            let variants: [(&str, fn(&mut GridInstances, &GridSnapshot, usize, Color32)); 4] = [
+            let variants: [(&str, fn(&mut GridInstances, &GridSnapshot, usize, Color32)); 5] = [
                 ("ship", |g, s, rows, bg| {
                     g.write_rows(0..rows, run_views(s, rows), bg, |ch, _| ch as u16)
                 }),
                 ("noskip", |g, s, rows, bg| {
                     g.write_rows_noskip(0..rows, run_views(s, rows), bg, |ch, _| ch as u16)
+                }),
+                ("nocount", |g, s, rows, bg| {
+                    g.write_rows_nocount(0..rows, run_views(s, rows), bg, |ch, _| ch as u16)
                 }),
                 ("probe: walk runs, no tile", |_g, s, rows, _bg| {
                     let mut acc = 0u32;
