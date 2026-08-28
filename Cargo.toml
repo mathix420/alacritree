@@ -12,6 +12,12 @@ resolver = "2"
 edition = "2024"
 rust-version = "1.85.0"
 
+# Dev builds are read through logs, harness output and panic backtraces, all of
+# which line tables carry.  Only a debugger stepping through frames wants the
+# variable and type information that makes up most of `target/debug`.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 lto = "thin"
 debug = 1
