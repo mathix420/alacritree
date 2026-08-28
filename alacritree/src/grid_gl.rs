@@ -200,6 +200,10 @@ impl Default for GpuGrid {
 
 struct GlResources {
     glyph: Program,
+    /// The pre-collapse glyph shader, built only when the A/B asks to price the
+    /// colour-channel conversion against reading coverage from alpha.  It
+    /// exists to be compared against, not to ship.
+    glyph_gamma: Option<Program>,
     background: Program,
     decoration: Program,
     vao: glow::VertexArray,
@@ -237,15 +241,6 @@ impl GlResources {
                 return Err(format!("{version:?} has no instanced arrays"));
             },
         };
-        // egui uploads its atlas as `SRGB8_ALPHA8` wherever the driver admits
-        // to an sRGB extension, and its own fragment shader converts back to
-        // gamma before multiplying.  Making the same choice here is what keeps
-        // glyph weight identical to the rest of the UI, so the flag is compiled
-        // into the shader rather than kept around.
-        let srgb_atlas =
-            gl.supported_extensions().iter().any(|extension| extension.contains("sRGB"))
-                || version == ShaderVersion::Es300;
-
         unsafe {
             let mut programs = Vec::new();
             for (vertex, fragment) in [
@@ -253,7 +248,7 @@ impl GlResources {
                 (BACKGROUND_VERT, BACKGROUND_FRAG),
                 (DECORATION_VERT, DECORATION_FRAG),
             ] {
-                match link(gl, header, vertex, fragment, srgb_atlas) {
+                match link(gl, header, vertex, fragment) {
                     Ok(program) => programs.push(program),
                     Err(err) => {
                         for spent in programs {
@@ -280,8 +275,14 @@ impl GlResources {
             ] {
                 gl.tex_parameter_i32(glow::TEXTURE_2D, name, value as i32);
             }
+            let timers = timing.enabled.then(|| GpuTimers::new(gl, timing.ab)).flatten();
+            let glyph_gamma = match timers.as_ref().is_some_and(GpuTimers::wants_glyph_gamma) {
+                true => Some(link(gl, header, GLYPH_VERT, GLYPH_FRAG_GAMMA)?),
+                false => None,
+            };
             Ok(Self {
                 glyph,
+                glyph_gamma,
                 background,
                 decoration,
                 vao,
@@ -289,7 +290,7 @@ impl GlResources {
                 instance_capacity: 0,
                 slot_texture,
                 slot_scratch: Vec::new(),
-                timers: timing.enabled.then(|| GpuTimers::new(gl, timing.ab)).flatten(),
+                timers,
             })
         }
     }
@@ -349,7 +350,14 @@ impl GlResources {
                 if let Some(timers) = &mut timers {
                     timers.begin(gl, gpu_timing::GLYPHS);
                 }
-                self.draw_glyphs(gl, state, atlas, atlas_size, cols * rows);
+                // The A/B's other arm recovers coverage from the colour
+                // channels, which needs its own program: the two shaders
+                // differ at compile time, not in a uniform.
+                let glyph = match timers.as_ref().is_some_and(GpuTimers::forces_glyph_gamma) {
+                    true => self.glyph_gamma.as_ref().unwrap_or(&self.glyph),
+                    false => &self.glyph,
+                };
+                self.draw_glyphs(gl, state, atlas, atlas_size, cols * rows, glyph);
                 if let Some(timers) = &timers {
                     timers.end(gl);
                 }
@@ -515,21 +523,22 @@ impl GlResources {
         atlas: glow::Texture,
         atlas_size: [f32; 2],
         cells: usize,
+        glyph: &Program,
     ) {
         unsafe {
-            gl.use_program(Some(self.glyph.program));
+            gl.use_program(Some(glyph.program));
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(atlas));
             gl.active_texture(glow::TEXTURE1);
             gl.bind_texture(glow::TEXTURE_2D, Some(self.slot_texture));
-            set_i32(gl, &self.glyph, "u_atlas", 0);
-            set_i32(gl, &self.glyph, "u_slots", 1);
-            set_i32(gl, &self.glyph, "u_slots_per_row", SLOTS_PER_ROW as i32);
-            set_i32(gl, &self.glyph, "u_cols", state.frame.grid[0] as i32);
-            set_vec2(gl, &self.glyph, "u_origin", state.frame.origin);
-            set_vec2(gl, &self.glyph, "u_cell", state.frame.cell);
-            set_vec2(gl, &self.glyph, "u_atlas_size", atlas_size);
-            set_vec2(gl, &self.glyph, "u_viewport", viewport_points(state));
+            set_i32(gl, glyph, "u_atlas", 0);
+            set_i32(gl, glyph, "u_slots", 1);
+            set_i32(gl, glyph, "u_slots_per_row", SLOTS_PER_ROW as i32);
+            set_i32(gl, glyph, "u_cols", state.frame.grid[0] as i32);
+            set_vec2(gl, glyph, "u_origin", state.frame.origin);
+            set_vec2(gl, glyph, "u_cell", state.frame.cell);
+            set_vec2(gl, glyph, "u_atlas_size", atlas_size);
+            set_vec2(gl, glyph, "u_viewport", viewport_points(state));
 
             gl.draw_arrays_instanced(glow::TRIANGLE_STRIP, 0, 4, cells as i32);
         }
@@ -596,10 +605,8 @@ unsafe fn link(
     header: &str,
     vertex: &str,
     fragment: &str,
-    srgb_atlas: bool,
 ) -> Result<Program, String> {
     unsafe {
-        let defines = format!("#define SRGB_TEXTURES {}\n", srgb_atlas as i32);
         let program = gl.create_program()?;
         for (index, name) in ATTRIBUTES {
             gl.bind_attrib_location(program, index, name);
@@ -614,7 +621,7 @@ unsafe fn link(
                 },
             };
             shaders.push(shader);
-            gl.shader_source(shader, &format!("{header}{defines}{body}"));
+            gl.shader_source(shader, &format!("{header}{body}"));
             gl.compile_shader(shader);
             if !gl.get_shader_compile_status(shader) {
                 let log = gl.get_shader_info_log(shader);
@@ -689,21 +696,17 @@ in vec2 v_uv;
 in vec4 v_fg;
 out vec4 f_color;
 
-vec3 srgb_gamma_from_linear(vec3 rgb) {
-    bvec3 cutoff = lessThan(rgb, vec3(0.0031308));
-    vec3 lower = rgb * vec3(12.92);
-    vec3 higher = vec3(1.055) * pow(rgb, vec3(1.0 / 2.4)) - vec3(0.055);
-    return mix(higher, lower, vec3(cutoff));
-}
-
 void main() {
-    vec4 tex = texture(u_atlas, v_uv);
-#if SRGB_TEXTURES
-    tex = vec4(srgb_gamma_from_linear(tex.rgb), tex.a);
-#endif
+    // Only alpha carries coverage, the same as the decoration strip.  epaint
+    // writes every font texel as `from_rgba_premultiplied(a, a, a, a)` and
+    // colour glyphs never reach this pass, so the colour channels hold nothing
+    // alpha does not, and alpha is stored linearly whatever the driver did to
+    // them.  egui converts all three back to gamma because its shader also
+    // draws images, where they differ.
+    //
     // Multiplied in gamma space, the same as egui's own text shader: it is the
     // only way glyph edges come out the weight the atlas was rasterized for.
-    f_color = v_fg * tex;
+    f_color = v_fg * texture(u_atlas, v_uv).a;
 }
 "#;
 
@@ -872,3 +875,27 @@ mod tests {
         assert_ne!(before, ctx.fonts(|f| f.font_image_size()));
     }
 }
+
+/// The glyph shader as it stood before coverage was read from alpha: egui's
+/// general conversion, which recovers it from the colour channels instead.
+/// Built only when `[debug] gpu_ab = "glyphs"` asks to price the difference,
+/// and never on the path a release paints with.
+const GLYPH_FRAG_GAMMA: &str = r#"
+uniform sampler2D u_atlas;
+in vec2 v_uv;
+in vec4 v_fg;
+out vec4 f_color;
+
+vec3 srgb_gamma_from_linear(vec3 rgb) {
+    bvec3 cutoff = lessThan(rgb, vec3(0.0031308));
+    vec3 lower = rgb * vec3(12.92);
+    vec3 higher = vec3(1.055) * pow(rgb, vec3(1.0 / 2.4)) - vec3(0.055);
+    return mix(higher, lower, vec3(cutoff));
+}
+
+void main() {
+    vec4 tex = texture(u_atlas, v_uv);
+    tex = vec4(srgb_gamma_from_linear(tex.rgb), tex.a);
+    f_color = v_fg * tex;
+}
+"#;
