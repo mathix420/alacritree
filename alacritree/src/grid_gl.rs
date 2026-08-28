@@ -331,16 +331,20 @@ impl GlResources {
         let mut timers = self.timers.take();
         if let Some(timers) = &mut timers {
             timers.begin_frame(gl);
-            // Opened before the clear, which belongs to the frame but to no
-            // stage, and so has never been counted anywhere.
             timers.begin_whole(gl);
         }
         unsafe {
+            if let Some(timers) = &mut timers {
+                timers.begin(gl, gpu_timing::CLEAR);
+            }
             // egui scissors the callback to its clip rect before handing over,
             // so this reaches the grid and nothing around it.
             let [r, g, b, a] = state.frame.default_bg;
             gl.clear_color(r, g, b, a);
             gl.clear(glow::COLOR_BUFFER_BIT);
+            if let Some(timers) = &timers {
+                timers.end(gl);
+            }
 
             if let Some(timers) = &mut timers {
                 timers.begin(gl, gpu_timing::UPLOAD);
