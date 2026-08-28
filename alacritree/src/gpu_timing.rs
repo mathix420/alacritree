@@ -15,6 +15,12 @@
 //! Results come back a few frames late.  Asking for a query on the frame that
 //! issued it blocks until the GPU catches up, which would make the instrument
 //! the slowest thing in the frame it is measuring.
+//!
+//! The timers also drive the decoration gate's A/B.  Two builds launched in
+//! turn cannot resolve a few microseconds on a loaded machine, because the
+//! round-to-round spread swamps it; alternating the two arms between report
+//! windows of one process puts them in front of the same driver, the same grid
+//! and the same minute, and leaves the reader a pair of adjacent lines.
 
 use std::time::Duration;
 
@@ -32,20 +38,42 @@ const REPORT_EVERY: usize = 240;
 
 pub struct GpuTimers {
     queries: [[glow::Query; STAGES.len()]; DEPTH],
-    /// Which queries a slot actually issued.  A frame with no decoration
-    /// strip runs three stages, not four, so this cannot be one flag per slot.
+    /// Which queries a slot actually issued.  A frame that skipped the
+    /// decoration pass runs three stages, not four, so this cannot be one flag
+    /// per slot.
     issued: [[bool; STAGES.len()]; DEPTH],
     slot: usize,
     gpu: [Vec<f64>; STAGES.len()],
+    /// Every stage of one frame added up, for the frames that got all their
+    /// answers back.  A per-stage median cannot be summed into this: the
+    /// medians come from different frames.
+    total: Vec<f64>,
     /// Wall time inside the callback, which no query can see.
     submit: Vec<f64>,
+    /// Whether the decoration gate is being A/B'd.  Alternating the two arms
+    /// between report windows of one process is what makes them comparable:
+    /// they meet the same driver, the same grid and the same minute, where two
+    /// binaries launched in turn meet neither.
+    ab: bool,
+    /// The arm this window is running.  `true` draws the decoration pass on
+    /// every frame, the way the code did before the gate.
+    arm: bool,
+    /// Frames this window that skipped the decoration pass.  Without it the
+    /// report cannot tell a gate that fired on every frame from one that never
+    /// fired: the stage median describes only the frames that drew.
+    skipped: usize,
+    /// Frames left before this window's samples are its own.  A result arrives
+    /// `DEPTH` frames after the draw that earned it, so the reads just after an
+    /// arm flip describe the arm that ended, and counting them would credit one
+    /// arm with the other's work.
+    settling: usize,
 }
 
 impl GpuTimers {
     /// `None` on a context that cannot time itself.  The grid runs on anything
     /// from GL 3 up and timer queries arrive in 3.3, so this is a real case
     /// rather than a defensive one.
-    pub fn new(gl: &glow::Context) -> Option<Self> {
+    pub fn new(gl: &glow::Context, ab: bool) -> Option<Self> {
         let version = gl.version();
         let core = !version.is_embedded && (version.major, version.minor) >= (3, 3);
         let extension = gl.supported_extensions().iter().any(|name| name.contains("timer_query"));
@@ -67,28 +95,61 @@ impl GpuTimers {
             issued: [[false; STAGES.len()]; DEPTH],
             slot: 0,
             gpu: std::array::from_fn(|_| Vec::new()),
+            total: Vec::new(),
             submit: Vec::new(),
+            ab,
+            arm: false,
+            skipped: 0,
+            settling: 0,
         })
+    }
+
+    /// True while the A/B is running its ungated arm, which draws the
+    /// decoration pass whether or not any cell carries one.
+    pub fn forces_decorations(&self) -> bool {
+        self.ab && self.arm
+    }
+
+    /// Record that this frame drew no decorations, so the report can say how
+    /// often the gate fired rather than only what a drawn pass cost.
+    pub fn skipped_decorations(&mut self) {
+        self.skipped += 1;
     }
 
     /// Collect whatever the slot about to be reused finished, so the frame
     /// that issued those queries is the one that paid for them.
     pub fn begin_frame(&mut self, gl: &glow::Context) {
+        // The queries still have to be read even while settling, or the slot
+        // is reused with a result outstanding.
+        let stale = self.settling > 0;
+        self.settling = self.settling.saturating_sub(1);
+        let (mut total, mut ran, mut complete) = (0.0, false, true);
         for stage in 0..STAGES.len() {
             if !std::mem::take(&mut self.issued[self.slot][stage]) {
                 continue;
             }
+            ran = true;
             let query = self.queries[self.slot][stage];
             unsafe {
                 // A driver still behind after `DEPTH` frames is better skipped
                 // than waited on: the wait would be charged to the frame doing
                 // the asking, not the frame that earned it.
                 if gl.get_query_parameter_u32(query, glow::QUERY_RESULT_AVAILABLE) == 0 {
+                    complete = false;
                     continue;
                 }
                 let ns = gl.get_query_parameter_u32(query, glow::QUERY_RESULT);
-                self.gpu[stage].push(f64::from(ns) / 1000.0);
+                let us = f64::from(ns) / 1000.0;
+                if !stale {
+                    self.gpu[stage].push(us);
+                }
+                total += us;
             }
+        }
+        // A frame one stage short has no total worth keeping: the sum of the
+        // rest would read as a cheaper frame rather than an unfinished one.
+        if ran && complete && !stale {
+            self.total.push(total);
         }
     }
 
@@ -112,11 +173,23 @@ impl GpuTimers {
     }
 
     fn report(&mut self) {
+        // Windows are the unit of comparison when the A/B runs, so the arm has
+        // to be on the line: two adjacent windows are the pair.
+        let arm = match (self.ab, self.arm) {
+            (false, _) => String::new(),
+            (true, true) => " [deco always]".into(),
+            (true, false) => " [deco gated]".into(),
+        };
         let mut line = format!(
-            "gpu grid, {} frames: submit {:.0}us",
+            "gpu grid{arm}, {} frames: submit {:.0}us",
             self.submit.len(),
             median(&mut self.submit)
         );
+        line.push_str(&format!("  skipped {}/{}", self.skipped, self.submit.len()));
+        match self.total.len() {
+            0 => line.push_str("  total -"),
+            _ => line.push_str(&format!("  total {:.0}us", median(&mut self.total))),
+        }
         for (stage, name) in STAGES.iter().enumerate() {
             // A stage whose samples all came back unavailable has nothing to
             // say, and printing 0 would read as "free" rather than "unknown".
@@ -126,7 +199,15 @@ impl GpuTimers {
             }
             self.gpu[stage].clear();
         }
+        self.total.clear();
+        self.skipped = 0;
+        // Only the A/B moves the arm, so only the A/B has a boundary to settle
+        // across; a steady run would throw away good samples every window.
+        if self.ab {
+            self.settling = DEPTH;
+        }
         self.submit.clear();
+        self.arm = !self.arm;
         log::info!("{line}");
     }
 }
