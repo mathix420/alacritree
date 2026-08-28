@@ -52,7 +52,7 @@ pub enum Ab {
 }
 
 /// The command ranges timed separately, in the order the callback issues them.
-const STAGES: [&str; 4] = ["upload", "backgrounds", "glyphs", "decorations"];
+const STAGES: [&str; 5] = ["clear", "upload", "backgrounds", "glyphs", "decorations"];
 
 /// Frames of queries in flight.  A slot is read on the frame that reuses it,
 /// by which point its work is long retired.
@@ -68,13 +68,14 @@ pub struct GpuTimers {
     /// per slot.
     issued: [[bool; STAGES.len()]; DEPTH],
     slot: usize,
-    /// One bracket around everything the callback issues, the clear included.
-    /// The stages do not add up to the frame: the clear sits outside all of
-    /// them, and a bracket that ends at bottom-of-pipe charges its stage for a
-    /// drain the next stage would otherwise have overlapped.  Only a span
-    /// measured on its own says by how much.  `GL_TIME_ELAPSED` cannot nest, so
-    /// this alternates with the per-stage queries frame by frame rather than
-    /// wrapping them, and one window reports both.
+    /// One bracket around everything the callback issues.  The stages still do
+    /// not add up to it: the vertex-array binds between them belong to no
+    /// stage, and a bracket that ends at bottom-of-pipe charges its stage for a
+    /// drain the next stage would otherwise have overlapped, which pushes the
+    /// sum the other way.  Only a span measured on its own says by how much.
+    /// `GL_TIME_ELAPSED` cannot nest, so this alternates with the per-stage
+    /// queries frame by frame rather than wrapping them, and one window reports
+    /// both.
     frame_queries: [glow::Query; DEPTH],
     frame_issued: [bool; DEPTH],
     frame: Vec<f64>,
@@ -323,9 +324,9 @@ impl GpuTimers {
             0 => line.push_str("  total -"),
             n => line.push_str(&format!("  total {:.0}us/{n}", median(&mut self.total))),
         }
-        // Read against `total`, which is the stages added up.  The gap is the
-        // clear plus whatever a per-stage bracket charges its stage for beyond
-        // the work inside it.
+        // Read against `total`, which is the stages added up.  What is left is
+        // the binds between stages plus whatever a per-stage bracket charges
+        // its stage for beyond the work inside it.
         match self.frame.len() {
             0 => line.push_str("  frame -"),
             n => line.push_str(&format!("  frame {:.0}us/{n}", median(&mut self.frame))),
@@ -355,10 +356,11 @@ impl GpuTimers {
 }
 
 /// The stage index the callback passes to `begin`.
-pub const UPLOAD: usize = 0;
-pub const BACKGROUNDS: usize = 1;
-pub const GLYPHS: usize = 2;
-pub const DECORATIONS: usize = 3;
+pub const CLEAR: usize = 0;
+pub const UPLOAD: usize = 1;
+pub const BACKGROUNDS: usize = 2;
+pub const GLYPHS: usize = 3;
+pub const DECORATIONS: usize = 4;
 
 fn median(samples: &mut [f64]) -> f64 {
     samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN from a duration"));
