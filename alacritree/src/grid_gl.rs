@@ -337,7 +337,10 @@ impl GlResources {
                     timers.end(gl);
                 }
             }
-            if let Some(strip) = decorations {
+            // Holding a strip only says the atlas exists.  Every cell still gets
+            // an instance, so an undecorated screen was paying a full-grid
+            // instanced draw to collapse every quad in the vertex shader.
+            if let Some(strip) = decorations.filter(|_| state.instances.any_decorated()) {
                 if let Some(timers) = &mut timers {
                     timers.begin(gl, gpu_timing::DECORATIONS);
                 }
@@ -442,8 +445,9 @@ impl GlResources {
     }
 
     /// Underlines and strikeouts, one instance per cell.  An undecorated cell
-    /// collapses in the vertex shader, so the draw costs the instance count
-    /// and nothing else on a screen carrying no decorations.
+    /// collapses in the vertex shader, so the pass costs the instance count
+    /// however few cells carry a line — which is why the caller skips it
+    /// outright on a screen that carries none.
     unsafe fn draw_decorations(
         &self,
         gl: &glow::Context,

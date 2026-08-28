@@ -212,11 +212,23 @@ pub struct GridInstances {
     pub glyphs: Vec<GlyphInstance>,
     cols: usize,
     rows: usize,
+    /// Whether each row was written a decorated run, so a frame can answer
+    /// `any_decorated` without walking the records.
+    deco_rows: Vec<bool>,
 }
 
 impl GridInstances {
     pub fn dimensions(&self) -> (usize, usize) {
         (self.cols, self.rows)
+    }
+
+    /// Whether the decoration pass has anything to draw.
+    ///
+    /// Conservative: a decorated run whose cells all landed past the last
+    /// column still counts, so the pass runs on a frame that would have drawn
+    /// nothing.  Erring the other way would drop a real underline.
+    pub fn any_decorated(&self) -> bool {
+        self.deco_rows.contains(&true)
     }
 
     /// Byte range covering `rows`, for a partial buffer upload.
@@ -233,6 +245,8 @@ impl GridInstances {
         self.rows = rows;
         self.glyphs.clear();
         self.glyphs.resize(cols * rows, GlyphInstance::default());
+        self.deco_rows.clear();
+        self.deco_rows.resize(rows, false);
         for row in 0..rows {
             self.clear_row(row, default_bg.to_array());
         }
@@ -243,6 +257,7 @@ impl GridInstances {
     fn clear_row(&mut self, row: usize, default_bg: [u8; 4]) {
         let blank = GlyphInstance { slot: BLANK_SLOT, deco: 0, fg: [0; 4], bg: default_bg };
         self.glyphs[row * self.cols..(row + 1) * self.cols].fill(blank);
+        self.deco_rows[row] = false;
     }
 
     /// Write every run in `runs` into the rows it covers, clearing those rows
@@ -277,6 +292,12 @@ impl GridInstances {
             // the run is decorated, since the line the shader draws across the
             // cell comes from the record and nowhere else.
             let keeps_background = bg == blank && run.deco == 0;
+            // Once per run rather than once per cell: the tile is constant
+            // across a run, and the reader only asks whether anything is
+            // decorated at all.
+            if run.deco != 0 {
+                self.deco_rows[run.row] = true;
+            }
             let mut col = run.start_col;
             for ch in run.text.chars() {
                 if col >= self.cols {
@@ -322,6 +343,9 @@ impl GridInstances {
         for run in runs {
             if run.row >= self.rows {
                 continue;
+            }
+            if run.deco != 0 {
+                self.deco_rows[run.row] = true;
             }
             let base = run.row * self.cols;
             let fg = run.fg.to_array();
@@ -625,5 +649,45 @@ mod tests {
         assert_eq!(grid.glyphs[1].bg, Color32::RED.to_array());
         assert_eq!(grid.glyphs[2].bg, Color32::RED.to_array());
         assert_eq!(grid.glyphs[3].bg, Color32::BLACK.to_array());
+    }
+
+    fn run(row: usize, deco: u16) -> RunView<'static> {
+        RunView {
+            text: "ab",
+            start_col: 0,
+            row,
+            face: Face::Normal,
+            deco,
+            fg: Color32::WHITE,
+            bg: Color32::BLACK,
+        }
+    }
+
+    /// The gate answers for the whole grid, so rewriting one row cannot speak
+    /// for the rest: a decoration two rows away has to survive a redraw of row
+    /// zero, or the pass is skipped and the underline vanishes.
+    #[test]
+    fn a_decoration_outside_the_rewritten_rows_still_counts() {
+        let mut grid = GridInstances::default();
+        grid.resize(4, 3, Color32::BLACK);
+        assert!(!grid.any_decorated(), "a fresh grid claims a decoration");
+
+        grid.write_rows([2], [run(2, decoration_sprites::STRAIGHT)], Color32::BLACK, |_, _| 1);
+        grid.write_rows([0], [run(0, 0)], Color32::BLACK, |_, _| 1);
+
+        assert!(grid.any_decorated());
+    }
+
+    /// And the other direction: once the decorated row is redrawn without one,
+    /// the pass has nothing left to draw and stops running.
+    #[test]
+    fn redrawing_the_decorated_row_clears_the_gate() {
+        let mut grid = GridInstances::default();
+        grid.resize(4, 3, Color32::BLACK);
+
+        grid.write_rows([1], [run(1, decoration_sprites::STRAIGHT)], Color32::BLACK, |_, _| 1);
+        grid.write_rows([1], [run(1, 0)], Color32::BLACK, |_, _| 1);
+
+        assert!(!grid.any_decorated());
     }
 }
