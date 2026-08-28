@@ -8414,9 +8414,19 @@ fn session_json(session: &Session, is_active_tab: bool) -> Value {
 
 impl eframe::App for AlacritreeApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        let bg = self.theme.terminal_bg;
-        let n = |c: u8| c as f32 / 255.0;
-        [n(bg.r()), n(bg.g()), n(bg.b()), self.config.window.opacity]
+        // This clear is the only thing painting a cell the grid leaves alone,
+        // so it has to carry the terminal's own background rather than the
+        // configured one.  eframe reads it before `update`, so a colour OSC 11
+        // moved this frame lands next frame; terminal output requests a repaint
+        // of its own, so the stale frame is replaced rather than left up.
+        let bg = self.grid_snapshot.default_bg(&self.config.palette);
+        let alpha = self.config.window.opacity;
+        // `egui_glow::clear` hands these to `glClearColor` untouched and the
+        // compositor reads the framebuffer as premultiplied, so the colour is
+        // scaled by the alpha here.  Alacritty's `renderer::clear` writes the
+        // same `(rgb * alpha, alpha)`.
+        let n = |c: u8| c as f32 / 255.0 * alpha;
+        [n(bg.r()), n(bg.g()), n(bg.b()), alpha]
     }
 
     fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
@@ -8476,7 +8486,10 @@ impl eframe::App for AlacritreeApp {
         // panel fill on top would compound the alpha through egui's blend.
         let translucent = self.config.window.opacity < 1.0;
         let sidebar_fill = if translucent { Color32::TRANSPARENT } else { theme.sidebar_bg };
-        let central_fill = if translucent { Color32::TRANSPARENT } else { theme.terminal_bg };
+        // Opaque, this fill is what a collapsed cell shows, so it tracks the
+        // terminal's background for the same reason the clear does.
+        let terminal_bg = self.grid_snapshot.default_bg(&self.config.palette);
+        let central_fill = if translucent { Color32::TRANSPARENT } else { terminal_bg };
 
         let panel_frame = Frame::default().fill(sidebar_fill).inner_margin(Margin::same(8));
 

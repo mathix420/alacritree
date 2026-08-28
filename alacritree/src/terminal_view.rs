@@ -14,7 +14,7 @@ use egui::{
 use crate::builtin_font::{BuiltinGlyphCache, Metrics, is_builtin_glyph};
 use crate::clipboard::{self, Target};
 use crate::color_glyph::{CachedColorGlyph, ColorGlyphCache};
-use crate::colors::{background, foreground, resolve, rgb_to_color32};
+use crate::colors::{background, default_background, foreground, resolve, rgb_to_color32};
 use crate::config::{Config, Palette};
 use crate::decoration_sprites;
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
@@ -857,6 +857,9 @@ pub struct GridSnapshot {
     /// cursor is drawn: the IME candidate window follows the caret even while
     /// the running app keeps the cursor hidden.
     caret: Option<(usize, i32)>,
+    /// The terminal's background as of the last capture.  `None` before the
+    /// first one, when there is no terminal to have an opinion yet.
+    default_bg: Option<Color32>,
     /// Rows the last capture rewrote, merged into one span.
     dirty_rows: std::ops::Range<usize>,
     /// Scratch for the rows a capture is about to walk, reused so reading
@@ -909,6 +912,13 @@ struct CursorSnapshot {
 impl GridSnapshot {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The terminal's background as of the last capture, for everything that
+    /// paints behind the grid as well as the grid itself.  Falls back to the
+    /// configured colour before the first capture.
+    pub fn default_bg(&self, palette: &Palette) -> Color32 {
+        self.default_bg.unwrap_or_else(|| background(palette))
     }
 
     /// Every run in the snapshot, paired with the text it covers.
@@ -1048,6 +1058,7 @@ impl GridSnapshot {
         );
 
         let runtime_palette = term.colors();
+        self.default_bg = Some(default_background(runtime_palette, &config.palette));
         let grid = term.grid();
         let in_link = |line: Line, column: Column| {
             link_bounds.is_some_and(|b| b.contains(&Point::new(line, column)))
@@ -1271,7 +1282,7 @@ fn paint_grid_gpu(
     glyphs: &mut GlyphCache,
     ctx: &egui::Context,
 ) {
-    let default_bg = background(&config.palette);
+    let default_bg = snapshot.default_bg(&config.palette);
     let size = config.font.egui_size();
     // Collected under the lock and drawn after it: painting needs the glyph
     // caches, and the grid state has no business being held while they work.
@@ -1403,7 +1414,7 @@ fn paint_grid(
     glyphs: &mut GlyphCache,
     ctx: &egui::Context,
 ) {
-    let bg_color = background(&config.palette);
+    let bg_color = snapshot.default_bg(&config.palette);
     // Every background goes down before any glyph does.  A background is an
     // opaque fill over the whole run, so painting one run at a time cuts off
     // whatever the run before it overhung into its first cell — which is how a
