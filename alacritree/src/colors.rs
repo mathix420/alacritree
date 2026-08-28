@@ -16,6 +16,13 @@ pub fn background(palette: &Palette) -> Color32 {
     rgb_to_color32(palette.bg)
 }
 
+/// The terminal's own default background, which OSC 11 can move away from the
+/// configured one.  Everything painting behind the grid has to agree on this:
+/// the background pass draws no quad for a cell already carrying it.
+pub fn default_background(runtime: &Colors, palette: &Palette) -> Color32 {
+    rgb_to_color32(resolve_named_raw(NamedColor::Background, runtime, palette))
+}
+
 pub fn foreground(palette: &Palette) -> Color32 {
     rgb_to_color32(palette.fg)
 }
