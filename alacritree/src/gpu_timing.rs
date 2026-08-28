@@ -49,18 +49,10 @@ pub enum Ab {
     Fill,
     /// Blending the background pass, every colour of which is opaque.
     Blend,
-    /// Clearing under the scissor rect egui leaves enabled, which on many
-    /// parts is what keeps a clear off the fast path.
-    Scissor,
-    /// Clearing with `glClear` rather than a full-rect quad in the same colour.
-    Quad,
-    /// Clearing the grid's rect at all, when eframe has already cleared the
-    /// whole framebuffer to the same colour before the callback ran.
-    Noclear,
 }
 
 /// The command ranges timed separately, in the order the callback issues them.
-const STAGES: [&str; 5] = ["clear", "upload", "backgrounds", "glyphs", "decorations"];
+const STAGES: [&str; 4] = ["upload", "backgrounds", "glyphs", "decorations"];
 
 /// Frames of queries in flight.  A slot is read on the frame that reuses it,
 /// by which point its work is long retired.
@@ -193,30 +185,6 @@ impl GpuTimers {
         self.ab == Ab::Blend && !self.arm
     }
 
-    /// True while the A/B is running the arm that turns the scissor off across
-    /// the clear.  The grid fills all but a few columns of the bench window, so
-    /// the two arms write nearly the same pixels and differ in little else.
-    pub fn lifts_clear_scissor(&self) -> bool {
-        self.ab == Ab::Scissor && !self.arm
-    }
-
-    /// True while the A/B is running the arm that paints the default
-    /// background with one full-rect draw instead of `glClear`.
-    pub fn draws_clear_quad(&self) -> bool {
-        self.ab == Ab::Quad && !self.arm
-    }
-
-    /// True while the A/B is running the arm that leaves the grid's rect to the
-    /// clear eframe already issued for the whole framebuffer.
-    pub fn skips_clear(&self) -> bool {
-        self.ab == Ab::Noclear && !self.arm
-    }
-
-    /// Whether the full-rect program has to be built.
-    pub fn wants_clear_quad(&self) -> bool {
-        self.ab == Ab::Quad
-    }
-
     /// Whether a glyph program that discards blank coverage has to be built.
     pub fn wants_glyph_discard(&self) -> bool {
         self.ab == Ab::Fill
@@ -345,12 +313,6 @@ impl GpuTimers {
             (Ab::Fill, false) => " [fill gated]",
             (Ab::Blend, true) => " [blend always]",
             (Ab::Blend, false) => " [blend gated]",
-            (Ab::Scissor, true) => " [scissor always]",
-            (Ab::Scissor, false) => " [scissor gated]",
-            (Ab::Quad, true) => " [quad always]",
-            (Ab::Quad, false) => " [quad gated]",
-            (Ab::Noclear, true) => " [noclear always]",
-            (Ab::Noclear, false) => " [noclear gated]",
         };
         let mut line = format!(
             "gpu grid{arm}, {} frames: submit {:.0}us",
@@ -394,11 +356,10 @@ impl GpuTimers {
 }
 
 /// The stage index the callback passes to `begin`.
-pub const CLEAR: usize = 0;
-pub const UPLOAD: usize = 1;
-pub const BACKGROUNDS: usize = 2;
-pub const GLYPHS: usize = 3;
-pub const DECORATIONS: usize = 4;
+pub const UPLOAD: usize = 0;
+pub const BACKGROUNDS: usize = 1;
+pub const GLYPHS: usize = 2;
+pub const DECORATIONS: usize = 3;
 
 fn median(samples: &mut [f64]) -> f64 {
     samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN from a duration"));

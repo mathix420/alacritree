@@ -32,21 +32,6 @@
           "const": "blend",
           "description": "Blending the background pass, every colour of which is opaque.",
           "type": "string"
-        },
-        {
-          "const": "scissor",
-          "description": "Clearing under the scissor rect egui leaves enabled, which on many\nparts is what keeps a clear off the fast path.",
-          "type": "string"
-        },
-        {
-          "const": "quad",
-          "description": "Clearing with `glClear` rather than a full-rect quad in the same colour.",
-          "type": "string"
-        },
-        {
-          "const": "noclear",
-          "description": "Clearing the grid's rect at all, when eframe has already cleared the\nwhole framebuffer to the same colour before the callback ran.",
-          "type": "string"
         }
       ]
     },
