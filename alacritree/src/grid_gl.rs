@@ -242,6 +242,15 @@ impl GlResources {
             },
         };
         unsafe {
+            // A hybrid laptop can hand the window to either GPU, and a
+            // microsecond figure from this callback is only plausible or
+            // implausible once you know which one drew it.
+            log::info!(
+                "grid gl: {} | {} | {}",
+                gl.get_parameter_string(glow::VENDOR),
+                gl.get_parameter_string(glow::RENDERER),
+                gl.get_parameter_string(glow::VERSION),
+            );
             let mut programs = Vec::new();
             for (vertex, fragment) in [
                 (GLYPH_VERT, GLYPH_FRAG),
@@ -395,7 +404,7 @@ impl GlResources {
         }
         if let Some(timers) = &mut timers {
             timers.end_whole(gl);
-            timers.end_frame(issued.elapsed());
+            timers.end_frame(issued.elapsed(), (cols, rows));
         }
         self.timers = timers;
     }

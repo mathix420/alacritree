@@ -94,6 +94,9 @@ pub struct GpuTimers {
     /// report cannot tell a gate that fired on every frame from one that never
     /// fired: the stage median describes only the frames that drew.
     skipped: usize,
+    /// Cells the last frame drew, so a microsecond figure on the report line
+    /// converts to a rate.
+    grid: (usize, usize),
     /// Frames left before this window's samples are its own.  A result arrives
     /// `DEPTH` frames after the draw that earned it, so the reads just after an
     /// arm flip describe the arm that ended, and counting them would credit one
@@ -139,6 +142,7 @@ impl GpuTimers {
             submit: Vec::new(),
             ab,
             arm: false,
+            grid: (0, 0),
             skipped: 0,
             settling: 0,
         })
@@ -205,8 +209,11 @@ impl GpuTimers {
                 total += us;
             }
         }
-        // A frame one stage short has no total worth keeping: the sum of the
-        // rest would read as a cheaper frame rather than an unfinished one.
+        // A frame still waiting on a query it issued has no total worth
+        // keeping: the sum of the rest would read as a cheaper frame rather
+        // than an unfinished one.  A stage the callback never issued is a
+        // different case -- a gated decoration pass leaves a three-stage frame
+        // that is complete as drawn, and its total counts.
         if ran && complete && !stale {
             self.total.push(total);
         }
@@ -257,8 +264,9 @@ impl GpuTimers {
         }
     }
 
-    pub fn end_frame(&mut self, submit: Duration) {
+    pub fn end_frame(&mut self, submit: Duration, grid: (usize, usize)) {
         self.submit.push(submit.as_secs_f64() * 1e6);
+        self.grid = grid;
         self.slot = (self.slot + 1) % DEPTH;
         self.whole_frame = !self.whole_frame;
         if self.submit.len() >= REPORT_EVERY {
@@ -286,24 +294,25 @@ impl GpuTimers {
         line.push_str(&format!("  skipped {}/{}", self.skipped, self.submit.len()));
         match self.total.len() {
             0 => line.push_str("  total -"),
-            _ => line.push_str(&format!("  total {:.0}us", median(&mut self.total))),
+            n => line.push_str(&format!("  total {:.0}us/{n}", median(&mut self.total))),
         }
         // Read against `total`, which is the stages added up.  The gap is the
         // clear plus whatever a per-stage bracket charges its stage for beyond
         // the work inside it.
         match self.frame.len() {
             0 => line.push_str("  frame -"),
-            _ => line.push_str(&format!("  frame {:.0}us", median(&mut self.frame))),
+            n => line.push_str(&format!("  frame {:.0}us/{n}", median(&mut self.frame))),
         }
         for (stage, name) in STAGES.iter().enumerate() {
             // A stage whose samples all came back unavailable has nothing to
             // say, and printing 0 would read as "free" rather than "unknown".
             match self.gpu[stage].len() {
                 0 => line.push_str(&format!("  {name} -")),
-                _ => line.push_str(&format!("  {name} {:.0}us", median(&mut self.gpu[stage]))),
+                n => line.push_str(&format!("  {name} {:.0}us/{n}", median(&mut self.gpu[stage]))),
             }
             self.gpu[stage].clear();
         }
+        line.push_str(&format!("  grid {}x{}", self.grid.0, self.grid.1));
         self.total.clear();
         self.frame.clear();
         self.skipped = 0;
