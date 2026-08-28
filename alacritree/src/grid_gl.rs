@@ -26,7 +26,7 @@ use eframe::glow::{self, HasContext};
 use egui::Rect;
 
 use crate::decoration_sprites::DecorationAtlas;
-use crate::gpu_timing::{self, GpuTimers};
+use crate::gpu_timing::{self, Ab, GpuTimers};
 use crate::grid_instances::{GlyphInstance, GlyphSlot, GlyphTable, GridInstances};
 
 /// Attribute locations, bound before linking so every program reads the same
@@ -63,9 +63,9 @@ pub struct Frame {
 pub struct Timing {
     /// `[debug] gpu_timing`: time the upload and each draw on the GPU.
     pub enabled: bool,
-    /// `[debug] gpu_deco_ab`: alternate the decoration gate between report
+    /// `[debug] gpu_ab`: alternate one of the callback's skips between report
     /// windows so both arms are timed against one driver and one grid.
-    pub deco_ab: bool,
+    pub ab: Ab,
 }
 
 /// The CPU half, written by the UI thread and read by the paint callback.
@@ -289,7 +289,7 @@ impl GlResources {
                 instance_capacity: 0,
                 slot_texture,
                 slot_scratch: Vec::new(),
-                timers: timing.enabled.then(|| GpuTimers::new(gl, timing.deco_ab)).flatten(),
+                timers: timing.enabled.then(|| GpuTimers::new(gl, timing.ab)).flatten(),
             })
         }
     }
@@ -334,7 +334,14 @@ impl GlResources {
             if let Some(timers) = &mut timers {
                 timers.begin(gl, gpu_timing::BACKGROUNDS);
             }
-            self.draw_backgrounds(gl, state, cols * rows);
+            // A colour no normalized byte can hold matches no cell, so the
+            // A/B's other arm draws every quad the way it did before the
+            // collapse without taking a different path to get there.
+            let default_bg = match timers.as_ref().is_some_and(GpuTimers::forces_backgrounds) {
+                true => [-1.0; 4],
+                false => state.frame.default_bg,
+            };
+            self.draw_backgrounds(gl, state, cols * rows, default_bg);
             if let Some(timers) = &timers {
                 timers.end(gl);
             }
@@ -458,10 +465,16 @@ impl GlResources {
     /// painted the whole grid rect that colour; alacritty reaches the same end
     /// by giving such a cell zero alpha and discarding it in the fragment
     /// shader (`compute_bg_alpha`, `text.f.glsl`).
-    unsafe fn draw_backgrounds(&self, gl: &glow::Context, state: &GridState, cells: usize) {
+    unsafe fn draw_backgrounds(
+        &self,
+        gl: &glow::Context,
+        state: &GridState,
+        cells: usize,
+        default_bg: [f32; 4],
+    ) {
         unsafe {
             gl.use_program(Some(self.background.program));
-            set_vec4(gl, &self.background, "u_default_bg", state.frame.default_bg);
+            set_vec4(gl, &self.background, "u_default_bg", default_bg);
             set_i32(gl, &self.background, "u_cols", state.frame.grid[0] as i32);
             set_vec2(gl, &self.background, "u_origin", state.frame.origin);
             set_vec2(gl, &self.background, "u_cell", state.frame.cell);
