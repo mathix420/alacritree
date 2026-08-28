@@ -314,6 +314,9 @@ impl GlResources {
         let mut timers = self.timers.take();
         if let Some(timers) = &mut timers {
             timers.begin_frame(gl);
+            // Opened before the clear, which belongs to the frame but to no
+            // stage, and so has never been counted anywhere.
+            timers.begin_whole(gl);
         }
         unsafe {
             // egui scissors the callback to its clip rect before handing over,
@@ -391,6 +394,7 @@ impl GlResources {
             gl.bind_vertex_array(None);
         }
         if let Some(timers) = &mut timers {
+            timers.end_whole(gl);
             timers.end_frame(issued.elapsed());
         }
         self.timers = timers;

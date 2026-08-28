@@ -63,6 +63,18 @@ pub struct GpuTimers {
     /// per slot.
     issued: [[bool; STAGES.len()]; DEPTH],
     slot: usize,
+    /// One bracket around everything the callback issues, the clear included.
+    /// The stages do not add up to the frame: the clear sits outside all of
+    /// them, and a bracket that ends at bottom-of-pipe charges its stage for a
+    /// drain the next stage would otherwise have overlapped.  Only a span
+    /// measured on its own says by how much.  `GL_TIME_ELAPSED` cannot nest, so
+    /// this alternates with the per-stage queries frame by frame rather than
+    /// wrapping them, and one window reports both.
+    frame_queries: [glow::Query; DEPTH],
+    frame_issued: [bool; DEPTH],
+    frame: Vec<f64>,
+    /// Which set of queries this frame issues.
+    whole_frame: bool,
     gpu: [Vec<f64>; STAGES.len()],
     /// Every stage of one frame added up, for the frames that got all their
     /// answers back.  A per-stage median cannot be summed into this: the
@@ -110,10 +122,18 @@ impl GpuTimers {
             made.push(slot.try_into().ok()?);
         }
         let queries = made.try_into().ok()?;
+        let mut whole = Vec::with_capacity(DEPTH);
+        for _ in 0..DEPTH {
+            whole.push(unsafe { gl.create_query() }.ok()?);
+        }
         Some(Self {
             queries,
             issued: [[false; STAGES.len()]; DEPTH],
             slot: 0,
+            frame_queries: whole.try_into().ok()?,
+            frame_issued: [false; DEPTH],
+            frame: Vec::new(),
+            whole_frame: false,
             gpu: std::array::from_fn(|_| Vec::new()),
             total: Vec::new(),
             submit: Vec::new(),
@@ -190,22 +210,57 @@ impl GpuTimers {
         if ran && complete && !stale {
             self.total.push(total);
         }
+        if std::mem::take(&mut self.frame_issued[self.slot]) {
+            let query = self.frame_queries[self.slot];
+            unsafe {
+                if gl.get_query_parameter_u32(query, glow::QUERY_RESULT_AVAILABLE) != 0 {
+                    let ns = gl.get_query_parameter_u32(query, glow::QUERY_RESULT);
+                    if !stale {
+                        self.frame.push(f64::from(ns) / 1000.0);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Bracket everything the callback issues, the clear included, so the
+    /// report can be read against the stages that are supposed to add up to it.
+    /// Silent on the frames measuring stages, which cannot nest inside this.
+    pub fn begin_whole(&mut self, gl: &glow::Context) {
+        if !self.whole_frame {
+            return;
+        }
+        self.frame_issued[self.slot] = true;
+        unsafe { gl.begin_query(glow::TIME_ELAPSED, self.frame_queries[self.slot]) };
+    }
+
+    pub fn end_whole(&self, gl: &glow::Context) {
+        if self.whole_frame {
+            unsafe { gl.end_query(glow::TIME_ELAPSED) };
+        }
     }
 
     /// `GL_TIME_ELAPSED` queries cannot nest, so a stage has to end before the
-    /// next one starts.
+    /// next one starts, and a frame measuring the whole callback measures no
+    /// stage at all.
     pub fn begin(&mut self, gl: &glow::Context, stage: usize) {
+        if self.whole_frame {
+            return;
+        }
         self.issued[self.slot][stage] = true;
         unsafe { gl.begin_query(glow::TIME_ELAPSED, self.queries[self.slot][stage]) };
     }
 
     pub fn end(&self, gl: &glow::Context) {
-        unsafe { gl.end_query(glow::TIME_ELAPSED) };
+        if !self.whole_frame {
+            unsafe { gl.end_query(glow::TIME_ELAPSED) };
+        }
     }
 
     pub fn end_frame(&mut self, submit: Duration) {
         self.submit.push(submit.as_secs_f64() * 1e6);
         self.slot = (self.slot + 1) % DEPTH;
+        self.whole_frame = !self.whole_frame;
         if self.submit.len() >= REPORT_EVERY {
             self.report();
         }
@@ -233,6 +288,13 @@ impl GpuTimers {
             0 => line.push_str("  total -"),
             _ => line.push_str(&format!("  total {:.0}us", median(&mut self.total))),
         }
+        // Read against `total`, which is the stages added up.  The gap is the
+        // clear plus whatever a per-stage bracket charges its stage for beyond
+        // the work inside it.
+        match self.frame.len() {
+            0 => line.push_str("  frame -"),
+            _ => line.push_str(&format!("  frame {:.0}us", median(&mut self.frame))),
+        }
         for (stage, name) in STAGES.iter().enumerate() {
             // A stage whose samples all came back unavailable has nothing to
             // say, and printing 0 would read as "free" rather than "unknown".
@@ -243,6 +305,7 @@ impl GpuTimers {
             self.gpu[stage].clear();
         }
         self.total.clear();
+        self.frame.clear();
         self.skipped = 0;
         // Only the A/B moves the arm, so only the A/B has a boundary to settle
         // across; a steady run would throw away good samples every window.
