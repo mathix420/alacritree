@@ -17,6 +17,11 @@
           "const": "backgrounds",
           "description": "Drawing a background quad over a cell already cleared to its colour.",
           "type": "string"
+        },
+        {
+          "const": "glyphs",
+          "description": "Recovering glyph coverage from the colour channels rather than alpha.",
+          "type": "string"
         }
       ]
     },

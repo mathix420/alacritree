@@ -42,6 +42,8 @@ pub enum Ab {
     Decorations,
     /// Drawing a background quad over a cell already cleared to its colour.
     Backgrounds,
+    /// Recovering glyph coverage from the colour channels rather than alpha.
+    Glyphs,
 }
 
 /// The command ranges timed separately, in the order the callback issues them.
@@ -134,6 +136,19 @@ impl GpuTimers {
         self.ab == Ab::Backgrounds && self.arm
     }
 
+    /// True while the A/B is running its baseline arm, which reads glyph
+    /// coverage back out of the colour channels the way egui's shader does.
+    pub fn forces_glyph_gamma(&self) -> bool {
+        self.ab == Ab::Glyphs && self.arm
+    }
+
+    /// Whether a second glyph program has to be built for the baseline arm.
+    /// The two shaders differ at compile time, so one program cannot serve
+    /// both the way a uniform serves the background arms.
+    pub fn wants_glyph_gamma(&self) -> bool {
+        self.ab == Ab::Glyphs
+    }
+
     /// Record that this frame drew no decorations, so the report can say how
     /// often the gate fired rather than only what a drawn pass cost.
     pub fn skipped_decorations(&mut self) {
@@ -205,6 +220,8 @@ impl GpuTimers {
             (Ab::Decorations, false) => " [deco gated]",
             (Ab::Backgrounds, true) => " [bg always]",
             (Ab::Backgrounds, false) => " [bg gated]",
+            (Ab::Glyphs, true) => " [glyph always]",
+            (Ab::Glyphs, false) => " [glyph gated]",
         };
         let mut line = format!(
             "gpu grid{arm}, {} frames: submit {:.0}us",
