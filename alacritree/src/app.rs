@@ -8420,13 +8420,14 @@ impl eframe::App for AlacritreeApp {
         // moved this frame lands next frame; terminal output requests a repaint
         // of its own, so the stale frame is replaced rather than left up.
         let bg = self.grid_snapshot.default_bg(&self.config.palette);
-        let alpha = self.config.window.opacity;
-        // `egui_glow::clear` hands these to `glClearColor` untouched and the
-        // compositor reads the framebuffer as premultiplied, so the colour is
-        // scaled by the alpha here.  Alacritty's `renderer::clear` writes the
-        // same `(rgb * alpha, alpha)`.
-        let n = |c: u8| c as f32 / 255.0 * alpha;
-        [n(bg.r()), n(bg.g()), n(bg.b()), alpha]
+        // Deliberately not premultiplied, where alacritty's `renderer::clear`
+        // writes `(rgb * alpha, alpha)`.  `egui_glow::clear` hands these to
+        // `glClearColor` untouched and the compositor reads the framebuffer as
+        // premultiplied, so a translucent window carries its background at full
+        // strength; scaling it here would darken every `[window] opacity`
+        // already tuned against this.
+        let n = |c: u8| c as f32 / 255.0;
+        [n(bg.r()), n(bg.g()), n(bg.b()), self.config.window.opacity]
     }
 
     fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
