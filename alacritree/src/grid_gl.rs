@@ -207,9 +207,6 @@ struct GlResources {
     /// The glyph shader that discards fragments the atlas gives no coverage,
     /// built only while the A/B is pricing that against blending them.
     glyph_discard: Option<Program>,
-    /// Paints the default background across the callback's rect with one draw,
-    /// built only while the A/B is pricing that against `glClear`.
-    clear_quad: Option<Program>,
     background: Program,
     decoration: Program,
     vao: glow::VertexArray,
@@ -299,15 +296,10 @@ impl GlResources {
                 true => Some(link(gl, header, GLYPH_VERT, GLYPH_FRAG_DISCARD)?),
                 false => None,
             };
-            let clear_quad = match timers.as_ref().is_some_and(GpuTimers::wants_clear_quad) {
-                true => Some(link(gl, header, CLEAR_VERT, CLEAR_FRAG)?),
-                false => None,
-            };
             Ok(Self {
                 glyph,
                 glyph_gamma,
                 glyph_discard,
-                clear_quad,
                 background,
                 decoration,
                 vao,
@@ -342,44 +334,11 @@ impl GlResources {
             timers.begin_whole(gl);
         }
         unsafe {
-            if let Some(timers) = &mut timers {
-                timers.begin(gl, gpu_timing::CLEAR);
-            }
-            // egui scissors the callback to its clip rect before handing over,
-            // so this reaches the grid and nothing around it.
-            let [r, g, b, a] = state.frame.default_bg;
-            let unscissored = timers.as_ref().is_some_and(GpuTimers::lifts_clear_scissor);
-            if unscissored {
-                gl.disable(glow::SCISSOR_TEST);
-            }
-            match self.clear_quad.as_ref().filter(|_| {
-                timers.as_ref().is_some_and(GpuTimers::draws_clear_quad)
-            }) {
-                // Writes the same pixels the clear would, through the ordinary
-                // raster path rather than the driver's clear path.  The three
-                // vertices come from `gl_VertexID`, so no buffer is bound and
-                // whatever the VAO carries is never fetched.
-                Some(program) => {
-                    gl.use_program(Some(program.program));
-                    if let Some(location) = program.location("u_color") {
-                        gl.uniform_4_f32(Some(location), r, g, b, a);
-                    }
-                    gl.bind_vertex_array(Some(self.vao));
-                    gl.draw_arrays(glow::TRIANGLES, 0, 3);
-                },
-                None if timers.as_ref().is_some_and(GpuTimers::skips_clear) => {},
-                None => {
-                    gl.clear_color(r, g, b, a);
-                    gl.clear(glow::COLOR_BUFFER_BIT);
-                },
-            }
-            if unscissored {
-                gl.enable(glow::SCISSOR_TEST);
-            }
-            if let Some(timers) = &timers {
-                timers.end(gl);
-            }
-
+            // Nothing clears the grid's rect here.  eframe clears the whole
+            // framebuffer to the terminal's background before the callback
+            // runs, which is the colour a collapsed cell is supposed to show,
+            // and a second `glClear` under egui's scissor cost 100us and
+            // overwrote the alpha a translucent window needs.
             if let Some(timers) = &mut timers {
                 timers.begin(gl, gpu_timing::UPLOAD);
             }
@@ -543,10 +502,10 @@ impl GlResources {
     }
 
     /// The cell backgrounds, one instance per cell.  A cell still carrying
-    /// `default_bg` collapses in the vertex shader, because the clear already
-    /// painted the whole grid rect that colour; alacritty reaches the same end
-    /// by giving such a cell zero alpha and discarding it in the fragment
-    /// shader (`compute_bg_alpha`, `text.f.glsl`).
+    /// `default_bg` collapses in the vertex shader, because eframe's clear
+    /// already painted the whole framebuffer that colour; alacritty reaches the
+    /// same end by giving such a cell zero alpha and discarding it in the
+    /// fragment shader (`compute_bg_alpha`, `text.f.glsl`).
     unsafe fn draw_backgrounds(
         &self,
         gl: &glow::Context,
@@ -952,30 +911,6 @@ mod tests {
         assert_ne!(before, ctx.fonts(|f| f.font_image_size()));
     }
 }
-
-/// Covers the callback's rect with one triangle, so the default background can
-/// be priced against `glClear` writing the same pixels.  Built only when
-/// `[debug] gpu_ab = "quad"` asks for it, and never on the path a release
-/// paints with.
-///
-/// The vertices are derived rather than fetched: a triangle twice the size of
-/// the viewport covers it, and the scissor egui leaves enabled trims the
-/// overhang the same way it trims the clear.
-const CLEAR_VERT: &str = r#"
-void main() {
-    vec2 corner = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
-    gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);
-}
-"#;
-
-const CLEAR_FRAG: &str = r#"
-uniform vec4 u_color;
-out vec4 f_color;
-
-void main() {
-    f_color = u_color;
-}
-"#;
 
 /// The glyph shader with the blank half of every atlas rectangle thrown away
 /// rather than blended.  Built only when `[debug] gpu_ab = "fill"` asks to
