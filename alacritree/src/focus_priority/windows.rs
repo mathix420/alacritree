@@ -126,6 +126,14 @@ impl PriorityJob {
         // start, in both directions, so releasing the boost is this same call
         // rather than a walk over the members.
         self.set_limit(JOB_OBJECT_LIMIT_PRIORITY_CLASS, class(boosted));
+        if !boosted {
+            // A job's class is a ceiling, not a setting: while the limit
+            // stands, every member is held at normal and cannot raise itself.
+            // Naming normal is what lowers the ones already running, and
+            // clearing the limit afterwards is what gives them back their own
+            // class — an unfocused session must cost its processes nothing.
+            self.set_limit(0, NORMAL_PRIORITY_CLASS);
+        }
     }
 
     fn set_limit(&self, flags: u32, class: u32) {
@@ -151,12 +159,10 @@ impl PriorityJob {
 impl Drop for PriorityJob {
     /// A job outlives the last handle to it for as long as it still has
     /// members, and a session's tab can be closed while something it started
-    /// keeps running.  Both steps matter: setting the class to normal is what
-    /// lowers those survivors, and clearing the limit is what stops a job
-    /// nobody holds any more from pinning them there for good.
+    /// keeps running.  Releasing the boost is the whole of it: that both
+    /// lowers those survivors and leaves them free to set their own class.
     fn drop(&mut self) {
         self.set_boosted(false);
-        self.set_limit(0, NORMAL_PRIORITY_CLASS);
     }
 }
 
@@ -330,5 +336,23 @@ mod tests {
 
         set_boosted(pid, true);
         assert_eq!(class_of(pid), ABOVE_NORMAL_PRIORITY_CLASS, "the dropped job still pins it");
+    }
+
+    /// Losing focus has to hand the members back their own class, not hold
+    /// them at normal.  A session that keeps the limit standing caps
+    /// everything it is running for as long as it is not the focused tab —
+    /// including anything that raises itself, which is what a build or an
+    /// agent under the shell does.
+    #[test]
+    fn releasing_the_boost_leaves_the_members_free_to_raise_themselves() {
+        let subject = subject();
+        let pid = subject.pid();
+        let job = PriorityJob::adopt(pid).expect("put the subject in a job");
+        job.set_boosted(true);
+        job.set_boosted(false);
+        assert_eq!(class_of(pid), NORMAL_PRIORITY_CLASS);
+
+        set_boosted(pid, true);
+        assert_eq!(class_of(pid), ABOVE_NORMAL_PRIORITY_CLASS, "the unfocused job caps it");
     }
 }
