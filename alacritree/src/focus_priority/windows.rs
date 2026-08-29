@@ -192,6 +192,7 @@ impl Drop for PriorityJob {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fmt;
     use std::num::NonZeroU32;
     use std::process::{Child, Command, Stdio};
     use std::sync::mpsc;
@@ -200,7 +201,10 @@ mod tests {
     use alacritty_terminal::event::WindowSize;
     use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-    use windows_sys::Win32::System::Threading::{GetPriorityClass, PROCESS_QUERY_INFORMATION};
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+    use windows_sys::Win32::System::Threading::{
+        GetPriorityClass, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
 
     use super::*;
 
@@ -384,6 +388,31 @@ mod tests {
         assert_eq!(class_of(pid), ABOVE_NORMAL_PRIORITY_CLASS, "the unfocused job caps it");
     }
 
+    /// One process of a session's tree, as it stood before the teardown.
+    struct Member {
+        pid: u32,
+        name: String,
+        /// Whether the kernel counted it as part of the session's job.  A
+        /// survivor that was never a member means the model is wrong; one
+        /// that was means kill-on-close is.
+        in_job: Option<bool>,
+    }
+
+    impl fmt::Display for Member {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{}({})", self.name, self.pid)?;
+            match self.in_job {
+                Some(true) => f.write_str(" in the job"),
+                Some(false) => f.write_str(" outside the job"),
+                None => Ok(()),
+            }
+        }
+    }
+
+    fn render(members: &[Member]) -> String {
+        members.iter().map(Member::to_string).collect::<Vec<_>>().join(", ")
+    }
+
     /// A real ConPTY session torn down, and what outlived it.
     struct Teardown {
         /// False when `ClosePseudoConsole` had not returned by the deadline.
@@ -391,9 +420,9 @@ mod tests {
         /// never exits wedges the drop rather than reporting anything.
         closed: bool,
         /// Everything the session was running before the teardown.
-        started: Vec<u32>,
+        started: Vec<Member>,
         /// The subset of those still running afterwards.
-        survivors: Vec<u32>,
+        survivors: Vec<Member>,
     }
 
     /// Every pid descended from `root`, `root` included, from one snapshot.
@@ -414,23 +443,6 @@ mod tests {
         tree
     }
 
-    /// Which of `pids` are still running once they have had `grace` to go.
-    fn still_running_after(pids: &[u32], grace: Duration) -> Vec<u32> {
-        let deadline = Instant::now() + grace;
-        loop {
-            let sys = snapshot();
-            let alive: Vec<u32> = pids
-                .iter()
-                .copied()
-                .filter(|pid| sys.process(Pid::from_u32(*pid)).is_some())
-                .collect();
-            if alive.is_empty() || Instant::now() > deadline {
-                return alive;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-    }
-
     fn snapshot() -> System {
         let mut sys = System::new();
         sys.refresh_processes_specifics(
@@ -439,6 +451,25 @@ mod tests {
             ProcessRefreshKind::nothing(),
         );
         sys
+    }
+
+    fn name_of(sys: &System, pid: u32) -> String {
+        sys.process(Pid::from_u32(pid))
+            .map(|p| p.name().to_string_lossy().into_owned())
+            .unwrap_or_else(|| "gone".to_owned())
+    }
+
+    /// Ask the kernel whether `pid` is a member of `job`, so a failure can say
+    /// which of the two halves — the model or the flag — is at fault.
+    fn is_in_job(pid: u32, job: HANDLE) -> Option<bool> {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let handle = Owned(handle);
+        let mut member = 0;
+        let asked = unsafe { IsProcessInJob(handle.0, job, &mut member) };
+        (asked != 0).then_some(member != 0)
     }
 
     /// Wait for `root` to have grown a tree of at least `want` processes, so a
@@ -454,22 +485,38 @@ mod tests {
         }
     }
 
-    /// Run `command` as the shell of a real pseudoconsole, wait for its tree to
-    /// come up, then close the console and report what survived.
+    /// Which of `members` are still running once they have had `grace` to go.
+    fn still_running_after(members: &[Member], grace: Duration) -> Vec<Member> {
+        let deadline = Instant::now() + grace;
+        loop {
+            let sys = snapshot();
+            let alive: Vec<Member> = members
+                .iter()
+                .filter(|m| sys.process(Pid::from_u32(m.pid)).is_some())
+                .map(|m| Member { pid: m.pid, name: m.name.clone(), in_job: m.in_job })
+                .collect();
+            if alive.is_empty() || Instant::now() > deadline {
+                return alive;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// Run `shell` inside a real pseudoconsole, wait for its tree to come up,
+    /// then close the console and report what survived.
     ///
     /// `job` is the only difference between the arms: `None` leaves the
     /// session unjobbed, `Some(reaping)` jobs it with or without kill-on-close.
     /// Everything runs on a worker thread because closing a console can block
     /// forever, and a teardown that never returns is a result here rather than
     /// a reason to hang the suite.
-    fn tear_down_a_conpty_session(job: Option<bool>, command: &str, want: usize) -> Teardown {
-        let (pids_tx, pids_rx) = mpsc::channel();
+    fn tear_down_a_conpty_session(job: Option<bool>, shell: Shell, want: usize) -> Teardown {
+        let (members_tx, members_rx) = mpsc::channel();
         let (closed_tx, closed_rx) = mpsc::channel();
-        let command = command.to_owned();
 
         std::thread::spawn(move || {
             let options = PtyOptions {
-                shell: Some(Shell::new("cmd.exe".into(), vec!["/c".into(), command])),
+                shell: Some(shell),
                 working_directory: None,
                 drain_on_exit: false,
                 env: HashMap::new(),
@@ -477,11 +524,24 @@ mod tests {
             };
             let size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
             let pty = tty::new(&options, size, 0).expect("open a pseudoconsole");
-            let shell = pty.child_watcher().pid().map(NonZeroU32::get).expect("the shell's pid");
-            let started = tree_once_grown(shell, want);
-            let job = job.map(|reaping| PriorityJob::adopt(shell, reaping).expect("job the shell"));
+            let root = pty.child_watcher().pid().map(NonZeroU32::get).expect("the shell's pid");
+            // Jobbed before the tree is waited for, as a session does it: a
+            // process joins a job when it is created, so anything already
+            // running when the job appears stays outside it for good.
+            let job = job.map(|reaping| PriorityJob::adopt(root, reaping).expect("job the shell"));
+            let started = tree_once_grown(root, want);
 
-            pids_tx.send(started).expect("report the session's pids");
+            let sys = snapshot();
+            let members: Vec<Member> = started
+                .into_iter()
+                .map(|pid| Member {
+                    pid,
+                    name: name_of(&sys, pid),
+                    in_job: job.as_ref().and_then(|j| is_in_job(pid, j.job.0)),
+                })
+                .collect();
+
+            members_tx.send(members).expect("report the session's tree");
             // Session drops its fields, the job among them, before the event
             // loop gets to the PTY, so the job goes first here too.
             drop(job);
@@ -489,34 +549,78 @@ mod tests {
             let _ = closed_tx.send(());
         });
 
-        let started = pids_rx.recv_timeout(Duration::from_secs(45)).expect("the session came up");
+        let started =
+            members_rx.recv_timeout(Duration::from_secs(45)).expect("the session came up");
         let closed = closed_rx.recv_timeout(Duration::from_secs(20)).is_ok();
 
         // Closing the console returns before the kernel has finished tearing
         // the clients down, so a survivor is one still there after a grace
         // period rather than one still there the instant the close returns.
         let survivors = still_running_after(&started, Duration::from_secs(5));
-        // A survivor would outlive the whole suite, which is the failure this
-        // is looking for.  Report it, then take it out.
-        for pid in &survivors {
-            let _ = Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
+        // A survivor would outlive the whole suite, and the arm that expects
+        // one still has to clean up after itself.
+        for member in &survivors {
+            let pid = member.pid.to_string();
+            let _ = Command::new("taskkill").args(["/F", "/T", "/PID", &pid]).output();
         }
         Teardown { closed, started, survivors }
     }
 
     /// A shell and the command it is running, both clients of the console.
-    const CONSOLE_CLIENTS: &str = "ping -n 60 127.0.0.1 > nul";
+    fn console_clients() -> Shell {
+        Shell::new("cmd.exe".into(), vec!["/c".into(), "ping -n 60 127.0.0.1 > nul".into()])
+    }
 
-    /// The baseline the jobbed arm is measured against.  Closing a
+    /// A shell that starts a process with no console of its own, which is the
+    /// shape of the leak: a helper an editor spawns for completions is a child
+    /// of the session but not a client of its console.
+    ///
+    /// Only a process already inside the session can start one, so the session
+    /// runs this test binary again and [`a_child_that_leaves_the_console`] does
+    /// the spawning.
+    fn a_shell_that_escapes_its_console() -> Shell {
+        let exe = std::env::current_exe().expect("the test binary's own path");
+        Shell::new(exe.display().to_string(), vec![
+            "--exact".into(),
+            "focus_priority::windows::tests::a_child_that_leaves_the_console".into(),
+            "--ignored".into(),
+        ])
+    }
+
+    /// Not a test on its own: the escaping child that
+    /// [`a_shell_that_escapes_its_console`] runs as a session's shell.
+    ///
+    /// `DETACHED_PROCESS` is what does the escaping — the child gets no
+    /// console at all, so it is nobody's console client and closing the
+    /// session's console has no claim on it.  It also spawns no window and no
+    /// console host, so a test run leaves the desktop alone.
+    #[test]
+    #[ignore = "the escaping child a reaping test runs as its session's shell"]
+    fn a_child_that_leaves_the_console() {
+        use std::os::windows::process::CommandExt as _;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+        Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .creation_flags(DETACHED_PROCESS)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start a child outside the console");
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    /// The baseline the jobbed arms are measured against.  Closing a
     /// pseudoconsole ends the shell and the command it is running, because
     /// conhost keeps its clients in a job it kills on close.  A failure here
     /// is the harness, not the feature.
     #[test]
     fn closing_a_pseudoconsole_reaps_its_console_clients() {
-        let torn = tear_down_a_conpty_session(None, CONSOLE_CLIENTS, 2);
+        let torn = tear_down_a_conpty_session(None, console_clients(), 2);
         assert!(torn.closed, "closing the pseudoconsole never returned");
-        assert!(torn.started.len() >= 2, "the session never started a command: {:?}", torn.started);
-        assert!(torn.survivors.is_empty(), "outlived the console: {:?}", torn.survivors);
+        assert!(torn.started.len() >= 2, "no command ran: {}", render(&torn.started));
+        assert!(torn.survivors.is_empty(), "outlived the console: {}", render(&torn.survivors));
     }
 
     /// The session's job nests inside conhost's, and conhost's is what reaps
@@ -524,9 +628,39 @@ mod tests {
     /// buy typing latency with processes that outlive the terminal.
     #[test]
     fn a_job_does_not_cost_the_session_its_reaping() {
-        let torn = tear_down_a_conpty_session(Some(true), CONSOLE_CLIENTS, 2);
+        let torn = tear_down_a_conpty_session(Some(true), console_clients(), 2);
         assert!(torn.closed, "closing the jobbed pseudoconsole never returned");
-        assert!(torn.started.len() >= 2, "the session never started a command: {:?}", torn.started);
-        assert!(torn.survivors.is_empty(), "outlived a jobbed console: {:?}", torn.survivors);
+        assert!(torn.started.len() >= 2, "no command ran: {}", render(&torn.started));
+        assert!(
+            torn.survivors.is_empty(),
+            "outlived a jobbed console: {}",
+            render(&torn.survivors)
+        );
+    }
+
+    /// The leak the feature exists for.  A console reaps its clients and
+    /// nothing else, so a descendant that left it is stranded by the teardown
+    /// and runs until the machine is rebooted.  Without this the reaping arm
+    /// below could pass on a session that never escaped anything.
+    #[test]
+    fn the_console_alone_strands_what_leaves_it() {
+        let torn = tear_down_a_conpty_session(None, a_shell_that_escapes_its_console(), 2);
+        assert!(torn.closed, "closing the pseudoconsole never returned");
+        assert!(torn.started.len() >= 2, "nothing left the console: {}", render(&torn.started));
+        assert!(
+            !torn.survivors.is_empty(),
+            "the console reaped what left it, so there is no leak to fix"
+        );
+    }
+
+    /// What the console cannot reach, the job has to: it holds every
+    /// descendant at every depth, console client or not, which makes it the
+    /// only thing placed to end them.
+    #[test]
+    fn a_reaping_job_ends_what_leaves_the_console() {
+        let torn = tear_down_a_conpty_session(Some(true), a_shell_that_escapes_its_console(), 2);
+        assert!(torn.closed, "closing the jobbed pseudoconsole never returned");
+        assert!(torn.started.len() >= 2, "nothing left the console: {}", render(&torn.started));
+        assert!(torn.survivors.is_empty(), "stranded by the teardown: {}", render(&torn.survivors));
     }
 }
