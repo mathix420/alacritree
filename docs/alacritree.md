@@ -383,6 +383,18 @@ vsync              = true   # restart required — wait for the display's refres
                             # before showing a finished frame (default true).
                             # false presents each frame as soon as it is drawn,
                             # trading tearing for lower keystroke-to-screen delay
+focus_priority_boost = false  # Windows only, restart required — put the
+                              # session on screen one scheduling class above
+                              # normal (default false).
+                              # A program that redraws its line as you type
+                              # needs CPU for every keystroke, and at normal
+                              # priority a build saturating every core starves
+                              # it: nushell echoed in 10 ms boosted, against up
+                              # to 1.9 s unboosted. Covers the shell and
+                              # everything it starts, at any depth, including
+                              # commands that live only a moment. Follows
+                              # focus, and raises nothing while the window is
+                              # in the background
 search_scope       = "filtered"  # whether a sidebar search is confined by the
                                  # active toggle filters
                                  # "filtered" (default): a query narrows what

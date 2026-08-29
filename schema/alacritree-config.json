@@ -937,6 +937,10 @@
           "$ref": "#/$defs/RawFocusOutline",
           "description": "Outline drawn around whichever pane holds keyboard focus."
         },
+        "focus_priority_boost": {
+          "description": "Put the session on screen one scheduling class above normal — its\nshell and every process that shell starts — so a busy machine cannot\nstarve what the user is typing into.  Follows focus.  Windows only.\nDefault false.",
+          "type": "boolean"
+        },
         "font": {
           "$ref": "#/$defs/RawUiFont",
           "description": "The font sidebars, tabs and dialogs are drawn with."

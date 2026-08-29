@@ -15,6 +15,7 @@ mod crash_log;
 mod digest;
 mod doppler;
 mod file_drop;
+mod focus_priority;
 mod fonts;
 mod frame_log;
 mod git_nav;

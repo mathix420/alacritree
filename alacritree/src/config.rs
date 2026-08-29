@@ -931,6 +931,12 @@ pub struct UiTheme {
     /// it (so filter typing works without the focus shortcut).  Off by default
     /// so unmodified configs keep click-through-to-terminal behavior.
     pub sidebar_click_focus: bool,
+    /// `[ui] focus_priority_boost`: put the session on screen one scheduling
+    /// class above normal — its shell and every process that shell starts, at
+    /// any depth — so a build saturating the machine cannot starve what the
+    /// user is typing into.  Follows focus, and raises nothing while the
+    /// window is in the background.  Off by default.  Windows only.
+    pub focus_priority_boost: bool,
     /// `[ui] vsync`: block each present until the display's next refresh.  On
     /// by default, as upstream eframe has it.  Turning it off presents a
     /// finished frame immediately, trading tearing for the queueing delay
@@ -979,6 +985,7 @@ impl Default for UiTheme {
             focus_outline: FocusOutline::default(),
             scrollbar: ScrollbarStyle::Floating,
             sidebar_click_focus: false,
+            focus_priority_boost: false,
             vsync: true,
             worktree_name: None,
             project_name: None,
@@ -2012,6 +2019,11 @@ struct RawUi {
     focus_outline: RawFocusOutline,
     /// Clicking a sidebar moves keyboard focus to it.  Default false.
     sidebar_click_focus: Option<bool>,
+    /// Put the session on screen one scheduling class above normal — its
+    /// shell and every process that shell starts — so a busy machine cannot
+    /// starve what the user is typing into.  Follows focus.  Windows only.
+    /// Default false.
+    focus_priority_boost: Option<bool>,
     /// Wait for the display's refresh before showing a finished frame.
     /// Default true.
     vsync: Option<bool>,
@@ -2230,6 +2242,7 @@ impl RawConfig {
             },
             scrollbar: parse_scrollbar(self.ui.scrollbar.as_deref()),
             sidebar_click_focus: self.ui.sidebar_click_focus.unwrap_or(false),
+            focus_priority_boost: self.ui.focus_priority_boost.unwrap_or(false),
             vsync: self.ui.vsync.unwrap_or(true),
             worktree_name: self.ui.worktree_name.clone().filter(|t| !t.trim().is_empty()),
             project_name: self.ui.project_name.clone().filter(|t| !t.trim().is_empty()),
@@ -3308,6 +3321,18 @@ program = "second"
     #[test]
     fn sidebar_click_focus_defaults_off() {
         assert!(!ui_from_toml("").sidebar_click_focus);
+    }
+
+    /// A boosted session outranks everything else the machine is doing, so an
+    /// unmodified config must never get it.
+    #[test]
+    fn focus_priority_boost_defaults_off() {
+        assert!(!ui_from_toml("").focus_priority_boost);
+    }
+
+    #[test]
+    fn focus_priority_boost_parses() {
+        assert!(ui_from_toml("[ui]\nfocus_priority_boost = true").focus_priority_boost);
     }
 
     #[test]
