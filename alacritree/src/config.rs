@@ -937,6 +937,13 @@ pub struct UiTheme {
     /// user is typing into.  Follows focus, and raises nothing while the
     /// window is in the background.  Off by default.  Windows only.
     pub focus_priority_boost: bool,
+    /// `[ui] reap_descendants_on_close`: end everything a session started when
+    /// that session closes, at any depth.  The console reaps only the clients
+    /// attached to it, so a process that left the console — an editor's search
+    /// helper, anything started detached — otherwise outlives the terminal.  A
+    /// process that means to survive can still say so with
+    /// `CREATE_BREAKAWAY_FROM_JOB`.  Off by default.  Windows only.
+    pub reap_descendants_on_close: bool,
     /// `[ui] vsync`: block each present until the display's next refresh.  On
     /// by default, as upstream eframe has it.  Turning it off presents a
     /// finished frame immediately, trading tearing for the queueing delay
@@ -986,6 +993,7 @@ impl Default for UiTheme {
             scrollbar: ScrollbarStyle::Floating,
             sidebar_click_focus: false,
             focus_priority_boost: false,
+            reap_descendants_on_close: false,
             vsync: true,
             worktree_name: None,
             project_name: None,
@@ -2024,6 +2032,10 @@ struct RawUi {
     /// starve what the user is typing into.  Follows focus.  Windows only.
     /// Default false.
     focus_priority_boost: Option<bool>,
+    /// End everything a session started when that session closes, at any
+    /// depth, except processes that ask to break away.  Windows only.
+    /// Default false.
+    reap_descendants_on_close: Option<bool>,
     /// Wait for the display's refresh before showing a finished frame.
     /// Default true.
     vsync: Option<bool>,
@@ -2243,6 +2255,7 @@ impl RawConfig {
             scrollbar: parse_scrollbar(self.ui.scrollbar.as_deref()),
             sidebar_click_focus: self.ui.sidebar_click_focus.unwrap_or(false),
             focus_priority_boost: self.ui.focus_priority_boost.unwrap_or(false),
+            reap_descendants_on_close: self.ui.reap_descendants_on_close.unwrap_or(false),
             vsync: self.ui.vsync.unwrap_or(true),
             worktree_name: self.ui.worktree_name.clone().filter(|t| !t.trim().is_empty()),
             project_name: self.ui.project_name.clone().filter(|t| !t.trim().is_empty()),
@@ -3333,6 +3346,19 @@ program = "second"
     #[test]
     fn focus_priority_boost_parses() {
         assert!(ui_from_toml("[ui]\nfocus_priority_boost = true").focus_priority_boost);
+    }
+
+    /// Killing what a closing session started is a change of behavior the
+    /// killed process has no say in, so an unmodified config must not get it.
+    #[test]
+    fn reap_descendants_on_close_defaults_off() {
+        assert!(!ui_from_toml("").reap_descendants_on_close);
+    }
+
+    #[test]
+    fn reap_descendants_on_close_parses() {
+        let ui = ui_from_toml("[ui]\nreap_descendants_on_close = true");
+        assert!(ui.reap_descendants_on_close);
     }
 
     #[test]

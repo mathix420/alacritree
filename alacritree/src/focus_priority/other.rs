@@ -12,7 +12,7 @@
 pub struct PriorityJob;
 
 impl PriorityJob {
-    pub fn adopt(_pid: u32) -> Option<Self> {
+    pub fn adopt(_pid: u32, _reaping: bool) -> Option<Self> {
         None
     }
 

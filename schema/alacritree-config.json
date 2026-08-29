@@ -994,6 +994,10 @@
           "description": "Template for a project row's label.",
           "type": "string"
         },
+        "reap_descendants_on_close": {
+          "description": "End everything a session started when that session closes, at any\ndepth, except processes that ask to break away.  Windows only.\nDefault false.",
+          "type": "boolean"
+        },
         "scrollbar": {
           "description": "Sidebar scrollbar style: \"floating\" (default) | \"solid\".",
           "enum": [

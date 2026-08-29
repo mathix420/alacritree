@@ -26,8 +26,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_PRIORITY_CLASS,
-    JOBOBJECT_BASIC_LIMIT_INFORMATION, JobObjectBasicLimitInformation, SetInformationJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PRIORITY_CLASS,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
 };
 use windows_sys::Win32::System::Threading::{
     ABOVE_NORMAL_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, OpenProcess, PROCESS_SET_INFORMATION,
@@ -83,6 +85,21 @@ pub fn set_self_boosted(boosted: bool) {
 pub struct PriorityJob {
     job: Owned,
     boosted: Cell<bool>,
+    /// Whether closing this job ends what it holds.  Fixed at creation, since
+    /// the flag has to be in place before the members exist.
+    reaping: bool,
+}
+
+/// The limits a job carries regardless of focus.
+///
+/// Kill-on-close is what makes the job answer for its members' lifetime: the
+/// console only reaps its own clients, so a descendant that left the console —
+/// an editor's search helper, anything started detached — outlives the session
+/// unless the job ends it.  Breakaway is the way out for a process that means
+/// to outlive the terminal: it must ask with `CREATE_BREAKAWAY_FROM_JOB`, and
+/// without this flag that request fails rather than being granted.
+fn lifetime_limits(reaping: bool) -> u32 {
+    if reaping { JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK } else { 0 }
 }
 
 impl PriorityJob {
@@ -91,7 +108,7 @@ impl PriorityJob {
     /// Taking a pid rather than the caller's handle is safe here because the
     /// caller holds one: a process cannot have its number reused while any
     /// handle to it is open.
-    pub fn adopt(pid: u32) -> Option<Self> {
+    pub fn adopt(pid: u32, reaping: bool) -> Option<Self> {
         let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if job.is_null() {
             log::debug!("could not create a job for {pid}: {}", io::Error::last_os_error());
@@ -111,7 +128,9 @@ impl PriorityJob {
             log::debug!("{pid} refused job assignment: {}", io::Error::last_os_error());
             return None;
         }
-        Some(Self { job, boosted: Cell::new(false) })
+        let job = Self { job, boosted: Cell::new(false), reaping };
+        job.set_limit(lifetime_limits(reaping), NORMAL_PRIORITY_CLASS);
+        Some(job)
     }
 
     /// Raise every member one class above the load, or return them all to
@@ -122,30 +141,32 @@ impl PriorityJob {
             return;
         }
         self.boosted.set(boosted);
+        let base = lifetime_limits(self.reaping);
         // The limit reaches members already running as well as ones yet to
         // start, in both directions, so releasing the boost is this same call
         // rather than a walk over the members.
-        self.set_limit(JOB_OBJECT_LIMIT_PRIORITY_CLASS, class(boosted));
+        self.set_limit(base | JOB_OBJECT_LIMIT_PRIORITY_CLASS, class(boosted));
         if !boosted {
             // A job's class is a ceiling, not a setting: while the limit
             // stands, every member is held at normal and cannot raise itself.
             // Naming normal is what lowers the ones already running, and
             // clearing the limit afterwards is what gives them back their own
             // class — an unfocused session must cost its processes nothing.
-            self.set_limit(0, NORMAL_PRIORITY_CLASS);
+            self.set_limit(base, NORMAL_PRIORITY_CLASS);
         }
     }
 
+    /// Kill-on-close lives in the extended structure, and every set replaces
+    /// `LimitFlags` whole, so the lifetime limits have to travel with the
+    /// priority one or a change of focus would quietly drop them.
     fn set_limit(&self, flags: u32, class: u32) {
-        let limits = JOBOBJECT_BASIC_LIMIT_INFORMATION {
-            LimitFlags: flags,
-            PriorityClass: class,
-            ..unsafe { std::mem::zeroed() }
-        };
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags = flags;
+        limits.BasicLimitInformation.PriorityClass = class;
         let set = unsafe {
             SetInformationJobObject(
                 self.job.0,
-                JobObjectBasicLimitInformation,
+                JobObjectExtendedLimitInformation,
                 std::ptr::addr_of!(limits).cast(),
                 std::mem::size_of_val(&limits) as u32,
             )
@@ -159,8 +180,10 @@ impl PriorityJob {
 impl Drop for PriorityJob {
     /// A job outlives the last handle to it for as long as it still has
     /// members, and a session's tab can be closed while something it started
-    /// keeps running.  Releasing the boost is the whole of it: that both
-    /// lowers those survivors and leaves them free to set their own class.
+    /// keeps running.  A reaping job ends those survivors as the last handle
+    /// closes, so there is nothing left to put back; one that carries only the
+    /// boost has to release it, which both lowers them and leaves them free to
+    /// set their own class.
     fn drop(&mut self) {
         self.set_boosted(false);
     }
@@ -168,10 +191,15 @@ impl Drop for PriorityJob {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::num::NonZeroU32;
     use std::process::{Child, Command, Stdio};
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    use alacritty_terminal::event::WindowSize;
+    use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
     use windows_sys::Win32::System::Threading::{GetPriorityClass, PROCESS_QUERY_INFORMATION};
 
     use super::*;
@@ -295,7 +323,7 @@ mod tests {
     fn a_job_raises_and_lowers_the_process_it_holds() {
         let subject = subject();
         let pid = subject.pid();
-        let job = PriorityJob::adopt(pid).expect("put the subject in a job");
+        let job = PriorityJob::adopt(pid, false).expect("put the subject in a job");
 
         job.set_boosted(true);
         assert_eq!(class_of(pid), ABOVE_NORMAL_PRIORITY_CLASS);
@@ -311,7 +339,7 @@ mod tests {
     #[test]
     fn a_process_born_in_the_job_comes_up_boosted() {
         let subject = subject_with_a_child();
-        let job = PriorityJob::adopt(subject.pid()).expect("put the subject in a job");
+        let job = PriorityJob::adopt(subject.pid(), false).expect("put the subject in a job");
         job.set_boosted(true);
 
         let child = child_of(subject.pid()).expect("the subject started a child");
@@ -327,7 +355,7 @@ mod tests {
     fn dropping_the_job_lowers_what_it_raised_without_pinning_it() {
         let subject = subject();
         let pid = subject.pid();
-        let job = PriorityJob::adopt(pid).expect("put the subject in a job");
+        let job = PriorityJob::adopt(pid, false).expect("put the subject in a job");
         job.set_boosted(true);
         assert_eq!(class_of(pid), ABOVE_NORMAL_PRIORITY_CLASS);
 
@@ -347,12 +375,158 @@ mod tests {
     fn releasing_the_boost_leaves_the_members_free_to_raise_themselves() {
         let subject = subject();
         let pid = subject.pid();
-        let job = PriorityJob::adopt(pid).expect("put the subject in a job");
+        let job = PriorityJob::adopt(pid, false).expect("put the subject in a job");
         job.set_boosted(true);
         job.set_boosted(false);
         assert_eq!(class_of(pid), NORMAL_PRIORITY_CLASS);
 
         set_boosted(pid, true);
         assert_eq!(class_of(pid), ABOVE_NORMAL_PRIORITY_CLASS, "the unfocused job caps it");
+    }
+
+    /// A real ConPTY session torn down, and what outlived it.
+    struct Teardown {
+        /// False when `ClosePseudoConsole` had not returned by the deadline.
+        /// It blocks until the conout pipe drains, so a session whose shell
+        /// never exits wedges the drop rather than reporting anything.
+        closed: bool,
+        /// Everything the session was running before the teardown.
+        started: Vec<u32>,
+        /// The subset of those still running afterwards.
+        survivors: Vec<u32>,
+    }
+
+    /// Every pid descended from `root`, `root` included, from one snapshot.
+    fn tree_of(sys: &System, root: u32) -> Vec<u32> {
+        let parents: Vec<(u32, Option<u32>)> = sys
+            .processes()
+            .iter()
+            .map(|(pid, p)| (pid.as_u32(), p.parent().map(|pp| pp.as_u32())))
+            .collect();
+        let mut tree = vec![root];
+        let mut frontier = vec![root];
+        while let Some(parent) = frontier.pop() {
+            for (pid, _) in parents.iter().filter(|(_, pp)| *pp == Some(parent)) {
+                tree.push(*pid);
+                frontier.push(*pid);
+            }
+        }
+        tree
+    }
+
+    /// Which of `pids` are still running once they have had `grace` to go.
+    fn still_running_after(pids: &[u32], grace: Duration) -> Vec<u32> {
+        let deadline = Instant::now() + grace;
+        loop {
+            let sys = snapshot();
+            let alive: Vec<u32> = pids
+                .iter()
+                .copied()
+                .filter(|pid| sys.process(Pid::from_u32(*pid)).is_some())
+                .collect();
+            if alive.is_empty() || Instant::now() > deadline {
+                return alive;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    fn snapshot() -> System {
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        sys
+    }
+
+    /// Wait for `root` to have grown a tree of at least `want` processes, so a
+    /// teardown is never asserted against a session that had not started yet.
+    fn tree_once_grown(root: u32, want: usize) -> Vec<u32> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let tree = tree_of(&snapshot(), root);
+            if tree.len() >= want || Instant::now() > deadline {
+                return tree;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Run `command` as the shell of a real pseudoconsole, wait for its tree to
+    /// come up, then close the console and report what survived.
+    ///
+    /// `job` is the only difference between the arms: `None` leaves the
+    /// session unjobbed, `Some(reaping)` jobs it with or without kill-on-close.
+    /// Everything runs on a worker thread because closing a console can block
+    /// forever, and a teardown that never returns is a result here rather than
+    /// a reason to hang the suite.
+    fn tear_down_a_conpty_session(job: Option<bool>, command: &str, want: usize) -> Teardown {
+        let (pids_tx, pids_rx) = mpsc::channel();
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let command = command.to_owned();
+
+        std::thread::spawn(move || {
+            let options = PtyOptions {
+                shell: Some(Shell::new("cmd.exe".into(), vec!["/c".into(), command])),
+                working_directory: None,
+                drain_on_exit: false,
+                env: HashMap::new(),
+                escape_args: false,
+            };
+            let size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
+            let pty = tty::new(&options, size, 0).expect("open a pseudoconsole");
+            let shell = pty.child_watcher().pid().map(NonZeroU32::get).expect("the shell's pid");
+            let started = tree_once_grown(shell, want);
+            let job = job.map(|reaping| PriorityJob::adopt(shell, reaping).expect("job the shell"));
+
+            pids_tx.send(started).expect("report the session's pids");
+            // Session drops its fields, the job among them, before the event
+            // loop gets to the PTY, so the job goes first here too.
+            drop(job);
+            drop(pty);
+            let _ = closed_tx.send(());
+        });
+
+        let started = pids_rx.recv_timeout(Duration::from_secs(45)).expect("the session came up");
+        let closed = closed_rx.recv_timeout(Duration::from_secs(20)).is_ok();
+
+        // Closing the console returns before the kernel has finished tearing
+        // the clients down, so a survivor is one still there after a grace
+        // period rather than one still there the instant the close returns.
+        let survivors = still_running_after(&started, Duration::from_secs(5));
+        // A survivor would outlive the whole suite, which is the failure this
+        // is looking for.  Report it, then take it out.
+        for pid in &survivors {
+            let _ = Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
+        }
+        Teardown { closed, started, survivors }
+    }
+
+    /// A shell and the command it is running, both clients of the console.
+    const CONSOLE_CLIENTS: &str = "ping -n 60 127.0.0.1 > nul";
+
+    /// The baseline the jobbed arm is measured against.  Closing a
+    /// pseudoconsole ends the shell and the command it is running, because
+    /// conhost keeps its clients in a job it kills on close.  A failure here
+    /// is the harness, not the feature.
+    #[test]
+    fn closing_a_pseudoconsole_reaps_its_console_clients() {
+        let torn = tear_down_a_conpty_session(None, CONSOLE_CLIENTS, 2);
+        assert!(torn.closed, "closing the pseudoconsole never returned");
+        assert!(torn.started.len() >= 2, "the session never started a command: {:?}", torn.started);
+        assert!(torn.survivors.is_empty(), "outlived the console: {:?}", torn.survivors);
+    }
+
+    /// The session's job nests inside conhost's, and conhost's is what reaps
+    /// the console's clients.  A job that cost the session that reaping would
+    /// buy typing latency with processes that outlive the terminal.
+    #[test]
+    fn a_job_does_not_cost_the_session_its_reaping() {
+        let torn = tear_down_a_conpty_session(Some(true), CONSOLE_CLIENTS, 2);
+        assert!(torn.closed, "closing the jobbed pseudoconsole never returned");
+        assert!(torn.started.len() >= 2, "the session never started a command: {:?}", torn.started);
+        assert!(torn.survivors.is_empty(), "outlived a jobbed console: {:?}", torn.survivors);
     }
 }

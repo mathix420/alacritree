@@ -1205,10 +1205,12 @@ impl Session {
 
         // Jobbed here rather than on focus: a process joins a job when it is
         // created, so anything the shell starts before the job exists escapes
-        // it for its whole life.
+        // it for its whole life.  One job serves both settings, so it is
+        // created when either wants it.
+        let reaping = config.ui.reap_descendants_on_close;
         let priority_job = shell_pid
-            .filter(|_| config.ui.focus_priority_boost)
-            .and_then(crate::focus_priority::PriorityJob::adopt);
+            .filter(|_| config.ui.focus_priority_boost || reaping)
+            .and_then(|pid| crate::focus_priority::PriorityJob::adopt(pid, reaping));
 
         #[cfg(windows)]
         let pty = crate::pty_rearm::RearmingPty::new(pty);
