@@ -200,6 +200,11 @@ impl StatusCache {
                 self.last_refreshed = Some(Instant::now());
                 self.last_hint = pending.hint.clone();
                 self.pending = None;
+            } else if pending.job.failed() {
+                // A panicked compute never reports a status; without this the
+                // `self.pending.is_none()` gate above would refuse every
+                // future refresh for this worktree.
+                self.pending = None;
             }
         }
 
@@ -673,6 +678,27 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(cache.last().branch.is_some(), "the background compute never landed");
+    }
+
+    /// A panicked compute must not wedge the cache: without clearing
+    /// `pending` on `Job::failed`, `needs_refresh && self.pending.is_none()`
+    /// would refuse every future refresh for this worktree.
+    #[test]
+    fn a_failed_compute_clears_pending_so_a_future_poll_is_not_blocked() {
+        let mut cache = StatusCache::new(PathBuf::from("/doesnt/matter"));
+        let job = jobs::pool()
+            .spawn(jobs::Priority::Background, |_: &jobs::Blocking| -> GitStatus {
+                panic!("boom")
+            });
+        cache.pending = Some(Pending { hint: None, job });
+
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cache.pending.is_some() {
+            let _ = cache.poll(None, &ctx);
+            assert!(Instant::now() < deadline, "pending was never cleared after the job failed");
+            std::thread::yield_now();
+        }
     }
 
     #[test]

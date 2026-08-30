@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -580,9 +580,9 @@ pub struct AlacritreeApp {
     /// Row styling only — never `Worktree::prunable`, which the delete flow
     /// reads to choose between removing a worktree and pruning it.
     liveness: worktree_liveness::LivenessCache,
-    /// The probe worker in flight, if any.  One at a time: a path slower than
+    /// The probe job in flight, if any.  One at a time: a path slower than
     /// the interval stretches freshness rather than queueing more work.
-    liveness_probe: Option<Receiver<Vec<(PathBuf, worktree_liveness::Liveness)>>>,
+    liveness_probe: Option<jobs::Job<Vec<(PathBuf, worktree_liveness::Liveness)>>>,
     /// When the user last gave the app an event.  Timed wake-ups are armed
     /// only just after one, so an app left open overnight goes fully quiet.
     last_input: Instant,
@@ -625,9 +625,26 @@ struct DeleteTask {
 }
 
 enum CreateState {
-    Prompt { project_idx: usize, branch: String, error: Option<String> },
-    Running { project_idx: usize, branch: String, steps: Vec<String>, rx: Receiver<Progress> },
-    Done { project_idx: usize, steps: Vec<String>, result: Result<PathBuf, String> },
+    Prompt {
+        project_idx: usize,
+        branch: String,
+        error: Option<String>,
+    },
+    Running {
+        project_idx: usize,
+        branch: String,
+        steps: Vec<String>,
+        rx: Receiver<Progress>,
+        /// Kept alive so dropping it doesn't cancel the still-running create
+        /// on the pool; never polled itself since `rx` already carries the
+        /// `Progress::Done` result.
+        _job: jobs::Job<()>,
+    },
+    Done {
+        project_idx: usize,
+        steps: Vec<String>,
+        result: Result<PathBuf, String>,
+    },
 }
 
 /// A worktree creation the user minimized from the running modal: it keeps
@@ -639,6 +656,8 @@ struct BackgroundCreate {
     /// replaces it on refresh.
     branch: String,
     rx: Receiver<Progress>,
+    /// See `CreateState::Running::_job`.
+    _job: jobs::Job<()>,
 }
 
 /// The rename dialog, keyed by root rather than index: an IPC `remove_project`
@@ -1028,8 +1047,8 @@ impl AlacritreeApp {
     /// leave it alone.
     fn poll_worktree_liveness(&mut self, ctx: &Context, probing: bool, drawn: &[PathBuf]) {
         let now = Instant::now();
-        match self.liveness_probe.as_ref().map(Receiver::try_recv) {
-            Some(Ok(results)) => {
+        match self.liveness_probe.as_ref().map(|job| (job.poll(), job.failed())) {
+            Some((Some(results), _)) => {
                 self.liveness.adopt(results, now);
                 self.liveness_probe = None;
                 // This runs after the rows painted, so the answers that just
@@ -1038,29 +1057,28 @@ impl AlacritreeApp {
                 // all once the grace window has closed.
                 ctx.request_repaint();
             },
-            // A worker still running is the backpressure: a path slower than
+            // A job still running is the backpressure: a path slower than
             // the interval stretches freshness instead of stacking up probes,
             // and its own `request_repaint` brings us back here.
-            Some(Err(TryRecvError::Empty)) => return,
-            Some(Err(TryRecvError::Disconnected)) => self.liveness_probe = None,
+            Some((None, false)) => return,
+            Some((None, true)) => self.liveness_probe = None,
             None => {},
         }
 
         if probing {
             let batch = self.liveness.batch(drawn);
             if batch.is_empty() {
-                // No worker will land to close the interval, so close it here.
+                // No job will land to close the interval, so close it here.
                 self.liveness.adopt(Vec::new(), now);
             } else {
-                let (tx, rx) = mpsc::channel();
                 let ctx = ctx.clone();
-                std::thread::spawn(move || {
-                    let results =
+                let job = jobs::pool().spawn(jobs::Priority::Background, move |_blocking| {
+                    let results: Vec<_> =
                         batch.iter().map(|p| (p.clone(), worktree_liveness::probe(p))).collect();
-                    let _ = tx.send(results);
                     ctx.request_repaint();
+                    results
                 });
-                self.liveness_probe = Some(rx);
+                self.liveness_probe = Some(job);
                 return;
             }
         }
@@ -4484,12 +4502,16 @@ impl AlacritreeApp {
     /// is never cached, so the discovery re-runs and a mid-session install is
     /// picked up on a later open.
     fn wsl_delta_path(&mut self, distro: &str, ctx: &Context) -> Option<String> {
-        match self.pending_delta.get(distro).map(|job| job.poll()) {
-            Some(Some(Some(path))) => {
+        match self.pending_delta.get(distro).map(|job| (job.poll(), job.failed())) {
+            Some((Some(Some(path)), _)) => {
                 self.pending_delta.remove(distro);
                 self.wsl_delta_paths.insert(distro.to_string(), path);
             },
-            Some(Some(None)) => {
+            // A found-nothing landing and a panicked lookup both clear the
+            // pending entry: the former banked its answer, the latter has
+            // none to bank, and either way it must not wedge this distro out
+            // of ever being retried.
+            Some((Some(None), _)) | Some((None, true)) => {
                 self.pending_delta.remove(distro);
             },
             _ => {},
@@ -7661,6 +7683,17 @@ impl AlacritreeApp {
                 finished.push((task.project_idx, task.prunable, result));
                 false
             },
+            // A panicked delete job never lands a result; without this the
+            // sidebar row's spinner would spin forever instead of surfacing
+            // a failure.
+            None if task.job.failed() => {
+                finished.push((
+                    task.project_idx,
+                    task.prunable,
+                    Err("the background worker panicked".to_string()),
+                ));
+                false
+            },
             None => true,
         });
         for (project_idx, prunable, result) in finished {
@@ -7893,7 +7926,7 @@ impl AlacritreeApp {
             CreateState::Prompt { project_idx, branch, error } => {
                 self.show_create_prompt(ctx, project_idx, branch, error)
             },
-            CreateState::Running { project_idx, branch, mut steps, rx } => {
+            CreateState::Running { project_idx, branch, mut steps, rx, _job } => {
                 let mut done: Option<Result<PathBuf, String>> = None;
                 while let Ok(p) = rx.try_recv() {
                     match p {
@@ -7909,10 +7942,15 @@ impl AlacritreeApp {
                     // Minimized: hand the still-running create off to
                     // `poll_pending_creates` and dismiss the modal.
                     None if minimized => {
-                        self.pending_creates.push(BackgroundCreate { project_idx, branch, rx });
+                        self.pending_creates.push(BackgroundCreate {
+                            project_idx,
+                            branch,
+                            rx,
+                            _job,
+                        });
                         None
                     },
-                    None => Some(CreateState::Running { project_idx, branch, steps, rx }),
+                    None => Some(CreateState::Running { project_idx, branch, steps, rx, _job }),
                 }
             },
             CreateState::Done { project_idx, steps, result } => {
@@ -8014,12 +8052,13 @@ impl AlacritreeApp {
             let base_dir = self.config.workspace.base_dir_for(&project_root);
             let req =
                 CreateRequest { project_root, default_branch, branch: canonical.clone(), base_dir };
-            let rx = wt::spawn_create(req, ctx.clone());
+            let (rx, _job) = wt::spawn_create(req, ctx.clone());
             return Some(CreateState::Running {
                 project_idx,
                 branch: canonical,
                 steps: Vec::new(),
                 rx,
+                _job,
             });
         }
         Some(CreateState::Prompt { project_idx, branch, error })

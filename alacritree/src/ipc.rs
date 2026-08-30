@@ -326,7 +326,10 @@ fn create_worktree(
         branch,
         base_dir: None,
     };
-    let rx = wt::spawn_create(req, ctx.clone());
+    // Held for the life of this call: dropping it would cancel the create on
+    // the pool before it starts, and this connection blocks on `rx` until
+    // the create either lands or the channel disconnects.
+    let (rx, _job) = wt::spawn_create(req, ctx.clone());
     let mut steps = Vec::new();
     loop {
         match rx.recv() {

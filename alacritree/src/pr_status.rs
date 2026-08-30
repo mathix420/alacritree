@@ -83,8 +83,9 @@ struct Entry {
 
 /// A lookup in flight, and when it started.  A job that never reports — a
 /// panic, or a `gh` call that hangs — would otherwise occupy its concurrency
-/// slot forever, so `drain_completed` treats one held past the TTL as stale
-/// the same way a disconnected channel used to.
+/// slot forever: a panicked one reports through `Job::failed` immediately,
+/// while a genuinely slow one is only backed off once it has been pending
+/// past the TTL.
 struct Pending {
     job: jobs::Job<LookupResult>,
     started: Instant,
@@ -184,12 +185,14 @@ impl PrCache {
                 entry.pending = None;
                 self.in_flight = self.in_flight.saturating_sub(1);
                 self.generation = self.generation.wrapping_add(1);
-            } else if pending.started.elapsed() > TTL {
-                // A job that never reports has no answer to bank, so the TTL
-                // is the only thing that can back it off — and it must do so
-                // even when a refresh was requested mid-flight, or the entry
-                // re-spawns a lookup and a `gh` process on every frame for as
-                // long as the failure lasts.
+            } else if pending.job.failed() || pending.started.elapsed() > TTL {
+                // A job that never reports has no answer to bank.  A panic
+                // reports through `failed` on the very poll above, so it
+                // backs off immediately; a job that is merely slow only backs
+                // off once it has been pending past the TTL.  Either way this
+                // must fire even when a refresh was requested mid-flight, or
+                // the entry re-spawns a lookup and a `gh` process on every
+                // frame for as long as the failure lasts.
                 entry.queried_at = Some(Instant::now());
                 entry.pending = None;
                 entry.refresh_requested = false;
@@ -552,9 +555,15 @@ mod tests {
     /// Spawn a job that blocks until `release` fires, so a test can hold a
     /// lookup pending for as long as it needs.  Dropping `release` unblocks
     /// it too, which is what reclaims the slot once a test is done with it.
+    ///
+    /// Runs on a throwaway pool rather than the process-wide `jobs::pool()`:
+    /// this deliberately wedges a background slot, and the shared pool is a
+    /// handful of workers other test binaries in this crate poll against
+    /// with their own deadlines — a pool built just for this call can never
+    /// starve them, or be starved by them.
     fn spawn_stuck_job() -> (mpsc::Sender<()>, jobs::Job<LookupResult>) {
         let (release, gate) = mpsc::channel::<()>();
-        let job = jobs::pool().spawn(jobs::Priority::Background, move |_| {
+        let job = jobs::Pool::new(2).spawn(jobs::Priority::Background, move |_| {
             let _ = gate.recv();
             LookupResult { branch: "main".to_string(), info: None }
         });
@@ -581,9 +590,12 @@ mod tests {
     }
 
     /// An `Instant` already old enough that `drain_completed` treats a job
-    /// started at it as stuck past the TTL.
-    fn stale_start() -> Instant {
-        Instant::now() - TTL - Duration::from_millis(1)
+    /// started at it as stuck past the TTL, or `None` on a machine that
+    /// hasn't been up long enough to backdate that far — `Instant` is
+    /// monotonic since boot, not since the epoch, so subtracting the TTL can
+    /// underflow on a freshly booted CI runner.
+    fn stale_start() -> Option<Instant> {
+        Instant::now().checked_sub(TTL + Duration::from_millis(1))
     }
 
     /// Drive `drain_completed` until the entry at `path` has no lookup
@@ -978,14 +990,35 @@ mod tests {
         assert_eq!(cache.in_flight(), 0);
     }
 
+    /// A panicking job must free its slot the moment `drain_completed`
+    /// observes `Job::failed`, not after waiting out the TTL — distinct from
+    /// the TTL tests below, which backdate `started` instead of panicking.
+    #[test]
+    fn drain_completed_frees_a_slot_immediately_when_the_job_panics() {
+        let mut cache = PrCache::new();
+        cache.set_concurrency(1);
+        let job = jobs::Pool::new(2)
+            .spawn(jobs::Priority::Background, |_| -> LookupResult { panic!("boom") });
+        cache.insert_pending(PathBuf::from("/repo/wt"), "main", job);
+        assert_eq!(cache.in_flight(), 1);
+
+        drain_until(&mut cache, Path::new("/repo/wt"), Duration::from_secs(5));
+
+        assert_eq!(cache.in_flight(), 0);
+    }
+
     /// A job that never reports — a panic, or a `gh` call that hangs — must
     /// not hold its slot forever. Without the TTL backoff a capped cache
     /// would stop polling permanently.
     #[test]
     fn drain_completed_frees_a_slot_for_a_job_stuck_past_the_ttl() {
+        let Some(started) = stale_start() else {
+            eprintln!("skipping: process has not been up long enough to backdate past the TTL");
+            return;
+        };
         let mut cache = PrCache::new();
         cache.set_concurrency(1);
-        let _release = insert_stuck_entry(&mut cache, Path::new("/repo/wt"), "main", stale_start());
+        let _release = insert_stuck_entry(&mut cache, Path::new("/repo/wt"), "main", started);
         assert_eq!(cache.in_flight(), 1);
 
         cache.drain_completed();
@@ -998,8 +1031,12 @@ mod tests {
     /// delivers the frame that would re-spawn it.
     #[test]
     fn a_job_stuck_past_the_ttl_leaves_the_entry_ineligible_to_respawn() {
+        let Some(started) = stale_start() else {
+            eprintln!("skipping: process has not been up long enough to backdate past the TTL");
+            return;
+        };
         let mut cache = PrCache::new();
-        let _release = insert_stuck_entry(&mut cache, Path::new("/repo/wt"), "main", stale_start());
+        let _release = insert_stuck_entry(&mut cache, Path::new("/repo/wt"), "main", started);
 
         cache.drain_completed();
 
@@ -1147,27 +1184,34 @@ mod tests {
         assert!(ctx.has_requested_repaint());
     }
 
+    /// `spawn_lookup` has no sender of its own any more — the pool's channel
+    /// is internal — so this drives a real job through the pool instead of
+    /// hand-rolling a thread, and checks the failure the same way production
+    /// code does: `poll` until `failed` latches.
     #[test]
-    fn a_panicking_worker_still_wakes_the_app_and_disconnects() {
+    fn a_panicking_worker_still_wakes_the_app_and_reports_failed() {
         let ctx = egui::Context::default();
         // See `dropping_the_guard_wakes_the_app`: a fresh context needs two
         // passes before its initial repaint request is fully consumed.
         let _ = ctx.run(Default::default(), |_| {});
         let _ = ctx.run(Default::default(), |_| {});
         assert!(!ctx.has_requested_repaint(), "precondition: no repaint pending");
-        let (tx, rx) = mpsc::channel::<LookupResult>();
 
-        let worker = {
+        let job = {
             let ctx = ctx.clone();
-            thread::spawn(move || {
+            jobs::Pool::new(2).spawn(jobs::Priority::Background, move |_| -> LookupResult {
                 let _wake = RepaintOnDrop(ctx);
-                let _sender = tx;
                 panic!("worker died");
             })
         };
-        assert!(worker.join().is_err(), "the worker must have panicked");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !job.failed() {
+            assert!(job.poll().is_none(), "a panicking job never reports a value");
+            assert!(Instant::now() < deadline, "the failure was never observed");
+            thread::yield_now();
+        }
 
         assert!(ctx.has_requested_repaint(), "a panicking unwind still wakes the app");
-        assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected));
     }
 }

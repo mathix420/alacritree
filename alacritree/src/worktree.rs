@@ -1,10 +1,13 @@
-//! Create and delete git worktrees on a background thread, streaming progress
-//! back to the UI via an `mpsc` channel.
+//! Create, delete, and prune git worktrees off the UI thread.
+//!
+//! Creation streams its progress back over an `mpsc` channel as each step
+//! starts; deletion and pruning report their single result through a
+//! `jobs::Job`. Both submit to the shared pool rather than spawning their
+//! own thread.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
-use std::thread;
 
 use crate::command_ext::CommandExt;
 use crate::{jobs, wsl};
@@ -57,10 +60,14 @@ pub fn validate_branch_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Run [`create`] on a background thread, waking the UI for each step.
-pub fn spawn_create(req: CreateRequest, ctx: egui::Context) -> Receiver<Progress> {
+/// Run [`create`] on the pool, waking the UI for each step.  A worktree
+/// create is user-initiated, so it runs at interactive priority.  The
+/// streamed progress travels over the channel; the returned `Job` carries no
+/// result of its own and exists only to be held — dropping it would cancel
+/// the create before it starts.
+pub fn spawn_create(req: CreateRequest, ctx: egui::Context) -> (Receiver<Progress>, jobs::Job<()>) {
     let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
+    let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
         let result = create(&req, |step| {
             let _ = tx.send(Progress::Step(step.to_string()));
             ctx.request_repaint();
@@ -68,7 +75,7 @@ pub fn spawn_create(req: CreateRequest, ctx: egui::Context) -> Receiver<Progress
         let _ = tx.send(Progress::Done(result));
         ctx.request_repaint();
     });
-    rx
+    (rx, job)
 }
 
 /// Create the worktree on the calling thread, reporting each step as it starts.
@@ -540,6 +547,8 @@ pub fn prune_worktree(
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use super::*;
     use crate::test_util::{add_worktree, init_repo};
 

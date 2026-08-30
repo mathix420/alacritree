@@ -6,6 +6,7 @@
 //! block take one, only a pool worker is handed one, so calling such a helper
 //! from `update` does not compile.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +29,12 @@ pub struct Blocking(());
 struct Task {
     cancelled: Arc<AtomicBool>,
     run: Box<dyn FnOnce(&Blocking) + Send>,
+    /// Reports a caught panic to the `Job`'s channel.  Kept separate from
+    /// `run` because `run` moves its sender into a closure that drops it,
+    /// unsent, on unwind — this holds a clone that survives that unwind so
+    /// the caller sees an explicit failure instead of a channel that just
+    /// went quiet.
+    on_failure: Box<dyn FnOnce() + Send>,
 }
 
 #[derive(Default)]
@@ -71,19 +78,43 @@ pub struct Pool {
 /// started, so a status scan for a workspace the user has left stops costing
 /// a core.
 pub struct Job<T> {
-    rx: mpsc::Receiver<T>,
+    rx: mpsc::Receiver<Result<T, JobFailed>>,
     cancelled: Arc<AtomicBool>,
+    /// Latched by `poll` the moment it drains a failure off the channel, so
+    /// the signal survives every `poll` after that one too — `poll` itself
+    /// can only report it on the one call that observes it, since its `T`
+    /// return has no room for "failed".
+    failed: Cell<bool>,
 }
+
+/// A job's closure unwound instead of returning.  Carries no data — the
+/// panic itself is already logged from the pool worker that caught it, so
+/// `Job::failed` is only ever asked "did it happen", not "with what".
+pub struct JobFailed;
 
 impl<T> Job<T> {
     /// The result if it has landed.  Never blocks.
     ///
-    /// A job whose closure panicked never resolves — `poll` keeps returning
-    /// `None` for the life of the handle. The panic is logged via
-    /// `log::error!` when it happens, so it is diagnosable from the log even
-    /// though the handle stays silent.
+    /// A job whose closure panicked reports through [`Job::failed`] instead
+    /// of a value here — this returns `None` for it, same as "hasn't landed
+    /// yet".  Poll every frame and check `failed` after: the failure only
+    /// latches on the `poll` call that drains it off the channel.
     pub fn poll(&self) -> Option<T> {
-        self.rx.try_recv().ok()
+        match self.rx.try_recv() {
+            Ok(Ok(value)) => Some(value),
+            Ok(Err(JobFailed)) => {
+                self.failed.set(true);
+                None
+            },
+            Err(_) => None,
+        }
+    }
+
+    /// Whether the job's closure panicked, as observed by a previous `poll`.
+    /// `false` for a job still running, and for one that panicked but hasn't
+    /// been polled since — call `poll` first on every frame, then check this.
+    pub fn failed(&self) -> bool {
+        self.failed.get()
     }
 }
 
@@ -114,11 +145,15 @@ impl Pool {
         T: Send + 'static,
     {
         let (tx, rx) = mpsc::channel();
+        let fail_tx = tx.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let task = Task {
             cancelled: Arc::clone(&cancelled),
             run: Box::new(move |blocking| {
-                let _ = tx.send(f(blocking));
+                let _ = tx.send(Ok(f(blocking)));
+            }),
+            on_failure: Box::new(move || {
+                let _ = fail_tx.send(Err(JobFailed));
             }),
         };
         let mut state = self.shared.state.lock().expect("the job queue is poisoned");
@@ -128,7 +163,7 @@ impl Pool {
         }
         drop(state);
         self.shared.wake.notify_one();
-        Job { rx, cancelled }
+        Job { rx, cancelled, failed: Cell::new(false) }
     }
 }
 
@@ -166,18 +201,16 @@ fn worker(shared: Arc<Shared>) {
             lower_this_thread(was_background);
             let outcome = catch_unwind(AssertUnwindSafe(|| (task.run)(&Blocking(()))));
             if let Err(panic) = outcome {
-                log::error!(
-                    "a job panicked and will never report a result: {}",
-                    panic_message(&panic)
-                );
+                log::error!("a job panicked: {}", panic_message(&panic));
+                (task.on_failure)();
             }
         }
     }
 }
 
 /// A job's closure and its `Send` payload panicked; the only recovery that
-/// keeps the pool alive is to log it here, since the caller only sees the
-/// handle stop resolving.
+/// keeps the pool alive is to log it here, since `Job::failed` reports only
+/// that a panic happened, not what it said.
 fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
     panic
         .downcast_ref::<&str>()
@@ -231,12 +264,14 @@ mod tests {
             state.interactive.push_back(Task {
                 cancelled: Arc::new(AtomicBool::new(false)),
                 run: Box::new(|_| {}),
+                on_failure: Box::new(|| {}),
             });
         }
         for _ in 0..background {
             state.background.push_back(Task {
                 cancelled: Arc::new(AtomicBool::new(false)),
                 run: Box::new(|_| {}),
+                on_failure: Box::new(|| {}),
             });
         }
         state
@@ -274,6 +309,7 @@ mod tests {
         loop {
             if let Some(value) = job.poll() {
                 assert_eq!(value, 7);
+                assert!(!job.failed(), "a job that reported a value did not fail");
                 return;
             }
             assert!(Instant::now() < deadline, "the job never reported");
@@ -316,6 +352,33 @@ mod tests {
             "a panicking job must not permanently occupy its background slot"
         );
         drop(panicking);
+    }
+
+    /// The regression test for `Job::failed`: a panicked closure must not
+    /// merely stop resolving, it must report through `failed` once `poll`
+    /// has drained the failure off the channel.
+    #[test]
+    fn a_panicking_jobs_failure_is_observable_through_failed() {
+        let pool = Pool::new(2);
+        let job = pool.spawn(Priority::Background, |_: &Blocking| -> u32 { panic!("boom") });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !job.failed() {
+            assert!(job.poll().is_none(), "a panicking job never reports a value");
+            assert!(Instant::now() < deadline, "the failure was never observed");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn a_job_still_running_has_not_failed() {
+        let pool = Pool::new(1);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let job = pool.spawn(Priority::Background, move |_| {
+            let _ = release_rx.recv();
+        });
+        assert!(job.poll().is_none(), "the job has not landed yet");
+        assert!(!job.failed(), "a job merely still running has not failed");
+        let _ = release_tx.send(());
     }
 
     #[test]
