@@ -208,7 +208,7 @@ fn has_remote(cwd: &Path, name: &str) -> bool {
 /// short names, in git's ref order.  Shells out through [`git_command`]
 /// rather than using git2 so WSL worktrees resolve the same way everything
 /// else in this module does.
-pub fn list_branches(cwd: &Path) -> Result<Vec<String>, String> {
+pub fn list_branches(cwd: &Path, _blocking: &jobs::Blocking) -> Result<Vec<String>, String> {
     let output = git_command(cwd)
         .args(["for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes/origin"])
         .stdout(Stdio::piped())
@@ -685,7 +685,8 @@ mod tests {
         git(&["fetch", "origin"]);
         git(&["remote", "set-head", "origin", "-a"]);
 
-        let branches = list_branches(dir.path()).expect("listing succeeds");
+        let branches = jobs::on_this_thread(|blocking| list_branches(dir.path(), blocking))
+            .expect("listing succeeds");
 
         assert!(branches.contains(&"develop".to_string()), "{branches:?}");
         assert!(branches.contains(&"main".to_string()), "{branches:?}");
@@ -703,6 +704,6 @@ mod tests {
     #[test]
     fn list_branches_reports_a_non_repo_as_an_error() {
         let dir = tempfile::TempDir::new().unwrap();
-        assert!(list_branches(dir.path()).is_err());
+        assert!(jobs::on_this_thread(|blocking| list_branches(dir.path(), blocking)).is_err());
     }
 }

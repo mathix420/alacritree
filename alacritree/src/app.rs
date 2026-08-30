@@ -694,8 +694,10 @@ struct ProjectRemoveState {
 struct BaseBranchPicker {
     worktree: PathBuf,
     query: String,
+    /// `None` until the listing lands; the picker opens before git answers.
     /// `Err` is what git said when listing failed (not a repo, WSL down…).
-    branches: Result<Vec<String>, String>,
+    branches: Option<Result<Vec<String>, String>>,
+    branches_job: Option<jobs::Job<Result<Vec<String>, String>>>,
     /// Auto-detected base shown on the "Auto" row.
     detected: Option<String>,
     cursor: usize,
@@ -4103,11 +4105,15 @@ impl AlacritreeApp {
 
     fn open_base_branch_picker(&mut self, worktree: PathBuf) {
         let detected = self.project_default_branch_for(&worktree);
-        let branches = crate::worktree::list_branches(&worktree);
+        let job_worktree = worktree.clone();
+        let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
+            crate::worktree::list_branches(&job_worktree, blocking)
+        });
         self.pending_base_branch = Some(BaseBranchPicker {
             worktree,
             query: String::new(),
-            branches,
+            branches: None,
+            branches_job: Some(job),
             detected,
             cursor: 0,
         });
@@ -7997,6 +8003,22 @@ impl AlacritreeApp {
         let Some(mut picker) = self.pending_base_branch.take() else {
             return;
         };
+        if let Some(job) = picker.branches_job.as_ref() {
+            match job.poll() {
+                Some(branches) => {
+                    picker.branches = Some(branches);
+                    picker.branches_job = None;
+                },
+                // A panicked listing never lands a result; drop the handle
+                // so the picker shows the failure row instead of "loading
+                // branches…" forever.
+                None if job.failed() => {
+                    picker.branches = Some(Err("branch listing did not complete".to_string()));
+                    picker.branches_job = None;
+                },
+                None => {},
+            }
+        }
         let theme = self.theme;
         let danger = rgb_to_color32(self.config.palette.normal[1]);
         let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
@@ -8041,13 +8063,13 @@ impl AlacritreeApp {
                 let query_changed = ui.add(edit).changed();
                 focus_default(ui.ctx(), input_id);
 
-                if let Err(e) = &picker.branches {
+                if let Some(Err(e)) = &picker.branches {
                     ui.label(RichText::new(e).color(danger).small());
                 }
 
                 filtered = match &picker.branches {
-                    Ok(branches) => filter_branches(branches, &picker.query),
-                    Err(_) => Vec::new(),
+                    Some(Ok(branches)) => filter_branches(branches, &picker.query),
+                    Some(Err(_)) | None => Vec::new(),
                 };
                 picker.cursor = picker_cursor(
                     query_changed,
@@ -8065,6 +8087,14 @@ impl AlacritreeApp {
                     let auto = ui.selectable_label(picker.cursor == 0, auto_label);
                     if auto.clicked() {
                         chosen = Some(None);
+                    }
+                    if picker.branches.is_none() {
+                        ui.add_enabled(
+                            false,
+                            egui::Label::new(
+                                RichText::new("loading branches…").color(theme.text_muted),
+                            ),
+                        );
                     }
                     for (i, branch) in filtered.iter().enumerate() {
                         let selected = current.as_deref() == Some(branch.as_str());
@@ -8090,11 +8120,12 @@ impl AlacritreeApp {
         if down {
             picker.cursor = (picker.cursor + 1).min(filtered.len());
         }
-        // A failed branch listing leaves `filtered` empty, so cursor 0 would
-        // resolve to Auto — applying it on Enter would clear an existing
-        // override on a reflexive keypress rather than the no-op a listing
-        // failure should be. Clicks can't reach this path (no rows render).
-        if confirm_via_key && picker.branches.is_ok() {
+        // While the listing is pending or failed, `filtered` is empty, so
+        // cursor 0 would resolve to Auto — applying it on Enter would clear
+        // an existing override on a reflexive keypress rather than the no-op
+        // that state should produce. Clicking Auto still works either way
+        // (see `auto.clicked()` above); only the keyboard shortcut is gated.
+        if confirm_via_key && matches!(picker.branches, Some(Ok(_))) {
             chosen = Some(if picker.cursor == 0 {
                 None
             } else {
