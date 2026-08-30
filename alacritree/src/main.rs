@@ -28,6 +28,7 @@ mod grid_instances;
 mod ime;
 mod input;
 mod ipc;
+mod jobs;
 mod links;
 mod logdir;
 mod logging;
