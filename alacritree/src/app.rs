@@ -4772,29 +4772,28 @@ fn profile_shell(profile: &crate::config::Profile) -> Shell {
 }
 
 /// `git worktree remove` refuses a tree with work in it, and that refusal is
-/// the authority on whether removing would lose anything. The wording is
-/// git's, so match the stable fragments rather than the whole sentence.
+/// the authority on whether removing would lose anything. Both fragments are
+/// real git wording: `contains modified or untracked files` is the current
+/// message, `is dirty` is what git 2.17 (the version that introduced
+/// `worktree remove`) said before the message was reworded.
+///
+/// `worktree.rs`'s failure string is `git <args>: fatal: '<path>' <reason>`,
+/// and `<path>` (attacker- or at least user-controlled) is echoed twice —
+/// once in the command args, once quoted right after `fatal:`. Matching
+/// against the raw message would let a worktree path that happens to spell
+/// out one of these fragments turn an unrelated failure (locked tree, main
+/// worktree, filesystem error) into a false "needs --force" prompt. Since
+/// git's own wording always lands after the closing quote of the path — never
+/// inside it — cutting the tail at the last `'` drops both copies of the path
+/// and leaves only text git itself authored.
 fn refused_for_unsaved_work(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    message.contains("contains modified or untracked files") || message.contains("is dirty")
+    let tail = message.rsplit_once("fatal:").map_or(message, |(_, tail)| tail);
+    let reason = tail.rsplit_once('\'').map_or(tail, |(_, after)| after).to_ascii_lowercase();
+    reason.contains("contains modified or untracked files, use --force")
+        || reason.contains("is dirty, use --force")
 }
 
-/// `counts` is `None` while the dirty check is still in flight; `force`
-/// reflects whether this confirm would pass `--force` (only the retry after
-/// git has already refused an unforced removal does).
-fn dirty_warning(counts: Option<&DirtyCounts>, force: bool) -> Option<String> {
-    let counts = match counts {
-        None => return Some("Checking working tree for uncommitted changes…".to_string()),
-        Some(counts) => counts,
-    };
-    if !counts.is_dirty() {
-        // A forced retry only happens after git itself refused the tree as
-        // dirty; a clean-looking count here is one read before that refusal
-        // went stale, not proof there is nothing to warn about.
-        return force.then(|| {
-            "git reported local changes; they will be discarded with --force.".to_string()
-        });
-    }
+fn dirty_parts(counts: &DirtyCounts) -> String {
     let mut parts = Vec::new();
     if counts.staged > 0 {
         parts.push(format!("{} staged", counts.staged));
@@ -4805,12 +4804,40 @@ fn dirty_warning(counts: Option<&DirtyCounts>, force: bool) -> Option<String> {
     if counts.untracked > 0 {
         parts.push(format!("{} untracked", counts.untracked));
     }
-    let files = parts.join(", ");
-    Some(if force {
-        format!("Working tree has {files} file(s) — they will be discarded with --force.")
-    } else {
-        format!("Working tree has {files} file(s) with local changes.")
-    })
+    parts.join(", ")
+}
+
+/// The delete confirm's warning line.
+///
+/// `counts` is `None` until a count lands (`checking`) or after a probe
+/// failed and left nothing to show (`!checking`). `force` is whether this
+/// confirm would pass `--force` — a first attempt whose resolved count is
+/// already known dirty, or the retry after git refused an unforced removal.
+///
+/// `force` is checked first: a forced retry followed git's own refusal, so
+/// it is never safe to render "nothing to warn about" for it, regardless of
+/// what `counts` holds — a stale-clean read, or none at all (the request was
+/// confirmed before its probe landed, which cancelled the probe).
+fn dirty_warning(counts: Option<&DirtyCounts>, force: bool, checking: bool) -> Option<String> {
+    if force {
+        return Some(match counts.filter(|c| c.is_dirty()) {
+            Some(counts) => {
+                format!(
+                    "Working tree has {} file(s) — they will be discarded with --force.",
+                    dirty_parts(counts)
+                )
+            },
+            None => "git reported local changes; they will be discarded with --force.".to_string(),
+        });
+    }
+    match counts {
+        Some(counts) if counts.is_dirty() => {
+            Some(format!("Working tree has {} file(s) with local changes.", dirty_parts(counts)))
+        },
+        Some(_) => None,
+        None if checking => Some("Checking working tree for uncommitted changes…".to_string()),
+        None => Some("Couldn't check the working tree for local changes.".to_string()),
+    }
 }
 
 /// The modal frame's horizontal inner margin.  Any width budgeted against the
@@ -7192,10 +7219,9 @@ impl AlacritreeApp {
                     req.dirty = Some(counts);
                     req.dirty_job = None;
                 },
-                // A panicked probe never lands a count. The confirm no longer
-                // waits on it — `run_pending_delete` never reads `dirty` to
-                // decide `--force` — so drop the handle and leave the dialog
-                // showing "checking…" rather than polling a dead job forever.
+                // A panicked probe never lands a count; drop the handle so
+                // the dialog stops claiming to be checking and reads
+                // "couldn't check" instead (see `dirty_warning`).
                 None if job.failed() => req.dirty_job = None,
                 None => {},
             }
@@ -7217,7 +7243,7 @@ impl AlacritreeApp {
                 "Delete",
             )
         };
-        let warning = dirty_warning(req.dirty.as_ref(), req.force);
+        let warning = dirty_warning(req.dirty.as_ref(), req.force, req.dirty_job.is_some());
 
         let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
 
@@ -8895,6 +8921,65 @@ mod tests {
 
     fn ws(p: &str) -> WorkspaceKey {
         Some(PathBuf::from(p))
+    }
+
+    #[test]
+    fn dirty_warning_under_force_never_goes_silent() {
+        // The exact regression this fixes: a forced retry with no counts at
+        // all (the request was confirmed before its probe landed, which
+        // cancelled the probe) must still tell the user `--force` discards
+        // work, not silently drop the warning.
+        let message = dirty_warning(None, true, false).expect("a forced confirm always warns");
+        assert!(message.contains("--force"));
+
+        // A stale-clean read carried into the retry must not read as "safe"
+        // either -- the retry only exists because git already refused this
+        // exact tree as dirty.
+        let clean = DirtyCounts::default();
+        let message =
+            dirty_warning(Some(&clean), true, false).expect("a forced confirm always warns");
+        assert!(message.contains("--force"));
+    }
+
+    #[test]
+    fn dirty_warning_stays_quiet_for_a_known_clean_unforced_tree() {
+        let clean = DirtyCounts::default();
+        assert_eq!(dirty_warning(Some(&clean), false, false), None);
+    }
+
+    #[test]
+    fn dirty_warning_distinguishes_checking_from_unavailable() {
+        let checking = dirty_warning(None, false, true).expect("still checking");
+        assert!(checking.to_lowercase().contains("checking"));
+        let unavailable = dirty_warning(None, false, false).expect("probe failed or was skipped");
+        assert!(!unavailable.to_lowercase().contains("checking"));
+    }
+
+    #[test]
+    fn refused_for_unsaved_work_matches_a_real_git_refusal() {
+        let message = "git worktree remove ../wt1: fatal: '../wt1' contains modified or untracked \
+                       files, use --force to delete it";
+        assert!(refused_for_unsaved_work(message));
+    }
+
+    #[test]
+    fn refused_for_unsaved_work_ignores_unrelated_failures() {
+        assert!(!refused_for_unsaved_work(
+            "git worktree remove ../wt1: fatal: '../wt1' is a main working tree"
+        ));
+    }
+
+    /// A worktree path that happens to contain the matched phrase must not
+    /// turn an unrelated failure into a false "needs --force" prompt --
+    /// `refused_for_unsaved_work` only reads the text after the closing
+    /// quote of the path, never the quoted path itself.
+    #[test]
+    fn refused_for_unsaved_work_is_not_fooled_by_a_path_spelling_out_the_phrase() {
+        let path = "../is dirty, use --force to delete it";
+        let message = format!(
+            "git worktree remove {path}: fatal: '{path}' cannot be locked: filesystem error"
+        );
+        assert!(!refused_for_unsaved_work(&message));
     }
 
     #[test]
