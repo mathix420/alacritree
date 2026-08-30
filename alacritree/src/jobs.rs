@@ -7,9 +7,9 @@
 //! from `update` does not compile.
 
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
-use std::time::Instant;
 
 /// Whether anything on screen is waiting for the job.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -59,6 +59,10 @@ struct Shared {
     workers: usize,
 }
 
+/// A pool of worker threads that run for the life of the process. There is
+/// no shutdown path — a dropped `Pool` leaks its threads, parked forever on
+/// the empty queue. Harmless for the process-wide singleton this crate uses;
+/// don't construct one you intend to drop.
 pub struct Pool {
     shared: Arc<Shared>,
 }
@@ -73,6 +77,11 @@ pub struct Job<T> {
 
 impl<T> Job<T> {
     /// The result if it has landed.  Never blocks.
+    ///
+    /// A job whose closure panicked never resolves — `poll` keeps returning
+    /// `None` for the life of the handle. The panic is logged via
+    /// `log::error!` when it happens, so it is diagnosable from the log even
+    /// though the handle stays silent.
     pub fn poll(&self) -> Option<T> {
         self.rx.try_recv().ok()
     }
@@ -98,6 +107,7 @@ impl Pool {
         Self { shared }
     }
 
+    #[must_use = "dropping the handle cancels the job"]
     pub fn spawn<T, F>(&self, priority: Priority, f: F) -> Job<T>
     where
         F: FnOnce(&Blocking) -> T + Send + 'static,
@@ -122,6 +132,23 @@ impl Pool {
     }
 }
 
+/// Releases a worker's background slot on drop, whether the task returned
+/// normally or unwound through a panic — a straight-line decrement after the
+/// call would never run for a panicking job, permanently shrinking the pool.
+struct BackgroundSlot<'a> {
+    shared: &'a Shared,
+}
+
+impl Drop for BackgroundSlot<'_> {
+    fn drop(&mut self) {
+        let mut state = self.shared.state.lock().expect("the job queue is poisoned");
+        state.background_running -= 1;
+        drop(state);
+        // A freed slot may admit a task another worker is asleep on.
+        self.shared.wake.notify_all();
+    }
+}
+
 fn worker(shared: Arc<Shared>) {
     loop {
         let mut state = shared.state.lock().expect("the job queue is poisoned");
@@ -133,19 +160,30 @@ fn worker(shared: Arc<Shared>) {
         };
         drop(state);
 
+        let _slot = was_background.then(|| BackgroundSlot { shared: &shared });
+
         if !task.cancelled.load(Ordering::Relaxed) {
             lower_this_thread(was_background);
-            (task.run)(&Blocking(()));
-        }
-
-        if was_background {
-            let mut state = shared.state.lock().expect("the job queue is poisoned");
-            state.background_running -= 1;
-            drop(state);
-            // A freed slot may admit a task another worker is asleep on.
-            shared.wake.notify_all();
+            let outcome = catch_unwind(AssertUnwindSafe(|| (task.run)(&Blocking(()))));
+            if let Err(panic) = outcome {
+                log::error!(
+                    "a job panicked and will never report a result: {}",
+                    panic_message(&panic)
+                );
+            }
         }
     }
+}
+
+/// A job's closure and its `Send` payload panicked; the only recovery that
+/// keeps the pool alive is to log it here, since the caller only sees the
+/// handle stop resolving.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
 }
 
 /// Housekeeping should yield to the UI thread when the CPU is contended, and a
@@ -185,7 +223,7 @@ pub fn pool() -> &'static Pool {
 mod tests {
     use super::*;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn state_with(interactive: usize, background: usize) -> State {
         let mut state = State::default();
@@ -241,6 +279,43 @@ mod tests {
             assert!(Instant::now() < deadline, "the job never reported");
             std::thread::yield_now();
         }
+    }
+
+    fn poll_until<T>(job: &Job<T>, timeout: Duration) -> T {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(value) = job.poll() {
+                return value;
+            }
+            assert!(Instant::now() < deadline, "the job never reported");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn a_second_background_job_runs_after_the_first_finishes() {
+        let pool = Pool::new(2);
+        let first = pool.spawn(Priority::Background, |_| 1_u32);
+        assert_eq!(poll_until(&first, Duration::from_secs(5)), 1);
+        let second = pool.spawn(Priority::Background, |_| 2_u32);
+        assert_eq!(
+            poll_until(&second, Duration::from_secs(5)),
+            2,
+            "the slot the first job held must be free for the second"
+        );
+    }
+
+    #[test]
+    fn a_panicking_background_job_frees_its_slot() {
+        let pool = Pool::new(2);
+        let panicking = pool.spawn(Priority::Background, |_: &Blocking| -> u32 { panic!("boom") });
+        let next = pool.spawn(Priority::Background, |_| 5_u32);
+        assert_eq!(
+            poll_until(&next, Duration::from_secs(5)),
+            5,
+            "a panicking job must not permanently occupy its background slot"
+        );
+        drop(panicking);
     }
 
     #[test]
