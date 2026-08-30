@@ -9,7 +9,9 @@ the prompt, so the prompt waits on a subprocess or a repository walk.
 
 Requires `ast-grep` on PATH.  Each finding prints the primitive, its line, and
 the call chain from `update` that reaches it.  The exit status is 1 while any
-finding stands, so CI can gate on it.
+finding stands, so CI can gate on it, and 2 when the scan itself came back
+empty — a guard that inspects nothing must not read as a guard that found
+nothing.
 
 ## How it decides
 
@@ -75,6 +77,14 @@ FNNAME = re.compile(r"\bfn\s+([A-Za-z_]\w*)")
 # trait names and generic parameters, and `T::new()` then links everywhere.
 IMPL_FOR = re.compile(r"\bfor\s+(?:&\s*)?([A-Z]\w*)")
 IMPL_TY = re.compile(r"\bimpl\b(?:\s*<[^>]*>)?\s+(?:&\s*)?([A-Z]\w*)")
+
+
+def scan_failed(reason):
+    """Exit distinctly from a real finding: a guard that inspected nothing
+    must not be mistaken for a guard that found nothing."""
+    print("the scan failed, so this run proves nothing about the code: " + reason,
+          file=sys.stderr)
+    sys.exit(2)
 
 
 def sg(args):
@@ -171,6 +181,11 @@ for m in by_kind("function_item"):
     fns.append(fn)
 
 live = [f for f in fns if not f.is_test]
+# A scan that returns nothing is a broken scan, not a clean codebase: an
+# ast-grep whose output format moved, a half-finished install, a wrong root.
+# Without this the report would read "0 blocking leaves" and pass.
+if not live:
+    scan_failed("ast-grep matched no functions under %s" % SRC)
 by_key = {f.key: f for f in live}
 by_name = collections.defaultdict(list)
 in_file = collections.defaultdict(lambda: collections.defaultdict(list))
@@ -218,6 +233,10 @@ while queue:
 
 roots = [f.key for f in live if f.name == "update"
          and f.file.endswith("app.rs") and f.ty == "AlacritreeApp"]
+# Same floor, for the other end: with no root every function is unreachable
+# and every finding disappears.
+if not roots:
+    scan_failed("AlacritreeApp::update was not found in app.rs")
 parent = {k: None for k in roots}
 queue = collections.deque(roots)
 while queue:

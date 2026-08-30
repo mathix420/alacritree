@@ -45,13 +45,16 @@ jobs:
       - name: Clippy
         run: cargo clippy -p alacritree --all-targets --locked --no-deps -- -D clippy::disallowed_methods
 
+      # Pinned: the audit parses ast-grep's JSON, and an upgrade that moves that
+      # format would leave it inspecting nothing. The script exits 2 on an empty
+      # scan rather than reporting a clean one, so a stale pin is loud.
+      - name: ast-grep
+        run: npm install -g @ast-grep/cli@0.45.1
+
       # The `jobs::Blocking` token is a compile-time gate, but `on_this_thread`
       # is public by design, so a handler can still hand itself a token. This is
       # what catches that. The script reads source text and does not evaluate
       # cfg, so one platform covers every target's code.
-      - name: ast-grep
-        run: npm install -g @ast-grep/cli
-
       - name: UI-thread audit
         run: python3 alacritree/tools/ui-thread-audit.py .
 
@@ -73,9 +76,10 @@ jobs:
 
       # Clippy rather than a plain check, for the same reason as the Windows
       # job: the macOS arms of links.rs and session.rs are lint-visible nowhere
-      # else, and compiling them is what this job already did.
+      # else. --all-targets covers session.rs's macOS-only test, which the
+      # check this replaces never compiled.
       - name: Clippy
-        run: cargo clippy -p alacritree --locked --no-deps -- -D clippy::disallowed_methods
+        run: cargo clippy -p alacritree --all-targets --locked --no-deps -- -D clippy::disallowed_methods
 
   # Clipboard file/image fallbacks and WSL path handling are primarily
   # Windows-facing. Compile and run their pure tests before those cfg branches
