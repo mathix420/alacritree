@@ -12,6 +12,8 @@ use std::time::SystemTime;
 
 use arboard::ImageData;
 
+use crate::jobs;
+
 /// A clipboard owner can advertise any dimensions it likes, and encoding runs
 /// on the UI thread during a keystroke.  64 MP is far past any screenshot.
 const MAX_PIXELS: usize = 64 * 1024 * 1024;
@@ -83,10 +85,14 @@ pub fn store(dir: &Path, png: &[u8], cap: Option<usize>) -> io::Result<PathBuf> 
     if !reusable(&path, png.len() as u64) {
         write_atomically(dir, &path, png)?;
     }
-    if let Some(keep) = cap {
-        apply_cap(dir, keep, &path);
-    }
     Ok(path)
+}
+
+/// Trim the managed directory to its cap.  Separate from `store` because the
+/// stored path is pasted into the terminal the moment it exists, while the
+/// sweep is housekeeping nothing reads.
+pub fn sweep(dir: &Path, keep: usize, in_use: &Path, _blocking: &jobs::Blocking) {
+    apply_cap(dir, keep, in_use);
 }
 
 /// Create and revalidate the directory that alacritree owns.  The open uses
@@ -453,7 +459,8 @@ mod tests {
         let retained = store(tmp.path(), b"retained", None).unwrap();
         fs::set_permissions(&retained, fs::Permissions::from_mode(0o666)).unwrap();
 
-        store(tmp.path(), b"new", Some(2)).unwrap();
+        let new = store(tmp.path(), b"new", Some(2)).unwrap();
+        jobs::on_this_thread(|blocking| sweep(tmp.path(), 2, &new, blocking));
 
         assert_eq!(fs::metadata(retained).unwrap().permissions().mode() & 0o777, 0o600);
     }
@@ -505,7 +512,8 @@ mod tests {
         }
 
         store(tmp.path(), b"old", None).unwrap();
-        store(tmp.path(), b"newest", Some(2)).unwrap();
+        let newest = store(tmp.path(), b"newest", Some(2)).unwrap();
+        jobs::on_this_thread(|blocking| sweep(tmp.path(), 2, &newest, blocking));
 
         assert!(old.is_file(), "a reused file was swept as though it were stale");
     }
@@ -519,6 +527,7 @@ mod tests {
         }
 
         let path = store(tmp.path(), b"newest", Some(3)).unwrap();
+        jobs::on_this_thread(|blocking| sweep(tmp.path(), 3, &path, blocking));
 
         assert!(path.is_file());
         assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 3);
@@ -533,6 +542,7 @@ mod tests {
         }
 
         let path = store(tmp.path(), b"last", Some(1)).unwrap();
+        jobs::on_this_thread(|blocking| sweep(tmp.path(), 1, &path, blocking));
 
         assert!(path.is_file());
         assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
@@ -561,7 +571,8 @@ mod tests {
             store(tmp.path(), &[i], None).unwrap();
         }
 
-        store(tmp.path(), b"newest", Some(1)).unwrap();
+        let newest = store(tmp.path(), b"newest", Some(1)).unwrap();
+        jobs::on_this_thread(|blocking| sweep(tmp.path(), 1, &newest, blocking));
 
         assert!(keeper.is_file(), "a foreign file was deleted");
     }
@@ -621,5 +632,29 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn storing_does_not_sweep() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        // `store` names a file by hashing its bytes and never parses them, so
+        // distinct payloads are all this needs to land under distinct names.
+        for byte in 0..4_u8 {
+            store(dir.path(), &[byte], Some(1)).expect("store");
+        }
+        let count = std::fs::read_dir(dir.path()).expect("read dir").count();
+        assert_eq!(count, 4, "store must leave the cap to the sweep");
+    }
+
+    #[test]
+    fn sweeping_applies_the_cap() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut last = PathBuf::new();
+        for byte in 0..4_u8 {
+            last = store(dir.path(), &[byte], Some(1)).expect("store");
+        }
+        jobs::on_this_thread(|blocking| sweep(dir.path(), 1, &last, blocking));
+        let count = std::fs::read_dir(dir.path()).expect("read dir").count();
+        assert_eq!(count, 1, "the sweep keeps the cap");
     }
 }

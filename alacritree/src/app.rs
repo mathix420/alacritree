@@ -532,9 +532,11 @@ pub struct AlacritreeApp {
     /// Worktrees already given a Doppler scope pass this app run, so opening
     /// more shells there doesn't re-invoke the doppler CLI.
     doppler_synced: HashSet<PathBuf>,
-    /// Submitted syncs, held so dropping the handle does not cancel them, and
-    /// drained once a frame.
-    doppler_syncs: Vec<jobs::Job<()>>,
+    /// Fire-and-forget jobs whose result nothing reads — Doppler scope syncs,
+    /// image-cache sweeps, link opens.  Held anyway: dropping a `Job` cancels
+    /// work that has not started yet, and a submission followed immediately
+    /// by drop would race the pool for nothing.  Drained once a frame.
+    detached_jobs: Vec<jobs::Job<()>>,
     pending_session_close: Option<SessionId>,
     notify_rx: Receiver<SessionId>,
     /// Requests from IPC connection threads, drained once per frame.
@@ -920,7 +922,7 @@ impl AlacritreeApp {
             pending_base_branch: None,
             pending_project_remove: None,
             doppler_synced: HashSet::new(),
-            doppler_syncs: Vec::new(),
+            detached_jobs: Vec::new(),
             pending_session_close: None,
             notify_rx,
             ipc_rx,
@@ -1257,7 +1259,7 @@ impl AlacritreeApp {
             return;
         };
         let worktree_for_log = worktree.clone();
-        self.doppler_syncs.push(jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
+        self.detached_jobs.push(jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
             let linked = doppler::mirror_scopes(&main_checkout, &worktree, blocking);
             if linked > 0 {
                 log::info!("linked {linked} doppler scope(s) into {}", worktree_for_log.display());
@@ -3017,7 +3019,11 @@ impl AlacritreeApp {
 
     /// The clipboard bitmap as a file something else can open, or `None` with
     /// the reason logged.
-    fn store_clipboard_image(&self, image: &arboard::ImageData<'_>) -> Option<PathBuf> {
+    ///
+    /// The returned path is pasted into the terminal immediately, so `store`
+    /// runs inline; only the cap sweep that follows a managed directory is
+    /// backgrounded, since nothing reads its result.
+    fn store_clipboard_image(&mut self, image: &arboard::ImageData<'_>) -> Option<PathBuf> {
         let png = match clipboard_image::encode_png(image) {
             Ok(png) => png,
             Err(e) => {
@@ -3027,8 +3033,19 @@ impl AlacritreeApp {
         };
         let cfg = &self.config.ui.paste;
         let (dir, owned) = cfg.image_target();
-        match clipboard_image::store(&dir, &png, owned.then_some(cfg.image_keep)) {
-            Ok(path) => Some(path),
+        let keep = cfg.image_keep;
+        match clipboard_image::store(&dir, &png, owned.then_some(keep)) {
+            Ok(path) => {
+                if owned {
+                    let in_use = path.clone();
+                    self.detached_jobs.push(
+                        jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
+                            clipboard_image::sweep(&dir, keep, &in_use, blocking)
+                        }),
+                    );
+                }
+                Some(path)
+            },
             Err(e) => {
                 log::warn!("cannot write the clipboard image to {}: {e}", dir.display());
                 None
@@ -8722,10 +8739,10 @@ impl eframe::App for AlacritreeApp {
         self.pr_cache.drain_completed();
         self.poll_pending_deletes(ctx);
         self.poll_pending_creates(ctx);
-        // Poll first, then check `failed`: a panicked sync's `poll` returns
+        // Poll first, then check `failed`: a panicked job's `poll` returns
         // `None` forever, so `failed` is what stops its handle from sitting
         // here for the rest of the process.
-        self.doppler_syncs.retain(|job| match job.poll() {
+        self.detached_jobs.retain(|job| match job.poll() {
             Some(()) => false,
             None => !job.failed(),
         });
@@ -8844,6 +8861,7 @@ impl eframe::App for AlacritreeApp {
                         &mut self.glyph_cache,
                         &mut self.grid_snapshot,
                         Some(&self.gpu_grid),
+                        &mut self.detached_jobs,
                     );
                     self.grid_paint += started.elapsed();
                     response
