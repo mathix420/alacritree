@@ -322,12 +322,12 @@ pub fn effective_branch<'a>(
 }
 
 fn spawn_lookup(path: PathBuf, branch: String, ctx: egui::Context) -> jobs::Job<LookupResult> {
-    jobs::pool().spawn(jobs::Priority::Background, move |_blocking| {
+    jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
         // Fires on a panicking unwind too, since it's a local: the drain that
         // frees this lookup's concurrency slot only runs on a frame, so an
         // exit without a repaint can stall polling for good.
         let _wake = RepaintOnDrop(ctx);
-        let info = query_gh(&path, &branch);
+        let info = query_gh(&path, &branch, blocking);
         LookupResult { branch, info }
     })
 }
@@ -363,7 +363,7 @@ fn pr_state(state: &str, is_draft: bool) -> PrState {
 /// `origin` is a personal fork therefore finds nothing.  `--head` filters on
 /// the head ref name alone, which both layouts share, and `--state all` keeps
 /// the merged and closed badges that `pr list` would otherwise drop.
-fn query_gh(path: &Path, branch: &str) -> Option<PrInfo> {
+fn query_gh(path: &Path, branch: &str, blocking: &jobs::Blocking) -> Option<PrInfo> {
     const PR_JSON_FIELDS: &str = "number,baseRefName,url,state,isDraft,headRepositoryOwner";
     // `--head` matches the ref name in every head repository and `--state all`
     // keeps the closed and merged ones, so a generic branch name in a busy base
@@ -372,7 +372,7 @@ fn query_gh(path: &Path, branch: &str) -> Option<PrInfo> {
     const PR_LIMIT: &str = "100";
     match wsl::classify(path) {
         wsl::Location::Windows(p) => {
-            let owner = local_origin_owner(&p);
+            let owner = local_origin_owner(&p, blocking);
             let output = Command::new("gh")
                 .hide_console()
                 .current_dir(p)
@@ -414,13 +414,12 @@ fn query_gh(path: &Path, branch: &str) -> Option<PrInfo> {
             let script = r#"cd "$1" || exit 1
 printf '%s\n' "$(git config --get remote.origin.url 2>/dev/null)"
 exec "$2" pr list --head "$3" --state all --limit "$4" --json "$5""#;
-            let stdout = wsl::run_batch(&distro, script, &[
-                &linux_path,
-                &gh,
-                branch,
-                PR_LIMIT,
-                PR_JSON_FIELDS,
-            ])
+            let stdout = wsl::run_batch(
+                &distro,
+                script,
+                &[&linux_path, &gh, branch, PR_LIMIT, PR_JSON_FIELDS],
+                blocking,
+            )
             .ok()?;
             let (origin_url, json) = split_origin_url_line(&stdout);
             let owner = origin_url.and_then(github_owner_from_url);
@@ -443,7 +442,7 @@ fn split_origin_url_line(stdout: &[u8]) -> (Option<&str>, &[u8]) {
 
 /// The GitHub owner of this worktree's `origin`, read straight from the
 /// repository config so the badge still costs exactly one `gh` process.
-fn local_origin_owner(path: &Path) -> Option<String> {
+fn local_origin_owner(path: &Path, _blocking: &jobs::Blocking) -> Option<String> {
     let repo = git2::Repository::open(path).ok()?;
     let remote = repo.find_remote("origin").ok()?;
     github_owner_from_url(remote.url()?)

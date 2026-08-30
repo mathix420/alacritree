@@ -233,10 +233,11 @@ fn lower_this_thread(background: bool) {
 #[cfg(not(windows))]
 fn lower_this_thread(_background: bool) {}
 
-/// Block on the calling thread, deliberately.  The CLI and the IPC connection
-/// threads have no window and nothing to paint, so blocking is correct there.
-/// A named entry point rather than a public constructor, so the exception is
-/// one reviewable call instead of a habit.
+/// Block on the calling thread, deliberately.  The CLI, the IPC connection
+/// threads, and construction before the first frame all have nothing on
+/// screen waiting on them, so blocking is correct there.  A named entry point
+/// rather than a public constructor, so the exception is one reviewable call
+/// instead of a habit.
 pub fn on_this_thread<T>(f: impl FnOnce(&Blocking) -> T) -> T {
     f(&Blocking(()))
 }

@@ -90,7 +90,7 @@ fn add(state_path: &Path, path: &Path) -> Project {
             s.projects.push(PersistedProject { root, expanded: true, shell: None, label: None });
         }
     });
-    Project::discover(path.to_path_buf(), false).project
+    jobs::on_this_thread(|blocking| Project::discover(path.to_path_buf(), false, blocking)).project
 }
 
 fn remove(state_path: &Path, root: &Path) -> Result<(), String> {
@@ -125,7 +125,8 @@ fn discover_all(state_path: &Path) -> Vec<Project> {
     projects
         .into_iter()
         .map(|p| {
-            let mut project = Project::discover(p.root, false).project;
+            let mut project =
+                jobs::on_this_thread(|blocking| Project::discover(p.root, false, blocking)).project;
             project.expanded = p.expanded;
             project.label = p.label;
             project

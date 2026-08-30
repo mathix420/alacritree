@@ -83,9 +83,11 @@ impl DirtyCounts {
 /// since we only need to know whether `git worktree remove` will refuse the
 /// path. Takes `&jobs::Blocking` because it shells out — call it from a pool
 /// job, never from the UI thread.
-pub fn dirty_counts(path: &Path, _blocking: &jobs::Blocking) -> DirtyCounts {
+pub fn dirty_counts(path: &Path, blocking: &jobs::Blocking) -> DirtyCounts {
     match wsl::classify(path) {
-        wsl::Location::Wsl { distro, linux_path } => dirty_counts_wsl(&distro, &linux_path),
+        wsl::Location::Wsl { distro, linux_path } => {
+            dirty_counts_wsl(&distro, &linux_path, blocking)
+        },
         wsl::Location::Windows(_) => dirty_counts_git2(path),
     }
 }
@@ -124,12 +126,13 @@ fn dirty_counts_git2(path: &Path) -> DirtyCounts {
 
 /// Counts from one porcelain-v2 round trip, run on a pool worker so a warm
 /// wsl.exe call (~400 ms) never stalls paint.
-fn dirty_counts_wsl(distro: &str, linux_path: &str) -> DirtyCounts {
-    let Ok(stdout) =
-        wsl::run_batch(distro, r#"git -C "$1" status --porcelain=v2 -z 2>/dev/null"#, &[
-            linux_path,
-        ])
-    else {
+fn dirty_counts_wsl(distro: &str, linux_path: &str, blocking: &jobs::Blocking) -> DirtyCounts {
+    let Ok(stdout) = wsl::run_batch(
+        distro,
+        r#"git -C "$1" status --porcelain=v2 -z 2>/dev/null"#,
+        &[linux_path],
+        blocking,
+    ) else {
         return DirtyCounts::default();
     };
     let (staged, unstaged) = parse_status_v2_z(&stdout);
@@ -257,11 +260,11 @@ fn spawn_compute(path: PathBuf, hint: Option<String>, ctx: egui::Context) -> Pen
 pub fn compute(
     path: &Path,
     default_branch_hint: Option<&str>,
-    _blocking: &jobs::Blocking,
+    blocking: &jobs::Blocking,
 ) -> GitStatus {
     match wsl::classify(path) {
         wsl::Location::Wsl { distro, linux_path } => {
-            compute_wsl(&distro, &linux_path, default_branch_hint)
+            compute_wsl(&distro, &linux_path, default_branch_hint, blocking)
         },
         wsl::Location::Windows(_) => match compute_inner(path, default_branch_hint) {
             Ok(s) => s,
@@ -502,11 +505,17 @@ if [ -n "$base" ]; then git -C "$p" diff --numstat -z "$base...HEAD" 2>/dev/null
 
 /// One wsl.exe round trip per refresh tick.  Runs on `spawn_compute`'s
 /// worker thread, so the ~400 ms round trip never blocks paint.
-fn compute_wsl(distro: &str, linux_path: &str, hint: Option<&str>) -> GitStatus {
-    let stdout = match wsl::run_batch(distro, STATUS_SCRIPT, &[linux_path, hint.unwrap_or("")]) {
-        Ok(s) => s,
-        Err(e) => return GitStatus { error: Some(e), ..Default::default() },
-    };
+fn compute_wsl(
+    distro: &str,
+    linux_path: &str,
+    hint: Option<&str>,
+    blocking: &jobs::Blocking,
+) -> GitStatus {
+    let stdout =
+        match wsl::run_batch(distro, STATUS_SCRIPT, &[linux_path, hint.unwrap_or("")], blocking) {
+            Ok(s) => s,
+            Err(e) => return GitStatus { error: Some(e), ..Default::default() },
+        };
     let sections = wsl::split_sections(&stdout);
     let text = |i: usize| {
         sections.get(i).map(|s| String::from_utf8_lossy(s).trim().to_string()).unwrap_or_default()

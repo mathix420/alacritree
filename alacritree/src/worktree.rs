@@ -112,7 +112,8 @@ pub fn create(
     run_git(&req.project_root, &["fetch", "origin", &base])?;
 
     send("Creating git worktree…");
-    let target = pick_worktree_path(&req.project_root, &req.branch, req.base_dir.as_deref())?;
+    let target =
+        pick_worktree_path(&req.project_root, &req.branch, req.base_dir.as_deref(), blocking)?;
     let target_arg = git_path_arg(&req.project_root, &target)?;
     run_git(&req.project_root, &["worktree", "add", &target_arg, "-b", &req.branch, &base_ref])?;
 
@@ -324,8 +325,13 @@ fn query_origin_head(cwd: &Path) -> Option<String> {
 /// directory and stay grouped per app; a configured `workspace.worktree_dir`
 /// relocates them.  The path hash disambiguates same-named repos in different
 /// locations.
-fn pick_worktree_path(repo: &Path, branch: &str, base: Option<&Path>) -> Result<PathBuf, String> {
-    let parent = project_worktree_dir(repo, base)?;
+fn pick_worktree_path(
+    repo: &Path,
+    branch: &str,
+    base: Option<&Path>,
+    blocking: &jobs::Blocking,
+) -> Result<PathBuf, String> {
+    let parent = project_worktree_dir(repo, base, blocking)?;
     std::fs::create_dir_all(&parent)
         .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     let safe_branch: String =
@@ -344,7 +350,11 @@ fn pick_worktree_path(repo: &Path, branch: &str, base: Option<&Path>) -> Result<
 /// using the *distro's* home for WSL repos so the worktree stays on the Linux
 /// filesystem next to its repo instead of crossing onto 9P-mounted NTFS.  The
 /// path hash disambiguates same-named repos in different locations.
-fn project_worktree_dir(repo: &Path, base: Option<&Path>) -> Result<PathBuf, String> {
+fn project_worktree_dir(
+    repo: &Path,
+    base: Option<&Path>,
+    blocking: &jobs::Blocking,
+) -> Result<PathBuf, String> {
     let base = match base {
         Some(dir) => dir.to_path_buf(),
         None => {
@@ -353,7 +363,7 @@ fn project_worktree_dir(repo: &Path, base: Option<&Path>) -> Result<PathBuf, Str
                     home::home_dir().ok_or_else(|| "could not locate home directory".to_string())?
                 },
                 wsl::Location::Wsl { distro, .. } => {
-                    let stdout = wsl::run_batch(&distro, r#"printf '%s' "$HOME""#, &[])
+                    let stdout = wsl::run_batch(&distro, r#"printf '%s' "$HOME""#, &[], blocking)
                         .map_err(|e| format!("could not query WSL home: {e}"))?;
                     let linux_home = String::from_utf8_lossy(&stdout).trim().to_string();
                     if linux_home.is_empty() {
@@ -572,7 +582,8 @@ mod tests {
     #[test]
     fn base_dir_replaces_default_worktree_parent() {
         let base = abs("wt-base");
-        let dir = project_worktree_dir(Path::new("repo"), Some(&base)).unwrap();
+        let dir = jobs::on_this_thread(|b| project_worktree_dir(Path::new("repo"), Some(&base), b))
+            .unwrap();
         assert!(dir.starts_with(&base), "{} not under {}", dir.display(), base.display());
         let leaf = dir.file_name().unwrap().to_string_lossy().into_owned();
         assert!(leaf.starts_with("repo-"), "leaf {leaf:?} should keep <project>-<hash> layout");
@@ -580,7 +591,8 @@ mod tests {
 
     #[test]
     fn no_base_dir_falls_back_to_home_default() {
-        let dir = project_worktree_dir(Path::new("repo"), None).unwrap();
+        let dir =
+            jobs::on_this_thread(|b| project_worktree_dir(Path::new("repo"), None, b)).unwrap();
         let expected = home::home_dir().unwrap().join(".alacritree").join("worktrees");
         assert!(dir.starts_with(&expected), "{} not under {}", dir.display(), expected.display());
     }

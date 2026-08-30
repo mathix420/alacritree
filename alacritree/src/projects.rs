@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use git2::Repository;
 use serde_json::{Value, json};
 
-use crate::wsl;
+use crate::{jobs, wsl};
 
 #[derive(Debug, Clone)]
 pub struct Project {
@@ -91,11 +91,11 @@ impl Project {
     /// Classify the root and discover through the owning backend: in-distro
     /// git for WSL paths, git2 for Windows paths, and a pseudo-worktree
     /// placeholder when the root is not a repository.
-    pub fn discover(root: PathBuf, upstream: bool) -> Discovered {
+    pub fn discover(root: PathBuf, upstream: bool, blocking: &jobs::Blocking) -> Discovered {
         let name = display_name(&root);
         match wsl::classify(&root) {
             wsl::Location::Wsl { distro, linux_path } => {
-                Self::discover_wsl(root, name, &distro, &linux_path, upstream)
+                Self::discover_wsl(root, name, &distro, &linux_path, upstream, blocking)
             },
             // A directory that is not a repository is a fact, not a failure.
             wsl::Location::Windows(_) => match Repository::open(&root) {
@@ -138,10 +138,11 @@ impl Project {
         distro: &str,
         linux_path: &str,
         upstream: bool,
+        blocking: &jobs::Blocking,
     ) -> Discovered {
         let upstream_arg = if upstream { "1" } else { "0" };
-        let batch =
-            wsl::run_batch(distro, DISCOVER_SCRIPT, &[linux_path, upstream_arg]).map_err(|e| {
+        let batch = wsl::run_batch(distro, DISCOVER_SCRIPT, &[linux_path, upstream_arg], blocking)
+            .map_err(|e| {
                 log::warn!("WSL discovery failed for {}: {e}", root.display());
             });
         let sections = batch.as_ref().map(|s| wsl::split_sections(s)).unwrap_or_default();
@@ -651,7 +652,7 @@ mod tests {
     #[test]
     fn a_non_git_windows_root_is_authoritative() {
         let dir = tempfile::tempdir().unwrap();
-        let found = Project::discover(dir.path().to_path_buf(), false);
+        let found = jobs::on_this_thread(|b| Project::discover(dir.path().to_path_buf(), false, b));
         assert!(found.authoritative, "a directory that is genuinely not a repo is the truth");
         assert_eq!(found.project.worktrees.len(), 1);
     }
@@ -663,7 +664,7 @@ mod tests {
         let repo = init_repo(&repo_dir);
         add_worktree(&repo, "feature");
 
-        let project = Project::discover(repo_dir, false).project;
+        let project = jobs::on_this_thread(|b| Project::discover(repo_dir, false, b)).project;
         let wt = project.worktrees.iter().find(|w| w.name == "feature").unwrap();
         assert!(!wt.prunable);
         assert_eq!(wt.branch.as_deref(), Some("feature"));
@@ -685,7 +686,7 @@ mod tests {
         let wt_path = add_worktree(&repo, "feature");
         std::fs::remove_dir_all(&wt_path).unwrap();
 
-        let project = Project::discover(repo_dir, false).project;
+        let project = jobs::on_this_thread(|b| Project::discover(repo_dir, false, b)).project;
         let wt = project.worktrees.iter().find(|w| w.name == "feature").unwrap();
         assert!(wt.prunable);
         assert_eq!(wt.branch.as_deref(), Some("feature"));
@@ -697,7 +698,7 @@ mod tests {
         let repo_dir = tmp.path().join("repo");
         init_repo(&repo_dir);
 
-        let project = Project::discover(repo_dir, false).project;
+        let project = jobs::on_this_thread(|b| Project::discover(repo_dir, false, b)).project;
         assert!(project.worktrees[0].is_main);
         assert!(!project.worktrees[0].prunable);
     }
@@ -708,7 +709,7 @@ mod tests {
         let repo_dir = tmp.path().join("repo");
         init_repo(&repo_dir);
 
-        let mut project = Project::discover(repo_dir, false).project;
+        let mut project = jobs::on_this_thread(|b| Project::discover(repo_dir, false, b)).project;
         assert_eq!(project.display_name(), "repo");
 
         project.label = Some("Work".to_string());
@@ -780,7 +781,8 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
         repo.branch(&short, &repo.find_commit(oid).unwrap(), false).unwrap();
         repo.set_head_detached(oid).unwrap();
 
-        let project = Project::discover(dir.path().to_path_buf(), true).project;
+        let project =
+            jobs::on_this_thread(|b| Project::discover(dir.path().to_path_buf(), true, b)).project;
         let main = &project.worktrees[0];
         assert!(
             main.upstream.is_none(),
@@ -805,8 +807,9 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
         let mut head_branch = repo.find_branch(&head_name, git2::BranchType::Local).unwrap();
         head_branch.set_upstream(Some("upstream-branch")).unwrap();
 
-        let with_flag = Project::discover(repo_dir.clone(), true).project;
-        let without_flag = Project::discover(repo_dir, false).project;
+        let with_flag =
+            jobs::on_this_thread(|b| Project::discover(repo_dir.clone(), true, b)).project;
+        let without_flag = jobs::on_this_thread(|b| Project::discover(repo_dir, false, b)).project;
 
         assert_eq!(
             with_flag.worktrees[0].upstream,

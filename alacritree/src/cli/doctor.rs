@@ -24,8 +24,8 @@ use crate::command_ext::CommandExt;
 use crate::config::{self, Config, ConfigDiagnosis, ConfigFile, Profile, ShellConfig};
 use crate::crash_log::{Verdict, classify};
 use crate::ipc::{self, IpcRequest, SendError};
-use crate::state;
 use crate::wsl::{self, ShellChoice};
+use crate::{jobs, state};
 
 /// An instance that is wedged should not wedge the report too.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -234,7 +234,8 @@ fn probe_distros(distros: &[wsl::WslDistro]) -> Vec<(String, Probe)> {
         let tx = tx.clone();
         let name = distro.name.clone();
         std::thread::spawn(move || {
-            let probe = wsl::probe_tools(&name, &WSL_TOOLS);
+            let probe =
+                jobs::on_this_thread(|blocking| wsl::probe_tools(&name, &WSL_TOOLS, blocking));
             let _ = tx.send((name, probe));
         });
     }

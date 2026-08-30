@@ -851,9 +851,9 @@ impl AlacritreeApp {
                 // background discovery later swaps in via `poll_project_refreshes`.
                 let root = wsl::normalize_root(p.root.clone());
                 let mut project = match wsl::classify(&root) {
-                    wsl::Location::Windows(_) => {
-                        Project::discover(root, config.ui.upstream_status).project
-                    },
+                    wsl::Location::Windows(_) => jobs::on_this_thread(|blocking| {
+                        Project::discover(root, config.ui.upstream_status, blocking).project
+                    }),
                     wsl::Location::Wsl { .. } => Project::placeholder(root),
                 };
                 project.expanded = p.expanded;
@@ -1052,8 +1052,8 @@ impl AlacritreeApp {
         let ctx = ctx.clone();
         let worker_root = root.clone();
         let upstream = self.config.ui.upstream_status;
-        let job = jobs::pool().spawn(jobs::Priority::Background, move |_blocking| {
-            let _ = tx.send(Project::discover(worker_root, upstream));
+        let job = jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
+            let _ = tx.send(Project::discover(worker_root, upstream, blocking));
             ctx.request_repaint();
         });
         self.project_refresh_jobs.insert(root.clone(), job);
@@ -4590,8 +4590,8 @@ impl AlacritreeApp {
         if !self.pending_delta.contains_key(distro) {
             let distro_owned = distro.to_string();
             let ctx = ctx.clone();
-            let job = jobs::pool().spawn(jobs::Priority::Background, move |_blocking| {
-                let found = wsl::discover_delta(&distro_owned);
+            let job = jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
+                let found = wsl::discover_delta(&distro_owned, blocking);
                 ctx.request_repaint();
                 found
             });
