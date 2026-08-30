@@ -961,6 +961,13 @@ impl AlacritreeApp {
 
         app.pr_cache.set_concurrency(pr_status_concurrency);
 
+        // The sidebar reads the distro list every frame and the registry
+        // answers most machines outright; only the `wsl.exe` fallback for a
+        // machine whose registry key is unreadable needs a thread of its own.
+        app.detached_jobs.push(jobs::pool().spawn(jobs::Priority::Background, |blocking| {
+            wsl::prime_distros_from_cli(blocking);
+        }));
+
         let wsl_indices: Vec<usize> = app
             .projects
             .iter()

@@ -6,6 +6,7 @@
 //! dormant without cfg-gating at call sites.
 
 use crate::command_ext::CommandExt;
+use crate::jobs;
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -183,32 +184,53 @@ fn is_utility_distro(name: &str) -> bool {
     name.starts_with("docker-desktop") || name.starts_with("rancher-desktop")
 }
 
-/// Registered distros, default first-classed.  Registry is the primary
-/// source (no process spawn, knows the default); `wsl -l -q` is the
-/// fallback when the key is unreadable.  Empty means WSL features stay
-/// dormant.
-///
-/// Cached for the process lifetime: one caller is a per-frame UI path (the
-/// sidebar), and the CLI fallback spawns `wsl.exe` — without caching, every
-/// repaint would probe the registry or shell out. A distro registered or
-/// unregistered after startup is picked up only on restart; that's an
-/// acceptable trade since mid-session registration churn is rare, and a
-/// stale entry just falls through the existing spawn-failure/degrade paths.
+/// The answer every caller shares once one of the two sources has produced
+/// a non-empty one.  A distro registered or unregistered afterwards is picked
+/// up only on restart; that's an acceptable trade since mid-session
+/// registration churn is rare, and a stale entry just falls through the
+/// existing spawn-failure/degrade paths.
+#[cfg(windows)]
+static DISTROS: OnceLock<Vec<WslDistro>> = OnceLock::new();
+
+/// Registered distros, default first-classed.  Reading the `Lxss` registry key
+/// costs microseconds and knows which distro is the default, so it is the only
+/// source this reaches for: the `wsl -l -q` fallback spawns a process, and the
+/// sidebar asks for this list every frame.  Until
+/// [`prime_distros_from_cli`] has filled that fallback in, a machine whose
+/// registry key is unreadable sees an empty list — the same answer it gets
+/// with no distros installed, which leaves WSL features dormant.
 #[cfg(windows)]
 pub fn distros() -> Vec<WslDistro> {
-    static DISTROS: OnceLock<Vec<WslDistro>> = OnceLock::new();
-    DISTROS
-        .get_or_init(|| match registry_distros() {
-            Some(list) if !list.is_empty() => list,
-            _ => cli_distros(),
-        })
-        .clone()
+    if let Some(list) = DISTROS.get() {
+        return list.clone();
+    }
+    match registry_distros() {
+        Some(list) if !list.is_empty() => DISTROS.get_or_init(|| list).clone(),
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(not(windows))]
 pub fn distros() -> Vec<WslDistro> {
     Vec::new()
 }
+
+/// Fill the shared list from `wsl.exe` when the registry has no answer.
+/// Submitted once at startup rather than reached from a draw path: `wsl.exe`
+/// costs hundreds of milliseconds warm and seconds while a distro VM boots.
+#[cfg(windows)]
+pub fn prime_distros_from_cli(blocking: &jobs::Blocking) {
+    if !distros().is_empty() {
+        return;
+    }
+    let list = cli_distros(blocking);
+    if !list.is_empty() {
+        let _ = DISTROS.set(list);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn prime_distros_from_cli(_: &jobs::Blocking) {}
 
 #[cfg(windows)]
 fn registry_distros() -> Option<Vec<WslDistro>> {
@@ -232,7 +254,7 @@ fn registry_distros() -> Option<Vec<WslDistro>> {
 }
 
 #[cfg(windows)]
-fn cli_distros() -> Vec<WslDistro> {
+fn cli_distros(_blocking: &jobs::Blocking) -> Vec<WslDistro> {
     let output = command_bare()
         .args(["-l", "-q"])
         .stdin(Stdio::null())
