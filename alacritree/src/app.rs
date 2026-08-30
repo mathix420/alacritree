@@ -1722,24 +1722,18 @@ impl AlacritreeApp {
         self.add_project_off_thread(ctx, wsl::normalize_root(path));
     }
 
-    /// Put a project in the sidebar without stalling the frame: `wsl.exe` takes
-    /// hundreds of milliseconds warm and seconds while the distro VM boots, so
-    /// a WSL root goes in as a placeholder and discovers on a worker.  Native
-    /// roots spawn nothing and are cheap enough to discover in place.
+    /// Put a project in the sidebar without stalling the frame: discovery
+    /// opens the repository, lists worktrees, opens each one, and detects the
+    /// default branch, none of which is free on a loaded machine (WSL roots
+    /// also pay `wsl.exe`'s startup cost on top).  Every root goes in as a
+    /// placeholder and discovers on a worker.
     fn add_project_off_thread(&mut self, ctx: &Context, path: PathBuf) {
         if self.projects.iter().any(|p| p.root == path) {
             return;
         }
-        match wsl::classify(&path) {
-            wsl::Location::Windows(_) => self
-                .projects
-                .push(Project::discover(path.clone(), self.config.ui.upstream_status).project),
-            wsl::Location::Wsl { .. } => {
-                self.projects.push(Project::placeholder(path.clone()));
-                let idx = self.projects.len() - 1;
-                self.refresh_project(ctx, idx);
-            },
-        }
+        self.projects.push(Project::placeholder(path.clone()));
+        let idx = self.projects.len() - 1;
+        self.refresh_project(ctx, idx);
         self.persist_project(&path);
     }
 
