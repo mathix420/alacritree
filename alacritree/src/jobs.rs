@@ -64,6 +64,11 @@ struct Shared {
     state: Mutex<State>,
     wake: Condvar,
     workers: usize,
+    /// How this pool wakes whatever is watching a job.  A callback rather than
+    /// an `egui::Context`, so the pool stays free of the UI toolkit; anything
+    /// with no screen — the CLI, the tests that only want a result — leaves it
+    /// unset and the wake is a no-op.
+    wake_ui: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 /// A pool of worker threads that run for the life of the process. There is
@@ -129,13 +134,23 @@ impl Pool {
     /// one worker beyond the one it holds free.
     pub fn new(workers: usize) -> Self {
         let workers = workers.max(2);
-        let shared =
-            Arc::new(Shared { state: Mutex::new(State::default()), wake: Condvar::new(), workers });
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State::default()),
+            wake: Condvar::new(),
+            workers,
+            wake_ui: OnceLock::new(),
+        });
         for _ in 0..workers {
             let shared = Arc::clone(&shared);
             std::thread::spawn(move || worker(shared));
         }
         Self { shared }
+    }
+
+    /// Register the wake-up this pool runs after every job.  The first
+    /// registration wins; later ones are ignored.
+    pub fn set_waker(&self, wake: impl Fn() + Send + Sync + 'static) {
+        let _ = self.shared.wake_ui.set(Box::new(wake));
     }
 
     #[must_use = "dropping the handle cancels the job"]
@@ -184,6 +199,23 @@ impl Drop for BackgroundSlot<'_> {
     }
 }
 
+/// Wakes the UI when a job ends, whether it returned or unwound.  A job that
+/// panics never reaches whatever repaint its own closure would have asked for,
+/// and [`Job::failed`] is only ever read from a frame — without this, a modal
+/// with nothing else driving repaints sits on its last state until the user
+/// happens to move the mouse.
+struct WakeOnEnd<'a> {
+    shared: &'a Shared,
+}
+
+impl Drop for WakeOnEnd<'_> {
+    fn drop(&mut self) {
+        if let Some(wake) = self.shared.wake_ui.get() {
+            wake();
+        }
+    }
+}
+
 fn worker(shared: Arc<Shared>) {
     loop {
         let mut state = shared.state.lock().expect("the job queue is poisoned");
@@ -199,7 +231,7 @@ fn worker(shared: Arc<Shared>) {
 
         if !task.cancelled.load(Ordering::Relaxed) {
             lower_this_thread(was_background);
-            let _wake = WakeOnEnd;
+            let _wake = WakeOnEnd { shared: &shared };
             let outcome = catch_unwind(AssertUnwindSafe(|| (task.run)(&Blocking(()))));
             if let Err(panic) = outcome {
                 log::error!("a job panicked: {}", panic_message(&panic));
@@ -233,33 +265,6 @@ fn lower_this_thread(background: bool) {
 
 #[cfg(not(windows))]
 fn lower_this_thread(_background: bool) {}
-
-/// How the pool wakes whatever is watching a job.  A callback rather than an
-/// `egui::Context`, so the pool stays free of the UI toolkit; the app registers
-/// one at startup and everything else — the CLI, the tests — leaves it unset
-/// and the wake is a no-op.
-static WAKE_UI: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
-
-/// Register the wake-up the pool uses after every job.  First registration
-/// wins; later ones are ignored.
-pub fn set_ui_waker(wake: impl Fn() + Send + Sync + 'static) {
-    let _ = WAKE_UI.set(Box::new(wake));
-}
-
-/// Wakes the UI when a job ends, whether it returned or unwound.  A job that
-/// panics never reaches whatever repaint its own closure would have asked for,
-/// and [`Job::failed`] is only ever read from a frame — without this, a modal
-/// with nothing else driving repaints sits on its last state until the user
-/// happens to move the mouse.
-struct WakeOnEnd;
-
-impl Drop for WakeOnEnd {
-    fn drop(&mut self) {
-        if let Some(wake) = WAKE_UI.get() {
-            wake();
-        }
-    }
-}
 
 /// Block on the calling thread, deliberately.  The CLI, the IPC connection
 /// threads, and construction before the first frame all have nothing on
@@ -414,21 +419,34 @@ mod tests {
 
     /// The regression test for the wake: a closure that unwinds never reaches
     /// its own repaint, so without the pool's own wake-up nothing brings the
-    /// frame that would read [`Job::failed`].  The only test that registers
-    /// the process-wide waker, since the first registration wins.
+    /// frame that would read [`Job::failed`].  The wake is only worth anything
+    /// if the failure is already on the channel when it fires, which is what
+    /// the guard's position in `worker` buys — hence the second half.
     #[test]
-    fn a_panicking_job_still_wakes_the_ui() {
-        let (woken_tx, woken_rx) = mpsc::channel();
-        set_ui_waker(move || {
-            let _ = woken_tx.send(());
-        });
+    fn a_panicking_job_wakes_the_ui_with_its_failure_already_readable() {
         let pool = Pool::new(2);
+        let (woken_tx, woken_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        // The waker holds its worker until the assertions below have run, so
+        // "what the frame sees when the wake arrives" is exactly what the pool
+        // had done by then — nothing the worker does afterwards can drift into
+        // the window and make a wrong order look right.  `Sender` and
+        // `Receiver` are `Send` but not `Sync`, hence the mutex.
+        let gate = Mutex::new((woken_tx, release_rx));
+        pool.set_waker(move || {
+            let gate = gate.lock().expect("the wake gate is poisoned");
+            let _ = gate.0.send(());
+            let _ = gate.1.recv();
+        });
         let job = pool.spawn(Priority::Background, |_: &Blocking| -> u32 { panic!("boom") });
+
         assert!(
             woken_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "a panicked job must wake the loop that reads its failure"
         );
-        drop(job);
+        assert!(job.poll().is_none(), "a panicking job never reports a value");
+        assert!(job.failed(), "the failure must be readable on the frame the wake brings");
+        let _ = release_tx.send(());
     }
 
     #[test]
