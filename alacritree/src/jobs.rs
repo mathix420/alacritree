@@ -199,6 +199,7 @@ fn worker(shared: Arc<Shared>) {
 
         if !task.cancelled.load(Ordering::Relaxed) {
             lower_this_thread(was_background);
+            let _wake = WakeOnEnd;
             let outcome = catch_unwind(AssertUnwindSafe(|| (task.run)(&Blocking(()))));
             if let Err(panic) = outcome {
                 log::error!("a job panicked: {}", panic_message(&panic));
@@ -232,6 +233,33 @@ fn lower_this_thread(background: bool) {
 
 #[cfg(not(windows))]
 fn lower_this_thread(_background: bool) {}
+
+/// How the pool wakes whatever is watching a job.  A callback rather than an
+/// `egui::Context`, so the pool stays free of the UI toolkit; the app registers
+/// one at startup and everything else — the CLI, the tests — leaves it unset
+/// and the wake is a no-op.
+static WAKE_UI: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+/// Register the wake-up the pool uses after every job.  First registration
+/// wins; later ones are ignored.
+pub fn set_ui_waker(wake: impl Fn() + Send + Sync + 'static) {
+    let _ = WAKE_UI.set(Box::new(wake));
+}
+
+/// Wakes the UI when a job ends, whether it returned or unwound.  A job that
+/// panics never reaches whatever repaint its own closure would have asked for,
+/// and [`Job::failed`] is only ever read from a frame — without this, a modal
+/// with nothing else driving repaints sits on its last state until the user
+/// happens to move the mouse.
+struct WakeOnEnd;
+
+impl Drop for WakeOnEnd {
+    fn drop(&mut self) {
+        if let Some(wake) = WAKE_UI.get() {
+            wake();
+        }
+    }
+}
 
 /// Block on the calling thread, deliberately.  The CLI, the IPC connection
 /// threads, and construction before the first frame all have nothing on
@@ -382,6 +410,25 @@ mod tests {
         assert!(job.poll().is_none(), "the job has not landed yet");
         assert!(!job.failed(), "a job merely still running has not failed");
         let _ = release_tx.send(());
+    }
+
+    /// The regression test for the wake: a closure that unwinds never reaches
+    /// its own repaint, so without the pool's own wake-up nothing brings the
+    /// frame that would read [`Job::failed`].  The only test that registers
+    /// the process-wide waker, since the first registration wins.
+    #[test]
+    fn a_panicking_job_still_wakes_the_ui() {
+        let (woken_tx, woken_rx) = mpsc::channel();
+        set_ui_waker(move || {
+            let _ = woken_tx.send(());
+        });
+        let pool = Pool::new(2);
+        let job = pool.spawn(Priority::Background, |_: &Blocking| -> u32 { panic!("boom") });
+        assert!(
+            woken_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "a panicked job must wake the loop that reads its failure"
+        );
+        drop(job);
     }
 
     #[test]

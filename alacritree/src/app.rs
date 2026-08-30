@@ -769,6 +769,11 @@ fn git_row_diff_request(row: &git_nav::GitRow, base: Option<&str>) -> Option<Dif
 
 impl AlacritreeApp {
     pub fn new(cc: &CreationContext<'_>, config: Config) -> Self {
+        // A job's own closure cannot wake the loop when it unwinds, and the
+        // failure it reports is only ever read from a frame.
+        let waker_ctx = cc.egui_ctx.clone();
+        jobs::set_ui_waker(move || waker_ctx.request_repaint());
+
         let theme = Theme::from_config(&config);
 
         let (font_chain, face_metrics) =
