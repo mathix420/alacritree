@@ -7225,6 +7225,29 @@ impl AlacritreeApp {
     }
 
     fn show_delete_dialog(&mut self, ctx: &Context) {
+        if self.pending_delete.is_none() {
+            return;
+        }
+
+        // Consume Enter/Escape, and act on a confirm, before adopting a
+        // dirty count below: adoption can flip `force` from `false` to
+        // `true` this same frame, but the keypress was the user's reaction
+        // to what was already painted (a previous frame's "checking…", read
+        // as `force: false`). Executing the confirm here, against the
+        // request as it stands before this frame's adoption runs, is what
+        // keeps "the `force` a confirm executes" equal to "the `force` the
+        // user was shown" — held Enter (key repeat) would otherwise hit the
+        // race on the exact frame the probe lands.
+        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        if confirm_via_key {
+            self.run_pending_delete(ctx);
+            return;
+        }
+        if cancel_via_key {
+            self.pending_delete = None;
+            return;
+        }
+
         let theme = self.theme;
         let danger = rgb_to_color32(self.config.palette.normal[1]);
         let Some(req) = self.pending_delete.as_mut() else {
@@ -7266,8 +7289,6 @@ impl AlacritreeApp {
             )
         };
         let warning = dirty_warning(req.dirty.as_ref(), req.force, req.dirty_job.is_some());
-
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
 
         let frame = modal_frame(&theme);
         let mut confirmed = false;
@@ -7315,11 +7336,11 @@ impl AlacritreeApp {
             },
         );
 
-        if confirm_via_key || confirmed {
+        if confirmed {
             self.run_pending_delete(ctx);
             return;
         }
-        if cancel_via_key || cancelled || modal.should_close() {
+        if cancelled || modal.should_close() {
             self.pending_delete = None;
         }
     }
