@@ -72,11 +72,13 @@ pub fn file_name(png: &[u8]) -> String {
 
 /// Write `png` into `dir` under its content-addressed name and return the path.
 ///
-/// `cap` bounds the directory to that many generated files and is `Some` only
-/// for a directory alacritree owns — a directory the user named may hold files
-/// alacritree never wrote, and a filename pattern is no proof of ownership.
-pub fn store(dir: &Path, png: &[u8], cap: Option<usize>) -> io::Result<PathBuf> {
-    if cap.is_some() {
+/// `owned` is true only for a directory alacritree owns, never for one the
+/// user named — a user's directory may hold files alacritree never wrote, and
+/// a filename pattern is no proof of ownership.  An owned directory gets the
+/// tightened permissions of [`prepare_managed_dir`]; the resulting cap on file
+/// count is [`sweep`]'s job, not this function's.
+pub fn store(dir: &Path, png: &[u8], owned: bool) -> io::Result<PathBuf> {
+    if owned {
         prepare_managed_dir(dir)?;
     } else {
         fs::create_dir_all(dir)?;
@@ -242,6 +244,13 @@ fn clear_directory_at(path: &Path) {
 
 /// Keep the `keep` newest generated files, `in_use` always among them.
 ///
+/// A sweep is queued at the moment its own `in_use` path is decided but runs
+/// later, off the UI thread — long enough for a second paste to land and
+/// reach the terminal first.  That second file is not this sweep's `in_use`,
+/// so by name alone it looks stale; excluding anything at least as new as
+/// `in_use` is what keeps a queued sweep from deleting a path that was
+/// already handed to the PTY after it was queued.
+///
 /// Failures are logged and skipped: a file that outlives its turn costs a few
 /// hundred kilobytes, while giving up here would abandon the rest of the sweep.
 fn apply_cap(dir: &Path, keep: usize, in_use: &Path) {
@@ -252,6 +261,17 @@ fn apply_cap(dir: &Path, keep: usize, in_use: &Path) {
             return;
         },
     };
+    let in_use_when =
+        match open_existing_private(in_use).and_then(|file| file.metadata()?.modified()) {
+            Ok(when) => when,
+            // Without `in_use`'s own timestamp there is no floor to weigh the
+            // rest of the directory against, so nothing here can be told apart
+            // from a paste that landed after this sweep was queued.
+            Err(e) => {
+                log::debug!("cannot sweep {}: cannot age the in-use path: {e}", dir.display());
+                return;
+            },
+        };
     let mut generated: Vec<(SystemTime, PathBuf)> = Vec::new();
     for entry in entries {
         let entry = match entry {
@@ -269,6 +289,7 @@ fn apply_cap(dir: &Path, keep: usize, in_use: &Path) {
             continue;
         }
         match open_existing_private(&path).and_then(|file| file.metadata()?.modified()) {
+            Ok(when) if when >= in_use_when => continue,
             Ok(when) => generated.push((when, path)),
             // Unranked means unswept: a file whose age cannot be read is never
             // the one chosen for deletion.
@@ -368,7 +389,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("nested").join("clipboard");
 
-        let path = store(&dir, b"png bytes", None).unwrap();
+        let path = store(&dir, b"png bytes", false).unwrap();
 
         assert_eq!(path.file_name().unwrap(), file_name(b"png bytes").as_str());
         assert_eq!(fs::read(&path).unwrap(), b"png bytes");
@@ -381,7 +402,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("clipboard");
-        let path = store(&dir, b"private", Some(20)).unwrap();
+        let path = store(&dir, b"private", true).unwrap();
 
         assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
@@ -397,7 +418,7 @@ mod tests {
         fs::create_dir(&dir).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
 
-        store(&dir, b"private", Some(20)).unwrap();
+        store(&dir, b"private", true).unwrap();
 
         assert_eq!(fs::metadata(dir).unwrap().permissions().mode() & 0o777, 0o700);
     }
@@ -413,7 +434,7 @@ mod tests {
         fs::create_dir(&target).unwrap();
         symlink(&target, &link).unwrap();
 
-        assert!(store(&link, b"private", Some(20)).is_err());
+        assert!(store(&link, b"private", true).is_err());
         assert_eq!(fs::read_dir(target).unwrap().count(), 0);
     }
 
@@ -429,7 +450,7 @@ mod tests {
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
         symlink(&target, &link).unwrap();
 
-        let path = store(&link, b"private", None).unwrap();
+        let path = store(&link, b"private", false).unwrap();
 
         assert_eq!(fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o755);
         assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
@@ -445,7 +466,7 @@ mod tests {
         fs::write(&path, b"private").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
 
-        store(tmp.path(), b"private", None).unwrap();
+        store(tmp.path(), b"private", false).unwrap();
 
         assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
     }
@@ -456,10 +477,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
-        let retained = store(tmp.path(), b"retained", None).unwrap();
+        let retained = store(tmp.path(), b"retained", false).unwrap();
         fs::set_permissions(&retained, fs::Permissions::from_mode(0o666)).unwrap();
 
-        let new = store(tmp.path(), b"new", Some(2)).unwrap();
+        let new = store(tmp.path(), b"new", true).unwrap();
         jobs::on_this_thread(|blocking| sweep(tmp.path(), 2, &new, blocking));
 
         assert_eq!(fs::metadata(retained).unwrap().permissions().mode() & 0o777, 0o600);
@@ -476,7 +497,7 @@ mod tests {
         fs::write(&target, b"untouched").unwrap();
         symlink(&target, &path).unwrap();
 
-        let stored = store(tmp.path(), b"private", None).unwrap();
+        let stored = store(tmp.path(), b"private", false).unwrap();
 
         assert_eq!(stored, path);
         assert_eq!(fs::read(target).unwrap(), b"untouched");
@@ -487,8 +508,8 @@ mod tests {
     fn storing_the_same_bytes_twice_leaves_one_file() {
         let tmp = tempfile::tempdir().unwrap();
 
-        let first = store(tmp.path(), b"same", None).unwrap();
-        let second = store(tmp.path(), b"same", None).unwrap();
+        let first = store(tmp.path(), b"same", false).unwrap();
+        let second = store(tmp.path(), b"same", false).unwrap();
 
         assert_eq!(first, second);
         assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
@@ -505,14 +526,14 @@ mod tests {
     #[test]
     fn reuse_refreshes_the_timestamp_so_a_later_sweep_spares_it() {
         let tmp = tempfile::tempdir().unwrap();
-        let old = store(tmp.path(), b"old", None).unwrap();
+        let old = store(tmp.path(), b"old", false).unwrap();
         age(&old, 9_000);
         for i in 0..3u8 {
-            age(&store(tmp.path(), &[i], None).unwrap(), 1_000);
+            age(&store(tmp.path(), &[i], false).unwrap(), 1_000);
         }
 
-        store(tmp.path(), b"old", None).unwrap();
-        let newest = store(tmp.path(), b"newest", Some(2)).unwrap();
+        store(tmp.path(), b"old", false).unwrap();
+        let newest = store(tmp.path(), b"newest", true).unwrap();
         jobs::on_this_thread(|blocking| sweep(tmp.path(), 2, &newest, blocking));
 
         assert!(old.is_file(), "a reused file was swept as though it were stale");
@@ -522,11 +543,11 @@ mod tests {
     fn the_cap_keeps_the_newest_and_always_the_returned_path() {
         let tmp = tempfile::tempdir().unwrap();
         for i in 0..6u8 {
-            let path = store(tmp.path(), &[i], None).unwrap();
+            let path = store(tmp.path(), &[i], false).unwrap();
             age(&path, u64::from(6 - i) * 100);
         }
 
-        let path = store(tmp.path(), b"newest", Some(3)).unwrap();
+        let path = store(tmp.path(), b"newest", true).unwrap();
         jobs::on_this_thread(|blocking| sweep(tmp.path(), 3, &path, blocking));
 
         assert!(path.is_file());
@@ -538,14 +559,31 @@ mod tests {
     fn a_cap_of_one_keeps_only_the_returned_path() {
         let tmp = tempfile::tempdir().unwrap();
         for i in 0..4u8 {
-            store(tmp.path(), &[i], None).unwrap();
+            age(&store(tmp.path(), &[i], false).unwrap(), 1_000);
         }
 
-        let path = store(tmp.path(), b"last", Some(1)).unwrap();
+        let path = store(tmp.path(), b"last", true).unwrap();
         jobs::on_this_thread(|blocking| sweep(tmp.path(), 1, &path, blocking));
 
         assert!(path.is_file());
         assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    /// A sweep captures `in_use` at submission time but runs later, off the
+    /// UI thread — long enough for a second paste to land and reach the
+    /// terminal before the first paste's sweep executes.  A queued sweep must
+    /// never delete that second, newer file just because it isn't the
+    /// specific path the sweep was queued with.
+    #[test]
+    fn a_sweep_queued_before_a_later_paste_does_not_delete_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = store(tmp.path(), b"a", true).unwrap();
+        age(&a, 9_000);
+        let b = store(tmp.path(), b"b", true).unwrap();
+
+        jobs::on_this_thread(|blocking| sweep(tmp.path(), 1, &a, blocking));
+
+        assert!(b.is_file(), "a sweep queued for an earlier paste deleted a later one");
     }
 
     /// The guarantee that makes pointing image_dir at a pictures folder safe.
@@ -553,10 +591,10 @@ mod tests {
     fn no_cap_deletes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         for i in 0..5u8 {
-            store(tmp.path(), &[i], None).unwrap();
+            store(tmp.path(), &[i], false).unwrap();
         }
 
-        store(tmp.path(), b"another", None).unwrap();
+        store(tmp.path(), b"another", false).unwrap();
 
         assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 6);
     }
@@ -568,10 +606,10 @@ mod tests {
         fs::write(&keeper, b"a real photo").unwrap();
         age(&keeper, 9_000);
         for i in 0..4u8 {
-            store(tmp.path(), &[i], None).unwrap();
+            store(tmp.path(), &[i], false).unwrap();
         }
 
-        let newest = store(tmp.path(), b"newest", Some(1)).unwrap();
+        let newest = store(tmp.path(), b"newest", true).unwrap();
         jobs::on_this_thread(|blocking| sweep(tmp.path(), 1, &newest, blocking));
 
         assert!(keeper.is_file(), "a foreign file was deleted");
@@ -583,7 +621,7 @@ mod tests {
         let path = tmp.path().join(file_name(b"payload"));
         fs::write(&path, b"truncated").unwrap();
 
-        let stored = store(tmp.path(), b"payload", None).unwrap();
+        let stored = store(tmp.path(), b"payload", false).unwrap();
 
         assert_eq!(stored, path);
         assert_eq!(fs::read(&path).unwrap(), b"payload");
@@ -594,7 +632,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         fs::create_dir(tmp.path().join(file_name(b"payload"))).unwrap();
 
-        let stored = store(tmp.path(), b"payload", None).unwrap();
+        let stored = store(tmp.path(), b"payload", false).unwrap();
 
         assert_eq!(fs::read(&stored).unwrap(), b"payload");
     }
@@ -609,7 +647,7 @@ mod tests {
         fs::create_dir(&squatter).unwrap();
         fs::write(squatter.join("precious.txt"), b"keep me").unwrap();
 
-        assert!(store(tmp.path(), b"payload", None).is_err());
+        assert!(store(tmp.path(), b"payload", false).is_err());
         assert_eq!(fs::read(squatter.join("precious.txt")).unwrap(), b"keep me");
 
         let leftovers: Vec<_> = fs::read_dir(tmp.path())
@@ -624,7 +662,7 @@ mod tests {
     fn no_temp_file_survives_a_completed_store() {
         let tmp = tempfile::tempdir().unwrap();
 
-        store(tmp.path(), b"payload", None).unwrap();
+        store(tmp.path(), b"payload", false).unwrap();
 
         let leftovers: Vec<_> = fs::read_dir(tmp.path())
             .unwrap()
@@ -640,7 +678,7 @@ mod tests {
         // `store` names a file by hashing its bytes and never parses them, so
         // distinct payloads are all this needs to land under distinct names.
         for byte in 0..4_u8 {
-            store(dir.path(), &[byte], Some(1)).expect("store");
+            store(dir.path(), &[byte], true).expect("store");
         }
         let count = std::fs::read_dir(dir.path()).expect("read dir").count();
         assert_eq!(count, 4, "store must leave the cap to the sweep");
@@ -651,7 +689,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         let mut last = PathBuf::new();
         for byte in 0..4_u8 {
-            last = store(dir.path(), &[byte], Some(1)).expect("store");
+            last = store(dir.path(), &[byte], true).expect("store");
         }
         jobs::on_this_thread(|blocking| sweep(dir.path(), 1, &last, blocking));
         let count = std::fs::read_dir(dir.path()).expect("read dir").count();

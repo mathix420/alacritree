@@ -151,9 +151,11 @@ fn post_process(term: &Term<EventProxy>, regex_match: Match, point: Point) -> Op
     trimmed.contains(&point).then_some(trimmed)
 }
 
-/// Hand the URI to the OS handler.  Submitted rather than spawned inline:
-/// `CreateProcess` is not free on a loaded machine, and this runs from the
-/// grid's click handler.
+/// Hand the URI to the OS handler — `xdg-open` on Linux/BSDs, `open` on
+/// macOS, `cmd /c start` on Windows — matching alacritty's default URL hint
+/// action.  Submitted rather than spawned inline: `CreateProcess` is not free
+/// on a loaded machine, and this runs from the grid's click handler.
+#[must_use = "dropping the handle cancels the open"]
 pub fn open(uri: &str) -> jobs::Job<()> {
     let uri = uri.to_owned();
     jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {

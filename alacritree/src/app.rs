@@ -3034,7 +3034,7 @@ impl AlacritreeApp {
         let cfg = &self.config.ui.paste;
         let (dir, owned) = cfg.image_target();
         let keep = cfg.image_keep;
-        match clipboard_image::store(&dir, &png, owned.then_some(keep)) {
+        match clipboard_image::store(&dir, &png, owned) {
             Ok(path) => {
                 if owned {
                     let in_use = path.clone();
