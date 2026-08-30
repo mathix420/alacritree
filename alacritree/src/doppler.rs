@@ -31,8 +31,8 @@ type Scopes = HashMap<String, HashMap<String, serde_json::Value>>;
 /// config) survives.  Returns how many scopes were written.  Takes
 /// `&jobs::Blocking` because it shells out — call it from a pool job, never
 /// from the UI thread.
-pub fn mirror_scopes(main_checkout: &Path, worktree: &Path, _blocking: &jobs::Blocking) -> usize {
-    let Some(scopes) = all_scopes(_blocking) else {
+pub fn mirror_scopes(main_checkout: &Path, worktree: &Path, blocking: &jobs::Blocking) -> usize {
+    let Some(scopes) = all_scopes(blocking) else {
         return 0;
     };
     let main = canonical(main_checkout);
@@ -63,7 +63,7 @@ pub fn mirror_scopes(main_checkout: &Path, worktree: &Path, _blocking: &jobs::Bl
         if let Some(pair) = &config_pair {
             args.push(pair);
         }
-        match run(&args, Some(&target), _blocking) {
+        match run(&args, Some(&target), blocking) {
             Some(_) => written += 1,
             None => log::warn!("doppler: failed to set scope for {}", target.display()),
         }
@@ -77,8 +77,8 @@ pub fn mirror_scopes(main_checkout: &Path, worktree: &Path, _blocking: &jobs::Bl
 /// end up empty.  Returns how many scopes were cleaned.  Takes
 /// `&jobs::Blocking` because it shells out — call it from a pool job, never
 /// from the UI thread.
-pub fn forget_scopes(worktree: &Path, _blocking: &jobs::Blocking) -> usize {
-    let Some(scopes) = all_scopes(_blocking) else {
+pub fn forget_scopes(worktree: &Path, blocking: &jobs::Blocking) -> usize {
+    let Some(scopes) = all_scopes(blocking) else {
         return 0;
     };
     let worktree = canonical(worktree);
@@ -91,7 +91,7 @@ pub fn forget_scopes(worktree: &Path, _blocking: &jobs::Blocking) -> usize {
         if !options.contains_key(PROJECT_KEY) && !options.contains_key(CONFIG_KEY) {
             continue;
         }
-        match run(&["configure", "unset", "project", "config"], Some(Path::new(scope)), _blocking) {
+        match run(&["configure", "unset", "project", "config"], Some(Path::new(scope)), blocking) {
             Some(_) => cleaned += 1,
             None => log::warn!("doppler: failed to unset scope {scope}"),
         }
@@ -107,8 +107,8 @@ fn rebase_scope(scope: &str, main: &Path, worktree: &Path) -> Option<PathBuf> {
 }
 
 /// Every scope in doppler's config file, keyed by absolute directory path.
-fn all_scopes(_blocking: &jobs::Blocking) -> Option<Scopes> {
-    let stdout = run(&["configure", "--all", "--json"], None, _blocking)?;
+fn all_scopes(blocking: &jobs::Blocking) -> Option<Scopes> {
+    let stdout = run(&["configure", "--all", "--json"], None, blocking)?;
     serde_json::from_slice(&stdout).ok()
 }
 
