@@ -8,7 +8,8 @@ the prompt, so the prompt waits on a subprocess or a repository walk.
     python3 alacritree/tools/ui-thread-audit.py . NAME   # status of named fns
 
 Requires `ast-grep` on PATH.  Each finding prints the primitive, its line, and
-the call chain from `update` that reaches it.
+the call chain from `update` that reaches it.  The exit status is 1 while any
+finding stands, so CI can gate on it.
 
 ## How it decides
 
@@ -261,3 +262,7 @@ if "--trace-new" in sys.argv:
         if f.key in reach and newkeys & f.calls:
             hits = [c for c in f.raw if any(g.key in newkeys for g in resolve(f, c))]
             print("%s:%d %s() -> app.rs new() via %r" % (f.file, f.start, f.name, hits[:4]))
+
+# Non-zero on a finding so CI fails on it.  The listing above is printed first,
+# so the failing run names the call paths rather than only a count.
+sys.exit(1 if leaves else 0)
