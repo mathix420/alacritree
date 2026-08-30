@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::git_status::{self, ChangeKind, GitStatus};
+use crate::jobs;
 use crate::worktree::{self as wt, CreateRequest, Progress};
 
 pub const SOCKET_ENV: &str = "ALACRITREE_SOCKET";
@@ -284,7 +285,11 @@ fn dispatch(request: IpcRequest, app_tx: &Sender<AppCall>, ctx: &egui::Context) 
     match request {
         // `compute` walks the working tree — the same work StatusCache
         // pushes to a background thread — so keep it off the UI thread.
-        IpcRequest::GitStatus { path } => Ok(git_status_json(&git_status::compute(&path, None))),
+        // This is already the connection thread, not the UI thread; the
+        // token just proves that plainly rather than adding a real wait.
+        IpcRequest::GitStatus { path } => Ok(git_status_json(&jobs::on_this_thread(|blocking| {
+            git_status::compute(&path, None, blocking)
+        }))),
         IpcRequest::CreateWorktree { project_root, branch } => {
             create_worktree(project_root, branch, app_tx, ctx)
         },

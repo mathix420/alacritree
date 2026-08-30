@@ -2,13 +2,11 @@
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use git2::{Delta, DiffOptions, Repository, Status, StatusOptions};
 
-use crate::wsl;
+use crate::{jobs, wsl};
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 
@@ -119,11 +117,11 @@ fn dirty_counts_git2(path: &Path) -> DirtyCounts {
 /// delete modal opens — a warm wsl.exe call (~400 ms) is a tolerable
 /// one-shot stall for an explicit destructive action.
 fn dirty_counts_wsl(distro: &str, linux_path: &str) -> DirtyCounts {
-    let Ok(stdout) = wsl::run_batch(
-        distro,
-        r#"git -C "$1" status --porcelain=v2 -z 2>/dev/null"#,
-        &[linux_path],
-    ) else {
+    let Ok(stdout) =
+        wsl::run_batch(distro, r#"git -C "$1" status --porcelain=v2 -z 2>/dev/null"#, &[
+            linux_path,
+        ])
+    else {
         return DirtyCounts::default();
     };
     let (staged, unstaged) = parse_status_v2_z(&stdout);
@@ -162,7 +160,7 @@ struct Pending {
     /// Hint the in-flight compute was started with, so we can tell whether
     /// the result that lands matches what the UI is currently asking for.
     hint: Option<String>,
-    rx: Receiver<GitStatus>,
+    job: jobs::Job<GitStatus>,
 }
 
 impl StatusCache {
@@ -197,7 +195,7 @@ impl StatusCache {
         // spawn another — a fresh answer shouldn't be ignored just because
         // the staleness timer also tripped.
         if let Some(pending) = &self.pending {
-            if let Ok(status) = pending.rx.try_recv() {
+            if let Some(status) = pending.job.poll() {
                 self.last = status;
                 self.last_refreshed = Some(Instant::now());
                 self.last_hint = pending.hint.clone();
@@ -222,17 +220,20 @@ impl StatusCache {
 }
 
 fn spawn_compute(path: PathBuf, hint: Option<String>, ctx: egui::Context) -> Pending {
-    let (tx, rx) = mpsc::channel();
     let worker_hint = hint.clone();
-    thread::spawn(move || {
-        let status = compute(&path, worker_hint.as_deref());
-        let _ = tx.send(status);
+    let job = jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
+        let status = compute(&path, worker_hint.as_deref(), blocking);
         ctx.request_repaint();
+        status
     });
-    Pending { hint, rx }
+    Pending { hint, job }
 }
 
-pub fn compute(path: &Path, default_branch_hint: Option<&str>) -> GitStatus {
+pub fn compute(
+    path: &Path,
+    default_branch_hint: Option<&str>,
+    _blocking: &jobs::Blocking,
+) -> GitStatus {
     match wsl::classify(path) {
         wsl::Location::Wsl { distro, linux_path } => {
             compute_wsl(&distro, &linux_path, default_branch_hint)
@@ -651,6 +652,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_status_poll_reports_without_blocking_its_caller() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        // A bare `Repository::init` leaves HEAD unborn (no commit for it to
+        // point at), and `compute` never reports a branch for that; give it
+        // one so the background result has a branch to land.
+        let repo = crate::test_util::init_repo(dir.path());
+        drop(repo);
+
+        let ctx = egui::Context::default();
+        let mut cache = StatusCache::new(dir.path().to_path_buf());
+        // The first poll has nothing banked and must return anyway.
+        let started = Instant::now();
+        let _ = cache.poll(None, &ctx);
+        assert!(started.elapsed() < Duration::from_millis(50), "poll blocked its caller");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while cache.last().branch.is_none() && Instant::now() < deadline {
+            let _ = cache.poll(None, &ctx);
+            std::thread::yield_now();
+        }
+        assert!(cache.last().branch.is_some(), "the background compute never landed");
+    }
+
+    #[test]
     fn parses_porcelain_v2_z() {
         let bytes = b"1 .M N... 100644 100644 100644 aaaa bbbb src/main.rs\0\
 1 A. N... 000000 100644 100644 0000 1111 new.rs\0\
@@ -661,24 +686,18 @@ u UU N... 100644 100644 100644 100644 e1 e2 e3 conflicted.rs\0\
 
         let staged_pairs: Vec<(&str, ChangeKind)> =
             staged.iter().map(|c| (c.path.as_str(), c.kind)).collect();
-        assert_eq!(
-            staged_pairs,
-            vec![
-                ("new.rs", ChangeKind::Added),
-                ("renamed.rs", ChangeKind::Renamed),
-                ("conflicted.rs", ChangeKind::Conflicted),
-            ]
-        );
+        assert_eq!(staged_pairs, vec![
+            ("new.rs", ChangeKind::Added),
+            ("renamed.rs", ChangeKind::Renamed),
+            ("conflicted.rs", ChangeKind::Conflicted),
+        ]);
 
         let unstaged_pairs: Vec<(&str, ChangeKind)> =
             unstaged.iter().map(|c| (c.path.as_str(), c.kind)).collect();
-        assert_eq!(
-            unstaged_pairs,
-            vec![
-                ("src/main.rs", ChangeKind::Modified),
-                ("untracked with space.txt", ChangeKind::Untracked),
-            ]
-        );
+        assert_eq!(unstaged_pairs, vec![
+            ("src/main.rs", ChangeKind::Modified),
+            ("untracked with space.txt", ChangeKind::Untracked),
+        ]);
     }
 
     #[test]

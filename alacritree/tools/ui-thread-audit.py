@@ -12,9 +12,10 @@ the call chain from `update` that reaches it.
 
 ## How it decides
 
-ast-grep supplies the structure: function extents, `impl` blocks, thread::spawn
-extents, test modules.  Call resolution is textual but scoped, and the scoping
-is what separates a readable answer from noise:
+ast-grep supplies the structure: function extents, `impl` blocks, background-job
+extents (`thread::spawn` and `jobs::pool().spawn`), test modules.  Call
+resolution is textual but scoped, and the scoping is what separates a readable
+answer from noise:
 
   * `Type::name` resolves against the functions inside `impl Type`, so two
     `new()` in one file stay distinct,
@@ -25,7 +26,7 @@ is what separates a readable answer from noise:
 Resolving bare names crate-wide instead turns `get`, `new` and `push` into
 edges, and every function reaches every other one.
 
-Lines inside a thread::spawn closure do not run on the calling thread, so they
+Lines inside a background-job closure do not run on the calling thread, so they
 are excluded from both the primitive scan and the call graph.  Work that is
 already correctly backgrounded therefore does not appear.
 
@@ -98,7 +99,7 @@ def extent(m):
 
 
 spawn_regions = collections.defaultdict(list)
-for pat in ("thread::spawn($$$)", "std::thread::spawn($$$)"):
+for pat in ("thread::spawn($$$)", "std::thread::spawn($$$)", "jobs::pool().spawn($$$)"):
     for m in by_pattern(pat):
         f, s, e = extent(m)
         spawn_regions[f].append((s, e))

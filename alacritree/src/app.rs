@@ -12,7 +12,6 @@ use serde_json::{Value, json};
 
 use crate::bindings::{self, BindingAction, KeyBinding, NamedAction};
 use crate::clipboard::{self, Target};
-use crate::clipboard_image;
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
 use crate::config::{
@@ -26,31 +25,26 @@ use crate::config::{
     SidebarTooltips, TextEmphasis, UiFont, profile_command,
 };
 use crate::crash_log::{self, ExitReason};
-use crate::doppler;
-use crate::file_drop;
 use crate::git_nav::{self, GitSection, SectionCount};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
-use crate::ipc;
 use crate::panel_filter::{self, PanelFilter};
-use crate::paste;
-use crate::path_style;
 use crate::path_style::PathStyle;
 use crate::pr_status::{self, PrCache, PrInfo, PrState};
 use crate::projects::{Project, Worktree, project_json};
-use crate::scratchpad;
 use crate::session::{
     AttentionVerdict, Session, SessionActivity, SessionId, SessionKind, TermSize,
     poll_attention_debounce,
 };
-use crate::sidebar_focus;
 use crate::sidebar_nav::{self, SidebarRow};
 use crate::state::{self, PersistedProject};
-use crate::terminal_view;
 use crate::upstream::UpstreamState;
 use crate::worktree::{self as wt, CreateRequest, Progress};
-use crate::worktree_liveness;
 use crate::wsl::{self, ShellChoice};
 use crate::wsl_helper::{self, WslProbe};
+use crate::{
+    clipboard_image, doppler, file_drop, ipc, jobs, paste, path_style, scratchpad, sidebar_focus,
+    terminal_view, worktree_liveness,
+};
 
 /// `None` is the home workspace (sessions inherit `$PWD`); `Some` is a worktree path.
 pub type WorkspaceKey = Option<PathBuf>;
@@ -570,6 +564,11 @@ pub struct AlacritreeApp {
     /// boots, and git2 takes tens of milliseconds on a project with many
     /// worktrees.  Results are adopted in `poll_project_refreshes`.
     project_refreshes: crate::project_refresh::ProjectRefreshes,
+    /// Keeps each `project_refreshes` job alive on the pool: `jobs::Job`
+    /// cancels its work on drop, so this is what stands between a refresh and
+    /// having it cancelled the instant `refresh_project` returns.  Cleared
+    /// alongside `project_refreshes` as each result is adopted.
+    project_refresh_jobs: HashMap<PathBuf, jobs::Job<()>>,
     /// Resolved absolute path of `delta` inside each WSL distro, so diff panes
     /// stop re-sourcing a login profile on every open.  Successes only: a miss
     /// is never stored, so installing delta mid-session is picked up later.
@@ -577,7 +576,7 @@ pub struct AlacritreeApp {
     /// In-flight delta discoveries, keyed by distro, mirroring
     /// `pending_project_refresh` — resolved off the UI thread, adopted in
     /// `wsl_delta_path`.
-    pending_delta: HashMap<String, Receiver<Option<String>>>,
+    pending_delta: HashMap<String, jobs::Job<Option<String>>>,
     /// Row styling only — never `Worktree::prunable`, which the delete flow
     /// reads to choose between removing a worktree and pruning it.
     liveness: worktree_liveness::LivenessCache,
@@ -622,7 +621,7 @@ struct DeleteTask {
     worktree_path: PathBuf,
     /// Distinguishes the "prune" vs "delete" wording in a failure message.
     prunable: bool,
-    result_rx: Receiver<Result<(), String>>,
+    job: jobs::Job<Result<(), String>>,
 }
 
 enum CreateState {
@@ -901,6 +900,7 @@ impl AlacritreeApp {
             phases: crate::frame_log::Phases::new(),
             grid_paint: std::time::Duration::ZERO,
             project_refreshes: Default::default(),
+            project_refresh_jobs: HashMap::new(),
             wsl_delta_paths: HashMap::new(),
             pending_delta: HashMap::new(),
             liveness: Default::default(),
@@ -999,10 +999,11 @@ impl AlacritreeApp {
         let ctx = ctx.clone();
         let worker_root = root.clone();
         let upstream = self.config.ui.upstream_status;
-        std::thread::spawn(move || {
+        let job = jobs::pool().spawn(jobs::Priority::Background, move |_blocking| {
             let _ = tx.send(Project::discover(worker_root, upstream));
             ctx.request_repaint();
         });
+        self.project_refresh_jobs.insert(root.clone(), job);
         self.project_refreshes.start(root, rx);
     }
 
@@ -1091,7 +1092,9 @@ impl AlacritreeApp {
     fn poll_project_refreshes(&mut self) {
         let sessions = &self.sessions;
         let projects = &mut self.projects;
+        let refresh_jobs = &mut self.project_refresh_jobs;
         self.project_refreshes.poll(|root, found| {
+            refresh_jobs.remove(root);
             match projects.iter_mut().find(|p| p.root == *root) {
                 Some(project) => {
                     let occupied: HashSet<PathBuf> =
@@ -2155,15 +2158,11 @@ impl AlacritreeApp {
                 && toggles_pass(&Some(wt.path.clone()))
                 && worktree_pr_passes(any_pr, &pr_matches, &wt.path)
         };
-        sidebar_nav::filtered_rows(
-            &self.projects,
-            &listed_sessions,
-            sidebar_nav::RowPredicates {
-                home,
-                project_self: &project_self,
-                worktree: &mut worktree,
-            },
-        )
+        sidebar_nav::filtered_rows(&self.projects, &listed_sessions, sidebar_nav::RowPredicates {
+            home,
+            project_self: &project_self,
+            worktree: &mut worktree,
+        })
     }
 
     fn workspace_has_sessions(&self, key: &WorkspaceKey) -> bool {
@@ -4485,12 +4484,12 @@ impl AlacritreeApp {
     /// is never cached, so the discovery re-runs and a mid-session install is
     /// picked up on a later open.
     fn wsl_delta_path(&mut self, distro: &str, ctx: &Context) -> Option<String> {
-        match self.pending_delta.get(distro).map(Receiver::try_recv) {
-            Some(Ok(Some(path))) => {
+        match self.pending_delta.get(distro).map(|job| job.poll()) {
+            Some(Some(Some(path))) => {
                 self.pending_delta.remove(distro);
                 self.wsl_delta_paths.insert(distro.to_string(), path);
             },
-            Some(Ok(None)) | Some(Err(TryRecvError::Disconnected)) => {
+            Some(Some(None)) => {
                 self.pending_delta.remove(distro);
             },
             _ => {},
@@ -4501,15 +4500,14 @@ impl AlacritreeApp {
         }
 
         if !self.pending_delta.contains_key(distro) {
-            let (tx, rx) = mpsc::channel();
             let distro_owned = distro.to_string();
             let ctx = ctx.clone();
-            std::thread::spawn(move || {
+            let job = jobs::pool().spawn(jobs::Priority::Background, move |_blocking| {
                 let found = wsl::discover_delta(&distro_owned);
-                let _ = tx.send(found);
                 ctx.request_repaint();
+                found
             });
-            self.pending_delta.insert(distro.to_string(), rx);
+            self.pending_delta.insert(distro.to_string(), job);
         }
         None
     }
@@ -4867,10 +4865,11 @@ fn column_galley(
 ) -> std::sync::Arc<egui::Galley> {
     use egui::text::{LayoutJob, TextFormat};
     let (max_rows, break_anywhere) = wrap.limits();
-    let mut job = LayoutJob::single_section(
-        text.to_owned(),
-        TextFormat { font_id: egui::FontId::new(size, family), color, ..Default::default() },
-    );
+    let mut job = LayoutJob::single_section(text.to_owned(), TextFormat {
+        font_id: egui::FontId::new(size, family),
+        color,
+        ..Default::default()
+    });
     job.wrap.max_width = max_w.max(0.0);
     job.wrap.max_rows = max_rows;
     job.wrap.break_anywhere = break_anywhere;
@@ -5441,16 +5440,12 @@ fn path_text(
         if text.is_empty() {
             return;
         }
-        job.append(
-            &text,
-            0.0,
-            egui::TextFormat {
-                font_id: egui::FontId::new(size, emphasis_family(e, &family)),
-                color: e.color.unwrap_or(base),
-                valign,
-                ..Default::default()
-            },
-        );
+        job.append(&text, 0.0, egui::TextFormat {
+            font_id: egui::FontId::new(size, emphasis_family(e, &family)),
+            color: e.color.unwrap_or(base),
+            valign,
+            ..Default::default()
+        });
     };
     let emphases = [&theme.path_style.filename, &theme.path_style.parent];
     for (text, e) in zed_spans(&parts).into_iter().zip(emphases) {
@@ -7634,7 +7629,7 @@ impl AlacritreeApp {
         // `poll_pending_deletes`; the dialog closes immediately either way and
         // the sidebar row shows a spinner meanwhile.
         let worktree_path = req.worktree_path.clone();
-        let job = if req.prunable {
+        let delete_job = if req.prunable {
             wt::DeleteJob::Prune {
                 worktree_name: req.worktree_name,
                 branch: req.branch,
@@ -7647,12 +7642,12 @@ impl AlacritreeApp {
                 force: req.dirty.is_dirty(),
             }
         };
-        let result_rx = wt::spawn_delete(project_root, job, ctx.clone());
+        let job = wt::spawn_delete(project_root, delete_job, ctx.clone());
         self.pending_deletes.push(DeleteTask {
             project_idx: req.project_idx,
             worktree_path,
             prunable: req.prunable,
-            result_rx,
+            job,
         });
     }
 
@@ -7661,13 +7656,12 @@ impl AlacritreeApp {
     /// the sidebar.
     fn poll_pending_deletes(&mut self, ctx: &Context) {
         let mut finished: Vec<(usize, bool, Result<(), String>)> = Vec::new();
-        self.pending_deletes.retain(|task| match task.result_rx.try_recv() {
-            Ok(result) => {
+        self.pending_deletes.retain(|task| match task.job.poll() {
+            Some(result) => {
                 finished.push((task.project_idx, task.prunable, result));
                 false
             },
-            Err(mpsc::TryRecvError::Empty) => true,
-            Err(mpsc::TryRecvError::Disconnected) => false,
+            None => true,
         });
         for (project_idx, prunable, result) in finished {
             if let Err(e) = result {
@@ -8010,7 +8004,8 @@ impl AlacritreeApp {
             return None;
         }
         if confirm_via_key || create_clicked {
-            // Whitespace runs become single hyphens — `some text like this` → `some-text-like-this`.
+            // Whitespace runs become single hyphens — `some text like this` →
+            // `some-text-like-this`.
             let canonical: String = branch.split_whitespace().collect::<Vec<_>>().join("-");
             if let Err(msg) = wt::validate_branch_name(&canonical) {
                 error = Some(msg);
@@ -8889,10 +8884,9 @@ mod tests {
             false,
         );
         assert!(!retain, "a matched search action consumes the key");
-        assert!(matches!(
-            steps.as_slice(),
-            [SidebarNavStep::SearchAction(NamedAction::SidebarSearchConfirm)]
-        ));
+        assert!(matches!(steps.as_slice(), [SidebarNavStep::SearchAction(
+            NamedAction::SidebarSearchConfirm
+        )]));
         // The filter is untouched by the drain — the action does the exit.
         assert_eq!(f.mode(), panel_filter::Mode::Search);
         assert_eq!(f.query(), "foo");
@@ -8906,10 +8900,9 @@ mod tests {
             egui::Modifiers::NONE,
             false,
         );
-        assert!(matches!(
-            steps.as_slice(),
-            [SidebarNavStep::SearchAction(NamedAction::SidebarSearchCancel)]
-        ));
+        assert!(matches!(steps.as_slice(), [SidebarNavStep::SearchAction(
+            NamedAction::SidebarSearchCancel
+        )]));
 
         let mut steps = Vec::new();
         drain_search_or_nav(
@@ -8921,10 +8914,9 @@ mod tests {
             false,
         );
         assert!(
-            matches!(
-                steps.as_slice(),
-                [SidebarNavStep::SearchAction(NamedAction::SidebarSearchCancelToTerminal)]
-            ),
+            matches!(steps.as_slice(), [SidebarNavStep::SearchAction(
+                NamedAction::SidebarSearchCancelToTerminal
+            )]),
             "Shift+Esc is a distinct search action from plain Esc"
         );
     }
@@ -8943,10 +8935,9 @@ mod tests {
             egui::Modifiers::NONE,
             false,
         );
-        assert!(matches!(
-            steps.as_slice(),
-            [SidebarNavStep::Filter(panel_filter::Outcome::MoveCursor(1))]
-        ));
+        assert!(matches!(steps.as_slice(), [SidebarNavStep::Filter(
+            panel_filter::Outcome::MoveCursor(1)
+        )]));
 
         // Space stays consumed as a no-op nav even in search (fake-click guard).
         let mut steps = Vec::new();
@@ -9741,19 +9732,16 @@ mod tests {
             "/home/lev/.cargo/bin/delta",
         );
         assert_eq!(program, "wsl.exe");
-        assert_eq!(
-            args[..8],
-            [
-                "-d",
-                "kali-linux",
-                "--cd",
-                r"\\wsl.localhost\kali-linux\home\lev\proj",
-                "--exec",
-                "sh",
-                "-c",
-                r#"export LESS="${LESS-R}"; exec git -c "core.pager=/home/lev/.cargo/bin/delta --paging=always" "$@""#,
-            ]
-        );
+        assert_eq!(args[..8], [
+            "-d",
+            "kali-linux",
+            "--cd",
+            r"\\wsl.localhost\kali-linux\home\lev\proj",
+            "--exec",
+            "sh",
+            "-c",
+            r#"export LESS="${LESS-R}"; exec git -c "core.pager=/home/lev/.cargo/bin/delta --paging=always" "$@""#,
+        ]);
         assert_eq!(args[8], "sh");
         assert_eq!(&args[9..], diff_args(&req("a.rs", DiffSource::Staged)).as_slice());
     }
@@ -9766,18 +9754,15 @@ mod tests {
             &req("a.rs", DiffSource::Staged),
         );
         assert_eq!(program, "wsl.exe");
-        assert_eq!(
-            args[..7],
-            [
-                "-d",
-                "kali-linux",
-                "--cd",
-                r"\\wsl.localhost\kali-linux\home\lev\proj",
-                "--exec",
-                "sh",
-                "-c"
-            ]
-        );
+        assert_eq!(args[..7], [
+            "-d",
+            "kali-linux",
+            "--cd",
+            r"\\wsl.localhost\kali-linux\home\lev\proj",
+            "--exec",
+            "sh",
+            "-c"
+        ]);
         let script = &args[7];
         assert!(script.contains("getent passwd"), "resolves login shell: {script}");
         // The LESS export lives inside the login shell's script so a LESS
@@ -10675,8 +10660,8 @@ mod tests {
         let expected_size = egui::vec2(16.0 * s, 16.0 * s);
         assert!(
             (painted_size - expected_size).length() < 0.01,
-            "styled_icon_button must paint into a 16x16 slot: got {painted_size:?}, \
-             expected {expected_size:?}"
+            "styled_icon_button must paint into a 16x16 slot: got {painted_size:?}, expected \
+             {expected_size:?}"
         );
         let (family, size, color) =
             painted_glyph_style(&output.shapes, "▶").expect("the configured glyph painted");
@@ -11124,11 +11109,11 @@ mod tests {
     fn the_upstream_tooltip_names_the_upstream_ref() {
         let icons = crate::config::Icons::default();
         let theme = Theme::from_config(&Config::default());
-        let (_, _, _, tip) = upstream_badge(
-            &icons,
-            &theme,
-            &UpstreamState::Diverged { upstream: "origin/x".into(), ahead: 2, behind: 1 },
-        );
+        let (_, _, _, tip) = upstream_badge(&icons, &theme, &UpstreamState::Diverged {
+            upstream: "origin/x".into(),
+            ahead: 2,
+            behind: 1,
+        });
         assert_eq!(tip, "tracks origin/x — 2 ahead, 1 behind");
 
         let (_, _, _, tip) = upstream_badge(&icons, &theme, &UpstreamState::Untracked);
@@ -11268,8 +11253,8 @@ mod tests {
                 assert_eq!(
                     row_elided(&texts, path),
                     path == long,
-                    "{mode:?} on {kind} {path:?}: the harness must elide exactly the long \
-                     path: {texts:?}"
+                    "{mode:?} on {kind} {path:?}: the harness must elide exactly the long path: \
+                     {texts:?}"
                 );
                 assert_eq!(
                     tooltip_shown(&texts, path),

@@ -7,7 +7,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 use crate::command_ext::CommandExt;
-use crate::wsl;
+use crate::{jobs, wsl};
 
 #[derive(Debug, Clone)]
 pub enum Progress {
@@ -486,17 +486,17 @@ pub enum DeleteJob {
     Prune { worktree_name: String, branch: Option<String>, delete_branch: bool },
 }
 
-/// Run a [`DeleteJob`] off the UI thread, waking the window when it finishes.
-/// The git shellouts and doppler cleanup are slow enough to stutter paint, so
-/// the caller confirms the dialog, hands the work here, and adopts the result
-/// (an error to surface, or nothing) from the returned channel.
+/// Run a [`DeleteJob`] on the pool, waking the window when it finishes. The
+/// git shellouts and doppler cleanup are slow enough to stutter paint, so the
+/// caller confirms the dialog, hands the work here, and adopts the result (an
+/// error to surface, or nothing) from the returned handle — the sidebar row
+/// shows a spinner until it lands, so this runs at interactive priority.
 pub fn spawn_delete(
     project_root: PathBuf,
     job: DeleteJob,
     ctx: egui::Context,
-) -> Receiver<Result<(), String>> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
+) -> jobs::Job<Result<(), String>> {
+    jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
         let result = match job {
             DeleteJob::Remove { worktree_path, branch, force } => {
                 delete_worktree(&project_root, &worktree_path, branch.as_deref(), force)
@@ -505,10 +505,9 @@ pub fn spawn_delete(
                 prune_worktree(&project_root, &worktree_name, branch.as_deref(), delete_branch)
             },
         };
-        let _ = tx.send(result);
         ctx.request_repaint();
-    });
-    rx
+        result
+    })
 }
 
 /// Remove the git metadata of a worktree whose checkout directory is gone
@@ -581,7 +580,15 @@ mod tests {
             branch: Some("feature".to_string()),
             force: false,
         };
-        let result = spawn_delete(repo_dir, job, egui::Context::default()).recv().unwrap();
+        let handle = spawn_delete(repo_dir, job, egui::Context::default());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let result = loop {
+            if let Some(result) = handle.poll() {
+                break result;
+            }
+            assert!(std::time::Instant::now() < deadline, "the delete never landed");
+            thread::yield_now();
+        };
 
         assert!(result.is_ok(), "delete failed: {result:?}");
         assert!(!wt_path.exists(), "worktree directory should be gone");
