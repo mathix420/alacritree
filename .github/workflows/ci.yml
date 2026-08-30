@@ -37,8 +37,23 @@ jobs:
       # question_mark) turns it into a hard error we can't fix without editing a
       # read-only dependency. Linting the fork's code, not upstream's, is what we
       # want anyway.
+      #
+      # disallowed_methods is denied on its own rather than through -D warnings:
+      # it is the backstop for a process wait written inline in a UI handler, and
+      # a lint that only warns lets one ship. Every other lint stays a warning so
+      # unrelated code does not fail the build.
       - name: Clippy
-        run: cargo clippy -p alacritree --all-targets --locked --no-deps
+        run: cargo clippy -p alacritree --all-targets --locked --no-deps -- -D clippy::disallowed_methods
+
+      # The `jobs::Blocking` token is a compile-time gate, but `on_this_thread`
+      # is public by design, so a handler can still hand itself a token. This is
+      # what catches that. The script reads source text and does not evaluate
+      # cfg, so one platform covers every target's code.
+      - name: ast-grep
+        run: npm install -g @ast-grep/cli
+
+      - name: UI-thread audit
+        run: python3 alacritree/tools/ui-thread-audit.py .
 
   # Compile the platform-specific process and notification integrations before
   # a release tag reaches cargo-dist.  Branch pushes with an open PR already
@@ -54,10 +69,13 @@ jobs:
         run: brew install cmake pkg-config fontconfig freetype
 
       - name: Rust toolchain
-        run: rustup show
+        run: rustup show && rustup component add clippy
 
-      - name: Check
-        run: cargo check -p alacritree --locked
+      # Clippy rather than a plain check, for the same reason as the Windows
+      # job: the macOS arms of links.rs and session.rs are lint-visible nowhere
+      # else, and compiling them is what this job already did.
+      - name: Clippy
+        run: cargo clippy -p alacritree --locked --no-deps -- -D clippy::disallowed_methods
 
   # Clipboard file/image fallbacks and WSL path handling are primarily
   # Windows-facing. Compile and run their pure tests before those cfg branches
@@ -69,10 +87,14 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Rust toolchain
-        run: rustup show
+        run: rustup show && rustup component add clippy
 
-      - name: Check
-        run: cargo check -p alacritree --all-targets --locked
+      # Clippy in place of a plain check: it compiles the same cfg branches and
+      # is the only run that lints them. Most of the crate's process spawning
+      # lives behind #[cfg(windows)] — wsl.rs, wsl_helper.rs, the Windows arm of
+      # links.rs — which a Linux-only lint never sees.
+      - name: Clippy
+        run: cargo clippy -p alacritree --all-targets --locked --no-deps -- -D clippy::disallowed_methods
 
       - name: Test
         run: cargo test -p alacritree --locked
