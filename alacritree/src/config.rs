@@ -133,7 +133,6 @@ impl FontConfig {
     /// Headings stay close to the grid's size for visual weight without
     /// crowding the chrome.
     pub const UI_HEADING_RATIO: f32 = 0.9;
-
     /// Normal UI text (rows, captions, button labels) is this fraction of the
     /// terminal font size so the chrome reads as secondary to the grid.
     pub const UI_NORMAL_RATIO: f32 = 0.8;
@@ -1021,7 +1020,10 @@ pub struct UiTheme {
     /// `[ui] pr_status_concurrency`: max `gh` lookups in flight at once.
     /// Defaults to 8; clamped to ≥ 1, since a cold cache spawns one lookup
     /// per eligible worktree in a single frame and an unbounded cap would
-    /// fork a thread and a `gh` process for every one of them at once.
+    /// fork a thread and a `gh` process for every one of them at once. The
+    /// shared background pool caps concurrent work underneath this too, so
+    /// this setting can lower how many lookups run at once but not raise it
+    /// past the pool's own ceiling.
     pub pr_status_concurrency: usize,
     pub icons: Icons,
     pub focus_outline: FocusOutline,
@@ -2156,6 +2158,8 @@ struct RawUi {
     /// filesystem could make expensive.
     worktree_liveness: Option<bool>,
     /// Max `gh` lookups in flight at once.  Defaults to 8; clamped to ≥ 1.
+    /// The shared background pool also caps concurrent work, so this can
+    /// lower that ceiling but not raise it.
     pr_status_concurrency: Option<usize>,
     /// The font sidebars, tabs and dialogs are drawn with.
     font: RawUiFont,
@@ -2780,8 +2784,8 @@ mod tests {
     #[test]
     fn path_style_emphasis_parses_and_a_blank_color_is_an_error() {
         let ui = ui_from_toml(
-            "[ui.path_style.filename]\ncolor = \"#e6e6e6\"\nbold = true\n\
-             [ui.path_style.parent]\nitalic = true\n",
+            "[ui.path_style.filename]\ncolor = \"#e6e6e6\"\nbold = \
+             true\n[ui.path_style.parent]\nitalic = true\n",
         );
         assert_eq!(ui.path_style.filename.color, Some(Color32::from_rgb(0xe6, 0xe6, 0xe6)));
         assert!(ui.path_style.filename.bold);
@@ -3222,10 +3226,11 @@ args = ["-d", "ubuntu"]
         let raw: RawConfig = toml::from_str(toml_src).unwrap();
         let config = raw.into_config();
         assert_eq!(config.profiles.len(), 2);
-        assert_eq!(
-            config.profiles[0],
-            Profile { name: "pwsh".into(), program: "pwsh".into(), args: vec!["-NoLogo".into()] }
-        );
+        assert_eq!(config.profiles[0], Profile {
+            name: "pwsh".into(),
+            program: "pwsh".into(),
+            args: vec!["-NoLogo".into()]
+        });
         assert_eq!(config.default_profile.as_deref(), Some("pwsh"));
         assert_eq!(config.profile("ubuntu").unwrap().program, "wsl.exe");
         assert!(config.profile("nope").is_none());
@@ -3483,7 +3488,8 @@ program = "second"
     #[test]
     fn focus_outline_parses_all_fields() {
         let fo = ui_from_toml(
-            "[ui.focus_outline]\nsidebar = true\nterminal = true\ncolor = \"#89b4fa\"\nthickness = 2.5",
+            "[ui.focus_outline]\nsidebar = true\nterminal = true\ncolor = \"#89b4fa\"\nthickness \
+             = 2.5",
         )
         .focus_outline;
         assert!(fo.sidebar);
@@ -3618,42 +3624,30 @@ program = "second"
     #[test]
     fn drop_options_default_to_on_with_auto_quoting() {
         let ui = ui_from_toml("");
-        assert_eq!(
-            ui.drop,
-            DropConfig {
-                enabled: true,
-                terminal: true,
-                sidebar: true,
-                scratchpad: true,
-                spelling: PathSpelling { quote: Quoting::Auto, wsl_translate: true },
-                highlight: true,
-            }
-        );
+        assert_eq!(ui.drop, DropConfig {
+            enabled: true,
+            terminal: true,
+            sidebar: true,
+            scratchpad: true,
+            spelling: PathSpelling { quote: Quoting::Auto, wsl_translate: true },
+            highlight: true,
+        });
     }
 
     #[test]
     fn drop_options_parse_from_the_ui_drop_table() {
         let ui = ui_from_toml(
-            "[ui.drop]\n\
-             enabled = false\n\
-             terminal = false\n\
-             sidebar = false\n\
-             scratchpad = false\n\
-             quote = \"posix\"\n\
-             wsl_translate = false\n\
-             highlight = false\n",
+            "[ui.drop]\nenabled = false\nterminal = false\nsidebar = false\nscratchpad = \
+             false\nquote = \"posix\"\nwsl_translate = false\nhighlight = false\n",
         );
-        assert_eq!(
-            ui.drop,
-            DropConfig {
-                enabled: false,
-                terminal: false,
-                sidebar: false,
-                scratchpad: false,
-                spelling: PathSpelling { quote: Quoting::Posix, wsl_translate: false },
-                highlight: false,
-            }
-        );
+        assert_eq!(ui.drop, DropConfig {
+            enabled: false,
+            terminal: false,
+            sidebar: false,
+            scratchpad: false,
+            spelling: PathSpelling { quote: Quoting::Posix, wsl_translate: false },
+            highlight: false,
+        });
     }
 
     #[test]
@@ -3668,10 +3662,12 @@ program = "second"
     #[test]
     fn paste_options_default_to_on_with_the_owned_image_dir() {
         let ui = ui_from_toml("");
-        assert_eq!(
-            ui.paste,
-            PasteConfig { files: true, image: true, image_dir: None, image_keep: 20 }
-        );
+        assert_eq!(ui.paste, PasteConfig {
+            files: true,
+            image: true,
+            image_dir: None,
+            image_keep: 20
+        });
         let (dir, owned) = ui.paste.image_target();
         assert_eq!(dir, default_image_dir());
         assert!(owned, "the default directory is alacritree's own");
@@ -3697,21 +3693,14 @@ program = "second"
     fn paste_options_parse_from_the_ui_paste_table() {
         let home = home::home_dir().expect("a home directory");
         let ui = ui_from_toml(
-            "[ui.paste]\n\
-             files = false\n\
-             image = false\n\
-             image_dir = \"~/shots\"\n\
-             image_keep = 5\n",
+            "[ui.paste]\nfiles = false\nimage = false\nimage_dir = \"~/shots\"\nimage_keep = 5\n",
         );
-        assert_eq!(
-            ui.paste,
-            PasteConfig {
-                files: false,
-                image: false,
-                image_dir: Some(home.join("shots")),
-                image_keep: 5,
-            }
-        );
+        assert_eq!(ui.paste, PasteConfig {
+            files: false,
+            image: false,
+            image_dir: Some(home.join("shots")),
+            image_keep: 5,
+        });
     }
 
     /// A directory the user chose may hold files alacritree never wrote, so it is

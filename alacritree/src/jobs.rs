@@ -241,13 +241,15 @@ pub fn on_this_thread<T>(f: impl FnOnce(&Blocking) -> T) -> T {
     f(&Blocking(()))
 }
 
-/// The process-wide pool.  Sized for work that waits on subprocesses and the
-/// filesystem rather than work that saturates a core, so a wide pool would only
-/// multiply concurrent git walks.
+/// The process-wide pool.  Sized for IO-bound work — subprocesses and git
+/// walks that spend their time waiting, not saturating a core — so the range
+/// is chosen for concurrency headroom rather than derived from core count;
+/// `available_parallelism` only seeds where in that range a given machine
+/// starts.
 pub fn pool() -> &'static Pool {
     static POOL: OnceLock<Pool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(2, 4));
+        let workers = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(4, 8));
         Pool::new(workers)
     })
 }
