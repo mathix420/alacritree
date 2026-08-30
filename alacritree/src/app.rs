@@ -1178,13 +1178,13 @@ impl AlacritreeApp {
                     format!("worktree is no longer checked out: {}", dir.display()),
                 ));
             }
-            // Called synchronously, before the PTY exists, so the
-            // once-per-worktree guard is set before a second rapid spawn for
-            // the same worktree can see it unset. The scope mirror itself
-            // runs off-thread, so a shell in a worktree git already knows
-            // about can still start before the mirrored scopes land, racing
-            // `doppler run` against the write. That costs one retryable
-            // "You must specify a project" failure, not lost work.
+            // Called synchronously, so the once-per-worktree guard is set
+            // before a second rapid spawn for the same worktree can see it
+            // unset. The scope mirror itself runs off-thread, so a shell in
+            // a worktree git already knows about can still start before the
+            // mirrored scopes land, racing `doppler run` against the write.
+            // That costs one retryable "You must specify a project" failure,
+            // not lost work.
             self.sync_doppler_scopes(dir.clone());
         }
         let session = Session::spawn(
@@ -1258,11 +1258,10 @@ impl AlacritreeApp {
         let Some(main_checkout) = main_checkout else {
             return;
         };
-        let worktree_for_log = worktree.clone();
         self.detached_jobs.push(jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
             let linked = doppler::mirror_scopes(&main_checkout, &worktree, blocking);
             if linked > 0 {
-                log::info!("linked {linked} doppler scope(s) into {}", worktree_for_log.display());
+                log::info!("linked {linked} doppler scope(s) into {}", worktree.display());
             }
         }));
     }
