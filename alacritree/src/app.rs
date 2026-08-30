@@ -643,6 +643,11 @@ struct DeleteTask {
     job: jobs::Job<Result<(), String>>,
 }
 
+/// What a create reports when its worker unwound instead of returning: the
+/// pool records only that a panic happened, and the step list stops wherever
+/// it got to.
+const CREATE_WORKER_PANICKED: &str = "the background worker panicked";
+
 enum CreateState {
     Prompt {
         project_idx: usize,
@@ -655,9 +660,9 @@ enum CreateState {
         steps: Vec<String>,
         rx: Receiver<Progress>,
         /// Kept alive so dropping it doesn't cancel the still-running create
-        /// on the pool; never polled itself since `rx` already carries the
-        /// `Progress::Done` result.
-        _job: jobs::Job<()>,
+        /// on the pool.  `rx` carries the result, so the handle is polled
+        /// only for the failure latch a panicked create reports through.
+        job: jobs::Job<()>,
     },
     Done {
         project_idx: usize,
@@ -675,8 +680,8 @@ struct BackgroundCreate {
     /// replaces it on refresh.
     branch: String,
     rx: Receiver<Progress>,
-    /// See `CreateState::Running::_job`.
-    _job: jobs::Job<()>,
+    /// See `CreateState::Running::job`.
+    job: jobs::Job<()>,
 }
 
 /// The rename dialog, keyed by root rather than index: an IPC `remove_project`
@@ -7934,16 +7939,30 @@ impl AlacritreeApp {
     fn poll_pending_creates(&mut self, ctx: &Context) {
         let mut finished: Vec<(usize, Result<PathBuf, String>)> = Vec::new();
         self.pending_creates.retain_mut(|task| {
+            let mut done = None;
             loop {
                 match task.rx.try_recv() {
                     Ok(Progress::Step(_)) => {},
                     Ok(Progress::Done(result)) => {
-                        finished.push((task.project_idx, result));
-                        break false;
+                        done = Some(result);
+                        break;
                     },
-                    Err(mpsc::TryRecvError::Empty) => break true,
-                    Err(mpsc::TryRecvError::Disconnected) => break false,
+                    // Nothing more this frame either way — a worker that
+                    // unwound instead of reporting comes back through the
+                    // failure latch below, so its placeholder row is
+                    // replaced rather than left standing forever.
+                    Err(_) => break,
                 }
+            }
+            let _ = task.job.poll();
+            let done =
+                done.or_else(|| task.job.failed().then(|| Err(CREATE_WORKER_PANICKED.to_string())));
+            match done {
+                Some(result) => {
+                    finished.push((task.project_idx, result));
+                    false
+                },
+                None => true,
             }
         });
         for (project_idx, result) in finished {
@@ -8172,13 +8191,19 @@ impl AlacritreeApp {
             CreateState::Prompt { project_idx, branch, error } => {
                 self.show_create_prompt(ctx, project_idx, branch, error)
             },
-            CreateState::Running { project_idx, branch, mut steps, rx, _job } => {
+            CreateState::Running { project_idx, branch, mut steps, rx, job } => {
                 let mut done: Option<Result<PathBuf, String>> = None;
                 while let Ok(p) = rx.try_recv() {
                     match p {
                         Progress::Step(s) => steps.push(s),
                         Progress::Done(r) => done = Some(r),
                     }
+                }
+                // A panicked worker sends no `Progress::Done`, so without the
+                // latch the modal would sit on its last step forever.
+                let _ = job.poll();
+                if done.is_none() && job.failed() {
+                    done = Some(Err(CREATE_WORKER_PANICKED.to_string()));
                 }
                 let minimized = self.show_create_running(ctx, project_idx, &branch, &steps);
                 match done {
@@ -8192,11 +8217,11 @@ impl AlacritreeApp {
                             project_idx,
                             branch,
                             rx,
-                            _job,
+                            job,
                         });
                         None
                     },
-                    None => Some(CreateState::Running { project_idx, branch, steps, rx, _job }),
+                    None => Some(CreateState::Running { project_idx, branch, steps, rx, job }),
                 }
             },
             CreateState::Done { project_idx, steps, result } => {
@@ -8298,13 +8323,13 @@ impl AlacritreeApp {
             let base_dir = self.config.workspace.base_dir_for(&project_root);
             let req =
                 CreateRequest { project_root, default_branch, branch: canonical.clone(), base_dir };
-            let (rx, _job) = wt::spawn_create(req, ctx.clone());
+            let (rx, job) = wt::spawn_create(req, ctx.clone());
             return Some(CreateState::Running {
                 project_idx,
                 branch: canonical,
                 steps: Vec::new(),
                 rx,
-                _job,
+                job,
             });
         }
         Some(CreateState::Prompt { project_idx, branch, error })
