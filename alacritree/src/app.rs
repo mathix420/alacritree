@@ -772,7 +772,7 @@ impl AlacritreeApp {
         // A job's own closure cannot wake the loop when it unwinds, and the
         // failure it reports is only ever read from a frame.
         let waker_ctx = cc.egui_ctx.clone();
-        jobs::set_ui_waker(move || waker_ctx.request_repaint());
+        jobs::pool().set_waker(move || waker_ctx.request_repaint());
 
         let theme = Theme::from_config(&config);
 
@@ -1100,7 +1100,15 @@ impl AlacritreeApp {
             // the interval stretches freshness instead of stacking up probes,
             // and its own `request_repaint` brings us back here.
             Some((None, false)) => return,
-            Some((None, true)) => self.liveness_probe = None,
+            // A panicked probe adopts nothing, and an interval that never
+            // restarts leaves `wants_probe` true: the next frame starts
+            // another batch, and the pool wakes a frame at every job end, so
+            // a probe that fails every time would run at frame rate.  An
+            // empty round restarts the interval the same way.
+            Some((None, true)) => {
+                self.liveness_probe = None;
+                self.liveness.adopt(Vec::new(), now);
+            },
             None => {},
         }
 

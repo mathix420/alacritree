@@ -10,6 +10,11 @@ use crate::{jobs, wsl};
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 
+/// What the panel shows for a compute whose worker unwound.  The panic itself
+/// is logged from the pool; the row only needs to stop claiming knowledge it
+/// does not have.
+const WORKER_DIED: &str = "the background worker did not finish";
+
 #[derive(Debug, Clone)]
 pub struct FileChange {
     pub path: String,
@@ -204,7 +209,8 @@ impl StatusCache {
     /// `GitStatus::default()` (all-zero counts) until then, which callers
     /// must not read as "known clean". A compute that landed but failed
     /// (`error: Some(..)`, e.g. the repository could not be opened) is the
-    /// same "don't know" case: it still sets `last_refreshed` so `poll`
+    /// same "don't know" case — as is a compute whose worker unwound, which
+    /// is banked the same way — it still sets `last_refreshed` so `poll`
     /// doesn't retry every frame, but it answers `false` here too.
     pub fn has_status(&self) -> bool {
         self.last_refreshed.is_some() && self.last.error.is_none()
@@ -224,9 +230,17 @@ impl StatusCache {
                 self.last_hint = pending.hint.clone();
                 self.pending = None;
             } else if pending.job.failed() {
-                // A panicked compute never reports a status; without this the
-                // `self.pending.is_none()` gate above would refuse every
-                // future refresh for this worktree.
+                // A panicked compute reports no status, and merely forgetting
+                // it leaves the cache looking never-refreshed: the next poll
+                // starts another, and the pool wakes a frame at every job end,
+                // so a compute that fails every time would respawn at frame
+                // rate.  Bank it as the failure it is, on the clock a landed
+                // error already uses, and the retry lands one interval later
+                // like any other.
+                self.last =
+                    GitStatus { error: Some(WORKER_DIED.to_string()), ..Default::default() };
+                self.last_refreshed = Some(Instant::now());
+                self.last_hint = pending.hint.clone();
                 self.pending = None;
             }
         }
@@ -728,6 +742,38 @@ mod tests {
             assert!(Instant::now() < deadline, "pending was never cleared after the job failed");
             std::thread::yield_now();
         }
+    }
+
+    /// The regression this guards: a failure that leaves the cache looking
+    /// never-refreshed is spawned again by the very next poll, and the pool
+    /// wakes a frame at every job end — so a compute that panics every time
+    /// would respawn at frame rate, burning a worker for as long as the panel
+    /// is open.  A compute that fails must not be retried more often than one
+    /// that succeeds.
+    #[test]
+    fn a_failed_compute_backs_off_as_far_as_a_successful_one() {
+        let job = jobs::pool()
+            .spawn(jobs::Priority::Background, |_: &jobs::Blocking| -> GitStatus {
+                panic!("boom")
+            });
+        // Latch the failure before the cache sees it, so the poll below reads
+        // a settled job rather than racing the worker.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !job.failed() {
+            assert!(job.poll().is_none(), "a panicking job never reports a value");
+            assert!(Instant::now() < deadline, "the failure was never observed");
+            std::thread::yield_now();
+        }
+
+        let mut cache = StatusCache::new(PathBuf::from("/doesnt/matter"));
+        cache.pending = Some(Pending { hint: None, job });
+        let ctx = egui::Context::default();
+
+        let _ = cache.poll(None, &ctx);
+        assert!(cache.pending.is_none(), "the poll that banks a failure must not start another");
+        assert!(!cache.has_status(), "a compute that failed knows nothing about the tree");
+        let _ = cache.poll(None, &ctx);
+        assert!(cache.pending.is_none(), "nor may the frames that follow it inside the interval");
     }
 
     /// The regression this guards: a cache entry exists from the moment the
