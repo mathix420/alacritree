@@ -616,8 +616,11 @@ struct DeleteRequest {
     prunable: bool,
     /// Checkbox state for the prune dialog's "also delete branch".
     delete_branch: bool,
-    /// Set when this confirm is the retry after an unforced `git worktree
-    /// remove` refused a dirty tree — the retry passes `--force`.
+    /// Whether this confirm's removal passes `--force`: preset `true` when
+    /// the dirty count is already known dirty (a warm cache, or a cold
+    /// probe that landed before the confirm), left `false` while the count
+    /// is unknown, and set `true` when reopening as the retry after an
+    /// unforced removal was refused by git.
     force: bool,
 }
 
@@ -1472,19 +1475,33 @@ impl AlacritreeApp {
         // `git worktree remove`.
         let prunable = wt.prunable || worktree_liveness::is_gone(&wt.path);
         // A missing dir has nothing to be dirty; skip the status probe. A
-        // worktree the git panel has already shown answers from that cache
-        // instead of walking the tree again; a cold one waits on a job so
-        // the dialog opens at once and fills in.
-        let (dirty, dirty_job) = if prunable {
-            (Some(DirtyCounts::default()), None)
-        } else if let Some(cache) = self.git_status.get(&wt.path) {
-            (Some(DirtyCounts::from_status(cache.last())), None)
+        // worktree the git panel has already completed a compute for answers
+        // from that cache instead of walking the tree again — a cache entry
+        // with no compute yet (the panel's first frame for this workspace)
+        // is `GitStatus::default()`, indistinguishable from "known clean",
+        // so it is not read as an answer. A cold one waits on a job so the
+        // dialog opens at once and fills in.
+        //
+        // A resolved dirty count preloads `force` so a known-dirty tree goes
+        // straight to a forced removal, as it always has — the unforced
+        // first attempt is reserved for a genuinely unknown count, where
+        // git's own refusal decides instead.
+        let (dirty, dirty_job, force) = if prunable {
+            (Some(DirtyCounts::default()), None, false)
+        } else if let Some(counts) = self
+            .git_status
+            .get(&wt.path)
+            .filter(|cache| cache.has_status())
+            .map(|cache| DirtyCounts::from_status(cache.last()))
+        {
+            let force = counts.is_dirty();
+            (Some(counts), None, force)
         } else {
             let path = wt.path.clone();
             let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
                 git_status::dirty_counts(&path, blocking)
             });
-            (None, Some(job))
+            (None, Some(job), false)
         };
         self.pending_delete = Some(DeleteRequest {
             project_idx,
@@ -1495,7 +1512,7 @@ impl AlacritreeApp {
             dirty_job,
             prunable,
             delete_branch: true,
-            force: false,
+            force,
         });
     }
 
@@ -7216,6 +7233,11 @@ impl AlacritreeApp {
         if let Some(job) = req.dirty_job.as_ref() {
             match job.poll() {
                 Some(counts) => {
+                    // A known-dirty count preloads `force` so confirming goes
+                    // straight to a forced removal, with the discard warning
+                    // already on screen — the same outcome a warm cache gets
+                    // at request time, just landing a frame later.
+                    req.force = counts.is_dirty();
                     req.dirty = Some(counts);
                     req.dirty_job = None;
                 },
@@ -7745,10 +7767,11 @@ impl AlacritreeApp {
                 delete_branch: req.delete_branch,
             }
         } else {
-            // Let git decide: attempt unforced and read its refusal, rather
-            // than trusting a dirty count that may be stale or still
-            // unresolved. `poll_pending_deletes` retries with `force: true`
-            // if git refuses because the tree has work in it.
+            // `req.force` already reflects a resolved dirty count (set in
+            // `request_worktree_delete` or when its probe landed); a count
+            // that never resolved before the confirm leaves it `false`, and
+            // `poll_pending_deletes` retries with `force: true` once git
+            // itself refuses the tree as dirty.
             wt::DeleteJob::Remove {
                 worktree_path: req.worktree_path,
                 branch: req.branch,
@@ -7821,18 +7844,29 @@ impl AlacritreeApp {
         for f in finished {
             match f.result {
                 Ok(()) => {},
+                // Only opens the retry when no confirm is currently on
+                // screen — reopening unconditionally would swap the dialog
+                // contents under a user looking at an unrelated confirm
+                // (same modal id, so an in-flight Enter would force-delete
+                // the wrong worktree), and a second refusal landing in this
+                // same batch would silently overwrite the first retry
+                // instead of surfacing it.
                 Err(e) if !f.prunable && refused_for_unsaved_work(&e) => {
-                    self.pending_delete = Some(DeleteRequest {
-                        project_idx: f.project_idx,
-                        worktree_path: f.worktree_path,
-                        worktree_name: f.worktree_name,
-                        branch: f.branch,
-                        dirty: f.dirty,
-                        dirty_job: None,
-                        prunable: false,
-                        delete_branch: f.delete_branch,
-                        force: true,
-                    });
+                    if self.pending_delete.is_none() {
+                        self.pending_delete = Some(DeleteRequest {
+                            project_idx: f.project_idx,
+                            worktree_path: f.worktree_path,
+                            worktree_name: f.worktree_name,
+                            branch: f.branch,
+                            dirty: f.dirty,
+                            dirty_job: None,
+                            prunable: false,
+                            delete_branch: f.delete_branch,
+                            force: true,
+                        });
+                    } else {
+                        self.error_dialog = Some(format!("Delete failed.\n\n{e}"));
+                    }
                 },
                 Err(e) => {
                     let action = if f.prunable { "Prune" } else { "Delete" };

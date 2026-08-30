@@ -195,6 +195,14 @@ impl StatusCache {
         &self.last
     }
 
+    /// Whether a compute has ever landed. A cache entry exists the moment the
+    /// git panel first renders a workspace, before its first background
+    /// compute finishes — `last()` answers `GitStatus::default()` (all-zero
+    /// counts) until then, which callers must not read as "known clean".
+    pub fn has_status(&self) -> bool {
+        self.last_refreshed.is_some()
+    }
+
     /// Returns the most recent known status, kicking off a background refresh
     /// when stale or when the default-branch hint changed since the last
     /// completed compute.  Never blocks the caller.
@@ -707,6 +715,29 @@ mod tests {
             assert!(Instant::now() < deadline, "pending was never cleared after the job failed");
             std::thread::yield_now();
         }
+    }
+
+    /// The regression this guards: a cache entry exists from the moment the
+    /// git panel first renders a workspace, before its first compute lands
+    /// -- `has_status` must read `false` for that entry so a caller deciding
+    /// whether to trust `last()` doesn't mistake "never checked" for "known
+    /// clean" (an all-zero `GitStatus::default()`).
+    #[test]
+    fn has_status_is_false_until_a_compute_lands() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let repo = crate::test_util::init_repo(dir.path());
+        drop(repo);
+
+        let ctx = egui::Context::default();
+        let mut cache = StatusCache::new(dir.path().to_path_buf());
+        assert!(!cache.has_status(), "a fresh cache has never completed a compute");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cache.has_status() && Instant::now() < deadline {
+            let _ = cache.poll(None, &ctx);
+            std::thread::yield_now();
+        }
+        assert!(cache.has_status(), "the background compute never landed");
     }
 
     #[test]
