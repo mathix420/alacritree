@@ -76,8 +76,7 @@ jobs:
 
       # Clippy rather than a plain check, for the same reason as the Windows
       # job: the macOS arms of links.rs and session.rs are lint-visible nowhere
-      # else. --all-targets covers session.rs's macOS-only test, which the
-      # check this replaces never compiled.
+      # else.  --all-targets is what reaches session.rs's macOS-only test.
       - name: Clippy
         run: cargo clippy -p alacritree --all-targets --locked --no-deps -- -D clippy::disallowed_methods
 
