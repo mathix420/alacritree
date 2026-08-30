@@ -166,6 +166,7 @@ pub fn open(uri: &str) -> jobs::Job<()> {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(clippy::disallowed_methods)] // Running the process is this function's job.
 fn spawn(uri: &str, _blocking: &jobs::Blocking) -> std::io::Result<()> {
     Command::new("open")
         .hide_console()
@@ -178,6 +179,7 @@ fn spawn(uri: &str, _blocking: &jobs::Blocking) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "windows")]
+#[allow(clippy::disallowed_methods)] // Running the process is this function's job.
 fn spawn(uri: &str, _blocking: &jobs::Blocking) -> std::io::Result<()> {
     // `start` treats its first quoted argument as a window title, so pass an
     // empty title before the URL to keep `cmd` from eating it.
@@ -193,6 +195,7 @@ fn spawn(uri: &str, _blocking: &jobs::Blocking) -> std::io::Result<()> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[allow(clippy::disallowed_methods)] // Running the process is this function's job.
 fn spawn(uri: &str, _blocking: &jobs::Blocking) -> std::io::Result<()> {
     Command::new("xdg-open")
         .hide_console()

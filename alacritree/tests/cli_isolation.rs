@@ -3,6 +3,10 @@
 //! Every check here is about which *process* does what, which no in-crate test
 //! can observe: the crate is binary-only, so these drive the real executable.
 
+// These tests exist to drive the real executable, so running and waiting on
+// it is the point.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

@@ -7,6 +7,9 @@
 //! rewrites the file instead of failing, so the run that catches the drift is
 //! also the one that fixes it.
 
+// The generated schema comes from running the real executable.
+#![allow(clippy::disallowed_methods)]
+
 use std::path::PathBuf;
 use std::process::Command;
 

@@ -491,6 +491,8 @@ fn default_branch_from_batch(
 }
 
 #[cfg(test)]
+// Fixtures drive real processes and wait on them; no frame is pending.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::command_ext::CommandExt as _;

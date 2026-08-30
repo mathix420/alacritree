@@ -254,6 +254,7 @@ fn registry_distros() -> Option<Vec<WslDistro>> {
 }
 
 #[cfg(windows)]
+#[allow(clippy::disallowed_methods)] // Running wsl.exe is this function's job.
 fn cli_distros(_blocking: &jobs::Blocking) -> Vec<WslDistro> {
     let output = command_bare()
         .args(["-l", "-q"])
@@ -336,6 +337,7 @@ pub const SECTION_SEP: &[u8] = b"\n@@ALACRITREE@@\n";
 /// wsl.exe round trip (~400 ms warm on a dev machine, seconds while the VM
 /// cold-boots) — callers batch every query for a repo into a single script
 /// and must never call this on the UI thread.
+#[allow(clippy::disallowed_methods)] // Running wsl.exe is this function's job.
 pub fn run_batch(
     distro: &str,
     script: &str,
@@ -395,6 +397,7 @@ pub fn discover_delta(distro: &str, blocking: &jobs::Blocking) -> Option<String>
 ///
 /// Program names are interpolated into the script, so they must be literals —
 /// nothing a user typed belongs here.
+#[allow(clippy::disallowed_methods)] // Running wsl.exe is this function's job.
 pub fn probe_tools(
     distro: &str,
     programs: &[&str],

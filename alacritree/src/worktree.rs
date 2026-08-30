@@ -187,6 +187,7 @@ fn git_path_arg(repo: &Path, path: &Path) -> Result<String, String> {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // Running git is this function's job.
 fn run_git(cwd: &Path, args: &[&str]) -> Result<(), String> {
     let output = git_command(cwd)
         .args(args)
@@ -203,6 +204,7 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<(), String> {
     Err(format!("git {}: {msg}", args.join(" ")))
 }
 
+#[allow(clippy::disallowed_methods)] // Running git is this function's job.
 fn has_remote(cwd: &Path, name: &str) -> bool {
     git_command(cwd)
         .args(["remote", "get-url", name])
@@ -217,6 +219,7 @@ fn has_remote(cwd: &Path, name: &str) -> bool {
 /// short names, in git's ref order.  Shells out through [`git_command`]
 /// rather than using git2 so WSL worktrees resolve the same way everything
 /// else in this module does.
+#[allow(clippy::disallowed_methods)] // Running git is this function's job.
 pub fn list_branches(cwd: &Path, _blocking: &jobs::Blocking) -> Result<Vec<String>, String> {
     let output = git_command(cwd)
         .args(["for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes/origin"])
@@ -284,6 +287,7 @@ fn resolve_base_branch(cwd: &Path, hint: Option<&str>) -> Result<(String, String
     Err(tried)
 }
 
+#[allow(clippy::disallowed_methods)] // Running git is this function's job.
 fn rev_parse_verify(cwd: &Path, name: &str) -> bool {
     git_command(cwd)
         .args(["rev-parse", "--verify", "--quiet", name])
@@ -298,6 +302,7 @@ fn rev_parse_verify(cwd: &Path, name: &str) -> bool {
 ///   ref: refs/heads/main\tHEAD
 ///   <sha>\tHEAD
 /// We pull the `refs/heads/<name>` from the symref line.
+#[allow(clippy::disallowed_methods)] // Running git is this function's job.
 fn query_origin_head(cwd: &Path) -> Option<String> {
     let output = git_command(cwd)
         .args(["ls-remote", "--symref", "origin", "HEAD"])
@@ -565,6 +570,8 @@ pub fn prune_worktree(
 }
 
 #[cfg(test)]
+// Fixtures drive real processes and wait on them; no frame is pending.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::thread;
 

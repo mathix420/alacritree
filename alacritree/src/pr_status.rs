@@ -363,6 +363,7 @@ fn pr_state(state: &str, is_draft: bool) -> PrState {
 /// `origin` is a personal fork therefore finds nothing.  `--head` filters on
 /// the head ref name alone, which both layouts share, and `--state all` keeps
 /// the merged and closed badges that `pr list` would otherwise drop.
+#[allow(clippy::disallowed_methods)] // Running `gh` is this function's job.
 fn query_gh(path: &Path, branch: &str, blocking: &jobs::Blocking) -> Option<PrInfo> {
     const PR_JSON_FIELDS: &str = "number,baseRefName,url,state,isDraft,headRepositoryOwner";
     // `--head` matches the ref name in every head repository and `--state all`

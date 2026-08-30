@@ -1,0 +1,12 @@
+# The `jobs::Blocking` token guards the helpers that block, but nothing stops a
+# handler running a process inline, where no helper is involved.  Clippy reads
+# the nearest config walking up from the crate it is linting, so this lives
+# beside alacritree's own manifest rather than at the workspace root: the
+# vendored alacritty crates are `#![deny(clippy::all)]`, and a rule that reached
+# them would turn their process spawns into errors we are not allowed to fix.
+
+disallowed-methods = [
+  { path = "std::process::Command::output", reason = "waiting on a process can hold the UI thread for an unknown duration; submit a job with alacritree::jobs" },
+  { path = "std::process::Command::status", reason = "waiting on a process can hold the UI thread for an unknown duration; submit a job with alacritree::jobs" },
+  { path = "std::process::Command::spawn", reason = "spawning a process can hold the UI thread for an unknown duration; submit a job with alacritree::jobs" },
+]

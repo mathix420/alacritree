@@ -115,6 +115,7 @@ fn all_scopes(blocking: &jobs::Blocking) -> Option<Scopes> {
 /// Run doppler with `args`, returning stdout on success and `None` on any
 /// failure — including the binary not being installed, which is the common
 /// case and must stay quiet.
+#[allow(clippy::disallowed_methods)] // Running the doppler CLI is this function's job.
 fn run(args: &[&str], scope: Option<&Path>, _blocking: &jobs::Blocking) -> Option<Vec<u8>> {
     let mut cmd = Command::new("doppler");
     cmd.hide_console()

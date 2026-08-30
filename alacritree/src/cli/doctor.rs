@@ -173,6 +173,9 @@ fn doppler_configured() -> bool {
 
 /// `gh` present but logged out fails exactly the way a missing `gh` does —
 /// silently — so it needs saying separately.
+// The report's job is to run the tools it reports on, from a CLI with no
+// window to stall.
+#[allow(clippy::disallowed_methods)]
 fn gh_auth_check() -> Option<Check> {
     locate("gh")?;
     let authenticated = Command::new("gh")
@@ -616,6 +619,7 @@ fn find(program: &str) -> Option<Found> {
 
 /// A tool that is on PATH but broken (a shim, a half-installed package) fails
 /// here rather than reporting a version, which is worth knowing on its own.
+#[allow(clippy::disallowed_methods)] // Running the tool is how its version is read.
 fn version_of(program: &Path) -> Option<String> {
     let output = Command::new(program)
         .hide_console()
