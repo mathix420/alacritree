@@ -67,11 +67,15 @@ pub fn validate_branch_name(name: &str) -> Result<(), String> {
 /// the create before it starts.
 pub fn spawn_create(req: CreateRequest, ctx: egui::Context) -> (Receiver<Progress>, jobs::Job<()>) {
     let (tx, rx) = mpsc::channel();
-    let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
-        let result = create(&req, |step| {
-            let _ = tx.send(Progress::Step(step.to_string()));
-            ctx.request_repaint();
-        });
+    let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
+        let result = create(
+            &req,
+            |step| {
+                let _ = tx.send(Progress::Step(step.to_string()));
+                ctx.request_repaint();
+            },
+            blocking,
+        );
         let _ = tx.send(Progress::Done(result));
         ctx.request_repaint();
     });
@@ -81,9 +85,13 @@ pub fn spawn_create(req: CreateRequest, ctx: egui::Context) -> (Receiver<Progres
 /// Create the worktree on the calling thread, reporting each step as it starts.
 ///
 /// Nothing here needs a window, so callers without one (the CLI, with no
-/// running app to talk to) drive this directly rather than through
-/// [`spawn_create`].
-pub fn create(req: &CreateRequest, mut on_step: impl FnMut(&str)) -> Result<PathBuf, String> {
+/// running app to talk to) drive this directly through [`jobs::on_this_thread`]
+/// rather than through [`spawn_create`].
+pub fn create(
+    req: &CreateRequest,
+    mut on_step: impl FnMut(&str),
+    blocking: &jobs::Blocking,
+) -> Result<PathBuf, String> {
     let send = &mut on_step;
 
     send("Syncing with remote…");
@@ -122,7 +130,7 @@ pub fn create(req: &CreateRequest, mut on_step: impl FnMut(&str)) -> Result<Path
         send("Enabled Claude Code terminal bell");
     }
 
-    let linked = crate::doppler::mirror_scopes(&req.project_root, &target);
+    let linked = crate::doppler::mirror_scopes(&req.project_root, &target, blocking);
     if linked > 0 {
         send(&format!("Linked {linked} Doppler scope(s)"));
     }
@@ -462,6 +470,7 @@ pub fn delete_worktree(
     worktree_path: &Path,
     branch: Option<&str>,
     force: bool,
+    blocking: &jobs::Blocking,
 ) -> Result<(), String> {
     let path_arg = git_path_arg(project_root, worktree_path)?;
     // Resolve before removal: canonicalize needs the directory to still
@@ -478,7 +487,7 @@ pub fn delete_worktree(
         // Branch may already be gone (e.g. detached HEAD) — ignore errors here.
         let _ = run_git(project_root, &["branch", "-D", branch]);
     }
-    let cleaned = crate::doppler::forget_scopes(&scope_root);
+    let cleaned = crate::doppler::forget_scopes(&scope_root, blocking);
     if cleaned > 0 {
         log::info!("dropped {cleaned} doppler scope(s) under {}", scope_root.display());
     }
@@ -503,10 +512,10 @@ pub fn spawn_delete(
     job: DeleteJob,
     ctx: egui::Context,
 ) -> jobs::Job<Result<(), String>> {
-    jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
+    jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
         let result = match job {
             DeleteJob::Remove { worktree_path, branch, force } => {
-                delete_worktree(&project_root, &worktree_path, branch.as_deref(), force)
+                delete_worktree(&project_root, &worktree_path, branch.as_deref(), force, blocking)
             },
             DeleteJob::Prune { worktree_name, branch, delete_branch } => {
                 prune_worktree(&project_root, &worktree_name, branch.as_deref(), delete_branch)

@@ -532,6 +532,9 @@ pub struct AlacritreeApp {
     /// Worktrees already given a Doppler scope pass this app run, so opening
     /// more shells there doesn't re-invoke the doppler CLI.
     doppler_synced: HashSet<PathBuf>,
+    /// Submitted syncs, held so dropping the handle does not cancel them, and
+    /// drained once a frame.
+    doppler_syncs: Vec<jobs::Job<()>>,
     pending_session_close: Option<SessionId>,
     notify_rx: Receiver<SessionId>,
     /// Requests from IPC connection threads, drained once per frame.
@@ -917,6 +920,7 @@ impl AlacritreeApp {
             pending_base_branch: None,
             pending_project_remove: None,
             doppler_synced: HashSet::new(),
+            doppler_syncs: Vec::new(),
             pending_session_close: None,
             notify_rx,
             ipc_rx,
@@ -1172,8 +1176,13 @@ impl AlacritreeApp {
                     format!("worktree is no longer checked out: {}", dir.display()),
                 ));
             }
-            // Before the PTY exists, so the shell can't race `doppler run`
-            // against the scope write.
+            // Called synchronously, before the PTY exists, so the
+            // once-per-worktree guard is set before a second rapid spawn for
+            // the same worktree can see it unset. The scope mirror itself
+            // runs off-thread, so a shell in a worktree git already knows
+            // about can still start before the mirrored scopes land, racing
+            // `doppler run` against the write. That costs one retryable
+            // "You must specify a project" failure, not lost work.
             self.sync_doppler_scopes(dir.clone());
         }
         let session = Session::spawn(
@@ -1247,10 +1256,13 @@ impl AlacritreeApp {
         let Some(main_checkout) = main_checkout else {
             return;
         };
-        let linked = doppler::mirror_scopes(&main_checkout, &worktree);
-        if linked > 0 {
-            log::info!("linked {linked} doppler scope(s) into {}", worktree.display());
-        }
+        let worktree_for_log = worktree.clone();
+        self.doppler_syncs.push(jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
+            let linked = doppler::mirror_scopes(&main_checkout, &worktree, blocking);
+            if linked > 0 {
+                log::info!("linked {linked} doppler scope(s) into {}", worktree_for_log.display());
+            }
+        }));
     }
 
     /// Spawn a named profile into the current workspace, bypassing the
@@ -8716,6 +8728,13 @@ impl eframe::App for AlacritreeApp {
         self.pr_cache.drain_completed();
         self.poll_pending_deletes(ctx);
         self.poll_pending_creates(ctx);
+        // Poll first, then check `failed`: a panicked sync's `poll` returns
+        // `None` forever, so `failed` is what stops its handle from sitting
+        // here for the rest of the process.
+        self.doppler_syncs.retain(|job| match job.poll() {
+            Some(()) => false,
+            None => !job.failed(),
+        });
         self.phases.mark("polls");
         let modal_open = self.is_modal_open();
         // Keys pressed mid-composition drive the IME's candidate window,

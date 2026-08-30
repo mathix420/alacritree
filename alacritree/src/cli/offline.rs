@@ -140,7 +140,9 @@ fn create_worktree(project_root: PathBuf, branch: String) -> IpcResult {
     wt::validate_branch_name(&branch)?;
     let request = CreateRequest { project_root, default_branch: None, branch, base_dir: None };
     let mut steps = Vec::new();
-    let path = wt::create(&request, |step| steps.push(step.to_string()))?;
+    let path = jobs::on_this_thread(|blocking| {
+        wt::create(&request, |step| steps.push(step.to_string()), blocking)
+    })?;
     Ok(json!({ "path": path, "steps": steps }))
 }
 
