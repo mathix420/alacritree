@@ -606,12 +606,19 @@ struct DeleteRequest {
     worktree_path: PathBuf,
     worktree_name: String,
     branch: Option<String>,
-    dirty: DirtyCounts,
+    /// `None` until a count lands. The cache answers for a worktree the git
+    /// panel has shown; one never selected has to wait for the job.
+    dirty: Option<DirtyCounts>,
+    /// Fills `dirty` when the cache was cold.
+    dirty_job: Option<jobs::Job<DirtyCounts>>,
     /// The checkout dir is already gone; confirm prunes metadata instead of
     /// removing a directory.
     prunable: bool,
     /// Checkbox state for the prune dialog's "also delete branch".
     delete_branch: bool,
+    /// Set when this confirm is the retry after an unforced `git worktree
+    /// remove` refused a dirty tree — the retry passes `--force`.
+    force: bool,
 }
 
 /// An in-flight background delete/prune awaiting its git result.
@@ -619,6 +626,10 @@ struct DeleteTask {
     project_idx: usize,
     /// Marks the matching sidebar row with a spinner while the removal runs.
     worktree_path: PathBuf,
+    worktree_name: String,
+    branch: Option<String>,
+    dirty: Option<DirtyCounts>,
+    delete_branch: bool,
     /// Distinguishes the "prune" vs "delete" wording in a failure message.
     prunable: bool,
     job: jobs::Job<Result<(), String>>,
@@ -1460,19 +1471,31 @@ impl AlacritreeApp {
         // refresh should still get the prune flow, not a doomed
         // `git worktree remove`.
         let prunable = wt.prunable || worktree_liveness::is_gone(&wt.path);
+        // A missing dir has nothing to be dirty; skip the status probe. A
+        // worktree the git panel has already shown answers from that cache
+        // instead of walking the tree again; a cold one waits on a job so
+        // the dialog opens at once and fills in.
+        let (dirty, dirty_job) = if prunable {
+            (Some(DirtyCounts::default()), None)
+        } else if let Some(cache) = self.git_status.get(&wt.path) {
+            (Some(DirtyCounts::from_status(cache.last())), None)
+        } else {
+            let path = wt.path.clone();
+            let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
+                git_status::dirty_counts(&path, blocking)
+            });
+            (None, Some(job))
+        };
         self.pending_delete = Some(DeleteRequest {
             project_idx,
             worktree_path: wt.path.clone(),
             worktree_name: wt.name.clone(),
             branch: wt.branch.clone(),
-            // A missing dir has nothing to be dirty; skip the status probe.
-            dirty: if prunable {
-                DirtyCounts::default()
-            } else {
-                git_status::dirty_counts(&wt.path)
-            },
+            dirty,
+            dirty_job,
             prunable,
             delete_branch: true,
+            force: false,
         });
     }
 
@@ -4748,9 +4771,29 @@ fn profile_shell(profile: &crate::config::Profile) -> Shell {
     Shell::new(profile.program.clone(), profile.args.clone())
 }
 
-fn dirty_warning(counts: &DirtyCounts) -> Option<String> {
+/// `git worktree remove` refuses a tree with work in it, and that refusal is
+/// the authority on whether removing would lose anything. The wording is
+/// git's, so match the stable fragments rather than the whole sentence.
+fn refused_for_unsaved_work(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("contains modified or untracked files") || message.contains("is dirty")
+}
+
+/// `counts` is `None` while the dirty check is still in flight; `force`
+/// reflects whether this confirm would pass `--force` (only the retry after
+/// git has already refused an unforced removal does).
+fn dirty_warning(counts: Option<&DirtyCounts>, force: bool) -> Option<String> {
+    let counts = match counts {
+        None => return Some("Checking working tree for uncommitted changes…".to_string()),
+        Some(counts) => counts,
+    };
     if !counts.is_dirty() {
-        return None;
+        // A forced retry only happens after git itself refused the tree as
+        // dirty; a clean-looking count here is one read before that refusal
+        // went stale, not proof there is nothing to warn about.
+        return force.then(|| {
+            "git reported local changes; they will be discarded with --force.".to_string()
+        });
     }
     let mut parts = Vec::new();
     if counts.staged > 0 {
@@ -4762,10 +4805,12 @@ fn dirty_warning(counts: &DirtyCounts) -> Option<String> {
     if counts.untracked > 0 {
         parts.push(format!("{} untracked", counts.untracked));
     }
-    Some(format!(
-        "Working tree has {} file(s) — they will be discarded with --force.",
-        parts.join(", ")
-    ))
+    let files = parts.join(", ");
+    Some(if force {
+        format!("Working tree has {files} file(s) — they will be discarded with --force.")
+    } else {
+        format!("Working tree has {files} file(s) with local changes.")
+    })
 }
 
 /// The modal frame's horizontal inner margin.  Any width budgeted against the
@@ -7141,6 +7186,20 @@ impl AlacritreeApp {
         let Some(req) = self.pending_delete.as_mut() else {
             return;
         };
+        if let Some(job) = req.dirty_job.as_ref() {
+            match job.poll() {
+                Some(counts) => {
+                    req.dirty = Some(counts);
+                    req.dirty_job = None;
+                },
+                // A panicked probe never lands a count. The confirm no longer
+                // waits on it — `run_pending_delete` never reads `dirty` to
+                // decide `--force` — so drop the handle and leave the dialog
+                // showing "checking…" rather than polling a dead job forever.
+                None if job.failed() => req.dirty_job = None,
+                None => {},
+            }
+        }
         let (title, detail, verb) = if req.prunable {
             (
                 format!("Prune worktree `{}`?", req.worktree_name),
@@ -7158,7 +7217,7 @@ impl AlacritreeApp {
                 "Delete",
             )
         };
-        let warning = dirty_warning(&req.dirty);
+        let warning = dirty_warning(req.dirty.as_ref(), req.force);
 
         let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
 
@@ -7651,6 +7710,8 @@ impl AlacritreeApp {
         // `poll_pending_deletes`; the dialog closes immediately either way and
         // the sidebar row shows a spinner meanwhile.
         let worktree_path = req.worktree_path.clone();
+        let worktree_name = req.worktree_name.clone();
+        let branch = req.branch.clone();
         let delete_job = if req.prunable {
             wt::DeleteJob::Prune {
                 worktree_name: req.worktree_name,
@@ -7658,16 +7719,24 @@ impl AlacritreeApp {
                 delete_branch: req.delete_branch,
             }
         } else {
+            // Let git decide: attempt unforced and read its refusal, rather
+            // than trusting a dirty count that may be stale or still
+            // unresolved. `poll_pending_deletes` retries with `force: true`
+            // if git refuses because the tree has work in it.
             wt::DeleteJob::Remove {
                 worktree_path: req.worktree_path,
                 branch: req.branch,
-                force: req.dirty.is_dirty(),
+                force: req.force,
             }
         };
         let job = wt::spawn_delete(project_root, delete_job, ctx.clone());
         self.pending_deletes.push(DeleteTask {
             project_idx: req.project_idx,
             worktree_path,
+            worktree_name,
+            branch,
+            dirty: req.dirty,
+            delete_branch: req.delete_branch,
             prunable: req.prunable,
             job,
         });
@@ -7675,33 +7744,76 @@ impl AlacritreeApp {
 
     /// Adopt finished background deletes: pop up any failure and refresh the
     /// affected project so the removed worktree (or its spinner) drops out of
-    /// the sidebar.
+    /// the sidebar. A refusal that names a dirty or untracked tree reopens the
+    /// confirm as a forced retry instead of surfacing a plain error — git is
+    /// the authority on whether the removal would lose work, not a count read
+    /// while the user was staring at the first dialog.
     fn poll_pending_deletes(&mut self, ctx: &Context) {
-        let mut finished: Vec<(usize, bool, Result<(), String>)> = Vec::new();
+        struct Finished {
+            project_idx: usize,
+            worktree_path: PathBuf,
+            worktree_name: String,
+            branch: Option<String>,
+            dirty: Option<DirtyCounts>,
+            delete_branch: bool,
+            prunable: bool,
+            result: Result<(), String>,
+        }
+        let mut finished: Vec<Finished> = Vec::new();
         self.pending_deletes.retain(|task| match task.job.poll() {
             Some(result) => {
-                finished.push((task.project_idx, task.prunable, result));
+                finished.push(Finished {
+                    project_idx: task.project_idx,
+                    worktree_path: task.worktree_path.clone(),
+                    worktree_name: task.worktree_name.clone(),
+                    branch: task.branch.clone(),
+                    dirty: task.dirty,
+                    delete_branch: task.delete_branch,
+                    prunable: task.prunable,
+                    result,
+                });
                 false
             },
             // A panicked delete job never lands a result; without this the
             // sidebar row's spinner would spin forever instead of surfacing
             // a failure.
             None if task.job.failed() => {
-                finished.push((
-                    task.project_idx,
-                    task.prunable,
-                    Err("the background worker panicked".to_string()),
-                ));
+                finished.push(Finished {
+                    project_idx: task.project_idx,
+                    worktree_path: task.worktree_path.clone(),
+                    worktree_name: task.worktree_name.clone(),
+                    branch: task.branch.clone(),
+                    dirty: task.dirty,
+                    delete_branch: task.delete_branch,
+                    prunable: task.prunable,
+                    result: Err("the background worker panicked".to_string()),
+                });
                 false
             },
             None => true,
         });
-        for (project_idx, prunable, result) in finished {
-            if let Err(e) = result {
-                let action = if prunable { "Prune" } else { "Delete" };
-                self.error_dialog = Some(format!("{action} failed.\n\n{e}"));
+        for f in finished {
+            match f.result {
+                Ok(()) => {},
+                Err(e) if !f.prunable && refused_for_unsaved_work(&e) => {
+                    self.pending_delete = Some(DeleteRequest {
+                        project_idx: f.project_idx,
+                        worktree_path: f.worktree_path,
+                        worktree_name: f.worktree_name,
+                        branch: f.branch,
+                        dirty: f.dirty,
+                        dirty_job: None,
+                        prunable: false,
+                        delete_branch: f.delete_branch,
+                        force: true,
+                    });
+                },
+                Err(e) => {
+                    let action = if f.prunable { "Prune" } else { "Delete" };
+                    self.error_dialog = Some(format!("{action} failed.\n\n{e}"));
+                },
             }
-            self.refresh_project(ctx, project_idx);
+            self.refresh_project(ctx, f.project_idx);
         }
     }
 

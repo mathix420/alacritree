@@ -69,12 +69,21 @@ impl DirtyCounts {
     pub fn is_dirty(&self) -> bool {
         self.staged + self.modified + self.untracked > 0
     }
+
+    /// Derive the delete modal's counts from a status the git panel already
+    /// polled, so opening the dialog costs no repository walk.
+    pub fn from_status(status: &GitStatus) -> Self {
+        let untracked = status.unstaged.iter().filter(|c| c.kind == ChangeKind::Untracked).count();
+        Self { staged: status.staged.len(), modified: status.unstaged.len() - untracked, untracked }
+    }
 }
 
-/// Cheap dirty check used by the delete modal: avoids the branch-diff work
-/// that `compute` does, since we only need to know whether `git worktree
-/// remove` will refuse the path.
-pub fn dirty_counts(path: &Path) -> DirtyCounts {
+/// Cheap dirty check used by the delete modal when the git panel has never
+/// polled this worktree: avoids the branch-diff work that `compute` does,
+/// since we only need to know whether `git worktree remove` will refuse the
+/// path. Takes `&jobs::Blocking` because it shells out — call it from a pool
+/// job, never from the UI thread.
+pub fn dirty_counts(path: &Path, _blocking: &jobs::Blocking) -> DirtyCounts {
     match wsl::classify(path) {
         wsl::Location::Wsl { distro, linux_path } => dirty_counts_wsl(&distro, &linux_path),
         wsl::Location::Windows(_) => dirty_counts_git2(path),
@@ -113,9 +122,8 @@ fn dirty_counts_git2(path: &Path) -> DirtyCounts {
     counts
 }
 
-/// Counts from one porcelain-v2 round trip.  Called synchronously when the
-/// delete modal opens — a warm wsl.exe call (~400 ms) is a tolerable
-/// one-shot stall for an explicit destructive action.
+/// Counts from one porcelain-v2 round trip, run on a pool worker so a warm
+/// wsl.exe call (~400 ms) never stalls paint.
 fn dirty_counts_wsl(distro: &str, linux_path: &str) -> DirtyCounts {
     let Ok(stdout) =
         wsl::run_batch(distro, r#"git -C "$1" status --porcelain=v2 -z 2>/dev/null"#, &[
@@ -699,6 +707,28 @@ mod tests {
             assert!(Instant::now() < deadline, "pending was never cleared after the job failed");
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn dirty_counts_come_from_a_status_the_panel_already_has() {
+        let status = GitStatus {
+            branch: Some("main".into()),
+            default_branch: None,
+            default_branch_resolved: None,
+            staged: vec![FileChange { path: "a".into(), kind: ChangeKind::Added }],
+            unstaged: vec![
+                FileChange { path: "b".into(), kind: ChangeKind::Modified },
+                FileChange { path: "c".into(), kind: ChangeKind::Untracked },
+                FileChange { path: "d".into(), kind: ChangeKind::Untracked },
+            ],
+            branch_diff: Vec::new(),
+            error: None,
+        };
+        let counts = DirtyCounts::from_status(&status);
+        assert_eq!(counts.staged, 1);
+        assert_eq!(counts.modified, 1);
+        assert_eq!(counts.untracked, 2);
+        assert!(counts.is_dirty());
     }
 
     #[test]
