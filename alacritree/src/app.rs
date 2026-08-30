@@ -1743,20 +1743,6 @@ impl AlacritreeApp {
         self.persist_project(&path);
     }
 
-    /// Put a project in the sidebar, discovering its worktrees.  A project that
-    /// is already there is left alone rather than duplicated, so callers that
-    /// cannot see the sidebar (IPC) need not check first.  WSL roots discover
-    /// synchronously here (no `ctx` for a worker); callers holding one use
-    /// `add_project_off_thread`.
-    fn add_project(&mut self, path: PathBuf) -> &Project {
-        if let Some(idx) = self.projects.iter().position(|p| p.root == path) {
-            return &self.projects[idx];
-        }
-        self.projects.push(Project::discover(path.clone(), self.config.ui.upstream_status).project);
-        self.persist_project(&path);
-        self.projects.last().expect("just pushed")
-    }
-
     /// Tint whichever region a drop would land on while files are hovering, so
     /// three targets do not become a guessing game.  Silent off Windows: no
     /// cursor position is available there, so the tint would be a lie.
@@ -8507,12 +8493,20 @@ impl AlacritreeApp {
         for call in calls {
             let ipc::AppCall { request, reply_tx } = call;
             // Discovery is far too slow to run here, and the caller still has
-            // to be answered from the refreshed list rather than the stale
-            // one, so this request owns its reply channel until then.
-            if let ipc::IpcRequest::RefreshProject { root } = request {
-                self.defer_project_refresh(ctx, root, reply_tx);
-                continue;
-            }
+            // to be answered from the discovered list rather than the stale
+            // one (or the placeholder), so these requests own their reply
+            // channel until it lands.
+            let request = match request {
+                ipc::IpcRequest::RefreshProject { root } => {
+                    self.defer_project_refresh(ctx, root, reply_tx);
+                    continue;
+                },
+                ipc::IpcRequest::AddProject { path } => {
+                    self.defer_project_add(ctx, path, reply_tx);
+                    continue;
+                },
+                other => other,
+            };
             let name = request.name();
             let started = std::time::Instant::now();
             let result = self.handle_ipc_request(ctx, request);
@@ -8535,6 +8529,26 @@ impl AlacritreeApp {
         };
         self.refresh_project(ctx, idx);
         if let Some(reply_tx) = self.project_refreshes.watch(&root, reply_tx) {
+            let _ = reply_tx.send(Ok(project_json(&self.projects[idx])));
+        }
+    }
+
+    /// A project that is already in the sidebar is answered from the list as
+    /// it stands; a new one goes in as a placeholder and its discovery runs on
+    /// a worker, so the reply waits for that rather than describing worktrees
+    /// nothing has looked for yet.
+    fn defer_project_add(
+        &mut self,
+        ctx: &Context,
+        path: PathBuf,
+        reply_tx: mpsc::Sender<ipc::IpcResult>,
+    ) {
+        self.add_project_off_thread(ctx, path.clone());
+        let Some(idx) = self.projects.iter().position(|p| p.root == path) else {
+            let _ = reply_tx.send(Err(format!("{} could not be added", path.display())));
+            return;
+        };
+        if let Some(reply_tx) = self.project_refreshes.watch(&path, reply_tx) {
             let _ = reply_tx.send(Ok(project_json(&self.projects[idx])));
         }
     }
@@ -8641,8 +8655,9 @@ impl AlacritreeApp {
             // Claimed by `process_ipc_calls` before dispatch: the reply is
             // held until the background discovery lands, which needs the
             // reply channel this method does not have.
-            Req::RefreshProject { .. } => Err("refresh was not deferred".to_string()),
-            Req::AddProject { path } => Ok(project_json(self.add_project(path))),
+            Req::RefreshProject { .. } | Req::AddProject { .. } => {
+                Err("discovery was not deferred".to_string())
+            },
             Req::RemoveProject { root } => {
                 let idx =
                     self.projects.iter().position(|p| p.root == root).ok_or_else(|| {
