@@ -195,12 +195,16 @@ impl StatusCache {
         &self.last
     }
 
-    /// Whether a compute has ever landed. A cache entry exists the moment the
-    /// git panel first renders a workspace, before its first background
-    /// compute finishes — `last()` answers `GitStatus::default()` (all-zero
-    /// counts) until then, which callers must not read as "known clean".
+    /// Whether a compute has landed and actually knows the tree. A cache
+    /// entry exists the moment the git panel first renders a workspace,
+    /// before its first background compute finishes — `last()` answers
+    /// `GitStatus::default()` (all-zero counts) until then, which callers
+    /// must not read as "known clean". A compute that landed but failed
+    /// (`error: Some(..)`, e.g. the repository could not be opened) is the
+    /// same "don't know" case: it still sets `last_refreshed` so `poll`
+    /// doesn't retry every frame, but it answers `false` here too.
     pub fn has_status(&self) -> bool {
-        self.last_refreshed.is_some()
+        self.last_refreshed.is_some() && self.last.error.is_none()
     }
 
     /// Returns the most recent known status, kicking off a background refresh
@@ -738,6 +742,28 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(cache.has_status(), "the background compute never landed");
+    }
+
+    /// The regression this guards: a compute that lands but fails to open
+    /// the repository still sets `last_refreshed` (so `poll` doesn't retry
+    /// every frame), which must not let `has_status` read it as a known,
+    /// clean tree -- a caller deciding whether to force a destructive action
+    /// needs "don't know" to stay "don't know" through this path too.
+    #[test]
+    fn has_status_is_false_for_an_errored_compute() {
+        // Not a git repository, so `compute` lands an error rather than a
+        // status.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let ctx = egui::Context::default();
+        let mut cache = StatusCache::new(dir.path().to_path_buf());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while cache.last().error.is_none() && Instant::now() < deadline {
+            let _ = cache.poll(None, &ctx);
+            std::thread::yield_now();
+        }
+        assert!(cache.last().error.is_some(), "the background compute never landed an error");
+        assert!(!cache.has_status(), "an errored compute must not read as a known status");
     }
 
     #[test]
