@@ -696,12 +696,12 @@ impl FaceMetrics {
 /// file engineered to be broken in exactly one way.
 fn resolve_fallbacks(raw: FaceMetrics) -> FaceMetrics {
     let defaults = FaceMetrics::default();
-    let ascender = nonzero(raw.ascender).unwrap_or(defaults.ascender);
+    let ascender = correctly_signed(raw.ascender, true).unwrap_or(defaults.ascender);
     let underline_thickness =
         nonzero(raw.underline_thickness).unwrap_or(defaults.underline_thickness);
     FaceMetrics {
         ascender,
-        descender: nonzero(raw.descender).unwrap_or(defaults.descender),
+        descender: correctly_signed(raw.descender, false).unwrap_or(defaults.descender),
         underline_position: nonzero(raw.underline_position).unwrap_or(defaults.underline_position),
         underline_thickness,
         strikeout_position: nonzero(raw.strikeout_position)
@@ -712,6 +712,15 @@ fn resolve_fallbacks(raw: FaceMetrics) -> FaceMetrics {
 
 fn nonzero(value: f32) -> Option<f32> {
     (value != 0.0 && value.is_finite()).then_some(value)
+}
+
+/// Like `nonzero`, but for a field whose downstream math assumes a sign: a
+/// face reporting a non-negative descender or a non-positive ascender passes
+/// the zero check yet still inverts the geometry that reads it, since zero is
+/// not the only value that means "not supplied" for these two.
+fn correctly_signed(value: f32, positive: bool) -> Option<f32> {
+    let sign_ok = if positive { value > 0.0 } else { value < 0.0 };
+    (sign_ok && value.is_finite()).then_some(value)
 }
 
 /// Scale a fallback face so one point of it is as tall as one point of the
@@ -2598,6 +2607,27 @@ mod tests {
         let fixed = resolve_fallbacks(broken);
         assert_eq!(fixed.underline_position, FaceMetrics::default().underline_position);
         assert_eq!(fixed.underline_thickness, FaceMetrics::default().underline_thickness);
+    }
+
+    /// A non-negative descender passes the "is it zero" check but still
+    /// inverts `descent` downstream, so it needs its own rejection.
+    #[test]
+    fn a_positive_descender_falls_back_to_the_default() {
+        let broken = FaceMetrics { descender: 0.2, ..FaceMetrics::default() };
+        let fixed = resolve_fallbacks(broken);
+        assert_eq!(fixed.descender, FaceMetrics::default().descender);
+    }
+
+    /// A non-positive ascender passes the "is it zero" check but still flips
+    /// `px_per_em` downstream.  The rejection also has to feed the *default*
+    /// ascender into the strikeout-position fallback, not the rejected value.
+    #[test]
+    fn a_negative_ascender_falls_back_to_the_default() {
+        let broken =
+            FaceMetrics { ascender: -0.1, strikeout_position: 0.0, ..FaceMetrics::default() };
+        let fixed = resolve_fallbacks(broken);
+        assert_eq!(fixed.ascender, FaceMetrics::default().ascender);
+        assert_eq!(fixed.strikeout_position, FaceMetrics::default().strikeout_position);
     }
 
     /// `[font.normal]` unresolvable means `build_font_definitions` returned
