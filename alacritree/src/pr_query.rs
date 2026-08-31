@@ -63,18 +63,24 @@ pub fn body(query: &str) -> String {
 /// Alias index back to branch, dropping any alias GitHub could not answer.
 /// A partial response is normal here: one request covers a whole project, so
 /// losing all of it because one branch failed would be worse than losing one.
+///
+/// `None` is the response that answered nothing — malformed, or the null
+/// `repository` GitHub returns beside `errors` under an HTTP 200 — and is what
+/// sends a group to the per-branch path.  An empty map is the opposite: a
+/// well-formed answer that no branch in this repository has a PR.  The two
+/// have to stay distinguishable, or the common "nobody here has a PR" answer
+/// costs a per-branch sweep that finds the same nothing.
 pub fn parse(
     stdout: &[u8],
     branches: &[String],
     origin_owner: Option<&str>,
-) -> HashMap<String, PrInfo> {
+) -> Option<HashMap<String, PrInfo>> {
+    let v: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    let repo = v.pointer("/data/repository")?;
+    if repo.is_null() {
+        return None;
+    }
     let mut found = HashMap::new();
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(stdout) else {
-        return found;
-    };
-    let Some(repo) = v.pointer("/data/repository") else {
-        return found;
-    };
     for (i, branch) in branches.iter().enumerate() {
         let Some(nodes) = repo.get(format!("b{i}")).and_then(|a| a.get("nodes")) else {
             continue;
@@ -84,7 +90,7 @@ pub fn parse(
             found.insert(branch.clone(), info);
         }
     }
-    found
+    Some(found)
 }
 
 #[cfg(test)]
@@ -131,9 +137,38 @@ mod tests {
                             "isDraft":false,"headRepositoryOwner":{"login":"me"}}]},
             "b1":null}},
             "errors":[{"message":"something went wrong"}]}"#;
-        let found = parse(stdout, &["main".into(), "topic".into()], Some("me"));
+        let found = parse(stdout, &["main".into(), "topic".into()], Some("me"))
+            .expect("a response carrying a repository is an answer");
         assert_eq!(found.get("main").map(|p| p.number), Some(7));
         assert!(!found.contains_key("topic"));
+    }
+
+    /// "No branch in this repository has a PR" is a real answer, and the
+    /// caller has to be able to tell it from a request that failed: falling
+    /// back on it would spend a `gh pr list` per branch finding the same
+    /// nothing.
+    #[test]
+    fn a_response_with_no_prs_is_still_an_answer() {
+        let stdout = br#"{"data":{"repository":{"b0":{"nodes":[]},"b1":{"nodes":[]}}}}"#;
+        let found = parse(stdout, &["main".into(), "topic".into()], Some("me"));
+        assert_eq!(found, Some(HashMap::new()));
+    }
+
+    /// GitHub answers a query it could not run with HTTP 200, a null
+    /// `repository` and an `errors` list.  Read as "no PRs" that would blank
+    /// every badge in the project until the TTL expired.
+    #[test]
+    fn a_null_repository_is_not_an_answer() {
+        let stdout = br#"{"data":{"repository":null},
+            "errors":[{"message":"Could not resolve to a Repository"}]}"#;
+        assert!(parse(stdout, &["main".into()], Some("me")).is_none());
+    }
+
+    #[test]
+    fn malformed_output_is_not_an_answer() {
+        assert!(parse(b"", &["main".into()], None).is_none());
+        assert!(parse(b"not json", &["main".into()], None).is_none());
+        assert!(parse(b"{}", &["main".into()], None).is_none());
     }
 
     /// A head ref name matches across head repositories, so several PRs can come
@@ -145,7 +180,7 @@ mod tests {
              "isDraft":false,"headRepositoryOwner":{"login":"someone-else"}},
             {"number":2,"baseRefName":"master","url":"b","state":"OPEN",
              "isDraft":false,"headRepositoryOwner":{"login":"me"}}]}}}}"#;
-        let found = parse(stdout, &["main".into()], Some("me"));
+        let found = parse(stdout, &["main".into()], Some("me")).expect("an answer");
         assert_eq!(found.get("main").map(|p| p.number), Some(2));
     }
 }

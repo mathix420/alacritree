@@ -430,7 +430,11 @@ pub fn effective_branch<'a>(
 fn run_due(due: Vec<Member>, blocking: &jobs::Blocking) -> BatchResult {
     let mut out = HashMap::new();
     for group in groups(due, blocking) {
-        let found = query_group(&group, blocking);
+        let found = query_group(
+            &group,
+            |cwd, query| run_graphql(cwd, query, blocking),
+            |m| query_gh(&m.path, &m.branch, blocking),
+        );
         for m in &group.members {
             out.insert(m.path.clone(), found.get(&m.branch).cloned());
         }
@@ -449,9 +453,20 @@ struct Group {
 }
 
 /// One request per repository, chunked, plus one per path that cannot be
-/// grouped.  Reading `origin` costs a git2 open per due path, which is why
-/// this runs on a worker rather than on the frame.
-fn groups(due: Vec<Member>, _blocking: &jobs::Blocking) -> Vec<Group> {
+/// grouped.  Reading `origin` costs a git2 open per due path, and resolving
+/// costs a `gh` process per repository, which is why this runs on a worker
+/// rather than on the frame.
+fn groups(due: Vec<Member>, blocking: &jobs::Blocking) -> Vec<Group> {
+    groups_with(due, |cwd| resolve_repo(cwd, blocking))
+}
+
+/// `resolve` names the repository a group asks about, given any worktree of
+/// it.  Separate from [`groups`] so a test can pin which repository a group
+/// ends up asking without a `gh` process deciding it.
+fn groups_with(
+    due: Vec<Member>,
+    resolve: impl Fn(&Path) -> Option<(String, String)>,
+) -> Vec<Group> {
     let mut by_repo: HashMap<(String, String), Group> = HashMap::new();
     let mut ungrouped = Vec::new();
     for m in due {
@@ -476,7 +491,13 @@ fn groups(due: Vec<Member>, _blocking: &jobs::Blocking) -> Vec<Group> {
     }
     by_repo
         .into_values()
-        .flat_map(|g| {
+        .flat_map(|mut g| {
+            // `origin` says only which worktrees share a repository.  Which
+            // repository to ask is `gh`'s answer, and the two differ on a fork
+            // checkout: `origin` names the fork, while a pull request is listed
+            // under the repository it targets.  One resolve per repository, so
+            // a project's worktrees still cost one process between them.
+            g.slug = resolve(&g.cwd);
             g.members
                 .chunks(pr_query::CHUNK)
                 .map(|c| Group { cwd: g.cwd.clone(), slug: g.slug.clone(), members: c.to_vec() })
@@ -487,26 +508,32 @@ fn groups(due: Vec<Member>, _blocking: &jobs::Blocking) -> Vec<Group> {
 }
 
 /// Ask GitHub about a whole group in one request, falling back to the
-/// per-branch path when there is no batched form or the batched one cannot
-/// answer.  GraphQL can need scopes `gh pr list` does not, so an install that
-/// works today can fail here, and a project's badges must not vanish when it
-/// does.
-fn query_group(group: &Group, blocking: &jobs::Blocking) -> HashMap<String, PrInfo> {
+/// per-branch path when there is no batched form or the request produced no
+/// usable answer.  GraphQL can need scopes `gh pr list` does not, so an
+/// install that works today can fail here, and a project's badges must not
+/// vanish when it does.
+///
+/// An answer naming no PR at all is still an answer and returns as one: a
+/// repository whose branches have no open PRs is the common case, and
+/// sweeping it per branch would find the same nothing at one process each.
+///
+/// `request` and `per_branch` are injected so a test can pin which of the two
+/// paths a given response takes without spawning `gh`.
+fn query_group(
+    group: &Group,
+    request: impl Fn(&Path, &str) -> Option<Vec<u8>>,
+    per_branch: impl Fn(&Member) -> Option<PrInfo>,
+) -> HashMap<String, PrInfo> {
     let branches: Vec<String> = group.members.iter().map(|m| m.branch.clone()).collect();
     if let Some((owner, name)) = &group.slug {
         let query = pr_query::build(owner, name, &branches);
-        if let Some(stdout) = run_graphql(&group.cwd, &query, blocking) {
-            let parsed = pr_query::parse(&stdout, &branches, Some(owner));
-            if !parsed.is_empty() {
+        if let Some(stdout) = request(&group.cwd, &query) {
+            if let Some(parsed) = pr_query::parse(&stdout, &branches, Some(owner)) {
                 return parsed;
             }
         }
     }
-    group
-        .members
-        .iter()
-        .filter_map(|m| query_gh(&m.path, &m.branch, blocking).map(|i| (m.branch.clone(), i)))
-        .collect()
+    group.members.iter().filter_map(|m| per_branch(m).map(|i| (m.branch.clone(), i))).collect()
 }
 
 /// Run one GraphQL document through `gh`, returning its stdout.
@@ -647,9 +674,42 @@ fn split_origin_url_line(stdout: &[u8]) -> (Option<&str>, &[u8]) {
     (url, &stdout[end + 1..])
 }
 
+/// The repository `gh` itself would act on from this worktree, which is the
+/// one holding the pull requests: `origin` on a fork checkout names the fork,
+/// while a pull request opened from it is listed under the repository it
+/// targets.  Asking `gh` rather than reimplementing its resolution also
+/// honours `gh repo set-default` and the `upstream` remote convention.
+///
+/// `None` for anything that does not answer with a GitHub `owner/name`, which
+/// leaves the group on the per-branch path.
+#[allow(clippy::disallowed_methods)] // Running `gh` is this function's job.
+fn resolve_repo(cwd: &Path, _blocking: &jobs::Blocking) -> Option<(String, String)> {
+    let output = command_ext::hidden("gh")
+        .current_dir(cwd)
+        .args(["repo", "view", "--json", "nameWithOwner"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_name_with_owner(&output.stdout)
+}
+
+/// Split `gh repo view --json nameWithOwner` into its two halves.
+fn parse_name_with_owner(stdout: &[u8]) -> Option<(String, String)> {
+    let value: serde_json::Value = serde_json::from_slice(stdout).ok()?;
+    let (owner, name) = value.get("nameWithOwner")?.as_str()?.split_once('/')?;
+    (!owner.is_empty() && !name.is_empty()).then(|| (owner.to_string(), name.to_string()))
+}
+
 /// The GitHub `(owner, repository)` of this worktree's `origin`, read straight
-/// from the repository config.  `None` for a missing, unreadable or non-GitHub
-/// remote, which is what puts a path on the per-branch path.
+/// from the repository config.  This is the grouping key — which worktrees
+/// share a repository — not what the request asks about; `resolve_repo`
+/// decides that.  `None` for a missing, unreadable or non-GitHub remote, which
+/// leaves the path on the per-branch path.
 fn origin_slug(path: &Path) -> Option<(String, String)> {
     let repo = git2::Repository::open(path).ok()?;
     let remote = repo.find_remote("origin").ok()?;
@@ -658,9 +718,10 @@ fn origin_slug(path: &Path) -> Option<(String, String)> {
 
 /// Owner and repository of a GitHub remote URL, for the shapes git accepts:
 /// `https://github.com/owner/repo.git`, `git@github.com:owner/repo.git`, and
-/// the scp-style host alias `gh:owner/repo.git`.  `None` for anything else —
-/// a batched request needs both halves, and an unreadable remote just leaves
-/// the worktree on the per-branch path.
+/// the scp-style host alias `gh:owner/repo.git`.  The `.git` suffix comes off
+/// so that two spellings of one remote group together.  `None` for anything
+/// else — the owner only breaks ties, and an ungroupable worktree just takes
+/// the per-branch path.
 fn github_slug_from_url(url: &str) -> Option<(String, String)> {
     let (host, path) = split_remote_url(url.trim())?;
     if !is_github_host(host) {
@@ -768,10 +829,11 @@ pub(crate) fn select_and_build(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
 
-    use crate::test_util::init_repo;
+    use crate::test_util::{add_worktree, init_repo};
 
     /// Spawn a job that blocks until `release` fires, so a test can hold a
     /// lookup pending for as long as it needs.  Dropping `release` unblocks
@@ -1021,12 +1083,14 @@ mod tests {
         assert_eq!(slug, Some(("owner".to_string(), "repo".to_string())));
     }
 
-    /// A batched query names the repository, and GitHub knows it without the
-    /// `.git` suffix git's own URLs carry.
+    /// The slug is the grouping key, so two spellings of one remote have to
+    /// produce the same one or a repository splits into two requests.
     #[test]
-    fn the_repository_name_drops_the_git_suffix() {
-        let slug = github_slug_from_url("https://github.com/owner/repo");
-        assert_eq!(slug, Some(("owner".to_string(), "repo".to_string())));
+    fn two_spellings_of_one_remote_share_a_grouping_key() {
+        let with_suffix = github_slug_from_url("https://github.com/owner/repo.git");
+        let without = github_slug_from_url("git@github.com:owner/repo");
+        assert_eq!(with_suffix, Some(("owner".to_string(), "repo".to_string())));
+        assert_eq!(with_suffix, without);
     }
 
     /// An `~/.ssh/config` alias is how a fork checkout picks an identity, and it
@@ -1499,6 +1563,78 @@ mod tests {
         assert!(ctx.has_requested_repaint(), "a panicking unwind still wakes the app");
     }
 
+    fn group_of(branches: &[&str]) -> Group {
+        Group {
+            cwd: PathBuf::from("/repo"),
+            slug: Some(("owner".to_string(), "repo".to_string())),
+            members: branches
+                .iter()
+                .map(|b| Member { path: PathBuf::from("/repo"), branch: (*b).to_string() })
+                .collect(),
+        }
+    }
+
+    /// A repository where nothing has a PR is the common case.  Reading its
+    /// answer as a failure would spend one `gh pr list` per branch finding the
+    /// same nothing, every TTL, which is the cost this batching exists to
+    /// remove.
+    #[test]
+    fn a_good_response_with_no_prs_does_not_fall_back() {
+        let group = group_of(&["topic-a", "topic-b"]);
+        let sweeps = AtomicUsize::new(0);
+
+        let found = query_group(
+            &group,
+            |_, _| {
+                Some(br#"{"data":{"repository":{"b0":{"nodes":[]},"b1":{"nodes":[]}}}}"#.to_vec())
+            },
+            |_| {
+                sweeps.fetch_add(1, Ordering::Relaxed);
+                Some(sample_info())
+            },
+        );
+
+        assert!(found.is_empty());
+        assert_eq!(sweeps.load(Ordering::Relaxed), 0, "an answer of `none` is still an answer");
+    }
+
+    /// GraphQL can need scopes `gh pr list` does not, and GitHub reports a
+    /// query it could not run as an HTTP 200 with a null `repository`.  Every
+    /// badge in the project depends on that reading as a failure.
+    #[test]
+    fn a_failed_request_sweeps_the_group_per_branch() {
+        let group = group_of(&["topic-a", "topic-b"]);
+        let sweeps = AtomicUsize::new(0);
+
+        let found = query_group(
+            &group,
+            |_, _| Some(br#"{"data":{"repository":null},"errors":[{"message":"nope"}]}"#.to_vec()),
+            |_| {
+                sweeps.fetch_add(1, Ordering::Relaxed);
+                Some(sample_info())
+            },
+        );
+
+        assert_eq!(sweeps.load(Ordering::Relaxed), 2, "one lookup per branch");
+        assert_eq!(found.len(), 2);
+    }
+
+    /// A group with no repository to name — a WSL worktree, or one whose
+    /// remote nothing could read — never reaches the batched form at all.
+    #[test]
+    fn a_group_without_a_repository_never_asks_for_a_batch() {
+        let mut group = group_of(&["topic"]);
+        group.slug = None;
+
+        let found = query_group(
+            &group,
+            |_, _| panic!("a group with no repository has nothing to ask about"),
+            |_| Some(sample_info()),
+        );
+
+        assert_eq!(found.len(), 1);
+    }
+
     /// One result covers many entries, so the drain has to fan a single map out
     /// across every path that contributed to it.
     #[test]
@@ -1550,10 +1686,74 @@ mod tests {
     fn an_ungroupable_path_still_gets_its_own_group() {
         let dir = tempfile::tempdir().expect("temp dir");
         let due = vec![Member { path: dir.path().to_path_buf(), branch: "topic".into() }];
-        let out = jobs::on_this_thread(|blocking| groups(due, blocking));
+        let resolves = AtomicUsize::new(0);
+
+        let out = groups_with(due, |_| {
+            resolves.fetch_add(1, Ordering::Relaxed);
+            Some(("resolved".to_string(), "repo".to_string()))
+        });
+
         assert_eq!(out.len(), 1);
         assert!(out[0].slug.is_none(), "a repo with no readable origin cannot be grouped");
         assert_eq!(out[0].members.len(), 1);
+        assert_eq!(resolves.load(Ordering::Relaxed), 0, "and costs no `gh` process to find out");
+    }
+
+    /// `origin` on a fork checkout names the fork, and a pull request opened
+    /// from it belongs to the repository it targets.  Asking the fork finds
+    /// nothing, so the group must ask whatever `gh` resolves instead — once
+    /// for the repository, not once per worktree.
+    #[test]
+    fn a_group_asks_the_resolved_repository_not_its_origin() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = init_repo(&dir.path().join("main"));
+        repo.remote("origin", "https://github.com/me/fork.git").expect("remote");
+        let linked = add_worktree(&repo, "topic-b");
+        let due =
+            vec![Member { path: dir.path().join("main"), branch: "topic-a".into() }, Member {
+                path: linked,
+                branch: "topic-b".into(),
+            }];
+        let resolves = AtomicUsize::new(0);
+
+        let out = groups_with(due, |_| {
+            resolves.fetch_add(1, Ordering::Relaxed);
+            Some(("upstream".to_string(), "repo".to_string()))
+        });
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].slug, Some(("upstream".to_string(), "repo".to_string())));
+        assert_eq!(resolves.load(Ordering::Relaxed), 1, "one resolve for the whole repository");
+    }
+
+    /// Nothing groups a worktree whose repository cannot be resolved, so it
+    /// keeps the per-branch path rather than losing its badge.
+    #[test]
+    fn a_repository_that_does_not_resolve_falls_back_to_per_branch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = init_repo(dir.path());
+        repo.remote("origin", "https://github.com/owner/repo.git").expect("remote");
+        let due = vec![Member { path: dir.path().to_path_buf(), branch: "topic".into() }];
+
+        let out = groups_with(due, |_| None);
+
+        assert_eq!(out.len(), 1);
+        assert!(out[0].slug.is_none());
+        assert_eq!(out[0].members.len(), 1);
+    }
+
+    #[test]
+    fn reads_the_repository_gh_resolved() {
+        let slug = parse_name_with_owner(br#"{"nameWithOwner":"mathix420/alacritree"}"#);
+        assert_eq!(slug, Some(("mathix420".to_string(), "alacritree".to_string())));
+    }
+
+    #[test]
+    fn rejects_output_that_names_no_repository() {
+        assert!(parse_name_with_owner(b"").is_none());
+        assert!(parse_name_with_owner(b"{}").is_none());
+        assert!(parse_name_with_owner(br#"{"nameWithOwner":"alacritree"}"#).is_none());
+        assert!(parse_name_with_owner(br#"{"nameWithOwner":"/alacritree"}"#).is_none());
     }
 
     /// Branches of one repository share a request; a chunk boundary splits them
@@ -1567,7 +1767,7 @@ mod tests {
             .map(|i| Member { path: dir.path().to_path_buf(), branch: format!("b{i}") })
             .collect();
 
-        let out = jobs::on_this_thread(|blocking| groups(due, blocking));
+        let out = groups_with(due, |_| Some(("owner".to_string(), "repo".to_string())));
 
         assert_eq!(out.len(), 2, "one chunk over the limit is two requests");
         assert!(out.iter().all(|g| g.slug == Some(("owner".into(), "repo".into()))));
