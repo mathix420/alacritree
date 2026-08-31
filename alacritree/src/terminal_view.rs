@@ -42,26 +42,19 @@ pub fn show(
     gpu: Option<&GpuGrid>,
 ) -> Response {
     let font_id = FontId::monospace(config.font.egui_size());
+    let (cell_w_pt, cell_h_pt) =
+        ui.ctx().fonts(|f| (f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
     // `Fonts` exposes no ascent, and deriving one from the face would miss the
     // quantization `FontImpl::new` applies when it stores its own.
-    // `font_ascent` on a laid-out glyph is the number epaint draws at.  egui
-    // caches this layout, so it costs one hash after the first frame.
-    let (cell_w_pt, cell_h_pt, font_ascent_pt) = ui.ctx().fonts(|f| {
-        let w = f.glyph_width(&font_id, 'M');
-        let h = f.row_height(&font_id);
-        let mut job = egui::text::LayoutJob::single_section(
-            "M".to_owned(),
-            egui::TextFormat::simple(font_id.clone(), Color32::PLACEHOLDER),
-        );
-        job.wrap.max_width = f32::INFINITY;
-        let galley = f.layout_job(job);
-        let ascent = galley
-            .rows
-            .first()
-            .and_then(|row| row.glyphs.first())
-            .map_or(h, |glyph| glyph.font_ascent);
-        (w, h, ascent)
-    });
+    // `font_ascent` on a laid-out glyph is the number epaint draws at, and the
+    // grid's own cache already holds that galley at this size, so reading it
+    // here is a lookup rather than a fresh layout every frame.
+    let font_ascent_pt = glyphs
+        .get(ui.ctx(), 'M', Face::Normal, font_id.size)
+        .rows
+        .first()
+        .and_then(|row| row.glyphs.first())
+        .map_or(cell_h_pt, |glyph| glyph.font_ascent);
     // Floor cell size to whole device pixels — matches alacritty's
     // `compute_cell_size`.  Without this, fractional cell widths combined
     // with egui's AA fringe leave visible seams between adjacent cells.
