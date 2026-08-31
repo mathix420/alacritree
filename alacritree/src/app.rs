@@ -8565,6 +8565,7 @@ impl eframe::App for AlacritreeApp {
                         ui,
                         session,
                         &self.config,
+                        &self.face_metrics,
                         allow_focus,
                         &mut self.builtin_glyphs,
                         &mut self.ime,

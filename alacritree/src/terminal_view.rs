@@ -32,6 +32,7 @@ pub fn show(
     ui: &mut Ui,
     session: &mut Session,
     config: &Config,
+    face_metrics: &crate::fonts::FaceMetrics,
     allow_focus: bool,
     builtin_glyphs: &mut BuiltinGlyphCache,
     ime: &mut crate::ime::Ime,
@@ -41,10 +42,25 @@ pub fn show(
     gpu: Option<&GpuGrid>,
 ) -> Response {
     let font_id = FontId::monospace(config.font.egui_size());
-    let (cell_w_pt, cell_h_pt) = ui.ctx().fonts(|f| {
+    // `Fonts` exposes no ascent, and deriving one from the face would miss the
+    // quantization `FontImpl::new` applies when it stores its own.
+    // `font_ascent` on a laid-out glyph is the number epaint draws at.  egui
+    // caches this layout, so it costs one hash after the first frame.
+    let (cell_w_pt, cell_h_pt, font_ascent_pt) = ui.ctx().fonts(|f| {
         let w = f.glyph_width(&font_id, 'M');
         let h = f.row_height(&font_id);
-        (w, h)
+        let mut job = egui::text::LayoutJob::single_section(
+            "M".to_owned(),
+            egui::TextFormat::simple(font_id.clone(), Color32::PLACEHOLDER),
+        );
+        job.wrap.max_width = f32::INFINITY;
+        let galley = f.layout_job(job);
+        let ascent = galley
+            .rows
+            .first()
+            .and_then(|row| row.glyphs.first())
+            .map_or(h, |glyph| glyph.font_ascent);
+        (w, h, ascent)
     });
     // Floor cell size to whole device pixels — matches alacritty's
     // `compute_cell_size`.  Without this, fractional cell widths combined
@@ -147,6 +163,8 @@ pub fn show(
                 rect,
                 snapshot,
                 config,
+                face_metrics,
+                font_ascent_pt,
                 cell_w,
                 cell_h,
                 cols,
@@ -1274,6 +1292,8 @@ fn paint_grid_gpu(
     rect: Rect,
     snapshot: &GridSnapshot,
     config: &Config,
+    face_metrics: &crate::fonts::FaceMetrics,
+    font_ascent_pt: f32,
     cell_w: f32,
     cell_h: f32,
     cols: usize,
@@ -1297,17 +1317,16 @@ fn paint_grid_gpu(
         // The strip is rasterized in physical pixels so its lines land on whole
         // ones; the quad sampling it is a cell in points, as everything else is.
         let ppp = ctx.pixels_per_point();
-        let geometry = decoration_sprites::Geometry {
-            cell: [(cell_w * ppp) as usize, (cell_h * ppp) as usize],
-            // Scaled off the cell rather than fixed at a point: a hairline is
-            // what makes a double underline read as one thick rule and dots
-            // blur into a solid line.
-            thickness: (cell_h * ppp / 14.0).round().max(1.0),
-            // Where `paint_grid` puts the same two lines, so a decorated run
-            // comes out in the same place whichever path drew it.
-            underline_y: (cell_h - 1.5) * ppp,
-            strikeout_y: cell_h * 0.5 * ppp,
-        };
+        // The mesh path still draws a straight rule at a fixed offset, so the
+        // two paths deliberately disagree; it is on its way out rather than
+        // waiting to be brought along.
+        let geometry = decoration_sprites::Geometry::resolve(
+            [(cell_w * ppp) as usize, (cell_h * ppp) as usize],
+            font_ascent_pt,
+            ppp,
+            face_metrics,
+            &config.ui.decorations,
+        );
         let strip = state.decorations.texture(ctx, geometry);
         state.frame = GridFrame {
             // egui sets the GL viewport to the callback's rect, so the grid
@@ -1847,6 +1866,7 @@ mod tests {
                     ui,
                     session,
                     config,
+                    &crate::fonts::FaceMetrics::default(),
                     false,
                     &mut caches.builtin,
                     &mut caches.ime,
@@ -1895,6 +1915,7 @@ mod tests {
                     ui,
                     session,
                     config,
+                    &crate::fonts::FaceMetrics::default(),
                     true,
                     &mut caches.builtin,
                     &mut caches.ime,
@@ -1968,6 +1989,7 @@ mod tests {
                     ui,
                     session,
                     config,
+                    &crate::fonts::FaceMetrics::default(),
                     true,
                     &mut caches.builtin,
                     &mut caches.ime,
@@ -2244,6 +2266,7 @@ mod tests {
                     ui,
                     session,
                     config,
+                    &crate::fonts::FaceMetrics::default(),
                     true,
                     &mut caches.builtin,
                     &mut caches.ime,
@@ -2414,6 +2437,7 @@ mod tests {
                     ui,
                     session,
                     config,
+                    &crate::fonts::FaceMetrics::default(),
                     true,
                     &mut caches.builtin,
                     &mut caches.ime,
