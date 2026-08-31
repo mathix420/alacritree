@@ -690,6 +690,11 @@ mod tests {
         let mut last = PathBuf::new();
         for byte in 0..4_u8 {
             last = store(dir.path(), &[byte], true).expect("store");
+            // The sweep exempts anything at least as new as the in-use file,
+            // and four writes in a row do not cross a filesystem timestamp
+            // tick.  Left tied, the neighbours read as new as `last` and
+            // survive the cap, so stamp a strict order instead.
+            age(&last, u64::from(4 - byte));
         }
         jobs::on_this_thread(|blocking| sweep(dir.path(), 1, &last, blocking));
         let count = std::fs::read_dir(dir.path()).expect("read dir").count();
