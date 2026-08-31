@@ -811,7 +811,17 @@ struct Style {
 
 impl Style {
     fn from_cell(cell: &Cell, underline_link: bool) -> Self {
+        // The two halves of a wide glyph are written from one cursor template,
+        // so the spacer carries the same colours and the same SGR flags as the
+        // character it belongs to and differs only in which of these two bits
+        // is set.  Reading them as style would end a run between the halves of
+        // a single character and leave the right half with no background and
+        // no decoration.  kitty sidesteps the question by storing the spacer as
+        // a copy of the lead cell (`screen.c`, `draw_text_loop`); alacritty
+        // instead drops spacers from its renderable cells and puts the column
+        // back when it draws a line (`renderer/rects.rs`).
         let mut flags = cell.flags;
+        flags.remove(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER);
         if underline_link {
             flags.insert(Flags::UNDERLINE);
         }
@@ -1086,10 +1096,6 @@ impl GridSnapshot {
                             || is_selected(selection_range.as_ref(), line, Column(col)) != selected
                         {
                             break;
-                        }
-                        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                            col += 1;
-                            continue;
                         }
                         let ch = if cell.c == '\0' || cell.flags.contains(Flags::HIDDEN) {
                             ' '
@@ -2143,6 +2149,47 @@ mod tests {
             decoration_sprites::STRAIGHT,
             "an undamaged row lost its underline",
         );
+    }
+
+    /// A wide glyph owns two cells and its decoration belongs to both.  The
+    /// terminal writes the spacer from the same cursor template as the
+    /// character, so the two differ only in one flag; reading that flag as
+    /// style ends the run between the halves and leaves the right half of
+    /// every CJK character bare.
+    #[test]
+    fn a_wide_glyph_decorates_both_of_its_cells() {
+        let grid = crate::grid_gl::GpuGrid::new();
+        let mut case = Case::new("gl", Some(&grid));
+        let screen = Vec2::new(1280.0, 720.0);
+        case.paint(screen);
+        case.advance("\x1b[4;41m\u{4f60}a".as_bytes());
+        case.paint(screen);
+
+        let state = grid.state.lock().expect("grid state");
+        let cells = &state.instances.glyphs;
+        assert_eq!(
+            (0..3).map(|c| cells[c].deco).collect::<Vec<_>>(),
+            vec![decoration_sprites::STRAIGHT; 3],
+            "the spacer cell of a wide glyph lost its underline",
+        );
+        assert_eq!(cells[1].bg, cells[0].bg, "the spacer cell of a wide glyph lost its background",);
+    }
+
+    /// Both painters take a run's extent from its character count, so a
+    /// spacer has to reach them as a character of the run rather than be
+    /// dropped on the way.
+    #[test]
+    fn a_wide_glyph_run_holds_a_character_per_cell() {
+        let mut term = term_running("\x1b[41m\u{4f60}\u{597d}".as_bytes());
+        let mut snapshot = GridSnapshot::new();
+
+        snapshot.capture(&mut term, &Config::default(), 0, None, true);
+
+        let (text, _) = snapshot
+            .runs()
+            .find(|(text, _)| text.starts_with('\u{4f60}'))
+            .expect("a run holding the wide glyphs");
+        assert_eq!(text, "\u{4f60} \u{597d} ", "a spacer went missing from its run");
     }
 
     /// An underline spans the whole run and is drawn in the run's foreground,
