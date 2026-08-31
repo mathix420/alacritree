@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.11.0](https://github.com/mathix420/alacritree/compare/v0.10.0...v0.11.0) (2026-08-31)
+
+
+### Features
+
+* **sidebar:** unify session status glyphs ([#199](https://github.com/mathix420/alacritree/issues/199)) ([3952cd5](https://github.com/mathix420/alacritree/commit/3952cd556943e86de7b64832c48b515ce04db0dd))
+
+
+### Bug Fixes
+
+* **pty:** hold a read-loop visit to one announcement [1] ([#195](https://github.com/mathix420/alacritree/issues/195)) ([4ca0744](https://github.com/mathix420/alacritree/commit/4ca0744cbc2a4376bb17360d30a024db82559928))
+
 ## [0.10.0](https://github.com/mathix420/alacritree/compare/v0.9.0...v0.10.0) (2026-08-24)
 
 
