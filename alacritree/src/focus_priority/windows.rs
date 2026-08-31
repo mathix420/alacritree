@@ -226,26 +226,36 @@ mod tests {
         }
     }
 
-    fn spawn(args: [&str; 2]) -> Subject {
-        Subject(
-            Command::new("cmd.exe")
-                .args(args)
-                .hide_console()
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .spawn()
-                .expect("spawn cmd.exe"),
-        )
-    }
-
+    /// A subject born at normal, said rather than assumed.
+    ///
+    /// Where a new process starts is not this module's contract, and it is not
+    /// fixed either: a creator inside a job hands its job's class on, and half
+    /// of these tests build jobs.  A test that reads a class it did not set is
+    /// asserting against whatever the rest of the suite was doing at the time.
     fn subject() -> Subject {
-        spawn(["/c", "pause"])
+        spawn(NORMAL_PRIORITY_CLASS, ["/c", "pause"])
     }
 
     /// A subject that starts a child of its own, so a test can ask what that
     /// child was born at.
     fn subject_with_a_child() -> Subject {
-        spawn(["/c", "ping -n 30 127.0.0.1 > nul"])
+        spawn(NORMAL_PRIORITY_CLASS, ["/c", "ping -n 30 127.0.0.1 > nul"])
+    }
+
+    /// `class` of zero leaves the choice to Windows, for the one test whose
+    /// subject is there to report that choice.
+    fn spawn(class: u32, args: [&str; 2]) -> Subject {
+        use std::os::windows::process::CommandExt as _;
+
+        Subject(
+            Command::new("cmd.exe")
+                .args(args)
+                .creation_flags(crate::command_ext::CREATE_NO_WINDOW | class)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("spawn cmd.exe"),
+        )
     }
 
     /// The first child of `parent`, waited for: a shell takes a moment to get
@@ -302,11 +312,14 @@ mod tests {
         // asserting so a failure cannot leave the runner elevated.
         let me = std::process::id();
         set_boosted(me, true);
-        let child = subject();
+        let child = spawn(0, ["/c", "pause"]);
         let inherited = class_of(child.pid());
         set_boosted(me, false);
 
-        assert_eq!(inherited, NORMAL_PRIORITY_CLASS);
+        assert_eq!(
+            inherited, NORMAL_PRIORITY_CLASS,
+            "a child came up raised: either Windows now spreads the class downward, or this              process is in a job that carries one"
+        );
     }
 
     /// Nothing here may panic on a pid that has gone, because the set is taken
