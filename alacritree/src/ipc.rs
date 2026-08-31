@@ -676,10 +676,11 @@ mod tests {
         let (tx, rx) = mpsc::channel::<wt::Progress>();
         let budget = Duration::from_millis(300);
         let step = Duration::from_millis(50);
+        let steps = 100u32;
 
         std::thread::spawn(move || {
             // Never sends `Done`; a real hung fetch reports and then stops.
-            for _ in 0..100 {
+            for _ in 0..steps {
                 if tx.send(wt::Progress::Step("working".into())).is_err() {
                     return;
                 }
@@ -692,8 +693,12 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(outcome.is_err(), "a create that never finished reported success");
+        // The two behaviours are seconds apart: a per-message timeout runs the
+        // whole dribble, an absolute deadline stops at the budget.  Splitting
+        // that gap separates them without measuring `recv_timeout`'s precision.
+        let dribble = step * steps;
         assert!(
-            elapsed < budget * 3,
+            elapsed < dribble / 2,
             "the deadline reset on every step: took {elapsed:?} against a {budget:?} budget"
         );
     }
