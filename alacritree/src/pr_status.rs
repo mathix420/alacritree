@@ -557,7 +557,17 @@ fn head_owner_is(pr: &serde_json::Value, owner: &str) -> bool {
 
 fn parse_gh_output(stdout: &[u8], origin_owner: Option<&str>) -> Option<PrInfo> {
     let list: serde_json::Value = serde_json::from_slice(stdout).ok()?;
-    let value = select_pr(list.as_array()?, origin_owner)?;
+    select_and_build(list.as_array()?, origin_owner)
+}
+
+/// Select the winning PR from a candidate list and build the `PrInfo` for it.
+/// Shared by the single-branch `gh pr list` path and the batched GraphQL one,
+/// so a change to selection or field reads applies to both by construction.
+pub(crate) fn select_and_build(
+    prs: &[serde_json::Value],
+    origin_owner: Option<&str>,
+) -> Option<PrInfo> {
+    let value = select_pr(prs, origin_owner)?;
     let number = value.get("number")?.as_u64()?;
     let base = value.get("baseRefName")?.as_str()?.to_string();
     let url = value.get("url")?.as_str()?.to_string();

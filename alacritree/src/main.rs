@@ -39,6 +39,7 @@ mod notify_macos;
 mod panel_filter;
 mod paste;
 mod path_style;
+mod pr_query;
 mod pr_status;
 mod project_refresh;
 mod projects;
