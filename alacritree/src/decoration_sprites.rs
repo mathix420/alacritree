@@ -188,7 +188,7 @@ fn draw_underline(buf: &mut [f32], stride: usize, x0: usize, kind: u16, geometry
         DOUBLE => {
             let spacing = (0.5 * geometry.descent).max(2.0 * t);
             let lower = (geometry.baseline + 0.75 * geometry.descent).min(h as f32 - t / 2.0);
-            let upper = lower - spacing;
+            let upper = (lower - spacing).max(t / 2.0);
             rect(buf, stride, x0, w, upper - t / 2.0, t);
             rect(buf, stride, x0, w, lower - t / 2.0, t);
         },
@@ -559,5 +559,18 @@ mod tests {
         let column: Vec<bool> = (0..g.cell[1]).map(|y| alpha(&image, DOUBLE, 5, y) > 128).collect();
         let stems = column.windows(2).filter(|w| !w[0] && w[1]).count();
         assert_eq!(stems, 2, "the stems merged: {column:?}");
+    }
+
+    /// A descent band far larger than the cell drives the unclamped upper
+    /// stem's whole span below row 0, which `rect_x` then drops entirely —
+    /// kitty clamps both ends for the same reason.
+    #[test]
+    fn the_upper_double_stem_stays_inside_the_cell() {
+        let g = Geometry { baseline: 1.0, descent: 100.0, underline_thickness: 2.0, ..geometry() };
+        let image = rasterize(g);
+        let column: Vec<u8> = (0..g.cell[1]).map(|y| alpha(&image, DOUBLE, 5, y)).collect();
+        assert!(column[0] > 128, "upper stem clipped off the top of the cell: {column:?}");
+        assert!(*column.last().unwrap() > 128, "lower stem missing: {column:?}");
+        assert!(column.iter().any(|&a| a < 128), "stems merged into one rule: {column:?}");
     }
 }
