@@ -26,7 +26,7 @@ use eframe::glow::{self, HasContext};
 use egui::Rect;
 
 use crate::decoration_sprites::DecorationAtlas;
-use crate::gpu_timing::{self, Ab, GpuTimers};
+use crate::gpu_timing::{self, GpuTimers};
 use crate::grid_instances::{GlyphInstance, GlyphSlot, GlyphTable, GridInstances};
 
 /// Attribute locations, bound before linking so every program reads the same
@@ -56,16 +56,6 @@ pub struct Frame {
     /// whole one, so the strip past it is filled by clearing rather than by a
     /// shape epaint would have to tessellate every frame.
     pub default_bg: [f32; 4],
-}
-
-/// What the paint callback is asked to measure.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Timing {
-    /// `[debug] gpu_timing`: time the upload and each draw on the GPU.
-    pub enabled: bool,
-    /// `[debug] gpu_ab`: alternate one of the callback's skips between report
-    /// windows so both arms are timed against one driver and one grid.
-    pub ab: Ab,
 }
 
 /// The CPU half, written by the UI thread and read by the paint callback.
@@ -156,7 +146,7 @@ impl GpuGrid {
     /// The shape to hand egui.  Everything it draws comes from `state`, which
     /// the caller has already written this frame — except the atlas size,
     /// which only the atlas live at paint time can give.
-    pub fn callback(&self, rect: Rect, ctx: &egui::Context, timing: Timing) -> egui::Shape {
+    pub fn callback(&self, rect: Rect, ctx: &egui::Context, time_gpu: bool) -> egui::Shape {
         let (state, resources, ctx) = (self.state.clone(), self.gl.clone(), ctx.clone());
         let failed = self.failed.clone();
         egui::Shape::Callback(egui::epaint::PaintCallback {
@@ -165,7 +155,7 @@ impl GpuGrid {
                 let mut held = resources.lock().expect("gl resources");
                 let gl = painter.gl().clone();
                 if let GlSlot::Unbuilt = *held {
-                    *held = match GlResources::new(&gl, timing) {
+                    *held = match GlResources::new(&gl, time_gpu) {
                         Ok(resources) => GlSlot::Ready(resources),
                         Err(err) => {
                             log::error!("gpu grid disabled: {err}");
@@ -200,13 +190,6 @@ impl Default for GpuGrid {
 
 struct GlResources {
     glyph: Program,
-    /// The pre-collapse glyph shader, built only when the A/B asks to price the
-    /// colour-channel conversion against reading coverage from alpha.  It
-    /// exists to be compared against, not to ship.
-    glyph_gamma: Option<Program>,
-    /// The glyph shader that discards fragments the atlas gives no coverage,
-    /// built only while the A/B is pricing that against blending them.
-    glyph_discard: Option<Program>,
     background: Program,
     decoration: Program,
     vao: glow::VertexArray,
@@ -233,7 +216,7 @@ impl Program {
 }
 
 impl GlResources {
-    fn new(gl: &glow::Context, timing: Timing) -> Result<Self, String> {
+    fn new(gl: &glow::Context, time_gpu: bool) -> Result<Self, String> {
         let version = ShaderVersion::get(gl);
         // Instanced arrays, `texelFetch` and integer vertex attributes all
         // arrive together in GL 3 / GLES 3.  Older contexts keep the mesh path.
@@ -287,19 +270,9 @@ impl GlResources {
             ] {
                 gl.tex_parameter_i32(glow::TEXTURE_2D, name, value as i32);
             }
-            let timers = timing.enabled.then(|| GpuTimers::new(gl, timing.ab)).flatten();
-            let glyph_gamma = match timers.as_ref().is_some_and(GpuTimers::wants_glyph_gamma) {
-                true => Some(link(gl, header, GLYPH_VERT, GLYPH_FRAG_GAMMA)?),
-                false => None,
-            };
-            let glyph_discard = match timers.as_ref().is_some_and(GpuTimers::wants_glyph_discard) {
-                true => Some(link(gl, header, GLYPH_VERT, GLYPH_FRAG_DISCARD)?),
-                false => None,
-            };
+            let timers = time_gpu.then(|| GpuTimers::new(gl)).flatten();
             Ok(Self {
                 glyph,
-                glyph_gamma,
-                glyph_discard,
                 background,
                 decoration,
                 vao,
@@ -352,25 +325,7 @@ impl GlResources {
             if let Some(timers) = &mut timers {
                 timers.begin(gl, gpu_timing::BACKGROUNDS);
             }
-            // A colour no normalized byte can hold matches no cell, so the
-            // A/B's other arm draws every quad the way it did before the
-            // collapse without taking a different path to get there.
-            let default_bg = match timers.as_ref().is_some_and(GpuTimers::forces_backgrounds) {
-                true => [-1.0; 4],
-                false => state.frame.default_bg,
-            };
-            // egui_glow leaves premultiplied blending on before handing over,
-            // and every terminal colour is opaque, so blending this pass
-            // computes the source it already had.  The A/B's other arm pays
-            // for it the way the shipped path does.
-            let unblended = timers.as_ref().is_some_and(GpuTimers::skips_background_blend);
-            if unblended {
-                gl.disable(glow::BLEND);
-            }
-            self.draw_backgrounds(gl, state, cols * rows, default_bg);
-            if unblended {
-                gl.enable(glow::BLEND);
-            }
+            self.draw_backgrounds(gl, state, cols * rows, state.frame.default_bg);
             if let Some(timers) = &timers {
                 timers.end(gl);
             }
@@ -378,29 +333,16 @@ impl GlResources {
                 if let Some(timers) = &mut timers {
                     timers.begin(gl, gpu_timing::GLYPHS);
                 }
-                // The A/B's other arm recovers coverage from the colour
-                // channels, which needs its own program: the two shaders
-                // differ at compile time, not in a uniform.
-                let timing = timers.as_ref();
-                let glyph = if timing.is_some_and(GpuTimers::forces_glyph_gamma) {
-                    self.glyph_gamma.as_ref().unwrap_or(&self.glyph)
-                } else if timing.is_some_and(GpuTimers::discards_blank_coverage) {
-                    self.glyph_discard.as_ref().unwrap_or(&self.glyph)
-                } else {
-                    &self.glyph
-                };
-                self.draw_glyphs(gl, state, atlas, atlas_size, cols * rows, glyph);
+                self.draw_glyphs(gl, state, atlas, atlas_size, cols * rows, &self.glyph);
                 if let Some(timers) = &timers {
                     timers.end(gl);
                 }
             }
-            // Holding a strip only says the atlas exists.  Every cell still
-            // gets an instance, so an undecorated screen was paying a
-            // full-grid instanced draw to collapse every quad in the vertex
-            // shader.  The A/B's other arm skips this test to price it.
-            let decorated = state.instances.any_decorated()
-                || timers.as_ref().is_some_and(GpuTimers::forces_decorations);
-            match decorations.filter(|_| decorated) {
+            // Holding a strip only says the atlas exists.  Every cell gets an
+            // instance either way, so without this test an undecorated screen
+            // pays a full-grid instanced draw to collapse every quad in the
+            // vertex shader.
+            match decorations.filter(|_| state.instances.any_decorated()) {
                 Some(strip) => {
                     if let Some(timers) = &mut timers {
                         timers.begin(gl, gpu_timing::DECORATIONS);
@@ -911,48 +853,3 @@ mod tests {
         assert_ne!(before, ctx.fonts(|f| f.font_image_size()));
     }
 }
-
-/// The glyph shader with the blank half of every atlas rectangle thrown away
-/// rather than blended.  Built only when `[debug] gpu_ab = "fill"` asks to
-/// price it, and never on the path a release paints with.
-const GLYPH_FRAG_DISCARD: &str = r#"
-uniform sampler2D u_atlas;
-in vec2 v_uv;
-flat in vec4 v_fg;
-out vec4 f_color;
-
-void main() {
-    float coverage = texture(u_atlas, v_uv).a;
-    // A glyph's rectangle is a box around its ink, and most of that box is
-    // empty.  Blending a fragment at zero coverage produces the destination it
-    // is about to overwrite, so the write can be dropped instead of made.
-    if (coverage == 0.0) {
-        discard;
-    }
-    f_color = v_fg * coverage;
-}
-"#;
-
-/// The glyph shader as it stood before coverage was read from alpha: egui's
-/// general conversion, which recovers it from the colour channels instead.
-/// Built only when `[debug] gpu_ab = "glyphs"` asks to price the difference,
-/// and never on the path a release paints with.
-const GLYPH_FRAG_GAMMA: &str = r#"
-uniform sampler2D u_atlas;
-in vec2 v_uv;
-flat in vec4 v_fg;
-out vec4 f_color;
-
-vec3 srgb_gamma_from_linear(vec3 rgb) {
-    bvec3 cutoff = lessThan(rgb, vec3(0.0031308));
-    vec3 lower = rgb * vec3(12.92);
-    vec3 higher = vec3(1.055) * pow(rgb, vec3(1.0 / 2.4)) - vec3(0.055);
-    return mix(higher, lower, vec3(cutoff));
-}
-
-void main() {
-    vec4 tex = texture(u_atlas, v_uv);
-    tex = vec4(srgb_gamma_from_linear(tex.rgb), tex.a);
-    f_color = v_fg * tex;
-}
-"#;
