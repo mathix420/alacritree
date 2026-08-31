@@ -525,6 +525,7 @@ mod tests {
                 escape_args: false,
             };
             let size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
+            crate::harden_dll_search_path();
             let pty = tty::new(&options, size, 0).expect("open a pseudoconsole");
             let root = pty.child_watcher().pid().map(NonZeroU32::get).expect("the shell's pid");
             // Jobbed before the tree is waited for, as a session does it: a

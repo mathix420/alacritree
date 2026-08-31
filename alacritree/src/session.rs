@@ -1198,6 +1198,11 @@ impl Session {
             escape_args,
         };
 
+        // `tty::new` is where `LoadLibraryW("conpty.dll")` happens, and the
+        // module it loads answers every later one for the life of the process.
+        #[cfg(windows)]
+        crate::harden_dll_search_path();
+
         // alacritty routes OSC 7 / signals by this id, so each session needs its own.
         let window_id = next_window_id();
         let pty = tty::new(&pty_options, window_size, window_id)?;
@@ -2081,8 +2086,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_burst_bigger_than_one_read_keeps_flowing_without_input() {
-        crate::harden_dll_search_path();
-
         const MARKER: &str = "BURST-COMPLETE";
 
         // Writing to the standard output handle rather than `Console.Out`,
@@ -2157,8 +2160,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_pane_runs_its_child_without_a_console_host_handshake() {
-        crate::harden_dll_search_path();
-
         let start = Instant::now();
         let session = Session::spawn_command(
             egui::Context::default(),
@@ -2195,12 +2196,6 @@ mod tests {
     /// None` or it would be filtered into a worktree workspace.
     #[test]
     fn a_home_session_starts_in_the_configured_working_directory() {
-        // Whichever test spawns first decides which `conpty.dll` the process
-        // loads, and the loaded module answers every later `LoadLibraryW`.
-        // The binary gets this from `main`; a test binary has no such entry,
-        // so every test that opens a PTY has to harden before it does.
-        crate::harden_dll_search_path();
-
         let dir = tempfile::tempdir().unwrap();
 
         let mut config = Config::default();
