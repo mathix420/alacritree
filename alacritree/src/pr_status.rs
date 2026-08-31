@@ -40,10 +40,11 @@ pub struct PrInfo {
     pub state: PrState,
 }
 
-/// How many lookups may run at once: what the config asks for, never above
-/// one below the pool's background ceiling.  Reserving that slot is the
-/// pool's own trick one level down, and it keeps local background work a
-/// worker on any pool size rather than by picking a number.
+/// How many lookups may run at once: what the config asks for, never above one
+/// below the pool's background ceiling.  Holding a slot back leaves other
+/// background work a worker even when a whole project's worktrees fall due
+/// together, and deriving the bound from the ceiling keeps that true at any
+/// pool size.
 fn effective_cap(configured: Option<usize>, ceiling: usize) -> usize {
     configured.unwrap_or(usize::MAX).min(ceiling.saturating_sub(1)).max(1)
 }
