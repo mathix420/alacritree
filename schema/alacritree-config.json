@@ -204,12 +204,12 @@
           "type": "string"
         },
         "underline_position": {
-          "description": "Shift or scale of how far the underline sits from the top of the cell.",
+          "description": "Shift or scale of how far the underline sits from the top of the\ncell, for the straight, dotted and dashed styles.  The double and\ncurly styles are placed from the font's descent instead, so this\nknob does not reach them.",
           "pattern": "^(-?[0-9]*\\.?[0-9]+(px|pt)?|[0-9]*\\.?[0-9]+%)$",
           "type": "string"
         },
         "underline_thickness": {
-          "description": "Shift or scale of the underline's stroke weight.",
+          "description": "Shift or scale of the underline's stroke weight.  Every style draws\nwith this value, including double and curly.",
           "pattern": "^(-?[0-9]*\\.?[0-9]+(px|pt)?|[0-9]*\\.?[0-9]+%)$",
           "type": "string"
         }

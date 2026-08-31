@@ -881,8 +881,11 @@ pub struct PathStyleConfig {
 }
 
 /// One correction to a decoration the font placed: a shift in physical pixels,
-/// a shift in points, or a multiplier.  kitty's grammar, so a value copied from
-/// a kitty config behaves the same way here.
+/// a shift in points, or a multiplier.  kitty's grammar, so a value copied
+/// from a kitty config parses the same way here.  Where it lands can still
+/// differ: kitty derives its double and curly underline positions from the
+/// face's underline position, while here those two styles are placed from
+/// the descent instead, so `underline_position` does not reach them.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Adjust {
     Pixels(f32),
@@ -1982,10 +1985,14 @@ struct RawSessionDisplay {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawDecorations {
-    /// Shift or scale of how far the underline sits from the top of the cell.
+    /// Shift or scale of how far the underline sits from the top of the
+    /// cell, for the straight, dotted and dashed styles.  The double and
+    /// curly styles are placed from the font's descent instead, so this
+    /// knob does not reach them.
     #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
     underline_position: Option<String>,
-    /// Shift or scale of the underline's stroke weight.
+    /// Shift or scale of the underline's stroke weight.  Every style draws
+    /// with this value, including double and curly.
     #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
     underline_thickness: Option<String>,
     /// Shift or scale of how far the strikeout sits from the top of the cell.
