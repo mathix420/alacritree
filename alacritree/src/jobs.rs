@@ -41,20 +41,33 @@ struct Task {
 struct State {
     interactive: VecDeque<Task>,
     background: VecDeque<Task>,
+    interactive_running: usize,
     background_running: usize,
 }
 
-/// The next task this worker may run, and whether it occupies a background
-/// slot.  Background work is capped one below the worker count so a click
-/// never queues behind a pool full of git walks.
-fn take(state: &mut State, workers: usize) -> Option<(Task, bool)> {
-    if let Some(task) = state.interactive.pop_front() {
-        return Some((task, false));
+/// Which class a running task occupies, so the guard that frees its slot
+/// knows which counter to decrement.
+#[derive(Clone, Copy)]
+enum Slot {
+    Interactive,
+    Background,
+}
+
+/// The next task this worker may run, and the slot it occupies.  Each class
+/// is capped one below the worker count, so neither can shut the other out:
+/// a click never queues behind a pool full of git walks, and a burst of
+/// creates never stops a status refresh.  Interactive keeps first refusal.
+fn take(state: &mut State, workers: usize) -> Option<(Task, Slot)> {
+    if state.interactive_running + 1 < workers {
+        if let Some(task) = state.interactive.pop_front() {
+            state.interactive_running += 1;
+            return Some((task, Slot::Interactive));
+        }
     }
     if state.background_running + 1 < workers {
         if let Some(task) = state.background.pop_front() {
             state.background_running += 1;
-            return Some((task, true));
+            return Some((task, Slot::Background));
         }
     }
     None
@@ -130,8 +143,8 @@ impl<T> Drop for Job<T> {
 }
 
 impl Pool {
-    /// `workers` is clamped to at least two: the background reservation needs
-    /// one worker beyond the one it holds free.
+    /// `workers` is clamped to at least two: each class's ceiling needs one
+    /// worker beyond the one it holds free.
     pub fn new(workers: usize) -> Self {
         let workers = workers.max(2);
         let shared = Arc::new(Shared {
@@ -182,17 +195,21 @@ impl Pool {
     }
 }
 
-/// Releases a worker's background slot on drop, whether the task returned
-/// normally or unwound through a panic — a straight-line decrement after the
-/// call would never run for a panicking job, permanently shrinking the pool.
-struct BackgroundSlot<'a> {
+/// Releases a worker's slot on drop, whether the task returned normally or
+/// unwound through a panic — a straight-line decrement after the call would
+/// never run for a panicking job, permanently shrinking the pool.
+struct SlotGuard<'a> {
     shared: &'a Shared,
+    slot: Slot,
 }
 
-impl Drop for BackgroundSlot<'_> {
+impl Drop for SlotGuard<'_> {
     fn drop(&mut self) {
         let mut state = self.shared.state.lock().expect("the job queue is poisoned");
-        state.background_running -= 1;
+        match self.slot {
+            Slot::Interactive => state.interactive_running -= 1,
+            Slot::Background => state.background_running -= 1,
+        }
         drop(state);
         // A freed slot may admit a task another worker is asleep on.
         self.shared.wake.notify_all();
@@ -219,7 +236,7 @@ impl Drop for WakeOnEnd<'_> {
 fn worker(shared: Arc<Shared>) {
     loop {
         let mut state = shared.state.lock().expect("the job queue is poisoned");
-        let (task, was_background) = loop {
+        let (task, slot) = loop {
             if let Some(taken) = take(&mut state, shared.workers) {
                 break taken;
             }
@@ -227,10 +244,10 @@ fn worker(shared: Arc<Shared>) {
         };
         drop(state);
 
-        let _slot = was_background.then(|| BackgroundSlot { shared: &shared });
+        let _slot = SlotGuard { shared: &shared, slot };
 
         if !task.cancelled.load(Ordering::Relaxed) {
-            lower_this_thread(was_background);
+            lower_this_thread(matches!(slot, Slot::Background));
             let _wake = WakeOnEnd { shared: &shared };
             let outcome = catch_unwind(AssertUnwindSafe(|| (task.run)(&Blocking(()))));
             if let Err(panic) = outcome {
@@ -316,8 +333,8 @@ mod tests {
     #[test]
     fn interactive_work_goes_first() {
         let mut state = state_with(1, 1);
-        let (_, was_background) = take(&mut state, 4).expect("a runnable task");
-        assert!(!was_background);
+        let (_, slot) = take(&mut state, 4).expect("a runnable task");
+        assert!(matches!(slot, Slot::Interactive));
         assert_eq!(state.background.len(), 1, "the background task is still queued");
     }
 
@@ -452,6 +469,40 @@ mod tests {
     #[test]
     fn the_calling_thread_can_take_a_token_explicitly() {
         assert_eq!(on_this_thread(|_| 3_u8), 3);
+    }
+
+    /// Interactive work must not be able to take every worker.  A pool with all
+    /// its workers on interactive jobs cannot refresh a git status, poll worktree
+    /// liveness, or look up a PR, and nothing on screen says why.
+    #[test]
+    fn interactive_work_leaves_a_worker_for_background() {
+        let pool = Pool::new(4);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let rx = Arc::clone(&release_rx);
+            held.push(pool.spawn(Priority::Interactive, move |_| {
+                let _ = rx.lock().expect("the release channel is poisoned").recv();
+            }));
+        }
+
+        let (ran_tx, ran_rx) = mpsc::channel();
+        let background = pool.spawn(Priority::Background, move |_| {
+            let _ = ran_tx.send(());
+        });
+
+        assert!(
+            ran_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the background job never ran: interactive work took every worker"
+        );
+
+        for _ in 0..4 {
+            let _ = release_tx.send(());
+        }
+        drop(held);
+        drop(background);
     }
 
     #[test]
