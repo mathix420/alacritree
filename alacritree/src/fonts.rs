@@ -1576,7 +1576,7 @@ mod tests {
             .expect("egui bundles default fonts")
             .font
             .to_vec();
-        let path = std::env::temp_dir().join(name);
+        let path = crate::test_util::scratch_dir().join(name);
         std::fs::write(&path, bytes).unwrap();
         path
     }
@@ -1587,7 +1587,7 @@ mod tests {
         // the bytes must be loaded once and the same egui font id appended to
         // each variant's family list (a plain HashSet dedup would starve
         // every variant after the first).
-        let path = write_parseable_font("alacritree_test_user_fallback.ttf");
+        let path = write_parseable_font("user_fallback.ttf");
 
         let mut defs = FontDefinitions::default();
         let fonts = SystemFonts::with_cache_dir(None);
@@ -1623,7 +1623,7 @@ mod tests {
 
     #[test]
     fn ui_font_heads_the_proportional_family() {
-        let path = write_parseable_font("alacritree_test_ui_font.ttf");
+        let path = write_parseable_font("ui_font.ttf");
 
         let mut defs = FontDefinitions::default();
         let fonts = SystemFonts::with_cache_dir(None);
@@ -1668,7 +1668,7 @@ mod tests {
     fn ui_variant_families_inherit_the_terminal_chain() {
         let fonts = SystemFonts::with_cache_dir(None);
         let mut defs = FontDefinitions::default();
-        let path = write_parseable_font("alacritree_test_ui_variant_chain.ttf");
+        let path = write_parseable_font("ui_variant_chain.ttf");
         let face = map_font_file(&path).unwrap();
         insert_face(&mut defs, NORMAL_FONT_ID, face, 0);
         register_variant(&mut defs, BOLD_FONT_ID, BOLD_FAMILY, None, (face, 0));
@@ -1707,7 +1707,7 @@ mod tests {
     fn unparseable_configured_variant_is_skipped_not_registered() {
         let fonts = SystemFonts::with_cache_dir(None);
         let mut defs = FontDefinitions::default();
-        let junk_path = std::env::temp_dir().join("alacritree_test_ui_variant_junk.ttf");
+        let junk_path = crate::test_util::scratch_dir().join("ui_variant_junk.ttf");
         std::fs::write(&junk_path, b"not a font").unwrap();
         let before = defs.font_data.len();
 
@@ -1742,7 +1742,7 @@ mod tests {
     // an owned face costs its file size twice for the life of the process.
     #[test]
     fn registered_faces_hand_epaint_borrowed_bytes() {
-        let path = write_parseable_font("alacritree_test_borrowed_bytes.ttf");
+        let path = write_parseable_font("borrowed_bytes.ttf");
 
         let mut defs = FontDefinitions::default();
         let fonts = SystemFonts::with_cache_dir(None);
@@ -1965,7 +1965,7 @@ mod tests {
         // User-configured fallbacks slot between the primary face and the
         // automatic system chain, so their font id must land ahead of every
         // id the automatic chain appends afterward in the family list.
-        let path = write_parseable_font("alacritree_test_user_precedes.ttf");
+        let path = write_parseable_font("user_precedes.ttf");
 
         let mut defs = FontDefinitions::default();
         let fonts = SystemFonts::with_cache_dir(None);
@@ -2056,7 +2056,7 @@ mod tests {
             return;
         };
 
-        let path = write_parseable_font("alacritree_test_bundled_last.ttf");
+        let path = write_parseable_font("bundled_last.ttf");
         let config = crate::config::FontConfig {
             normal: crate::config::FontFace { family: Some(family), style: None },
             fallback: vec![path.to_string_lossy().into_owned()],
@@ -2132,7 +2132,7 @@ mod tests {
 
     #[cfg(not(unix))]
     fn scratch_cache_path(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("alacritree_test_coverage_cache_{name}"));
+        let dir = crate::test_util::scratch_dir().join(format!("coverage_cache_{name}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("coverage-cache.v1.bin")
     }
@@ -2243,7 +2243,7 @@ mod tests {
     /// override working chrome instead of filling gaps.
     #[test]
     fn the_symbol_face_lands_last_in_every_chrome_family() {
-        let path = write_parseable_font("alacritree_test_symbol_order.ttf");
+        let path = write_parseable_font("symbol_order.ttf");
         let mut defs = FontDefinitions::default();
         let fonts = SystemFonts::with_cache_dir(None);
         let ui = UiFont { family: Some(path.to_string_lossy().into_owned()), ..UiFont::default() };
@@ -2394,7 +2394,7 @@ mod tests {
     #[test]
     fn a_seed_outside_the_scan_is_parsed_once_per_install() {
         let fonts = SystemFonts::with_cache_dir(None);
-        let path = write_parseable_font("alacritree_test_seed_memo.ttf");
+        let path = write_parseable_font("seed_memo.ttf");
         let family = path.to_str().expect("the temp path is utf-8");
         let seed = resolve_face(family, None, Variant::Normal, &fonts).expect("a path resolves");
         // An explicit path is not automatically outside the scan: a system
@@ -2418,7 +2418,7 @@ mod tests {
     #[cfg(not(unix))]
     #[test]
     fn face_coverage_maps_the_file_instead_of_reading_it() {
-        let path = write_parseable_font("alacritree_test_face_coverage_maps.ttf");
+        let path = write_parseable_font("face_coverage_maps.ttf");
         assert!(!is_mapped(&path), "the fixture path must be untouched by other tests");
 
         let _ = face_coverage(&path, 0);
