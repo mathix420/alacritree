@@ -1,7 +1,7 @@
 class Alacritree < Formula
   desc "Alacritty fork with worktree-aware sidebars"
   homepage "https://github.com/mathix420/alacritree"
-  version "0.10.0"
+  version "0.11.0"
   license "Apache-2.0"
 
   # Linked dynamically through the `fontconfig` Rust crate (alacritty's font
@@ -22,7 +22,7 @@ class Alacritree < Formula
   on_macos do
     on_arm do
       url "https://github.com/mathix420/alacritree/releases/download/v#{version}/alacritree-aarch64-apple-darwin.tar.gz"
-      sha256 "74ddfd9841ad69a96d89051d6edf26f2203089bb52de547effcfff72f0775fd0"
+      sha256 "63e47faa8fb73717426f42bc903ad181ab1e6cc13a183428f2652ad836e31ded"
     end
   end
 
