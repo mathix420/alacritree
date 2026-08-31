@@ -51,7 +51,13 @@ const APP_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long this process will hold a pool worker for one create request.
 /// The server's own limit, not a mirror of any client's: a client with a
 /// different timeout changes nothing here.
-const IPC_CREATE_BUDGET: Duration = Duration::from_secs(300);
+///
+/// It sits under the 300s the CLI and the MCP bridge allow so that an overrun
+/// is reported by the side that knows why it overran.  A client's timer starts
+/// when it sends; this one starts after the request has been received, parsed
+/// and validated, so on an equal budget the client always gives up first and
+/// this message is never seen.
+const IPC_CREATE_BUDGET: Duration = Duration::from_secs(240);
 
 /// Everything a client can ask of a running alacritree.  Tagged so the wire
 /// format is `{"type": "list_sessions", …fields}` — the MCP bridge builds
