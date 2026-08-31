@@ -500,6 +500,53 @@ mod tests {
         assert_eq!(doubled.underline_thickness, 3.0);
     }
 
+    /// Mirrors `a_position_knob_moves_the_line_by_what_it_asked_for` for the
+    /// strikeout pair, and checks `underline_y` stays put so a knob wired to
+    /// the wrong field fails here instead of only in production.
+    #[test]
+    fn a_strikeout_position_knob_moves_the_line_by_what_it_asked_for() {
+        use crate::config::{Adjust, Decorations};
+        let metrics = crate::fonts::FaceMetrics::default();
+        let plain = Geometry::resolve([10, 24], 16.0, 2.0, &metrics, &Decorations::default());
+        let shifted = Geometry::resolve(
+            [10, 24],
+            16.0,
+            2.0,
+            &metrics,
+            &Decorations { strikeout_position: Adjust::Pixels(2.0), ..Decorations::default() },
+        );
+        assert_eq!(shifted.strikeout_y - plain.strikeout_y, 2.0);
+        assert_eq!(shifted.underline_y, plain.underline_y, "moved the wrong line");
+
+        let in_points = Geometry::resolve(
+            [10, 24],
+            16.0,
+            2.0,
+            &metrics,
+            &Decorations { strikeout_position: Adjust::Points(2.0), ..Decorations::default() },
+        );
+        assert_eq!(in_points.strikeout_y - plain.strikeout_y, 4.0);
+    }
+
+    /// Mirrors `a_thickness_percentage_scales_before_rounding` for the
+    /// strikeout bar, and checks `underline_thickness` stays put so a knob
+    /// wired to the wrong field fails here instead of only in production.
+    #[test]
+    fn a_strikeout_thickness_percentage_scales_before_rounding() {
+        use crate::config::{Adjust, Decorations};
+        let metrics = crate::fonts::FaceMetrics::default();
+        let plain = Geometry::resolve([10, 24], 22.4, 1.0, &metrics, &Decorations::default());
+        let doubled = Geometry::resolve(
+            [10, 24],
+            22.4,
+            1.0,
+            &metrics,
+            &Decorations { strikeout_thickness: Adjust::Scale(2.0), ..Decorations::default() },
+        );
+        assert_eq!(doubled.strikeout_thickness, 3.0);
+        assert_eq!(doubled.underline_thickness, plain.underline_thickness, "scaled the wrong bar");
+    }
+
     /// A stroke thick enough to span the room the descent left has to push the
     /// stems apart rather than fill the gap between them.  Splitting the band
     /// alone puts the two stems `descent / 2` apart, so anything from a
