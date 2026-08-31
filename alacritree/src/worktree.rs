@@ -92,7 +92,17 @@ pub fn create(
     blocking: &jobs::Blocking,
 ) -> Result<PathBuf, String> {
     let send = &mut on_step;
+    // A cancel that lands between children has nothing to kill, so each step
+    // asks before starting rather than running for a caller that is gone.
+    macro_rules! bail_if_cancelled {
+        () => {
+            if blocking.cancelled() {
+                return Err("worktree create cancelled".into());
+            }
+        };
+    }
 
+    bail_if_cancelled!();
     send("Syncing with remote…");
     if !has_remote(&req.project_root, "origin") {
         return Err("no `origin` remote configured".into());
@@ -107,15 +117,18 @@ pub fn create(
         })?;
     send(&format!("Verifying base branch `{base}`"));
 
+    bail_if_cancelled!();
     send("Fetching latest changes…");
-    run_git(&req.project_root, &["fetch", "origin", &base])?;
+    run_git_cancellable(blocking, &req.project_root, &["fetch", "origin", &base])?;
 
+    bail_if_cancelled!();
     send("Creating git worktree…");
     let target =
         pick_worktree_path(&req.project_root, &req.branch, req.base_dir.as_deref(), blocking)?;
     let target_arg = git_path_arg(&req.project_root, &target)?;
     run_git(&req.project_root, &["worktree", "add", &target_arg, "-b", &req.branch, &base_ref])?;
 
+    bail_if_cancelled!();
     send("Copying LLM configurations…");
     let copied = copy_llm_configs(&req.project_root, &target);
     if copied > 0 {
@@ -193,6 +206,24 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<(), String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let msg = if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() };
+    Err(format!("git {}: {msg}", args.join(" ")))
+}
+
+/// `run_git`, for a call a cancel is allowed to end.  Progress goes to a
+/// pipe, where git suppresses it, so the output stays small enough that the
+/// undrained pipes cannot fill.
+#[allow(clippy::disallowed_methods)] // Running git is this function's job.
+fn run_git_cancellable(blocking: &jobs::Blocking, cwd: &Path, args: &[&str]) -> Result<(), String> {
+    let mut cmd = git_command(cwd);
+    let output = blocking
+        .run_cancellable(cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped()))
         .map_err(|e| format!("failed to run git: {e}"))?;
     if output.status.success() {
         return Ok(());
@@ -573,6 +604,7 @@ pub fn prune_worktree(
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use std::thread;
+    use std::time::Duration;
 
     use super::*;
     use crate::test_util::{add_worktree, init_repo};
@@ -730,5 +762,44 @@ mod tests {
     fn list_branches_reports_a_non_repo_as_an_error() {
         let dir = tempfile::TempDir::new().unwrap();
         assert!(jobs::on_this_thread(|blocking| list_branches(dir.path(), blocking)).is_err());
+    }
+
+    /// `create` must stop between steps when its handle is gone.  Killing a
+    /// registered child only covers the steps that have one; the local steps
+    /// would otherwise run to completion for a worktree nobody is waiting for.
+    #[test]
+    fn create_stops_between_steps_once_cancelled() {
+        let repo = tempfile::tempdir().expect("temp dir");
+        let req = CreateRequest {
+            project_root: repo.path().to_path_buf(),
+            default_branch: Some("main".into()),
+            branch: "topic".into(),
+            base_dir: None,
+        };
+        let (tx, rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
+            // Both halves of this handshake are load-bearing.  Without the
+            // started signal, a flag set while the task is still queued hits the
+            // pre-start check, the task is skipped, `tx` drops unsent, and the
+            // assertion below reports a disconnect.  Without the gate, the task
+            // can race past the first bail before the flag lands and fail on the
+            // missing remote instead.
+            let _ = started_tx.send(());
+            let _ = gate_rx.recv();
+            let _ = tx.send(create(&req, |_| {}, blocking));
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).expect("the job never started");
+        drop(job);
+        let _ = gate_tx.send(());
+        let result = rx.recv_timeout(Duration::from_secs(10));
+        match result {
+            Ok(Err(msg)) => {
+                assert!(msg.contains("cancelled"), "create failed for the wrong reason: {msg}")
+            },
+            Ok(Ok(path)) => panic!("create finished a worktree nobody was waiting for: {path:?}"),
+            Err(e) => panic!("create never returned: {e}"),
+        }
     }
 }
