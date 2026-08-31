@@ -40,11 +40,17 @@ pub struct PrInfo {
     pub state: PrState,
 }
 
-/// How many lookups may run at once: what the config asks for, never above one
-/// below the pool's background ceiling.  Holding a slot back leaves other
-/// background work a worker even when a whole project's worktrees fall due
-/// together, and deriving the bound from the ceiling keeps that true at any
-/// pool size.
+/// How many bursts may run at once: what the config asks for, never above one
+/// below the pool's background ceiling.
+///
+/// A ceiling rather than a limit that binds today.  One frame's whole due list
+/// becomes a single job, and every entry it covers stays `pending` until that
+/// job settles, so nothing new falls due meanwhile: one request is in flight in
+/// steady state and two across a handover, under any cap this returns.  It
+/// stays because the shape it guards against is cheap to reintroduce — a spawn
+/// per group would put a project's repositories on the pool at once — and
+/// because reserving a slot below the ceiling is what leaves a worker for the
+/// local work sharing the pool, at any pool size.
 fn effective_cap(configured: Option<usize>, ceiling: usize) -> usize {
     configured.unwrap_or(usize::MAX).min(ceiling.saturating_sub(1)).max(1)
 }
@@ -284,8 +290,11 @@ impl PrCache {
     /// each path's `origin`, which is why nothing here inspects the list: the
     /// frame only decides whether there is room to ask.
     ///
-    /// Over the cap, the list is dropped and every member's `pending` flag
-    /// cleared, so they fall due again next frame rather than being lost.
+    /// Over the cap the list is dropped, and every member is returned to the
+    /// state it was polled in — not just `pending` cleared.  `poll` has
+    /// already written the new branch, so on a branch switch the stamp is the
+    /// only thing left saying the entry is stale; keeping it would read as a
+    /// fresh answer for a branch nothing ever looked up.
     fn spawn_due(&mut self, ctx: &egui::Context) {
         let due = std::mem::take(&mut self.due);
         if due.is_empty() {
@@ -295,6 +304,7 @@ impl PrCache {
             for m in &due {
                 if let Some(entry) = self.entries.get_mut(&m.path) {
                     entry.pending = false;
+                    entry.queried_at = None;
                 }
             }
             return;
@@ -439,6 +449,12 @@ pub fn effective_branch<'a>(
 fn run_due(due: Vec<Member>, blocking: &jobs::Blocking) -> BatchResult {
     let mut out = HashMap::new();
     for group in groups(due, blocking) {
+        // A cancel landing between groups has no child to kill — neither the
+        // request nor the sweep registers one — so each group asks before
+        // starting rather than forking `gh` for a caller that is gone.
+        if blocking.cancelled() {
+            break;
+        }
         let found = query_group(
             &group,
             |cwd, query| run_graphql(cwd, query, blocking),
@@ -1516,6 +1532,17 @@ mod tests {
         bank_one(&mut cache, "/repo/busy", "main", job);
 
         let capped = Path::new("/repo/capped");
+        // A worktree that has just switched branch is the case a cleared
+        // `pending` alone cannot rescue: `poll` writes the new branch before
+        // the cap has had its say, so the mismatch that would make the entry
+        // due is gone and the old branch's stamp is still inside the TTL.
+        cache.entries.insert(capped.to_path_buf(), Entry {
+            branch: Some("old".into()),
+            info: Some(sample_info()),
+            queried_at: Some(Duration::ZERO),
+            pending: false,
+            refresh_requested: false,
+        });
         let ctx = egui::Context::default();
         cache.poll(capped, Some("feature"), &ctx);
         cache.drain_completed(&ctx);
@@ -1685,6 +1712,39 @@ mod tests {
         );
 
         assert_eq!(found.len(), 1);
+    }
+
+    /// A cancel landing between groups has no child to kill — neither the
+    /// batched request nor the per-branch sweep registers one — so the loop
+    /// has to ask.  Otherwise a burst keeps forking `gh` to build an answer
+    /// the drain has already backed off and nobody will read.
+    #[test]
+    fn run_due_stops_between_groups_once_cancelled() {
+        let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().expect("temp dir")).collect();
+        let due: Vec<Member> = dirs
+            .iter()
+            .map(|d| Member { path: d.path().to_path_buf(), branch: "topic".into() })
+            .collect();
+        let (tx, rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+
+        let job = jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
+            // Both halves of this handshake are load-bearing, for the reasons
+            // spelled out in `worktree::tests::create_stops_between_steps_
+            // once_cancelled`: the started signal keeps the task off the
+            // pre-start skip, and the gate keeps it from racing past the first
+            // check before the flag lands.
+            let _ = started_tx.send(());
+            let _ = gate_rx.recv();
+            let _ = tx.send(run_due(due, blocking));
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).expect("the job never started");
+        drop(job);
+        let _ = gate_tx.send(());
+
+        let out = rx.recv_timeout(Duration::from_secs(30)).expect("run_due never returned");
+        assert!(out.is_empty(), "a cancelled burst kept asking: {out:?}");
     }
 
     /// One result covers many entries, so the drain has to fan a single map out
