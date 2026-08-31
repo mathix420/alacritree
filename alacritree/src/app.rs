@@ -549,6 +549,9 @@ pub struct AlacritreeApp {
     ime: crate::ime::Ime,
     color_glyphs: crate::color_glyph::ColorGlyphCache,
     glyph_cache: crate::glyph_cache::GlyphCache,
+    /// The `[font.normal]` face's own decoration metrics, parsed once when the
+    /// fonts were installed.  Nothing re-reads the file per frame.
+    face_metrics: crate::fonts::FaceMetrics,
     /// Scratch buffers the painter copies the visible grid into, so the
     /// terminal lock is released before any shape is built.
     grid_snapshot: crate::terminal_view::GridSnapshot,
@@ -724,7 +727,7 @@ impl AlacritreeApp {
     pub fn new(cc: &CreationContext<'_>, config: Config) -> Self {
         let theme = Theme::from_config(&config);
 
-        let font_chain =
+        let (font_chain, face_metrics) =
             crate::fonts::install_terminal_fonts(&cc.egui_ctx, &config.font, &config.ui_font);
         let color_glyph_budget_mb = config.font.color_glyph_cache_mb;
 
@@ -890,6 +893,7 @@ impl AlacritreeApp {
                 font_chain,
                 color_glyph_budget_mb,
             ),
+            face_metrics,
             glyph_cache: crate::glyph_cache::GlyphCache::new(),
             grid_snapshot: crate::terminal_view::GridSnapshot::new(),
             gpu_grid: crate::grid_gl::GpuGrid::new(),
