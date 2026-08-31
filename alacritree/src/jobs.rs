@@ -115,9 +115,14 @@ impl Blocking {
                     std::thread::sleep(CHILD_POLL);
                 },
                 Err(err) => {
-                    // Leaving a live `Child` in the slot on error would orphan
-                    // it unreaped; take it out before propagating.
-                    slot.take();
+                    // Taking the child out removes the only handle a cancel
+                    // could have killed it through, and `Child::drop` neither
+                    // kills nor reaps, so a live child is stopped and collected
+                    // here or never.
+                    if let Some(mut child) = slot.take() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
                     return Err(err);
                 },
             }
