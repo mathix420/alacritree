@@ -880,6 +880,84 @@ pub struct PathStyleConfig {
     pub parent: TextEmphasis,
 }
 
+/// One correction to a decoration the font placed: a shift in physical pixels,
+/// a shift in points, or a multiplier.  kitty's grammar, so a value copied from
+/// a kitty config behaves the same way here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Adjust {
+    Pixels(f32),
+    Points(f32),
+    Scale(f32),
+}
+
+impl Adjust {
+    /// Draw what the font asked for.
+    pub const NONE: Self = Self::Pixels(0.0);
+
+    /// `"2px"`, `"2pt"`, a bare `"2"` (points, which is how kitty spells it),
+    /// or `"150%"`.  `None` for anything else, a signed percentage included.
+    pub fn parse(raw: &str) -> Option<Self> {
+        if let Some(number) = raw.strip_suffix('%') {
+            let percent = finite(number)?;
+            return (percent >= 0.0).then_some(Self::Scale(percent / 100.0));
+        }
+        if let Some(number) = raw.strip_suffix("px") {
+            return finite(number).map(Self::Pixels);
+        }
+        finite(raw.strip_suffix("pt").unwrap_or(raw)).map(Self::Points)
+    }
+
+    /// `value` is already in physical pixels, so a point shift scales by
+    /// `pixels_per_point` and a percentage multiplies what the font resolved
+    /// to rather than the em fraction it was read from.
+    pub fn apply(self, value: f32, pixels_per_point: f32) -> f32 {
+        match self {
+            Self::Pixels(px) => value + px,
+            Self::Points(pt) => value + pt * pixels_per_point,
+            Self::Scale(factor) => value * factor,
+        }
+    }
+}
+
+/// `"inf"` and `"nan"` parse as `f32` and would put a line nowhere at all.
+fn finite(raw: &str) -> Option<f32> {
+    raw.parse::<f32>().ok().filter(|value| value.is_finite())
+}
+
+/// `[ui.decorations]`: corrections to what the font reports for its underline
+/// and strikeout, for a face whose tables are wrong.  Every knob is a no-op by
+/// default, so an unmodified config draws what the face asked for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Decorations {
+    pub underline_position: Adjust,
+    pub underline_thickness: Adjust,
+    pub strikeout_position: Adjust,
+    pub strikeout_thickness: Adjust,
+}
+
+impl Default for Decorations {
+    fn default() -> Self {
+        Self {
+            underline_position: Adjust::NONE,
+            underline_thickness: Adjust::NONE,
+            strikeout_position: Adjust::NONE,
+            strikeout_thickness: Adjust::NONE,
+        }
+    }
+}
+
+/// A knob that will not parse logs and behaves as `"0"`, the way the rest of
+/// this file treats a value it does not recognize.
+fn parse_adjust(field: &str, raw: Option<&str>) -> Adjust {
+    let Some(text) = raw else {
+        return Adjust::NONE;
+    };
+    Adjust::parse(text).unwrap_or_else(|| {
+        log::warn!("unusable ui.decorations.{field} value {text:?}, using \"0\"");
+        Adjust::NONE
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct UiTheme {
     pub sidebar_background: Option<Color32>,
@@ -917,6 +995,10 @@ pub struct UiTheme {
     /// old for instanced arrays logs once, costs the frame it was found on,
     /// and paints the mesh from the next one.
     pub gpu_grid: bool,
+    /// Corrections applied to the underline and strikeout the font placed
+    /// ([`Decorations`]).  Only the GPU grid reads these; the mesh path draws
+    /// a straight rule at a fixed offset either way.
+    pub decorations: Decorations,
     /// Paint PR-status badges on worktree rows (and poll `gh` for expanded
     /// projects' worktrees).  Off by default so an unmodified config spawns
     /// no `gh` processes; when enabled it is best-effort like the diff-base
@@ -1001,6 +1083,7 @@ impl Default for UiTheme {
             icon_tooltips: true,
             session_display: SessionDisplay::default(),
             gpu_grid: false,
+            decorations: Decorations::default(),
             pr_status: false,
             upstream_status: false,
             worktree_liveness: true,
@@ -1891,6 +1974,28 @@ struct RawSessionDisplay {
     tabs_always: Option<bool>,
 }
 
+/// Corrections applied to what the font reports for its underline and
+/// strikeout.  Each value is `"2px"` (physical pixels, added), `"2pt"` or a
+/// bare `"2"` (points, added), or `"150%"` (a multiplier).  Positive moves a
+/// line down, matching kitty and ghostty.  A percentage takes no sign.
+/// Default `"0"`, which draws what the font asked for.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default)]
+struct RawDecorations {
+    /// Shift or scale of how far the underline sits from the top of the cell.
+    #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
+    underline_position: Option<String>,
+    /// Shift or scale of the underline's stroke weight.
+    #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
+    underline_thickness: Option<String>,
+    /// Shift or scale of how far the strikeout sits from the top of the cell.
+    #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
+    strikeout_position: Option<String>,
+    /// Shift or scale of the strikeout bar's weight.
+    #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
+    strikeout_thickness: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawUiFont {
@@ -2027,6 +2132,9 @@ struct RawUi {
     /// context too old for instanced arrays logs once and paints the mesh
     /// from the next frame on.
     gpu_grid: Option<bool>,
+    /// Corrections to the underline and strikeout the font placed
+    /// ([`RawDecorations`]).
+    decorations: RawDecorations,
     /// Poll `gh` for each branch's open pull request, which drives the PR row
     /// icons, the PR-state filters, and `$pr` in row templates.
     pr_status: Option<bool>,
@@ -2270,6 +2378,24 @@ impl RawConfig {
                 tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
             },
             gpu_grid: self.ui.gpu_grid.unwrap_or(false),
+            decorations: Decorations {
+                underline_position: parse_adjust(
+                    "underline_position",
+                    self.ui.decorations.underline_position.as_deref(),
+                ),
+                underline_thickness: parse_adjust(
+                    "underline_thickness",
+                    self.ui.decorations.underline_thickness.as_deref(),
+                ),
+                strikeout_position: parse_adjust(
+                    "strikeout_position",
+                    self.ui.decorations.strikeout_position.as_deref(),
+                ),
+                strikeout_thickness: parse_adjust(
+                    "strikeout_thickness",
+                    self.ui.decorations.strikeout_thickness.as_deref(),
+                ),
+            },
             pr_status: self.ui.pr_status.unwrap_or(false),
             upstream_status: self.ui.upstream_status.unwrap_or(false),
             worktree_liveness: self.ui.worktree_liveness.unwrap_or(true),
@@ -3702,5 +3828,52 @@ program = "second"
 
         assert!(config.debug.persistent_logging, "the alacritty.toml key was dropped");
         assert!(!config.debug.crash_log, "the alacritree.toml key was dropped");
+    }
+
+    #[test]
+    fn every_accepted_adjustment_spelling_parses() {
+        assert_eq!(Adjust::parse("0"), Some(Adjust::Points(0.0)));
+        assert_eq!(Adjust::parse("-2"), Some(Adjust::Points(-2.0)));
+        assert_eq!(Adjust::parse("1.5"), Some(Adjust::Points(1.5)));
+        assert_eq!(Adjust::parse("2pt"), Some(Adjust::Points(2.0)));
+        assert_eq!(Adjust::parse("2px"), Some(Adjust::Pixels(2.0)));
+        assert_eq!(Adjust::parse("-2px"), Some(Adjust::Pixels(-2.0)));
+        assert_eq!(Adjust::parse("150%"), Some(Adjust::Scale(1.5)));
+    }
+
+    /// A percentage is a magnitude.  kitty silently takes the absolute value of a
+    /// negative one, which gives back a line the user did not ask for and no way
+    /// to tell that happened.
+    #[test]
+    fn unusable_adjustment_spellings_are_rejected() {
+        for text in ["", "abc", "2 px", "-150%", "px", "%", "nan", "inf"] {
+            assert_eq!(Adjust::parse(text), None, "{text:?} should not parse");
+        }
+    }
+
+    /// The two spellings of "leave it alone" have to agree, since one is the
+    /// default and the other is what a user writes to say the same thing.
+    #[test]
+    fn a_zero_adjustment_is_the_identity_in_both_units() {
+        assert_eq!(Adjust::parse("0").unwrap().apply(7.0, 2.0), 7.0);
+        assert_eq!(Adjust::parse("100%").unwrap().apply(7.0, 2.0), 7.0);
+        assert_eq!(Adjust::NONE.apply(7.0, 2.0), 7.0);
+    }
+
+    /// Pixels are physical and points are not, which is the whole reason both
+    /// spellings exist.
+    #[test]
+    fn pixels_are_absolute_and_points_scale_with_the_display() {
+        assert_eq!(Adjust::parse("2px").unwrap().apply(10.0, 2.0), 12.0);
+        assert_eq!(Adjust::parse("2pt").unwrap().apply(10.0, 2.0), 14.0);
+        assert_eq!(Adjust::parse("150%").unwrap().apply(10.0, 2.0), 15.0);
+    }
+
+    /// A malformed knob must not fail the whole config load, and must not leave
+    /// the line somewhere the user cannot predict.
+    #[test]
+    fn a_malformed_adjustment_behaves_as_zero() {
+        assert_eq!(parse_adjust("underline_position", Some("2 px")), Adjust::NONE);
+        assert_eq!(parse_adjust("underline_position", None), Adjust::NONE);
     }
 }
