@@ -13,6 +13,9 @@
 
 use egui::{Color32, ColorImage, Context, TextureHandle, TextureId, TextureOptions};
 
+use crate::config::Decorations;
+use crate::fonts::FaceMetrics;
+
 /// Underline styles, in the order their tiles sit in the strip.  Zero is the
 /// undecorated cell, whose tile is never sampled: the vertex shader collapses
 /// that quad rather than reading it.
@@ -35,14 +38,70 @@ pub fn tile(underline: u16, strikeout: bool) -> u16 {
     underline + if strikeout { UNDERLINE_KINDS } else { 0 }
 }
 
-/// Where the lines sit and how thick they are, in physical pixels.
+/// Where the lines sit and how thick they are, in physical pixels.  The `y`
+/// values and `baseline` are measured down from the cell's top edge;
+/// `descent` is a length.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Geometry {
     pub cell: [usize; 2],
-    pub thickness: f32,
+    /// Where epaint puts the glyph baseline inside the cell.  The descent area
+    /// hangs from here rather than from the cell's bottom edge: `cell_h` is a
+    /// floored row height plus `font.offset.y`, so the two are different places
+    /// and only this one tracks where glyphs actually sit.
+    pub baseline: f32,
+    /// Height of the descent area below the baseline.  It is the vertical room
+    /// the double and curly styles divide up, which is what keeps them legible
+    /// on a face whose strokes are fine.
+    pub descent: f32,
     /// Centre of the underline, measured down from the cell's top edge.
     pub underline_y: f32,
+    pub underline_thickness: f32,
     pub strikeout_y: f32,
+    pub strikeout_thickness: f32,
+}
+
+impl Geometry {
+    /// Turn a face's em fractions into pixels for one cell.
+    ///
+    /// The face resolves to pixels before a knob touches it, and thickness
+    /// rounds after: rounding first would quantize the value a percentage then
+    /// scales, leaving a 50% request against a one-pixel line nothing to halve.
+    pub fn resolve(
+        cell: [usize; 2],
+        font_ascent_pt: f32,
+        pixels_per_point: f32,
+        metrics: &FaceMetrics,
+        knobs: &Decorations,
+    ) -> Self {
+        let ppp = pixels_per_point;
+        let baseline = font_ascent_pt * ppp;
+        let px_per_em = baseline / metrics.ascender;
+        // Table positions are measured up from the baseline; the cell is
+        // measured down from its top edge.
+        let down_from_top = |em: f32| baseline - em * px_per_em;
+
+        Self {
+            cell,
+            baseline,
+            descent: -metrics.descender * px_per_em,
+            underline_y: knobs
+                .underline_position
+                .apply(down_from_top(metrics.underline_position), ppp),
+            underline_thickness: knobs
+                .underline_thickness
+                .apply(metrics.underline_thickness * px_per_em, ppp)
+                .round()
+                .max(1.0),
+            strikeout_y: knobs
+                .strikeout_position
+                .apply(down_from_top(metrics.strikeout_position), ppp),
+            strikeout_thickness: knobs
+                .strikeout_thickness
+                .apply(metrics.strikeout_thickness * px_per_em, ppp)
+                .round()
+                .max(1.0),
+        }
+    }
 }
 
 /// The strip, rebuilt whenever the cell it was drawn for changes size.
@@ -89,22 +148,16 @@ fn rasterize(geometry: Geometry) -> ColorImage {
             let x0 = tile(underline, strikeout) as usize * w;
             draw_underline(&mut coverage, width, x0, underline, geometry);
             if strikeout {
-                let y = geometry.strikeout_y;
-                rect(&mut coverage, width, x0, w, y - geometry.thickness / 2.0, geometry.thickness);
+                let t = geometry.strikeout_thickness;
+                rect(&mut coverage, width, x0, w, geometry.strikeout_y - t / 2.0, t);
             }
         }
     }
     // A struck cell with no underline is the one tile the loop above cannot
     // reach: it has no underline style to iterate over.
     let x0 = tile(NONE, true) as usize * w;
-    rect(
-        &mut coverage,
-        width,
-        x0,
-        w,
-        geometry.strikeout_y - geometry.thickness / 2.0,
-        geometry.thickness,
-    );
+    let t = geometry.strikeout_thickness;
+    rect(&mut coverage, width, x0, w, geometry.strikeout_y - t / 2.0, t);
 
     let pixels = coverage
         .iter()
@@ -118,19 +171,23 @@ fn rasterize(geometry: Geometry) -> ColorImage {
 
 fn draw_underline(buf: &mut [f32], stride: usize, x0: usize, kind: u16, geometry: Geometry) {
     let [w, h] = geometry.cell;
-    let t = geometry.thickness;
+    let t = geometry.underline_thickness;
     // Styles taller than one stem are pulled up until they fit, so a thick
     // line on a short cell loses its lower half to the cell edge instead of
     // its shape.
     let fit = |extent: f32| geometry.underline_y.min(h as f32 - extent);
     match kind {
         STRAIGHT => rect(buf, stride, x0, w, fit(t / 2.0) - t / 2.0, t),
-        // One stem above the single underline's position and one below, with a
-        // stem's worth of gap: any less and the pair reads as one thick rule.
+        // One stem in each half of the descent area.  Deriving the gap from
+        // the stroke instead would merge the pair on a face with fine strokes,
+        // leaving the style indistinguishable from a straight rule.  Both move
+        // together when the lower one would fall off the cell, so the pair
+        // survives rather than the spacing.
         DOUBLE => {
-            let y = fit(t * 1.5);
-            rect(buf, stride, x0, w, y - t * 1.5, t);
-            rect(buf, stride, x0, w, y + t * 0.5, t);
+            let lower = (geometry.baseline + 0.75 * geometry.descent).min(h as f32 - t / 2.0);
+            let upper = lower - 0.5 * geometry.descent;
+            rect(buf, stride, x0, w, upper - t / 2.0, t);
+            rect(buf, stride, x0, w, lower - t / 2.0, t);
         },
         CURLY => curl(buf, stride, x0, geometry),
         // Both patterns repeat a whole number of times per cell, which is what
@@ -181,15 +238,16 @@ fn rect_x(buf: &mut [f32], stride: usize, x0: usize, left: f32, width: f32, top:
 /// exactly where the eye reads a curl's shape.
 fn curl(buf: &mut [f32], stride: usize, x0: usize, geometry: Geometry) {
     let [w, h] = geometry.cell;
-    let t = geometry.thickness;
-    // The wave hangs from the underline position rather than sitting on it:
-    // anchoring the lowest ink there and claiming the room above is what keeps
-    // the amplitude off zero on a cell whose underline sits near the bottom,
-    // where a slope-limited curl degrades into a straight line.
-    let bottom = (geometry.underline_y + t).min(h as f32 - 1.0);
-    let top = (bottom - 3.0 * t).max(0.0);
-    let amplitude = ((bottom - top - t) / 2.0).max(0.5);
+    let t = geometry.underline_thickness;
+    // The wave's ink fills the descent area, so the amplitude comes from the
+    // room the band leaves rather than from the stroke: a face with fine
+    // strokes would otherwise get a curl too shallow to read as one.  Pulled
+    // up whole when the band runs past the cell, so the shape survives instead
+    // of losing its lower lobe to the edge.
+    let bottom = (geometry.baseline + geometry.descent).min(h as f32);
+    let top = (bottom - geometry.descent).max(0.0);
     let centre = (top + bottom) / 2.0;
+    let amplitude = ((bottom - top - t) / 2.0).max(0.5);
     let two_pi = std::f32::consts::TAU;
 
     for px in 0..w {
@@ -220,8 +278,18 @@ fn curl(buf: &mut [f32], stride: usize, x0: usize, geometry: Geometry) {
 mod tests {
     use super::*;
 
+    /// A cell roomy enough that no style hits the `fit` clamp, so a test that
+    /// fails is describing the arithmetic rather than the clamp.
     fn geometry() -> Geometry {
-        Geometry { cell: [10, 20], thickness: 2.0, underline_y: 17.0, strikeout_y: 10.0 }
+        Geometry {
+            cell: [10, 24],
+            baseline: 14.0,
+            descent: 8.0,
+            underline_y: 17.0,
+            underline_thickness: 2.0,
+            strikeout_y: 10.0,
+            strikeout_thickness: 2.0,
+        }
     }
 
     fn alpha(image: &ColorImage, tile_index: u16, x: usize, y: usize) -> u8 {
@@ -323,5 +391,111 @@ mod tests {
         let index = tile(STRAIGHT, true);
         assert_eq!(alpha(&image, index, 5, 17), 255, "underline missing");
         assert_eq!(alpha(&image, index, 5, 10), 255, "strikeout missing");
+    }
+
+    /// The descent area hangs from the baseline, not from the cell's bottom
+    /// edge.  `cell_h` is a floored row height plus `font.offset.y`, so an
+    /// anchor read off the bottom drifts by the line gap and by the offset,
+    /// and this is the assertion that catches it.
+    #[test]
+    fn the_curl_stays_inside_the_descent_area() {
+        let g = geometry();
+        let image = rasterize(g);
+        let band = (g.baseline as usize)..=((g.baseline + g.descent) as usize);
+        for y in 0..g.cell[1] {
+            if band.contains(&y) {
+                continue;
+            }
+            for x in 0..g.cell[0] {
+                assert_eq!(alpha(&image, CURLY, x, y), 0, "curl ink at row {y}, outside {band:?}");
+            }
+        }
+    }
+
+    /// One stem in each half of the descent area.  Both above or both below
+    /// its midpoint would mean the stems were placed from a single position
+    /// rather than from the band.
+    #[test]
+    fn the_double_stems_straddle_the_descent_midpoint() {
+        let g = geometry();
+        let image = rasterize(g);
+        let inked: Vec<usize> =
+            (0..g.cell[1]).filter(|&y| alpha(&image, DOUBLE, 5, y) > 128).collect();
+        let midpoint = (g.baseline + g.descent / 2.0) as usize;
+        assert!(inked.iter().any(|&y| y < midpoint), "nothing above {midpoint}: {inked:?}");
+        assert!(inked.iter().any(|&y| y > midpoint), "nothing below {midpoint}: {inked:?}");
+    }
+
+    /// The two lines carry separate weights because the font reports them
+    /// separately, and a tile has to honour both at once.
+    #[test]
+    fn the_strikeout_keeps_its_own_weight() {
+        let g = Geometry { strikeout_thickness: 4.0, ..geometry() };
+        let image = rasterize(g);
+        let index = tile(STRAIGHT, true);
+        let bar = (0..g.cell[1]).filter(|&y| alpha(&image, index, 5, y) > 128).count();
+        assert!(bar >= 4 + 2, "strikeout and underline together cover {bar} rows");
+    }
+
+    /// Zero adjustments must reproduce the face: the underline below the
+    /// baseline, the strikeout above it, and a descent the multi-line styles
+    /// can divide.
+    #[test]
+    fn an_unadjusted_geometry_follows_the_face() {
+        let metrics = crate::fonts::FaceMetrics::default();
+        let g = Geometry::resolve([10, 24], 16.0, 1.0, &metrics, &Default::default());
+        assert!(g.underline_y > g.baseline, "underline {} at {}", g.underline_y, g.baseline);
+        assert!(g.strikeout_y < g.baseline, "strikeout {} at {}", g.strikeout_y, g.baseline);
+        assert!(g.descent > 0.0, "descent {}", g.descent);
+        assert!(g.underline_thickness >= 1.0);
+        assert!(g.strikeout_thickness >= 1.0);
+    }
+
+    /// A knob shifts by exactly what it says, and a point shift is the one
+    /// that grows with the display.
+    #[test]
+    fn a_position_knob_moves_the_line_by_what_it_asked_for() {
+        use crate::config::{Adjust, Decorations};
+        let metrics = crate::fonts::FaceMetrics::default();
+        let plain = Geometry::resolve([10, 24], 16.0, 2.0, &metrics, &Decorations::default());
+        let shifted = Geometry::resolve(
+            [10, 24],
+            16.0,
+            2.0,
+            &metrics,
+            &Decorations { underline_position: Adjust::Pixels(2.0), ..Decorations::default() },
+        );
+        assert_eq!(shifted.underline_y - plain.underline_y, 2.0);
+
+        let in_points = Geometry::resolve(
+            [10, 24],
+            16.0,
+            2.0,
+            &metrics,
+            &Decorations { underline_position: Adjust::Points(2.0), ..Decorations::default() },
+        );
+        assert_eq!(in_points.underline_y - plain.underline_y, 4.0);
+    }
+
+    /// Rounding the font's thickness before a percentage scales it would
+    /// quantize a 1px line to nothing a knob could halve.
+    #[test]
+    fn a_thickness_percentage_scales_before_rounding() {
+        use crate::config::{Adjust, Decorations};
+        let metrics = crate::fonts::FaceMetrics::default();
+        let doubled = Geometry::resolve(
+            [10, 24],
+            16.0,
+            1.0,
+            &metrics,
+            &Decorations { underline_thickness: Adjust::Scale(2.0), ..Decorations::default() },
+        );
+        let plain = Geometry::resolve([10, 24], 16.0, 1.0, &metrics, &Decorations::default());
+        assert!(
+            doubled.underline_thickness > plain.underline_thickness,
+            "{} is not thicker than {}",
+            doubled.underline_thickness,
+            plain.underline_thickness
+        );
     }
 }
