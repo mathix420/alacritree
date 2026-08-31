@@ -77,13 +77,6 @@ pub struct DebugConfig {
     /// to someone reading it.  Needs `[ui] gpu_grid` and a GL 3.3 context.
     /// Keeps this session's log file for as long as it is on, since the
     /// report has nowhere else to go.
-    /// alacritree-only, set in `alacritree.toml`.  Log what the GPU grid's
-    /// paint callback costs: the wall time of issuing a frame, and the GPU's
-    /// own time for the upload and each of the three draws.  Off by default;
-    /// timer queries are cheap but not free, and the line is only meaningful
-    /// to someone reading it.  Needs `[ui] gpu_grid` and a GL 3.3 context.
-    /// Keeps this session's log file for as long as it is on, since the
-    /// report has nowhere else to go.
     pub gpu_timing: bool,
 }
 
@@ -1466,13 +1459,6 @@ struct RawDebug {
     /// Keep the log file after quitting.  Upstream's name and upstream's
     /// default (`false`).
     persistent_logging: Option<bool>,
-    /// Log what the GPU grid's paint callback costs: the wall time of
-    /// issuing a frame, and the GPU's own time for the upload and each of
-    /// the three draws.  alacritree-only, so it belongs in
-    /// `alacritree.toml`.  Default `false`; timer queries are cheap but not
-    /// free, and the line is only meaningful to someone reading it.  Needs
-    /// `[ui] gpu_grid` and a GL 3.3 context.  Keeps this session's log file
-    /// for as long as it is on, since the report has nowhere else to go.
     /// Log what the GPU grid's paint callback costs: the wall time of
     /// issuing a frame, and the GPU's own time for the upload and each of
     /// the three draws.  alacritree-only, so it belongs in
