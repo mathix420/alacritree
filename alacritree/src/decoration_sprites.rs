@@ -180,12 +180,15 @@ fn draw_underline(buf: &mut [f32], stride: usize, x0: usize, kind: u16, geometry
         STRAIGHT => rect(buf, stride, x0, w, fit(t / 2.0) - t / 2.0, t),
         // One stem in each half of the descent area.  Deriving the gap from
         // the stroke instead would merge the pair on a face with fine strokes,
-        // leaving the style indistinguishable from a straight rule.  Both move
-        // together when the lower one would fall off the cell, so the pair
-        // survives rather than the spacing.
+        // leaving the style indistinguishable from a straight rule.  The band
+        // is a floor and not the whole story: a stroke thick enough to close
+        // the room it opened pushes the stems apart to keep a stroke's worth
+        // of blank between them.  Both move together when the lower one would
+        // fall off the cell, so the pair survives rather than the spacing.
         DOUBLE => {
+            let spacing = (0.5 * geometry.descent).max(2.0 * t);
             let lower = (geometry.baseline + 0.75 * geometry.descent).min(h as f32 - t / 2.0);
-            let upper = lower - 0.5 * geometry.descent;
+            let upper = lower - spacing;
             rect(buf, stride, x0, w, upper - t / 2.0, t);
             rect(buf, stride, x0, w, lower - t / 2.0, t);
         },
@@ -483,19 +486,31 @@ mod tests {
     fn a_thickness_percentage_scales_before_rounding() {
         use crate::config::{Adjust, Decorations};
         let metrics = crate::fonts::FaceMetrics::default();
+        // An ascent of 22.4 puts 28 pixels in the em, so the face's stroke
+        // resolves to a fractional 1.4: rounding first would answer 2.0 where
+        // scaling first answers 3.0.  A whole-pixel stroke leaves the two
+        // orderings agreeing and the assertion proving nothing.
         let doubled = Geometry::resolve(
             [10, 24],
-            16.0,
+            22.4,
             1.0,
             &metrics,
             &Decorations { underline_thickness: Adjust::Scale(2.0), ..Decorations::default() },
         );
-        let plain = Geometry::resolve([10, 24], 16.0, 1.0, &metrics, &Decorations::default());
-        assert!(
-            doubled.underline_thickness > plain.underline_thickness,
-            "{} is not thicker than {}",
-            doubled.underline_thickness,
-            plain.underline_thickness
-        );
+        assert_eq!(doubled.underline_thickness, 3.0);
+    }
+
+    /// A stroke thick enough to span the room the descent left has to push the
+    /// stems apart rather than fill the gap between them.  Splitting the band
+    /// alone puts the two stems `descent / 2` apart, so anything from a
+    /// compressed face to a thickness knob turned up closes the pair into the
+    /// single rule the style exists to be distinguishable from.
+    #[test]
+    fn a_thick_stroke_keeps_the_double_stems_apart() {
+        let g = Geometry { descent: 3.0, underline_thickness: 2.0, ..geometry() };
+        let image = rasterize(g);
+        let column: Vec<bool> = (0..g.cell[1]).map(|y| alpha(&image, DOUBLE, 5, y) > 128).collect();
+        let stems = column.windows(2).filter(|w| !w[0] && w[1]).count();
+        assert_eq!(stems, 2, "the stems merged: {column:?}");
     }
 }
