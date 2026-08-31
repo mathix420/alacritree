@@ -311,12 +311,17 @@ mod tests {
 
     /// Nothing here may panic on a pid that has gone, because the set is taken
     /// from a process table that is stale the moment it is read.
+    ///
+    /// The number has to be one the kernel cannot hand to anything, not one
+    /// this test reaped: a pid is free for reuse the moment its last handle
+    /// closes, so boosting a reaped one reaches whichever process picked it
+    /// up next.  Windows numbers processes in multiples of four, which the
+    /// probe below confirms rather than assumes.
     #[test]
     fn a_vanished_pid_is_ignored() {
-        let pid = {
-            let subject = subject();
-            subject.pid()
-        };
+        let pid = u32::MAX;
+        let live = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        assert!(live.is_null(), "{pid} is a live process; boosting it would reach a stranger");
 
         set_boosted(pid, true);
         set_boosted(pid, false);
