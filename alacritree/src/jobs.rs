@@ -118,8 +118,13 @@ impl Blocking {
                     // Taking the child out removes the only handle a cancel
                     // could have killed it through, and `Child::drop` neither
                     // kills nor reaps, so a live child is stopped and collected
-                    // here or never.
-                    if let Some(mut child) = slot.take() {
+                    // here or never.  The slot is released first: a cancel
+                    // reaching it now finds nothing to kill, which is right
+                    // because this arm kills, and `cancel` runs on the UI
+                    // thread where waiting on the lock would stall a frame.
+                    let taken = slot.take();
+                    drop(slot);
+                    if let Some(mut child) = taken {
                         let _ = child.kill();
                         let _ = child.wait();
                     }
