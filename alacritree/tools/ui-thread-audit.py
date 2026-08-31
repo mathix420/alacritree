@@ -58,7 +58,7 @@ SRC = "alacritree/src"
 # under load.
 PRIMS = [
     (re.compile(r"Command::new\("), "spawns a process"),
-    (re.compile(r"\.output\(\)|wait_with_output\("), "waits on a process"),
+    (re.compile(r"\.output\(\)|wait_with_output\(|\.wait\(\)"), "waits on a process"),
     (re.compile(r"\.statuses\("), "walks the repository status"),
     (re.compile(r"diff_tree_to_workdir|diff_tree_to_index|diff_index_to_workdir"), "diffs the working tree"),
     (re.compile(r"Repository::open|Repository::discover"), "opens a repository"),
