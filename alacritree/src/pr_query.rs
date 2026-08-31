@@ -99,18 +99,17 @@ mod tests {
         assert!(q.contains("repository(owner: \"owner\", name: \"repo\")"), "{q}");
     }
 
-    /// A quote in a branch name must stay inside its own literal rather than
-    /// closing it early: one request answers a whole project, so a name that
-    /// broke out of its literal would corrupt every branch's alias, not just
-    /// its own.
+    /// A quote in any interpolated name must stay inside its own literal
+    /// rather than closing it early: one request answers a whole project, so a
+    /// name that broke out would corrupt every branch's alias, not just its
+    /// own.  The expected forms are spelled out rather than built with
+    /// `graphql_string`, so a bug inside that function cannot satisfy both
+    /// sides of the assertion.
     #[test]
-    fn a_quote_in_a_branch_name_stays_inside_its_own_literal() {
-        let evil = "topic\"evil".to_string();
-        let q = build("owner", "repo", &[evil.clone(), "main".into()]);
-        assert!(
-            q.contains(&format!("b0: pullRequests(headRefName: {}", graphql_string(&evil))),
-            "{q}"
-        );
+    fn a_quote_in_any_name_stays_inside_its_own_literal() {
+        let q = build("own\"er", "repo", &["topic\"evil".into(), "main".into()]);
+        assert!(q.contains("repository(owner: \"own\\\"er\", name: \"repo\")"), "{q}");
+        assert!(q.contains("b0: pullRequests(headRefName: \"topic\\\"evil\""), "{q}");
         assert!(q.contains("b1: pullRequests(headRefName: \"main\""), "{q}");
     }
 
