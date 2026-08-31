@@ -206,6 +206,7 @@ mod tests {
         GetPriorityClass, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
+    use crate::command_ext::CommandExt as _;
     use super::*;
 
     /// A child that sits still for the length of a test without spinning a
@@ -229,6 +230,7 @@ mod tests {
         Subject(
             Command::new("cmd.exe")
                 .args(args)
+                .hide_console()
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .spawn()
@@ -561,7 +563,8 @@ mod tests {
         // one still has to clean up after itself.
         for member in &survivors {
             let pid = member.pid.to_string();
-            let _ = Command::new("taskkill").args(["/F", "/T", "/PID", &pid]).output();
+            let _ =
+                Command::new("taskkill").args(["/F", "/T", "/PID", &pid]).hide_console().output();
         }
         Teardown { closed, started, survivors }
     }
