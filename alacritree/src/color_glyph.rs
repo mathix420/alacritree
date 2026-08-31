@@ -365,7 +365,7 @@ mod tests {
             .collect(),
             ..FontConfig::default()
         };
-        let chain = crate::fonts::install_terminal_fonts(ctx, &font, &UiFont::default());
+        let (chain, _) = crate::fonts::install_terminal_fonts(ctx, &font, &UiFont::default());
 
         let renders_emoji = chain.iter().find_map(|face| {
             let data = std::fs::read(&face.path).ok()?;
@@ -458,7 +458,7 @@ mod tests {
     #[test]
     fn plain_text_is_left_to_egui() {
         let ctx = Context::default();
-        let chain =
+        let (chain, _) =
             crate::fonts::install_terminal_fonts(&ctx, &FontConfig::default(), &UiFont::default());
         let mut cache = ColorGlyphCache::new(chain, 10);
         for c in ['A', 'z', '0', '─', '│'] {

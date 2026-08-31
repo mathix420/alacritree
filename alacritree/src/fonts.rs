@@ -622,6 +622,98 @@ fn face_height_ratio(data: &[u8], index: u32) -> Option<f32> {
     (units > 0.0 && height > 0.0).then(|| height / units)
 }
 
+/// Em fractions used where a face reports nothing usable.  A zero in a metric
+/// table means "not supplied" rather than "at the baseline", so every field is
+/// checked against these rather than used as read.
+const DEFAULT_ASCENDER: f32 = 0.8;
+const DEFAULT_DESCENDER: f32 = -0.2;
+const DEFAULT_UNDERLINE_POSITION: f32 = -0.1;
+const DEFAULT_UNDERLINE_THICKNESS: f32 = 0.05;
+
+/// Where a strikeout goes above the baseline when OS/2 does not say, as a
+/// fraction of the ascender.  kitty spells the same rule as
+/// `floor(baseline * 0.65)` measured down from the cell top.
+const STRIKEOUT_ASCENDER_RATIO: f32 = 0.35;
+
+/// What a face asks for its decorations, as fractions of the em measured from
+/// the baseline with up positive.  That is the sign convention of the `post`
+/// and OS/2 tables the numbers come from: an underline position is negative,
+/// a strikeout position is positive, and so is the ascender while the
+/// descender is negative.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FaceMetrics {
+    pub ascender: f32,
+    pub descender: f32,
+    pub underline_position: f32,
+    pub underline_thickness: f32,
+    pub strikeout_position: f32,
+    pub strikeout_thickness: f32,
+}
+
+impl Default for FaceMetrics {
+    fn default() -> Self {
+        Self {
+            ascender: DEFAULT_ASCENDER,
+            descender: DEFAULT_DESCENDER,
+            underline_position: DEFAULT_UNDERLINE_POSITION,
+            underline_thickness: DEFAULT_UNDERLINE_THICKNESS,
+            strikeout_position: STRIKEOUT_ASCENDER_RATIO * DEFAULT_ASCENDER,
+            strikeout_thickness: DEFAULT_UNDERLINE_THICKNESS,
+        }
+    }
+}
+
+impl FaceMetrics {
+    /// Read face `index` of `data`.  Anything the face leaves at zero, omits,
+    /// or cannot express is filled in by `resolve_fallbacks`.
+    pub fn from_face(data: &[u8], index: u32) -> Self {
+        let Ok(face) = ttf_parser::Face::parse(data, index) else {
+            log::warn!("could not parse the terminal face; using default decoration metrics");
+            return Self::default();
+        };
+        let units = f32::from(face.units_per_em());
+        if units <= 0.0 {
+            log::warn!("the terminal face reports no em size; using default decoration metrics");
+            return Self::default();
+        }
+        let em = |v: i16| f32::from(v) / units;
+        let underline = face.underline_metrics();
+        let strikeout = face.strikeout_metrics();
+
+        resolve_fallbacks(Self {
+            ascender: em(face.ascender()),
+            descender: em(face.descender()),
+            underline_position: underline.map_or(0.0, |m| em(m.position)),
+            underline_thickness: underline.map_or(0.0, |m| em(m.thickness)),
+            strikeout_position: strikeout.map_or(0.0, |m| em(m.position)),
+            strikeout_thickness: strikeout.map_or(0.0, |m| em(m.thickness)),
+        })
+    }
+}
+
+/// Substitute for every field a face left at zero.  Split out from
+/// `from_face` so each substitution is reachable from a test without a font
+/// file engineered to be broken in exactly one way.
+fn resolve_fallbacks(raw: FaceMetrics) -> FaceMetrics {
+    let defaults = FaceMetrics::default();
+    let ascender = nonzero(raw.ascender).unwrap_or(defaults.ascender);
+    let underline_thickness =
+        nonzero(raw.underline_thickness).unwrap_or(defaults.underline_thickness);
+    FaceMetrics {
+        ascender,
+        descender: nonzero(raw.descender).unwrap_or(defaults.descender),
+        underline_position: nonzero(raw.underline_position).unwrap_or(defaults.underline_position),
+        underline_thickness,
+        strikeout_position: nonzero(raw.strikeout_position)
+            .unwrap_or(STRIKEOUT_ASCENDER_RATIO * ascender),
+        strikeout_thickness: nonzero(raw.strikeout_thickness).unwrap_or(underline_thickness),
+    }
+}
+
+fn nonzero(value: f32) -> Option<f32> {
+    (value != 0.0 && value.is_finite()).then_some(value)
+}
+
 /// Scale a fallback face so one point of it is as tall as one point of the
 /// primary face; without this, powerline caps, emoji, and CJK glyphs from
 /// fallback fonts overshoot or undershoot the cell.  Clamped so a face with
@@ -855,17 +947,39 @@ pub fn ui_variant_family(bold: bool, italic: bool) -> FontFamily {
 
 /// Register the terminal faces with egui and return the normal-variant
 /// fallback chain, in the order egui consults it, for the colour glyph
-/// renderer to resolve against.
-pub fn install_terminal_fonts(ctx: &Context, font: &FontConfig, ui: &UiFont) -> Vec<ChainFace> {
+/// renderer to resolve against, together with the decoration metrics of the
+/// face at its head.
+pub fn install_terminal_fonts(
+    ctx: &Context,
+    font: &FontConfig,
+    ui: &UiFont,
+) -> (Vec<ChainFace>, FaceMetrics) {
     let fonts = SystemFonts::default();
     match build_font_definitions(font, ui, &fonts) {
         Some((defs, chain)) => {
             ctx.set_fonts(defs);
-            chain
+            let metrics = primary_face_metrics(&chain);
+            (chain, metrics)
         },
         None => {
             ctx.set_fonts(unresolvable_font_definitions(ui));
-            Vec::new()
+            (Vec::new(), FaceMetrics::default())
+        },
+    }
+}
+
+/// The chain's head is the `[font.normal]` face, pushed ahead of every
+/// fallback, so its metrics are the ones the grid is laid out against.  An
+/// empty chain means the family could not be resolved at all.
+fn primary_face_metrics(chain: &[ChainFace]) -> FaceMetrics {
+    let Some(primary) = chain.first() else {
+        return FaceMetrics::default();
+    };
+    match map_font_file(&primary.path) {
+        Ok(data) => FaceMetrics::from_face(data, primary.face_index),
+        Err(err) => {
+            log::warn!("could not read {} for decoration metrics: {err}", primary.path.display());
+            FaceMetrics::default()
         },
     }
 }
@@ -1823,7 +1937,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let chain = install_terminal_fonts(&ctx, &config, &UiFont::default());
+        let (chain, _) = install_terminal_fonts(&ctx, &config, &UiFont::default());
         assert!(chain.is_empty(), "an unresolvable family produces no fallback chain");
 
         let input = egui::RawInput {
@@ -2424,6 +2538,74 @@ mod tests {
         let _ = face_coverage(&path, 0);
 
         assert!(is_mapped(&path), "face_coverage read the file instead of mapping it");
+    }
+
+    /// Raw font units are in the hundreds; em fractions are not.  A face read
+    /// without dividing by `units_per_em` passes every other test in this file
+    /// and puts the underline several cells below the glyph.
+    #[test]
+    fn the_bundled_face_reports_em_fractions() {
+        let m = FaceMetrics::from_face(SYMBOLS_FONT, 0);
+        assert!((0.5..1.5).contains(&m.ascender), "ascender {}", m.ascender);
+        assert!((-0.6..0.0).contains(&m.descender), "descender {}", m.descender);
+        assert!(m.underline_position.abs() < 1.0, "underline {}", m.underline_position);
+        assert!(m.strikeout_position.abs() < 1.0, "strikeout {}", m.strikeout_position);
+        assert!(
+            m.underline_thickness > 0.0 && m.underline_thickness <= 0.5,
+            "underline thickness {}",
+            m.underline_thickness
+        );
+        assert!(
+            m.strikeout_thickness > 0.0 && m.strikeout_thickness <= 0.5,
+            "strikeout thickness {}",
+            m.strikeout_thickness
+        );
+    }
+
+    /// Bytes that are not a font at all, which is what a truncated or swapped
+    /// file looks like by the time it reaches here.
+    #[test]
+    fn an_unreadable_face_yields_defaults() {
+        assert_eq!(FaceMetrics::from_face(b"not a font", 0), FaceMetrics::default());
+    }
+
+    /// ghostty guards the same way in `has_broken_strikethrough`: a zero in OS/2
+    /// would otherwise draw a bar with no height at all.
+    #[test]
+    fn a_zero_strikeout_thickness_borrows_the_underline_weight() {
+        let broken = FaceMetrics { strikeout_thickness: 0.0, ..FaceMetrics::default() };
+        let fixed = resolve_fallbacks(broken);
+        assert_eq!(fixed.strikeout_thickness, fixed.underline_thickness);
+    }
+
+    /// kitty puts the bar at `floor(baseline * 0.65)` from the cell top, which is
+    /// 0.35 of the ascender above the baseline.
+    #[test]
+    fn a_zero_strikeout_position_follows_the_ascender() {
+        let broken =
+            FaceMetrics { strikeout_position: 0.0, ascender: 0.9, ..FaceMetrics::default() };
+        let fixed = resolve_fallbacks(broken);
+        assert!((fixed.strikeout_position - 0.315).abs() < 1e-6, "{}", fixed.strikeout_position);
+    }
+
+    #[test]
+    fn a_zero_underline_pair_falls_back_to_the_defaults() {
+        let broken = FaceMetrics {
+            underline_position: 0.0,
+            underline_thickness: 0.0,
+            ..FaceMetrics::default()
+        };
+        let fixed = resolve_fallbacks(broken);
+        assert_eq!(fixed.underline_position, FaceMetrics::default().underline_position);
+        assert_eq!(fixed.underline_thickness, FaceMetrics::default().underline_thickness);
+    }
+
+    /// `[font.normal]` unresolvable means `build_font_definitions` returned
+    /// `None` and there is no face to read, which is not the same case as a face
+    /// that failed to parse but reaches the same place.
+    #[test]
+    fn an_empty_chain_yields_defaults() {
+        assert_eq!(primary_face_metrics(&[]), FaceMetrics::default());
     }
 }
 
