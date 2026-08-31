@@ -54,16 +54,16 @@ pub struct PrCache {
     in_flight: usize,
     concurrency: usize,
     generation: u64,
+    /// Elapsed since this cache was built.  A `Duration` rather than an
+    /// `Instant` because an `Instant` cannot be constructed or advanced, so
+    /// nothing could set one to test a boundary against.
+    clock: Box<dyn Fn() -> Duration + Send>,
 }
 
 impl Default for PrCache {
     fn default() -> Self {
-        Self {
-            entries: HashMap::new(),
-            in_flight: 0,
-            concurrency: effective_cap(None, jobs::pool().background_ceiling()),
-            generation: 0,
-        }
+        let origin = Instant::now();
+        Self::with_clock(move || origin.elapsed())
     }
 }
 
@@ -73,7 +73,7 @@ struct Entry {
     /// same worktree invalidates the entry.
     branch: Option<String>,
     info: Option<PrInfo>,
-    queried_at: Option<Instant>,
+    queried_at: Option<Duration>,
     /// Set while a lookup is running on the pool.  `poll` reads this to
     /// avoid starting a competing lookup; `drain_completed` is what banks
     /// the result and clears it.
@@ -91,7 +91,7 @@ struct Entry {
 /// past the TTL.
 struct Pending {
     job: jobs::Job<LookupResult>,
-    started: Instant,
+    started: Duration,
 }
 
 #[derive(Debug, PartialEq)]
@@ -103,6 +103,20 @@ struct LookupResult {
 impl PrCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_clock(clock: impl Fn() -> Duration + Send + 'static) -> Self {
+        Self {
+            entries: HashMap::new(),
+            in_flight: 0,
+            concurrency: effective_cap(None, jobs::pool().background_ceiling()),
+            generation: 0,
+            clock: Box::new(clock),
+        }
+    }
+
+    fn now(&self) -> Duration {
+        (self.clock)()
     }
 
     /// The state of a cached lookup, without starting or refreshing one.
@@ -127,6 +141,7 @@ impl PrCache {
         branch: Option<&str>,
         ctx: &egui::Context,
     ) -> Option<PrInfo> {
+        let now = self.now();
         let entry = self.entries.entry(path.to_path_buf()).or_default();
 
         // A `None` poll (the git-status compute hasn't produced a branch
@@ -142,6 +157,7 @@ impl PrCache {
             Some(branch),
             entry.queried_at,
             entry.pending.is_some(),
+            now,
         );
 
         if spawn && may_spawn(self.concurrency, self.in_flight) {
@@ -173,6 +189,7 @@ impl PrCache {
     /// collapsed mid-lookup is never polled again, and a slot it still held
     /// would never come back.
     pub fn drain_completed(&mut self) {
+        let now = self.now();
         for entry in self.entries.values_mut() {
             let Some(pending) = entry.pending.as_ref() else {
                 continue;
@@ -182,13 +199,12 @@ impl PrCache {
                 entry.info = result.info;
                 // A refresh that arrived mid-lookup wants the *next* answer,
                 // so leave the entry stale and let the next poll re-query.
-                entry.queried_at =
-                    if entry.refresh_requested { None } else { Some(Instant::now()) };
+                entry.queried_at = if entry.refresh_requested { None } else { Some(now) };
                 entry.refresh_requested = false;
                 entry.pending = None;
                 self.in_flight = self.in_flight.saturating_sub(1);
                 self.generation = self.generation.wrapping_add(1);
-            } else if pending.job.failed() || pending.started.elapsed() > TTL {
+            } else if pending.job.failed() || now.saturating_sub(pending.started) > TTL {
                 // A job that never reports has no answer to bank.  A panic
                 // reports through `failed` on the very poll above, so it
                 // backs off immediately; a job that is merely slow only backs
@@ -196,7 +212,7 @@ impl PrCache {
                 // must fire even when a refresh was requested mid-flight, or
                 // the entry re-spawns a lookup and a `gh` process on every
                 // frame for as long as the failure lasts.
-                entry.queried_at = Some(Instant::now());
+                entry.queried_at = Some(now);
                 entry.pending = None;
                 entry.refresh_requested = false;
                 self.in_flight = self.in_flight.saturating_sub(1);
@@ -224,6 +240,7 @@ impl PrCache {
     /// and a mismatched branch makes the entry due again on the next frame
     /// however recently it was queried.
     fn bank_pending(&mut self, path: PathBuf, branch: &str, job: jobs::Job<LookupResult>) {
+        let now = self.now();
         let entry = self.entries.entry(path).or_default();
         debug_assert!(entry.pending.is_none(), "a second lookup would strand the first's slot");
         // Clear stale data immediately on branch switch so we don't show
@@ -232,7 +249,7 @@ impl PrCache {
             entry.info = None;
         }
         entry.branch = Some(branch.to_string());
-        entry.pending = Some(Pending { job, started: Instant::now() });
+        entry.pending = Some(Pending { job, started: now });
         self.in_flight += 1;
     }
 
@@ -256,14 +273,15 @@ fn may_spawn(concurrency: usize, in_flight: usize) -> bool {
 fn should_spawn(
     cached_branch: Option<&str>,
     branch: Option<&str>,
-    queried_at: Option<Instant>,
+    queried_at: Option<Duration>,
     pending: bool,
+    now: Duration,
 ) -> bool {
     if pending {
         return false;
     }
     let invalidate = should_invalidate(cached_branch, branch);
-    let fresh = queried_at.map_or(false, |when| when.elapsed() < TTL);
+    let fresh = queried_at.is_some_and(|when| now.saturating_sub(when) < TTL);
     invalidate || !fresh
 }
 
@@ -551,7 +569,7 @@ fn parse_gh_output(stdout: &[u8], origin_owner: Option<&str>) -> Option<PrInfo> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
 
     /// Spawn a job that blocks until `release` fires, so a test can hold a
@@ -579,7 +597,7 @@ mod tests {
         cache: &mut PrCache,
         path: &Path,
         branch: &str,
-        started: Instant,
+        started: Duration,
     ) -> mpsc::Sender<()> {
         let (release, job) = spawn_stuck_job();
         cache.entries.insert(path.to_path_buf(), Entry {
@@ -589,15 +607,6 @@ mod tests {
         });
         cache.in_flight += 1;
         release
-    }
-
-    /// An `Instant` already old enough that `drain_completed` treats a job
-    /// started at it as stuck past the TTL, or `None` on a machine that
-    /// hasn't been up long enough to backdate that far — `Instant` is
-    /// monotonic since boot, not since the epoch, so subtracting the TTL can
-    /// underflow on a freshly booted CI runner.
-    fn stale_start() -> Option<Instant> {
-        Instant::now().checked_sub(TTL + Duration::from_millis(1))
     }
 
     /// Drive `drain_completed` until the entry at `path` has no lookup
@@ -866,7 +875,7 @@ mod tests {
         cache.entries.insert(path.clone(), Entry {
             branch: Some("b".to_string()),
             info: Some(sample_info()),
-            queried_at: Some(Instant::now()),
+            queried_at: Some(Duration::ZERO),
             pending: None,
             refresh_requested: false,
         });
@@ -1014,15 +1023,15 @@ mod tests {
     /// would stop polling permanently.
     #[test]
     fn drain_completed_frees_a_slot_for_a_job_stuck_past_the_ttl() {
-        let Some(started) = stale_start() else {
-            eprintln!("skipping: process has not been up long enough to backdate past the TTL");
-            return;
-        };
-        let mut cache = PrCache::new();
+        let now = Arc::new(Mutex::new(Duration::ZERO));
+        let reader = Arc::clone(&now);
+        let mut cache = PrCache::with_clock(move || *reader.lock().expect("clock poisoned"));
         cache.set_concurrency(Some(1));
-        let _release = insert_stuck_entry(&mut cache, Path::new("/repo/wt"), "main", started);
+        let _release =
+            insert_stuck_entry(&mut cache, Path::new("/repo/wt"), "main", Duration::ZERO);
         assert_eq!(cache.in_flight(), 1);
 
+        *now.lock().expect("clock poisoned") = TTL + Duration::from_nanos(1);
         cache.drain_completed();
 
         assert_eq!(cache.in_flight(), 0);
@@ -1033,13 +1042,13 @@ mod tests {
     /// delivers the frame that would re-spawn it.
     #[test]
     fn a_job_stuck_past_the_ttl_leaves_the_entry_ineligible_to_respawn() {
-        let Some(started) = stale_start() else {
-            eprintln!("skipping: process has not been up long enough to backdate past the TTL");
-            return;
-        };
-        let mut cache = PrCache::new();
-        let _release = insert_stuck_entry(&mut cache, Path::new("/repo/wt"), "main", started);
+        let now = Arc::new(Mutex::new(Duration::ZERO));
+        let reader = Arc::clone(&now);
+        let mut cache = PrCache::with_clock(move || *reader.lock().expect("clock poisoned"));
+        let _release =
+            insert_stuck_entry(&mut cache, Path::new("/repo/wt"), "main", Duration::ZERO);
 
+        *now.lock().expect("clock poisoned") = TTL + Duration::from_nanos(1);
         cache.drain_completed();
 
         let entry = cache.entries.get(Path::new("/repo/wt")).unwrap();
@@ -1048,17 +1057,46 @@ mod tests {
                 entry.branch.as_deref(),
                 Some("main"),
                 entry.queried_at,
-                entry.pending.is_some()
+                entry.pending.is_some(),
+                cache.now()
             ),
             "a job just backed off by the TTL must not leave the entry due on the very next frame"
         );
+    }
+
+    /// The TTL boundary itself, which `Instant` arithmetic could not reach: an
+    /// `Instant` cannot be constructed or advanced, so a test could only subtract
+    /// from now and hope the machine had been up long enough.
+    #[test]
+    fn the_ttl_boundary_is_exact() {
+        let now = Arc::new(Mutex::new(Duration::ZERO));
+        let reader = Arc::clone(&now);
+        let mut cache = PrCache::with_clock(move || *reader.lock().expect("clock poisoned"));
+
+        cache.entries.insert(PathBuf::from("/repo"), Entry {
+            branch: Some("main".into()),
+            queried_at: Some(Duration::ZERO),
+            ..Entry::default()
+        });
+
+        *now.lock().expect("clock poisoned") = TTL - Duration::from_nanos(1);
+        assert!(!should_spawn(
+            Some("main"),
+            Some("main"),
+            Some(Duration::ZERO),
+            false,
+            cache.now()
+        ));
+
+        *now.lock().expect("clock poisoned") = TTL;
+        assert!(should_spawn(Some("main"), Some("main"), Some(Duration::ZERO), false, cache.now()));
     }
 
     #[test]
     fn generation_advances_on_a_banked_result_and_holds_still_otherwise() {
         let mut cache = PrCache::new();
         let _release =
-            insert_stuck_entry(&mut cache, Path::new("/repo/pending"), "main", Instant::now());
+            insert_stuck_entry(&mut cache, Path::new("/repo/pending"), "main", Duration::ZERO);
 
         let before = cache.generation();
         cache.drain_completed();
@@ -1097,7 +1135,8 @@ mod tests {
                 entry.branch.as_deref(),
                 Some("main"),
                 entry.queried_at,
-                entry.pending.is_some()
+                entry.pending.is_some(),
+                cache.now()
             ),
             "a spent refresh must leave the entry eligible to spawn"
         );
@@ -1112,7 +1151,7 @@ mod tests {
         cache.entries.insert(PathBuf::from("/repo/wt"), Entry {
             branch: Some("main".into()),
             info: None,
-            queried_at: Some(Instant::now()),
+            queried_at: Some(Duration::ZERO),
             pending: None,
             refresh_requested: false,
         });
