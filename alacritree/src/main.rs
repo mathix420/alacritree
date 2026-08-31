@@ -35,7 +35,6 @@ mod mcp;
 mod mouse;
 #[cfg(target_os = "macos")]
 mod notify_macos;
-mod paint_phases;
 mod panel_filter;
 mod paste;
 mod path_style;
