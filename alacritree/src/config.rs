@@ -551,6 +551,9 @@ baked_glyphs! {
 
 baked_glyphs! {
     CHROME_GLYPHS:
+    /// Every recognized agent shares one status mark; identity belongs in the
+    /// tooltip and title instead of changing the sidebar's visual grammar.
+    DEFAULT_AGENT_ICON = "◇";
     /// Action buttons.  Each takes a config key of its own; the glyphs are
     /// declared here because coverage is owed regardless of who names them.
     DEFAULT_ADD_ICON = "+";
@@ -3560,7 +3563,7 @@ program = "second"
     #[test]
     fn the_chrome_slice_carries_the_action_and_decorative_glyphs() {
         let chrome: Vec<&str> = CHROME_GLYPHS.iter().map(|g| g.as_str()).collect();
-        for g in ["+", "×", "↻", "⇅", "·", "—", "•", "…", "↓", "⠿", "▌"] {
+        for g in ["◇", "+", "×", "↻", "⇅", "·", "—", "•", "…", "↓", "⠿", "▌"] {
             assert!(chrome.contains(&g), "{g} is missing from CHROME_GLYPHS");
         }
     }

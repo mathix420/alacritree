@@ -2235,7 +2235,7 @@ mod tests {
 
     #[test]
     fn the_baked_glyph_set_is_the_documented_size() {
-        assert_eq!(baked_glyphs().len(), 29, "assets/README.md lists the codepoints");
+        assert_eq!(baked_glyphs().len(), 24, "assets/README.md lists the codepoints");
     }
 
     /// Last position is the whole guarantee: an earlier face that already draws
@@ -2353,7 +2353,6 @@ mod tests {
             .iter()
             .chain(crate::config::CHROME_GLYPHS.iter())
             .flat_map(|g| g.as_str().chars())
-            .chain(crate::session::AGENT_PROCESS_GLYPHS.iter().map(|(_, g)| *g))
             .collect();
         seen.sort_unstable();
         seen.dedup();

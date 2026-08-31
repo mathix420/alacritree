@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::tty::Shell;
 use eframe::CreationContext;
@@ -16,10 +16,10 @@ use crate::clipboard_image;
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
 use crate::config::{
-    BakedGlyph, Config, DEFAULT_ADD_ICON, DEFAULT_CLOSE_ICON, DEFAULT_HOME_ICON,
-    DEFAULT_PR_CLOSED_ICON, DEFAULT_PR_DRAFT_ICON, DEFAULT_PR_MERGED_ICON, DEFAULT_PR_OPEN_ICON,
-    DEFAULT_PROJECT_COLLAPSED_ICON, DEFAULT_PROJECT_EXPANDED_ICON, DEFAULT_REFRESH_ICON,
-    DEFAULT_REORDER_ICON, DEFAULT_SEARCH_ICON, DEFAULT_SESSION_ICON,
+    BakedGlyph, Config, DEFAULT_ADD_ICON, DEFAULT_AGENT_ICON, DEFAULT_CLOSE_ICON,
+    DEFAULT_HOME_ICON, DEFAULT_PR_CLOSED_ICON, DEFAULT_PR_DRAFT_ICON, DEFAULT_PR_MERGED_ICON,
+    DEFAULT_PR_OPEN_ICON, DEFAULT_PROJECT_COLLAPSED_ICON, DEFAULT_PROJECT_EXPANDED_ICON,
+    DEFAULT_REFRESH_ICON, DEFAULT_REORDER_ICON, DEFAULT_SEARCH_ICON, DEFAULT_SESSION_ICON,
     DEFAULT_UPSTREAM_DIVERGED_ICON, DEFAULT_UPSTREAM_GONE_ICON, DEFAULT_UPSTREAM_LEVEL_ICON,
     DEFAULT_UPSTREAM_UNTRACKED_ICON, DEFAULT_WORKTREE_ICON, DEFAULT_WORKTREE_MAIN_ICON, FontConfig,
     IconStyle, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SearchScope, SidebarFocus,
@@ -39,7 +39,8 @@ use crate::pr_status::{self, PrCache, PrInfo, PrState};
 use crate::projects::{Project, Worktree, project_json};
 use crate::scratchpad;
 use crate::session::{
-    AttentionVerdict, Session, SessionId, SessionKind, TermSize, poll_attention_debounce,
+    AttentionVerdict, Session, SessionActivity, SessionId, SessionKind, TermSize,
+    poll_attention_debounce,
 };
 use crate::sidebar_focus;
 use crate::sidebar_nav::{self, SidebarRow};
@@ -3309,13 +3310,16 @@ impl AlacritreeApp {
             .map(|v| v.iter().map(|rows| !rows.is_empty()).collect())
             .collect();
 
-        // A rendered session list carries its own per-session dots and
-        // glyphs; repeating them on the parent row reads as noise — the same
+        // A rendered session list carries its own per-session status; repeating
+        // it on the parent row reads as noise — the same
         // rule the project row applies when expanded.  Aggregates therefore
         // apply only while the list is hidden (fewer than two sessions).
         let home_attention = home_session_rows.is_empty() && self.workspace_needs_attention(&None);
-        let home_agent_glyph =
-            if home_session_rows.is_empty() { self.workspace_agent_glyph(&None) } else { None };
+        let home_activity = if home_session_rows.is_empty() {
+            self.workspace_activity(&None)
+        } else {
+            SessionActivity::Idle
+        };
         let project_attention: Vec<bool> =
             self.projects.iter().map(|p| self.project_needs_attention(p)).collect();
         let worktree_attention: Vec<Vec<bool>> = self
@@ -3337,7 +3341,7 @@ impl AlacritreeApp {
                     .collect()
             })
             .collect();
-        let worktree_agent: Vec<Vec<Option<char>>> = self
+        let worktree_activity: Vec<Vec<SessionActivity>> = self
             .projects
             .iter()
             .enumerate()
@@ -3352,9 +3356,9 @@ impl AlacritreeApp {
                             .copied()
                             .unwrap_or(false);
                         if listed {
-                            None
+                            SessionActivity::Idle
                         } else {
-                            self.workspace_agent_glyph(&Some(wt.path.clone()))
+                            self.workspace_activity(&Some(wt.path.clone()))
                         }
                     })
                     .collect()
@@ -3493,7 +3497,7 @@ impl AlacritreeApp {
                             home_is_cursor,
                             scrolls(home_is_cursor),
                             home_attention,
-                            home_agent_glyph,
+                            home_activity,
                             &icons,
                             &theme,
                         );
@@ -3795,11 +3799,11 @@ impl AlacritreeApp {
                                     .and_then(|v| v.get(wt_idx))
                                     .copied()
                                     .unwrap_or(false);
-                                let wt_glyph = worktree_agent
+                                let wt_activity = worktree_activity
                                     .get(idx)
                                     .and_then(|v| v.get(wt_idx))
                                     .copied()
-                                    .unwrap_or(None);
+                                    .unwrap_or_default();
                                 let is_cursor = matches!(
                                     &cursor_row,
                                     Some(SidebarRow::Worktree(p)) if *p == wt.path
@@ -3836,7 +3840,7 @@ impl AlacritreeApp {
                                     is_cursor,
                                     wt_scroll,
                                     wt_attention,
-                                    wt_glyph,
+                                    wt_activity,
                                     is_deleting,
                                     &worktree_profiles,
                                     &icons,
@@ -5548,6 +5552,7 @@ fn row_status_icon_size(theme: &Theme) -> egui::Vec2 {
 }
 
 const ATTENTION_HINT: &str = "needs attention";
+const LOADER_FRAME: Duration = Duration::from_millis(120);
 
 /// Painted (rather than `RichText("●")`) so its size is independent of font
 /// metrics — `RichText("●")` renders inconsistently across fallback fonts.
@@ -5558,8 +5563,45 @@ fn attention_dot(ui: &mut egui::Ui, theme: &Theme) -> egui::Response {
     resp
 }
 
-/// Priority: attention dot > agent glyph (animated by the agent's own title
-/// updates) > active highlight > the configured color > the built-in default.
+/// The loader is geometry rather than text so its three square dots stay the
+/// same shape in status and action slots on every font stack.
+fn three_square_loader_dots(rect: egui::Rect, missing: usize) -> [egui::Rect; 3] {
+    let side = rect.width().min(rect.height());
+    let canvas = egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(side));
+    let gap = side / 6.0;
+    let dot = (side - gap) / 2.0;
+    let corners = [
+        canvas.left_top(),
+        egui::pos2(canvas.right() - dot, canvas.top()),
+        egui::pos2(canvas.right() - dot, canvas.bottom() - dot),
+        egui::pos2(canvas.left(), canvas.bottom() - dot),
+    ];
+    const VISIBLE: [[usize; 3]; 4] = [[1, 2, 3], [0, 2, 3], [0, 1, 3], [0, 1, 2]];
+    VISIBLE[missing % VISIBLE.len()]
+        .map(|index| egui::Rect::from_min_size(corners[index], egui::Vec2::splat(dot)))
+}
+
+fn paint_three_square_loader(ui: &mut egui::Ui, rect: egui::Rect, color: Color32) {
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    ui.ctx().request_repaint_after(LOADER_FRAME);
+
+    let missing = ui.input(|i| (i.time / LOADER_FRAME.as_secs_f64()) as usize % 4);
+    for dot in three_square_loader_dots(rect, missing) {
+        ui.painter().rect_filled(dot, 0.0, color);
+    }
+}
+
+fn three_square_loader(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover());
+    response.widget_info(|| egui::WidgetInfo::new(egui::WidgetType::ProgressIndicator));
+    paint_three_square_loader(ui, rect, color);
+    response
+}
+
+/// Priority: attention dot > loader > generic agent > active highlight > the
+/// configured color > the built-in default.
 ///
 /// Returns what the slot has to say on hover, for the row to register with the
 /// rest of its icons. The row icon proper reports nothing the row does not
@@ -5568,7 +5610,7 @@ fn paint_row_status_icon(
     ui: &mut egui::Ui,
     theme: &Theme,
     attention: bool,
-    agent_glyph: Option<char>,
+    activity: SessionActivity,
     style: &IconStyle,
     default_glyph: BakedGlyph,
     is_active: bool,
@@ -5577,25 +5619,36 @@ fn paint_row_status_icon(
         return Some((attention_dot(ui, theme).rect, ATTENTION_HINT.to_owned()));
     }
     let s = theme.ui_scale;
-    let (glyph, font, color) = match agent_glyph {
-        Some(g) => (
-            g.to_string(),
+    if let SessionActivity::Loading(agent) = activity {
+        let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
+        let loader = egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(10.0 * s));
+        paint_three_square_loader(ui, loader, theme.accent);
+        let hint = agent.map_or_else(|| "working".to_owned(), |name| format!("{name} is working"));
+        return Some((rect, hint));
+    }
+    let (glyph, font, color, hint) = match activity {
+        SessionActivity::Agent(agent) => (
+            DEFAULT_AGENT_ICON.as_str(),
             egui::FontId::proportional(10.0 * s),
             if is_active { theme.accent } else { theme.text },
+            Some(agent.map_or_else(
+                || "agent is running".to_owned(),
+                |name| format!("{name} is running"),
+            )),
         ),
-        None => {
+        SessionActivity::Idle => {
             let (glyph, font, resolved) =
                 resolve_icon(style, default_glyph, theme.text_muted, 10.0, 10.0, theme);
             let color = if is_active { theme.accent } else { resolved };
-            (glyph.to_string(), font, color)
+            (glyph, font, color, None)
         },
+        SessionActivity::Loading(_) => unreachable!(),
     };
     // Centered into the fixed slot: laying the glyph out as text would size
     // the slot to its advance width and shift the label with it.
     let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, glyph, font, color);
-    let name = agent_glyph.and_then(crate::session::agent_name_for_glyph)?;
-    Some((rect, format!("{name} is running")))
+    hint.map(|hint| (rect, hint))
 }
 
 /// Gap between adjacent action buttons. They already pad their own glyph, so
@@ -5932,7 +5985,7 @@ fn home_row(
     is_cursor: bool,
     scroll_into_view: bool,
     attention: bool,
-    agent_glyph: Option<char>,
+    activity: SessionActivity,
     icons: &Icons,
     theme: &Theme,
 ) -> HomeAction {
@@ -5956,7 +6009,7 @@ fn home_row(
                         ui,
                         theme,
                         attention,
-                        agent_glyph,
+                        activity,
                         &icons.home,
                         DEFAULT_HOME_ICON,
                         is_active,
@@ -6039,7 +6092,7 @@ struct SessionRowData {
     id: SessionId,
     title: String,
     needs_attention: bool,
-    agent_glyph: Option<char>,
+    activity: SessionActivity,
     /// This workspace's remembered active session (accent icon).
     is_active: bool,
     /// Active *and* the workspace is current — the session on screen
@@ -6441,17 +6494,19 @@ fn picker_cursor(
     }
 }
 
-/// Agent glyphs usually come from the title's own leading char
-/// (`Session::agent_glyph`), and the session row paints that glyph as its
-/// status icon right next to the title — showing it in both places doubles
-/// the icon. Drop the leading glyph from the label when it's exactly what
-/// the icon paints, unless that would leave the label empty.
-fn session_row_title(title: &str, agent_glyph: Option<char>) -> String {
-    if let Some(g) = agent_glyph {
-        if let Some(rest) = title.strip_prefix(g) {
-            let rest = rest.trim_start();
-            if !rest.is_empty() {
-                return rest.to_string();
+/// Agent titles commonly lead with their own decorative mark. Once the row
+/// paints a semantic agent/loader status, retaining that mark beside it would
+/// reintroduce the vendor-specific icon set this status model replaces.
+fn session_row_title(title: &str, activity: SessionActivity) -> String {
+    if activity != SessionActivity::Idle {
+        let trimmed = title.trim_start();
+        if let Some(first) = trimmed.chars().next() {
+            let rest = &trimmed[first.len_utf8()..];
+            if !first.is_ascii() && rest.chars().next().is_some_and(char::is_whitespace) {
+                let rest = rest.trim_start();
+                if !rest.is_empty() {
+                    return rest.to_string();
+                }
             }
         }
     }
@@ -6487,7 +6542,7 @@ fn creating_row(ui: &mut egui::Ui, branch: &str, icons: &Icons, theme: &Theme) {
                 let _ = name_tooltip(resp, branch, galley.elided, theme.sidebar_tooltips);
             },
             |ui| {
-                ui.add(egui::Spinner::new().size(12.0 * s).color(theme.text_muted));
+                three_square_loader(ui, 12.0 * s, theme.accent);
             },
         );
     });
@@ -6567,7 +6622,7 @@ fn worktree_row(
     is_cursor: bool,
     scroll_into_view: bool,
     attention: bool,
-    agent_glyph: Option<char>,
+    activity: SessionActivity,
     deleting: bool,
     // Shell profiles offered in the row's "Open session" menu: `.0` is the
     // profile name (spawned and shown as the button label), `.1` is the
@@ -6616,7 +6671,7 @@ fn worktree_row(
                         ui,
                         theme,
                         attention,
-                        agent_glyph,
+                        activity,
                         default_icon,
                         default_glyph,
                         is_active,
@@ -6633,11 +6688,7 @@ fn worktree_row(
                     // Mid-removal the row is inert: swap its controls for a
                     // spinner so the user sees the delete is in flight.
                     if deleting {
-                        ui.add(
-                            egui::Spinner::new()
-                                .size(12.0 * theme.ui_scale)
-                                .color(theme.text_muted),
-                        );
+                        three_square_loader(ui, 12.0 * theme.ui_scale, theme.accent);
                         return;
                     }
                     if !wt.is_main {
@@ -6828,7 +6879,7 @@ fn session_row(
                         ui,
                         theme,
                         row.needs_attention,
-                        row.agent_glyph,
+                        row.activity,
                         &icons.session,
                         DEFAULT_SESSION_ICON,
                         row.is_active,
@@ -6984,26 +7035,28 @@ impl AlacritreeApp {
         project.worktrees.iter().any(|wt| self.workspace_needs_attention(&Some(wt.path.clone())))
     }
 
-    /// Prefer the active session's glyph so two parallel agents don't fight
-    /// over which icon the sidebar shows.
-    fn workspace_agent_glyph(&self, ws: &WorkspaceKey) -> Option<char> {
+    /// Prefer the active session's status so parallel agents do not fight over
+    /// the parent row. If that session is idle, a loading background session
+    /// wins over a merely present agent because it communicates live work.
+    fn workspace_activity(&self, ws: &WorkspaceKey) -> SessionActivity {
         let active_id = self.active_session.get(ws).copied();
-        let mut active_glyph = None;
-        let mut other_glyph = None;
+        let mut other = SessionActivity::Idle;
         for s in &self.sessions {
             if s.working_directory != *ws {
                 continue;
             }
-            let Some(g) = s.agent_glyph() else { continue };
-            if Some(s.id) == active_id {
-                active_glyph = Some(g);
-                break;
+            let activity = s.activity();
+            if activity == SessionActivity::Idle {
+                continue;
             }
-            if other_glyph.is_none() {
-                other_glyph = Some(g);
+            if Some(s.id) == active_id {
+                return activity;
+            }
+            if matches!(activity, SessionActivity::Loading(_)) || other == SessionActivity::Idle {
+                other = activity;
             }
         }
-        active_glyph.or(other_glyph)
+        other
     }
 
     /// The session rows every workspace currently lists, for the keyboard
@@ -7034,13 +7087,16 @@ impl AlacritreeApp {
         let is_current = self.current_workspace == *ws;
         ids.iter()
             .filter_map(|id| self.sessions.iter().find(|s| s.id == *id))
-            .map(|s| SessionRowData {
-                id: s.id,
-                title: session_row_title(&s.title, s.agent_glyph()),
-                needs_attention: s.needs_attention,
-                agent_glyph: s.agent_glyph(),
-                is_active: active == Some(s.id),
-                is_displayed: is_current && active == Some(s.id),
+            .map(|s| {
+                let activity = s.activity();
+                SessionRowData {
+                    id: s.id,
+                    title: session_row_title(&s.title, activity),
+                    needs_attention: s.needs_attention,
+                    activity,
+                    is_active: active == Some(s.id),
+                    is_displayed: is_current && active == Some(s.id),
+                }
             })
             .collect()
     }
@@ -9172,14 +9228,39 @@ mod tests {
     }
 
     #[test]
-    fn session_row_title_drops_glyph_the_icon_already_shows() {
-        assert_eq!(session_row_title("✳ claude", Some('✳')), "claude");
-        // Attention/plain rows keep the title untouched.
-        assert_eq!(session_row_title("✳ claude", None), "✳ claude");
-        // A static process glyph absent from the title strips nothing.
-        assert_eq!(session_row_title("node build", Some('◇')), "node build");
+    fn session_row_title_drops_an_agents_decorative_prefix() {
+        let agent = SessionActivity::Agent(Some("claude"));
+        assert_eq!(session_row_title("✳ claude", agent), "claude");
+        assert_eq!(session_row_title("⠋ Thinking…", SessionActivity::Loading(None)), "Thinking…");
+        // An ordinary session title owns its decoration because the status
+        // slot is not replacing it with an agent mark.
+        assert_eq!(session_row_title("✳ favorite", SessionActivity::Idle), "✳ favorite");
+        // A recognized agent with a plain title strips nothing.
+        assert_eq!(session_row_title("node build", agent), "node build");
         // Never strip down to an empty label.
-        assert_eq!(session_row_title("✳ ", Some('✳')), "✳ ");
+        assert_eq!(session_row_title("✳ ", agent), "✳ ");
+    }
+
+    #[test]
+    fn loader_is_three_equal_squares_rotating_around_a_two_by_two_grid() {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::splat(12.0));
+        let corners = [
+            egui::pos2(0.0, 0.0),
+            egui::pos2(7.0, 0.0),
+            egui::pos2(7.0, 7.0),
+            egui::pos2(0.0, 7.0),
+        ];
+        for missing in 0..4 {
+            let dots = three_square_loader_dots(rect, missing);
+            assert!(dots.iter().all(|dot| dot.size() == egui::Vec2::splat(5.0)));
+            for (index, corner) in corners.iter().enumerate() {
+                assert_eq!(
+                    dots.iter().any(|dot| dot.min == *corner),
+                    index != missing,
+                    "frame {missing}, corner {index}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -10308,7 +10389,7 @@ mod tests {
                 false,
                 false,
                 false,
-                None,
+                SessionActivity::Idle,
                 false,
                 &[],
                 &icons,
@@ -10481,7 +10562,7 @@ mod tests {
                     false,
                     false,
                     false,
-                    None,
+                    SessionActivity::Idle,
                     false,
                     &[],
                     &icons,
@@ -10615,7 +10696,7 @@ mod tests {
                 false,
                 false,
                 false,
-                None,
+                SessionActivity::Idle,
                 false,
                 &[],
                 &icons,
@@ -10689,7 +10770,7 @@ mod tests {
                 id: 1,
                 title: "zsh".to_owned(),
                 needs_attention: false,
-                agent_glyph: None,
+                activity: SessionActivity::Idle,
                 is_active: true,
                 is_displayed: true,
             };
@@ -10703,7 +10784,7 @@ mod tests {
             );
 
             let mut home = |ui: &mut egui::Ui| {
-                home_row(ui, true, false, false, false, None, &icons, &theme);
+                home_row(ui, true, false, false, false, SessionActivity::Idle, &icons, &theme);
             };
             assert_eq!(
                 hint_painted_over(&mut home, "+", "new shell"),
@@ -10772,11 +10853,11 @@ mod tests {
     fn icon_tooltips_gate_the_status_slot_hint() {
         const WIDTH: f32 = 220.0;
         let icons = crate::config::Icons::default();
-        let session = |attention, agent_glyph| SessionRowData {
+        let session = |attention, activity| SessionRowData {
             id: 1,
             title: "zsh".to_owned(),
             needs_attention: attention,
-            agent_glyph,
+            activity,
             is_active: true,
             is_displayed: true,
         };
@@ -10787,21 +10868,32 @@ mod tests {
             config.ui.sidebar_tooltips = SidebarTooltips::Off;
             let theme = Theme::from_config(&config);
 
-            let agent = session(false, Some('✳'));
+            let agent = session(false, SessionActivity::Agent(Some("claude")));
             let mut agent_row = |ui: &mut egui::Ui| {
                 session_row(ui, &agent, false, false, &icons, &theme);
             };
             assert_eq!(
-                hint_painted_over(&mut agent_row, "✳", "claude is running"),
+                hint_painted_over(&mut agent_row, DEFAULT_AGENT_ICON.as_str(), "claude is running",),
                 want,
-                "agent glyph, icon_tooltips = {icon_tooltips}"
+                "agent status, icon_tooltips = {icon_tooltips}"
             );
 
             let probe =
                 frames_while_hovering_at(egui::Pos2::new(-100.0, -100.0), WIDTH, &mut agent_row);
-            let slot = painted_glyph_positions(probe.last().expect("the row painted"))["✳"];
+            let slot = painted_glyph_positions(probe.last().expect("the row painted"))
+                [DEFAULT_AGENT_ICON.as_str()];
 
-            let waiting = session(true, None);
+            let loading = session(false, SessionActivity::Loading(Some("claude")));
+            let texts = texts_while_hovering_at(slot, WIDTH, |ui| {
+                session_row(ui, &loading, false, false, &icons, &theme);
+            });
+            assert_eq!(
+                texts.iter().flatten().any(|(text, _)| text == "claude is working"),
+                want,
+                "loading status, icon_tooltips = {icon_tooltips}"
+            );
+
+            let waiting = session(true, SessionActivity::Idle);
             let texts = texts_while_hovering_at(slot, WIDTH, |ui| {
                 session_row(ui, &waiting, false, false, &icons, &theme);
             });
@@ -10927,7 +11019,7 @@ mod tests {
                     false,
                     false,
                     false,
-                    None,
+                    SessionActivity::Idle,
                     false,
                     &[],
                     &icons,
@@ -10993,7 +11085,7 @@ mod tests {
                     false,
                     false,
                     false,
-                    None,
+                    SessionActivity::Idle,
                     false,
                     &[],
                     &icons,
@@ -11066,7 +11158,7 @@ mod tests {
                     false,
                     false,
                     false,
-                    None,
+                    SessionActivity::Idle,
                     false,
                     &[],
                     &icons,
@@ -11099,7 +11191,7 @@ mod tests {
             id: 1,
             title: "cargo test --workspace --all-features -- --nocapture".to_owned(),
             needs_attention: false,
-            agent_glyph: None,
+            activity: SessionActivity::Idle,
             is_active: true,
             is_displayed: true,
         };

@@ -57,11 +57,11 @@ fn carries_payload(event: &TermEvent) -> bool {
 /// How long a background session's spinner frame may wait for the loop.
 ///
 /// Agents animate a Braille spinner in the terminal title, so a busy one emits
-/// a title change several times a second.  Off screen that moves a sidebar
-/// glyph, and waking the loop for each one repaints the entire visible grid to
-/// do it — with a few agents running, enough to saturate the UI thread.
-/// Coalescing to this interval keeps the glyph turning without letting the
-/// animation set the frame rate.
+/// a title change several times a second. Once the sidebar has entered its
+/// loading state those frames carry no new status, and waking the loop for
+/// each one repaints the entire visible grid — with a few agents running,
+/// enough to saturate the UI thread. Coalescing bounds that cost while still
+/// surfacing the loading transition promptly.
 const SPINNER_COALESCE: Duration = Duration::from_millis(120);
 
 impl EventListener for EventProxy {
@@ -135,6 +135,21 @@ pub enum SessionKind {
     },
 }
 
+/// What the sidebar needs to communicate about a live session.  Agent
+/// identity remains available for hover text, but every agent shares the same
+/// visual language instead of each CLI bringing its own status glyph.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SessionActivity {
+    #[default]
+    Idle,
+    /// A recognized name enriches the tooltip; `None` is an agent inferred
+    /// only from the conventional decorative title prefix.
+    Agent(Option<&'static str>),
+    /// A Braille spinner in the title is the cross-agent signal for active
+    /// work. Unknown agents can therefore still report loading.
+    Loading(Option<&'static str>),
+}
+
 /// One tab in a workspace. Shell/diff tabs own a PTY and parsed terminal;
 /// scratchpad tabs retain the same lightweight terminal allocation so the tab
 /// model stays uniform, but own no child process or event-loop thread.
@@ -183,8 +198,8 @@ pub struct Session {
 #[derive(Clone, Copy, Default)]
 struct AgentCache {
     polled_at: Option<Instant>,
-    /// Static glyph for the foreground process if it's a recognized agent.
-    process_glyph: Option<char>,
+    /// Recognized foreground agent, retained for status hints.
+    agent_name: Option<&'static str>,
     /// Whether anything is running in the terminal beyond the shell itself.
     foreground_job: bool,
     /// Whether a split-managing TUI (vim, tmux) is running in the terminal;
@@ -194,26 +209,11 @@ struct AgentCache {
 
 const AGENT_CACHE_TTL: Duration = Duration::from_millis(1000);
 
-/// Map a foreground process name (`/proc/<pid>/comm` on Linux, `p_comm` on
-/// macOS, image name on Windows) to its static sidebar glyph.  Compared with
-/// `starts_with`: `comm` is kernel-truncated — 15 bytes on Linux, 16 on
-/// macOS (`cursor-agent` would otherwise miss) — and Windows names carry an
-/// `.exe` suffix.
-pub(crate) const AGENT_PROCESS_GLYPHS: &[(&str, char)] = &[
-    ("claude", '✳'),
-    ("codex", '◇'),
-    ("gemini", '✦'),
-    ("aider", '▲'),
-    ("cursor-agent", '❖'),
-    ("continue", '⊕'),
-];
-
-/// The agent a status glyph stands for. A title's own decorative glyph is not
-/// in the table, so it names nothing rather than claiming an agent alacritree
-/// never recognized.
-pub fn agent_name_for_glyph(glyph: char) -> Option<&'static str> {
-    AGENT_PROCESS_GLYPHS.iter().find(|(_, g)| *g == glyph).map(|(name, _)| *name)
-}
+/// Foreground process names recognized as agents. `comm` is kernel-truncated
+/// — 15 bytes on Linux, 16 on macOS (`cursor-agent` would otherwise miss) —
+/// and Windows names carry an `.exe` suffix, so matching uses `starts_with`.
+const AGENT_PROCESS_NAMES: &[&str] =
+    &["claude", "codex", "gemini", "aider", "cursor-agent", "continue"];
 
 /// Plain-text dump of a session's grid for IPC clients.
 pub struct ScreenSnapshot {
@@ -249,14 +249,14 @@ fn process_tree_pids(procs: &[(u32, Option<u32>)], root: u32) -> Vec<u32> {
     tree
 }
 
-/// Match process names against the agent map.  Lowercased `starts_with`,
+/// Match process names against the agent list. Lowercased `starts_with`,
 /// mirroring the Linux `comm` match while tolerating Windows' `.exe`
 /// suffix and case-insensitive filenames.
 #[cfg(any(test, windows))]
-fn agent_glyph_by_name(names: impl IntoIterator<Item = impl AsRef<str>>) -> Option<char> {
+fn agent_name_by_name(names: impl IntoIterator<Item = impl AsRef<str>>) -> Option<&'static str> {
     names.into_iter().find_map(|n| {
         let n = n.as_ref().to_ascii_lowercase();
-        AGENT_PROCESS_GLYPHS.iter().find(|(name, _)| n.starts_with(name)).map(|(_, g)| *g)
+        AGENT_PROCESS_NAMES.iter().find(|name| n.starts_with(*name)).copied()
     })
 }
 
@@ -285,7 +285,7 @@ fn wsl_nav_tui(comm: Option<&str>) -> bool {
 
 #[cfg(not(any(test, target_os = "linux", windows)))]
 fn wsl_nav_tui(_comm: Option<&str>) -> bool {
-    // Same gap as the glyph probe: macOS isn't wired up yet.
+    // Same gap as the agent probe: macOS isn't wired up yet.
     false
 }
 
@@ -298,14 +298,14 @@ fn wsl_probe_signals(comm: Option<&str>) -> (bool, bool) {
     (comm.is_some(), wsl_nav_tui(comm))
 }
 
-/// Match full command lines against the agent map — picks up
+/// Match full command lines against the agent list — picks up
 /// `node ...\claude-code\cli.js`-style wrappers that hide behind their
 /// runtime's name, same as the Linux cmdline pass.
 #[cfg(any(test, windows))]
-fn agent_glyph_by_cmdline(cmds: impl IntoIterator<Item = impl AsRef<str>>) -> Option<char> {
+fn agent_name_by_cmdline(cmds: impl IntoIterator<Item = impl AsRef<str>>) -> Option<&'static str> {
     cmds.into_iter().find_map(|c| {
         let c = c.as_ref().to_ascii_lowercase();
-        AGENT_PROCESS_GLYPHS.iter().find(|(name, _)| c.contains(name)).map(|(_, g)| *g)
+        AGENT_PROCESS_NAMES.iter().find(|name| c.contains(*name)).copied()
     })
 }
 
@@ -389,27 +389,34 @@ pub fn poll_attention_debounce(
     if elapsed >= grace { AttentionVerdict::Fire } else { AttentionVerdict::Wait(grace - elapsed) }
 }
 
-/// A session "looks busy" when its foreground process is a recognized
-/// agent or its title is in a spinner state — the signal the sidebar's
+/// A session "looks busy" when its foreground process is a recognized agent
+/// or its title is in a spinner state — the signal the sidebar's
 /// close-confirmation policy keys on.
-fn looks_busy(agent_glyph: Option<char>, title: &str) -> bool {
-    agent_glyph.is_some() || is_spinner_title(title)
+fn looks_busy(agent_name: Option<&str>, title: &str) -> bool {
+    agent_name.is_some() || is_spinner_title(title) || title_decorative_glyph(title).is_some()
 }
 
 /// `<glyph> <text>` titles are the universal agent-CLI shape: a non-ASCII
-/// leading glyph followed by whitespace.  Plain titles (`~/foo`, `bash`)
-/// fail both checks.
+/// leading glyph followed by whitespace. The glyph is detection input only;
+/// the sidebar replaces it with its generic agent status.
 fn title_decorative_glyph(title: &str) -> Option<char> {
     let trimmed = title.trim_start();
     let mut chars = trimmed.chars();
     let first = chars.next()?;
-    if (first as u32) < 0x80 {
-        return None;
-    }
-    if !chars.next().is_some_and(|c| c.is_whitespace()) {
+    if first.is_ascii() || !chars.next().is_some_and(char::is_whitespace) {
         return None;
     }
     Some(first)
+}
+
+fn session_activity(agent_name: Option<&'static str>, title: &str) -> SessionActivity {
+    if is_spinner_title(title) {
+        SessionActivity::Loading(agent_name)
+    } else if agent_name.is_some() || title_decorative_glyph(title).is_some() {
+        SessionActivity::Agent(agent_name)
+    } else {
+        SessionActivity::Idle
+    }
 }
 
 #[cfg(unix)]
@@ -429,22 +436,20 @@ fn pty_shell_pid(_pty: &alacritty_terminal::tty::Pty) -> Option<u32> {
     None
 }
 
-/// Match a foreground process against the agent map: `comm` first (cheap),
+/// Match a foreground process against the agent list: `comm` first (cheap),
 /// then anywhere in `cmdline` — picks up `node /path/to/agent-cli.js`-style
 /// wrappers that hide behind their runtime's name.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn agent_glyph_for(comm: Option<&str>, cmdline: Option<&str>) -> Option<char> {
+fn agent_name_for(comm: Option<&str>, cmdline: Option<&str>) -> Option<&'static str> {
     let comm_trim = comm.map(str::trim).unwrap_or("");
-    let by_comm =
-        AGENT_PROCESS_GLYPHS.iter().find(|(name, _)| comm_trim.starts_with(name)).map(|(_, g)| *g);
+    let by_comm = AGENT_PROCESS_NAMES.iter().find(|name| comm_trim.starts_with(*name)).copied();
     if by_comm.is_some() {
         return by_comm;
     }
     if let Some(cmd) = cmdline {
-        let glyph =
-            AGENT_PROCESS_GLYPHS.iter().find(|(name, _)| cmd.contains(name)).map(|(_, g)| *g);
-        if glyph.is_some() {
-            return glyph;
+        let name = AGENT_PROCESS_NAMES.iter().find(|name| cmd.contains(*name)).copied();
+        if name.is_some() {
+            return name;
         }
         log::debug!("foreground process not matched: comm={comm_trim:?} cmdline={cmd:?}");
     }
@@ -452,14 +457,14 @@ fn agent_glyph_for(comm: Option<&str>, cmdline: Option<&str>) -> Option<char> {
 }
 
 #[cfg(target_os = "linux")]
-fn foreground_process_glyph(shell_pid: u32) -> Option<char> {
+fn foreground_agent_name(shell_pid: u32) -> Option<&'static str> {
     let tpgid = read_tpgid(shell_pid)?;
     if tpgid <= 0 {
         return None;
     }
     let comm = std::fs::read_to_string(format!("/proc/{tpgid}/comm")).ok();
     let cmdline = read_cmdline(tpgid as u32);
-    agent_glyph_for(comm.as_deref(), cmdline.as_deref())
+    agent_name_for(comm.as_deref(), cmdline.as_deref())
 }
 
 #[cfg(target_os = "linux")]
@@ -622,12 +627,12 @@ fn procargs2_cmdline(buf: &[u8]) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn foreground_process_glyph(shell_pid: u32) -> Option<char> {
+fn foreground_agent_name(shell_pid: u32) -> Option<&'static str> {
     let (_, tpgid) = pgid_tpgid(shell_pid)?;
     let tpgid = foreground_group(tpgid)?;
     let comm = comm_for_pid(tpgid);
     let cmdline = read_cmdline(tpgid);
-    agent_glyph_for(comm.as_deref(), cmdline.as_deref())
+    agent_name_for(comm.as_deref(), cmdline.as_deref())
 }
 
 /// Same rule as Linux: the shell is its own foreground group when idle, so
@@ -698,7 +703,7 @@ fn foreground_group_has_nav_tui(pgid: u32) -> bool {
 
 /// Windows has no foreground process group, so "a job is running" is
 /// approximated as the shell having any descendant process — the same
-/// approximation the agent glyph uses.
+/// approximation the agent probe uses.
 #[cfg(windows)]
 fn shell_has_foreground_job(shell_pid: u32) -> bool {
     windows_process_probe::probe(shell_pid).1
@@ -711,17 +716,17 @@ fn shell_has_foreground_job(_shell_pid: u32) -> bool {
 }
 
 /// Windows has no foreground process group, so "foreground" is approximated
-/// as *any* recognized agent in the shell's descendant tree.  This is what
-/// the glyph means to the user — "an agent is running here" — and it stays
+/// as *any* recognized agent in the shell's descendant tree. This is what the
+/// status means to the user — "an agent is running here" — and it stays
 /// stable while agents run their own subprocesses, where a deepest-leaf
 /// heuristic would flicker.
 #[cfg(windows)]
-fn foreground_process_glyph(shell_pid: u32) -> Option<char> {
+fn foreground_agent_name(shell_pid: u32) -> Option<&'static str> {
     windows_process_probe::probe(shell_pid).0
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn foreground_process_glyph(_shell_pid: u32) -> Option<char> {
+fn foreground_agent_name(_shell_pid: u32) -> Option<&'static str> {
     // No probe wired for this platform (BSDs would mirror the macOS sysctl).
     None
 }
@@ -778,8 +783,8 @@ fn foreground_group_has_nav_tui(pgid: u32) -> bool {
 }
 
 /// Windows has no foreground process group, so a nav TUI anywhere in the
-/// shell's descendant tree counts — the same approximation the agent
-/// glyph uses.
+/// shell's descendant tree counts — the same approximation the agent probe
+/// uses.
 #[cfg(windows)]
 fn foreground_nav_tui(shell_pid: u32) -> bool {
     windows_process_probe::probe(shell_pid).2
@@ -787,7 +792,7 @@ fn foreground_nav_tui(shell_pid: u32) -> bool {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn foreground_nav_tui(_shell_pid: u32) -> bool {
-    // Same gap as the glyph probe: no probe wired for this platform.
+    // Same gap as the agent probe: no probe wired for this platform.
     false
 }
 
@@ -860,19 +865,19 @@ mod windows_process_probe {
 
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
-    use super::{agent_glyph_by_cmdline, agent_glyph_by_name, is_nav_tui_name, process_tree_pids};
+    use super::{agent_name_by_cmdline, agent_name_by_name, is_nav_tui_name, process_tree_pids};
 
     /// Slightly under `AGENT_CACHE_TTL`, so a session polling on its own clock
     /// finds a result no older than one of its own cache windows.
     pub(super) const REFRESH_INTERVAL: Duration = Duration::from_millis(900);
 
-    /// Agent glyph found in the shell's descendant tree, whether the shell has
-    /// any descendants at all, and whether one of them is a nav TUI.
-    pub(super) type Signals = (Option<char>, bool, bool);
+    /// Agent found in the shell's descendant tree, whether the shell has any
+    /// descendants at all, and whether one of them is a nav TUI.
+    pub(super) type Signals = (Option<&'static str>, bool, bool);
 
     /// Per shell: the descendant tree the last command-line scan ran on, and
-    /// the glyph it found there.
-    pub(super) type ScannedTrees = BTreeMap<u32, (Vec<u32>, Option<char>)>;
+    /// the agent it found there.
+    pub(super) type ScannedTrees = BTreeMap<u32, (Vec<u32>, Option<&'static str>)>;
 
     #[derive(Default)]
     struct Shared {
@@ -984,11 +989,11 @@ mod windows_process_probe {
             .map(|p| p.name().to_string_lossy().into_owned())
             .collect();
         let nav_tui = names.iter().any(|n| is_nav_tui_name(n));
-        if let Some(glyph) = agent_glyph_by_name(&names) {
-            return (Some(glyph), has_children, nav_tui);
+        if let Some(name) = agent_name_by_name(&names) {
+            return (Some(name), has_children, nav_tui);
         }
-        if let Some(glyph) = remembered_glyph(scanned, shell_pid, &tree) {
-            return (glyph, has_children, nav_tui);
+        if let Some(name) = remembered_agent(scanned, shell_pid, &tree) {
+            return (name, has_children, nav_tui);
         }
 
         // Names missed: fetch command lines for just the tree to catch
@@ -1002,21 +1007,21 @@ mod windows_process_probe {
             .iter()
             .filter_map(|pid| sys.process(*pid))
             .map(|p| p.cmd().iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "));
-        let glyph = agent_glyph_by_cmdline(cmds);
-        scanned.insert(shell_pid, (tree, glyph));
-        (glyph, has_children, nav_tui)
+        let name = agent_name_by_cmdline(cmds);
+        scanned.insert(shell_pid, (tree, name));
+        (name, has_children, nav_tui)
     }
 
-    /// The glyph remembered for `shell_pid`, or `None` when the tree has
+    /// The agent remembered for `shell_pid`, or `None` when the tree has
     /// changed since it was taken and the scan has to run again.  Fetching
     /// command lines is the expensive half of a pass, and its answer can only
     /// change when the descendant set does.
-    pub(super) fn remembered_glyph(
+    pub(super) fn remembered_agent(
         cache: &ScannedTrees,
         shell_pid: u32,
         tree: &[u32],
-    ) -> Option<Option<char>> {
-        cache.get(&shell_pid).filter(|(scanned, _)| scanned == tree).map(|(_, glyph)| *glyph)
+    ) -> Option<Option<&'static str>> {
+        cache.get(&shell_pid).filter(|(scanned, _)| scanned == tree).map(|(_, name)| *name)
     }
 }
 
@@ -1315,24 +1320,14 @@ impl Session {
         self.wsl_probe.as_ref().map(|probe| probe.distro.as_str())
     }
 
-    /// Sidebar glyph for the agent running here.  Identity comes from the
-    /// PTY's foreground process (`/proc` on Linux, `sysctl` on macOS); the
-    /// displayed glyph
-    /// prefers the title's current leading char so the agent's own spinner
-    /// frames animate for free, falling back to a per-agent static glyph
-    /// when the title is plain ASCII.  When proc identification yields
-    /// nothing, accept a decorative title as a permissive fallback so
-    /// agents we don't have in the process map still show *something*.
-    pub fn agent_glyph(&self) -> Option<char> {
+    /// Semantic sidebar state for this session. Process probing identifies a
+    /// waiting agent; a Braille title takes precedence because it signals
+    /// active work even for an agent the process list does not recognize.
+    pub fn activity(&self) -> SessionActivity {
         if self.scratchpad.is_some() {
-            return None;
+            return SessionActivity::Idle;
         }
-        let proc_glyph = self.process_agent_glyph();
-        let title_glyph = title_decorative_glyph(&self.title);
-        if proc_glyph.is_some() {
-            return title_glyph.or(proc_glyph);
-        }
-        title_glyph
+        session_activity(self.process_agent_name(), &self.title)
     }
 
     /// A session "looks busy" when a process is running in the terminal
@@ -1344,10 +1339,11 @@ impl Session {
         if self.scratchpad.is_some() {
             return false;
         }
-        self.process_probe().1 || looks_busy(self.agent_glyph(), &self.title)
+        let (agent_name, foreground_job, _) = self.process_probe();
+        foreground_job || looks_busy(agent_name, &self.title)
     }
 
-    fn process_agent_glyph(&self) -> Option<char> {
+    fn process_agent_name(&self) -> Option<&'static str> {
         self.process_probe().0
     }
 
@@ -1365,13 +1361,13 @@ impl Session {
         self.process_probe().2
     }
 
-    fn process_probe(&self) -> (Option<char>, bool, bool) {
+    fn process_probe(&self) -> (Option<&'static str>, bool, bool) {
         let cached = self.agent_cache.get();
         let fresh = cached.polled_at.is_some_and(|t| t.elapsed() < AGENT_CACHE_TTL);
         if fresh {
-            return (cached.process_glyph, cached.foreground_job, cached.nav_tui);
+            return (cached.agent_name, cached.foreground_job, cached.nav_tui);
         }
-        let glyph = self.shell_pid.and_then(foreground_process_glyph);
+        let agent_name = self.shell_pid.and_then(foreground_agent_name);
         let (foreground_job, nav_tui) = match &self.wsl_probe {
             Some(probe) => {
                 wsl_probe_signals(wsl_helper::foreground_comm(&probe.distro, &probe.key).as_deref())
@@ -1383,11 +1379,11 @@ impl Session {
         };
         self.agent_cache.set(AgentCache {
             polled_at: Some(Instant::now()),
-            process_glyph: glyph,
+            agent_name,
             foreground_job,
             nav_tui,
         });
-        (glyph, foreground_job, nav_tui)
+        (agent_name, foreground_job, nav_tui)
     }
 
     /// Text dump of the visible screen plus up to `scrollback_lines` of
@@ -1561,9 +1557,9 @@ mod tests {
     }
 
     /// An agent animating a Braille spinner in its title emits one of these
-    /// several times a second.  Off screen it moves a sidebar glyph, and
-    /// waking the loop for each repaints the whole visible grid to do it —
-    /// with a few agents running, that alone saturates the UI thread.
+    /// several times a second. Off screen only the loading state matters, and
+    /// waking the loop for every title frame repaints the whole visible grid
+    /// — with a few agents running, that alone saturates the UI thread.
     #[test]
     fn a_hidden_sessions_spinner_frame_does_not_force_a_repaint() {
         let ctx = egui::Context::default();
@@ -1674,21 +1670,21 @@ mod tests {
     fn a_remembered_cmdline_scan_expires_when_the_tree_changes() {
         use std::collections::BTreeMap;
 
-        use super::windows_process_probe::remembered_glyph;
+        use super::windows_process_probe::remembered_agent;
 
         let mut cache = BTreeMap::new();
         cache.insert(42, (vec![42, 100], None));
 
-        assert_eq!(remembered_glyph(&cache, 42, &[42, 100]), Some(None));
-        assert_eq!(remembered_glyph(&cache, 42, &[42, 100, 101]), None);
-        assert_eq!(remembered_glyph(&cache, 43, &[42, 100]), None);
+        assert_eq!(remembered_agent(&cache, 42, &[42, 100]), Some(None));
+        assert_eq!(remembered_agent(&cache, 42, &[42, 100, 101]), None);
+        assert_eq!(remembered_agent(&cache, 43, &[42, 100]), None);
     }
 
     /// Not a gate — run it by hand:
     /// `cargo test -p alacritree --release -- --ignored --nocapture report_process_probe_cost`
     ///
     /// `process_probe` runs on the UI thread whenever a session's agent cache
-    /// goes stale, and every visible frame asks for the glyph.  What one call
+    /// goes stale, and every visible frame asks for the status. What one call
     /// costs is what a keystroke can queue behind.
     #[cfg(windows)]
     #[test]
@@ -2329,8 +2325,8 @@ mod tests {
     }
 
     #[test]
-    fn busy_when_agent_glyph_present() {
-        assert!(looks_busy(Some('✳'), "plain title"));
+    fn busy_when_agent_present() {
+        assert!(looks_busy(Some("claude"), "plain title"));
     }
 
     #[test]
@@ -2339,9 +2335,29 @@ mod tests {
     }
 
     #[test]
-    fn idle_when_no_glyph_and_plain_title() {
+    fn busy_when_an_unknown_agent_uses_a_decorative_title() {
+        assert!(looks_busy(None, "✦ waiting"));
+    }
+
+    #[test]
+    fn idle_when_no_agent_and_plain_title() {
         assert!(!looks_busy(None, "~/projects/alacritree"));
         assert!(!looks_busy(None, ""));
+    }
+
+    #[test]
+    fn session_activity_uses_one_cross_agent_status_set() {
+        assert_eq!(session_activity(None, "zsh"), SessionActivity::Idle);
+        assert_eq!(
+            session_activity(Some("claude"), "✳ waiting"),
+            SessionActivity::Agent(Some("claude"))
+        );
+        assert_eq!(session_activity(None, "✦ waiting"), SessionActivity::Agent(None));
+        assert_eq!(
+            session_activity(Some("codex"), "⠋ working"),
+            SessionActivity::Loading(Some("codex"))
+        );
+        assert_eq!(session_activity(None, "⠋ working"), SessionActivity::Loading(None));
     }
 
     #[test]
@@ -2418,11 +2434,11 @@ mod tests {
 
     #[test]
     fn name_match_handles_exe_suffix_and_case() {
-        assert_eq!(agent_glyph_by_name(["pwsh.exe", "Claude.exe"]), Some('✳'));
-        assert_eq!(agent_glyph_by_name(["cursor-agent.exe"]), Some('❖'));
-        assert_eq!(agent_glyph_by_name(["pwsh.exe", "git.exe"]), None);
-        assert_eq!(agent_glyph_by_name(["not-claude.exe"]), None);
-        assert_eq!(agent_glyph_by_name(std::iter::empty::<&str>()), None);
+        assert_eq!(agent_name_by_name(["pwsh.exe", "Claude.exe"]), Some("claude"));
+        assert_eq!(agent_name_by_name(["cursor-agent.exe"]), Some("cursor-agent"));
+        assert_eq!(agent_name_by_name(["pwsh.exe", "git.exe"]), None);
+        assert_eq!(agent_name_by_name(["not-claude.exe"]), None);
+        assert_eq!(agent_name_by_name(std::iter::empty::<&str>()), None);
     }
 
     #[test]
@@ -2472,8 +2488,8 @@ mod tests {
     fn cmdline_match_catches_runtime_wrappers() {
         let cmd =
             r"node C:\Users\lev\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js";
-        assert_eq!(agent_glyph_by_cmdline([cmd]), Some('✳'));
-        assert_eq!(agent_glyph_by_cmdline([r"pwsh.exe -NoLogo"]), None);
+        assert_eq!(agent_name_by_cmdline([cmd]), Some("claude"));
+        assert_eq!(agent_name_by_cmdline([r"pwsh.exe -NoLogo"]), None);
     }
 
     #[test]
