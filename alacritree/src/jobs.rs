@@ -8,9 +8,12 @@
 
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::process::{Child, Command, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
+use std::time::Duration;
 
 /// Whether anything on screen is waiting for the job.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -21,13 +24,89 @@ pub enum Priority {
     Background,
 }
 
-/// Proof that the holder runs on a pool worker.  The constructor is private to
-/// this module, so a blocking helper that takes one cannot be called from the
-/// UI thread.
-pub struct Blocking(());
+/// A job's cancellation state, shared by its handle, its queued task, and the
+/// `Blocking` its worker runs with.
+#[derive(Default)]
+struct Cancel {
+    flag: AtomicBool,
+    /// The child this job opted into having killed, while one is running.
+    child: Mutex<Option<Child>>,
+}
+
+impl Cancel {
+    /// Set the flag, then end whatever child is registered.  Killing is what
+    /// frees the worker: it is blocked in a wait the kernel returns from.
+    fn cancel(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+        self.kill_registered();
+    }
+
+    fn kill_registered(&self) {
+        if let Some(mut child) = self.child.lock().expect("the cancel slot is poisoned").take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Proof that the holder runs on a pool worker.  The constructor is private
+/// to this module, so a blocking helper that takes one cannot be called from
+/// the UI thread.
+pub struct Blocking(Arc<Cancel>);
+
+impl Blocking {
+    /// Whether this job's handle has been dropped.  Check between steps: a
+    /// job doing local work has no child registered for a cancel to kill, so
+    /// nothing else would stop it.
+    pub fn cancelled(&self) -> bool {
+        self.0.flag.load(Ordering::Relaxed)
+    }
+
+    /// Run a child a cancel is allowed to kill, and return what it wrote.
+    /// Registering is the opt-in: an unregistered child runs to completion
+    /// whatever the caller does with the handle.
+    ///
+    /// The pipes are not drained until the child exits, so this suits a child
+    /// whose output is bounded.  A child that fills a pipe would block on the
+    /// write and never reach the exit this waits for.
+    #[allow(clippy::disallowed_methods)] // Spawning the child is this method's job.
+    pub fn run_cancellable(&self, cmd: &mut Command) -> io::Result<Output> {
+        let child = cmd.spawn()?;
+        *self.0.child.lock().expect("the cancel slot is poisoned") = Some(child);
+        // The handle can drop between the spawn above and the registration, in
+        // which case `cancel` ran while there was nothing to kill.
+        if self.cancelled() {
+            self.0.kill_registered();
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "job cancelled"));
+        }
+        loop {
+            let mut slot = self.0.child.lock().expect("the cancel slot is poisoned");
+            let exited = match slot.as_mut() {
+                Some(child) => child.try_wait()?.is_some(),
+                // The killer got here first and took it.
+                None => {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "job cancelled"));
+                },
+            };
+            if exited {
+                let child = slot.take().expect("observed present on this iteration");
+                drop(slot);
+                return child.wait_with_output();
+            }
+            drop(slot);
+            std::thread::sleep(CHILD_POLL);
+        }
+    }
+}
+
+/// How often `run_cancellable` asks whether its child has exited.  The killer
+/// and the waiter both need `&mut Child`, so they take turns on the mutex
+/// rather than one blocking inside it.  Invisible against a fetch that runs
+/// for seconds.
+const CHILD_POLL: Duration = Duration::from_millis(25);
 
 struct Task {
-    cancelled: Arc<AtomicBool>,
+    cancel: Arc<Cancel>,
     run: Box<dyn FnOnce(&Blocking) + Send>,
     /// Reports a caught panic to the `Job`'s channel.  Kept separate from
     /// `run` because `run` moves its sender into a closure that drops it,
@@ -92,12 +171,13 @@ pub struct Pool {
     shared: Arc<Shared>,
 }
 
-/// A submitted job.  Dropping the handle cancels the work if it has not
-/// started, so a status scan for a workspace the user has left stops costing
-/// a core.
+/// A submitted job.  Dropping the handle cancels the work: an unstarted task
+/// is skipped, and a task already blocked in [`Blocking::run_cancellable`]
+/// has its child killed, so a status scan for a workspace the user has left
+/// stops costing a core either way.
 pub struct Job<T> {
     rx: mpsc::Receiver<Result<T, JobFailed>>,
-    cancelled: Arc<AtomicBool>,
+    cancel: Arc<Cancel>,
     /// Latched by `poll` the moment it drains a failure off the channel, so
     /// the signal survives every `poll` after that one too — `poll` itself
     /// can only report it on the one call that observes it, since its `T`
@@ -138,7 +218,7 @@ impl<T> Job<T> {
 
 impl<T> Drop for Job<T> {
     fn drop(&mut self) {
-        self.cancelled.store(true, Ordering::Relaxed);
+        self.cancel.cancel();
     }
 }
 
@@ -174,9 +254,9 @@ impl Pool {
     {
         let (tx, rx) = mpsc::channel();
         let fail_tx = tx.clone();
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(Cancel::default());
         let task = Task {
-            cancelled: Arc::clone(&cancelled),
+            cancel: Arc::clone(&cancel),
             run: Box::new(move |blocking| {
                 let _ = tx.send(Ok(f(blocking)));
             }),
@@ -191,7 +271,7 @@ impl Pool {
         }
         drop(state);
         self.shared.wake.notify_one();
-        Job { rx, cancelled, failed: Cell::new(false) }
+        Job { rx, cancel, failed: Cell::new(false) }
     }
 }
 
@@ -246,10 +326,11 @@ fn worker(shared: Arc<Shared>) {
 
         let _slot = SlotGuard { shared: &shared, slot };
 
-        if !task.cancelled.load(Ordering::Relaxed) {
+        if !task.cancel.flag.load(Ordering::Relaxed) {
             lower_this_thread(matches!(slot, Slot::Background));
             let _wake = WakeOnEnd { shared: &shared };
-            let outcome = catch_unwind(AssertUnwindSafe(|| (task.run)(&Blocking(()))));
+            let blocking = Blocking(Arc::clone(&task.cancel));
+            let outcome = catch_unwind(AssertUnwindSafe(|| (task.run)(&blocking)));
             if let Err(panic) = outcome {
                 log::error!("a job panicked: {}", panic_message(&panic));
                 (task.on_failure)();
@@ -289,7 +370,9 @@ fn lower_this_thread(_background: bool) {}
 /// rather than a public constructor, so the exception is one reviewable call
 /// instead of a habit.
 pub fn on_this_thread<T>(f: impl FnOnce(&Blocking) -> T) -> T {
-    f(&Blocking(()))
+    // Nothing holds this `Cancel`, so `run_cancellable` here behaves exactly
+    // like a plain run.
+    f(&Blocking(Arc::new(Cancel::default())))
 }
 
 /// The process-wide pool.  Sized for IO-bound work — subprocesses and git
@@ -308,6 +391,8 @@ pub fn pool() -> &'static Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command_ext::CommandExt as _;
+    use std::process::{Command, Stdio};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -315,14 +400,14 @@ mod tests {
         let mut state = State::default();
         for _ in 0..interactive {
             state.interactive.push_back(Task {
-                cancelled: Arc::new(AtomicBool::new(false)),
+                cancel: Arc::new(Cancel::default()),
                 run: Box::new(|_| {}),
                 on_failure: Box::new(|| {}),
             });
         }
         for _ in 0..background {
             state.background.push_back(Task {
-                cancelled: Arc::new(AtomicBool::new(false)),
+                cancel: Arc::new(Cancel::default()),
                 run: Box::new(|_| {}),
                 on_failure: Box::new(|| {}),
             });
@@ -524,6 +609,84 @@ mod tests {
         assert!(
             ran_rx.recv_timeout(Duration::from_millis(500)).is_err(),
             "a cancelled task must not run"
+        );
+    }
+
+    /// A command that outlives any test, so only a kill ends it.
+    ///
+    /// `ping` rather than `timeout` on Windows: `timeout` refuses to run when
+    /// stdin is not a console and exits at once, which would let the test pass
+    /// without ever killing anything.
+    fn long_sleep() -> Command {
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("ping");
+            c.args(["-n", "31", "127.0.0.1"]);
+            c
+        } else {
+            let mut c = Command::new("sleep");
+            c.arg("30");
+            c
+        };
+        cmd.stdout(Stdio::null()).stderr(Stdio::piped()).hide_console();
+        cmd
+    }
+
+    /// Dropping the handle of a job already waiting on a child must kill that
+    /// child and free the worker.  Checking the flag only before the task starts
+    /// leaves a worker parked for as long as the child runs.
+    #[test]
+    fn dropping_a_running_job_kills_its_child_and_frees_the_worker() {
+        let pool = Pool::new(2);
+        let (started_tx, started_rx) = mpsc::channel();
+        let job = pool.spawn(Priority::Interactive, move |blocking| {
+            let _ = started_tx.send(());
+            let _ = blocking.run_cancellable(&mut long_sleep());
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).expect("the job never started");
+
+        drop(job);
+
+        let (ran_tx, ran_rx) = mpsc::channel();
+        let next = pool.spawn(Priority::Interactive, move |_| {
+            let _ = ran_tx.send(());
+        });
+        assert!(
+            ran_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the worker was still parked on the killed child"
+        );
+        drop(next);
+    }
+
+    /// The handle can drop between the spawn and the registration, so `cancel`
+    /// finds nothing to kill.  Registering must re-check the flag, or that child
+    /// runs to completion with nobody left to want it.
+    #[test]
+    fn a_cancel_racing_registration_still_kills_the_child() {
+        let pool = Pool::new(2);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel();
+        let job = pool.spawn(Priority::Interactive, move |blocking| {
+            // The handshake has to come before the drop.  A flag set while the
+            // task is still queued is caught by the pre-start check, the task is
+            // skipped, `done_tx` drops unsent, and the assertion below reports a
+            // disconnect instead of the behaviour under test.
+            let _ = started_tx.send(());
+            // Hold here until the handle has already been dropped, so the flag is
+            // set before any child exists to register.
+            let _ = gate_rx.recv();
+            let result = blocking.run_cancellable(&mut long_sleep());
+            let _ = done_tx.send(result.is_err());
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).expect("the job never started");
+
+        drop(job);
+        let _ = gate_tx.send(());
+
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "the child outlived a cancel that landed before it was registered"
         );
     }
 }
