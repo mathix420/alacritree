@@ -190,6 +190,32 @@
       },
       "type": "object"
     },
+    "RawDecorations": {
+      "description": "Corrections applied to what the font reports for its underline and\nstrikeout.  Each value is `\"2px\"` (physical pixels, added), `\"2pt\"` or a\nbare `\"2\"` (points, added), or `\"150%\"` (a multiplier).  Positive moves a\nline down, matching kitty and ghostty.  A percentage takes no sign.\nDefault `\"0\"`, which draws what the font asked for.",
+      "properties": {
+        "strikeout_position": {
+          "description": "Shift or scale of how far the strikeout sits from the top of the cell.",
+          "pattern": "^(-?[0-9]*\\.?[0-9]+(px|pt)?|[0-9]*\\.?[0-9]+%)$",
+          "type": "string"
+        },
+        "strikeout_thickness": {
+          "description": "Shift or scale of the strikeout bar's weight.",
+          "pattern": "^(-?[0-9]*\\.?[0-9]+(px|pt)?|[0-9]*\\.?[0-9]+%)$",
+          "type": "string"
+        },
+        "underline_position": {
+          "description": "Shift or scale of how far the underline sits from the top of the cell.",
+          "pattern": "^(-?[0-9]*\\.?[0-9]+(px|pt)?|[0-9]*\\.?[0-9]+%)$",
+          "type": "string"
+        },
+        "underline_thickness": {
+          "description": "Shift or scale of the underline's stroke weight.",
+          "pattern": "^(-?[0-9]*\\.?[0-9]+(px|pt)?|[0-9]*\\.?[0-9]+%)$",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "RawFocusOutline": {
       "properties": {
         "color": {
@@ -924,6 +950,10 @@
             "always"
           ],
           "type": "string"
+        },
+        "decorations": {
+          "$ref": "#/$defs/RawDecorations",
+          "description": "Corrections to the underline and strikeout the font placed\n([`RawDecorations`])."
         },
         "default_profile": {
           "description": "Name of the profile new sessions use.  Must match a `[[ui.profiles]]`\nentry, or it is ignored with a warning.",
