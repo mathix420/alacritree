@@ -279,15 +279,6 @@ impl GridInstances {
         self.overlays[row].clear();
     }
 
-    /// `clear_row` without the decorated-row bookkeeping, so the benchmark's
-    /// uncounted writer differs from the shipped one in that alone.
-    #[cfg(test)]
-    fn clear_row_uncounted(&mut self, row: usize, default_bg: [u8; 4]) {
-        let blank = GlyphInstance { slot: BLANK_SLOT, deco: 0, fg: [0; 4], bg: default_bg };
-        self.glyphs[row * self.cols..(row + 1) * self.cols].fill(blank);
-        self.overlays[row].clear();
-    }
-
     /// Every cell an overlay owns, with the row it sits on.
     pub fn overlays(&self) -> impl Iterator<Item = (usize, Overlay)> + '_ {
         self.overlays
@@ -353,98 +344,6 @@ impl GridInstances {
                             BLANK_SLOT
                         },
                     }
-                };
-                self.glyphs[base + col] = GlyphInstance { slot, deco: run.deco, fg, bg };
-                col += 1;
-            }
-        }
-    }
-}
-
-/// Alternative writer bodies, kept beside the shipped one so a benchmark can
-/// run them against a single captured snapshot in one process.  Comparing
-/// across separate binaries makes the machine's drift and each build's capture
-/// phase part of the measurement; comparing here does not.
-#[cfg(test)]
-impl GridInstances {
-    /// Every cell gets a record, so the loop carries no per-run predicate.
-    /// Blank-heavy rows pay stores that `clear_row` already made redundant.
-    pub fn write_rows_noskip<'a>(
-        &mut self,
-        rows_touched: impl IntoIterator<Item = usize>,
-        runs: impl IntoIterator<Item = RunView<'a>>,
-        default_bg: Color32,
-        mut slot_for: impl FnMut(char, Face) -> Option<u16>,
-    ) {
-        let blank = default_bg.to_array();
-        for row in rows_touched {
-            if row < self.rows {
-                self.clear_row(row, blank);
-            }
-        }
-        for run in runs {
-            if run.row >= self.rows {
-                continue;
-            }
-            if run.deco != 0 {
-                self.deco_rows[run.row] = true;
-            }
-            let base = run.row * self.cols;
-            let fg = run.fg.to_array();
-            let bg = run.bg.to_array();
-            let mut col = run.start_col;
-            for ch in run.text.chars() {
-                if col >= self.cols {
-                    break;
-                }
-                let slot = if ch == ' ' {
-                    BLANK_SLOT
-                } else {
-                    slot_for(ch, run.face).unwrap_or(BLANK_SLOT)
-                };
-                self.glyphs[base + col] = GlyphInstance { slot, deco: run.deco, fg, bg };
-                col += 1;
-            }
-        }
-    }
-
-    /// The shipped body without the decorated-row bookkeeping, so its cost can
-    /// be priced against the whole-grid write it rides along with.  Paints the
-    /// same records; only `any_decorated` disagrees, and it is never asked here.
-    pub fn write_rows_nocount<'a>(
-        &mut self,
-        rows_touched: impl IntoIterator<Item = usize>,
-        runs: impl IntoIterator<Item = RunView<'a>>,
-        default_bg: Color32,
-        mut slot_for: impl FnMut(char, Face) -> u16,
-    ) {
-        let blank = default_bg.to_array();
-        for row in rows_touched {
-            if row < self.rows {
-                self.clear_row_uncounted(row, blank);
-            }
-        }
-        for run in runs {
-            if run.row >= self.rows {
-                continue;
-            }
-            let base = run.row * self.cols;
-            let fg = run.fg.to_array();
-            let bg = run.bg.to_array();
-            let keeps_background = bg == blank && run.deco == 0;
-            let mut col = run.start_col;
-            for ch in run.text.chars() {
-                if col >= self.cols {
-                    break;
-                }
-                let slot = if ch == ' ' {
-                    if keeps_background {
-                        col += 1;
-                        continue;
-                    }
-                    BLANK_SLOT
-                } else {
-                    slot_for(ch, run.face)
                 };
                 self.glyphs[base + col] = GlyphInstance { slot, deco: run.deco, fg, bg };
                 col += 1;

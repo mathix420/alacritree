@@ -19,12 +19,11 @@ use crate::config::{Config, Palette};
 use crate::decoration_sprites;
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
 use crate::glyph_cache::{Face, GlyphCache, MAX_EXTRA_CELLS, growth_offset, may_grow};
-use crate::grid_gl::{Frame as GridFrame, GpuGrid, Timing as GpuTiming};
+use crate::grid_gl::{Frame as GridFrame, GpuGrid};
 use crate::grid_instances::RunView;
 use crate::input::{associated_text, event_to_bytes};
 use crate::links::{self, Link};
 use crate::mouse;
-use crate::paint_phases::phase;
 use crate::paste;
 use crate::session::{EventProxy, Session, SessionId, SessionKind, TermSize};
 
@@ -1074,53 +1073,51 @@ impl GridSnapshot {
             link_bounds.is_some_and(|b| b.contains(&Point::new(line, column)))
         };
 
-        phase!(Capture, {
-            for &row in &self.damaged {
-                let line = Line(row as i32 - display_offset);
-                let cells = &grid[line];
-                let dest = &mut self.rows[row];
-                dest.text.clear();
-                dest.runs.clear();
+        for &row in &self.damaged {
+            let line = Line(row as i32 - display_offset);
+            let cells = &grid[line];
+            let dest = &mut self.rows[row];
+            dest.text.clear();
+            dest.runs.clear();
 
-                let mut col = 0;
+            let mut col = 0;
+            while col < cols {
+                let start = col;
+                let style = Style::from_cell(&cells[Column(col)], in_link(line, Column(col)));
+                let selected = is_selected(selection_range.as_ref(), line, Column(col));
+                let text_start = dest.text.len();
                 while col < cols {
-                    let start = col;
-                    let style = Style::from_cell(&cells[Column(col)], in_link(line, Column(col)));
-                    let selected = is_selected(selection_range.as_ref(), line, Column(col));
-                    let text_start = dest.text.len();
-                    while col < cols {
-                        let cell = &cells[Column(col)];
-                        let cell_style = Style::from_cell(cell, in_link(line, Column(col)));
-                        let blank = matches!(cell.c, ' ' | '\0');
-                        if (cell_style != style && !style.absorbs(&cell_style, blank))
-                            || is_selected(selection_range.as_ref(), line, Column(col)) != selected
-                        {
-                            break;
-                        }
-                        let ch = if cell.c == '\0' || cell.flags.contains(Flags::HIDDEN) {
-                            ' '
-                        } else {
-                            cell.c
-                        };
-                        dest.text.push(ch);
-                        col += 1;
+                    let cell = &cells[Column(col)];
+                    let cell_style = Style::from_cell(cell, in_link(line, Column(col)));
+                    let blank = matches!(cell.c, ' ' | '\0');
+                    if (cell_style != style && !style.absorbs(&cell_style, blank))
+                        || is_selected(selection_range.as_ref(), line, Column(col)) != selected
+                    {
+                        break;
                     }
-                    if dest.text.len() == text_start {
-                        continue;
-                    }
-                    let (fg, bg) = run_colors(style, selected, runtime_palette, config);
-                    dest.runs.push(Run {
-                        text: text_start..dest.text.len(),
-                        start_col: start,
-                        row: row as i32,
-                        flags: style.flags,
-                        fg,
-                        bg,
-                        selected,
-                    });
+                    let ch = if cell.c == '\0' || cell.flags.contains(Flags::HIDDEN) {
+                        ' '
+                    } else {
+                        cell.c
+                    };
+                    dest.text.push(ch);
+                    col += 1;
                 }
+                if dest.text.len() == text_start {
+                    continue;
+                }
+                let (fg, bg) = run_colors(style, selected, runtime_palette, config);
+                dest.runs.push(Run {
+                    text: text_start..dest.text.len(),
+                    start_col: start,
+                    row: row as i32,
+                    flags: style.flags,
+                    fg,
+                    bg,
+                    selected,
+                });
             }
-        });
+        }
 
         let cursor_point: Point = grid.cursor.point;
         let cursor_row = cursor_point.line.0 + display_offset;
@@ -1345,31 +1342,25 @@ fn paint_grid_gpu(
             fg: run.fg,
             bg: run.bg,
         });
-        phase!(WriteRows, {
-            instances.write_rows(touched, runs, default_bg, |ch, face| {
-                // ASCII is neither box drawing nor emoji, and it is most of
-                // what a terminal holds, so it never reaches the caches.
-                if !ch.is_ascii() {
-                    if config.font.builtin_box_drawing && is_builtin_glyph(ch) {
-                        return None;
-                    }
-                    if config.font.color_glyphs
-                        && color_glyphs.get(ctx, ch, metrics, char_cells(ch)).is_some()
-                    {
-                        return None;
-                    }
+        instances.write_rows(touched, runs, default_bg, |ch, face| {
+            // ASCII is neither box drawing nor emoji, and it is most of
+            // what a terminal holds, so it never reaches the caches.
+            if !ch.is_ascii() {
+                if config.font.builtin_box_drawing && is_builtin_glyph(ch) {
+                    return None;
                 }
-                Some(table.slot(ch, face, || {
-                    crate::paint_phases::record_glyph_miss();
-                    glyphs.get(ctx, ch, face, size)
-                }))
-            })
+                if config.font.color_glyphs
+                    && color_glyphs.get(ctx, ch, metrics, char_cells(ch)).is_some()
+                {
+                    return None;
+                }
+            }
+            Some(table.slot(ch, face, || glyphs.get(ctx, ch, face, size)))
         });
         overlays.extend(instances.overlays());
         state.mark_rows_dirty(upload);
     }
-    let timing = GpuTiming { enabled: config.debug.gpu_timing, ab: config.debug.gpu_ab };
-    painter.add(gpu.callback(rect, ctx, timing));
+    painter.add(gpu.callback(rect, ctx, config.debug.gpu_timing));
     // After the callback, so they land over the grid the way the mesh path
     // draws them over its own backgrounds.  Both caches are consulted again
     // rather than held across the lock; every lookup here is a cache hit,
@@ -2134,7 +2125,7 @@ mod tests {
     #[test]
     fn an_underline_outside_the_damage_survives_the_frame() {
         let grid = crate::grid_gl::GpuGrid::new();
-        let mut case = Case::new("gl", Some(&grid));
+        let mut case = Case::new(Some(&grid));
         let screen = Vec2::new(1280.0, 720.0);
         case.paint(screen);
         case.advance(b"\x1b[4mlinked\x1b[0m\r\nplain");
@@ -2159,7 +2150,7 @@ mod tests {
     #[test]
     fn a_wide_glyph_decorates_both_of_its_cells() {
         let grid = crate::grid_gl::GpuGrid::new();
-        let mut case = Case::new("gl", Some(&grid));
+        let mut case = Case::new(Some(&grid));
         let screen = Vec2::new(1280.0, 720.0);
         case.paint(screen);
         case.advance("\x1b[4;41m\u{4f60}a".as_bytes());
@@ -3001,462 +2992,6 @@ mod tests {
         out
     }
 
-    /// How much colour a generated frame carries.  `None` is the floor the
-    /// colour workloads are read against: the same characters and the same
-    /// full damage, with no SGR for the parser to decode.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Colors {
-        None,
-        Fg,
-        FgBg,
-    }
-
-    /// What decoration a generated frame carries.  Set once at the top of a
-    /// frame, so every run on screen inherits it: the cost under test is what
-    /// painting decorations charges, not what parsing the escape charges.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Decoration {
-        None,
-        Underline,
-        UnderlineAndStrikeout,
-    }
-
-    impl Decoration {
-        fn sgr(self) -> &'static str {
-            match self {
-                Decoration::None => "",
-                Decoration::Underline => "\x1b[4m",
-                Decoration::UnderlineAndStrikeout => "\x1b[4;9m",
-            }
-        }
-    }
-
-    /// One frame of termbench's `FGPerChar` (`Colors::Fg`) or `FGBGPerChar`
-    /// (`Colors::FgBg`), transcribed from `termbench.cpp`: a truecolour SGR on
-    /// every cell, colours derived from the frame index, background written
-    /// before foreground.
-    ///
-    /// The frame index is the part that matters.  Every colour on screen moves
-    /// between frames, so the terminal reports full damage each time — the
-    /// same thing a real run of termbench does, and the reason a harness that
-    /// paints one fixed screen repeatedly measures nothing useful for a
-    /// renderer that skips clean rows.
-    ///
-    /// `stride` is the one thing here termbench has no equivalent of: it holds
-    /// each colour for that many columns, so a row splits into `cols / stride`
-    /// runs while the cell count stays put.  At 1 this is the transcription.
-    /// Above 1 it is the only way to tell per-cell cost from per-run cost,
-    /// which every previous reading of these numbers had to guess at.
-    fn colored_frame(
-        cols: usize,
-        rows: usize,
-        frame: usize,
-        colors: Colors,
-        decoration: Decoration,
-        stride: usize,
-    ) -> Vec<u8> {
-        let mut out = Vec::from(decoration.sgr());
-        for y in 0..rows {
-            out.extend_from_slice(format!("\x1b[{};1H", y + 1).as_bytes());
-            for x in 0..cols {
-                let c = x - x % stride;
-                if x % stride == 0 && colors != Colors::None {
-                    if colors == Colors::FgBg {
-                        let (r, g, b) = (frame + y + c, frame + y, frame);
-                        let sgr = format!("\x1b[48;2;{};{};{}m", r & 0xff, g & 0xff, b & 0xff);
-                        out.extend_from_slice(sgr.as_bytes());
-                    }
-                    let (r, g, b) = (frame, frame + y, frame + y + c);
-                    let sgr = format!("\x1b[38;2;{};{};{}m", r & 0xff, g & 0xff, b & 0xff);
-                    out.extend_from_slice(sgr.as_bytes());
-                }
-                out.push(b'a' + ((frame + x + y) % 25) as u8);
-            }
-        }
-        out
-    }
-
-    /// Not a gate — run it by hand:
-    /// `cargo test -p alacritree --release -- --ignored --nocapture --test-threads=1
-    /// report_colored_frame`
-    ///
-    /// Frame cost under termbench's two colour tests, mesh path against GL
-    /// path, with a third workload that keeps the cell count and cuts the run
-    /// count to an eighth.  Every other harness here runs `dense_screen`, which
-    /// holds the default background, changes colour every seventh column, and
-    /// never changes between frames: the one shape where neither run count nor
-    /// damage tracking costs anything.
-    ///
-    /// Both paths are stepped through the same frames in lockstep and sampled
-    /// in the same round, so a thermal drift or a background process hits both
-    /// or neither.  Reading them one after the other, as this used to, let a
-    /// quiet minute and a busy one land on different paths and read as a
-    /// difference between the paths.
-    ///
-    /// Parsing happens outside the timed region, so what is reported is paint
-    /// alone; both paths see byte-identical frames.
-    ///
-    /// There is no GL context here, so the GL path's callback is emitted and
-    /// never invoked.  Both rows are therefore the CPU half only, which is the
-    /// half that runs on the UI thread ahead of the next keystroke.
-    #[test]
-    #[ignore = "timing harness, not an assertion"]
-    fn report_colored_frame() {
-        #[cfg(windows)]
-        crate::harden_dll_search_path();
-
-        let grid = crate::grid_gl::GpuGrid::new();
-
-        for screen in [Vec2::new(1280.0, 720.0), Vec2::new(2560.0, 1440.0)] {
-            let mut printed_header = false;
-            for (label, colors, decoration, stride) in [
-                ("FGPerChar", Colors::Fg, Decoration::None, 1),
-                ("FGBGPerChar", Colors::FgBg, Decoration::None, 1),
-                ("FGBG stride 8", Colors::FgBg, Decoration::None, 8),
-                ("FG underlined", Colors::Fg, Decoration::Underline, 1),
-                ("FG under+strike", Colors::Fg, Decoration::UnderlineAndStrikeout, 1),
-            ] {
-                let mut cases: Vec<Case<'_>> = ["mesh", "gl"]
-                    .into_iter()
-                    .map(|path| Case::new(path, (path == "gl").then_some(&grid)))
-                    .collect();
-
-                for case in &mut cases {
-                    case.paint(screen);
-                }
-                let (cols, rows) =
-                    (cases[0].session.size.columns, cases[0].session.size.screen_lines);
-                for case in &mut cases {
-                    case.session.term.lock().resize(TermSize::new(cols, rows));
-                }
-
-                // Generating the escapes is the benchmark's cost, not the
-                // painter's, so the ring is built up front.  Reusing it wraps
-                // round every RING frames, and only consecutive frames have to
-                // differ for damage to stay full.
-                let ring: Vec<Vec<u8>> = (0..RING)
-                    .map(|frame| colored_frame(cols, rows, frame, colors, decoration, stride))
-                    .collect();
-
-                for i in 0..WARMUP {
-                    for case in &mut cases {
-                        case.advance(&ring[i % RING]);
-                        case.paint(screen);
-                    }
-                }
-
-                for round in 0..ROUNDS {
-                    for case in &mut cases {
-                        case.round = Sample::default();
-                    }
-                    for f in 0..BATCH {
-                        let bytes = &ring[(WARMUP + round * BATCH + f) % RING];
-                        for case in &mut cases {
-                            case.advance(bytes);
-                            case.measure(screen);
-                        }
-                    }
-                    for case in &mut cases {
-                        case.rounds.push(case.round);
-                    }
-                }
-
-                if !printed_header {
-                    println!("{}x{} logical px = {cols}x{rows} cells", screen.x, screen.y);
-                    printed_header = true;
-                }
-                for case in &mut cases {
-                    case.report(label);
-                }
-            }
-        }
-    }
-
-    /// A shell-like screen: a short coloured run at the start of each line and
-    /// blanks to the right margin.
-    ///
-    /// The decorated workloads fill every cell, so they cannot price the blank
-    /// fast path in `write_rows` at all: a screen with no spaces never takes
-    /// it. Real terminal output is mostly blank, which is the case that path
-    /// exists for, and the case where writing a record per cell has to pay.
-    fn sparse_frame(cols: usize, rows: usize, frame: usize) -> Vec<u8> {
-        let mut out = Vec::from(&b"\x1b[2J"[..]);
-        for y in 0..rows {
-            out.extend_from_slice(format!("\x1b[{};1H", y + 1).as_bytes());
-            let sgr = format!("\x1b[38;2;{};128;64m", (frame + y) & 0xff);
-            out.extend_from_slice(sgr.as_bytes());
-            // Varying the width keeps every row from sharing one run shape.
-            let width = (8 + (frame * 7 + y * 3) % 48).min(cols);
-            for x in 0..width {
-                out.push(b'a' + ((x + y) % 26) as u8);
-            }
-            out.extend_from_slice(b"\x1b[0m");
-        }
-        out
-    }
-
-    /// Not a gate. Run it by hand:
-    /// `cargo test -p alacritree --release -- --ignored --nocapture --test-threads=1
-    /// report_writer_variants`
-    ///
-    /// What each candidate write loop costs, measured against one captured
-    /// snapshot inside one process.
-    ///
-    /// Comparing writers by building a binary per candidate makes two things
-    /// part of the result that have nothing to do with the writer: the
-    /// machine's drift between runs, and the capture phase, which is not the
-    /// same code in every candidate once a candidate moves work into it.
-    /// Capturing once here and replaying it leaves only the loop under test.
-    ///
-    /// `slot_for` is a plain arithmetic map rather than the interning table
-    /// the painter uses, so a cache lookup does not sit between the loop and
-    /// the numbers.  That makes these figures a comparison between loops, not
-    /// a prediction of the painter's write phase.
-    #[test]
-    #[ignore = "timing harness, not an assertion"]
-    fn report_writer_variants() {
-        use crate::grid_instances::GridInstances;
-        const COLS: usize = 318;
-        const ROWS: usize = 83;
-        let rounds: usize = std::env::var("ALACRITREE_BENCH_ROUNDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(400);
-        const REPS: usize = 6;
-
-        println!("{COLS}x{ROWS} cells, {rounds} rounds of {REPS} writes per variant");
-
-        for (label, colors, decoration, stride, sparse) in [
-            ("FGPerChar", Colors::Fg, Decoration::None, 1, false),
-            ("FGBGPerChar", Colors::FgBg, Decoration::None, 1, false),
-            ("FGBG stride 8", Colors::FgBg, Decoration::None, 8, false),
-            ("FG underlined", Colors::Fg, Decoration::Underline, 1, false),
-            ("FG under+strike", Colors::Fg, Decoration::UnderlineAndStrikeout, 1, false),
-            ("sparse shell", Colors::Fg, Decoration::None, 1, true),
-        ] {
-            let (proxy, _events) = EventProxy::new(egui::Context::default());
-            let mut term = Term::new(TermConfig::default(), &TermSize::new(COLS, ROWS), proxy);
-            let mut parser = Processor::<StdSyncHandler>::new();
-            let config = Config::default();
-            let mut snapshot = GridSnapshot::new();
-            // Two frames: the first capture has no damage history to read, so
-            // the second is the one a steady-state frame produces.
-            for frame in 0..2 {
-                let bytes = if sparse {
-                    sparse_frame(COLS, ROWS, frame)
-                } else {
-                    colored_frame(COLS, ROWS, frame, colors, decoration, stride)
-                };
-                parser.advance(&mut term, &bytes);
-                snapshot.capture(&mut term, &config, 0, None, true);
-            }
-
-            // The painter resolves the default background from the palette, and
-            // the blank fast path compares a run's background against exactly
-            // that.  A hardcoded colour here makes that comparison fail for
-            // every run, so the path under test would never run.
-            let bg = background(&config.palette);
-
-            // A workload that means to price the blank fast path has to contain
-            // blanks that path would take: a space on the default background
-            // in an undecorated run.  Printed so a workload cannot claim to
-            // exercise it while capture emits no such cell.
-            let (mut runs, mut cells, mut skippable) = (0usize, 0usize, 0usize);
-            for (text, run) in snapshot.runs_in_rows(0..ROWS) {
-                runs += 1;
-                cells += text.chars().count();
-                if run.bg == bg && decoration_tile(run.flags) == 0 {
-                    skippable += text.chars().filter(|c| *c == ' ').count();
-                }
-            }
-            let mut instances = GridInstances::default();
-            instances.resize(COLS, ROWS, bg);
-
-            // Each entry writes the whole grid once, except the probes, which
-            // walk the runs and write nothing.  Their difference prices the
-            // per-run tile computation on its own, which is what any proposal
-            // to resolve the tile somewhere else trades against.
-            let variants: [(&str, fn(&mut GridInstances, &GridSnapshot, usize, Color32)); 5] = [
-                ("ship", |g, s, rows, bg| {
-                    g.write_rows(0..rows, run_views(s, rows), bg, |ch, _| Some(ch as u16))
-                }),
-                ("noskip", |g, s, rows, bg| {
-                    g.write_rows_noskip(0..rows, run_views(s, rows), bg, |ch, _| Some(ch as u16))
-                }),
-                ("nocount", |g, s, rows, bg| {
-                    g.write_rows_nocount(0..rows, run_views(s, rows), bg, |ch, _| ch as u16)
-                }),
-                ("probe: walk runs, no tile", |_g, s, rows, _bg| {
-                    let mut acc = 0u32;
-                    for (_, run) in s.runs_in_rows(0..rows) {
-                        acc ^= run.start_col as u32;
-                    }
-                    std::hint::black_box(acc);
-                }),
-                ("probe: walk runs + tile", |_g, s, rows, _bg| {
-                    let mut acc = 0u32;
-                    for (_, run) in s.runs_in_rows(0..rows) {
-                        acc ^= run.start_col as u32 ^ decoration_tile(run.flags) as u32;
-                    }
-                    std::hint::black_box(acc);
-                }),
-            ];
-            // A faster loop that renders differently is not a candidate.  The
-            // one legitimate difference is the foreground byte of an
-            // undecorated blank: `clear_row` leaves it zeroed and `noskip`
-            // writes the run's, and nothing samples it because that cell draws
-            // no glyph and no decoration.
-            let reference = {
-                (variants[0].1)(&mut instances, &snapshot, ROWS, bg);
-                instances.glyphs.clone()
-            };
-            for (name, run) in &variants {
-                // Probes measure a walk, not a write, and leave the buffer alone.
-                if name.starts_with("probe") {
-                    continue;
-                }
-                run(&mut instances, &snapshot, ROWS, bg);
-                for (i, (a, b)) in reference.iter().zip(&instances.glyphs).enumerate() {
-                    let blank = a.slot == crate::grid_instances::BLANK_SLOT && a.deco == 0;
-                    let same = a.slot == b.slot && a.deco == b.deco && a.bg == b.bg;
-                    assert!(
-                        same && (blank || a.fg == b.fg),
-                        "{name} disagrees with ship at cell {i} on {label}"
-                    );
-                }
-            }
-
-            let mut samples: Vec<Vec<f64>> = vec![Vec::new(); variants.len()];
-            for _ in 0..8 {
-                for (_, run) in &variants {
-                    run(&mut instances, &snapshot, ROWS, bg);
-                }
-            }
-            for round in 0..rounds {
-                // Rotate the order so no variant always runs first.
-                for i in 0..variants.len() {
-                    let v = (i + round) % variants.len();
-                    let started = std::time::Instant::now();
-                    for _ in 0..REPS {
-                        (variants[v].1)(&mut instances, &snapshot, ROWS, bg);
-                        std::hint::black_box(&instances.glyphs[0]);
-                    }
-                    samples[v].push(started.elapsed().as_secs_f64() * 1e6 / REPS as f64);
-                }
-            }
-
-            println!(
-                "\n  {label}  ({runs} runs, {cells} cells, {skippable} skippable blanks = {:.0}%)",
-                100.0 * skippable as f64 / cells.max(1) as f64,
-            );
-            // Paired per-round ratios rather than a ratio of two medians: the
-            // rounds interleave, so a round's own load cancels inside the
-            // ratio, and the count above parity says whether a difference
-            // smaller than the noise is a real ordering or a coin flip.
-            for (i, (name, _)) in variants.iter().enumerate() {
-                let med = median(&mut samples[i].clone());
-                let mut paired: Vec<f64> =
-                    samples[i].iter().zip(&samples[0]).map(|(a, b)| a / b).collect();
-                let above = paired.iter().filter(|r| **r > 1.0).count();
-                println!(
-                    "    {name:<26} {med:8.1}us  paired vs ship {:.3}  above parity {above}/{rounds}",
-                    median(&mut paired),
-                );
-            }
-        }
-    }
-
-    /// The run views the shipped painter builds.
-    fn run_views<'a>(snapshot: &'a GridSnapshot, rows: usize) -> impl Iterator<Item = RunView<'a>> {
-        snapshot.runs_in_rows(0..rows).map(|(text, run)| RunView {
-            text,
-            start_col: run.start_col,
-            row: run.row as usize,
-            face: Face::new(run.flags.contains(Flags::BOLD), run.flags.contains(Flags::ITALIC)),
-            deco: decoration_tile(run.flags),
-            fg: run.fg,
-            bg: run.bg,
-        })
-    }
-
-    fn median(v: &mut Vec<f64>) -> f64 {
-        v.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
-        v[v.len() / 2]
-    }
-
-    /// Not a gate — run it by hand:
-    /// `cargo test -p alacritree --release -- --ignored --nocapture --test-threads=1
-    /// report_parse_share`
-    ///
-    /// What the VT parser costs beside the painter it feeds, on the GL path
-    /// alone.  Every other harness here times painting and leaves `advance`
-    /// outside the measured region, which reads as though parsing were free.
-    ///
-    /// The three workloads bracket real output rather than describing it: an
-    /// SGR pair per cell is termbench's worst case, no SGR at all is the
-    /// floor, and the byte count printed beside each says how far apart they
-    /// are.  `ALACRITREE_BENCH_WORKLOAD=plain` narrows the run to one of them,
-    /// which is what makes a sampled profile attributable.
-    #[test]
-    #[ignore = "timing harness, not an assertion"]
-    fn report_parse_share() {
-        #[cfg(windows)]
-        crate::harden_dll_search_path();
-
-        let grid = crate::grid_gl::GpuGrid::new();
-        let only = std::env::var("ALACRITREE_BENCH_WORKLOAD").ok();
-        let screen = Vec2::new(2560.0, 1440.0);
-
-        for (label, colors, decoration) in [
-            ("fgbg", Colors::FgBg, Decoration::None),
-            ("fg", Colors::Fg, Decoration::None),
-            ("plain", Colors::None, Decoration::None),
-            ("under", Colors::Fg, Decoration::Underline),
-        ] {
-            if only.as_deref().is_some_and(|want| want != label) {
-                continue;
-            }
-
-            let mut case = Case::new("gl", Some(&grid));
-            case.paint(screen);
-            let (cols, rows) = (case.session.size.columns, case.session.size.screen_lines);
-            case.session.term.lock().resize(TermSize::new(cols, rows));
-
-            let ring: Vec<Vec<u8>> = (0..RING)
-                .map(|frame| colored_frame(cols, rows, frame, colors, decoration, 1))
-                .collect();
-            let bytes = ring.iter().map(Vec::len).sum::<usize>() / RING;
-
-            for i in 0..WARMUP {
-                case.advance(&ring[i % RING]);
-                case.paint(screen);
-            }
-
-            crate::paint_phases::reset();
-            let (mut parse, mut paint) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
-            let frames = ROUNDS * BATCH;
-            for f in 0..frames {
-                let feed = &ring[(WARMUP + f) % RING];
-                let started = std::time::Instant::now();
-                case.advance(feed);
-                parse += started.elapsed();
-                let started = std::time::Instant::now();
-                std::hint::black_box(case.paint(screen));
-                paint += started.elapsed();
-            }
-
-            let n = frames as u32;
-            let share = 100.0 * parse.as_secs_f64() / (parse + paint).as_secs_f64();
-            println!(
-                "  {label:<6} {cols}x{rows}  {bytes:>7} B/frame  parse {:>10?}  paint {:>10?}  \
-                 parse {share:>3.0}% of the two",
-                parse / n,
-                paint / n,
-            );
-            println!("       {}", crate::paint_phases::totals().per_frame(n).summary());
-        }
-    }
-
     /// A row between two damaged ones holds records nothing invalidated, so
     /// the frame owes it nothing.  Handing the painter the span instead makes
     /// one edited line and one repainted status bar cost the whole screen.
@@ -3481,7 +3016,7 @@ mod tests {
     #[test]
     fn a_gpu_grid_that_will_not_build_paints_the_mesh() {
         let grid = crate::grid_gl::GpuGrid::new();
-        let mut case = Case::new("gl", Some(&grid));
+        let mut case = Case::new(Some(&grid));
         let screen = Vec2::new(1280.0, 720.0);
         case.advance(b"hello");
 
@@ -3505,8 +3040,8 @@ mod tests {
     fn a_decorated_run_costs_no_geometry() {
         let (plain_grid, decorated_grid) =
             (crate::grid_gl::GpuGrid::new(), crate::grid_gl::GpuGrid::new());
-        let mut plain = Case::new("gl", Some(&plain_grid));
-        let mut decorated = Case::new("gl", Some(&decorated_grid));
+        let mut plain = Case::new(Some(&plain_grid));
+        let mut decorated = Case::new(Some(&decorated_grid));
         let screen = Vec2::new(1280.0, 720.0);
         // The first frame is what tells the session how big its grid is.
         plain.paint(screen);
@@ -3531,27 +3066,9 @@ mod tests {
         );
     }
 
-    const ROUNDS: usize = 11;
-    const BATCH: usize = 20;
-    const RING: usize = 32;
-    const WARMUP: usize = 10;
-
-    /// One round's worth of frames, summed.  Divided by `BATCH` at print time.
-    #[derive(Clone, Copy, Default)]
-    struct Sample {
-        frame: std::time::Duration,
-        build: std::time::Duration,
-        tessellate: std::time::Duration,
-        allocs: usize,
-        bytes: usize,
-        vertices: usize,
-        phases: crate::paint_phases::Totals,
-    }
-
     /// One painter under test: its own terminal, its own caches, its own egui
     /// context, fed the same bytes as every other case in the sweep.
     struct Case<'a> {
-        path: &'static str,
         gpu: Option<&'a crate::grid_gl::GpuGrid>,
         config: Config,
         ctx: egui::Context,
@@ -3559,18 +3076,15 @@ mod tests {
         _dir: tempfile::TempDir,
         caches: Caches,
         parser: Processor<StdSyncHandler>,
-        round: Sample,
-        rounds: Vec<Sample>,
     }
 
     impl<'a> Case<'a> {
-        fn new(path: &'static str, gpu: Option<&'a crate::grid_gl::GpuGrid>) -> Self {
+        fn new(gpu: Option<&'a crate::grid_gl::GpuGrid>) -> Self {
             let mut config = Config::default();
             config.ui.gpu_grid = gpu.is_some();
             let ctx = egui::Context::default();
             let (session, dir) = headless_session(&ctx, &config);
             Self {
-                path,
                 gpu,
                 config,
                 ctx,
@@ -3578,8 +3092,6 @@ mod tests {
                 _dir: dir,
                 caches: Caches::new(),
                 parser: Processor::new(),
-                round: Sample::default(),
-                rounds: Vec::new(),
             }
         }
 
@@ -3597,51 +3109,6 @@ mod tests {
                 screen,
                 self.gpu,
             )
-        }
-
-        fn measure(&mut self, screen: Vec2) {
-            crate::paint_phases::reset();
-            let started = std::time::Instant::now();
-            let (cost, counts) =
-                crate::steady_state::measure(|| std::hint::black_box(self.paint(screen)));
-            self.round.frame += started.elapsed();
-            self.round.build += cost.build;
-            self.round.tessellate += cost.tessellate;
-            self.round.vertices = cost.vertices;
-            self.round.allocs += counts.allocs;
-            self.round.bytes += counts.bytes;
-            self.round.phases += crate::paint_phases::totals();
-        }
-
-        /// The median round, with the spread across rounds beside it.  A tight
-        /// spread is the only thing that makes a difference between two of
-        /// these lines worth reading.
-        fn report(&mut self, label: &str) {
-            self.rounds.sort_by_key(|s| s.frame);
-            let mid = self.rounds[self.rounds.len() / 2];
-            let (lo, hi) = (self.rounds[0].frame, self.rounds[self.rounds.len() - 1].frame);
-            let spread = (hi.as_secs_f64() / lo.as_secs_f64() - 1.0) * 100.0;
-            let n = BATCH as u32;
-            println!(
-                "  {label:<14} {:<4} {:>11?}/frame  spread {spread:>4.0}%  build {:?} tess {:?}  \
-                 verts {}  alloc {}/{}",
-                self.path,
-                mid.frame / n,
-                mid.build / n,
-                mid.tessellate / n,
-                mid.vertices,
-                mid.allocs / BATCH,
-                bytes_human(mid.bytes / BATCH),
-            );
-            println!("       {}", mid.phases.per_frame(n).summary());
-        }
-    }
-
-    fn bytes_human(bytes: usize) -> String {
-        match bytes {
-            b if b >= 1 << 20 => format!("{:.2}MB", b as f64 / (1 << 20) as f64),
-            b if b >= 1 << 10 => format!("{:.1}kB", b as f64 / (1 << 10) as f64),
-            b => format!("{b}B"),
         }
     }
 
@@ -3708,970 +3175,6 @@ mod tests {
                 cost.vertices,
             );
         }
-    }
-
-    /// Not a gate — run it by hand:
-    /// `cargo test -p alacritree --release -- --ignored --nocapture report_instance_frame`
-    ///
-    /// The same frame `report_paint_cost` and `report_mesh_frame` measure,
-    /// built as one twelve-byte record per cell for a GPU that derives the
-    /// quad itself.  The rows list is the point of the fixed stride: a frame
-    /// that rewrites only the rows the terminal reported damaged pays for
-    /// those rows and nothing else.
-    #[test]
-    #[ignore = "timing harness, not an assertion"]
-    fn report_instance_frame() {
-        #[cfg(windows)]
-        crate::harden_dll_search_path();
-
-        use std::sync::Arc;
-
-        use crate::grid_instances::{GlyphTable, GridInstances, RunView};
-
-        let config = Config::default();
-        let screen = Vec2::new(2560.0, 1440.0);
-        let ctx = egui::Context::default();
-        let (mut session, _dir) = headless_session(&ctx, &config);
-        let mut caches = Caches::new();
-        paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
-        let (cols, rows) = (session.size.columns, session.size.screen_lines);
-        let feed = dense_screen(cols, rows);
-        let mut parser = Processor::<StdSyncHandler>::new();
-        {
-            let mut term = session.term.lock();
-            term.resize(TermSize::new(cols, rows));
-            parser.advance(&mut *term, &feed);
-        }
-        for _ in 0..10 {
-            paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
-        }
-
-        let mut snapshot = GridSnapshot::new();
-        {
-            let mut term = session.term.lock();
-            snapshot.capture(&mut term, &config, 0, None, false);
-        }
-        let size = config.font.egui_size();
-        let default_bg = background(&config.palette);
-        let mut table = GlyphTable::default();
-        let mut grid = GridInstances::default();
-        grid.resize(cols, rows, default_bg);
-
-        fn views<'a>(snapshot: &'a GridSnapshot, want: &dyn Fn(usize) -> bool) -> Vec<RunView<'a>> {
-            snapshot
-                .runs()
-                .filter(|(_, r)| want(r.row as usize))
-                .map(|(text, r)| RunView {
-                    text,
-                    start_col: r.start_col,
-                    row: r.row as usize,
-                    face: Face::new(r.flags.contains(Flags::BOLD), r.flags.contains(Flags::ITALIC)),
-                    deco: decoration_tile(r.flags),
-                    fg: r.fg,
-                    bg: r.bg,
-                })
-                .collect()
-        }
-
-        let iterations = 60u32;
-        fn time(iterations: u32, mut body: impl FnMut()) -> std::time::Duration {
-            for _ in 0..5 {
-                body();
-            }
-            let start = std::time::Instant::now();
-            for _ in 0..iterations {
-                body();
-            }
-            start.elapsed() / iterations
-        }
-
-        // Warm the glyph table so the timed loop measures writing records, not
-        // laying characters out for the first time.
-        let all = views(&snapshot, &|_| true);
-        grid.write_rows(0..rows, all, default_bg, |ch, face| {
-            Some(table.slot(ch, face, || caches.glyphs.get(&ctx, ch, face, size)))
-        });
-        let slots = table.slots().len();
-
-        println!("{cols}x{rows} cells, {} runs, {slots} distinct glyphs", snapshot.runs().count());
-        println!(
-            "  reading one row costs {} B of grid, writing it {} B of records",
-            cols * size_of::<Cell>(),
-            cols * size_of::<crate::grid_instances::GlyphInstance>(),
-        );
-        for damaged in [rows, rows / 2, 8, 3, 1] {
-            let touched = views(&snapshot, &|row| row < damaged);
-            let build = time(iterations, || {
-                grid.write_rows(0..damaged, touched.iter().copied(), default_bg, |ch, face| {
-                    Some(table.slot(ch, face, || caches.glyphs.get(&ctx, ch, face, size)))
-                });
-                std::hint::black_box(grid.glyphs.len());
-            });
-            let bytes = grid.row_bytes(0, damaged).len();
-            println!(
-                "  rewrite {damaged:>3} of {rows} rows: {build:?}, {} KiB to upload",
-                bytes / 1024,
-            );
-        }
-
-        // The shape a real TUI produces: an edited line and a status bar, with
-        // the untouched screen between them.  The upload still has to carry
-        // the span, so the two numbers on this line diverge.
-        let ends = [0, rows - 1];
-        let touched = views(&snapshot, &|row| ends.contains(&row));
-        let build = time(iterations, || {
-            grid.write_rows(ends, touched.iter().copied(), default_bg, |ch, face| {
-                Some(table.slot(ch, face, || caches.glyphs.get(&ctx, ch, face, size)))
-            });
-            std::hint::black_box(grid.glyphs.len());
-        });
-        println!(
-            "  rewrite rows 0 and {} only: {build:?}, {} KiB to upload",
-            rows - 1,
-            grid.row_bytes(0, rows).len() / 1024,
-        );
-
-        // What epaint charges for a grid it never sees the geometry of.
-        let callback = vec![egui::epaint::ClippedShape {
-            clip_rect: Rect::from_min_size(Pos2::ZERO, screen),
-            shape: egui::Shape::Callback(egui::epaint::PaintCallback {
-                rect: Rect::from_min_size(Pos2::ZERO, screen),
-                callback: Arc::new(()),
-            }),
-        }];
-        let ppp = 1.0;
-        let tessellate = time(iterations, || {
-            std::hint::black_box(ctx.tessellate(callback.clone(), ppp));
-        });
-        println!("  tessellate a callback-only shape list: {tessellate:?}");
-
-        // The rewrite between captures is what gives the next one anything to
-        // read: `capture` drains the damage it is handed, so a second one
-        // against an untouched terminal walks the cursor line and stops.  It
-        // stays outside the clock — damage is marked per line written, not per
-        // line changed, so re-feeding the same bytes is enough.
-        let capture = {
-            let mut total = std::time::Duration::ZERO;
-            for i in 0..iterations + 5 {
-                {
-                    let mut term = session.term.lock();
-                    parser.advance(&mut *term, &feed);
-                }
-                let started = std::time::Instant::now();
-                {
-                    let mut term = session.term.lock();
-                    snapshot.capture(&mut term, &config, 0, None, false);
-                    std::hint::black_box(snapshot.runs().count());
-                }
-                if i >= 5 {
-                    total += started.elapsed();
-                }
-            }
-            total / iterations
-        };
-        println!("  capture the grid under the lock      : {capture:?}");
-    }
-
-    /// Not a gate — run it by hand:
-    /// `cargo test -p alacritree --release -- --ignored --nocapture report_record_shapes`
-    ///
-    /// Three ways to lay out a cell's record.  Twelve bytes does not divide a
-    /// cache line, so a row's records straddle lines arbitrarily; sixteen puts
-    /// exactly four per line and starts every row on one.  The padding is only
-    /// worth its extra bytes if it carries something, so the third shape moves
-    /// the background colour out of its own buffer and into the record.
-    #[test]
-    #[ignore = "timing harness, not an assertion"]
-    fn report_record_shapes() {
-        #[cfg(windows)]
-        crate::harden_dll_search_path();
-
-        #[derive(Clone, Copy, Default)]
-        #[repr(C)]
-        struct Narrow {
-            cell: [u16; 2],
-            slot: u16,
-            flags: u16,
-            fg: [u8; 4],
-        }
-
-        #[derive(Clone, Copy, Default)]
-        #[repr(C)]
-        struct Padded {
-            cell: [u16; 2],
-            slot: u16,
-            flags: u16,
-            fg: [u8; 4],
-            _pad: u32,
-        }
-
-        #[derive(Clone, Copy, Default)]
-        #[repr(C)]
-        struct WithBackground {
-            cell: [u16; 2],
-            slot: u16,
-            flags: u16,
-            fg: [u8; 4],
-            bg: [u8; 4],
-        }
-
-        let config = Config::default();
-        let screen = Vec2::new(2560.0, 1440.0);
-        let ctx = egui::Context::default();
-        let (mut session, _dir) = headless_session(&ctx, &config);
-        let mut caches = Caches::new();
-        paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
-        let (cols, rows) = (session.size.columns, session.size.screen_lines);
-        {
-            let mut term = session.term.lock();
-            term.resize(TermSize::new(cols, rows));
-            Processor::<StdSyncHandler>::new().advance(&mut *term, &dense_screen(cols, rows));
-        }
-        for _ in 0..10 {
-            paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
-        }
-        let mut snapshot = GridSnapshot::new();
-        {
-            let mut term = session.term.lock();
-            snapshot.capture(&mut term, &config, 0, None, false);
-        }
-
-        // Every cell the frame writes, as (row, column, foreground, background).
-        let mut cells: Vec<(usize, usize, [u8; 4], [u8; 4])> = Vec::new();
-        for (text, run) in snapshot.runs() {
-            for (offset, _) in text.chars().enumerate() {
-                let col = run.start_col + offset;
-                if col < cols {
-                    cells.push((run.row as usize, col, run.fg.to_array(), run.bg.to_array()));
-                }
-            }
-        }
-
-        let iterations = 60u32;
-        fn time(iterations: u32, mut body: impl FnMut()) -> std::time::Duration {
-            for _ in 0..5 {
-                body();
-            }
-            let start = std::time::Instant::now();
-            for _ in 0..iterations {
-                body();
-            }
-            start.elapsed() / iterations
-        }
-
-        let mut twelve = vec![Narrow::default(); cols * rows];
-        let mut padded = vec![Padded::default(); cols * rows];
-        let mut merged = vec![WithBackground::default(); cols * rows];
-        let mut background = vec![0u32; cols * rows];
-
-        let narrow = time(iterations, || {
-            for &(row, col, fg, bg) in &cells {
-                twelve[row * cols + col] =
-                    Narrow { cell: [col as u16, row as u16], slot: 1, flags: 0, fg };
-                background[row * cols + col] = u32::from_le_bytes(bg);
-            }
-            std::hint::black_box((&twelve, &background));
-        });
-        let wide = time(iterations, || {
-            for &(row, col, fg, bg) in &cells {
-                padded[row * cols + col] =
-                    Padded { cell: [col as u16, row as u16], slot: 1, flags: 0, fg, _pad: 0 };
-                background[row * cols + col] = u32::from_le_bytes(bg);
-            }
-            std::hint::black_box((&padded, &background));
-        });
-        let one = time(iterations, || {
-            for &(row, col, fg, bg) in &cells {
-                merged[row * cols + col] =
-                    WithBackground { cell: [col as u16, row as u16], slot: 1, flags: 0, fg, bg };
-            }
-            std::hint::black_box(&merged);
-        });
-
-        println!("{cols}x{rows} cells, {} written", cells.len());
-        for (name, taken, bytes) in [
-            ("12 B record + 4 B background", narrow, 16),
-            ("16 B padded + 4 B background", wide, 20),
-            ("16 B record carrying the bg ", one, 16),
-        ] {
-            println!(
-                "  {name}: {taken:?}, {} KiB per screen, {:.2} ns/cell",
-                cells.len() * bytes / 1024,
-                taken.as_nanos() as f64 / cells.len() as f64,
-            );
-        }
-    }
-
-    /// Not a gate — run it by hand:
-    /// `cargo test -p alacritree --release -- --ignored --nocapture report_gpu_frame`
-    ///
-    /// The frame `report_paint_cost` measures, routed through `[ui] gpu_grid`.
-    /// There is no GL context here, so the callback is emitted and never
-    /// invoked: what this reports is the CPU half, which is the half that runs
-    /// on the UI thread ahead of the next keystroke.
-    #[test]
-    #[ignore = "timing harness, not an assertion"]
-    fn report_gpu_frame() {
-        #[cfg(windows)]
-        crate::harden_dll_search_path();
-
-        let mut config = Config::default();
-        config.ui.gpu_grid = true;
-        let gpu = crate::grid_gl::GpuGrid::new();
-
-        for screen in [Vec2::new(1280.0, 720.0), Vec2::new(2560.0, 1440.0)] {
-            let ctx = egui::Context::default();
-            let (mut session, _dir) = headless_session(&ctx, &config);
-            let mut caches = Caches::new();
-            paint_one_frame_on(&ctx, &mut session, &config, &mut caches, screen, Some(&gpu));
-            let (cols, rows) = (session.size.columns, session.size.screen_lines);
-            {
-                let mut term = session.term.lock();
-                term.resize(TermSize::new(cols, rows));
-                Processor::<StdSyncHandler>::new().advance(&mut *term, &dense_screen(cols, rows));
-            }
-            for _ in 0..10 {
-                paint_one_frame_on(&ctx, &mut session, &config, &mut caches, screen, Some(&gpu));
-            }
-
-            let iterations = 60;
-            let start = std::time::Instant::now();
-            let (mut build, mut tessellate) =
-                (std::time::Duration::ZERO, std::time::Duration::ZERO);
-            let mut cost = FrameCost::default();
-            for _ in 0..iterations {
-                cost = std::hint::black_box(paint_one_frame_on(
-                    &ctx,
-                    &mut session,
-                    &config,
-                    &mut caches,
-                    screen,
-                    Some(&gpu),
-                ));
-                build += cost.build;
-                tessellate += cost.tessellate;
-            }
-            let each = start.elapsed() / iterations;
-            let (build, tessellate) = (build / iterations, tessellate / iterations);
-            let uploaded = {
-                let state = gpu.state.lock().expect("grid state");
-                state.instances.row_bytes(0, rows).len()
-            };
-
-            println!(
-                "{}x{} logical px = {cols}x{rows} cells: {each:?} per frame",
-                screen.x, screen.y,
-            );
-            println!(
-                "  build {build:?} + tessellate {tessellate:?}, {} vertices to epaint",
-                cost.vertices,
-            );
-            println!("  {} KiB of cell records", uploaded / 1024);
-        }
-    }
-
-    /// Not a gate — run it by hand:
-    /// `cargo test -p alacritree --release -- --ignored --nocapture report_fill_variants`
-    ///
-    /// Four ways to write the same 105k vertices, from the galley walk the
-    /// mesh path starts with down to unchecked stores out of a per-character
-    /// template.  The spread between them is the whole size of the prize a
-    /// hand-vectorized vertex build could compete for.
-    #[test]
-    #[ignore = "timing harness, not an assertion"]
-    fn report_fill_variants() {
-        #[cfg(windows)]
-        crate::harden_dll_search_path();
-
-        use egui::emath::GuiRounding as _;
-        use egui::epaint::{Mesh, Vertex};
-
-        let config = Config::default();
-        let screen = Vec2::new(2560.0, 1440.0);
-        let ctx = egui::Context::default();
-        let (mut session, _dir) = headless_session(&ctx, &config);
-        let mut caches = Caches::new();
-        paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
-        let (cols, rows) = (session.size.columns, session.size.screen_lines);
-        {
-            let mut term = session.term.lock();
-            term.resize(TermSize::new(cols, rows));
-            Processor::<StdSyncHandler>::new().advance(&mut *term, &dense_screen(cols, rows));
-        }
-        for _ in 0..10 {
-            paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
-        }
-
-        let out = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, screen)),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    show(
-                        ui,
-                        &mut session,
-                        &config,
-                        false,
-                        &mut caches.builtin,
-                        &mut caches.ime,
-                        &mut caches.colors,
-                        &mut caches.glyphs,
-                        &mut caches.snapshot,
-                        None,
-                    );
-                });
-            },
-        );
-        let ppp = out.pixels_per_point;
-        let tex = ctx.fonts(|f| f.font_image_size());
-        let inv = Vec2::new(1.0 / tex[0] as f32, 1.0 / tex[1] as f32);
-
-        let glyphs: Vec<_> = out
-            .shapes
-            .iter()
-            .filter_map(|cs| match &cs.shape {
-                egui::Shape::Text(t) => Some((
-                    t.pos.round_to_pixels(ppp),
-                    t.galley.clone(),
-                    t.override_text_color.unwrap_or(Color32::WHITE),
-                )),
-                _ => None,
-            })
-            .collect();
-
-        // Every glyph the frame draws, flattened to a 4-vertex template plus
-        // where it goes and what colour it takes.
-        let mut quads: Vec<([Vertex; 4], Pos2, Color32)> = Vec::new();
-        let mut odd = 0usize;
-        for (pos, galley, color) in &glyphs {
-            for row in &galley.rows {
-                let v = &row.visuals.mesh.vertices;
-                if v.len() != 4 || row.visuals.mesh.indices.len() != 6 {
-                    odd += 1;
-                    continue;
-                }
-                let template = std::array::from_fn(|i| Vertex {
-                    pos: v[i].pos,
-                    uv: (v[i].uv.to_vec2() * inv).to_pos2(),
-                    color: Color32::PLACEHOLDER,
-                });
-                quads.push((template, *pos, *color));
-            }
-        }
-        let indices: Vec<u32> = {
-            let (_, galley, _) = &glyphs[0];
-            galley.rows[0].visuals.mesh.indices.clone()
-        };
-
-        let iterations = 60u32;
-        fn time(iterations: u32, mut body: impl FnMut()) -> std::time::Duration {
-            for _ in 0..5 {
-                body();
-            }
-            let start = std::time::Instant::now();
-            for _ in 0..iterations {
-                body();
-            }
-            start.elapsed() / iterations
-        }
-
-        let mut mesh = Mesh::default();
-        let walk = time(iterations, || {
-            mesh.vertices.clear();
-            mesh.indices.clear();
-            for (pos, galley, color) in &glyphs {
-                for row in &galley.rows {
-                    let base = mesh.vertices.len() as u32;
-                    mesh.indices.extend(row.visuals.mesh.indices.iter().map(|k| k + base));
-                    mesh.vertices.extend(row.visuals.mesh.vertices.iter().map(|v| Vertex {
-                        pos: *pos + v.pos.to_vec2(),
-                        uv: (v.uv.to_vec2() * inv).to_pos2(),
-                        color: *color,
-                    }));
-                }
-            }
-            std::hint::black_box(mesh.vertices.len());
-        });
-
-        let templated = time(iterations, || {
-            mesh.vertices.clear();
-            mesh.indices.clear();
-            mesh.vertices.reserve(quads.len() * 4);
-            mesh.indices.reserve(quads.len() * 6);
-            for (template, pos, color) in &quads {
-                let base = mesh.vertices.len() as u32;
-                mesh.indices.extend(indices.iter().map(|k| k + base));
-                let d = pos.to_vec2();
-                for v in template {
-                    mesh.vertices.push(Vertex { pos: v.pos + d, uv: v.uv, color: *color });
-                }
-            }
-            std::hint::black_box(mesh.vertices.len());
-        });
-
-        let unchecked = time(iterations, || {
-            mesh.vertices.clear();
-            mesh.indices.clear();
-            mesh.vertices.reserve(quads.len() * 4);
-            mesh.indices.reserve(quads.len() * 6);
-            // SAFETY: both buffers were reserved for exactly the count written
-            // below, and every element is written before the length is set.
-            unsafe {
-                let vp = mesh.vertices.as_mut_ptr();
-                let ip = mesh.indices.as_mut_ptr();
-                for (n, (template, pos, color)) in quads.iter().enumerate() {
-                    let base = (n * 4) as u32;
-                    for (k, &i) in indices.iter().enumerate() {
-                        ip.add(n * 6 + k).write(i + base);
-                    }
-                    let d = pos.to_vec2();
-                    for (k, v) in template.iter().enumerate() {
-                        vp.add(n * 4 + k).write(Vertex { pos: v.pos + d, uv: v.uv, color: *color });
-                    }
-                }
-                mesh.vertices.set_len(quads.len() * 4);
-                mesh.indices.set_len(quads.len() * 6);
-            }
-            std::hint::black_box(mesh.vertices.len());
-        });
-
-        // The floor: the same bytes moved with no per-vertex arithmetic at all.
-        let flat: Vec<Vertex> = mesh.vertices.clone();
-        let copied = time(iterations, || {
-            mesh.vertices.clear();
-            mesh.vertices.extend_from_slice(&flat);
-            std::hint::black_box(mesh.vertices.len());
-        });
-
-        println!("{} quads, {odd} rows skipped as not-a-quad", quads.len());
-        println!("  walk galleys, iterator extend : {walk:?}");
-        println!("  per-char template, push       : {templated:?}");
-        println!("  per-char template, unchecked  : {unchecked:?}");
-        println!("  memcpy of the finished buffer : {copied:?}");
-    }
-
-    /// Not a gate — run it by hand:
-    /// `cargo test -p alacritree --release -- --ignored --nocapture report_mesh_frame`
-    ///
-    /// The same frame `report_paint_cost` measures, painted as one
-    /// `Shape::Mesh` built from a character-indexed galley table instead of one
-    /// `TextShape` per glyph off a hashed cache.  Geometry follows `show`, so
-    /// the two numbers are comparable.  Emoji and box-drawing glyphs are left
-    /// out: they carry their own textures and cannot join a single mesh.
-    #[test]
-    #[ignore = "timing harness, not an assertion"]
-    fn report_mesh_frame() {
-        #[cfg(windows)]
-        crate::harden_dll_search_path();
-
-        use std::sync::Arc;
-
-        use egui::emath::GuiRounding as _;
-        use egui::epaint::{Mesh, Vertex};
-
-        let config = Config::default();
-        for screen in [Vec2::new(1280.0, 720.0), Vec2::new(2560.0, 1440.0)] {
-            let ctx = egui::Context::default();
-            let (mut session, _dir) = headless_session(&ctx, &config);
-            let mut caches = Caches::new();
-            paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
-            let (cols, rows) = (session.size.columns, session.size.screen_lines);
-            {
-                let mut term = session.term.lock();
-                term.resize(TermSize::new(cols, rows));
-                Processor::<StdSyncHandler>::new().advance(&mut *term, &dense_screen(cols, rows));
-            }
-
-            let mut table: Vec<Option<Arc<egui::Galley>>> = vec![None; 128 * 4];
-            let mut held: Arc<Mesh> = Arc::new(Mesh::default());
-            let mut snapshot = GridSnapshot::new();
-            let mut glyph_cache = GlyphCache::new();
-            let mut reused = 0u32;
-
-            let frame = |ctx: &egui::Context,
-                         session: &mut Session,
-                         snapshot: &mut GridSnapshot,
-                         glyph_cache: &mut GlyphCache,
-                         table: &mut Vec<Option<Arc<egui::Galley>>>,
-                         held: &mut Arc<Mesh>,
-                         reused: &mut u32|
-             -> FrameCost {
-                let raw = egui::RawInput {
-                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, screen)),
-                    ..Default::default()
-                };
-                let started = std::time::Instant::now();
-                let out = ctx.run(raw, |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        let font_id = FontId::monospace(config.font.egui_size());
-                        let (cell_w_pt, cell_h_pt) = ui
-                            .ctx()
-                            .fonts(|f| (f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
-                        let ppp = ui.ctx().pixels_per_point();
-                        let cell_w = ((cell_w_pt * ppp).floor() + config.font.offset.x as f32)
-                            .max(1.0)
-                            / ppp;
-                        let cell_h = ((cell_h_pt * ppp).floor() + config.font.offset.y as f32)
-                            .max(1.0)
-                            / ppp;
-                        let (pad_x, pad_y) = (config.window.padding_x, config.window.padding_y);
-                        let avail = ui.available_size();
-                        let cols = ((avail.x - 2.0 * pad_x).max(cell_w) / cell_w).floor().max(1.0)
-                            as usize;
-                        let rows = ((avail.y - 2.0 * pad_y).max(cell_h) / cell_h).floor().max(1.0)
-                            as usize;
-                        session.resize(TermSize::new(cols, rows), (cell_w, cell_h));
-                        if pad_x > 0.0 || pad_y > 0.0 {
-                            ui.add_space(pad_y);
-                        }
-                        let (rect, _response) = ui.allocate_exact_size(
-                            Vec2::new(cols as f32 * cell_w + 2.0 * pad_x, rows as f32 * cell_h),
-                            Sense::hover(),
-                        );
-                        let snap = |v: f32| (v * ppp).round() / ppp;
-                        let rect = Rect::from_min_size(
-                            Pos2::new(snap(rect.min.x + pad_x), snap(rect.min.y)),
-                            Vec2::new(cols as f32 * cell_w, rows as f32 * cell_h),
-                        );
-                        let painter = ui.painter_at(rect);
-
-                        glyph_cache.begin_frame(ui.ctx());
-                        snapshot.capture(
-                            &mut session.term.lock(),
-                            &config,
-                            session.id,
-                            None,
-                            false,
-                        );
-
-                        let tex = ui.ctx().fonts(|f| f.font_image_size());
-                        let inv = Vec2::new(1.0 / tex[0] as f32, 1.0 / tex[1] as f32);
-                        let size = config.font.egui_size();
-                        let default_bg = background(&config.palette);
-
-                        if Arc::get_mut(held).is_none() {
-                            *held = Arc::new(Mesh::default());
-                        } else {
-                            *reused += 1;
-                        }
-                        let mesh = Arc::get_mut(held).expect("sole owner");
-                        mesh.vertices.clear();
-                        mesh.indices.clear();
-
-                        for (text, run) in snapshot.runs() {
-                            if run.bg != default_bg || run.selected {
-                                mesh.add_colored_rect(
-                                    run_rect(rect, text, run, cell_w, cell_h),
-                                    run.bg,
-                                );
-                            }
-                        }
-                        for (text, run) in snapshot.runs() {
-                            if run.flags.contains(Flags::HIDDEN) {
-                                continue;
-                            }
-                            let face = Face::new(
-                                run.flags.contains(Flags::BOLD),
-                                run.flags.contains(Flags::ITALIC),
-                            );
-                            let x = rect.min.x + run.start_col as f32 * cell_w;
-                            let y = rect.min.y + run.row as f32 * cell_h;
-                            for (i, ch) in text.chars().enumerate() {
-                                if ch == ' ' {
-                                    continue;
-                                }
-                                let slot = face as usize * 128 + (ch as usize & 127);
-                                if (ch as u32) >= 128 || table[slot].is_none() {
-                                    let galley = glyph_cache.get(ui.ctx(), ch, face, size);
-                                    table[slot] = Some(galley);
-                                }
-                                let galley = table[slot].as_ref().expect("filled above");
-                                let pos = Pos2::new(x + i as f32 * cell_w, y).round_to_pixels(ppp);
-                                for grow in &galley.rows {
-                                    let base = mesh.vertices.len() as u32;
-                                    mesh.indices
-                                        .extend(grow.visuals.mesh.indices.iter().map(|k| k + base));
-                                    mesh.vertices.extend(grow.visuals.mesh.vertices.iter().map(
-                                        |v| Vertex {
-                                            pos: pos + v.pos.to_vec2(),
-                                            uv: (v.uv.to_vec2() * inv).to_pos2(),
-                                            color: run.fg,
-                                        },
-                                    ));
-                                }
-                            }
-                        }
-                        painter.add(egui::Shape::Mesh(held.clone()));
-                    });
-                });
-                let build = started.elapsed();
-                let ppp = out.pixels_per_point;
-                let started = std::time::Instant::now();
-                let primitives = ctx.tessellate(out.shapes, ppp);
-                let tessellate = started.elapsed();
-                let vertices = primitives
-                    .iter()
-                    .map(|p| match &p.primitive {
-                        egui::epaint::Primitive::Mesh(mesh) => mesh.vertices.len(),
-                        _ => 0,
-                    })
-                    .sum();
-                FrameCost { build, tessellate, vertices }
-            };
-
-            for _ in 0..10 {
-                frame(
-                    &ctx,
-                    &mut session,
-                    &mut snapshot,
-                    &mut glyph_cache,
-                    &mut table,
-                    &mut held,
-                    &mut reused,
-                );
-            }
-            reused = 0;
-            let iterations = 60;
-            let start = std::time::Instant::now();
-            let (mut build, mut tessellate) =
-                (std::time::Duration::ZERO, std::time::Duration::ZERO);
-            let mut cost = FrameCost::default();
-            for _ in 0..iterations {
-                cost = std::hint::black_box(frame(
-                    &ctx,
-                    &mut session,
-                    &mut snapshot,
-                    &mut glyph_cache,
-                    &mut table,
-                    &mut held,
-                    &mut reused,
-                ));
-                build += cost.build;
-                tessellate += cost.tessellate;
-            }
-            let each = start.elapsed() / iterations;
-            let (build, tessellate) = (build / iterations, tessellate / iterations);
-
-            println!(
-                "{}x{} logical px = {cols}x{rows} cells: {each:?} per frame (build {build:?} + \
-                 tessellate {tessellate:?}), {} vertices, mesh buffer reused \
-                 {reused}/{iterations} frames",
-                screen.x, screen.y, cost.vertices,
-            );
-        }
-    }
-
-    /// Not a gate — run it by hand:
-    /// `cargo test -p alacritree --release -- --ignored --nocapture report_lookup_shapes`
-    ///
-    /// Three ways to reach a cached galley for every non-blank cell on screen:
-    /// the hashed key the cache uses today, the same probe without the `Arc`
-    /// clone the caller does not need once glyphs are copied rather than
-    /// referenced, and a table indexed straight by character.
-    #[test]
-    #[ignore = "timing harness, not an assertion"]
-    fn report_lookup_shapes() {
-        #[cfg(windows)]
-        crate::harden_dll_search_path();
-
-        use std::collections::HashMap;
-        use std::sync::Arc;
-
-        let config = Config::default();
-        let screen = Vec2::new(2560.0, 1440.0);
-        let ctx = egui::Context::default();
-        let (mut session, _dir) = headless_session(&ctx, &config);
-        let mut caches = Caches::new();
-        paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
-        let (cols, rows) = (session.size.columns, session.size.screen_lines);
-        {
-            let mut term = session.term.lock();
-            term.resize(TermSize::new(cols, rows));
-            Processor::<StdSyncHandler>::new().advance(&mut *term, &dense_screen(cols, rows));
-        }
-        for _ in 0..10 {
-            paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
-        }
-
-        let mut snapshot = GridSnapshot::new();
-        {
-            let mut term = session.term.lock();
-            snapshot.capture(&mut term, &config, 0, None, false);
-        }
-
-        // Every (char, face) the frame asks for, in paint order.
-        let mut asks: Vec<(char, Face)> = Vec::new();
-        for (text, run) in snapshot.runs() {
-            let face =
-                Face::new(run.flags.contains(Flags::BOLD), run.flags.contains(Flags::ITALIC));
-            for ch in text.chars() {
-                if ch != ' ' {
-                    asks.push((ch, face));
-                }
-            }
-        }
-
-        let size = config.font.size as f32;
-        let mut hashed: HashMap<(char, Face), Arc<egui::Galley>> = HashMap::new();
-        let mut direct: Vec<Option<Arc<egui::Galley>>> = vec![None; 128 * 4];
-        for &(ch, face) in &asks {
-            let galley = caches.glyphs.get(&ctx, ch, face, size);
-            hashed.insert((ch, face), galley.clone());
-            if (ch as u32) < 128 {
-                direct[face as usize * 128 + ch as usize] = Some(galley);
-            }
-        }
-
-        let iterations = 60u32;
-        fn time(iterations: u32, mut body: impl FnMut()) -> std::time::Duration {
-            for _ in 0..5 {
-                body();
-            }
-            let start = std::time::Instant::now();
-            for _ in 0..iterations {
-                body();
-            }
-            start.elapsed() / iterations
-        }
-
-        let cloned = time(iterations, || {
-            for &(ch, face) in &asks {
-                std::hint::black_box(hashed.get(&(ch, face)).cloned());
-            }
-        });
-        let borrowed = time(iterations, || {
-            for &(ch, face) in &asks {
-                std::hint::black_box(hashed.get(&(ch, face)).map(|g| g.rows.len()));
-            }
-        });
-        let indexed = time(iterations, || {
-            for &(ch, face) in &asks {
-                let slot = &direct[face as usize * 128 + (ch as usize & 127)];
-                std::hint::black_box(slot.as_ref().map(|g| g.rows.len()));
-            }
-        });
-
-        println!("{} lookups per frame", asks.len());
-        println!("  hashed key, Arc clone   : {cloned:?}");
-        println!("  hashed key, borrow only : {borrowed:?}");
-        println!("  table indexed by char   : {indexed:?}");
-    }
-
-    /// Not a gate — run it by hand:
-    /// `cargo test -p alacritree --release -- --ignored --nocapture report_build_breakdown`
-    ///
-    /// Splits the build phase into the three things it does per frame: read
-    /// the grid under the terminal lock, look a galley up per glyph, and emit
-    /// a shape per glyph.  Which of them dominates decides whether the next
-    /// move is a different data structure or a different paint path.
-    #[test]
-    #[ignore = "timing harness, not an assertion"]
-    fn report_build_breakdown() {
-        #[cfg(windows)]
-        crate::harden_dll_search_path();
-
-        let config = Config::default();
-        let screen = Vec2::new(2560.0, 1440.0);
-        let ctx = egui::Context::default();
-        let (mut session, _dir) = headless_session(&ctx, &config);
-        let mut caches = Caches::new();
-        paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
-        let (cols, rows) = (session.size.columns, session.size.screen_lines);
-        let feed = dense_screen(cols, rows);
-        let mut parser = Processor::<StdSyncHandler>::new();
-        {
-            let mut term = session.term.lock();
-            term.resize(TermSize::new(cols, rows));
-            parser.advance(&mut *term, &feed);
-        }
-        for _ in 0..10 {
-            paint_one_frame(&ctx, &mut session, &config, &mut caches, screen);
-        }
-
-        let iterations = 60u32;
-        fn time(iterations: u32, mut body: impl FnMut()) -> std::time::Duration {
-            for _ in 0..5 {
-                body();
-            }
-            let start = std::time::Instant::now();
-            for _ in 0..iterations {
-                body();
-            }
-            start.elapsed() / iterations
-        }
-
-        // Rewriting the screen between captures is what makes this a capture
-        // at all: `capture` drains the damage it is given, so a second one
-        // against an untouched terminal walks the cursor line and stops.  The
-        // rewrite is identical every time and stays outside the clock —
-        // damage is marked per line written, not per line changed.
-        let capture = {
-            let mut snapshot = GridSnapshot::new();
-            let mut total = std::time::Duration::ZERO;
-            for i in 0..iterations + 5 {
-                {
-                    let mut term = session.term.lock();
-                    parser.advance(&mut *term, &feed);
-                }
-                let started = std::time::Instant::now();
-                {
-                    let mut term = session.term.lock();
-                    snapshot.capture(&mut term, &config, 0, None, false);
-                    std::hint::black_box(snapshot.runs().count());
-                }
-                if i >= 5 {
-                    total += started.elapsed();
-                }
-            }
-            total / iterations
-        };
-
-        let mut snapshot = GridSnapshot::new();
-        {
-            let mut term = session.term.lock();
-            snapshot.capture(&mut term, &config, 0, None, false);
-        }
-        let cells: usize = snapshot.runs().map(|(text, _)| text.chars().count()).sum();
-
-        let font_size = config.font.size as f32;
-        let lookup = {
-            let glyphs = &mut caches.glyphs;
-            time(iterations, || {
-                for (text, run) in snapshot.runs() {
-                    let face = Face::new(
-                        run.flags.contains(Flags::BOLD),
-                        run.flags.contains(Flags::ITALIC),
-                    );
-                    for ch in text.chars() {
-                        if ch == ' ' {
-                            continue;
-                        }
-                        std::hint::black_box(glyphs.get(&ctx, ch, face, font_size));
-                    }
-                }
-            })
-        };
-
-        // The same walk with the galley lookup removed, so the loop overhead
-        // the lookup number carries can be subtracted out.
-        let walk = time(iterations, || {
-            for (text, run) in snapshot.runs() {
-                let face =
-                    Face::new(run.flags.contains(Flags::BOLD), run.flags.contains(Flags::ITALIC));
-                std::hint::black_box(face);
-                for ch in text.chars() {
-                    std::hint::black_box(ch);
-                }
-            }
-        });
-
-        println!("{cols}x{rows} cells, {} runs, {cells} non-blank cells", snapshot.runs().count());
-        println!("  capture the grid under the lock : {capture:?}");
-        println!("  walk runs and chars, no lookup  : {walk:?}");
-        println!("  same walk with GlyphCache::get  : {lookup:?}");
-        println!("  net galley lookup               : {:?}", lookup.saturating_sub(walk));
     }
 
     /// Full-screen apps hide the cursor with DECTCEM while they repaint, then
