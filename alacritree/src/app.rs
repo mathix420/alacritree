@@ -8795,7 +8795,7 @@ impl eframe::App for AlacritreeApp {
         self.poll_project_refreshes();
         // Unconditional: either sidebar can be hidden, and a drain hung off one
         // of them would strand every entry the other polled.
-        self.pr_cache.drain_completed();
+        self.pr_cache.drain_completed(ctx);
         self.poll_pending_deletes(ctx);
         self.poll_pending_creates(ctx);
         // Poll first, then check `failed`: a panicked job's `poll` returns

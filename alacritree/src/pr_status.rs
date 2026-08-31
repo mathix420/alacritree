@@ -15,7 +15,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use crate::projects::Worktree;
-use crate::{command_ext, jobs, wsl};
+use crate::{command_ext, jobs, pr_query, wsl};
 
 /// Re-query at most this often.  PR base branches rarely change, and a stale
 /// answer just falls back to the previous diff target — not worth hammering
@@ -51,6 +51,14 @@ fn effective_cap(configured: Option<usize>, ceiling: usize) -> usize {
 
 pub struct PrCache {
     entries: HashMap<PathBuf, Entry>,
+    /// Requests in flight.  `in_flight` counts these rather than branches:
+    /// the cap exists to bound `gh` processes, and one batch is one process
+    /// however many branches it names.
+    batches: Vec<Batch>,
+    /// Entries that asked for a lookup this frame, grouped and spawned by the
+    /// next `drain_completed`.  Batching needs a whole frame's worth of due
+    /// entries before it can group them, which one `poll` call cannot see.
+    due: Vec<Member>,
     in_flight: usize,
     concurrency: usize,
     generation: u64,
@@ -74,31 +82,40 @@ struct Entry {
     branch: Option<String>,
     info: Option<PrInfo>,
     queried_at: Option<Duration>,
-    /// Set while a lookup is running on the pool.  `poll` reads this to
-    /// avoid starting a competing lookup; `drain_completed` is what banks
-    /// the result and clears it.
-    pending: Option<Pending>,
+    /// Set from the moment this entry joins the due list until its answer is
+    /// banked.  `should_spawn` reads it to avoid asking twice for one badge,
+    /// so it has to cover the queued frame as well as the running one.
+    pending: bool,
     /// A refresh landed while `pending` was already occupied.  The drain
     /// leaves `queried_at` cleared instead of stamping the fresh lookup's
     /// result as current, so the next poll re-queries.
     refresh_requested: bool,
 }
 
-/// A lookup in flight, and when it started.  A job that never reports — a
-/// panic, or a `gh` call that hangs — would otherwise occupy its concurrency
-/// slot forever: a panicked one reports through `Job::failed` immediately,
-/// while a genuinely slow one is only backed off once it has been pending
-/// past the TTL.
-struct Pending {
-    job: jobs::Job<LookupResult>,
-    started: Duration,
+/// A worktree and the branch its badge is keyed to.  Carried through
+/// grouping and back out through the drain, so a batched answer can find
+/// every entry that asked for it.
+#[derive(Debug, Clone, PartialEq)]
+struct Member {
+    path: PathBuf,
+    branch: String,
 }
 
-#[derive(Debug, PartialEq)]
-struct LookupResult {
-    branch: String,
-    info: Option<PrInfo>,
+/// One request in flight, and every entry waiting on it.  A job that never
+/// reports would otherwise hold its concurrency slot forever: a panicked one
+/// reports through `Job::failed` immediately, a merely slow one is backed off
+/// once it has been in flight past the TTL.
+struct Batch {
+    job: jobs::Job<BatchResult>,
+    started: Duration,
+    members: Vec<Member>,
 }
+
+/// What one request reports back: an answer per worktree it covered.  Keyed by
+/// path rather than by branch, because two repositories in one burst can hold
+/// the same branch name.  `None` means the request covered that path and found
+/// no PR, which is a real answer.
+type BatchResult = HashMap<PathBuf, Option<PrInfo>>;
 
 impl PrCache {
     pub fn new() -> Self {
@@ -108,6 +125,8 @@ impl PrCache {
     pub fn with_clock(clock: impl Fn() -> Duration + Send + 'static) -> Self {
         Self {
             entries: HashMap::new(),
+            batches: Vec::new(),
+            due: Vec::new(),
             in_flight: 0,
             concurrency: effective_cap(None, jobs::pool().background_ceiling()),
             generation: 0,
@@ -156,13 +175,24 @@ impl PrCache {
             entry.branch.as_deref(),
             Some(branch),
             entry.queried_at,
-            entry.pending.is_some(),
+            entry.pending,
             now,
         );
 
-        if spawn && may_spawn(self.concurrency, self.in_flight) {
-            let job = spawn_lookup(path.to_path_buf(), branch.to_string(), ctx.clone());
-            self.bank_pending(path.to_path_buf(), branch, job);
+        if spawn {
+            // Clear stale data immediately on branch switch so we don't show
+            // a PR base that belongs to a different branch.
+            if should_invalidate(entry.branch.as_deref(), Some(branch)) {
+                entry.info = None;
+            }
+            entry.branch = Some(branch.to_string());
+            entry.pending = true;
+            self.due.push(Member { path: path.to_path_buf(), branch: branch.to_string() });
+            // The frame that queues a lookup is not the frame that starts one
+            // — the next drain is — and egui paints on demand.  Without asking
+            // for that frame the request waits on the user's next input
+            // instead of on the TTL.
+            ctx.request_repaint();
         }
 
         self.entries.get(path).and_then(|entry| entry.info.clone())
@@ -184,40 +214,92 @@ impl PrCache {
         self.concurrency = effective_cap(configured, jobs::pool().background_ceiling());
     }
 
-    /// Bank every finished lookup and free its slot.  Runs once a frame ahead
-    /// of every poll site rather than inside `poll`: an entry whose project
-    /// collapsed mid-lookup is never polled again, and a slot it still held
-    /// would never come back.
-    pub fn drain_completed(&mut self) {
+    /// Bank every finished request and free its slot, then turn the frame's
+    /// due list into new requests.  Runs once a frame ahead of every poll
+    /// site rather than inside `poll`: an entry whose project collapsed
+    /// mid-lookup is never polled again, and a slot it still held would never
+    /// come back.
+    pub fn drain_completed(&mut self, ctx: &egui::Context) {
         let now = self.now();
-        for entry in self.entries.values_mut() {
-            let Some(pending) = entry.pending.as_ref() else {
+        let mut banked = false;
+        let mut still_running = Vec::new();
+        for batch in std::mem::take(&mut self.batches) {
+            if let Some(found) = batch.job.poll() {
+                for m in &batch.members {
+                    self.settle(m, found.get(&m.path).cloned().flatten(), now);
+                }
+                banked = true;
+            } else if batch.job.failed() || now.saturating_sub(batch.started) > TTL {
+                // A request that never reports has no answer to bank, but its
+                // members must still be stamped: leaving them due re-spawns a
+                // `gh` process every frame for as long as the failure lasts.
+                for m in &batch.members {
+                    self.back_off(m, now);
+                }
+            } else {
+                still_running.push(batch);
                 continue;
-            };
-            if let Some(result) = pending.job.poll() {
-                entry.branch = Some(result.branch);
-                entry.info = result.info;
-                // A refresh that arrived mid-lookup wants the *next* answer,
-                // so leave the entry stale and let the next poll re-query.
-                entry.queried_at = if entry.refresh_requested { None } else { Some(now) };
-                entry.refresh_requested = false;
-                entry.pending = None;
-                self.in_flight = self.in_flight.saturating_sub(1);
-                self.generation = self.generation.wrapping_add(1);
-            } else if pending.job.failed() || now.saturating_sub(pending.started) > TTL {
-                // A job that never reports has no answer to bank.  A panic
-                // reports through `failed` on the very poll above, so it
-                // backs off immediately; a job that is merely slow only backs
-                // off once it has been pending past the TTL.  Either way this
-                // must fire even when a refresh was requested mid-flight, or
-                // the entry re-spawns a lookup and a `gh` process on every
-                // frame for as long as the failure lasts.
-                entry.queried_at = Some(now);
-                entry.pending = None;
-                entry.refresh_requested = false;
-                self.in_flight = self.in_flight.saturating_sub(1);
             }
+            self.in_flight = self.in_flight.saturating_sub(1);
         }
+        self.batches = still_running;
+        if banked {
+            self.generation = self.generation.wrapping_add(1);
+        }
+        self.spawn_due(ctx);
+    }
+
+    /// Record one member's answer.  `None` means the request covered this
+    /// branch and found no PR, which is a real answer and gets stamped.
+    fn settle(&mut self, m: &Member, info: Option<PrInfo>, now: Duration) {
+        let entry = self.entries.entry(m.path.clone()).or_default();
+        entry.branch = Some(m.branch.clone());
+        entry.info = info;
+        // A refresh that arrived mid-request wants the *next* answer, so
+        // leave the entry stale and let the next poll re-query.
+        entry.queried_at = if entry.refresh_requested { None } else { Some(now) };
+        entry.refresh_requested = false;
+        entry.pending = false;
+    }
+
+    /// Stamp a member whose request produced nothing, keeping its previous
+    /// answer on screen and holding it off for a TTL.
+    fn back_off(&mut self, m: &Member, now: Duration) {
+        let entry = self.entries.entry(m.path.clone()).or_default();
+        entry.queried_at = Some(now);
+        entry.refresh_requested = false;
+        entry.pending = false;
+    }
+
+    /// Hand the frame's due list to one worker.  Grouping needs `git2` to read
+    /// each path's `origin`, which is why nothing here inspects the list: the
+    /// frame only decides whether there is room to ask.
+    ///
+    /// Over the cap, the list is dropped and every member's `pending` flag
+    /// cleared, so they fall due again next frame rather than being lost.
+    fn spawn_due(&mut self, ctx: &egui::Context) {
+        let due = std::mem::take(&mut self.due);
+        if due.is_empty() {
+            return;
+        }
+        if !may_spawn(self.concurrency, self.in_flight) {
+            for m in &due {
+                if let Some(entry) = self.entries.get_mut(&m.path) {
+                    entry.pending = false;
+                }
+            }
+            return;
+        }
+        let members = due.clone();
+        let ctx = ctx.clone();
+        let job = jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
+            // Fires on a panicking unwind too, since it's a local: the drain
+            // that frees this slot only runs on a frame, so an exit without a
+            // repaint can stall polling for good.
+            let _wake = RepaintOnDrop(ctx);
+            run_due(due, blocking)
+        });
+        self.bank_batch(members, job);
     }
 
     /// Mark every entry stale.  Entries with a lookup already running also get
@@ -227,29 +309,26 @@ impl PrCache {
     pub fn invalidate_all(&mut self) {
         for entry in self.entries.values_mut() {
             entry.queried_at = None;
-            if entry.pending.is_some() {
+            if entry.pending {
                 entry.refresh_requested = true;
             }
         }
         self.generation = self.generation.wrapping_add(1);
     }
 
-    /// Record a started lookup against its entry.  The entry is keyed to the
-    /// branch being looked up rather than to the last banked answer: a worker
-    /// that dies without sending leaves nothing for the drain to key it with,
-    /// and a mismatched branch makes the entry due again on the next frame
-    /// however recently it was queried.
-    fn bank_pending(&mut self, path: PathBuf, branch: &str, job: jobs::Job<LookupResult>) {
-        let now = self.now();
-        let entry = self.entries.entry(path).or_default();
-        debug_assert!(entry.pending.is_none(), "a second lookup would strand the first's slot");
-        // Clear stale data immediately on branch switch so we don't show
-        // a PR base that belongs to a different branch.
-        if should_invalidate(entry.branch.as_deref(), Some(branch)) {
-            entry.info = None;
+    /// Record a started request against every entry it covers.  Each entry is
+    /// keyed to the branch being asked about rather than to the last banked
+    /// answer: a worker that dies without sending leaves nothing for the drain
+    /// to key it with, and a mismatched branch makes the entry due again on the
+    /// next frame however recently it was queried.
+    fn bank_batch(&mut self, members: Vec<Member>, job: jobs::Job<BatchResult>) {
+        let started = self.now();
+        for m in &members {
+            let entry = self.entries.entry(m.path.clone()).or_default();
+            entry.branch = Some(m.branch.clone());
+            entry.pending = true;
         }
-        entry.branch = Some(branch.to_string());
-        entry.pending = Some(Pending { job, started: now });
+        self.batches.push(Batch { job, started, members });
         self.in_flight += 1;
     }
 
@@ -259,8 +338,11 @@ impl PrCache {
     }
 
     #[cfg(test)]
-    fn insert_pending(&mut self, path: PathBuf, branch: &str, job: jobs::Job<LookupResult>) {
-        self.bank_pending(path, branch, job);
+    fn is_due(&self, path: &Path, branch: &str) -> bool {
+        let now = self.now();
+        self.entries.get(path).is_none_or(|e| {
+            should_spawn(e.branch.as_deref(), Some(branch), e.queried_at, e.pending, now)
+        })
     }
 }
 
@@ -342,15 +424,119 @@ pub fn effective_branch<'a>(
     }
 }
 
-fn spawn_lookup(path: PathBuf, branch: String, ctx: egui::Context) -> jobs::Job<LookupResult> {
-    jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
-        // Fires on a panicking unwind too, since it's a local: the drain that
-        // frees this lookup's concurrency slot only runs on a frame, so an
-        // exit without a repaint can stall polling for good.
-        let _wake = RepaintOnDrop(ctx);
-        let info = query_gh(&path, &branch, blocking);
-        LookupResult { branch, info }
-    })
+/// Group a whole burst and ask for each group in turn, reporting one answer
+/// per worktree.  Runs on a worker: both the `git2` reads that grouping needs
+/// and the requests themselves block.
+fn run_due(due: Vec<Member>, blocking: &jobs::Blocking) -> BatchResult {
+    let mut out = HashMap::new();
+    for group in groups(due, blocking) {
+        let found = query_group(&group, blocking);
+        for m in &group.members {
+            out.insert(m.path.clone(), found.get(&m.branch).cloned());
+        }
+    }
+    out
+}
+
+/// What one request covers: the branches asked about, and one worktree inside
+/// the repository to run `gh` from.  An absent `slug` means this group has no
+/// batched form and runs the per-branch path instead.
+struct Group {
+    /// Any worktree of this repository; `gh` resolves the repo from its cwd.
+    cwd: PathBuf,
+    slug: Option<(String, String)>,
+    members: Vec<Member>,
+}
+
+/// One request per repository, chunked, plus one per path that cannot be
+/// grouped.  Reading `origin` costs a git2 open per due path, which is why
+/// this runs on a worker rather than on the frame.
+fn groups(due: Vec<Member>, _blocking: &jobs::Blocking) -> Vec<Group> {
+    let mut by_repo: HashMap<(String, String), Group> = HashMap::new();
+    let mut ungrouped = Vec::new();
+    for m in due {
+        let slug = match wsl::classify(&m.path) {
+            wsl::Location::Windows(p) => origin_slug(&p),
+            // Nothing here can read a repository inside a distro, and its
+            // `gh` runs as a script rather than a `Command`.
+            wsl::Location::Wsl { .. } => None,
+        };
+        match slug {
+            Some((owner, name)) => by_repo
+                .entry((owner.clone(), name.clone()))
+                .or_insert_with(|| Group {
+                    cwd: m.path.clone(),
+                    slug: Some((owner, name)),
+                    members: Vec::new(),
+                })
+                .members
+                .push(m),
+            None => ungrouped.push(Group { cwd: m.path.clone(), slug: None, members: vec![m] }),
+        }
+    }
+    by_repo
+        .into_values()
+        .flat_map(|g| {
+            g.members
+                .chunks(pr_query::CHUNK)
+                .map(|c| Group { cwd: g.cwd.clone(), slug: g.slug.clone(), members: c.to_vec() })
+                .collect::<Vec<_>>()
+        })
+        .chain(ungrouped)
+        .collect()
+}
+
+/// Ask GitHub about a whole group in one request, falling back to the
+/// per-branch path when there is no batched form or the batched one cannot
+/// answer.  GraphQL can need scopes `gh pr list` does not, so an install that
+/// works today can fail here, and a project's badges must not vanish when it
+/// does.
+fn query_group(group: &Group, blocking: &jobs::Blocking) -> HashMap<String, PrInfo> {
+    let branches: Vec<String> = group.members.iter().map(|m| m.branch.clone()).collect();
+    if let Some((owner, name)) = &group.slug {
+        let query = pr_query::build(owner, name, &branches);
+        if let Some(stdout) = run_graphql(&group.cwd, &query, blocking) {
+            let parsed = pr_query::parse(&stdout, &branches, Some(owner));
+            if !parsed.is_empty() {
+                return parsed;
+            }
+        }
+    }
+    group
+        .members
+        .iter()
+        .filter_map(|m| query_gh(&m.path, &m.branch, blocking).map(|i| (m.branch.clone(), i)))
+        .collect()
+}
+
+/// Run one GraphQL document through `gh`, returning its stdout.
+///
+/// The query goes in on stdin because `-f query=` puts it in argv, and a
+/// Windows command line caps at 32,767 characters, which a full chunk of
+/// aliases can exceed.  `--input -` reads a JSON body, so a bare query piped
+/// in comes back as HTTP 502 rather than as an argument error.
+///
+/// Only ever called for a group with a slug, which means a native path: a WSL
+/// group has no slug and never reaches here.
+#[allow(clippy::disallowed_methods)] // Running `gh` is this function's job.
+fn run_graphql(cwd: &Path, query: &str, _blocking: &jobs::Blocking) -> Option<Vec<u8>> {
+    let mut child = command_ext::hidden("gh")
+        .current_dir(cwd)
+        .args(["api", "graphql", "--input", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    {
+        use std::io::Write;
+        // The scope ends before the wait below, which closes the pipe and lets
+        // `gh` see EOF; held open, the child waits for input that never ends.
+        let mut stdin = child.stdin.take()?;
+        stdin.write_all(pr_query::body(query).as_bytes()).ok()?;
+    }
+    let output = child.wait_with_output().ok()?;
+    output.status.success().then_some(output.stdout)
 }
 
 struct RepaintOnDrop(egui::Context);
@@ -394,7 +580,7 @@ fn query_gh(path: &Path, branch: &str, blocking: &jobs::Blocking) -> Option<PrIn
     const PR_LIMIT: &str = "100";
     match wsl::classify(path) {
         wsl::Location::Windows(p) => {
-            let owner = local_origin_owner(&p, blocking);
+            let owner = origin_slug(&p).map(|(owner, _)| owner);
             let output = command_ext::hidden("gh")
                 .current_dir(p)
                 .args([
@@ -443,7 +629,7 @@ exec "$2" pr list --head "$3" --state all --limit "$4" --json "$5""#;
             )
             .ok()?;
             let (origin_url, json) = split_origin_url_line(&stdout);
-            let owner = origin_url.and_then(github_owner_from_url);
+            let owner = origin_url.and_then(github_slug_from_url).map(|(owner, _)| owner);
             parse_gh_output(json, owner.as_deref())
         },
     }
@@ -461,25 +647,28 @@ fn split_origin_url_line(stdout: &[u8]) -> (Option<&str>, &[u8]) {
     (url, &stdout[end + 1..])
 }
 
-/// The GitHub owner of this worktree's `origin`, read straight from the
-/// repository config so the badge still costs exactly one `gh` process.
-fn local_origin_owner(path: &Path, _blocking: &jobs::Blocking) -> Option<String> {
+/// The GitHub `(owner, repository)` of this worktree's `origin`, read straight
+/// from the repository config.  `None` for a missing, unreadable or non-GitHub
+/// remote, which is what puts a path on the per-branch path.
+fn origin_slug(path: &Path) -> Option<(String, String)> {
     let repo = git2::Repository::open(path).ok()?;
     let remote = repo.find_remote("origin").ok()?;
-    github_owner_from_url(remote.url()?)
+    github_slug_from_url(remote.url()?)
 }
 
-/// Owner of a GitHub remote URL, for the shapes git accepts:
+/// Owner and repository of a GitHub remote URL, for the shapes git accepts:
 /// `https://github.com/owner/repo.git`, `git@github.com:owner/repo.git`, and
 /// the scp-style host alias `gh:owner/repo.git`.  `None` for anything else —
-/// the owner only breaks ties, so an unreadable remote costs nothing.
-fn github_owner_from_url(url: &str) -> Option<String> {
+/// a batched request needs both halves, and an unreadable remote just leaves
+/// the worktree on the per-branch path.
+fn github_slug_from_url(url: &str) -> Option<(String, String)> {
     let (host, path) = split_remote_url(url.trim())?;
     if !is_github_host(host) {
         return None;
     }
     let (owner, repo) = path.trim_start_matches('/').split_once('/')?;
-    (!owner.is_empty() && !repo.is_empty()).then(|| owner.to_string())
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    (!owner.is_empty() && !repo.is_empty()).then(|| (owner.to_string(), repo.to_string()))
 }
 
 /// Host and path of a remote URL, covering both the scheme form and the
@@ -582,6 +771,8 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
 
+    use crate::test_util::init_repo;
+
     /// Spawn a job that blocks until `release` fires, so a test can hold a
     /// lookup pending for as long as it needs.  Dropping `release` unblocks
     /// it too, which is what reclaims the slot once a test is done with it.
@@ -591,18 +782,28 @@ mod tests {
     /// handful of workers other test binaries in this crate poll against
     /// with their own deadlines — a pool built just for this call can never
     /// starve them, or be starved by them.
-    fn spawn_stuck_job() -> (mpsc::Sender<()>, jobs::Job<LookupResult>) {
+    fn spawn_stuck_job() -> (mpsc::Sender<()>, jobs::Job<BatchResult>) {
         let (release, gate) = mpsc::channel::<()>();
         let job = jobs::Pool::new(2).spawn(jobs::Priority::Background, move |_| {
             let _ = gate.recv();
-            LookupResult { branch: "main".to_string(), info: None }
+            BatchResult::new()
         });
         (release, job)
     }
 
-    /// Wire a stuck job into `cache` as if it had been pending since `started`,
-    /// for tests that need to force `drain_completed`'s TTL branch without
-    /// waiting out the real TTL.
+    /// Bank `job` as the request covering `(path, branch)`, the shape `poll`
+    /// and the drain produce for a single due worktree.
+    fn bank_one(cache: &mut PrCache, path: &str, branch: &str, job: jobs::Job<BatchResult>) {
+        cache.bank_batch(
+            vec![Member { path: PathBuf::from(path), branch: branch.to_string() }],
+            job,
+        );
+    }
+
+    /// Wire a stuck request into `cache` as if it had been in flight since
+    /// `started`, for tests that need to force `drain_completed`'s TTL branch
+    /// without waiting out the real TTL.  `bank_batch` stamps `started` from
+    /// the cache's own clock, so the batch is assembled by hand instead.
     fn insert_stuck_entry(
         cache: &mut PrCache,
         path: &Path,
@@ -610,22 +811,25 @@ mod tests {
         started: Duration,
     ) -> mpsc::Sender<()> {
         let (release, job) = spawn_stuck_job();
+        let member = Member { path: path.to_path_buf(), branch: branch.to_string() };
         cache.entries.insert(path.to_path_buf(), Entry {
             branch: Some(branch.to_string()),
-            pending: Some(Pending { job, started }),
+            pending: true,
             ..Default::default()
         });
+        cache.batches.push(Batch { job, started, members: vec![member] });
         cache.in_flight += 1;
         release
     }
 
-    /// Drive `drain_completed` until the entry at `path` has no lookup
-    /// pending, mirroring how the UI's frame loop drives it.
+    /// Drive `drain_completed` until the entry at `path` has no request
+    /// outstanding, mirroring how the UI's frame loop drives it.
     fn drain_until(cache: &mut PrCache, path: &Path, timeout: Duration) {
+        let ctx = egui::Context::default();
         let deadline = Instant::now() + timeout;
         loop {
-            cache.drain_completed();
-            if cache.entries.get(path).is_none_or(|e| e.pending.is_none()) {
+            cache.drain_completed(&ctx);
+            if cache.entries.get(path).is_none_or(|e| !e.pending) {
                 return;
             }
             assert!(Instant::now() < deadline, "the lookup never landed");
@@ -806,15 +1010,23 @@ mod tests {
     }
 
     #[test]
-    fn derives_the_owner_from_an_https_remote() {
-        let owner = github_owner_from_url("https://github.com/owner/repo.git");
-        assert_eq!(owner.as_deref(), Some("owner"));
+    fn derives_the_slug_from_an_https_remote() {
+        let slug = github_slug_from_url("https://github.com/owner/repo.git");
+        assert_eq!(slug, Some(("owner".to_string(), "repo".to_string())));
     }
 
     #[test]
-    fn derives_the_owner_from_an_scp_style_ssh_remote() {
-        let owner = github_owner_from_url("git@github.com:owner/repo.git");
-        assert_eq!(owner.as_deref(), Some("owner"));
+    fn derives_the_slug_from_an_scp_style_ssh_remote() {
+        let slug = github_slug_from_url("git@github.com:owner/repo.git");
+        assert_eq!(slug, Some(("owner".to_string(), "repo".to_string())));
+    }
+
+    /// A batched query names the repository, and GitHub knows it without the
+    /// `.git` suffix git's own URLs carry.
+    #[test]
+    fn the_repository_name_drops_the_git_suffix() {
+        let slug = github_slug_from_url("https://github.com/owner/repo");
+        assert_eq!(slug, Some(("owner".to_string(), "repo".to_string())));
     }
 
     /// An `~/.ssh/config` alias is how a fork checkout picks an identity, and it
@@ -822,22 +1034,22 @@ mod tests {
     /// preference to exactly the layout it exists for.
     #[test]
     fn derives_the_owner_from_an_ssh_host_alias() {
-        let owner = github_owner_from_url("gh:owner/repo.git");
-        assert_eq!(owner.as_deref(), Some("owner"));
+        let slug = github_slug_from_url("gh:owner/repo.git");
+        assert_eq!(slug.map(|(owner, _)| owner).as_deref(), Some("owner"));
     }
 
     #[test]
     fn rejects_a_non_github_remote() {
-        assert!(github_owner_from_url("https://gitlab.com/owner/repo.git").is_none());
-        assert!(github_owner_from_url("git@gitlab.com:owner/repo.git").is_none());
+        assert!(github_slug_from_url("https://gitlab.com/owner/repo.git").is_none());
+        assert!(github_slug_from_url("git@gitlab.com:owner/repo.git").is_none());
     }
 
     #[test]
     fn rejects_a_malformed_remote() {
-        assert!(github_owner_from_url("").is_none());
-        assert!(github_owner_from_url("not a url").is_none());
-        assert!(github_owner_from_url("https://github.com/owner").is_none());
-        assert!(github_owner_from_url("C:/repos/checkout").is_none());
+        assert!(github_slug_from_url("").is_none());
+        assert!(github_slug_from_url("not a url").is_none());
+        assert!(github_slug_from_url("https://github.com/owner").is_none());
+        assert!(github_slug_from_url("C:/repos/checkout").is_none());
     }
 
     #[test]
@@ -886,7 +1098,7 @@ mod tests {
             branch: Some("b".to_string()),
             info: Some(sample_info()),
             queried_at: Some(Duration::ZERO),
-            pending: None,
+            pending: false,
             refresh_requested: false,
         });
 
@@ -897,7 +1109,7 @@ mod tests {
         let entry = cache.entries.get(&path).unwrap();
         assert_eq!(entry.branch.as_deref(), Some("b"));
         assert!(entry.info.is_some(), "None poll must not clear the cached info");
-        assert!(entry.pending.is_none(), "None poll must not spawn a competing lookup");
+        assert!(!entry.pending, "None poll must not queue a competing lookup");
     }
 
     fn worktree(path: &str, branch: Option<&str>) -> Worktree {
@@ -983,7 +1195,7 @@ mod tests {
                 state: PrState::Open,
             }),
             queried_at: None,
-            pending: None,
+            pending: false,
             refresh_requested: false,
         });
 
@@ -999,11 +1211,8 @@ mod tests {
     fn drain_completed_frees_a_slot_for_an_entry_nobody_polls() {
         let mut cache = PrCache::new();
         cache.set_concurrency(Some(1));
-        let job = jobs::pool().spawn(jobs::Priority::Background, |_| LookupResult {
-            branch: "main".to_string(),
-            info: None,
-        });
-        cache.insert_pending(PathBuf::from("/repo/wt"), "main", job);
+        let job = jobs::pool().spawn(jobs::Priority::Background, |_| BatchResult::new());
+        bank_one(&mut cache, "/repo/wt", "main", job);
         assert_eq!(cache.in_flight(), 1);
 
         drain_until(&mut cache, Path::new("/repo/wt"), Duration::from_secs(5));
@@ -1019,8 +1228,8 @@ mod tests {
         let mut cache = PrCache::new();
         cache.set_concurrency(Some(1));
         let job = jobs::Pool::new(2)
-            .spawn(jobs::Priority::Background, |_| -> LookupResult { panic!("boom") });
-        cache.insert_pending(PathBuf::from("/repo/wt"), "main", job);
+            .spawn(jobs::Priority::Background, |_| -> BatchResult { panic!("boom") });
+        bank_one(&mut cache, "/repo/wt", "main", job);
         assert_eq!(cache.in_flight(), 1);
 
         drain_until(&mut cache, Path::new("/repo/wt"), Duration::from_secs(5));
@@ -1042,7 +1251,7 @@ mod tests {
         assert_eq!(cache.in_flight(), 1);
 
         *now.lock().expect("clock poisoned") = TTL + Duration::from_nanos(1);
-        cache.drain_completed();
+        cache.drain_completed(&egui::Context::default());
 
         assert_eq!(cache.in_flight(), 0);
     }
@@ -1059,7 +1268,7 @@ mod tests {
             insert_stuck_entry(&mut cache, Path::new("/repo/wt"), "main", Duration::ZERO);
 
         *now.lock().expect("clock poisoned") = TTL + Duration::from_nanos(1);
-        cache.drain_completed();
+        cache.drain_completed(&egui::Context::default());
 
         let entry = cache.entries.get(Path::new("/repo/wt")).unwrap();
         assert!(
@@ -1067,7 +1276,7 @@ mod tests {
                 entry.branch.as_deref(),
                 Some("main"),
                 entry.queried_at,
-                entry.pending.is_some(),
+                entry.pending,
                 cache.now()
             ),
             "a job just backed off by the TTL must not leave the entry due on the very next frame"
@@ -1109,14 +1318,11 @@ mod tests {
             insert_stuck_entry(&mut cache, Path::new("/repo/pending"), "main", Duration::ZERO);
 
         let before = cache.generation();
-        cache.drain_completed();
+        cache.drain_completed(&egui::Context::default());
         assert_eq!(cache.generation(), before, "a frame that banks nothing must not invalidate");
 
-        let job = jobs::pool().spawn(jobs::Priority::Background, |_| LookupResult {
-            branch: "main".to_string(),
-            info: None,
-        });
-        cache.insert_pending(PathBuf::from("/repo/banked"), "main", job);
+        let job = jobs::pool().spawn(jobs::Priority::Background, |_| BatchResult::new());
+        bank_one(&mut cache, "/repo/banked", "main", job);
         drain_until(&mut cache, Path::new("/repo/banked"), Duration::from_secs(5));
         assert!(cache.generation() > before);
     }
@@ -1128,7 +1334,7 @@ mod tests {
     fn a_refresh_during_a_lookup_survives_the_drain() {
         let mut cache = PrCache::new();
         let (release, job) = spawn_stuck_job();
-        cache.insert_pending(PathBuf::from("/repo/wt"), "main", job);
+        bank_one(&mut cache, "/repo/wt", "main", job);
 
         cache.invalidate_all();
 
@@ -1145,7 +1351,7 @@ mod tests {
                 entry.branch.as_deref(),
                 Some("main"),
                 entry.queried_at,
-                entry.pending.is_some(),
+                entry.pending,
                 cache.now()
             ),
             "a spent refresh must leave the entry eligible to spawn"
@@ -1162,7 +1368,7 @@ mod tests {
             branch: Some("main".into()),
             info: None,
             queried_at: Some(Duration::ZERO),
-            pending: None,
+            pending: false,
             refresh_requested: false,
         });
 
@@ -1226,23 +1432,23 @@ mod tests {
         assert_eq!(effective_cap(Some(0), 7), 1);
     }
 
-    /// The cap has to hold at the `poll` entry point, not just in the helper:
-    /// a cold cache polls every eligible worktree in one frame.
+    /// The cap has to hold where a due list becomes requests, not just in the
+    /// helper: a cold cache polls every eligible worktree in one frame.  A
+    /// refused member falls due again rather than being lost.
     #[test]
-    fn poll_respects_the_concurrency_cap() {
+    fn the_drain_respects_the_concurrency_cap() {
         let mut cache = PrCache::new();
         cache.set_concurrency(Some(1));
         let (_release, job) = spawn_stuck_job();
-        cache.insert_pending(PathBuf::from("/repo/busy"), "main", job);
+        bank_one(&mut cache, "/repo/busy", "main", job);
 
         let capped = Path::new("/repo/capped");
-        cache.poll(capped, Some("feature"), &egui::Context::default());
+        let ctx = egui::Context::default();
+        cache.poll(capped, Some("feature"), &ctx);
+        cache.drain_completed(&ctx);
 
-        assert!(
-            cache.entries.get(capped).is_none_or(|entry| entry.pending.is_none()),
-            "the cap must refuse the second lookup"
-        );
-        assert_eq!(cache.in_flight(), 1);
+        assert_eq!(cache.in_flight(), 1, "the cap must refuse the second request");
+        assert!(cache.is_due(capped, "feature"), "a refused member must fall due again");
     }
 
     /// The drain that frees a concurrency slot only runs on a frame, so a
@@ -1262,10 +1468,10 @@ mod tests {
         assert!(ctx.has_requested_repaint());
     }
 
-    /// `spawn_lookup` has no sender of its own any more — the pool's channel
-    /// is internal — so this drives a real job through the pool instead of
-    /// hand-rolling a thread, and checks the failure the same way production
-    /// code does: `poll` until `failed` latches.
+    /// The spawn has no sender of its own — the pool's channel is internal —
+    /// so this drives a real job through the pool instead of hand-rolling a
+    /// thread, and checks the failure the same way production code does:
+    /// `poll` until `failed` latches.
     #[test]
     fn a_panicking_worker_still_wakes_the_app_and_reports_failed() {
         let ctx = egui::Context::default();
@@ -1277,7 +1483,7 @@ mod tests {
 
         let job = {
             let ctx = ctx.clone();
-            jobs::Pool::new(2).spawn(jobs::Priority::Background, move |_| -> LookupResult {
+            jobs::Pool::new(2).spawn(jobs::Priority::Background, move |_| -> BatchResult {
                 let _wake = RepaintOnDrop(ctx);
                 panic!("worker died");
             })
@@ -1291,5 +1497,80 @@ mod tests {
         }
 
         assert!(ctx.has_requested_repaint(), "a panicking unwind still wakes the app");
+    }
+
+    /// One result covers many entries, so the drain has to fan a single map out
+    /// across every path that contributed to it.
+    #[test]
+    fn one_banked_result_reaches_every_member() {
+        let ctx = egui::Context::default();
+        let mut cache = PrCache::new();
+        let members =
+            vec![Member { path: PathBuf::from("/repo/a"), branch: "topic-a".into() }, Member {
+                path: PathBuf::from("/repo/b"),
+                branch: "topic-b".into(),
+            }];
+        let job = jobs::Pool::new(2).spawn(jobs::Priority::Background, |_| {
+            HashMap::from([
+                (
+                    PathBuf::from("/repo/a"),
+                    Some(PrInfo {
+                        number: 7,
+                        base_branch: "master".into(),
+                        url: "u".into(),
+                        state: PrState::Open,
+                    }),
+                ),
+                (PathBuf::from("/repo/b"), None),
+            ])
+        });
+        cache.bank_batch(members, job);
+        assert_eq!(cache.in_flight(), 1, "one request, not one per branch");
+
+        for _ in 0..200 {
+            cache.drain_completed(&ctx);
+            if cache.in_flight() == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(cache.in_flight(), 0, "the request never reported");
+
+        assert_eq!(cache.state(Path::new("/repo/a"), Some("topic-a")), Some(PrState::Open));
+        // Asked about and absent from the answer means no PR, not "never asked":
+        // the entry must be stamped, or it re-queries on the very next frame.
+        assert_eq!(cache.state(Path::new("/repo/b"), Some("topic-b")), None);
+        assert!(!cache.is_due(Path::new("/repo/b"), "topic-b"), "banked as no-PR, not left due");
+    }
+
+    /// A WSL worktree has no `origin` git2 can read and no `Command` to pipe a
+    /// query into.  Grouping must leave it on the per-branch path rather than
+    /// dropping it, or its badge disappears.
+    #[test]
+    fn an_ungroupable_path_still_gets_its_own_group() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let due = vec![Member { path: dir.path().to_path_buf(), branch: "topic".into() }];
+        let out = jobs::on_this_thread(|blocking| groups(due, blocking));
+        assert_eq!(out.len(), 1);
+        assert!(out[0].slug.is_none(), "a repo with no readable origin cannot be grouped");
+        assert_eq!(out[0].members.len(), 1);
+    }
+
+    /// Branches of one repository share a request; a chunk boundary splits them
+    /// into two rather than growing one request without limit.
+    #[test]
+    fn one_repository_chunks_at_the_limit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = init_repo(dir.path());
+        repo.remote("origin", "https://github.com/owner/repo.git").expect("remote");
+        let due: Vec<Member> = (0..pr_query::CHUNK + 1)
+            .map(|i| Member { path: dir.path().to_path_buf(), branch: format!("b{i}") })
+            .collect();
+
+        let out = jobs::on_this_thread(|blocking| groups(due, blocking));
+
+        assert_eq!(out.len(), 2, "one chunk over the limit is two requests");
+        assert!(out.iter().all(|g| g.slug == Some(("owner".into(), "repo".into()))));
+        assert_eq!(out.iter().map(|g| g.members.len()).sum::<usize>(), pr_query::CHUNK + 1);
     }
 }
