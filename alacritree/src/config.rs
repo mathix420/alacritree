@@ -24,7 +24,6 @@ use serde::Deserialize;
 
 use crate::bindings::{self, KeyBinding};
 use crate::path_style::PathStyle;
-use crate::pr_status::DEFAULT_CONCURRENCY;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -1018,13 +1017,11 @@ pub struct UiTheme {
     /// listed row and an exotic filesystem could make that expensive.
     pub worktree_liveness: bool,
     /// `[ui] pr_status_concurrency`: max `gh` lookups in flight at once.
-    /// Defaults to 8; clamped to ≥ 1, since a cold cache spawns one lookup
-    /// per eligible worktree in a single frame and an unbounded cap would
-    /// fork a thread and a `gh` process for every one of them at once. The
-    /// shared background pool caps concurrent work underneath this too, so
-    /// this setting can lower how many lookups run at once but not raise it
-    /// past the pool's own ceiling.
-    pub pr_status_concurrency: usize,
+    /// Unset lets the pool decide, which is one below its own background
+    /// ceiling so a lookup can never take the last slot local work needs.
+    /// A value lowers that; nothing raises it, because the pool's ceiling
+    /// binds underneath either way.
+    pub pr_status_concurrency: Option<usize>,
     pub icons: Icons,
     pub focus_outline: FocusOutline,
     /// `[ui] scrollbar`: sidebar scrollbar style, "floating" (default) or
@@ -1092,7 +1089,7 @@ impl Default for UiTheme {
             pr_status: false,
             upstream_status: false,
             worktree_liveness: true,
-            pr_status_concurrency: DEFAULT_CONCURRENCY,
+            pr_status_concurrency: None,
             icons: Icons::default(),
             focus_outline: FocusOutline::default(),
             scrollbar: ScrollbarStyle::Floating,
@@ -2157,9 +2154,10 @@ struct RawUi {
     /// `true`; the probe is one `stat` per listed row, which an exotic
     /// filesystem could make expensive.
     worktree_liveness: Option<bool>,
-    /// Max `gh` lookups in flight at once.  Defaults to 8; clamped to ≥ 1.
-    /// The shared background pool also caps concurrent work, so this can
-    /// lower that ceiling but not raise it.
+    /// Max `gh` lookups in flight at once.  Unset lets the pool decide, which
+    /// is one below its own background ceiling so a lookup can never take
+    /// the last slot local work needs.  A value lowers that; nothing raises
+    /// it, because the pool's ceiling binds underneath either way.
     pr_status_concurrency: Option<usize>,
     /// The font sidebars, tabs and dialogs are drawn with.
     font: RawUiFont,
@@ -2410,11 +2408,7 @@ impl RawConfig {
             pr_status: self.ui.pr_status.unwrap_or(false),
             upstream_status: self.ui.upstream_status.unwrap_or(false),
             worktree_liveness: self.ui.worktree_liveness.unwrap_or(true),
-            pr_status_concurrency: self
-                .ui
-                .pr_status_concurrency
-                .unwrap_or(DEFAULT_CONCURRENCY)
-                .max(1),
+            pr_status_concurrency: self.ui.pr_status_concurrency,
             icons: build_icons(self.ui.icons),
             focus_outline: FocusOutline {
                 sidebar: self.ui.focus_outline.sidebar.unwrap_or(false),
@@ -3466,14 +3460,9 @@ program = "second"
     }
 
     #[test]
-    fn pr_status_concurrency_defaults_to_eight() {
-        assert_eq!(ui_from_toml("").pr_status_concurrency, 8);
-        assert_eq!(ui_from_toml("[ui]\npr_status_concurrency = 4").pr_status_concurrency, 4);
-    }
-
-    #[test]
-    fn pr_status_concurrency_clamps_to_one() {
-        assert_eq!(ui_from_toml("[ui]\npr_status_concurrency = 0").pr_status_concurrency, 1);
+    fn pr_status_concurrency_is_unset_by_default() {
+        assert_eq!(ui_from_toml("").pr_status_concurrency, None);
+        assert_eq!(ui_from_toml("[ui]\npr_status_concurrency = 4").pr_status_concurrency, Some(4));
     }
 
     #[test]

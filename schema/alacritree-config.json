@@ -1107,7 +1107,7 @@
           "type": "boolean"
         },
         "pr_status_concurrency": {
-          "description": "Max `gh` lookups in flight at once.  Defaults to 8; clamped to ≥ 1.\nThe shared background pool also caps concurrent work, so this can\nlower that ceiling but not raise it.",
+          "description": "Max `gh` lookups in flight at once.  Unset lets the pool decide, which\nis one below its own background ceiling so a lookup can never take\nthe last slot local work needs.  A value lowers that; nothing raises\nit, because the pool's ceiling binds underneath either way.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"

@@ -40,10 +40,13 @@ pub struct PrInfo {
     pub state: PrState,
 }
 
-/// Cap a cache carries until one is configured.  Zero is not a usable cap —
-/// it admits no lookup at all — so the field cannot be left at its numeric
-/// default.
-pub const DEFAULT_CONCURRENCY: usize = 8;
+/// How many lookups may run at once: what the config asks for, never above
+/// one below the pool's background ceiling.  Reserving that slot is the
+/// pool's own trick one level down, and it keeps local background work a
+/// worker on any pool size rather than by picking a number.
+fn effective_cap(configured: Option<usize>, ceiling: usize) -> usize {
+    configured.unwrap_or(usize::MAX).min(ceiling.saturating_sub(1)).max(1)
+}
 
 pub struct PrCache {
     entries: HashMap<PathBuf, Entry>,
@@ -57,7 +60,7 @@ impl Default for PrCache {
         Self {
             entries: HashMap::new(),
             in_flight: 0,
-            concurrency: DEFAULT_CONCURRENCY,
+            concurrency: effective_cap(None, jobs::pool().background_ceiling()),
             generation: 0,
         }
     }
@@ -156,12 +159,12 @@ impl PrCache {
         self.generation
     }
 
-    /// The cap on lookups in flight at once. A cold cache is otherwise ready
-    /// to fork one `gh` process per eligible worktree in a single frame.
-    /// Clamped to one, since a zero cap would wedge the cache instead of
-    /// uncapping it.
-    pub fn set_concurrency(&mut self, cap: usize) {
-        self.concurrency = cap.max(1);
+    /// The cap on lookups in flight at once: `configured` if given, else the
+    /// pool decides.  Either way it never exceeds the pool's own background
+    /// ceiling, so a cold cache can't fork one `gh` process per eligible
+    /// worktree and starve the local work sharing the pool.
+    pub fn set_concurrency(&mut self, configured: Option<usize>) {
+        self.concurrency = effective_cap(configured, jobs::pool().background_ceiling());
     }
 
     /// Bank every finished lookup and free its slot.  Runs once a frame ahead
@@ -975,7 +978,7 @@ mod tests {
     #[test]
     fn drain_completed_frees_a_slot_for_an_entry_nobody_polls() {
         let mut cache = PrCache::new();
-        cache.set_concurrency(1);
+        cache.set_concurrency(Some(1));
         let job = jobs::pool().spawn(jobs::Priority::Background, |_| LookupResult {
             branch: "main".to_string(),
             info: None,
@@ -994,7 +997,7 @@ mod tests {
     #[test]
     fn drain_completed_frees_a_slot_immediately_when_the_job_panics() {
         let mut cache = PrCache::new();
-        cache.set_concurrency(1);
+        cache.set_concurrency(Some(1));
         let job = jobs::Pool::new(2)
             .spawn(jobs::Priority::Background, |_| -> LookupResult { panic!("boom") });
         cache.insert_pending(PathBuf::from("/repo/wt"), "main", job);
@@ -1015,7 +1018,7 @@ mod tests {
             return;
         };
         let mut cache = PrCache::new();
-        cache.set_concurrency(1);
+        cache.set_concurrency(Some(1));
         let _release = insert_stuck_entry(&mut cache, Path::new("/repo/wt"), "main", started);
         assert_eq!(cache.in_flight(), 1);
 
@@ -1141,9 +1144,36 @@ mod tests {
     #[test]
     fn set_concurrency_clamps_zero_to_one() {
         let mut cache = PrCache::new();
-        cache.set_concurrency(0);
+        cache.set_concurrency(Some(0));
         assert!(may_spawn(cache.concurrency, 0));
         assert!(!may_spawn(cache.concurrency, 1));
+    }
+
+    /// `gh` is the slowest thing the pool runs and the least urgent.  Letting it
+    /// take the last background slot puts the git status panel, which is what a
+    /// user reads to decide what to do next, behind a network call.
+    #[test]
+    fn gh_never_takes_the_last_background_slot() {
+        // A four-worker pool admits three background tasks; an eight-worker one,
+        // seven.
+        assert_eq!(effective_cap(None, 3), 2);
+        assert_eq!(effective_cap(None, 7), 6);
+    }
+
+    /// The setting lowers the cap and never raises it, which is what its doc
+    /// comment already claims.
+    #[test]
+    fn the_configured_cap_can_only_lower() {
+        assert_eq!(effective_cap(Some(1), 7), 1);
+        assert_eq!(effective_cap(Some(99), 7), 6);
+    }
+
+    /// A two-worker pool has a background ceiling of one, and one minus the
+    /// reservation is zero, which would admit no lookup at all.
+    #[test]
+    fn the_cap_never_reaches_zero() {
+        assert_eq!(effective_cap(None, 1), 1);
+        assert_eq!(effective_cap(Some(0), 7), 1);
     }
 
     /// The cap has to hold at the `poll` entry point, not just in the helper:
@@ -1151,7 +1181,7 @@ mod tests {
     #[test]
     fn poll_respects_the_concurrency_cap() {
         let mut cache = PrCache::new();
-        cache.set_concurrency(1);
+        cache.set_concurrency(Some(1));
         let (_release, job) = spawn_stuck_job();
         cache.insert_pending(PathBuf::from("/repo/busy"), "main", job);
 

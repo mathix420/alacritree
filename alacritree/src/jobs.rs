@@ -266,6 +266,13 @@ impl Pool {
         Self { shared }
     }
 
+    /// The most background tasks this pool runs at once.  Callers that keep
+    /// their own admission count clamp against this rather than inventing a
+    /// number that a differently sized pool would make wrong.
+    pub fn background_ceiling(&self) -> usize {
+        self.shared.workers - 1
+    }
+
     /// Register the wake-up this pool runs after every job.  The first
     /// registration wins; later ones are ignored.
     pub fn set_waker(&self, wake: impl Fn() + Send + Sync + 'static) {
