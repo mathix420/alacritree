@@ -64,12 +64,13 @@ pub fn body(query: &str) -> String {
 /// A partial response is normal here: one request covers a whole project, so
 /// losing all of it because one branch failed would be worse than losing one.
 ///
-/// `None` is the response that answered nothing — malformed, or the null
-/// `repository` GitHub returns beside `errors` under an HTTP 200 — and is what
-/// sends a group to the per-branch path.  An empty map is the opposite: a
-/// well-formed answer that no branch in this repository has a PR.  The two
-/// have to stay distinguishable, or the common "nobody here has a PR" answer
-/// costs a per-branch sweep that finds the same nothing.
+/// `None` is the response that answered nothing — malformed, a null
+/// `repository`, or every alias failing beside a top-level `errors`, all of
+/// which GitHub can report under an HTTP 200 — and is what sends a group to
+/// the per-branch path.  An empty map is the opposite: a well-formed answer
+/// that no branch in this repository has a PR.  The two have to stay
+/// distinguishable, or the common "nobody here has a PR" answer costs a
+/// per-branch sweep that finds the same nothing.
 pub fn parse(
     stdout: &[u8],
     branches: &[String],
@@ -90,7 +91,18 @@ pub fn parse(
             found.insert(branch.clone(), info);
         }
     }
+    // Nothing came back and the response is carrying errors: a whole selection
+    // failed, which a timeout on a full chunk produces.  A repository where no
+    // branch has a PR answers the same shape without the `errors`, so reading
+    // both as "no PR" would blank every badge in the project for a TTL.
+    if found.is_empty() && has_errors(&v) {
+        return None;
+    }
     Some(found)
+}
+
+fn has_errors(response: &serde_json::Value) -> bool {
+    response.get("errors").and_then(|e| e.as_array()).is_some_and(|list| !list.is_empty())
 }
 
 #[cfg(test)]
@@ -162,6 +174,17 @@ mod tests {
         let stdout = br#"{"data":{"repository":null},
             "errors":[{"message":"Could not resolve to a Repository"}]}"#;
         assert!(parse(stdout, &["main".into()], Some("me")).is_none());
+    }
+
+    /// A whole-selection failure — a timeout on a full chunk, say — comes back
+    /// as HTTP 200 with every alias null beside a top-level `errors`.  Read as
+    /// "no branch here has a PR" it would blank every badge in the project
+    /// until the TTL expired.
+    #[test]
+    fn a_response_whose_aliases_all_failed_is_not_an_answer() {
+        let stdout = br#"{"data":{"repository":{"b0":null,"b1":null}},
+            "errors":[{"message":"upstream timeout"}]}"#;
+        assert!(parse(stdout, &["main".into(), "topic".into()], Some("me")).is_none());
     }
 
     #[test]

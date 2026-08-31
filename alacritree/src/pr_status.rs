@@ -52,8 +52,9 @@ fn effective_cap(configured: Option<usize>, ceiling: usize) -> usize {
 pub struct PrCache {
     entries: HashMap<PathBuf, Entry>,
     /// Requests in flight.  `in_flight` counts these rather than branches:
-    /// the cap exists to bound `gh` processes, and one batch is one process
-    /// however many branches it names.
+    /// what a burst costs follows the repositories it spans — a resolve and a
+    /// query each, or one `gh pr list` per member of a group that could not be
+    /// batched — not the number of branches waiting on it.
     batches: Vec<Batch>,
     /// Entries that asked for a lookup this frame, grouped and spawned by the
     /// next `drain_completed`.  Batching needs a whole frame's worth of due
@@ -192,7 +193,15 @@ impl PrCache {
             // — the next drain is — and egui paints on demand.  Without asking
             // for that frame the request waits on the user's next input
             // instead of on the TTL.
-            ctx.request_repaint();
+            //
+            // Only while a slot is free, though: over the cap the drain
+            // refuses the member and leaves it due, so an unconditional ask
+            // would repaint at frame rate for as long as the batch runs.  The
+            // guard inside the spawn closure delivers that wake when a slot
+            // frees, on the panicking path too.
+            if may_spawn(self.concurrency, self.in_flight) {
+                ctx.request_repaint();
+            }
         }
 
         self.entries.get(path).and_then(|entry| entry.info.clone())
@@ -1513,6 +1522,49 @@ mod tests {
 
         assert_eq!(cache.in_flight(), 1, "the cap must refuse the second request");
         assert!(cache.is_due(capped, "feature"), "a refused member must fall due again");
+    }
+
+    /// Drive a fresh context to the point where it wants no repaint of its
+    /// own: it always asks for an initial one, and `run` only clears that
+    /// once the request has been consumed — hence two passes.
+    fn quiesce(ctx: &egui::Context) {
+        let _ = ctx.run(Default::default(), |_| {});
+        let _ = ctx.run(Default::default(), |_| {});
+        assert!(!ctx.has_requested_repaint(), "precondition: no repaint pending");
+    }
+
+    /// The frame that queues a lookup is not the frame that spawns it — the
+    /// next drain is — and egui paints on demand, so without this the request
+    /// waits on the user's next input instead of on the TTL.
+    #[test]
+    fn a_queued_poll_asks_for_the_frame_that_spawns_it() {
+        let ctx = egui::Context::default();
+        quiesce(&ctx);
+        let mut cache = PrCache::new();
+
+        cache.poll(Path::new("/repo/wt"), Some("main"), &ctx);
+
+        assert!(ctx.has_requested_repaint(), "a queued lookup must ask for its spawning frame");
+    }
+
+    /// A member the cap refuses has its `pending` cleared, so it falls due
+    /// again on the very next frame.  Asking for that frame while nothing can
+    /// spawn spins the UI at frame rate for as long as the batch runs, and a
+    /// batch runs several serial `gh` processes.  Nothing is lost by staying
+    /// quiet: the guard inside the spawn closure delivers the wake the moment
+    /// a slot frees, on the panicking path too.
+    #[test]
+    fn a_poll_the_cap_will_refuse_does_not_ask_for_another_frame() {
+        let ctx = egui::Context::default();
+        let mut cache = PrCache::new();
+        cache.set_concurrency(Some(1));
+        let (_release, job) = spawn_stuck_job();
+        bank_one(&mut cache, "/repo/busy", "main", job);
+        quiesce(&ctx);
+
+        cache.poll(Path::new("/repo/capped"), Some("feature"), &ctx);
+
+        assert!(!ctx.has_requested_repaint(), "a saturated cap must not spin the frame loop");
     }
 
     /// The drain that frees a concurrency slot only runs on a frame, so a
