@@ -34,17 +34,23 @@ struct Cancel {
 }
 
 impl Cancel {
-    /// Set the flag, then end whatever child is registered.  Killing is what
-    /// frees the worker: it is blocked in a wait the kernel returns from.
+    /// Set the flag, then kill whatever child is registered.  `Job::drop` runs
+    /// on whatever thread drops the handle, sometimes the UI thread, so this
+    /// must return without waiting on the child — see `kill_registered`.
     fn cancel(&self) {
         self.flag.store(true, Ordering::Relaxed);
         self.kill_registered();
     }
 
+    /// Kill in place, without taking or waiting.  Reaping stays with
+    /// `run_cancellable`'s own poll loop, on the worker thread, so a caller
+    /// of `cancel` never blocks on the child's exit.  The tradeoff: a worker
+    /// whose task never returns leaves its child unreaped — the same
+    /// exposure a straight `wait()` here would have carried too, since
+    /// nothing else in this module reaps on the killer's behalf either way.
     fn kill_registered(&self) {
-        if let Some(mut child) = self.child.lock().expect("the cancel slot is poisoned").take() {
+        if let Some(child) = self.child.lock().expect("the cancel slot is poisoned").as_mut() {
             let _ = child.kill();
-            let _ = child.wait();
         }
     }
 }
@@ -74,27 +80,47 @@ impl Blocking {
         let child = cmd.spawn()?;
         *self.0.child.lock().expect("the cancel slot is poisoned") = Some(child);
         // The handle can drop between the spawn above and the registration, in
-        // which case `cancel` ran while there was nothing to kill.
+        // which case `cancel` ran while there was nothing to kill.  Killing
+        // here does not skip the loop below: reaping stays there regardless
+        // of which path did the killing.
         if self.cancelled() {
             self.0.kill_registered();
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "job cancelled"));
         }
         loop {
             let mut slot = self.0.child.lock().expect("the cancel slot is poisoned");
-            let exited = match slot.as_mut() {
-                Some(child) => child.try_wait()?.is_some(),
-                // The killer got here first and took it.
-                None => {
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "job cancelled"));
-                },
+            let status = match slot.as_mut() {
+                Some(child) => child.try_wait(),
+                // Nothing else in this module takes from the slot, so this
+                // arm is unreached today; kept so a future caller that does
+                // still gets a cancelled result instead of a panic.
+                None => return Err(io::Error::new(io::ErrorKind::Interrupted, "job cancelled")),
             };
-            if exited {
-                let child = slot.take().expect("observed present on this iteration");
-                drop(slot);
-                return child.wait_with_output();
+            match status {
+                Ok(Some(_)) => {
+                    let mut child = slot.take().expect("observed present on this iteration");
+                    drop(slot);
+                    // The exit observed above may be the kill landing rather
+                    // than the child's own work finishing, in which case the
+                    // caller wants "cancelled", not a killed process's status.
+                    // `wait` here cannot block: `try_wait` already reaped the
+                    // process and `Child` caches the status it collected.
+                    if self.cancelled() {
+                        let _ = child.wait();
+                        return Err(io::Error::new(io::ErrorKind::Interrupted, "job cancelled"));
+                    }
+                    return child.wait_with_output();
+                },
+                Ok(None) => {
+                    drop(slot);
+                    std::thread::sleep(CHILD_POLL);
+                },
+                Err(err) => {
+                    // Leaving a live `Child` in the slot on error would orphan
+                    // it unreaped; take it out before propagating.
+                    slot.take();
+                    return Err(err);
+                },
             }
-            drop(slot);
-            std::thread::sleep(CHILD_POLL);
         }
     }
 }
@@ -676,16 +702,20 @@ mod tests {
             // set before any child exists to register.
             let _ = gate_rx.recv();
             let result = blocking.run_cancellable(&mut long_sleep());
-            let _ = done_tx.send(result.is_err());
+            let _ = done_tx.send(result.err().map(|err| err.kind()));
         });
         started_rx.recv_timeout(Duration::from_secs(5)).expect("the job never started");
 
         drop(job);
         let _ = gate_tx.send(());
 
+        // Collapsing every failure to `true` would also pass if `long_sleep`'s
+        // command were missing from PATH: `spawn` would fail immediately with
+        // no kill involved.  The exact kind distinguishes "cancelled" from
+        // "never started".
         assert_eq!(
             done_rx.recv_timeout(Duration::from_secs(5)),
-            Ok(true),
+            Ok(Some(io::ErrorKind::Interrupted)),
             "the child outlived a cancel that landed before it was registered"
         );
     }
