@@ -11,12 +11,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use crate::command_ext::CommandExt;
 use crate::projects::Worktree;
-use crate::{jobs, wsl};
+use crate::{command_ext, jobs, wsl};
 
 /// Re-query at most this often.  PR base branches rarely change, and a stale
 /// answer just falls back to the previous diff target — not worth hammering
@@ -374,8 +373,7 @@ fn query_gh(path: &Path, branch: &str, blocking: &jobs::Blocking) -> Option<PrIn
     match wsl::classify(path) {
         wsl::Location::Windows(p) => {
             let owner = local_origin_owner(&p, blocking);
-            let output = Command::new("gh")
-                .hide_console()
+            let output = command_ext::hidden("gh")
                 .current_dir(p)
                 .args([
                     "pr",

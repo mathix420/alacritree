@@ -495,7 +495,7 @@ fn default_branch_from_batch(
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
-    use crate::command_ext::CommandExt as _;
+    use crate::command_ext;
     use crate::test_util::{add_worktree, init_repo};
 
     /// `%(refname:short)` shortens to the *unambiguous* name, so a branch that
@@ -506,8 +506,7 @@ mod tests {
     fn the_upstream_format_keys_branches_by_plain_name_even_when_a_tag_shares_it() {
         let dir = tempfile::TempDir::new().unwrap();
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .hide_console()
+            let out = command_ext::hidden("git")
                 .current_dir(dir.path())
                 .args(args)
                 .output()

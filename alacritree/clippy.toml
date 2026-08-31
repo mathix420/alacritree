@@ -9,4 +9,5 @@ disallowed-methods = [
   { path = "std::process::Command::output", reason = "waiting on a process can hold the UI thread for an unknown duration; submit a job with alacritree::jobs" },
   { path = "std::process::Command::status", reason = "waiting on a process can hold the UI thread for an unknown duration; submit a job with alacritree::jobs" },
   { path = "std::process::Command::spawn", reason = "spawning a process can hold the UI thread for an unknown duration; submit a job with alacritree::jobs" },
+  { path = "std::process::Command::new", reason = "a console child opens a window when the parent has no console; build it with command_ext::hidden" },
 ]

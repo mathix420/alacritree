@@ -5,8 +5,7 @@
 //! empty and `classify` never returns `Wsl`, so all WSL code paths are
 //! dormant without cfg-gating at call sites.
 
-use crate::command_ext::CommandExt;
-use crate::jobs;
+use crate::{command_ext, jobs};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -305,8 +304,8 @@ pub fn command(distro: &str, cd: Option<&Path>) -> Command {
 }
 
 fn command_bare() -> Command {
-    let mut cmd = Command::new("wsl.exe");
-    cmd.hide_console().env("WSL_UTF8", "1");
+    let mut cmd = command_ext::hidden("wsl.exe");
+    cmd.env("WSL_UTF8", "1");
     cmd
 }
 

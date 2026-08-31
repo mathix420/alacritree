@@ -14,18 +14,17 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use crate::app::{ShellDecision, shell_decision};
-use crate::command_ext::CommandExt;
 use crate::config::{self, Config, ConfigDiagnosis, ConfigFile, Profile, ShellConfig};
 use crate::crash_log::{Verdict, classify};
 use crate::ipc::{self, IpcRequest, SendError};
 use crate::wsl::{self, ShellChoice};
-use crate::{jobs, state};
+use crate::{command_ext, jobs, state};
 
 /// An instance that is wedged should not wedge the report too.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -178,8 +177,7 @@ fn doppler_configured() -> bool {
 #[allow(clippy::disallowed_methods)]
 fn gh_auth_check() -> Option<Check> {
     locate("gh")?;
-    let authenticated = Command::new("gh")
-        .hide_console()
+    let authenticated = command_ext::hidden("gh")
         .args(["auth", "status"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -621,8 +619,7 @@ fn find(program: &str) -> Option<Found> {
 /// here rather than reporting a version, which is worth knowing on its own.
 #[allow(clippy::disallowed_methods)] // Running the tool is how its version is read.
 fn version_of(program: &Path) -> Option<String> {
-    let output = Command::new(program)
-        .hide_console()
+    let output = command_ext::hidden(program)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

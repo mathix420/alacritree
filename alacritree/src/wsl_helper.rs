@@ -893,19 +893,18 @@ mod tests {
         // An unregistered probe key resolves to "no foreground comm".
         assert_eq!(client.probe("999999-999999").expect("probe"), None);
 
-        use std::process::{Command, Stdio};
+        use std::process::Stdio;
 
-        use crate::command_ext::CommandExt;
+        use crate::command_ext;
 
         // The shim publishes its pid, then execs the login shell; piped stdin
         // (held open) keeps that shell alive for the duration of the test.
-        // Without hide_console the spawn pops a visible terminal window when
-        // the test runs from a hidden console.
+        // Without command_ext::hidden the spawn pops a visible terminal window
+        // when the test runs from a hidden console.
         let key = new_probe_key();
         let (program, args) = shim_invocation(&distro.name, Path::new(r"C:\"), &key);
-        let mut child = Command::new(program)
+        let mut child = command_ext::hidden(program)
             .args(&args)
-            .hide_console()
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

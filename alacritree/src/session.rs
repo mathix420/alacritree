@@ -1792,7 +1792,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn sysctl_probe_reads_a_real_childs_comm_and_group() {
-        let mut child = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let mut child = crate::command_ext::hidden("/bin/sleep").arg("30").spawn().unwrap();
         let comm = comm_for_pid(child.id());
         let groups = pgid_tpgid(child.id());
         child.kill().ok();

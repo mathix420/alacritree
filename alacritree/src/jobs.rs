@@ -417,7 +417,7 @@ pub fn pool() -> &'static Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command_ext::CommandExt as _;
+    use crate::command_ext;
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -645,15 +645,15 @@ mod tests {
     /// without ever killing anything.
     fn long_sleep() -> Command {
         let mut cmd = if cfg!(windows) {
-            let mut c = Command::new("ping");
+            let mut c = command_ext::hidden("ping");
             c.args(["-n", "31", "127.0.0.1"]);
             c
         } else {
-            let mut c = Command::new("sleep");
+            let mut c = command_ext::hidden("sleep");
             c.arg("30");
             c
         };
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped()).hide_console();
+        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
         cmd
     }
 

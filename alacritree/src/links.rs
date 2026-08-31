@@ -5,16 +5,15 @@
 //! terminal view can underline them on hover and open them on click.
 
 use std::cell::RefCell;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use alacritty_terminal::grid::BidirectionalIterator;
 use alacritty_terminal::index::{Direction, Point};
 use alacritty_terminal::term::Term;
 use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 
-use crate::command_ext::CommandExt;
-use crate::jobs;
 use crate::session::EventProxy;
+use crate::{command_ext, jobs};
 
 // Identical to alacritty's built-in URL hint regex so the set of recognised
 // schemes (and the trailing-character rules) stay in sync with what users
@@ -168,8 +167,7 @@ pub fn open(uri: &str) -> jobs::Job<()> {
 #[cfg(target_os = "macos")]
 #[allow(clippy::disallowed_methods)] // Running the process is this function's job.
 fn spawn(uri: &str, _blocking: &jobs::Blocking) -> std::io::Result<()> {
-    Command::new("open")
-        .hide_console()
+    command_ext::hidden("open")
         .arg(uri)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -183,8 +181,7 @@ fn spawn(uri: &str, _blocking: &jobs::Blocking) -> std::io::Result<()> {
 fn spawn(uri: &str, _blocking: &jobs::Blocking) -> std::io::Result<()> {
     // `start` treats its first quoted argument as a window title, so pass an
     // empty title before the URL to keep `cmd` from eating it.
-    Command::new("cmd")
-        .hide_console()
+    command_ext::hidden("cmd")
         .args(["/c", "start", ""])
         .arg(uri)
         .stdin(Stdio::null())
@@ -197,8 +194,7 @@ fn spawn(uri: &str, _blocking: &jobs::Blocking) -> std::io::Result<()> {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[allow(clippy::disallowed_methods)] // Running the process is this function's job.
 fn spawn(uri: &str, _blocking: &jobs::Blocking) -> std::io::Result<()> {
-    Command::new("xdg-open")
-        .hide_console()
+    command_ext::hidden("xdg-open")
         .arg(uri)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

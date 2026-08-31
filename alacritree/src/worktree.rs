@@ -9,8 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 
-use crate::command_ext::CommandExt;
-use crate::{jobs, wsl};
+use crate::{command_ext, jobs, wsl};
 
 #[derive(Debug, Clone)]
 pub enum Progress {
@@ -165,8 +164,8 @@ fn enable_claude_terminal_bell(worktree_root: &Path) -> std::io::Result<()> {
 fn git_command(cwd: &Path) -> Command {
     match wsl::classify(cwd) {
         wsl::Location::Windows(path) => {
-            let mut cmd = Command::new("git");
-            cmd.hide_console().arg("-C").arg(path);
+            let mut cmd = command_ext::hidden("git");
+            cmd.arg("-C").arg(path);
             cmd
         },
         wsl::Location::Wsl { distro, linux_path } => {
@@ -677,8 +676,7 @@ mod tests {
     fn list_branches_returns_locals_then_origin_remotes() {
         let dir = tempfile::TempDir::new().unwrap();
         let git = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .hide_console()
+            let status = command_ext::hidden("git")
                 .current_dir(dir.path())
                 .args(args)
                 .stdout(Stdio::null())
@@ -693,8 +691,7 @@ mod tests {
 
         let bare = tempfile::TempDir::new().unwrap();
         let git_bare = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .hide_console()
+            let status = command_ext::hidden("git")
                 .current_dir(bare.path())
                 .args(args)
                 .stdout(Stdio::null())
