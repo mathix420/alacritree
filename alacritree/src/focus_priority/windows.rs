@@ -446,16 +446,38 @@ mod tests {
     }
 
     /// Every pid descended from `root`, `root` included, from one snapshot.
+    ///
+    /// A parent pid alone does not establish descent: Windows frees a pid for
+    /// reuse as soon as the last handle to it closes, and an orphan goes on
+    /// naming the number its parent had, so whoever is given that number next
+    /// inherits a stranger's children.  The teardown arms kill what they find
+    /// here, which is what makes the guard load-bearing rather than tidy.  No
+    /// child predates its parent, and that is what rules the orphans out.
     fn tree_of(sys: &System, root: u32) -> Vec<u32> {
+        // A process the snapshot could not open reports no start time at all,
+        // which is why zero is dropped here rather than compared: it would
+        // read as the epoch and rule out every child wearing it.
+        let born: HashMap<u32, u64> = sys
+            .processes()
+            .iter()
+            .filter_map(|(pid, p)| (p.start_time() > 0).then_some((pid.as_u32(), p.start_time())))
+            .collect();
         let parents: Vec<(u32, Option<u32>)> = sys
             .processes()
             .iter()
             .map(|(pid, p)| (pid.as_u32(), p.parent().map(|pp| pp.as_u32())))
             .collect();
+        let predates = |child: &u32, parent: u32| match (born.get(child), born.get(&parent)) {
+            (Some(child), Some(parent)) => child < parent,
+            _ => false,
+        };
+
         let mut tree = vec![root];
         let mut frontier = vec![root];
         while let Some(parent) = frontier.pop() {
-            for (pid, _) in parents.iter().filter(|(_, pp)| *pp == Some(parent)) {
+            for (pid, _) in
+                parents.iter().filter(|(pid, pp)| *pp == Some(parent) && !predates(pid, parent))
+            {
                 tree.push(*pid);
                 frontier.push(*pid);
             }
