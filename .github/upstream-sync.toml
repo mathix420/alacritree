@@ -3,4 +3,4 @@
 # .github/workflows/upstream-sync.yml when it opens a sync PR.
 upstream = "https://github.com/alacritty/alacritty"
 branch   = "master"
-sha      = "ede2ac144da4dec4c075bfa803aacf3b3739bce6"
+sha      = "d692748d3f61253ebe9f5094320120d22f6a046f"
