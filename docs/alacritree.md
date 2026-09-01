@@ -643,10 +643,12 @@ Two things worth knowing about what the schema does and does not do:
   but they are not flagged.
 - **Closed-value keys are completed.** `confirm_session_close`, `scrollbar`,
   `sidebar_focus`, `search_scope`, `sidebar_tooltips`, `last_session_close`,
-  `path_style.*` and `drop.quote` offer their accepted spellings. Keys where
-  Alacritty accepts more than one spelling for the same value — cursor `shape`
-  and `blinking`, binding `action` — are deliberately left unconstrained, so a
-  working config is never marked wrong.
+  `path_style.*` and `drop.quote` offer their accepted spellings. A binding's
+  `action` completes from every action alacritree implements but rejects
+  nothing, so an alacritty-only action still validates. Cursor `shape` and
+  `blinking`, where Alacritty accepts more than one spelling for the same
+  value, are deliberately left unconstrained, so a working config is never
+  marked wrong.
 
 [taplo]: https://taplo.tamasfe.dev/
 [ebt]: https://marketplace.visualstudio.com/items?itemName=tamasfe.even-better-toml

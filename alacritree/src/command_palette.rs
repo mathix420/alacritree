@@ -17,7 +17,7 @@ use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use crate::app::WorkspaceKey;
-use crate::bindings::{BindingAction, KeyBinding, NamedAction};
+use crate::bindings::{BindingAction, KeyBinding, NamedAction, bindable_actions};
 use crate::session::SessionId;
 
 /// What activating a palette row does. Each arm is resolved by
@@ -251,78 +251,6 @@ pub fn group(items: &[PaletteItem], ranked: &[usize]) -> Vec<(PaletteSection, Ve
         }
     }
     out
-}
-
-/// Every simple (non-parametrized) `NamedAction`, kept in sync with the enum by
-/// hand. Mirrors the old shortcuts window's bindable list; `SelectTab`/
-/// `SpawnProfile` are excluded here because they carry an index.
-fn bindable_actions() -> [NamedAction; 63] {
-    use NamedAction::*;
-    [
-        Paste,
-        PasteSelection,
-        Copy,
-        CopySelection,
-        ScrollPageUp,
-        ScrollPageDown,
-        ScrollHalfPageUp,
-        ScrollHalfPageDown,
-        ScrollLineUp,
-        ScrollLineDown,
-        ScrollToTop,
-        ScrollToBottom,
-        ClearHistory,
-        SpawnNewInstance,
-        IncreaseFontSize,
-        DecreaseFontSize,
-        ResetFontSize,
-        ToggleFullscreen,
-        ToggleMaximized,
-        Minimize,
-        SelectNextTab,
-        SelectPreviousTab,
-        SelectLastTab,
-        SelectNextSession,
-        SelectPreviousSession,
-        SelectNextWorkspace,
-        SelectPreviousWorkspace,
-        OpenScratchpad,
-        ToggleLeftSidebar,
-        ToggleRightSidebar,
-        AddProject,
-        ToggleSidebarFocus,
-        CloseSession,
-        SidebarTop,
-        SidebarBottom,
-        SidebarNextProject,
-        SidebarPreviousProject,
-        FocusProjectsSidebar,
-        FocusGitSidebar,
-        FocusTerminal,
-        FocusLeft,
-        FocusRight,
-        ToggleSessionRows,
-        ToggleSessionTabs,
-        SetBaseBranch,
-        SidebarSearchConfirm,
-        SidebarSearchCancel,
-        SidebarSearchCancelToTerminal,
-        Quit,
-        TogglePalette,
-        ToggleSessionsFilter,
-        ToggleAttentionFilter,
-        TogglePrOpenFilter,
-        TogglePrDraftFilter,
-        TogglePrMergedFilter,
-        TogglePrClosedFilter,
-        ClearProjectFilters,
-        ToggleModifiedFilter,
-        ToggleDeletedFilter,
-        ToggleUntrackedFilter,
-        ClearGitFilters,
-        ToggleSearchScope,
-        RefreshPrStatus,
-    ]
 }
 
 fn format_shortcut(key: egui::Key, mods: egui::Modifiers) -> String {

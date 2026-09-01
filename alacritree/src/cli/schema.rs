@@ -157,6 +157,7 @@ pub fn default_config_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bindings::BindingAction;
 
     fn parsed() -> serde_json::Value {
         serde_json::from_str(&document()).unwrap()
@@ -260,6 +261,38 @@ mod tests {
     fn a_color_is_constrained_to_the_spellings_that_parse() {
         let schema = parsed();
         assert_eq!(schema["$defs"]["Color"]["pattern"], "^(0[xX]|#)?[0-9a-fA-F]{6}$");
+    }
+
+    /// The suggestions and the parser are two hand-maintained lists.  A name
+    /// completed from the schema that the parser then calls unknown is worse
+    /// than no suggestion at all.
+    #[test]
+    fn every_suggested_action_is_one_the_parser_accepts() {
+        let schema = parsed();
+        let names = schema["$defs"]["RawBinding"]["properties"]["action"]["anyOf"][0]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(!names.is_empty());
+        for name in names {
+            let name = name.as_str().unwrap();
+            assert!(
+                matches!(crate::bindings::parse_action(name), BindingAction::Named(_)),
+                "the schema suggests `{name}`, which does not parse"
+            );
+        }
+    }
+
+    /// An alacritty-only action in the shared `alacritty.toml` is something
+    /// alacritree ignores, not something the editor should paint red.
+    #[test]
+    fn an_action_alacritree_does_not_implement_still_validates() {
+        let schema = parsed();
+        let branches =
+            schema["$defs"]["RawBinding"]["properties"]["action"]["anyOf"].as_array().unwrap();
+        let names = branches[0]["enum"].as_array().unwrap();
+
+        assert!(!names.contains(&serde_json::json!("ToggleViMode")));
+        assert_eq!(branches[1], serde_json::json!({ "type": "string" }));
     }
 
     #[test]
