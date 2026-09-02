@@ -1672,17 +1672,18 @@ mod tests {
     /// registers what it wants and returns with whatever was last computed,
     /// the refresher answers on its own clock, and it then stops scanning for
     /// a shell nobody has asked about again.
+    ///
+    /// What a call costs is measured by `report_process_probe_cost` below,
+    /// which reports rather than asserts.  A wall-clock bound here could not
+    /// tell a probe that scanned from a runner that descheduled the thread,
+    /// and the default answer already says no scan produced it.
     #[cfg(windows)]
     #[test]
     fn the_probe_hands_the_scan_to_the_refresher() {
         let pid = std::process::id();
 
-        let started = Instant::now();
         let first = windows_process_probe::probe(pid);
-        let waited = started.elapsed();
-
         assert_eq!(first, (None, false, false), "the first probe had an answer to give");
-        assert!(waited < Duration::from_millis(5), "the probe took {waited:?} to return");
 
         let deadline = Instant::now() + Duration::from_secs(20);
         while windows_process_probe::published(pid).is_none() {
