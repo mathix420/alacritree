@@ -1875,42 +1875,39 @@ mod tests {
         assert_eq!(outcome.clipboard, vec![(Target::Clipboard, "hello".to_owned())]);
     }
 
-    /// A session whose child has already exited, so nothing more arrives from
-    /// the PTY and an injected sequence is the only event left to drain.  On
-    /// Windows that also consumes ConPTY's own startup title, so the assertions
-    /// below are about *our* sequence rather than racing that one.
-    fn spawn_exited_probe(kind: SessionKind, title: &str) -> Session {
-        #[cfg(windows)]
-        let (program, args) = ("cmd", vec!["/c", "exit"]);
-        #[cfg(not(windows))]
-        let (program, args) = ("sh", vec!["-c", "true"]);
+    /// A session with no PTY behind it, so an injected sequence is the only
+    /// event there is to drain.  A real child has to be waited out first, and
+    /// on Windows its ConPTY publishes a startup title of its own that would
+    /// race the injected one.
+    fn pty_less_probe(kind: SessionKind, title: &str) -> Session {
+        let size = TermSize::new(80, 24);
+        let (proxy, events) = EventProxy::new(egui::Context::default());
+        let term =
+            Arc::new(FairMutex::new(Term::new(TermConfig::default(), &size, proxy.clone())));
 
-        let mut session = Session::spawn_command(
-            egui::Context::default(),
-            &Config::default(),
-            std::env::current_dir().ok(),
-            TermSize::new(80, 24),
-            (8.0, 16.0),
-            program.to_string(),
-            args.into_iter().map(str::to_string).collect(),
-            title.to_string(),
+        Session {
+            id: 0,
+            title: title.to_string(),
+            working_directory: None,
             kind,
-        )
-        .unwrap();
-
-        // Draining until `ChildExit` is seen consumes everything the child sent:
-        // the loop emits `ChildExit` and then stops reading the PTY, because
-        // `spawn_with` passes `drain_on_exit: false` (`session.rs:866`,
-        // `event_loop.rs:263`).  Only a `Wakeup` can follow, and nothing maps it
-        // to a title.
-        let palette = Palette::default();
-        let start = Instant::now();
-        while !session.is_exited() {
-            assert!(start.elapsed() < Duration::from_secs(10), "child never exited");
-            session.drain_events(&palette);
-            std::thread::sleep(Duration::from_millis(1));
+            size,
+            cell_size: (8.0, 16.0),
+            term,
+            events,
+            scratchpad: None,
+            needs_attention: false,
+            pending_attention: None,
+            accumulated_scroll: (0.0, 0.0),
+            last_report_cell: None,
+            shell_pid: None,
+            agent_cache: Cell::new(AgentCache::default()),
+            wsl_probe: None,
+            priority_job: None,
+            notifier: None,
+            sender: None,
+            proxy,
+            exited: false,
         }
-        session
     }
 
     /// Drive a real OSC 0 through the real VT parser into the real drain, the
@@ -1931,7 +1928,7 @@ mod tests {
     #[test]
     fn a_diff_panes_title_survives_a_title_sequence() {
         let session =
-            spawn_exited_probe(SessionKind::Diff { key: "probe".to_string() }, "diff: src/app.rs");
+            pty_less_probe(SessionKind::Diff { key: "probe".to_string() }, "diff: src/app.rs");
         assert_eq!(
             title_after_osc(session, r"C:\Program Files\Git\cmd\git"),
             "diff: src/app.rs",
@@ -1943,7 +1940,7 @@ mod tests {
     /// and that is how editors and agents label their tab.
     #[test]
     fn a_shell_still_follows_its_childs_title() {
-        let session = spawn_exited_probe(SessionKind::Shell, "shell");
+        let session = pty_less_probe(SessionKind::Shell, "shell");
         assert_eq!(title_after_osc(session, "nvim src/app.rs"), "nvim src/app.rs");
     }
 
