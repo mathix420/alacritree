@@ -2149,44 +2149,86 @@ mod tests {
         );
     }
 
-    /// A pane must not wait on the console host's startup handshake.
+    /// Not a test on its own: the loader probe
+    /// [`a_pane_loads_no_foreign_console_host`] runs as a child process.
     ///
-    /// `harden_dll_search_path` keeps `LoadLibraryW("conpty.dll")` off PATH.  Without
-    /// it, any `conpty.dll` sitting in another terminal's install directory (WezTerm
-    /// ships one) hosts our pseudoconsoles, and WezTerm's blocks the child process
-    /// for three seconds waiting on a device-attributes reply that never satisfies
-    /// it.  The child here prints and exits immediately, so a runtime anywhere near
-    /// that timeout means a foreign console server is back in the loop.
+    /// Exits with the error code `LoadLibraryW("conpty.dll")` failed with, or 0
+    /// if it loaded something, so the parent can tell a loader that reached
+    /// PATH from one that did not.  `ALACRITREE_PROBE_HARDEN` picks the arm; it
+    /// has to be a child because `SetDefaultDllDirectories` is process-wide and
+    /// cannot be undone, and every other test in this binary may already have
+    /// called it.
     #[cfg(windows)]
     #[test]
-    fn a_pane_runs_its_child_without_a_console_host_handshake() {
-        let start = Instant::now();
-        let session = Session::spawn_command(
-            egui::Context::default(),
-            &Config::default(),
-            std::env::current_dir().ok(),
-            TermSize::new(80, 24),
-            (8.0, 16.0),
-            "cmd".to_string(),
-            vec!["/c".to_string(), "echo".to_string(), "ready".to_string()],
-            "probe".to_string(),
-            SessionKind::Shell,
-        )
-        .unwrap();
+    #[ignore = "the loader probe the DLL search-order test runs as a child"]
+    fn a_child_that_loads_conpty_by_name() {
+        use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
 
-        let exited = loop {
-            assert!(start.elapsed() < Duration::from_secs(10), "child never exited");
-            match session.events.try_recv() {
-                Ok(TermEvent::ChildExit(_)) => break start.elapsed(),
-                Ok(_) => {},
-                Err(_) => std::thread::sleep(Duration::from_millis(1)),
+        if std::env::var_os("ALACRITREE_PROBE_HARDEN").is_some() {
+            crate::harden_dll_search_path();
+        }
+
+        let name: Vec<u16> = "conpty.dll\0".encode_utf16().collect();
+        let module = unsafe { LoadLibraryW(name.as_ptr()) };
+        let code = if module.is_null() {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        } else {
+            0
+        };
+        std::process::exit(code);
+    }
+
+    /// A pane must not load another terminal's console host.
+    ///
+    /// `alacritty_terminal` opens a pseudoconsole through
+    /// `LoadLibraryW("conpty.dll")`, and Windows ships no `conpty.dll` of its
+    /// own, so that bare name matches nothing until some other terminal's
+    /// install directory is on PATH.  WezTerm ships one whose console server
+    /// blocks the child for three seconds waiting on a device-attributes reply,
+    /// which reads as a stall opening every pane.  `harden_dll_search_path`
+    /// drops PATH from the search order to keep it out.
+    ///
+    /// A file named `conpty.dll` that is not a module separates the two loader
+    /// outcomes without timing anything: a loader that reaches PATH finds it and
+    /// rejects its contents, one that never looks reports nothing to reject.
+    #[cfg(windows)]
+    #[test]
+    fn a_pane_loads_no_foreign_console_host() {
+        const ERROR_MOD_NOT_FOUND: i32 = 126;
+        const ERROR_BAD_EXE_FORMAT: i32 = 193;
+
+        let planted = tempfile::tempdir().expect("a directory to plant a conpty.dll in");
+        std::fs::write(planted.path().join("conpty.dll"), b"not a module")
+            .expect("plant a conpty.dll");
+        let path = std::env::join_paths(
+            std::iter::once(planted.path().to_path_buf())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
+        )
+        .expect("a PATH led by the planted directory");
+
+        let probe = |harden: bool| {
+            let exe = std::env::current_exe().expect("the test binary's own path");
+            let mut command = std::process::Command::new(exe);
+            command
+                .args(["--exact", "session::tests::a_child_that_loads_conpty_by_name", "--ignored"])
+                .env("PATH", &path);
+            if harden {
+                command.env("ALACRITREE_PROBE_HARDEN", "1");
             }
+            command.output().expect("run the loader probe").status.code().expect("the probe's code")
         };
 
-        assert!(
-            exited < Duration::from_secs(2),
-            "`cmd /c echo ready` took {exited:?}; the console host is stalling on a \
-             handshake (the foreign conpty.dll stall is ~3s)"
+        assert_eq!(
+            probe(false),
+            ERROR_BAD_EXE_FORMAT,
+            "the planted conpty.dll was not reached through PATH, so the hardened arm \
+             below would pass whatever the search order does"
+        );
+        assert_eq!(
+            probe(true),
+            ERROR_MOD_NOT_FOUND,
+            "`conpty.dll` still resolves out of PATH, so another terminal's console host \
+             would end up hosting every pane"
         );
     }
 
