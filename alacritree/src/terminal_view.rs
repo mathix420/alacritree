@@ -746,6 +746,12 @@ fn click_position(ui: &Ui, response: &Response) -> Option<Pos2> {
     response.interact_pointer_pos().or_else(|| ui.input(|i| i.pointer.hover_pos()))
 }
 
+/// Grid cell under `pos`, and which half of that cell the pointer sits on.
+///
+/// A drag captures the pointer, so `pos` routinely lands outside the grid.
+/// Clamping before the side is derived is what makes those positions anchor
+/// left of column 0 and right of the last column, as alacritty's saturating
+/// `Mouse::point` and `cell_side` do.
 fn cell_at_pos(
     pos: Pos2,
     rect: Rect,
@@ -755,14 +761,11 @@ fn cell_at_pos(
     rows: usize,
     display_offset: i32,
 ) -> (Point, Side) {
-    let local_x = pos.x - rect.min.x;
-    let local_y = pos.y - rect.min.y;
-    let col_f = local_x / cell_w;
-    let row_f = local_y / cell_h;
-    let col = (col_f.floor() as i32).clamp(0, cols as i32 - 1) as usize;
-    let row = (row_f.floor() as i32).clamp(0, rows as i32 - 1) as usize;
-    let frac = col_f - col_f.floor();
-    let side = if frac < 0.5 { Side::Left } else { Side::Right };
+    let col_f = ((pos.x - rect.min.x) / cell_w).clamp(0.0, cols as f32);
+    let row_f = ((pos.y - rect.min.y) / cell_h).clamp(0.0, rows as f32);
+    let col = (col_f as usize).min(cols - 1);
+    let row = (row_f as usize).min(rows - 1);
+    let side = if col_f - (col as f32) < 0.5 { Side::Left } else { Side::Right };
     (Point::new(Line(row as i32 - display_offset), Column(col)), side)
 }
 
@@ -3446,5 +3449,82 @@ mod tests {
             matches!(consumed_event(&press, None, TermMode::empty()), Some(ConsumedEvent::Bytes(ref b)) if b == &vec![0x16]),
             "Ctrl+V must reach the PTY as 0x16"
         );
+    }
+
+    /// Grid rect for the pointer-mapping tests: origin away from 0 so a
+    /// pointer left of the grid produces a genuinely negative local offset.
+    fn grid_rect(cell_w: f32, cell_h: f32, cols: usize, rows: usize) -> Rect {
+        Rect::from_min_size(
+            Pos2::new(120.0, 40.0),
+            Vec2::new(cols as f32 * cell_w, rows as f32 * cell_h),
+        )
+    }
+
+    #[test]
+    fn dragging_past_the_left_edge_keeps_the_first_column() {
+        let (cell_w, cell_h, cols, rows) = (10.0, 20.0, 80, 24);
+        let rect = grid_rect(cell_w, cell_h, cols, rows);
+
+        // Every pointer left of the grid anchors on the left of column 0, so
+        // dragging out of the window never drops the leftmost character.
+        for offset in [-0.1, -0.3, -0.6, -0.9, -4.0, -40.0] {
+            let pos = Pos2::new(rect.min.x + offset * cell_w, rect.min.y + 0.5 * cell_h);
+            let (point, side) = cell_at_pos(pos, rect, cell_w, cell_h, cols, rows, 0);
+            assert_eq!(
+                (point.column, side),
+                (Column(0), Side::Left),
+                "pointer {offset} cells left of the grid must anchor left of column 0"
+            );
+        }
+    }
+
+    #[test]
+    fn selection_dragged_off_the_left_edge_includes_the_first_character() {
+        let (cell_w, cell_h, cols, rows) = (10.0, 20.0, 80, 24);
+        let rect = grid_rect(cell_w, cell_h, cols, rows);
+        let mut term = term_running(b"hello");
+
+        let press = Pos2::new(rect.min.x + 4.5 * cell_w, rect.min.y + 0.5 * cell_h);
+        let (anchor, anchor_side) = cell_at_pos(press, rect, cell_w, cell_h, cols, rows, 0);
+        let mut selection = Selection::new(SelectionType::Simple, anchor, anchor_side);
+
+        let dragged = Pos2::new(rect.min.x - 0.3 * cell_w, rect.min.y + 0.5 * cell_h);
+        let (point, side) = cell_at_pos(dragged, rect, cell_w, cell_h, cols, rows, 0);
+        selection.update(point, side);
+        term.selection = Some(selection);
+
+        assert_eq!(term.selection_to_string().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn dragging_past_the_right_edge_keeps_the_last_column() {
+        let (cell_w, cell_h, cols, rows) = (10.0, 20.0, 80, 24);
+        let rect = grid_rect(cell_w, cell_h, cols, rows);
+
+        for offset in [0.1, 0.4, 1.0, 30.0] {
+            let x = rect.min.x + (cols as f32 + offset) * cell_w;
+            let pos = Pos2::new(x, rect.min.y + 0.5 * cell_h);
+            let (point, side) = cell_at_pos(pos, rect, cell_w, cell_h, cols, rows, 0);
+            assert_eq!(
+                (point.column, side),
+                (Column(cols - 1), Side::Right),
+                "pointer {offset} cells right of the grid must anchor right of the last column"
+            );
+        }
+    }
+
+    #[test]
+    fn cell_side_splits_each_cell_at_its_midpoint() {
+        let (cell_w, cell_h, cols, rows) = (10.0, 20.0, 80, 24);
+        let rect = grid_rect(cell_w, cell_h, cols, rows);
+        let at = |frac: f32| {
+            let pos = Pos2::new(rect.min.x + frac * cell_w, rect.min.y + 0.5 * cell_h);
+            cell_at_pos(pos, rect, cell_w, cell_h, cols, rows, 0)
+        };
+
+        assert_eq!(at(0.0), (Point::new(Line(0), Column(0)), Side::Left));
+        assert_eq!(at(0.49), (Point::new(Line(0), Column(0)), Side::Left));
+        assert_eq!(at(0.51), (Point::new(Line(0), Column(0)), Side::Right));
+        assert_eq!(at(1.2), (Point::new(Line(0), Column(1)), Side::Left));
     }
 }
