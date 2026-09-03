@@ -2422,9 +2422,6 @@ mod tests {
     #[test]
     #[ignore = "timing harness, not an assertion"]
     fn report_paint_cost() {
-        #[cfg(windows)]
-        crate::harden_dll_search_path();
-
         let config = Config::default();
         for screen in [Vec2::new(1280.0, 720.0), Vec2::new(2560.0, 1440.0)] {
             let ctx = egui::Context::default();
@@ -2634,7 +2631,6 @@ mod tests {
     fn a_wheel_tick_scrolls_the_diff_panes_pager() {
         use std::io::Write as _;
 
-        crate::harden_dll_search_path();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("body.txt");
         let mut file = std::fs::File::create(&path).unwrap();

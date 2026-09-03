@@ -187,6 +187,11 @@ pub struct Session {
     /// shim published, unregistered again on drop.  The Windows process
     /// table ends at wsl.exe, so this is the only live view inside.
     wsl_probe: Option<WslProbe>,
+    /// Holds the shell and, as they are created, everything it starts, so
+    /// focus can raise the whole tree in one call.  `None` unless
+    /// `[ui] focus_priority_boost` is on, when the shell refused the job, and
+    /// always on platforms that have no boost.
+    priority_job: Option<crate::focus_priority::PriorityJob>,
     notifier: Option<Notifier>,
     sender: Option<EventLoopSender>,
     /// Shares this session's on-screen flag with the `EventProxy` its PTY
@@ -1115,6 +1120,7 @@ impl Session {
             shell_pid: None,
             agent_cache: Cell::new(AgentCache::default()),
             wsl_probe: None,
+            priority_job: None,
             notifier: None,
             sender: None,
             proxy,
@@ -1192,10 +1198,24 @@ impl Session {
             escape_args,
         };
 
+        // `tty::new` is where `LoadLibraryW("conpty.dll")` happens, and the
+        // module it loads answers every later one for the life of the process.
+        #[cfg(windows)]
+        crate::harden_dll_search_path();
+
         // alacritty routes OSC 7 / signals by this id, so each session needs its own.
         let window_id = next_window_id();
         let pty = tty::new(&pty_options, window_size, window_id)?;
         let shell_pid = pty_shell_pid(&pty);
+
+        // Jobbed here rather than on focus: a process joins a job when it is
+        // created, so anything the shell starts before the job exists escapes
+        // it for its whole life.  One job serves both settings, so it is
+        // created when either wants it.
+        let reaping = config.ui.reap_descendants_on_close;
+        let priority_job = shell_pid
+            .filter(|_| config.ui.focus_priority_boost || reaping)
+            .and_then(|pid| crate::focus_priority::PriorityJob::adopt(pid, reaping));
 
         #[cfg(windows)]
         let pty = crate::pty_rearm::RearmingPty::new(pty);
@@ -1224,6 +1244,7 @@ impl Session {
             shell_pid,
             agent_cache: Cell::new(AgentCache::default()),
             wsl_probe,
+            priority_job,
             notifier: Some(Notifier(sender.clone())),
             sender: Some(sender),
             proxy,
@@ -1236,6 +1257,19 @@ impl Session {
     /// background tab no longer costs a full repaint per chunk of output.
     pub fn set_visible(&self, visible: bool) {
         self.proxy.set_visible(visible);
+    }
+
+    /// Put this session's whole process tree one scheduling class above the
+    /// load, or return it to normal, and answer whether it now holds the
+    /// boost.  A session with no job holds nothing and always answers false.
+    /// Only the session the user is typing into may be raised; see
+    /// `app::process_session_events`.
+    pub fn set_priority_boost(&self, boosted: bool) -> bool {
+        let Some(job) = &self.priority_job else {
+            return false;
+        };
+        job.set_boosted(boosted);
+        boosted
     }
 
     pub fn write(&self, bytes: Vec<u8>) {
@@ -1638,17 +1672,18 @@ mod tests {
     /// registers what it wants and returns with whatever was last computed,
     /// the refresher answers on its own clock, and it then stops scanning for
     /// a shell nobody has asked about again.
+    ///
+    /// What a call costs is measured by `report_process_probe_cost` below,
+    /// which reports rather than asserts.  A wall-clock bound here could not
+    /// tell a probe that scanned from a runner that descheduled the thread,
+    /// and the default answer already says no scan produced it.
     #[cfg(windows)]
     #[test]
     fn the_probe_hands_the_scan_to_the_refresher() {
         let pid = std::process::id();
 
-        let started = Instant::now();
         let first = windows_process_probe::probe(pid);
-        let waited = started.elapsed();
-
         assert_eq!(first, (None, false, false), "the first probe had an answer to give");
-        assert!(waited < Duration::from_millis(5), "the probe took {waited:?} to return");
 
         let deadline = Instant::now() + Duration::from_secs(20);
         while windows_process_probe::published(pid).is_none() {
@@ -1840,42 +1875,39 @@ mod tests {
         assert_eq!(outcome.clipboard, vec![(Target::Clipboard, "hello".to_owned())]);
     }
 
-    /// A session whose child has already exited, so nothing more arrives from
-    /// the PTY and an injected sequence is the only event left to drain.  On
-    /// Windows that also consumes ConPTY's own startup title, so the assertions
-    /// below are about *our* sequence rather than racing that one.
-    fn spawn_exited_probe(kind: SessionKind, title: &str) -> Session {
-        #[cfg(windows)]
-        let (program, args) = ("cmd", vec!["/c", "exit"]);
-        #[cfg(not(windows))]
-        let (program, args) = ("sh", vec!["-c", "true"]);
+    /// A session with no PTY behind it, so an injected sequence is the only
+    /// event there is to drain.  A real child has to be waited out first, and
+    /// on Windows its ConPTY publishes a startup title of its own that would
+    /// race the injected one.
+    fn pty_less_probe(kind: SessionKind, title: &str) -> Session {
+        let size = TermSize::new(80, 24);
+        let (proxy, events) = EventProxy::new(egui::Context::default());
+        let term =
+            Arc::new(FairMutex::new(Term::new(TermConfig::default(), &size, proxy.clone())));
 
-        let mut session = Session::spawn_command(
-            egui::Context::default(),
-            &Config::default(),
-            std::env::current_dir().ok(),
-            TermSize::new(80, 24),
-            (8.0, 16.0),
-            program.to_string(),
-            args.into_iter().map(str::to_string).collect(),
-            title.to_string(),
+        Session {
+            id: 0,
+            title: title.to_string(),
+            working_directory: None,
             kind,
-        )
-        .unwrap();
-
-        // Draining until `ChildExit` is seen consumes everything the child sent:
-        // the loop emits `ChildExit` and then stops reading the PTY, because
-        // `spawn_with` passes `drain_on_exit: false` (`session.rs:866`,
-        // `event_loop.rs:263`).  Only a `Wakeup` can follow, and nothing maps it
-        // to a title.
-        let palette = Palette::default();
-        let start = Instant::now();
-        while !session.is_exited() {
-            assert!(start.elapsed() < Duration::from_secs(10), "child never exited");
-            session.drain_events(&palette);
-            std::thread::sleep(Duration::from_millis(1));
+            size,
+            cell_size: (8.0, 16.0),
+            term,
+            events,
+            scratchpad: None,
+            needs_attention: false,
+            pending_attention: None,
+            accumulated_scroll: (0.0, 0.0),
+            last_report_cell: None,
+            shell_pid: None,
+            agent_cache: Cell::new(AgentCache::default()),
+            wsl_probe: None,
+            priority_job: None,
+            notifier: None,
+            sender: None,
+            proxy,
+            exited: false,
         }
-        session
     }
 
     /// Drive a real OSC 0 through the real VT parser into the real drain, the
@@ -1896,7 +1928,7 @@ mod tests {
     #[test]
     fn a_diff_panes_title_survives_a_title_sequence() {
         let session =
-            spawn_exited_probe(SessionKind::Diff { key: "probe".to_string() }, "diff: src/app.rs");
+            pty_less_probe(SessionKind::Diff { key: "probe".to_string() }, "diff: src/app.rs");
         assert_eq!(
             title_after_osc(session, r"C:\Program Files\Git\cmd\git"),
             "diff: src/app.rs",
@@ -1908,7 +1940,7 @@ mod tests {
     /// and that is how editors and agents label their tab.
     #[test]
     fn a_shell_still_follows_its_childs_title() {
-        let session = spawn_exited_probe(SessionKind::Shell, "shell");
+        let session = pty_less_probe(SessionKind::Shell, "shell");
         assert_eq!(title_after_osc(session, "nvim src/app.rs"), "nvim src/app.rs");
     }
 
@@ -2052,8 +2084,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_burst_bigger_than_one_read_keeps_flowing_without_input() {
-        crate::harden_dll_search_path();
-
         const MARKER: &str = "BURST-COMPLETE";
 
         // Writing to the standard output handle rather than `Console.Out`,
@@ -2117,46 +2147,86 @@ mod tests {
         );
     }
 
-    /// A pane must not wait on the console host's startup handshake.
+    /// Not a test on its own: the loader probe
+    /// [`a_pane_loads_no_foreign_console_host`] runs as a child process.
     ///
-    /// `harden_dll_search_path` keeps `LoadLibraryW("conpty.dll")` off PATH.  Without
-    /// it, any `conpty.dll` sitting in another terminal's install directory (WezTerm
-    /// ships one) hosts our pseudoconsoles, and WezTerm's blocks the child process
-    /// for three seconds waiting on a device-attributes reply that never satisfies
-    /// it.  The child here prints and exits immediately, so a runtime anywhere near
-    /// that timeout means a foreign console server is back in the loop.
+    /// Exits with the error code `LoadLibraryW("conpty.dll")` failed with, or 0
+    /// if it loaded something, so the parent can tell a loader that reached
+    /// PATH from one that did not.  `ALACRITREE_PROBE_HARDEN` picks the arm; it
+    /// has to be a child because `SetDefaultDllDirectories` is process-wide and
+    /// cannot be undone, and every other test in this binary may already have
+    /// called it.
     #[cfg(windows)]
     #[test]
-    fn a_pane_runs_its_child_without_a_console_host_handshake() {
-        crate::harden_dll_search_path();
+    #[ignore = "the loader probe the DLL search-order test runs as a child"]
+    fn a_child_that_loads_conpty_by_name() {
+        use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
 
-        let start = Instant::now();
-        let session = Session::spawn_command(
-            egui::Context::default(),
-            &Config::default(),
-            std::env::current_dir().ok(),
-            TermSize::new(80, 24),
-            (8.0, 16.0),
-            "cmd".to_string(),
-            vec!["/c".to_string(), "echo".to_string(), "ready".to_string()],
-            "probe".to_string(),
-            SessionKind::Shell,
+        if std::env::var_os("ALACRITREE_PROBE_HARDEN").is_some() {
+            crate::harden_dll_search_path();
+        }
+
+        let name: Vec<u16> = "conpty.dll\0".encode_utf16().collect();
+        let module = unsafe { LoadLibraryW(name.as_ptr()) };
+        let code = if module.is_null() {
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        } else {
+            0
+        };
+        std::process::exit(code);
+    }
+
+    /// A pane must not load another terminal's console host.
+    ///
+    /// `alacritty_terminal` opens a pseudoconsole through
+    /// `LoadLibraryW("conpty.dll")`, and Windows ships no `conpty.dll` of its
+    /// own, so that bare name matches nothing until some other terminal's
+    /// install directory is on PATH.  WezTerm ships one whose console server
+    /// blocks the child for three seconds waiting on a device-attributes reply,
+    /// which reads as a stall opening every pane.  `harden_dll_search_path`
+    /// drops PATH from the search order to keep it out.
+    ///
+    /// A file named `conpty.dll` that is not a module separates the two loader
+    /// outcomes without timing anything: a loader that reaches PATH finds it and
+    /// rejects its contents, one that never looks reports nothing to reject.
+    #[cfg(windows)]
+    #[test]
+    fn a_pane_loads_no_foreign_console_host() {
+        const ERROR_MOD_NOT_FOUND: i32 = 126;
+        const ERROR_BAD_EXE_FORMAT: i32 = 193;
+
+        let planted = tempfile::tempdir().expect("a directory to plant a conpty.dll in");
+        std::fs::write(planted.path().join("conpty.dll"), b"not a module")
+            .expect("plant a conpty.dll");
+        let path = std::env::join_paths(
+            std::iter::once(planted.path().to_path_buf())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
         )
-        .unwrap();
+        .expect("a PATH led by the planted directory");
 
-        let exited = loop {
-            assert!(start.elapsed() < Duration::from_secs(10), "child never exited");
-            match session.events.try_recv() {
-                Ok(TermEvent::ChildExit(_)) => break start.elapsed(),
-                Ok(_) => {},
-                Err(_) => std::thread::sleep(Duration::from_millis(1)),
+        let probe = |harden: bool| {
+            let exe = std::env::current_exe().expect("the test binary's own path");
+            let mut command = std::process::Command::new(exe);
+            command
+                .args(["--exact", "session::tests::a_child_that_loads_conpty_by_name", "--ignored"])
+                .env("PATH", &path);
+            if harden {
+                command.env("ALACRITREE_PROBE_HARDEN", "1");
             }
+            command.output().expect("run the loader probe").status.code().expect("the probe's code")
         };
 
-        assert!(
-            exited < Duration::from_secs(2),
-            "`cmd /c echo ready` took {exited:?}; the console host is stalling on a \
-             handshake (the foreign conpty.dll stall is ~3s)"
+        assert_eq!(
+            probe(false),
+            ERROR_BAD_EXE_FORMAT,
+            "the planted conpty.dll was not reached through PATH, so the hardened arm \
+             below would pass whatever the search order does"
+        );
+        assert_eq!(
+            probe(true),
+            ERROR_MOD_NOT_FOUND,
+            "`conpty.dll` still resolves out of PATH, so another terminal's console host \
+             would end up hosting every pane"
         );
     }
 
@@ -2166,12 +2236,6 @@ mod tests {
     /// None` or it would be filtered into a worktree workspace.
     #[test]
     fn a_home_session_starts_in_the_configured_working_directory() {
-        // Whichever test spawns first decides which `conpty.dll` the process
-        // loads, and the loaded module answers every later `LoadLibraryW`.
-        // The binary gets this from `main`; a test binary has no such entry,
-        // so every test that opens a PTY has to harden before it does.
-        crate::harden_dll_search_path();
-
         let dir = tempfile::tempdir().unwrap();
 
         let mut config = Config::default();
@@ -2202,19 +2266,25 @@ mod tests {
             "the configured cwd must not turn the home tab into a worktree workspace"
         );
 
-        let start = Instant::now();
-        loop {
-            assert!(start.elapsed() < Duration::from_secs(10), "child never exited");
-            match session.events.try_recv() {
-                Ok(TermEvent::ChildExit(_)) => break,
-                Ok(_) => {},
-                Err(_) => std::thread::sleep(Duration::from_millis(1)),
+        // Waiting for the child's exit event first would put the pty event
+        // loop's own scheduling inside the deadline alongside the write, and a
+        // loaded machine can spend longer delivering that event than the child
+        // spent running.  The file is what the assertion needs, so polling it
+        // ends the wait as soon as the answer exists.
+        let probe = dir.path().join("cwd-probe.txt");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let reported = loop {
+            if let Ok(content) = std::fs::read_to_string(&probe) {
+                if let Ok(path) = PathBuf::from(content.trim()).canonicalize() {
+                    break path;
+                }
             }
-        }
-
-        let content = std::fs::read_to_string(dir.path().join("cwd-probe.txt"))
-            .expect("no probe file: the child did not start in general.working_directory");
-        let reported = PathBuf::from(content.trim()).canonicalize().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "no probe file: the child did not start in general.working_directory"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
         assert_eq!(reported, dir.path().canonicalize().unwrap());
     }
 

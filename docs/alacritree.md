@@ -383,6 +383,30 @@ vsync              = true   # restart required — wait for the display's refres
                             # before showing a finished frame (default true).
                             # false presents each frame as soon as it is drawn,
                             # trading tearing for lower keystroke-to-screen delay
+focus_priority_boost = false  # Windows only, restart required — put the
+                              # session on screen one scheduling class above
+                              # normal (default false).
+                              # A program that redraws its line as you type
+                              # needs CPU for every keystroke, and at normal
+                              # priority a build saturating every core starves
+                              # it: nushell echoed in 10 ms boosted, against up
+                              # to 1.9 s unboosted. Covers the shell and
+                              # everything it starts, at any depth, including
+                              # commands that live only a moment. Follows
+                              # focus, and raises nothing while the window is
+                              # in the background
+reap_descendants_on_close = false  # Windows only, restart required — when a
+                              # session closes, end everything it started at
+                              # any depth (default false).
+                              # The console reaps only the programs attached to
+                              # it, so a helper that left the console — an
+                              # editor's background search, anything started
+                              # detached — outlives the terminal and keeps
+                              # piling up. This also covers alacritree being
+                              # killed or crashing, since the kernel does the
+                              # reaping when the last handle closes. A process
+                              # that means to outlive the terminal must ask
+                              # with CREATE_BREAKAWAY_FROM_JOB
 search_scope       = "filtered"  # whether a sidebar search is confined by the
                                  # active toggle filters
                                  # "filtered" (default): a query narrows what
