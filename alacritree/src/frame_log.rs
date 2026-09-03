@@ -200,6 +200,23 @@ pub fn note_if_slow(kind: &str, what: impl std::fmt::Debug, took: Duration) {
     }
 }
 
+/// One phase of opening a session, logged only under `ALACRITREE_FRAME_LOG`.
+///
+/// Spawn cost is charged to whichever frame phase happened to be running when
+/// the click arrived, so without a marker of its own it reads as a sidebar or
+/// shortcut problem.  The session id is what pairs a phase with the tab it
+/// belongs to when several are opening at once.
+pub fn spawn_phase(session: Option<u64>, phase: &str, elapsed: Duration) {
+    if !enabled() {
+        return;
+    }
+    let millis = elapsed.as_secs_f64() * 1000.0;
+    match session {
+        Some(id) => log::info!("spawn {phase} [{id}]: {millis:.1}ms"),
+        None => log::info!("spawn {phase}: {millis:.1}ms"),
+    }
+}
+
 #[derive(Default)]
 struct Samples {
     totals: Vec<Duration>,
