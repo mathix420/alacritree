@@ -1057,6 +1057,66 @@ fn session_env(
     env
 }
 
+/// Everything opening a PTY needs, and nothing that has to stay on the UI
+/// thread.  Built by [`Session::pending`], consumed by [`open`].
+pub struct OpenRequest {
+    id: SessionId,
+    window_id: u64,
+    pty_options: PtyOptions,
+    window_size: WindowSize,
+    term: Arc<FairMutex<Term<EventProxy>>>,
+    proxy: EventProxy,
+    boost: bool,
+    reap: bool,
+}
+
+/// The half of a session that only exists once its PTY does.  Applied by
+/// [`Session::attach`]; dropping one instead shuts the PTY down, which is
+/// what happens when the tab it belongs to closes mid-open.
+pub struct Attachment {
+    shell_pid: Option<u32>,
+    priority_job: Option<crate::focus_priority::PriorityJob>,
+    sender: EventLoopSender,
+}
+
+/// Open the PTY for a pending session: process creation, the job that owns
+/// it, and the event loop that drains it.  This is the part that costs
+/// milliseconds, which is why it is a free function rather than a method —
+/// it must be callable from a thread that holds no `Session`.
+pub fn open(request: OpenRequest) -> std::io::Result<Attachment> {
+    let started = std::time::Instant::now();
+    let OpenRequest { id, window_id, pty_options, window_size, term, proxy, boost, reap } = request;
+
+    ensure_working_directory(pty_options.working_directory.as_deref())?;
+
+    // `tty::new` is where `LoadLibraryW("conpty.dll")` happens, and the
+    // module it loads answers every later one for the life of the process.
+    #[cfg(windows)]
+    crate::harden_dll_search_path();
+
+    let pty = tty::new(&pty_options, window_size, window_id)?;
+    crate::frame_log::spawn_phase(Some(id), "pty", started.elapsed());
+    let shell_pid = pty_shell_pid(&pty);
+
+    // Jobbed here rather than on focus: a process joins a job when it is
+    // created, so anything the shell starts before the job exists escapes
+    // it for its whole life.  One job serves both settings, so it is
+    // created when either wants it.
+    let priority_job = shell_pid
+        .filter(|_| boost || reap)
+        .and_then(|pid| crate::focus_priority::PriorityJob::adopt(pid, reap));
+
+    #[cfg(windows)]
+    let pty = crate::pty_rearm::RearmingPty::new(pty);
+
+    let event_loop = EventLoop::new(term, proxy, pty, false, false)?;
+    let sender = event_loop.channel();
+    event_loop.spawn();
+    crate::frame_log::spawn_phase(Some(id), "open", started.elapsed());
+
+    Ok(Attachment { shell_pid, priority_job, sender })
+}
+
 impl Session {
     pub fn spawn(
         ctx: egui::Context,
@@ -1067,29 +1127,17 @@ impl Session {
         shell_override: Option<Shell>,
         wsl_probe: Option<WslProbe>,
     ) -> std::io::Result<Self> {
-        // Overrides are argv built in code (`wsl.exe -d <distro> --cd <dir>`),
-        // so their args need Windows quoting like diff-pane argv; config
-        // shells stay raw to match upstream alacritty.
-        let escape_args = shell_override.is_some();
-        let shell = shell_override.or_else(|| {
-            config.shell.as_ref().map(|s| Shell::new(s.program.clone(), s.args.clone()))
-        });
-        let title = working_directory
-            .as_ref()
-            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| "shell".to_string());
-        Self::spawn_with(
+        let (mut session, request) = Self::pending_shell(
             ctx,
             config,
             working_directory,
             size,
             cell_size,
-            shell,
-            title,
-            SessionKind::Shell,
-            escape_args,
+            shell_override,
             wsl_probe,
-        )
+        );
+        session.attach(open(request)?);
+        Ok(session)
     }
 
     pub fn spawn_scratchpad(
@@ -1142,7 +1190,71 @@ impl Session {
         title: String,
         kind: SessionKind,
     ) -> std::io::Result<Self> {
-        Self::spawn_with(
+        let (mut session, request) = Self::pending_command(
+            ctx,
+            config,
+            working_directory,
+            size,
+            cell_size,
+            program,
+            args,
+            title,
+            kind,
+        );
+        session.attach(open(request)?);
+        Ok(session)
+    }
+
+    /// The `spawn` half of the split: a pending shell session plus what its
+    /// PTY will need, without opening it.
+    pub fn pending_shell(
+        ctx: egui::Context,
+        config: &Config,
+        working_directory: Option<PathBuf>,
+        size: TermSize,
+        cell_size: (f32, f32),
+        shell_override: Option<Shell>,
+        wsl_probe: Option<WslProbe>,
+    ) -> (Self, OpenRequest) {
+        // Overrides are argv built in code (`wsl.exe -d <distro> --cd <dir>`),
+        // so their args need Windows quoting like diff-pane argv; config
+        // shells stay raw to match upstream alacritty.
+        let escape_args = shell_override.is_some();
+        let shell = shell_override.or_else(|| {
+            config.shell.as_ref().map(|s| Shell::new(s.program.clone(), s.args.clone()))
+        });
+        let title = working_directory
+            .as_ref()
+            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "shell".to_string());
+        Self::pending(
+            ctx,
+            config,
+            working_directory,
+            size,
+            cell_size,
+            shell,
+            title,
+            SessionKind::Shell,
+            escape_args,
+            wsl_probe,
+        )
+    }
+
+    /// The `spawn_command` half of the split: a pending session running
+    /// `program args`, without opening its PTY.
+    pub fn pending_command(
+        ctx: egui::Context,
+        config: &Config,
+        working_directory: Option<PathBuf>,
+        size: TermSize,
+        cell_size: (f32, f32),
+        program: String,
+        args: Vec<String>,
+        title: String,
+        kind: SessionKind,
+    ) -> (Self, OpenRequest) {
+        Self::pending(
             ctx,
             config,
             working_directory,
@@ -1156,7 +1268,10 @@ impl Session {
         )
     }
 
-    fn spawn_with(
+    /// The half of a session that costs nothing: ids, the grid, the event
+    /// channel and the arguments its PTY will be opened with.  Cheap enough
+    /// for a frame, which is the whole point of the split.
+    fn pending(
         ctx: egui::Context,
         config: &Config,
         working_directory: Option<PathBuf>,
@@ -1167,9 +1282,8 @@ impl Session {
         kind: SessionKind,
         escape_args: bool,
         wsl_probe: Option<WslProbe>,
-    ) -> std::io::Result<Self> {
+    ) -> (Self, OpenRequest) {
         let pty_cwd = pty_working_directory(working_directory.clone(), config);
-        ensure_working_directory(pty_cwd.as_deref())?;
         let window_size = window_size(size, cell_size);
 
         let (proxy, events) = EventProxy::new(ctx);
@@ -1198,58 +1312,62 @@ impl Session {
             escape_args,
         };
 
-        // `tty::new` is where `LoadLibraryW("conpty.dll")` happens, and the
-        // module it loads answers every later one for the life of the process.
-        #[cfg(windows)]
-        crate::harden_dll_search_path();
-
         // alacritty routes OSC 7 / signals by this id, so each session needs its own.
         let window_id = next_window_id();
-        let pty = tty::new(&pty_options, window_size, window_id)?;
-        let shell_pid = pty_shell_pid(&pty);
 
-        // Jobbed here rather than on focus: a process joins a job when it is
-        // created, so anything the shell starts before the job exists escapes
-        // it for its whole life.  One job serves both settings, so it is
-        // created when either wants it.
-        let reaping = config.ui.reap_descendants_on_close;
-        let priority_job = shell_pid
-            .filter(|_| config.ui.focus_priority_boost || reaping)
-            .and_then(|pid| crate::focus_priority::PriorityJob::adopt(pid, reaping));
-
-        #[cfg(windows)]
-        let pty = crate::pty_rearm::RearmingPty::new(pty);
-
-        let event_loop = EventLoop::new(term.clone(), proxy.clone(), pty, false, false)?;
-        let sender = event_loop.channel();
-        event_loop.spawn();
-
+        // Registration only needs the probe's identity, not the open PTY, so
+        // it happens here rather than waiting for attach.
         if let Some(probe) = &wsl_probe {
             wsl_helper::register_probe(&probe.distro, &probe.key);
         }
-        Ok(Self {
+
+        let session = Self {
             id,
             title,
             working_directory,
             kind,
             size,
             cell_size,
-            term,
+            term: term.clone(),
             events,
             scratchpad: None,
             needs_attention: false,
             pending_attention: None,
             accumulated_scroll: (0.0, 0.0),
             last_report_cell: None,
-            shell_pid,
+            shell_pid: None,
             agent_cache: Cell::new(AgentCache::default()),
             wsl_probe,
-            priority_job,
-            notifier: Some(Notifier(sender.clone())),
-            sender: Some(sender),
-            proxy,
+            priority_job: None,
+            notifier: None,
+            sender: None,
+            proxy: proxy.clone(),
             exited: false,
-        })
+        };
+
+        let request = OpenRequest {
+            id,
+            window_id,
+            pty_options,
+            window_size,
+            term,
+            proxy,
+            boost: config.ui.focus_priority_boost,
+            reap: config.ui.reap_descendants_on_close,
+        };
+
+        (session, request)
+    }
+
+    /// Adopt a PTY opened elsewhere.  Everything a session cannot do without
+    /// one is switched on here, in one place, so there is a single answer to
+    /// "when does this session become live".
+    pub fn attach(&mut self, attachment: Attachment) {
+        let Attachment { shell_pid, priority_job, sender } = attachment;
+        self.shell_pid = shell_pid;
+        self.priority_job = priority_job;
+        self.notifier = Some(Notifier(sender.clone()));
+        self.sender = Some(sender);
     }
 
     /// Mark whether this session's grid is the one being painted.  Output from

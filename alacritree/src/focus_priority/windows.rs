@@ -90,6 +90,13 @@ pub struct PriorityJob {
     reaping: bool,
 }
 
+// A job handle is a process-wide kernel object: the thread that closes it
+// need not be the thread that opened it.  Moving one is what lets the PTY be
+// opened off the UI thread, since the job can only be created once the shell
+// it adopts has a pid.  The interior `Cell` keeps the type `!Sync`, which is
+// what we want: only one thread may drive the boost at a time.
+unsafe impl Send for PriorityJob {}
+
 /// The limits a job carries regardless of focus.
 ///
 /// Kill-on-close is what makes the job answer for its members' lifetime: the
@@ -208,6 +215,12 @@ mod tests {
 
     use crate::command_ext::CommandExt as _;
     use super::*;
+
+    #[test]
+    fn a_priority_job_can_move_to_the_thread_that_opens_the_pty() {
+        fn assert_send<T: Send>() {}
+        assert_send::<PriorityJob>();
+    }
 
     /// A child that sits still for the length of a test without spinning a
     /// core: `pause` blocks on a piped stdin nobody writes to.

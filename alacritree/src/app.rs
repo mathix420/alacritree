@@ -1212,12 +1212,24 @@ impl AlacritreeApp {
             // not lost work.
             self.sync_doppler_scopes(dir.clone());
         }
+        // The PTY is born at the geometry it will keep.  Under the gate this
+        // matters: a session that opened at 80x24 and was resized on attach
+        // makes a fast shell print its first prompt into a grid that is about
+        // to be reflowed under it.  `active_session_index` is `None` for the
+        // constructor (no session yet) and for a respawn after
+        // `close_session` (the active entry is removed before the respawn
+        // spawns); both fall back to the same 80x24 a first launch always
+        // used, rather than reaching for `self.sessions.last()`.
+        let (size, cell_size) = self
+            .active_session_index()
+            .map(|idx| (self.sessions[idx].size, self.sessions[idx].cell_size))
+            .unwrap_or((TermSize::new(80, 24), (8.0, 16.0)));
         let session = Session::spawn(
             ctx.clone(),
             &self.config,
             working_directory.clone(),
-            TermSize::new(80, 24),
-            (8.0, 16.0),
+            size,
+            cell_size,
             shell,
             wsl_probe,
         )?;
