@@ -549,9 +549,16 @@ pub struct AlacritreeApp {
     ime: crate::ime::Ime,
     color_glyphs: crate::color_glyph::ColorGlyphCache,
     glyph_cache: crate::glyph_cache::GlyphCache,
+    /// The `[font.normal]` face's own decoration metrics, parsed once when the
+    /// fonts were installed.  Nothing re-reads the file per frame.
+    face_metrics: crate::fonts::FaceMetrics,
     /// Scratch buffers the painter copies the visible grid into, so the
     /// terminal lock is released before any shape is built.
     grid_snapshot: crate::terminal_view::GridSnapshot,
+    /// Buffers and GL objects for `[ui] gpu_grid`.  Held whether or not the
+    /// option is on: it allocates nothing until a frame writes to it, and
+    /// the GL side is built on the first paint that needs it.
+    gpu_grid: crate::grid_gl::GpuGrid,
     /// Present only under `ALACRITREE_FRAME_LOG`; `None` is the normal run.
     frame_log: Option<crate::frame_log::FrameLog>,
     phases: crate::frame_log::Phases,
@@ -720,7 +727,7 @@ impl AlacritreeApp {
     pub fn new(cc: &CreationContext<'_>, config: Config) -> Self {
         let theme = Theme::from_config(&config);
 
-        let font_chain =
+        let (font_chain, face_metrics) =
             crate::fonts::install_terminal_fonts(&cc.egui_ctx, &config.font, &config.ui_font);
         let color_glyph_budget_mb = config.font.color_glyph_cache_mb;
 
@@ -886,8 +893,10 @@ impl AlacritreeApp {
                 font_chain,
                 color_glyph_budget_mb,
             ),
+            face_metrics,
             glyph_cache: crate::glyph_cache::GlyphCache::new(),
             grid_snapshot: crate::terminal_view::GridSnapshot::new(),
+            gpu_grid: crate::grid_gl::GpuGrid::new(),
             frame_log: crate::frame_log::FrameLog::from_env(),
             phases: crate::frame_log::Phases::new(),
             grid_paint: std::time::Duration::ZERO,
@@ -6975,6 +6984,22 @@ impl AlacritreeApp {
         // treat unknown as "focused" so we don't pile up stale attention dots.
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
 
+        // Only the session on screen, and only while the window has focus:
+        // typing somewhere else is the one moment a terminal has no claim on
+        // the machine.  Both calls are no-ops unless they change something, so
+        // a frame where focus has not moved costs nothing, and a session with
+        // no boost to give — the feature off, or a platform that has none —
+        // answers false without a call of any kind.
+        let target = visible_idx.filter(|_| focused);
+        let mut anything_raised = false;
+        for (idx, session) in self.sessions.iter().enumerate() {
+            anything_raised |= session.set_priority_boost(Some(idx) == target);
+        }
+        // A boost covers every depth, so a focused tab running
+        // `cargo build -j16` raises all sixteen compilers.  The GUI left at
+        // normal would then lose to the tree it is drawing.
+        crate::focus_priority::set_self_boosted(anything_raised);
+
         let grace = self.config.ui.attention_grace;
         for idx in 0..self.sessions.len() {
             // Window focus is deliberately not part of this: an unfocused
@@ -8401,7 +8426,18 @@ fn session_json(session: &Session, is_active_tab: bool) -> Value {
 
 impl eframe::App for AlacritreeApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        let bg = self.theme.terminal_bg;
+        // This clear is the only thing painting a cell the grid leaves alone,
+        // so it has to carry the terminal's own background rather than the
+        // configured one.  eframe reads it before `update`, so a colour OSC 11
+        // moved this frame lands next frame; terminal output requests a repaint
+        // of its own, so the stale frame is replaced rather than left up.
+        let bg = self.grid_snapshot.default_bg(&self.config.palette);
+        // Deliberately not premultiplied, where alacritty's `renderer::clear`
+        // writes `(rgb * alpha, alpha)`.  `egui_glow::clear` hands these to
+        // `glClearColor` untouched and the compositor reads the framebuffer as
+        // premultiplied, so a translucent window carries its background at full
+        // strength; scaling it here would darken every `[window] opacity`
+        // already tuned against this.
         let n = |c: u8| c as f32 / 255.0;
         [n(bg.r()), n(bg.g()), n(bg.b()), self.config.window.opacity]
     }
@@ -8463,7 +8499,10 @@ impl eframe::App for AlacritreeApp {
         // panel fill on top would compound the alpha through egui's blend.
         let translucent = self.config.window.opacity < 1.0;
         let sidebar_fill = if translucent { Color32::TRANSPARENT } else { theme.sidebar_bg };
-        let central_fill = if translucent { Color32::TRANSPARENT } else { theme.terminal_bg };
+        // Opaque, this fill is what a collapsed cell shows, so it tracks the
+        // terminal's background for the same reason the clear does.
+        let terminal_bg = self.grid_snapshot.default_bg(&self.config.palette);
+        let central_fill = if translucent { Color32::TRANSPARENT } else { terminal_bg };
 
         let panel_frame = Frame::default().fill(sidebar_fill).inner_margin(Margin::same(8));
 
@@ -8534,12 +8573,14 @@ impl eframe::App for AlacritreeApp {
                         ui,
                         session,
                         &self.config,
+                        &self.face_metrics,
                         allow_focus,
                         &mut self.builtin_glyphs,
                         &mut self.ime,
                         &mut self.color_glyphs,
                         &mut self.glyph_cache,
                         &mut self.grid_snapshot,
+                        Some(&self.gpu_grid),
                     );
                     self.grid_paint += started.elapsed();
                     response

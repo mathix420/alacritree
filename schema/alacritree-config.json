@@ -43,8 +43,99 @@
       "description": "One `[[keyboard.bindings]]` entry.  A binding needs `key`, plus exactly one\nof `chars`, `action` or `command` to say what pressing it does.",
       "properties": {
         "action": {
-          "description": "Named action to run, e.g. `\"Paste\"`, `\"ToggleLeftSidebar\"`.  Not\nenumerated here: the shared `alacritty.toml` legitimately carries\nactions only the real alacritty implements, and alacritree ignores\nthose rather than rejecting them.  `docs/keyboard-shortcuts.md` lists\nwhat alacritree acts on.",
-          "type": "string"
+          "anyOf": [
+            {
+              "enum": [
+                "Paste",
+                "PasteSelection",
+                "Copy",
+                "CopySelection",
+                "ScrollPageUp",
+                "ScrollPageDown",
+                "ScrollHalfPageUp",
+                "ScrollHalfPageDown",
+                "ScrollLineUp",
+                "ScrollLineDown",
+                "ScrollToTop",
+                "ScrollToBottom",
+                "ClearHistory",
+                "SpawnNewInstance",
+                "IncreaseFontSize",
+                "DecreaseFontSize",
+                "ResetFontSize",
+                "ToggleFullscreen",
+                "ToggleMaximized",
+                "Minimize",
+                "SelectNextTab",
+                "SelectPreviousTab",
+                "SelectLastTab",
+                "SelectNextSession",
+                "SelectPreviousSession",
+                "SelectNextWorkspace",
+                "SelectPreviousWorkspace",
+                "OpenScratchpad",
+                "ToggleLeftSidebar",
+                "ToggleRightSidebar",
+                "AddProject",
+                "ToggleSidebarFocus",
+                "CloseSession",
+                "SidebarTop",
+                "SidebarBottom",
+                "SidebarNextProject",
+                "SidebarPreviousProject",
+                "FocusProjectsSidebar",
+                "FocusGitSidebar",
+                "FocusTerminal",
+                "FocusLeft",
+                "FocusRight",
+                "ToggleSessionRows",
+                "ToggleSessionTabs",
+                "SetBaseBranch",
+                "SidebarSearchConfirm",
+                "SidebarSearchCancel",
+                "SidebarSearchCancelToTerminal",
+                "Quit",
+                "TogglePalette",
+                "ToggleSessionsFilter",
+                "ToggleAttentionFilter",
+                "TogglePrOpenFilter",
+                "TogglePrDraftFilter",
+                "TogglePrMergedFilter",
+                "TogglePrClosedFilter",
+                "ClearProjectFilters",
+                "ToggleModifiedFilter",
+                "ToggleDeletedFilter",
+                "ToggleUntrackedFilter",
+                "ClearGitFilters",
+                "ToggleSearchScope",
+                "RefreshPrStatus",
+                "SelectTab1",
+                "SelectTab2",
+                "SelectTab3",
+                "SelectTab4",
+                "SelectTab5",
+                "SelectTab6",
+                "SelectTab7",
+                "SelectTab8",
+                "SelectTab9",
+                "SpawnProfile1",
+                "SpawnProfile2",
+                "SpawnProfile3",
+                "SpawnProfile4",
+                "SpawnProfile5",
+                "SpawnProfile6",
+                "SpawnProfile7",
+                "SpawnProfile8",
+                "SpawnProfile9",
+                "None",
+                "ReceiveChar"
+              ]
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "Named action to run, e.g. `\"Paste\"`, `\"ToggleLeftSidebar\"`.  The schema\nsuggests every name alacritree implements without rejecting the rest:\nthe shared `alacritty.toml` legitimately carries actions only the real\nalacritty implements, and alacritree ignores those rather than\nrejecting them.  `docs/keyboard-shortcuts.md` says what each one does."
         },
         "chars": {
           "description": "Bytes to write to the PTY, with the usual escapes (`\\x1b`, `\\u001b`).",
@@ -179,9 +270,39 @@
           "description": "Write an artifact when the process panics.  alacritree-only, so it\nbelongs in `alacritree.toml`.  Default `true`: a crash that leaves no\nrecord is the failure this exists to prevent.",
           "type": "boolean"
         },
+        "gpu_timing": {
+          "description": "Log what the GPU grid's paint callback costs: the wall time of\nissuing a frame, and the GPU's own time for the upload and each of\nthe three draws.  alacritree-only, so it belongs in\n`alacritree.toml`.  Default `false`; timer queries are cheap but not\nfree, and the line is only meaningful to someone reading it.  Needs\n`[ui] gpu_grid` and a GL 3.3 context.  Keeps this session's log file\nfor as long as it is on, since the report has nowhere else to go.",
+          "type": "boolean"
+        },
         "persistent_logging": {
           "description": "Keep the log file after quitting.  Upstream's name and upstream's\ndefault (`false`).",
           "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "RawDecorations": {
+      "description": "Corrections applied to what the font reports for its underline and\nstrikeout.  Each value is `\"2px\"` (physical pixels, added), `\"2pt\"` or a\nbare `\"2\"` (points, added), or `\"150%\"` (a multiplier).  Positive moves a\nline down, matching kitty and ghostty.  A percentage takes no sign.\nDefault `\"0\"`, which draws what the font asked for.",
+      "properties": {
+        "strikeout_position": {
+          "description": "Shift or scale of how far the strikeout sits from the top of the cell.",
+          "pattern": "^(-?[0-9]*\\.?[0-9]+(px|pt)?|[0-9]*\\.?[0-9]+%)$",
+          "type": "string"
+        },
+        "strikeout_thickness": {
+          "description": "Shift or scale of the strikeout bar's weight.",
+          "pattern": "^(-?[0-9]*\\.?[0-9]+(px|pt)?|[0-9]*\\.?[0-9]+%)$",
+          "type": "string"
+        },
+        "underline_position": {
+          "description": "Shift or scale of how far the underline sits from the top of the\ncell, for the straight, dotted and dashed styles.  The double and\ncurly styles are placed from the font's descent instead, so this\nknob does not reach them.",
+          "pattern": "^(-?[0-9]*\\.?[0-9]+(px|pt)?|[0-9]*\\.?[0-9]+%)$",
+          "type": "string"
+        },
+        "underline_thickness": {
+          "description": "Shift or scale of the underline's stroke weight.  Every style draws\nwith this value, including double and curly.",
+          "pattern": "^(-?[0-9]*\\.?[0-9]+(px|pt)?|[0-9]*\\.?[0-9]+%)$",
+          "type": "string"
         }
       },
       "type": "object"
@@ -921,6 +1042,10 @@
           ],
           "type": "string"
         },
+        "decorations": {
+          "$ref": "#/$defs/RawDecorations",
+          "description": "Corrections to the underline and strikeout the font placed\n([`RawDecorations`])."
+        },
         "default_profile": {
           "description": "Name of the profile new sessions use.  Must match a `[[ui.profiles]]`\nentry, or it is ignored with a warning.",
           "type": "string"
@@ -937,9 +1062,17 @@
           "$ref": "#/$defs/RawFocusOutline",
           "description": "Outline drawn around whichever pane holds keyboard focus."
         },
+        "focus_priority_boost": {
+          "description": "Put the session on screen one scheduling class above normal — its\nshell and every process that shell starts — so a busy machine cannot\nstarve what the user is typing into.  Follows focus.  Windows only.\nDefault false.",
+          "type": "boolean"
+        },
         "font": {
           "$ref": "#/$defs/RawUiFont",
           "description": "The font sidebars, tabs and dialogs are drawn with."
+        },
+        "gpu_grid": {
+          "description": "Draw the terminal grid through an OpenGL paint callback instead of\nhanding epaint a mesh.  Default `false`: it needs a GL 3 context and\nbypasses the renderer every other panel goes through, so an\nunmodified config keeps the path that has always drawn the grid.  A\ncontext too old for instanced arrays logs once and paints the mesh\nfrom the next frame on.",
+          "type": "boolean"
         },
         "icon_tooltips": {
           "description": "Whether a sidebar icon explains itself on hover: `true` (default).",
@@ -989,6 +1122,10 @@
         "project_name": {
           "description": "Template for a project row's label.",
           "type": "string"
+        },
+        "reap_descendants_on_close": {
+          "description": "End everything a session started when that session closes, at any\ndepth, except processes that ask to break away.  Windows only.\nDefault false.",
+          "type": "boolean"
         },
         "scrollbar": {
           "description": "Sidebar scrollbar style: \"floating\" (default) | \"solid\".",
