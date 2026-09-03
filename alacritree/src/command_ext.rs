@@ -4,6 +4,12 @@
 
 use std::process::Command;
 
+/// The flag that suppresses the console window.  Public because creation flags
+/// are one field: a caller that names another flag has to pass this one too
+/// rather than calling [`CommandExt::hide_console`].
+#[cfg(windows)]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 pub trait CommandExt {
     /// Suppress the console window Windows would spawn for this child. No-op
     /// elsewhere.
@@ -14,7 +20,6 @@ impl CommandExt for Command {
     #[cfg(windows)]
     fn hide_console(&mut self) -> &mut Self {
         use std::os::windows::process::CommandExt as _;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         self.creation_flags(CREATE_NO_WINDOW)
     }
 
