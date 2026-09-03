@@ -365,7 +365,7 @@ mod tests {
             .collect(),
             ..FontConfig::default()
         };
-        let chain = crate::fonts::install_terminal_fonts(ctx, &font, &UiFont::default());
+        let (chain, _) = crate::fonts::install_terminal_fonts(ctx, &font, &UiFont::default());
 
         let renders_emoji = chain.iter().find_map(|face| {
             let data = std::fs::read(&face.path).ok()?;
@@ -458,7 +458,7 @@ mod tests {
     #[test]
     fn plain_text_is_left_to_egui() {
         let ctx = Context::default();
-        let chain =
+        let (chain, _) =
             crate::fonts::install_terminal_fonts(&ctx, &FontConfig::default(), &UiFont::default());
         let mut cache = ColorGlyphCache::new(chain, 10);
         for c in ['A', 'z', '0', '─', '│'] {
@@ -510,7 +510,7 @@ mod tests {
     /// what this has to assert.
     #[test]
     fn load_returns_the_mapping_rather_than_a_copy() {
-        let path = std::env::temp_dir().join("alacritree_test_color_glyph_load.ttf");
+        let path = crate::test_util::scratch_dir().join("color_glyph_load.ttf");
         std::fs::write(&path, FIXTURE).unwrap();
 
         let mapped = crate::fonts::map_font_file(&path).expect("the fixture maps");
@@ -528,7 +528,7 @@ mod tests {
     #[test]
     fn an_unclaimed_character_is_memoized() {
         let ctx = Context::default();
-        let path = std::env::temp_dir().join("alacritree_test_unclaimed_memo.ttf");
+        let path = crate::test_util::scratch_dir().join("unclaimed_memo.ttf");
         std::fs::write(&path, FIXTURE).unwrap();
         let chain = vec![ChainFace { path, face_index: 0, color_only: false }];
         let mut cache = ColorGlyphCache::new(chain, 10);
