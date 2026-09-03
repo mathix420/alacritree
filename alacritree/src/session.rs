@@ -2266,19 +2266,25 @@ mod tests {
             "the configured cwd must not turn the home tab into a worktree workspace"
         );
 
-        let start = Instant::now();
-        loop {
-            assert!(start.elapsed() < Duration::from_secs(10), "child never exited");
-            match session.events.try_recv() {
-                Ok(TermEvent::ChildExit(_)) => break,
-                Ok(_) => {},
-                Err(_) => std::thread::sleep(Duration::from_millis(1)),
+        // Waiting for the child's exit event first would put the pty event
+        // loop's own scheduling inside the deadline alongside the write, and a
+        // loaded machine can spend longer delivering that event than the child
+        // spent running.  The file is what the assertion needs, so polling it
+        // ends the wait as soon as the answer exists.
+        let probe = dir.path().join("cwd-probe.txt");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let reported = loop {
+            if let Ok(content) = std::fs::read_to_string(&probe) {
+                if let Ok(path) = PathBuf::from(content.trim()).canonicalize() {
+                    break path;
+                }
             }
-        }
-
-        let content = std::fs::read_to_string(dir.path().join("cwd-probe.txt"))
-            .expect("no probe file: the child did not start in general.working_directory");
-        let reported = PathBuf::from(content.trim()).canonicalize().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "no probe file: the child did not start in general.working_directory"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
         assert_eq!(reported, dir.path().canonicalize().unwrap());
     }
 
