@@ -194,6 +194,11 @@ pub struct Session {
     priority_job: Option<crate::focus_priority::PriorityJob>,
     notifier: Option<Notifier>,
     sender: Option<EventLoopSender>,
+    /// Bytes written before the PTY existed, replayed by `attach`.  `Some`
+    /// only between `pending` and `attach`, which also makes it the answer to
+    /// whether this session is still opening — a scratchpad has no PTY either
+    /// and must not be mistaken for one that is coming.
+    pending_writes: Option<Vec<u8>>,
     /// Shares this session's on-screen flag with the `EventProxy` its PTY
     /// thread posts events through.
     proxy: EventProxy,
@@ -1079,6 +1084,32 @@ pub struct Attachment {
     sender: EventLoopSender,
 }
 
+impl Attachment {
+    /// Take the pieces apart without running `Drop`.  `attach` is what adopts
+    /// an opened PTY, so running the "nobody adopted this" shutdown on the
+    /// very attachment being adopted would tear down the PTY under it.
+    fn into_parts(
+        self,
+    ) -> (Option<u32>, Option<crate::focus_priority::PriorityJob>, EventLoopSender) {
+        let mut this = std::mem::ManuallyDrop::new(self);
+        let shell_pid = this.shell_pid;
+        let priority_job = this.priority_job.take();
+        // SAFETY: `this` is a `ManuallyDrop`, so its `Drop` impl never runs
+        // and `sender` is never read again after this.
+        let sender = unsafe { std::ptr::read(&this.sender) };
+        (shell_pid, priority_job, sender)
+    }
+}
+
+impl Drop for Attachment {
+    /// An attachment nobody adopted belongs to a tab that closed while its
+    /// PTY was opening.  Shutting the loop down here rather than at the call
+    /// site means a quit mid-open, or a receiver that hung up, cleans up too.
+    fn drop(&mut self) {
+        let _ = self.sender.send(Msg::Shutdown);
+    }
+}
+
 /// Open the PTY for a pending session: process creation, the job that owns
 /// it, and the event loop that drains it.  This is the part that costs
 /// milliseconds, which is why it is a free function rather than a method —
@@ -1171,6 +1202,7 @@ impl Session {
             priority_job: None,
             notifier: None,
             sender: None,
+            pending_writes: None,
             proxy,
             exited: false,
         })
@@ -1315,12 +1347,6 @@ impl Session {
         // alacritty routes OSC 7 / signals by this id, so each session needs its own.
         let window_id = next_window_id();
 
-        // Registration only needs the probe's identity, not the open PTY, so
-        // it happens here rather than waiting for attach.
-        if let Some(probe) = &wsl_probe {
-            wsl_helper::register_probe(&probe.distro, &probe.key);
-        }
-
         let session = Self {
             id,
             title,
@@ -1341,6 +1367,7 @@ impl Session {
             priority_job: None,
             notifier: None,
             sender: None,
+            pending_writes: Some(Vec::new()),
             proxy: proxy.clone(),
             exited: false,
         };
@@ -1363,11 +1390,34 @@ impl Session {
     /// one is switched on here, in one place, so there is a single answer to
     /// "when does this session become live".
     pub fn attach(&mut self, attachment: Attachment) {
-        let Attachment { shell_pid, priority_job, sender } = attachment;
+        let (shell_pid, priority_job, sender) = attachment.into_parts();
         self.shell_pid = shell_pid;
         self.priority_job = priority_job;
         self.notifier = Some(Notifier(sender.clone()));
         self.sender = Some(sender);
+
+        // The pane may have been resized while the PTY was opening, and the
+        // size the request carried is the one it was born with.
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(Msg::Resize(window_size(self.size, self.cell_size)));
+        }
+
+        // After the resize and before anything the app writes this frame, so
+        // the shell answers a buffered command at the size the pane is at
+        // rather than the one the PTY was opened with.
+        if let Some(pending) = self.pending_writes.take() {
+            if !pending.is_empty() {
+                self.notifier.as_ref().expect("attach set the notifier").notify(pending);
+            }
+        }
+
+        // Registered here rather than where the PTY is opened: `Session::drop`
+        // is the only unregister, so a probe registered for a session that no
+        // longer exists would stay in the cache and be polled for the life of
+        // the process.
+        if let Some(probe) = &self.wsl_probe {
+            wsl_helper::register_probe(&probe.distro, &probe.key);
+        }
     }
 
     /// Mark whether this session's grid is the one being painted.  Output from
@@ -1390,10 +1440,17 @@ impl Session {
         boosted
     }
 
-    pub fn write(&self, bytes: Vec<u8>) {
+    pub fn write(&mut self, bytes: Vec<u8>) {
         if let Some(notifier) = &self.notifier {
             notifier.notify(bytes);
+        } else if let Some(pending) = self.pending_writes.as_mut() {
+            pending.extend(bytes);
         }
+    }
+
+    /// Whether this session is waiting for a PTY that is on its way.
+    pub fn is_pending(&self) -> bool {
+        self.pending_writes.is_some()
     }
 
     /// Pull every pending event out of the PTY channel.  Called once per frame
@@ -1454,12 +1511,12 @@ impl Session {
         }
         self.size = size;
         self.cell_size = cell_size;
-        let ws = window_size(size, cell_size);
+        self.term.lock().resize(size);
         let Some(sender) = &self.sender else {
             return;
         };
+        let ws = window_size(size, cell_size);
         let _ = sender.send(Msg::Resize(ws));
-        self.term.lock().resize(size);
     }
 
     pub fn is_exited(&self) -> bool {
@@ -1929,7 +1986,7 @@ mod tests {
         let mut config = Config::default();
         config.env.insert("TERM".to_string(), "xterm-256color".to_string());
 
-        let session = Session::spawn_command(
+        let mut session = Session::spawn_command(
             egui::Context::default(),
             &config,
             std::env::current_dir().ok(),
@@ -2025,6 +2082,7 @@ mod tests {
             priority_job: None,
             notifier: None,
             sender: None,
+            pending_writes: None,
             proxy,
             exited: false,
         }
@@ -2696,5 +2754,115 @@ mod tests {
         user.insert("ALACRITREE_SESSION_ID".to_string(), "999".to_string());
         let env = session_env(&user, &SessionKind::Shell, 7);
         assert_eq!(env.get("ALACRITREE_SESSION_ID").map(String::as_str), Some("7"));
+    }
+
+    #[test]
+    fn an_open_request_can_move_to_the_thread_that_opens_the_pty() {
+        fn assert_send<T: Send>() {}
+        assert_send::<OpenRequest>();
+    }
+
+    /// Poll the grid until `needle` appears, or fail saying what was there
+    /// instead.  A deadline rather than a sleep: the shells these tests drive
+    /// take wildly different times to come up on a loaded runner.
+    fn grid_contains(session: &Session, needle: &str, patience: Duration) -> bool {
+        let deadline = Instant::now() + patience;
+        while Instant::now() < deadline {
+            let text: String = {
+                let term = session.term.lock();
+                term.grid().display_iter().map(|cell| cell.c).collect()
+            };
+            if text.contains(needle) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        false
+    }
+
+    /// Input typed into a tab whose PTY is still opening has to arrive, and
+    /// in order.  Under load that gap is long enough to swallow a command.
+    #[cfg(windows)]
+    #[test]
+    fn input_written_before_attach_arrives_before_input_written_after() {
+        let mut config = Config::default();
+        config.env.insert("TERM".to_string(), "xterm-256color".to_string());
+        let (mut session, request) = Session::pending_command(
+            egui::Context::default(),
+            &config,
+            std::env::current_dir().ok(),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            "cmd.exe".to_string(),
+            vec!["/q".to_string(), "/k".to_string(), "prompt $g".to_string()],
+            "probe".to_string(),
+            SessionKind::Shell,
+        );
+
+        session.write(b"echo alpha\r\n".to_vec());
+        session.attach(open(request).expect("open the pty"));
+        session.write(b"echo beta\r\n".to_vec());
+
+        assert!(
+            grid_contains(&session, "beta", Duration::from_secs(20)),
+            "the shell never answered the write made after attach"
+        );
+        let text: String = session.term.lock().grid().display_iter().map(|cell| cell.c).collect();
+        let alpha = text.find("alpha").expect("the write made before attach was dropped");
+        let beta = text.find("beta").expect("the write made after attach was dropped");
+        assert!(alpha < beta, "buffered input was replayed out of order");
+    }
+
+    /// A pending session's grid tracks the pane it is drawn in.  Without
+    /// this the shell prints its first prompt into a grid that is about to
+    /// be reflowed under it.
+    #[test]
+    fn a_resize_before_attach_reaches_the_grid() {
+        let (mut session, _request) = Session::pending_command(
+            egui::Context::default(),
+            &Config::default(),
+            None,
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            "cmd.exe".to_string(),
+            vec![],
+            "probe".to_string(),
+            SessionKind::Shell,
+        );
+
+        session.resize(TermSize::new(120, 40), (8.0, 16.0));
+
+        assert_eq!(session.term.lock().screen_lines(), 40);
+        assert_eq!(session.term.lock().columns(), 120);
+    }
+
+    /// The size the PTY is opened at is the size the request carried, so a
+    /// pane resized while it was opening has to be replayed — and replayed
+    /// before any buffered input, or the shell answers at the old width.
+    #[cfg(windows)]
+    #[test]
+    fn a_resize_before_attach_reaches_the_pty() {
+        let mut config = Config::default();
+        config.env.insert("TERM".to_string(), "xterm-256color".to_string());
+        let (mut session, request) = Session::pending_command(
+            egui::Context::default(),
+            &config,
+            std::env::current_dir().ok(),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            "cmd.exe".to_string(),
+            vec!["/q".to_string(), "/k".to_string(), "prompt $g".to_string()],
+            "probe".to_string(),
+            SessionKind::Shell,
+        );
+
+        session.resize(TermSize::new(120, 40), (8.0, 16.0));
+        session.write(b"mode con\r\n".to_vec());
+        session.attach(open(request).expect("open the pty"));
+
+        assert!(
+            grid_contains(&session, "120", Duration::from_secs(20)),
+            "the child sees the size the PTY was opened at, not the one the pane ended up at"
+        );
     }
 }

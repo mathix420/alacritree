@@ -357,7 +357,7 @@ fn peek_term(
 fn handle_selection(
     ui: &Ui,
     response: &Response,
-    session: &Session,
+    session: &mut Session,
     config: &Config,
     rect: Rect,
     cell_w: f32,

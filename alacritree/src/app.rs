@@ -1837,14 +1837,13 @@ impl AlacritreeApp {
                     );
                     return;
                 };
-                let session = &self.sessions[idx];
                 let text = file_drop::shell_payload(
                     &paths,
-                    session.wsl_distro(),
+                    self.sessions[idx].wsl_distro(),
                     &self.config.ui.drop.spelling,
                 );
                 if !text.is_empty() {
-                    paste::paste(session, &text, true);
+                    paste::paste(&mut self.sessions[idx], &text, true);
                 }
             },
             file_drop::Target::Scratchpad => {
@@ -3035,7 +3034,7 @@ impl AlacritreeApp {
         if let Some(editor) = self.sessions[idx].scratchpad.as_mut() {
             editor.insert_at_cursor(ctx, id, text);
         } else {
-            paste::paste(&self.sessions[idx], text, true);
+            paste::paste(&mut self.sessions[idx], text, true);
         }
     }
 
@@ -8653,7 +8652,7 @@ impl AlacritreeApp {
                 if let Some(editor) = self.sessions[idx].scratchpad.as_mut() {
                     editor.insert_at_cursor(ctx, session_id, &text);
                 } else {
-                    let session = &self.sessions[idx];
+                    let session = &mut self.sessions[idx];
                     paste::on_terminal_input_start(session);
                     session.write(text.into_bytes());
                 }
