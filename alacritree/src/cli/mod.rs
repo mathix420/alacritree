@@ -42,6 +42,17 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     socket: Option<PathBuf>,
 
+    /// Read alacritty.toml and alacritree.toml from this directory instead of
+    /// the search path. A file missing there is missing, not looked up
+    /// elsewhere.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub config_dir: Option<PathBuf>,
+
+    /// Write this session's log here instead of under the log directory. Turns
+    /// logging on by itself, so the file is never empty.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub log_file: Option<PathBuf>,
+
     /// Print the licence for the bundled symbol font and exit.
     #[arg(long)]
     licenses: bool,
@@ -240,14 +251,18 @@ pub fn run(cli: Cli) -> Option<i32> {
         },
         // Diagnosing the machine is not something a running instance can answer:
         // the report has to be truthful when there is nothing to ask.
-        Command::Doctor => return Some(doctor::run(cli.json, cli.socket.as_deref())),
+        Command::Doctor => {
+            return Some(doctor::run(cli.json, cli.socket.as_deref(), cli.config_dir.as_deref()));
+        },
         // Reads files rather than asking an instance, so it answers when
         // nothing is running — which is exactly when a crash is being chased.
         Command::Crashes { all } => return Some(crashes::run(cli.json, all)),
         Command::Install { dest } => return Some(install::run(dest, cli.json)),
         // Generated from the config types in this binary, so it answers with
         // no instance running and no config on disk.
-        Command::Schema { command } => return Some(run_schema(command)),
+        Command::Schema { command } => {
+            return Some(run_schema(command, cli.config_dir.as_deref()));
+        },
         #[cfg(debug_assertions)]
         Command::ProvokeLockPanic => {
             crate::crash_log::provoke_lock_panic();
@@ -259,14 +274,14 @@ pub fn run(cli: Cli) -> Option<i32> {
     Some(execute(&request, cli.socket.as_deref(), cli.json))
 }
 
-fn run_schema(command: Option<SchemaCommand>) -> i32 {
+fn run_schema(command: Option<SchemaCommand>, config_dir: Option<&Path>) -> i32 {
     match command {
         None => {
             schema::print();
             0
         },
         Some(SchemaCommand::Init { path }) => {
-            let path = path.unwrap_or_else(schema::default_config_path);
+            let path = path.unwrap_or_else(|| schema::default_config_path(config_dir));
             match schema::init(&path) {
                 Ok(()) => 0,
                 Err(e) => {

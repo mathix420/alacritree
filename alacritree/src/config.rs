@@ -1515,6 +1515,15 @@ fn installed_config(stem: &str, suffix: &str) -> Option<PathBuf> {
     candidate.exists().then_some(candidate)
 }
 
+/// One config file inside an explicitly named directory.  Both stems resolve
+/// there and nowhere else, so a directory holding only `alacritree.toml` runs
+/// without an `alacritty.toml` rather than quietly merging the installed one:
+/// an override the search path can still reach is not an override.
+fn named_config(dir: &Path, stem: &str, suffix: &str) -> Option<PathBuf> {
+    let candidate = dir.join(format!("{stem}.{suffix}"));
+    candidate.exists().then_some(candidate)
+}
+
 /// Where an `alacritree.toml` belongs when none exists yet: the head of the
 /// search path, so a file written there is the one [`load`] picks up.
 pub fn preferred_alacritree_path() -> PathBuf {
@@ -1538,8 +1547,8 @@ fn alacritty_config_dir() -> PathBuf {
 
 /// Load the config, and report which files it came from so the startup log
 /// can record them.
-pub fn load() -> (Config, Vec<ConfigFile>) {
-    let (files, merged) = assemble();
+pub fn load(config_dir: Option<&Path>) -> (Config, Vec<ConfigFile>) {
+    let (files, merged) = assemble(config_dir);
     for file in &files {
         if let (Some(path), Some(e)) = (&file.path, &file.error) {
             log::warn!("failed to load {}: {e}", path.display());
@@ -1580,8 +1589,8 @@ pub struct ConfigDiagnosis {
     pub schema_error: Option<String>,
 }
 
-pub fn diagnose() -> ConfigDiagnosis {
-    let (files, merged) = assemble();
+pub fn diagnose(config_dir: Option<&Path>) -> ConfigDiagnosis {
+    let (files, merged) = assemble(config_dir);
     let schema_error = merged.try_into::<RawConfig>().err().map(|e| e.to_string());
     ConfigDiagnosis { files, schema_error }
 }
@@ -1589,12 +1598,15 @@ pub fn diagnose() -> ConfigDiagnosis {
 /// Read both config files off the search path and merge them, alacritree over
 /// alacritty.  A file that fails to parse contributes nothing and is reported
 /// through its [`ConfigFile::error`].
-fn assemble() -> (Vec<ConfigFile>, toml::Value) {
+fn assemble(config_dir: Option<&Path>) -> (Vec<ConfigFile>, toml::Value) {
     let mut merged = toml::Value::Table(toml::value::Table::new());
     let mut files = Vec::new();
 
     for stem in ["alacritty", "alacritree"] {
-        let path = installed_config(stem, "toml");
+        let path = match config_dir {
+            Some(dir) => named_config(dir, stem, "toml"),
+            None => installed_config(stem, "toml"),
+        };
         let mut error = None;
         match path.as_deref().map(read_toml_value) {
             Some(Ok(Some(value))) => merged = merge(merged, value),
@@ -2936,6 +2948,62 @@ fn build_profiles(raw: Vec<RawProfile>) -> Vec<Profile> {
 
 #[cfg(test)]
 mod tests {
+    /// A config directory holding the given files, kept alive by the caller.
+    fn config_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        for (name, body) in files {
+            std::fs::write(dir.path().join(name), body).expect("write a config file");
+        }
+        dir
+    }
+
+    #[test]
+    fn a_named_directory_supplies_both_config_files() {
+        let dir = config_dir(&[
+            ("alacritty.toml", "[terminal.shell]\nprogram = \"nu\"\n"),
+            ("alacritree.toml", "[ui]\nasync_session_spawn = true\n"),
+        ]);
+
+        let (config, files) = super::load(Some(dir.path()));
+
+        assert!(config.ui.async_session_spawn, "alacritree.toml applies");
+        assert_eq!(
+            config.shell.as_ref().map(|s| s.program.as_str()),
+            Some("nu"),
+            "alacritty.toml applies, so the two still merge"
+        );
+        for file in &files {
+            assert_eq!(
+                file.path.as_deref().and_then(|p| p.parent()),
+                Some(dir.path()),
+                "{} came from the named directory",
+                file.stem
+            );
+        }
+    }
+
+    /// The point of the override: a directory with no `alacritty.toml` runs
+    /// without one. Falling back to the search path for the missing half would
+    /// silently mix the machine's real config into a run meant to be isolated.
+    #[test]
+    fn a_file_absent_from_the_named_directory_is_not_looked_up_elsewhere() {
+        let dir = config_dir(&[("alacritree.toml", "[ui]\ngpu_grid = true\n")]);
+
+        let (_, files) = super::load(Some(dir.path()));
+
+        let alacritty = files.iter().find(|f| f.stem == "alacritty").expect("both stems reported");
+        assert_eq!(alacritty.path, None, "the installed alacritty.toml is not reached");
+    }
+
+    #[test]
+    fn an_empty_named_directory_yields_the_stock_config() {
+        let dir = config_dir(&[]);
+
+        let (config, _) = super::load(Some(dir.path()));
+
+        assert_eq!(config.changed_from_defaults(), None);
+    }
+
     use super::*;
 
     /// The `Config` `toml` resolves to, defaults filled in as `load` fills

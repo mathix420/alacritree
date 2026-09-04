@@ -145,8 +145,8 @@ pub fn init(path: &Path) -> Result<(), String> {
 
 /// Where `schema init` writes when given no path: the `alacritree.toml`
 /// already in use, or the one the search path would pick up next.
-pub fn default_config_path() -> PathBuf {
-    crate::config::diagnose()
+pub fn default_config_path(config_dir: Option<&Path>) -> PathBuf {
+    crate::config::diagnose(config_dir)
         .files
         .into_iter()
         .find(|f| f.stem == "alacritree")
