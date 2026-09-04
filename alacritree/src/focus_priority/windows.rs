@@ -244,6 +244,9 @@ mod tests {
 
     /// `class` of zero leaves the choice to Windows, for the one test whose
     /// subject is there to report that choice.
+    // `hidden` fixes the creation flags, and this needs a priority class ORed
+    // into them; it sets CREATE_NO_WINDOW itself.
+    #[allow(clippy::disallowed_methods)]
     fn spawn(class: u32, args: [&str; 2]) -> Subject {
         use std::os::windows::process::CommandExt as _;
 
@@ -604,6 +607,9 @@ mod tests {
         // one still has to clean up after itself.
         for member in &survivors {
             let pid = member.pid.to_string();
+            // Test cleanup on a thread of its own: no UI thread to hold, and
+            // the console is already hidden.
+            #[allow(clippy::disallowed_methods)]
             let _ =
                 Command::new("taskkill").args(["/F", "/T", "/PID", &pid]).hide_console().output();
         }
@@ -640,6 +646,9 @@ mod tests {
     /// console host, so a test run leaves the desktop alone.
     #[test]
     #[ignore = "the escaping child a reaping test runs as its session's shell"]
+    // DETACHED_PROCESS is the subject of the test, so `hidden`'s
+    // CREATE_NO_WINDOW would spawn the wrong kind of child.
+    #[allow(clippy::disallowed_methods)]
     fn a_child_that_leaves_the_console() {
         use std::os::windows::process::CommandExt as _;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
