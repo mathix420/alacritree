@@ -344,15 +344,19 @@ impl Timing {
         Self { slice: Duration::from_secs(5), silence_limit: Duration::from_secs(30) };
 }
 
+/// A slice whose own sleep ran well past what it asked for was descheduled,
+/// so the silence it measured says nothing about the far end.
+fn starved(asked: Duration, slept: Duration) -> bool {
+    slept > asked.saturating_mul(2)
+}
+
 /// Whether an expired slice is evidence the transport is dead.
 ///
-/// `slept` past twice `asked` means the waiter's own sleep overran, so the
-/// host was starved and nothing measured under it is evidence of anything.
 /// `silence` is how long the caller has *observed* no bytes, which is not
 /// the same as how old the last byte is: after a resume the last byte is
 /// legitimately hours old with nobody watching.
 fn wedged(timing: &Timing, asked: Duration, slept: Duration, silence: Duration) -> bool {
-    slept <= asked * 2 && silence > timing.silence_limit
+    !starved(asked, slept) && silence > timing.silence_limit
 }
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -635,7 +639,7 @@ impl HelperClient {
             }
             let slept = slice_start.elapsed();
             let silence = self.silent_for().min(watching_since.elapsed());
-            if slept > asked * 2 {
+            if starved(asked, slept) {
                 watching_since = Instant::now();
             }
             if wedged(&self.timing, asked, slept, silence) {
@@ -1131,6 +1135,29 @@ mod tests {
     }
 
     #[test]
+    fn a_punctual_slice_is_not_starved() {
+        assert!(!starved(Duration::from_secs(5), Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_slice_at_exactly_twice_its_ask_is_not_starved() {
+        assert!(!starved(Duration::from_secs(5), Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn a_slice_past_twice_its_ask_is_starved() {
+        assert!(starved(
+            Duration::from_secs(5),
+            Duration::from_secs(10) + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn starved_saturates_rather_than_overflows_on_a_huge_ask() {
+        assert!(!starved(Duration::MAX, Duration::from_secs(5)));
+    }
+
+    #[test]
     fn a_client_that_has_never_read_reports_its_whole_life_as_silence() {
         // The helper end is bound rather than dropped: dropping it closes the
         // pipe, which the reader would correctly read as EOF and tear down.
@@ -1238,12 +1265,15 @@ mod tests {
 
     #[test]
     fn silence_older_than_the_wait_is_not_the_waiter_s_to_judge() {
+        // Wide margin on purpose: this runs alongside other `wsl_helper`
+        // tests under nextest's parallel execution, and a scheduling delay
+        // here must never read the same as a genuine clamp regression.
         let timing =
-            Timing { slice: Duration::from_millis(50), silence_limit: Duration::from_millis(300) };
+            Timing { slice: Duration::from_millis(50), silence_limit: Duration::from_secs(1) };
         let (client, helper) = FakeHelper::with_timing(timing);
         // The client has been quiet longer than the limit before the request is
         // even sent; only silence observed after it counts.
-        std::thread::sleep(Duration::from_millis(400));
+        std::thread::sleep(Duration::from_millis(1200));
         let answering = std::thread::spawn(move || {
             while let Ok(sent) = helper.from_client.recv_timeout(Duration::from_secs(10)) {
                 if sent == b"0\tPING\n" {
