@@ -565,6 +565,11 @@ pub struct AlacritreeApp {
     /// How much of the frame in progress went to painting the terminal grid,
     /// as opposed to the sidebars and everything else sharing it.
     grid_paint: std::time::Duration,
+    /// Geometry of the terminal pane as `terminal_view` last painted it.  A
+    /// session spawned into an empty workspace is born at this size rather
+    /// than at a constant, so a shell fast enough to print before the first
+    /// paint prints into the grid it will keep.
+    last_pane_geometry: Option<(TermSize, (f32, f32))>,
     /// In-flight background re-discoveries, keyed by project root.  Neither
     /// backend may block paint: wsl.exe takes seconds while the distro VM
     /// boots, and git2 takes tens of milliseconds on a project with many
@@ -953,6 +958,7 @@ impl AlacritreeApp {
             frame_log: crate::frame_log::FrameLog::from_env(),
             phases: crate::frame_log::Phases::new(),
             grid_paint: std::time::Duration::ZERO,
+            last_pane_geometry: None,
             project_refreshes: Default::default(),
             project_refresh_jobs: HashMap::new(),
             pending_spawns: Default::default(),
@@ -1303,15 +1309,18 @@ impl AlacritreeApp {
         // The PTY is born at the geometry it will keep.  Under the gate this
         // matters: a session that opened at 80x24 and was resized on attach
         // makes a fast shell print its first prompt into a grid that is about
-        // to be reflowed under it.  `active_session_index` is `None` for the
-        // constructor (no session yet) and for a respawn after
-        // `close_session` (the active entry is removed before the respawn
-        // spawns); both fall back to the same 80x24 a first launch always
-        // used, rather than reaching for `self.sessions.last()`.
-        let (size, cell_size) = self
+        // to be reflowed under it.  Three tiers, most exact first: the active
+        // session's own numbers when one exists; the terminal pane's last
+        // painted size when it doesn't, which covers a respawn after
+        // `close_session` removes the active entry before the replacement
+        // spawns; 80x24 when neither is available, which only the
+        // constructor reaches, since no frame has painted yet to leave a
+        // better number behind.  Never `self.sessions.last()`, an arbitrary
+        // session possibly in another workspace at a different pane size.
+        let active = self
             .active_session_index()
-            .map(|idx| (self.sessions[idx].size, self.sessions[idx].cell_size))
-            .unwrap_or((TermSize::new(80, 24), (8.0, 16.0)));
+            .map(|idx| (self.sessions[idx].size, self.sessions[idx].cell_size));
+        let (size, cell_size) = spawn_geometry(active, self.last_pane_geometry);
         let (session, request) = Session::pending_shell(
             ctx.clone(),
             &self.config,
@@ -4735,6 +4744,16 @@ impl AlacritreeApp {
             if let SessionKind::Diff { key } = &s.kind { Some(key.clone()) } else { None }
         })
     }
+}
+
+/// Geometry a new PTY is born at, most exact source first: the active
+/// session's own numbers, then the terminal pane's last painted size, then
+/// the constant neither has anything to improve on.
+fn spawn_geometry(
+    active: Option<(TermSize, (f32, f32))>,
+    last_pane: Option<(TermSize, (f32, f32))>,
+) -> (TermSize, (f32, f32)) {
+    active.or(last_pane).unwrap_or((TermSize::new(80, 24), (8.0, 16.0)))
 }
 
 /// git arguments (everything after `git`) for the requested diff — shared
@@ -9095,6 +9114,7 @@ impl eframe::App for AlacritreeApp {
                         &mut self.detached_jobs,
                     );
                     self.grid_paint += started.elapsed();
+                    self.last_pane_geometry = Some((session.size, session.cell_size));
                     response
                 };
                 // egui fake-clicks the natively focused widget on Space/Enter,
@@ -9328,6 +9348,35 @@ mod tests {
             "git worktree remove {path}: fatal: '{path}' cannot be locked: filesystem error"
         );
         assert!(!refused_for_unsaved_work(&message));
+    }
+
+    #[test]
+    fn spawn_geometry_prefers_the_active_session_over_the_last_painted_pane() {
+        let active = Some((TermSize::new(120, 40), (9.0, 18.0)));
+        let last_pane = Some((TermSize::new(80, 24), (8.0, 16.0)));
+
+        let (size, cell_size) = spawn_geometry(active, last_pane);
+
+        assert_eq!((size.columns, size.screen_lines), (120, 40));
+        assert_eq!(cell_size, (9.0, 18.0));
+    }
+
+    #[test]
+    fn spawn_geometry_falls_back_to_the_last_painted_pane_without_an_active_session() {
+        let last_pane = Some((TermSize::new(120, 40), (9.0, 18.0)));
+
+        let (size, cell_size) = spawn_geometry(None, last_pane);
+
+        assert_eq!((size.columns, size.screen_lines), (120, 40));
+        assert_eq!(cell_size, (9.0, 18.0));
+    }
+
+    #[test]
+    fn spawn_geometry_falls_back_to_80x24_before_anything_has_painted() {
+        let (size, cell_size) = spawn_geometry(None, None);
+
+        assert_eq!((size.columns, size.screen_lines), (80, 24));
+        assert_eq!(cell_size, (8.0, 16.0));
     }
 
     #[test]
