@@ -1027,6 +1027,10 @@
     },
     "RawUi": {
       "properties": {
+        "async_session_spawn": {
+          "description": "Open a session's PTY on a worker rather than in the frame that asked\nfor it, so spawning does not stutter.  Default false.",
+          "type": "boolean"
+        },
         "attention_grace_ms": {
           "description": "Grace window in milliseconds before an attention trigger pings; a\nsession that resumes work inside it swallows the ping.  Default 0.",
           "format": "uint64",

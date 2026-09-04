@@ -395,6 +395,14 @@ focus_priority_boost = false  # Windows only, restart required — put the
                               # commands that live only a moment. Follows
                               # focus, and raises nothing while the window is
                               # in the background
+async_session_spawn = false   # open a session's PTY on a worker rather than
+                              # in the frame that asked for it, so spawning
+                              # does not stutter (default false).
+                              # Creating a console process costs milliseconds
+                              # when the machine is idle and hundreds when it is
+                              # busy, and the frame pays all of it. The tab
+                              # appears at once and starts painting when its PTY
+                              # attaches; anything typed in between is replayed
 reap_descendants_on_close = false  # Windows only, restart required — when a
                               # session closes, end everything it started at
                               # any depth (default false).

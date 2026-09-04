@@ -1037,6 +1037,13 @@ pub struct UiTheme {
     /// user is typing into.  Follows focus, and raises nothing while the
     /// window is in the background.  Off by default.  Windows only.
     pub focus_priority_boost: bool,
+    /// `[ui] async_session_spawn`: open a session's PTY on a worker instead
+    /// of inside the frame that asked for it.  Creating a console process
+    /// costs milliseconds when the machine is idle and hundreds when it is
+    /// busy, and the frame pays all of it, so the click that opens a tab is
+    /// what stutters.  The tab appears at once and starts painting when its
+    /// PTY attaches; anything typed in between is replayed.  Off by default.
+    pub async_session_spawn: bool,
     /// `[ui] reap_descendants_on_close`: end everything a session started when
     /// that session closes, at any depth.  The console reaps only the clients
     /// attached to it, so a process that left the console — an editor's search
@@ -1095,6 +1102,7 @@ impl Default for UiTheme {
             scrollbar: ScrollbarStyle::Floating,
             sidebar_click_focus: false,
             focus_priority_boost: false,
+            async_session_spawn: false,
             reap_descendants_on_close: false,
             vsync: true,
             worktree_name: None,
@@ -2181,6 +2189,9 @@ struct RawUi {
     /// starve what the user is typing into.  Follows focus.  Windows only.
     /// Default false.
     focus_priority_boost: Option<bool>,
+    /// Open a session's PTY on a worker rather than in the frame that asked
+    /// for it, so spawning does not stutter.  Default false.
+    async_session_spawn: Option<bool>,
     /// End everything a session started when that session closes, at any
     /// depth, except processes that ask to break away.  Windows only.
     /// Default false.
@@ -2419,6 +2430,7 @@ impl RawConfig {
             scrollbar: parse_scrollbar(self.ui.scrollbar.as_deref()),
             sidebar_click_focus: self.ui.sidebar_click_focus.unwrap_or(false),
             focus_priority_boost: self.ui.focus_priority_boost.unwrap_or(false),
+            async_session_spawn: self.ui.async_session_spawn.unwrap_or(false),
             reap_descendants_on_close: self.ui.reap_descendants_on_close.unwrap_or(false),
             vsync: self.ui.vsync.unwrap_or(true),
             worktree_name: self.ui.worktree_name.clone().filter(|t| !t.trim().is_empty()),
