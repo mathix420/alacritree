@@ -1,13 +1,16 @@
-//! Create and delete git worktrees on a background thread, streaming progress
-//! back to the UI via an `mpsc` channel.
+//! Create, delete, and prune git worktrees off the UI thread.
+//!
+//! Creation streams its progress back over an `mpsc` channel as each step
+//! starts; deletion and pruning report their single result through a
+//! `jobs::Job`. Both submit to the shared pool rather than spawning their
+//! own thread.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
-use std::thread;
 
 use crate::command_ext::CommandExt;
-use crate::wsl;
+use crate::{jobs, wsl};
 
 #[derive(Debug, Clone)]
 pub enum Progress {
@@ -57,26 +60,38 @@ pub fn validate_branch_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Run [`create`] on a background thread, waking the UI for each step.
-pub fn spawn_create(req: CreateRequest, ctx: egui::Context) -> Receiver<Progress> {
+/// Run [`create`] on the pool, waking the UI for each step.  A worktree
+/// create is user-initiated, so it runs at interactive priority.  The
+/// streamed progress travels over the channel; the returned `Job` carries no
+/// result of its own and exists only to be held — dropping it would cancel
+/// the create before it starts.
+pub fn spawn_create(req: CreateRequest, ctx: egui::Context) -> (Receiver<Progress>, jobs::Job<()>) {
     let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let result = create(&req, |step| {
-            let _ = tx.send(Progress::Step(step.to_string()));
-            ctx.request_repaint();
-        });
+    let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
+        let result = create(
+            &req,
+            |step| {
+                let _ = tx.send(Progress::Step(step.to_string()));
+                ctx.request_repaint();
+            },
+            blocking,
+        );
         let _ = tx.send(Progress::Done(result));
         ctx.request_repaint();
     });
-    rx
+    (rx, job)
 }
 
 /// Create the worktree on the calling thread, reporting each step as it starts.
 ///
 /// Nothing here needs a window, so callers without one (the CLI, with no
-/// running app to talk to) drive this directly rather than through
-/// [`spawn_create`].
-pub fn create(req: &CreateRequest, mut on_step: impl FnMut(&str)) -> Result<PathBuf, String> {
+/// running app to talk to) drive this directly through [`jobs::on_this_thread`]
+/// rather than through [`spawn_create`].
+pub fn create(
+    req: &CreateRequest,
+    mut on_step: impl FnMut(&str),
+    blocking: &jobs::Blocking,
+) -> Result<PathBuf, String> {
     let send = &mut on_step;
 
     send("Syncing with remote…");
@@ -97,7 +112,8 @@ pub fn create(req: &CreateRequest, mut on_step: impl FnMut(&str)) -> Result<Path
     run_git(&req.project_root, &["fetch", "origin", &base])?;
 
     send("Creating git worktree…");
-    let target = pick_worktree_path(&req.project_root, &req.branch, req.base_dir.as_deref())?;
+    let target =
+        pick_worktree_path(&req.project_root, &req.branch, req.base_dir.as_deref(), blocking)?;
     let target_arg = git_path_arg(&req.project_root, &target)?;
     run_git(&req.project_root, &["worktree", "add", &target_arg, "-b", &req.branch, &base_ref])?;
 
@@ -115,7 +131,7 @@ pub fn create(req: &CreateRequest, mut on_step: impl FnMut(&str)) -> Result<Path
         send("Enabled Claude Code terminal bell");
     }
 
-    let linked = crate::doppler::mirror_scopes(&req.project_root, &target);
+    let linked = crate::doppler::mirror_scopes(&req.project_root, &target, blocking);
     if linked > 0 {
         send(&format!("Linked {linked} Doppler scope(s)"));
     }
@@ -171,6 +187,7 @@ fn git_path_arg(repo: &Path, path: &Path) -> Result<String, String> {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // Running git is this function's job.
 fn run_git(cwd: &Path, args: &[&str]) -> Result<(), String> {
     let output = git_command(cwd)
         .args(args)
@@ -187,6 +204,7 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<(), String> {
     Err(format!("git {}: {msg}", args.join(" ")))
 }
 
+#[allow(clippy::disallowed_methods)] // Running git is this function's job.
 fn has_remote(cwd: &Path, name: &str) -> bool {
     git_command(cwd)
         .args(["remote", "get-url", name])
@@ -201,7 +219,8 @@ fn has_remote(cwd: &Path, name: &str) -> bool {
 /// short names, in git's ref order.  Shells out through [`git_command`]
 /// rather than using git2 so WSL worktrees resolve the same way everything
 /// else in this module does.
-pub fn list_branches(cwd: &Path) -> Result<Vec<String>, String> {
+#[allow(clippy::disallowed_methods)] // Running git is this function's job.
+pub fn list_branches(cwd: &Path, _blocking: &jobs::Blocking) -> Result<Vec<String>, String> {
     let output = git_command(cwd)
         .args(["for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes/origin"])
         .stdout(Stdio::piped())
@@ -268,6 +287,7 @@ fn resolve_base_branch(cwd: &Path, hint: Option<&str>) -> Result<(String, String
     Err(tried)
 }
 
+#[allow(clippy::disallowed_methods)] // Running git is this function's job.
 fn rev_parse_verify(cwd: &Path, name: &str) -> bool {
     git_command(cwd)
         .args(["rev-parse", "--verify", "--quiet", name])
@@ -282,6 +302,7 @@ fn rev_parse_verify(cwd: &Path, name: &str) -> bool {
 ///   ref: refs/heads/main\tHEAD
 ///   <sha>\tHEAD
 /// We pull the `refs/heads/<name>` from the symref line.
+#[allow(clippy::disallowed_methods)] // Running git is this function's job.
 fn query_origin_head(cwd: &Path) -> Option<String> {
     let output = git_command(cwd)
         .args(["ls-remote", "--symref", "origin", "HEAD"])
@@ -309,8 +330,13 @@ fn query_origin_head(cwd: &Path) -> Option<String> {
 /// directory and stay grouped per app; a configured `workspace.worktree_dir`
 /// relocates them.  The path hash disambiguates same-named repos in different
 /// locations.
-fn pick_worktree_path(repo: &Path, branch: &str, base: Option<&Path>) -> Result<PathBuf, String> {
-    let parent = project_worktree_dir(repo, base)?;
+fn pick_worktree_path(
+    repo: &Path,
+    branch: &str,
+    base: Option<&Path>,
+    blocking: &jobs::Blocking,
+) -> Result<PathBuf, String> {
+    let parent = project_worktree_dir(repo, base, blocking)?;
     std::fs::create_dir_all(&parent)
         .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
     let safe_branch: String =
@@ -329,7 +355,11 @@ fn pick_worktree_path(repo: &Path, branch: &str, base: Option<&Path>) -> Result<
 /// using the *distro's* home for WSL repos so the worktree stays on the Linux
 /// filesystem next to its repo instead of crossing onto 9P-mounted NTFS.  The
 /// path hash disambiguates same-named repos in different locations.
-fn project_worktree_dir(repo: &Path, base: Option<&Path>) -> Result<PathBuf, String> {
+fn project_worktree_dir(
+    repo: &Path,
+    base: Option<&Path>,
+    blocking: &jobs::Blocking,
+) -> Result<PathBuf, String> {
     let base = match base {
         Some(dir) => dir.to_path_buf(),
         None => {
@@ -338,7 +368,7 @@ fn project_worktree_dir(repo: &Path, base: Option<&Path>) -> Result<PathBuf, Str
                     home::home_dir().ok_or_else(|| "could not locate home directory".to_string())?
                 },
                 wsl::Location::Wsl { distro, .. } => {
-                    let stdout = wsl::run_batch(&distro, r#"printf '%s' "$HOME""#, &[])
+                    let stdout = wsl::run_batch(&distro, r#"printf '%s' "$HOME""#, &[], blocking)
                         .map_err(|e| format!("could not query WSL home: {e}"))?;
                     let linux_home = String::from_utf8_lossy(&stdout).trim().to_string();
                     if linux_home.is_empty() {
@@ -455,6 +485,7 @@ pub fn delete_worktree(
     worktree_path: &Path,
     branch: Option<&str>,
     force: bool,
+    blocking: &jobs::Blocking,
 ) -> Result<(), String> {
     let path_arg = git_path_arg(project_root, worktree_path)?;
     // Resolve before removal: canonicalize needs the directory to still
@@ -471,7 +502,7 @@ pub fn delete_worktree(
         // Branch may already be gone (e.g. detached HEAD) — ignore errors here.
         let _ = run_git(project_root, &["branch", "-D", branch]);
     }
-    let cleaned = crate::doppler::forget_scopes(&scope_root);
+    let cleaned = crate::doppler::forget_scopes(&scope_root, blocking);
     if cleaned > 0 {
         log::info!("dropped {cleaned} doppler scope(s) under {}", scope_root.display());
     }
@@ -486,29 +517,28 @@ pub enum DeleteJob {
     Prune { worktree_name: String, branch: Option<String>, delete_branch: bool },
 }
 
-/// Run a [`DeleteJob`] off the UI thread, waking the window when it finishes.
-/// The git shellouts and doppler cleanup are slow enough to stutter paint, so
-/// the caller confirms the dialog, hands the work here, and adopts the result
-/// (an error to surface, or nothing) from the returned channel.
+/// Run a [`DeleteJob`] on the pool, waking the window when it finishes. The
+/// git shellouts and doppler cleanup are slow enough to stutter paint, so the
+/// caller confirms the dialog, hands the work here, and adopts the result (an
+/// error to surface, or nothing) from the returned handle — the sidebar row
+/// shows a spinner until it lands, so this runs at interactive priority.
 pub fn spawn_delete(
     project_root: PathBuf,
     job: DeleteJob,
     ctx: egui::Context,
-) -> Receiver<Result<(), String>> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
+) -> jobs::Job<Result<(), String>> {
+    jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
         let result = match job {
             DeleteJob::Remove { worktree_path, branch, force } => {
-                delete_worktree(&project_root, &worktree_path, branch.as_deref(), force)
+                delete_worktree(&project_root, &worktree_path, branch.as_deref(), force, blocking)
             },
             DeleteJob::Prune { worktree_name, branch, delete_branch } => {
                 prune_worktree(&project_root, &worktree_name, branch.as_deref(), delete_branch)
             },
         };
-        let _ = tx.send(result);
         ctx.request_repaint();
-    });
-    rx
+        result
+    })
 }
 
 /// Remove the git metadata of a worktree whose checkout directory is gone
@@ -540,7 +570,11 @@ pub fn prune_worktree(
 }
 
 #[cfg(test)]
+// Fixtures drive real processes and wait on them; no frame is pending.
+#[allow(clippy::disallowed_methods)]
 mod tests {
+    use std::thread;
+
     use super::*;
     use crate::test_util::{add_worktree, init_repo};
 
@@ -555,7 +589,8 @@ mod tests {
     #[test]
     fn base_dir_replaces_default_worktree_parent() {
         let base = abs("wt-base");
-        let dir = project_worktree_dir(Path::new("repo"), Some(&base)).unwrap();
+        let dir = jobs::on_this_thread(|b| project_worktree_dir(Path::new("repo"), Some(&base), b))
+            .unwrap();
         assert!(dir.starts_with(&base), "{} not under {}", dir.display(), base.display());
         let leaf = dir.file_name().unwrap().to_string_lossy().into_owned();
         assert!(leaf.starts_with("repo-"), "leaf {leaf:?} should keep <project>-<hash> layout");
@@ -563,7 +598,8 @@ mod tests {
 
     #[test]
     fn no_base_dir_falls_back_to_home_default() {
-        let dir = project_worktree_dir(Path::new("repo"), None).unwrap();
+        let dir =
+            jobs::on_this_thread(|b| project_worktree_dir(Path::new("repo"), None, b)).unwrap();
         let expected = home::home_dir().unwrap().join(".alacritree").join("worktrees");
         assert!(dir.starts_with(&expected), "{} not under {}", dir.display(), expected.display());
     }
@@ -581,7 +617,15 @@ mod tests {
             branch: Some("feature".to_string()),
             force: false,
         };
-        let result = spawn_delete(repo_dir, job, egui::Context::default()).recv().unwrap();
+        let handle = spawn_delete(repo_dir, job, egui::Context::default());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let result = loop {
+            if let Some(result) = handle.poll() {
+                break result;
+            }
+            assert!(std::time::Instant::now() < deadline, "the delete never landed");
+            thread::yield_now();
+        };
 
         assert!(result.is_ok(), "delete failed: {result:?}");
         assert!(!wt_path.exists(), "worktree directory should be gone");
@@ -669,7 +713,8 @@ mod tests {
         git(&["fetch", "origin"]);
         git(&["remote", "set-head", "origin", "-a"]);
 
-        let branches = list_branches(dir.path()).expect("listing succeeds");
+        let branches = jobs::on_this_thread(|blocking| list_branches(dir.path(), blocking))
+            .expect("listing succeeds");
 
         assert!(branches.contains(&"develop".to_string()), "{branches:?}");
         assert!(branches.contains(&"main".to_string()), "{branches:?}");
@@ -687,6 +732,6 @@ mod tests {
     #[test]
     fn list_branches_reports_a_non_repo_as_an_error() {
         let dir = tempfile::TempDir::new().unwrap();
-        assert!(list_branches(dir.path()).is_err());
+        assert!(jobs::on_this_thread(|blocking| list_branches(dir.path(), blocking)).is_err());
     }
 }

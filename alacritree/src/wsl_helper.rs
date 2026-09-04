@@ -366,6 +366,9 @@ impl HelperClient {
     /// attempted; readiness (the hello line) arrives asynchronously on the
     /// reader thread.  Failures leave the client marked down so the
     /// registry's cooldown sees them like any other death.
+    // Launching the resident helper is this function's job; the child is
+    // long-lived and never waited on here.
+    #[allow(clippy::disallowed_methods)]
     fn spawn(distro: &str) -> Arc<Self> {
         let client = Arc::new(Self {
             distro: distro.to_string(),
@@ -660,6 +663,8 @@ fn ensure_poller() {
 }
 
 #[cfg(test)]
+// Fixtures drive real processes and wait on them; no frame is pending.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

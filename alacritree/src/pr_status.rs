@@ -12,13 +12,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::command_ext::CommandExt;
 use crate::projects::Worktree;
-use crate::wsl;
+use crate::{jobs, wsl};
 
 /// Re-query at most this often.  PR base branches rarely change, and a stale
 /// answer just falls back to the previous diff target — not worth hammering
@@ -73,14 +71,24 @@ struct Entry {
     branch: Option<String>,
     info: Option<PrInfo>,
     queried_at: Option<Instant>,
-    /// Set while a background thread is running.  `poll` reads this to
+    /// Set while a lookup is running on the pool.  `poll` reads this to
     /// avoid starting a competing lookup; `drain_completed` is what banks
     /// the result and clears it.
-    pending: Option<Receiver<LookupResult>>,
+    pending: Option<Pending>,
     /// A refresh landed while `pending` was already occupied.  The drain
     /// leaves `queried_at` cleared instead of stamping the fresh lookup's
     /// result as current, so the next poll re-queries.
     refresh_requested: bool,
+}
+
+/// A lookup in flight, and when it started.  A job that never reports — a
+/// panic, or a `gh` call that hangs — would otherwise occupy its concurrency
+/// slot forever: a panicked one reports through `Job::failed` immediately,
+/// while a genuinely slow one is only backed off once it has been pending
+/// past the TTL.
+struct Pending {
+    job: jobs::Job<LookupResult>,
+    started: Instant,
 }
 
 #[derive(Debug, PartialEq)]
@@ -134,8 +142,8 @@ impl PrCache {
         );
 
         if spawn && may_spawn(self.concurrency, self.in_flight) {
-            let rx = spawn_lookup(path.to_path_buf(), branch.to_string(), ctx.clone());
-            self.bank_pending(path.to_path_buf(), branch, rx);
+            let job = spawn_lookup(path.to_path_buf(), branch.to_string(), ctx.clone());
+            self.bank_pending(path.to_path_buf(), branch, job);
         }
 
         self.entries.get(path).and_then(|entry| entry.info.clone())
@@ -163,34 +171,32 @@ impl PrCache {
     /// would never come back.
     pub fn drain_completed(&mut self) {
         for entry in self.entries.values_mut() {
-            let Some(rx) = entry.pending.as_ref() else {
+            let Some(pending) = entry.pending.as_ref() else {
                 continue;
             };
-            match rx.try_recv() {
-                Ok(result) => {
-                    entry.branch = Some(result.branch);
-                    entry.info = result.info;
-                    // A refresh that arrived mid-lookup wants the *next* answer,
-                    // so leave the entry stale and let the next poll re-query.
-                    entry.queried_at =
-                        if entry.refresh_requested { None } else { Some(Instant::now()) };
-                    entry.refresh_requested = false;
-                    entry.pending = None;
-                    self.in_flight = self.in_flight.saturating_sub(1);
-                    self.generation = self.generation.wrapping_add(1);
-                },
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    // A worker that died without sending has no answer to bank,
-                    // so the TTL is the only thing that can back it off — and it
-                    // must do so even when a refresh was requested mid-flight,
-                    // or the entry re-spawns a thread and a `gh` process on
-                    // every frame for as long as the failure lasts.
-                    entry.queried_at = Some(Instant::now());
-                    entry.pending = None;
-                    entry.refresh_requested = false;
-                    self.in_flight = self.in_flight.saturating_sub(1);
-                },
-                Err(mpsc::TryRecvError::Empty) => {},
+            if let Some(result) = pending.job.poll() {
+                entry.branch = Some(result.branch);
+                entry.info = result.info;
+                // A refresh that arrived mid-lookup wants the *next* answer,
+                // so leave the entry stale and let the next poll re-query.
+                entry.queried_at =
+                    if entry.refresh_requested { None } else { Some(Instant::now()) };
+                entry.refresh_requested = false;
+                entry.pending = None;
+                self.in_flight = self.in_flight.saturating_sub(1);
+                self.generation = self.generation.wrapping_add(1);
+            } else if pending.job.failed() || pending.started.elapsed() > TTL {
+                // A job that never reports has no answer to bank.  A panic
+                // reports through `failed` on the very poll above, so it
+                // backs off immediately; a job that is merely slow only backs
+                // off once it has been pending past the TTL.  Either way this
+                // must fire even when a refresh was requested mid-flight, or
+                // the entry re-spawns a lookup and a `gh` process on every
+                // frame for as long as the failure lasts.
+                entry.queried_at = Some(Instant::now());
+                entry.pending = None;
+                entry.refresh_requested = false;
+                self.in_flight = self.in_flight.saturating_sub(1);
             }
         }
     }
@@ -214,7 +220,7 @@ impl PrCache {
     /// that dies without sending leaves nothing for the drain to key it with,
     /// and a mismatched branch makes the entry due again on the next frame
     /// however recently it was queried.
-    fn bank_pending(&mut self, path: PathBuf, branch: &str, rx: Receiver<LookupResult>) {
+    fn bank_pending(&mut self, path: PathBuf, branch: &str, job: jobs::Job<LookupResult>) {
         let entry = self.entries.entry(path).or_default();
         debug_assert!(entry.pending.is_none(), "a second lookup would strand the first's slot");
         // Clear stale data immediately on branch switch so we don't show
@@ -223,7 +229,7 @@ impl PrCache {
             entry.info = None;
         }
         entry.branch = Some(branch.to_string());
-        entry.pending = Some(rx);
+        entry.pending = Some(Pending { job, started: Instant::now() });
         self.in_flight += 1;
     }
 
@@ -233,8 +239,8 @@ impl PrCache {
     }
 
     #[cfg(test)]
-    fn insert_pending(&mut self, path: PathBuf, branch: &str, rx: Receiver<LookupResult>) {
-        self.bank_pending(path, branch, rx);
+    fn insert_pending(&mut self, path: PathBuf, branch: &str, job: jobs::Job<LookupResult>) {
+        self.bank_pending(path, branch, job);
     }
 }
 
@@ -315,22 +321,15 @@ pub fn effective_branch<'a>(
     }
 }
 
-fn spawn_lookup(path: PathBuf, branch: String, ctx: egui::Context) -> Receiver<LookupResult> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        // Fires on a panicking unwind too: the drain that frees this lookup's
-        // concurrency slot only runs on a frame, so an exit without a repaint
-        // can stall polling for good.
+fn spawn_lookup(path: PathBuf, branch: String, ctx: egui::Context) -> jobs::Job<LookupResult> {
+    jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
+        // Fires on a panicking unwind too, since it's a local: the drain that
+        // frees this lookup's concurrency slot only runs on a frame, so an
+        // exit without a repaint can stall polling for good.
         let _wake = RepaintOnDrop(ctx);
-        // A body local rather than a capture: locals drop in reverse
-        // declaration order, so a panicking unwind disconnects the channel
-        // before the guard requests the repaint that observes it.  Closure
-        // capture drop order is unspecified and would not guarantee that.
-        let sender = tx;
-        let info = query_gh(&path, &branch);
-        let _ = sender.send(LookupResult { branch, info });
-    });
-    rx
+        let info = query_gh(&path, &branch, blocking);
+        LookupResult { branch, info }
+    })
 }
 
 struct RepaintOnDrop(egui::Context);
@@ -364,7 +363,8 @@ fn pr_state(state: &str, is_draft: bool) -> PrState {
 /// `origin` is a personal fork therefore finds nothing.  `--head` filters on
 /// the head ref name alone, which both layouts share, and `--state all` keeps
 /// the merged and closed badges that `pr list` would otherwise drop.
-fn query_gh(path: &Path, branch: &str) -> Option<PrInfo> {
+#[allow(clippy::disallowed_methods)] // Running `gh` is this function's job.
+fn query_gh(path: &Path, branch: &str, blocking: &jobs::Blocking) -> Option<PrInfo> {
     const PR_JSON_FIELDS: &str = "number,baseRefName,url,state,isDraft,headRepositoryOwner";
     // `--head` matches the ref name in every head repository and `--state all`
     // keeps the closed and merged ones, so a generic branch name in a busy base
@@ -373,7 +373,7 @@ fn query_gh(path: &Path, branch: &str) -> Option<PrInfo> {
     const PR_LIMIT: &str = "100";
     match wsl::classify(path) {
         wsl::Location::Windows(p) => {
-            let owner = local_origin_owner(&p);
+            let owner = local_origin_owner(&p, blocking);
             let output = Command::new("gh")
                 .hide_console()
                 .current_dir(p)
@@ -419,6 +419,7 @@ exec "$2" pr list --head "$3" --state all --limit "$4" --json "$5""#;
                 &distro,
                 script,
                 &[&linux_path, &gh, branch, PR_LIMIT, PR_JSON_FIELDS],
+                blocking,
             )
             .ok()?;
             let (origin_url, json) = split_origin_url_line(&stdout);
@@ -442,7 +443,7 @@ fn split_origin_url_line(stdout: &[u8]) -> (Option<&str>, &[u8]) {
 
 /// The GitHub owner of this worktree's `origin`, read straight from the
 /// repository config so the badge still costs exactly one `gh` process.
-fn local_origin_owner(path: &Path) -> Option<String> {
+fn local_origin_owner(path: &Path, _blocking: &jobs::Blocking) -> Option<String> {
     let repo = git2::Repository::open(path).ok()?;
     let remote = repo.find_remote("origin").ok()?;
     github_owner_from_url(remote.url()?)
@@ -548,6 +549,68 @@ fn parse_gh_output(stdout: &[u8], origin_owner: Option<&str>) -> Option<PrInfo> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+
+    /// Spawn a job that blocks until `release` fires, so a test can hold a
+    /// lookup pending for as long as it needs.  Dropping `release` unblocks
+    /// it too, which is what reclaims the slot once a test is done with it.
+    ///
+    /// Runs on a throwaway pool rather than the process-wide `jobs::pool()`:
+    /// this deliberately wedges a background slot, and the shared pool is a
+    /// handful of workers other test binaries in this crate poll against
+    /// with their own deadlines — a pool built just for this call can never
+    /// starve them, or be starved by them.
+    fn spawn_stuck_job() -> (mpsc::Sender<()>, jobs::Job<LookupResult>) {
+        let (release, gate) = mpsc::channel::<()>();
+        let job = jobs::Pool::new(2).spawn(jobs::Priority::Background, move |_| {
+            let _ = gate.recv();
+            LookupResult { branch: "main".to_string(), info: None }
+        });
+        (release, job)
+    }
+
+    /// Wire a stuck job into `cache` as if it had been pending since `started`,
+    /// for tests that need to force `drain_completed`'s TTL branch without
+    /// waiting out the real TTL.
+    fn insert_stuck_entry(
+        cache: &mut PrCache,
+        path: &Path,
+        branch: &str,
+        started: Instant,
+    ) -> mpsc::Sender<()> {
+        let (release, job) = spawn_stuck_job();
+        cache.entries.insert(path.to_path_buf(), Entry {
+            branch: Some(branch.to_string()),
+            pending: Some(Pending { job, started }),
+            ..Default::default()
+        });
+        cache.in_flight += 1;
+        release
+    }
+
+    /// An `Instant` already old enough that `drain_completed` treats a job
+    /// started at it as stuck past the TTL, or `None` on a machine that
+    /// hasn't been up long enough to backdate that far — `Instant` is
+    /// monotonic since boot, not since the epoch, so subtracting the TTL can
+    /// underflow on a freshly booted CI runner.
+    fn stale_start() -> Option<Instant> {
+        Instant::now().checked_sub(TTL + Duration::from_millis(1))
+    }
+
+    /// Drive `drain_completed` until the entry at `path` has no lookup
+    /// pending, mirroring how the UI's frame loop drives it.
+    fn drain_until(cache: &mut PrCache, path: &Path, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            cache.drain_completed();
+            if cache.entries.get(path).is_none_or(|e| e.pending.is_none()) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "the lookup never landed");
+            thread::yield_now();
+        }
+    }
 
     #[test]
     fn parses_gh_json() {
@@ -798,16 +861,13 @@ mod tests {
     fn polling_with_none_retains_info_from_a_completed_some_branch_lookup() {
         let mut cache = PrCache::new();
         let path = PathBuf::from("/repo");
-        cache.entries.insert(
-            path.clone(),
-            Entry {
-                branch: Some("b".to_string()),
-                info: Some(sample_info()),
-                queried_at: Some(Instant::now()),
-                pending: None,
-                refresh_requested: false,
-            },
-        );
+        cache.entries.insert(path.clone(), Entry {
+            branch: Some("b".to_string()),
+            info: Some(sample_info()),
+            queried_at: Some(Instant::now()),
+            pending: None,
+            refresh_requested: false,
+        });
 
         let ctx = egui::Context::default();
         let result = cache.poll(&path, None, &ctx);
@@ -893,21 +953,18 @@ mod tests {
     #[test]
     fn state_is_none_for_a_branch_the_entry_was_not_queried_for() {
         let mut cache = PrCache::new();
-        cache.entries.insert(
-            PathBuf::from("/repo/wt"),
-            Entry {
-                branch: Some("main".into()),
-                info: Some(PrInfo {
-                    number: 1,
-                    base_branch: "master".into(),
-                    url: String::new(),
-                    state: PrState::Open,
-                }),
-                queried_at: None,
-                pending: None,
-                refresh_requested: false,
-            },
-        );
+        cache.entries.insert(PathBuf::from("/repo/wt"), Entry {
+            branch: Some("main".into()),
+            info: Some(PrInfo {
+                number: 1,
+                base_branch: "master".into(),
+                url: String::new(),
+                state: PrState::Open,
+            }),
+            queried_at: None,
+            pending: None,
+            refresh_requested: false,
+        });
 
         let p = Path::new("/repo/wt");
         assert_eq!(cache.state(p, Some("main")), Some(PrState::Open));
@@ -921,39 +978,65 @@ mod tests {
     fn drain_completed_frees_a_slot_for_an_entry_nobody_polls() {
         let mut cache = PrCache::new();
         cache.set_concurrency(1);
-        let (tx, rx) = mpsc::channel();
-        cache.insert_pending(PathBuf::from("/repo/wt"), "main", rx);
+        let job = jobs::pool().spawn(jobs::Priority::Background, |_| LookupResult {
+            branch: "main".to_string(),
+            info: None,
+        });
+        cache.insert_pending(PathBuf::from("/repo/wt"), "main", job);
         assert_eq!(cache.in_flight(), 1);
 
-        tx.send(LookupResult { branch: "main".into(), info: None }).unwrap();
-        cache.drain_completed();
+        drain_until(&mut cache, Path::new("/repo/wt"), Duration::from_secs(5));
 
         assert_eq!(cache.in_flight(), 0);
     }
 
-    /// A worker that panics never sends. Without a decrement here a capped
-    /// cache stops polling permanently.
+    /// A panicking job must free its slot the moment `drain_completed`
+    /// observes `Job::failed`, not after waiting out the TTL — distinct from
+    /// the TTL tests below, which backdate `started` instead of panicking.
     #[test]
-    fn drain_completed_frees_a_slot_for_a_disconnected_worker() {
+    fn drain_completed_frees_a_slot_immediately_when_the_job_panics() {
         let mut cache = PrCache::new();
         cache.set_concurrency(1);
-        let (tx, rx) = mpsc::channel::<LookupResult>();
-        cache.insert_pending(PathBuf::from("/repo/wt"), "main", rx);
-        drop(tx);
+        let job = jobs::Pool::new(2)
+            .spawn(jobs::Priority::Background, |_| -> LookupResult { panic!("boom") });
+        cache.insert_pending(PathBuf::from("/repo/wt"), "main", job);
+        assert_eq!(cache.in_flight(), 1);
+
+        drain_until(&mut cache, Path::new("/repo/wt"), Duration::from_secs(5));
+
+        assert_eq!(cache.in_flight(), 0);
+    }
+
+    /// A job that never reports — a panic, or a `gh` call that hangs — must
+    /// not hold its slot forever. Without the TTL backoff a capped cache
+    /// would stop polling permanently.
+    #[test]
+    fn drain_completed_frees_a_slot_for_a_job_stuck_past_the_ttl() {
+        let Some(started) = stale_start() else {
+            eprintln!("skipping: process has not been up long enough to backdate past the TTL");
+            return;
+        };
+        let mut cache = PrCache::new();
+        cache.set_concurrency(1);
+        let _release = insert_stuck_entry(&mut cache, Path::new("/repo/wt"), "main", started);
+        assert_eq!(cache.in_flight(), 1);
 
         cache.drain_completed();
 
         assert_eq!(cache.in_flight(), 0);
     }
 
-    /// A dead worker banks no answer, so nothing but the TTL can hold the entry
-    /// back — and the guard's repaint delivers the frame that would re-spawn it.
+    /// A job just backed off by the TTL banks no answer, so nothing but a
+    /// fresh `queried_at` can hold the entry back — and the guard's repaint
+    /// delivers the frame that would re-spawn it.
     #[test]
-    fn a_dead_worker_leaves_the_entry_ineligible_to_respawn() {
+    fn a_job_stuck_past_the_ttl_leaves_the_entry_ineligible_to_respawn() {
+        let Some(started) = stale_start() else {
+            eprintln!("skipping: process has not been up long enough to backdate past the TTL");
+            return;
+        };
         let mut cache = PrCache::new();
-        let (tx, rx) = mpsc::channel::<LookupResult>();
-        cache.insert_pending(PathBuf::from("/repo/wt"), "main", rx);
-        drop(tx);
+        let _release = insert_stuck_entry(&mut cache, Path::new("/repo/wt"), "main", started);
 
         cache.drain_completed();
 
@@ -965,24 +1048,26 @@ mod tests {
                 entry.queried_at,
                 entry.pending.is_some()
             ),
-            "a dead worker must not leave the entry due on the very next frame"
+            "a job just backed off by the TTL must not leave the entry due on the very next frame"
         );
     }
 
     #[test]
     fn generation_advances_on_a_banked_result_and_holds_still_otherwise() {
         let mut cache = PrCache::new();
-        let (_tx, rx) = mpsc::channel::<LookupResult>();
-        cache.insert_pending(PathBuf::from("/repo/pending"), "main", rx);
+        let _release =
+            insert_stuck_entry(&mut cache, Path::new("/repo/pending"), "main", Instant::now());
 
         let before = cache.generation();
         cache.drain_completed();
         assert_eq!(cache.generation(), before, "a frame that banks nothing must not invalidate");
 
-        let (tx, rx) = mpsc::channel();
-        cache.insert_pending(PathBuf::from("/repo/banked"), "main", rx);
-        tx.send(LookupResult { branch: "main".into(), info: None }).unwrap();
-        cache.drain_completed();
+        let job = jobs::pool().spawn(jobs::Priority::Background, |_| LookupResult {
+            branch: "main".to_string(),
+            info: None,
+        });
+        cache.insert_pending(PathBuf::from("/repo/banked"), "main", job);
+        drain_until(&mut cache, Path::new("/repo/banked"), Duration::from_secs(5));
         assert!(cache.generation() > before);
     }
 
@@ -992,13 +1077,13 @@ mod tests {
     #[test]
     fn a_refresh_during_a_lookup_survives_the_drain() {
         let mut cache = PrCache::new();
-        let (tx, rx) = mpsc::channel();
-        cache.insert_pending(PathBuf::from("/repo/wt"), "main", rx);
+        let (release, job) = spawn_stuck_job();
+        cache.insert_pending(PathBuf::from("/repo/wt"), "main", job);
 
         cache.invalidate_all();
 
-        tx.send(LookupResult { branch: "main".into(), info: None }).unwrap();
-        cache.drain_completed();
+        let _ = release.send(());
+        drain_until(&mut cache, Path::new("/repo/wt"), Duration::from_secs(5));
 
         let entry = cache.entries.get(Path::new("/repo/wt")).unwrap();
         assert!(entry.queried_at.is_none(), "the next poll must re-query");
@@ -1022,16 +1107,13 @@ mod tests {
     #[test]
     fn a_refresh_on_an_idle_entry_does_not_set_the_flag() {
         let mut cache = PrCache::new();
-        cache.entries.insert(
-            PathBuf::from("/repo/wt"),
-            Entry {
-                branch: Some("main".into()),
-                info: None,
-                queried_at: Some(Instant::now()),
-                pending: None,
-                refresh_requested: false,
-            },
-        );
+        cache.entries.insert(PathBuf::from("/repo/wt"), Entry {
+            branch: Some("main".into()),
+            info: None,
+            queried_at: Some(Instant::now()),
+            pending: None,
+            refresh_requested: false,
+        });
 
         cache.invalidate_all();
 
@@ -1072,8 +1154,8 @@ mod tests {
     fn poll_respects_the_concurrency_cap() {
         let mut cache = PrCache::new();
         cache.set_concurrency(1);
-        let (_tx, rx) = mpsc::channel::<LookupResult>();
-        cache.insert_pending(PathBuf::from("/repo/busy"), "main", rx);
+        let (_release, job) = spawn_stuck_job();
+        cache.insert_pending(PathBuf::from("/repo/busy"), "main", job);
 
         let capped = Path::new("/repo/capped");
         cache.poll(capped, Some("feature"), &egui::Context::default());
@@ -1102,27 +1184,34 @@ mod tests {
         assert!(ctx.has_requested_repaint());
     }
 
+    /// `spawn_lookup` has no sender of its own any more — the pool's channel
+    /// is internal — so this drives a real job through the pool instead of
+    /// hand-rolling a thread, and checks the failure the same way production
+    /// code does: `poll` until `failed` latches.
     #[test]
-    fn a_panicking_worker_still_wakes_the_app_and_disconnects() {
+    fn a_panicking_worker_still_wakes_the_app_and_reports_failed() {
         let ctx = egui::Context::default();
         // See `dropping_the_guard_wakes_the_app`: a fresh context needs two
         // passes before its initial repaint request is fully consumed.
         let _ = ctx.run(Default::default(), |_| {});
         let _ = ctx.run(Default::default(), |_| {});
         assert!(!ctx.has_requested_repaint(), "precondition: no repaint pending");
-        let (tx, rx) = mpsc::channel::<LookupResult>();
 
-        let worker = {
+        let job = {
             let ctx = ctx.clone();
-            thread::spawn(move || {
+            jobs::Pool::new(2).spawn(jobs::Priority::Background, move |_| -> LookupResult {
                 let _wake = RepaintOnDrop(ctx);
-                let _sender = tx;
                 panic!("worker died");
             })
         };
-        assert!(worker.join().is_err(), "the worker must have panicked");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !job.failed() {
+            assert!(job.poll().is_none(), "a panicking job never reports a value");
+            assert!(Instant::now() < deadline, "the failure was never observed");
+            thread::yield_now();
+        }
 
         assert!(ctx.has_requested_repaint(), "a panicking unwind still wakes the app");
-        assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected));
     }
 }

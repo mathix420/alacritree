@@ -70,11 +70,19 @@ pub struct DebugConfig {
     pub crash_log: bool,
     /// Upstream's name and upstream's default.
     pub persistent_logging: bool,
+    /// alacritree-only, set in `alacritree.toml`.  Log what the GPU grid's
+    /// paint callback costs: the wall time of issuing a frame, and the GPU's
+    /// own time for the upload and each of the three draws.  Off by default;
+    /// timer queries are cheap but not free, and the line is only meaningful
+    /// to someone reading it.  Needs `[ui] gpu_grid` and a GL 3.3 context.
+    /// Keeps this session's log file for as long as it is on, since the
+    /// report has nowhere else to go.
+    pub gpu_timing: bool,
 }
 
 impl Default for DebugConfig {
     fn default() -> Self {
-        Self { crash_log: true, persistent_logging: false }
+        Self { crash_log: true, persistent_logging: false, gpu_timing: false }
     }
 }
 
@@ -125,7 +133,6 @@ impl FontConfig {
     /// Headings stay close to the grid's size for visual weight without
     /// crowding the chrome.
     pub const UI_HEADING_RATIO: f32 = 0.9;
-
     /// Normal UI text (rows, captions, button labels) is this fraction of the
     /// terminal font size so the chrome reads as secondary to the grid.
     pub const UI_NORMAL_RATIO: f32 = 0.8;
@@ -223,7 +230,7 @@ pub fn profile_command(p: &Profile) -> String {
         .join(" ")
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Palette {
     pub fg: Rgb,
     pub bg: Rgb,
@@ -872,6 +879,87 @@ pub struct PathStyleConfig {
     pub parent: TextEmphasis,
 }
 
+/// One correction to a decoration the font placed: a shift in physical pixels,
+/// a shift in points, or a multiplier.  kitty's grammar, so a value copied
+/// from a kitty config parses the same way here.  Where it lands can still
+/// differ: kitty derives its double and curly underline positions from the
+/// face's underline position, while here those two styles are placed from
+/// the descent instead, so `underline_position` does not reach them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Adjust {
+    Pixels(f32),
+    Points(f32),
+    Scale(f32),
+}
+
+impl Adjust {
+    /// Draw what the font asked for.
+    pub const NONE: Self = Self::Pixels(0.0);
+
+    /// `"2px"`, `"2pt"`, a bare `"2"` (points, which is how kitty spells it),
+    /// or `"150%"`.  `None` for anything else, a signed percentage included.
+    pub fn parse(raw: &str) -> Option<Self> {
+        if let Some(number) = raw.strip_suffix('%') {
+            let percent = finite(number)?;
+            return (percent >= 0.0).then_some(Self::Scale(percent / 100.0));
+        }
+        if let Some(number) = raw.strip_suffix("px") {
+            return finite(number).map(Self::Pixels);
+        }
+        finite(raw.strip_suffix("pt").unwrap_or(raw)).map(Self::Points)
+    }
+
+    /// `value` is already in physical pixels, so a point shift scales by
+    /// `pixels_per_point` and a percentage multiplies what the font resolved
+    /// to rather than the em fraction it was read from.
+    pub fn apply(self, value: f32, pixels_per_point: f32) -> f32 {
+        match self {
+            Self::Pixels(px) => value + px,
+            Self::Points(pt) => value + pt * pixels_per_point,
+            Self::Scale(factor) => value * factor,
+        }
+    }
+}
+
+/// `"inf"` and `"nan"` parse as `f32` and would put a line nowhere at all.
+fn finite(raw: &str) -> Option<f32> {
+    raw.parse::<f32>().ok().filter(|value| value.is_finite())
+}
+
+/// `[ui.decorations]`: corrections to what the font reports for its underline
+/// and strikeout, for a face whose tables are wrong.  Every knob is a no-op by
+/// default, so an unmodified config draws what the face asked for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Decorations {
+    pub underline_position: Adjust,
+    pub underline_thickness: Adjust,
+    pub strikeout_position: Adjust,
+    pub strikeout_thickness: Adjust,
+}
+
+impl Default for Decorations {
+    fn default() -> Self {
+        Self {
+            underline_position: Adjust::NONE,
+            underline_thickness: Adjust::NONE,
+            strikeout_position: Adjust::NONE,
+            strikeout_thickness: Adjust::NONE,
+        }
+    }
+}
+
+/// A knob that will not parse logs and behaves as `"0"`, the way the rest of
+/// this file treats a value it does not recognize.
+fn parse_adjust(field: &str, raw: Option<&str>) -> Adjust {
+    let Some(text) = raw else {
+        return Adjust::NONE;
+    };
+    Adjust::parse(text).unwrap_or_else(|| {
+        log::warn!("unusable ui.decorations.{field} value {text:?}, using \"0\"");
+        Adjust::NONE
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct UiTheme {
     pub sidebar_background: Option<Color32>,
@@ -901,6 +989,18 @@ pub struct UiTheme {
     pub icon_tooltips: bool,
     /// Show single-session sidebar rows / tab segments ([`SessionDisplay`]).
     pub session_display: SessionDisplay,
+    /// Draw the terminal grid through an OpenGL paint callback instead of
+    /// handing epaint a mesh: one twelve-byte record per cell, and the vertex
+    /// shader derives the quads.  Off by default — it needs a GL 3 context and
+    /// bypasses the renderer every other panel goes through, so an unmodified
+    /// config keeps the path that has always drawn the grid.  A context too
+    /// old for instanced arrays logs once, costs the frame it was found on,
+    /// and paints the mesh from the next one.
+    pub gpu_grid: bool,
+    /// Corrections applied to the underline and strikeout the font placed
+    /// ([`Decorations`]).  Only the GPU grid reads these; the mesh path draws
+    /// a straight rule at a fixed offset either way.
+    pub decorations: Decorations,
     /// Paint PR-status badges on worktree rows (and poll `gh` for expanded
     /// projects' worktrees).  Off by default so an unmodified config spawns
     /// no `gh` processes; when enabled it is best-effort like the diff-base
@@ -920,7 +1020,10 @@ pub struct UiTheme {
     /// `[ui] pr_status_concurrency`: max `gh` lookups in flight at once.
     /// Defaults to 8; clamped to ≥ 1, since a cold cache spawns one lookup
     /// per eligible worktree in a single frame and an unbounded cap would
-    /// fork a thread and a `gh` process for every one of them at once.
+    /// fork a thread and a `gh` process for every one of them at once. The
+    /// shared background pool caps concurrent work underneath this too, so
+    /// this setting can lower how many lookups run at once but not raise it
+    /// past the pool's own ceiling.
     pub pr_status_concurrency: usize,
     pub icons: Icons,
     pub focus_outline: FocusOutline,
@@ -931,6 +1034,19 @@ pub struct UiTheme {
     /// it (so filter typing works without the focus shortcut).  Off by default
     /// so unmodified configs keep click-through-to-terminal behavior.
     pub sidebar_click_focus: bool,
+    /// `[ui] focus_priority_boost`: put the session on screen one scheduling
+    /// class above normal — its shell and every process that shell starts, at
+    /// any depth — so a build saturating the machine cannot starve what the
+    /// user is typing into.  Follows focus, and raises nothing while the
+    /// window is in the background.  Off by default.  Windows only.
+    pub focus_priority_boost: bool,
+    /// `[ui] reap_descendants_on_close`: end everything a session started when
+    /// that session closes, at any depth.  The console reaps only the clients
+    /// attached to it, so a process that left the console — an editor's search
+    /// helper, anything started detached — otherwise outlives the terminal.  A
+    /// process that means to survive can still say so with
+    /// `CREATE_BREAKAWAY_FROM_JOB`.  Off by default.  Windows only.
+    pub reap_descendants_on_close: bool,
     /// `[ui] vsync`: block each present until the display's next refresh.  On
     /// by default, as upstream eframe has it.  Turning it off presents a
     /// finished frame immediately, trading tearing for the queueing delay
@@ -971,6 +1087,8 @@ impl Default for UiTheme {
             sidebar_tooltips: SidebarTooltips::default(),
             icon_tooltips: true,
             session_display: SessionDisplay::default(),
+            gpu_grid: false,
+            decorations: Decorations::default(),
             pr_status: false,
             upstream_status: false,
             worktree_liveness: true,
@@ -979,6 +1097,8 @@ impl Default for UiTheme {
             focus_outline: FocusOutline::default(),
             scrollbar: ScrollbarStyle::Floating,
             sidebar_click_focus: false,
+            focus_priority_boost: false,
+            reap_descendants_on_close: false,
             vsync: true,
             worktree_name: None,
             project_name: None,
@@ -1427,6 +1547,14 @@ struct RawDebug {
     /// Keep the log file after quitting.  Upstream's name and upstream's
     /// default (`false`).
     persistent_logging: Option<bool>,
+    /// Log what the GPU grid's paint callback costs: the wall time of
+    /// issuing a frame, and the GPU's own time for the upload and each of
+    /// the three draws.  alacritree-only, so it belongs in
+    /// `alacritree.toml`.  Default `false`; timer queries are cheap but not
+    /// free, and the line is only meaningful to someone reading it.  Needs
+    /// `[ui] gpu_grid` and a GL 3.3 context.  Keeps this session's log file
+    /// for as long as it is on, since the report has nowhere else to go.
+    gpu_timing: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1851,6 +1979,32 @@ struct RawSessionDisplay {
     tabs_always: Option<bool>,
 }
 
+/// Corrections applied to what the font reports for its underline and
+/// strikeout.  Each value is `"2px"` (physical pixels, added), `"2pt"` or a
+/// bare `"2"` (points, added), or `"150%"` (a multiplier).  Positive moves a
+/// line down, matching kitty and ghostty.  A percentage takes no sign.
+/// Default `"0"`, which draws what the font asked for.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default)]
+struct RawDecorations {
+    /// Shift or scale of how far the underline sits from the top of the
+    /// cell, for the straight, dotted and dashed styles.  The double and
+    /// curly styles are placed from the font's descent instead, so this
+    /// knob does not reach them.
+    #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
+    underline_position: Option<String>,
+    /// Shift or scale of the underline's stroke weight.  Every style draws
+    /// with this value, including double and curly.
+    #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
+    underline_thickness: Option<String>,
+    /// Shift or scale of how far the strikeout sits from the top of the cell.
+    #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
+    strikeout_position: Option<String>,
+    /// Shift or scale of the strikeout bar's weight.
+    #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
+    strikeout_thickness: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawUiFont {
@@ -1980,6 +2134,16 @@ struct RawUi {
     /// Sidebar scrollbar style: "floating" (default) | "solid".
     #[schemars(extend("enum" = ["floating", "solid"]))]
     scrollbar: Option<String>,
+    /// Draw the terminal grid through an OpenGL paint callback instead of
+    /// handing epaint a mesh.  Default `false`: it needs a GL 3 context and
+    /// bypasses the renderer every other panel goes through, so an
+    /// unmodified config keeps the path that has always drawn the grid.  A
+    /// context too old for instanced arrays logs once and paints the mesh
+    /// from the next frame on.
+    gpu_grid: Option<bool>,
+    /// Corrections to the underline and strikeout the font placed
+    /// ([`RawDecorations`]).
+    decorations: RawDecorations,
     /// Poll `gh` for each branch's open pull request, which drives the PR row
     /// icons, the PR-state filters, and `$pr` in row templates.
     pr_status: Option<bool>,
@@ -1994,6 +2158,8 @@ struct RawUi {
     /// filesystem could make expensive.
     worktree_liveness: Option<bool>,
     /// Max `gh` lookups in flight at once.  Defaults to 8; clamped to ≥ 1.
+    /// The shared background pool also caps concurrent work, so this can
+    /// lower that ceiling but not raise it.
     pr_status_concurrency: Option<usize>,
     /// The font sidebars, tabs and dialogs are drawn with.
     font: RawUiFont,
@@ -2012,6 +2178,15 @@ struct RawUi {
     focus_outline: RawFocusOutline,
     /// Clicking a sidebar moves keyboard focus to it.  Default false.
     sidebar_click_focus: Option<bool>,
+    /// Put the session on screen one scheduling class above normal — its
+    /// shell and every process that shell starts — so a busy machine cannot
+    /// starve what the user is typing into.  Follows focus.  Windows only.
+    /// Default false.
+    focus_priority_boost: Option<bool>,
+    /// End everything a session started when that session closes, at any
+    /// depth, except processes that ask to break away.  Windows only.
+    /// Default false.
+    reap_descendants_on_close: Option<bool>,
     /// Wait for the display's refresh before showing a finished frame.
     /// Default true.
     vsync: Option<bool>,
@@ -2213,6 +2388,25 @@ impl RawConfig {
                 sidebar_always: self.ui.session_display.sidebar_always.unwrap_or(false),
                 tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
             },
+            gpu_grid: self.ui.gpu_grid.unwrap_or(false),
+            decorations: Decorations {
+                underline_position: parse_adjust(
+                    "underline_position",
+                    self.ui.decorations.underline_position.as_deref(),
+                ),
+                underline_thickness: parse_adjust(
+                    "underline_thickness",
+                    self.ui.decorations.underline_thickness.as_deref(),
+                ),
+                strikeout_position: parse_adjust(
+                    "strikeout_position",
+                    self.ui.decorations.strikeout_position.as_deref(),
+                ),
+                strikeout_thickness: parse_adjust(
+                    "strikeout_thickness",
+                    self.ui.decorations.strikeout_thickness.as_deref(),
+                ),
+            },
             pr_status: self.ui.pr_status.unwrap_or(false),
             upstream_status: self.ui.upstream_status.unwrap_or(false),
             worktree_liveness: self.ui.worktree_liveness.unwrap_or(true),
@@ -2230,6 +2424,8 @@ impl RawConfig {
             },
             scrollbar: parse_scrollbar(self.ui.scrollbar.as_deref()),
             sidebar_click_focus: self.ui.sidebar_click_focus.unwrap_or(false),
+            focus_priority_boost: self.ui.focus_priority_boost.unwrap_or(false),
+            reap_descendants_on_close: self.ui.reap_descendants_on_close.unwrap_or(false),
             vsync: self.ui.vsync.unwrap_or(true),
             worktree_name: self.ui.worktree_name.clone().filter(|t| !t.trim().is_empty()),
             project_name: self.ui.project_name.clone().filter(|t| !t.trim().is_empty()),
@@ -2424,6 +2620,7 @@ impl RawConfig {
             debug: DebugConfig {
                 crash_log: self.debug.crash_log.unwrap_or(true),
                 persistent_logging: self.debug.persistent_logging.unwrap_or(false),
+                gpu_timing: self.debug.gpu_timing.unwrap_or(false),
             },
             working_directory: self
                 .general
@@ -2587,8 +2784,8 @@ mod tests {
     #[test]
     fn path_style_emphasis_parses_and_a_blank_color_is_an_error() {
         let ui = ui_from_toml(
-            "[ui.path_style.filename]\ncolor = \"#e6e6e6\"\nbold = true\n\
-             [ui.path_style.parent]\nitalic = true\n",
+            "[ui.path_style.filename]\ncolor = \"#e6e6e6\"\nbold = \
+             true\n[ui.path_style.parent]\nitalic = true\n",
         );
         assert_eq!(ui.path_style.filename.color, Some(Color32::from_rgb(0xe6, 0xe6, 0xe6)));
         assert!(ui.path_style.filename.bold);
@@ -3029,10 +3226,11 @@ args = ["-d", "ubuntu"]
         let raw: RawConfig = toml::from_str(toml_src).unwrap();
         let config = raw.into_config();
         assert_eq!(config.profiles.len(), 2);
-        assert_eq!(
-            config.profiles[0],
-            Profile { name: "pwsh".into(), program: "pwsh".into(), args: vec!["-NoLogo".into()] }
-        );
+        assert_eq!(config.profiles[0], Profile {
+            name: "pwsh".into(),
+            program: "pwsh".into(),
+            args: vec!["-NoLogo".into()]
+        });
         assert_eq!(config.default_profile.as_deref(), Some("pwsh"));
         assert_eq!(config.profile("ubuntu").unwrap().program, "wsl.exe");
         assert!(config.profile("nope").is_none());
@@ -3290,7 +3488,8 @@ program = "second"
     #[test]
     fn focus_outline_parses_all_fields() {
         let fo = ui_from_toml(
-            "[ui.focus_outline]\nsidebar = true\nterminal = true\ncolor = \"#89b4fa\"\nthickness = 2.5",
+            "[ui.focus_outline]\nsidebar = true\nterminal = true\ncolor = \"#89b4fa\"\nthickness \
+             = 2.5",
         )
         .focus_outline;
         assert!(fo.sidebar);
@@ -3308,6 +3507,31 @@ program = "second"
     #[test]
     fn sidebar_click_focus_defaults_off() {
         assert!(!ui_from_toml("").sidebar_click_focus);
+    }
+
+    /// A boosted session outranks everything else the machine is doing, so an
+    /// unmodified config must never get it.
+    #[test]
+    fn focus_priority_boost_defaults_off() {
+        assert!(!ui_from_toml("").focus_priority_boost);
+    }
+
+    #[test]
+    fn focus_priority_boost_parses() {
+        assert!(ui_from_toml("[ui]\nfocus_priority_boost = true").focus_priority_boost);
+    }
+
+    /// Killing what a closing session started is a change of behavior the
+    /// killed process has no say in, so an unmodified config must not get it.
+    #[test]
+    fn reap_descendants_on_close_defaults_off() {
+        assert!(!ui_from_toml("").reap_descendants_on_close);
+    }
+
+    #[test]
+    fn reap_descendants_on_close_parses() {
+        let ui = ui_from_toml("[ui]\nreap_descendants_on_close = true");
+        assert!(ui.reap_descendants_on_close);
     }
 
     #[test]
@@ -3400,42 +3624,30 @@ program = "second"
     #[test]
     fn drop_options_default_to_on_with_auto_quoting() {
         let ui = ui_from_toml("");
-        assert_eq!(
-            ui.drop,
-            DropConfig {
-                enabled: true,
-                terminal: true,
-                sidebar: true,
-                scratchpad: true,
-                spelling: PathSpelling { quote: Quoting::Auto, wsl_translate: true },
-                highlight: true,
-            }
-        );
+        assert_eq!(ui.drop, DropConfig {
+            enabled: true,
+            terminal: true,
+            sidebar: true,
+            scratchpad: true,
+            spelling: PathSpelling { quote: Quoting::Auto, wsl_translate: true },
+            highlight: true,
+        });
     }
 
     #[test]
     fn drop_options_parse_from_the_ui_drop_table() {
         let ui = ui_from_toml(
-            "[ui.drop]\n\
-             enabled = false\n\
-             terminal = false\n\
-             sidebar = false\n\
-             scratchpad = false\n\
-             quote = \"posix\"\n\
-             wsl_translate = false\n\
-             highlight = false\n",
+            "[ui.drop]\nenabled = false\nterminal = false\nsidebar = false\nscratchpad = \
+             false\nquote = \"posix\"\nwsl_translate = false\nhighlight = false\n",
         );
-        assert_eq!(
-            ui.drop,
-            DropConfig {
-                enabled: false,
-                terminal: false,
-                sidebar: false,
-                scratchpad: false,
-                spelling: PathSpelling { quote: Quoting::Posix, wsl_translate: false },
-                highlight: false,
-            }
-        );
+        assert_eq!(ui.drop, DropConfig {
+            enabled: false,
+            terminal: false,
+            sidebar: false,
+            scratchpad: false,
+            spelling: PathSpelling { quote: Quoting::Posix, wsl_translate: false },
+            highlight: false,
+        });
     }
 
     #[test]
@@ -3450,10 +3662,12 @@ program = "second"
     #[test]
     fn paste_options_default_to_on_with_the_owned_image_dir() {
         let ui = ui_from_toml("");
-        assert_eq!(
-            ui.paste,
-            PasteConfig { files: true, image: true, image_dir: None, image_keep: 20 }
-        );
+        assert_eq!(ui.paste, PasteConfig {
+            files: true,
+            image: true,
+            image_dir: None,
+            image_keep: 20
+        });
         let (dir, owned) = ui.paste.image_target();
         assert_eq!(dir, default_image_dir());
         assert!(owned, "the default directory is alacritree's own");
@@ -3479,21 +3693,14 @@ program = "second"
     fn paste_options_parse_from_the_ui_paste_table() {
         let home = home::home_dir().expect("a home directory");
         let ui = ui_from_toml(
-            "[ui.paste]\n\
-             files = false\n\
-             image = false\n\
-             image_dir = \"~/shots\"\n\
-             image_keep = 5\n",
+            "[ui.paste]\nfiles = false\nimage = false\nimage_dir = \"~/shots\"\nimage_keep = 5\n",
         );
-        assert_eq!(
-            ui.paste,
-            PasteConfig {
-                files: false,
-                image: false,
-                image_dir: Some(home.join("shots")),
-                image_keep: 5,
-            }
-        );
+        assert_eq!(ui.paste, PasteConfig {
+            files: false,
+            image: false,
+            image_dir: Some(home.join("shots")),
+            image_keep: 5,
+        });
     }
 
     /// A directory the user chose may hold files alacritree never wrote, so it is
@@ -3595,6 +3802,15 @@ program = "second"
         assert!(raw.into_config().debug.persistent_logging);
     }
 
+    #[test]
+    fn gpu_timing_is_off_unless_asked_for() {
+        let off: RawConfig = toml::from_str("").unwrap();
+        let on: RawConfig = toml::from_str("[debug]\ngpu_timing = true").unwrap();
+
+        assert!(!off.into_config().debug.gpu_timing);
+        assert!(on.into_config().debug.gpu_timing);
+    }
+
     /// `[debug]` in both files merges key by key rather than the later table
     /// replacing the earlier one wholesale.
     #[test]
@@ -3608,5 +3824,52 @@ program = "second"
 
         assert!(config.debug.persistent_logging, "the alacritty.toml key was dropped");
         assert!(!config.debug.crash_log, "the alacritree.toml key was dropped");
+    }
+
+    #[test]
+    fn every_accepted_adjustment_spelling_parses() {
+        assert_eq!(Adjust::parse("0"), Some(Adjust::Points(0.0)));
+        assert_eq!(Adjust::parse("-2"), Some(Adjust::Points(-2.0)));
+        assert_eq!(Adjust::parse("1.5"), Some(Adjust::Points(1.5)));
+        assert_eq!(Adjust::parse("2pt"), Some(Adjust::Points(2.0)));
+        assert_eq!(Adjust::parse("2px"), Some(Adjust::Pixels(2.0)));
+        assert_eq!(Adjust::parse("-2px"), Some(Adjust::Pixels(-2.0)));
+        assert_eq!(Adjust::parse("150%"), Some(Adjust::Scale(1.5)));
+    }
+
+    /// A percentage is a magnitude.  kitty silently takes the absolute value of a
+    /// negative one, which gives back a line the user did not ask for and no way
+    /// to tell that happened.
+    #[test]
+    fn unusable_adjustment_spellings_are_rejected() {
+        for text in ["", "abc", "2 px", "-150%", "px", "%", "nan", "inf"] {
+            assert_eq!(Adjust::parse(text), None, "{text:?} should not parse");
+        }
+    }
+
+    /// The two spellings of "leave it alone" have to agree, since one is the
+    /// default and the other is what a user writes to say the same thing.
+    #[test]
+    fn a_zero_adjustment_is_the_identity_in_both_units() {
+        assert_eq!(Adjust::parse("0").unwrap().apply(7.0, 2.0), 7.0);
+        assert_eq!(Adjust::parse("100%").unwrap().apply(7.0, 2.0), 7.0);
+        assert_eq!(Adjust::NONE.apply(7.0, 2.0), 7.0);
+    }
+
+    /// Pixels are physical and points are not, which is the whole reason both
+    /// spellings exist.
+    #[test]
+    fn pixels_are_absolute_and_points_scale_with_the_display() {
+        assert_eq!(Adjust::parse("2px").unwrap().apply(10.0, 2.0), 12.0);
+        assert_eq!(Adjust::parse("2pt").unwrap().apply(10.0, 2.0), 14.0);
+        assert_eq!(Adjust::parse("150%").unwrap().apply(10.0, 2.0), 15.0);
+    }
+
+    /// A malformed knob must not fail the whole config load, and must not leave
+    /// the line somewhere the user cannot predict.
+    #[test]
+    fn a_malformed_adjustment_behaves_as_zero() {
+        assert_eq!(parse_adjust("underline_position", Some("2 px")), Adjust::NONE);
+        assert_eq!(parse_adjust("underline_position", None), Adjust::NONE);
     }
 }

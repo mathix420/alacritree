@@ -6,6 +6,7 @@
 //! dormant without cfg-gating at call sites.
 
 use crate::command_ext::CommandExt;
+use crate::jobs;
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -183,32 +184,53 @@ fn is_utility_distro(name: &str) -> bool {
     name.starts_with("docker-desktop") || name.starts_with("rancher-desktop")
 }
 
-/// Registered distros, default first-classed.  Registry is the primary
-/// source (no process spawn, knows the default); `wsl -l -q` is the
-/// fallback when the key is unreadable.  Empty means WSL features stay
-/// dormant.
-///
-/// Cached for the process lifetime: one caller is a per-frame UI path (the
-/// sidebar), and the CLI fallback spawns `wsl.exe` — without caching, every
-/// repaint would probe the registry or shell out. A distro registered or
-/// unregistered after startup is picked up only on restart; that's an
-/// acceptable trade since mid-session registration churn is rare, and a
-/// stale entry just falls through the existing spawn-failure/degrade paths.
+/// The answer every caller shares once one of the two sources has produced
+/// a non-empty one.  A distro registered or unregistered afterwards is picked
+/// up only on restart; that's an acceptable trade since mid-session
+/// registration churn is rare, and a stale entry just falls through the
+/// existing spawn-failure/degrade paths.
+#[cfg(windows)]
+static DISTROS: OnceLock<Vec<WslDistro>> = OnceLock::new();
+
+/// Registered distros, default first-classed.  Reading the `Lxss` registry key
+/// costs microseconds and knows which distro is the default, so it is the only
+/// source this reaches for: the `wsl -l -q` fallback spawns a process, and the
+/// sidebar asks for this list every frame.  Until
+/// [`prime_distros_from_cli`] has filled that fallback in, a machine whose
+/// registry key is unreadable sees an empty list — the same answer it gets
+/// with no distros installed, which leaves WSL features dormant.
 #[cfg(windows)]
 pub fn distros() -> Vec<WslDistro> {
-    static DISTROS: OnceLock<Vec<WslDistro>> = OnceLock::new();
-    DISTROS
-        .get_or_init(|| match registry_distros() {
-            Some(list) if !list.is_empty() => list,
-            _ => cli_distros(),
-        })
-        .clone()
+    if let Some(list) = DISTROS.get() {
+        return list.clone();
+    }
+    match registry_distros() {
+        Some(list) if !list.is_empty() => DISTROS.get_or_init(|| list).clone(),
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(not(windows))]
 pub fn distros() -> Vec<WslDistro> {
     Vec::new()
 }
+
+/// Fill the shared list from `wsl.exe` when the registry has no answer.
+/// Submitted once at startup rather than reached from a draw path: `wsl.exe`
+/// costs hundreds of milliseconds warm and seconds while a distro VM boots.
+#[cfg(windows)]
+pub fn prime_distros_from_cli(blocking: &jobs::Blocking) {
+    if !distros().is_empty() {
+        return;
+    }
+    let list = cli_distros(blocking);
+    if !list.is_empty() {
+        let _ = DISTROS.set(list);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn prime_distros_from_cli(_: &jobs::Blocking) {}
 
 #[cfg(windows)]
 fn registry_distros() -> Option<Vec<WslDistro>> {
@@ -232,7 +254,8 @@ fn registry_distros() -> Option<Vec<WslDistro>> {
 }
 
 #[cfg(windows)]
-fn cli_distros() -> Vec<WslDistro> {
+#[allow(clippy::disallowed_methods)] // Running wsl.exe is this function's job.
+fn cli_distros(_blocking: &jobs::Blocking) -> Vec<WslDistro> {
     let output = command_bare()
         .args(["-l", "-q"])
         .stdin(Stdio::null())
@@ -314,7 +337,13 @@ pub const SECTION_SEP: &[u8] = b"\n@@ALACRITREE@@\n";
 /// wsl.exe round trip (~400 ms warm on a dev machine, seconds while the VM
 /// cold-boots) — callers batch every query for a repo into a single script
 /// and must never call this on the UI thread.
-pub fn run_batch(distro: &str, script: &str, args: &[&str]) -> Result<Vec<u8>, String> {
+#[allow(clippy::disallowed_methods)] // Running wsl.exe is this function's job.
+pub fn run_batch(
+    distro: &str,
+    script: &str,
+    args: &[&str],
+    _blocking: &jobs::Blocking,
+) -> Result<Vec<u8>, String> {
     // A request the helper may have executed is never re-run as a one-shot
     // (batch scripts have side effects); only a transport that failed
     // before the write falls through to the spawn below.
@@ -345,14 +374,14 @@ pub fn run_batch(distro: &str, script: &str, args: &[&str]) -> Result<Vec<u8>, S
 /// Resolve `delta`'s absolute path inside `distro`.  Returns `None` when delta
 /// isn't found; callers must not cache that, so an install mid-session is
 /// picked up on the next attempt.
-pub fn discover_delta(distro: &str) -> Option<String> {
+pub fn discover_delta(distro: &str, blocking: &jobs::Blocking) -> Option<String> {
     // The helper's hello already resolved delta through the login shell; a
     // missing capability is not a cached miss — fall through and re-check
     // live so a mid-session install is still picked up.
     if let Some(path) = crate::wsl_helper::capability_delta(distro) {
         return Some(path);
     }
-    probe_tools(distro, &["delta"]).ok()?.into_iter().next().flatten()
+    probe_tools(distro, &["delta"], blocking).ok()?.into_iter().next().flatten()
 }
 
 /// Resolve each of `programs` inside `distro` as the user's login shell sees
@@ -368,7 +397,12 @@ pub fn discover_delta(distro: &str) -> Option<String> {
 ///
 /// Program names are interpolated into the script, so they must be literals —
 /// nothing a user typed belongs here.
-pub fn probe_tools(distro: &str, programs: &[&str]) -> Result<Vec<Option<String>>, String> {
+#[allow(clippy::disallowed_methods)] // Running wsl.exe is this function's job.
+pub fn probe_tools(
+    distro: &str,
+    programs: &[&str],
+    _blocking: &jobs::Blocking,
+) -> Result<Vec<Option<String>>, String> {
     let probes: Vec<String> = programs.iter().map(|p| format!("command -v {p} || echo")).collect();
     let script = format!(
         r#"s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=${{SHELL:-/bin/sh}}; exec "$s" -lc '{}'"#,
@@ -677,7 +711,10 @@ mod tests {
     #[ignore]
     fn run_batch_round_trips() {
         let distro = distros().into_iter().find(|d| d.is_default).expect("a default distro");
-        let out = run_batch(&distro.name, r#"printf '%s' "$1""#, &["hello"]).unwrap();
+        let out = jobs::on_this_thread(|blocking| {
+            run_batch(&distro.name, r#"printf '%s' "$1""#, &["hello"], blocking)
+        })
+        .unwrap();
         assert_eq!(out, b"hello");
     }
 }
