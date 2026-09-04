@@ -8663,6 +8663,13 @@ impl AlacritreeApp {
                     self.defer_project_add(ctx, path, reply_tx);
                     continue;
                 },
+                // The reply has to wait for the PTY: a client that creates a
+                // session in order to write to it would otherwise be told the
+                // id before anything can receive what it writes.
+                ipc::IpcRequest::CreateSession { workspace } => {
+                    self.defer_create_session(ctx, workspace, reply_tx);
+                    continue;
+                },
                 other => other,
             };
             let name = request.name();
@@ -8711,6 +8718,40 @@ impl AlacritreeApp {
         }
     }
 
+    fn defer_create_session(
+        &mut self,
+        ctx: &Context,
+        workspace: Option<PathBuf>,
+        reply_tx: mpsc::Sender<ipc::IpcResult>,
+    ) {
+        let workspace = match workspace {
+            None => None,
+            Some(p) => match self.known_worktree_path(&p) {
+                Some(known) => Some(known),
+                None => {
+                    let _ = reply_tx.send(Err(unknown_worktree(&p)));
+                    return;
+                },
+            },
+        };
+        let id = match self.spawn_session(ctx, workspace) {
+            Ok(id) => id,
+            // `defer_create_session` answers the client itself, so a failure
+            // the frame can still see has to be sent rather than returned.
+            Err(e) => {
+                let _ = reply_tx.send(Err(format!("failed to spawn shell: {e}")));
+                return;
+            },
+        };
+        // Nothing is opening for this id when the gate is off, since
+        // `spawn_session` attaches inline before returning: `watch` hands
+        // the channel straight back and it is answered the same way the
+        // gate-off path answers today.
+        if let Some(reply_tx) = self.pending_spawns.watch(id, reply_tx) {
+            let _ = reply_tx.send(Ok(json!({ "session_id": id })));
+        }
+    }
+
     fn handle_ipc_request(&mut self, ctx: &Context, request: ipc::IpcRequest) -> ipc::IpcResult {
         use ipc::IpcRequest as Req;
         match request {
@@ -8741,18 +8782,10 @@ impl AlacritreeApp {
                     Ok(json!({ "workspace": known }))
                 },
             },
-            Req::CreateSession { workspace } => {
-                let workspace = match workspace {
-                    None => None,
-                    Some(p) => {
-                        Some(self.known_worktree_path(&p).ok_or_else(|| unknown_worktree(&p))?)
-                    },
-                };
-                let id = self
-                    .spawn_session(ctx, workspace)
-                    .map_err(|e| format!("failed to spawn shell: {e}"))?;
-                Ok(json!({ "session_id": id }))
-            },
+            // Claimed by `process_ipc_calls` before dispatch: the reply is
+            // held until the session's PTY is live, which needs the reply
+            // channel this method does not have.
+            Req::CreateSession { .. } => Err("create_session was not deferred".to_string()),
             Req::CloseSession { session_id } => {
                 if !self.sessions.iter().any(|s| s.id == session_id) {
                     return Err(format!("no session with id {session_id}"));
