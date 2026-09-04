@@ -1260,14 +1260,18 @@ fn gather_fallback_faces(
 #[cfg(not(unix))]
 fn cmap_coverage(face: &ttf_parser::Face) -> Option<coverage::Coverage> {
     let cmap = face.tables().cmap?;
-    let mut codepoints = Vec::new();
+    // A font's BMP and full subtables overlap heavily, so the per-subtable
+    // sets are unioned rather than concatenated.  `merge` coalesces
+    // overlapping and adjacent ranges, which concatenation would not.
+    let mut covered = coverage::Coverage::default();
     for subtable in cmap.subtables {
         if !subtable.is_unicode() {
             continue;
         }
-        subtable.codepoints(|cp| codepoints.push(cp));
+        let one = coverage::Coverage::from_ascending_walk(|emit| subtable.codepoints(emit));
+        covered.merge(&one);
     }
-    Some(coverage::Coverage::from_codepoints(codepoints))
+    Some(covered)
 }
 
 #[cfg(all(not(unix), test))]
@@ -2547,6 +2551,42 @@ mod tests {
         let _ = face_coverage(&path, 0);
 
         assert!(is_mapped(&path), "face_coverage read the file instead of mapping it");
+    }
+
+    /// Today's collect-and-sort body, kept so the fold has something to be
+    /// equivalent to.  If this and `cmap_coverage` ever disagree, the fold is
+    /// wrong, not this.
+    #[cfg(not(unix))]
+    fn cmap_coverage_by_sorting(face: &ttf_parser::Face) -> Option<coverage::Coverage> {
+        let cmap = face.tables().cmap?;
+        let mut codepoints = Vec::new();
+        for subtable in cmap.subtables {
+            if !subtable.is_unicode() {
+                continue;
+            }
+            subtable.codepoints(|cp| codepoints.push(cp));
+        }
+        Some(coverage::Coverage::from_codepoints(codepoints))
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn cmap_coverage_matches_the_sorting_implementation_on_every_system_face() {
+        let fonts = SystemFonts::with_cache_dir(None);
+        let db = fonts.db();
+        let mut compared = 0usize;
+        for face in db.faces() {
+            let both = db.with_face_data(face.id, |data, index| {
+                let parsed = ttf_parser::Face::parse(data, index).ok()?;
+                Some((cmap_coverage(&parsed), cmap_coverage_by_sorting(&parsed)))
+            });
+            let Some(Some((folded, sorted))) = both else {
+                continue;
+            };
+            assert_eq!(folded, sorted, "coverage differs for {:?}", face.source);
+            compared += 1;
+        }
+        assert!(compared > 0, "no system faces were parsed, so this proved nothing");
     }
 
     /// Raw font units are in the hundreds; em fractions are not.  A face read
