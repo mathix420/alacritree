@@ -4767,6 +4767,24 @@ fn spawn_geometry(
     active.or(last_pane).unwrap_or((TermSize::new(80, 24), (8.0, 16.0)))
 }
 
+/// What one session contributes to the GUI's own priority boost for a frame.
+struct SessionBoost {
+    /// The session's job holds a boost of its own.
+    raised: bool,
+    /// The session is the one on screen, with the window focused.
+    visible: bool,
+    /// The session's PTY is still opening.
+    pending: bool,
+}
+
+/// Whether this session is a reason for the GUI to stay boosted.  A session
+/// still opening its PTY has no job to raise yet but will have one within a
+/// frame or two, and counting it is what stops a spawn dropping the GUI to
+/// normal priority for the whole open and raising it again on attach.
+fn holds_self_boost(session: SessionBoost) -> bool {
+    session.raised || (session.visible && session.pending)
+}
+
 /// git arguments (everything after `git`) for the requested diff — shared
 /// by the Windows and WSL pane commands.
 fn diff_args(req: &DiffRequest) -> Vec<String> {
@@ -7293,12 +7311,11 @@ impl AlacritreeApp {
         let mut anything_raised = false;
         for (idx, session) in self.sessions.iter().enumerate() {
             let wanted = Some(idx) == target;
-            // A session still opening its PTY has no job to raise yet but will
-            // have one within a frame or two.  Counting it is what stops a
-            // spawn dropping the GUI to normal priority for the whole open and
-            // raising it again on attach.
-            anything_raised |=
-                session.set_priority_boost(wanted) || (wanted && session.is_pending());
+            anything_raised |= holds_self_boost(SessionBoost {
+                raised: session.set_priority_boost(wanted),
+                visible: wanted,
+                pending: session.is_pending(),
+            });
         }
         // A boost covers every depth, so a focused tab running
         // `cargo build -j16` raises all sixteen compilers.  The GUI left at
@@ -9388,6 +9405,28 @@ mod tests {
 
         assert_eq!((size.columns, size.screen_lines), (80, 24));
         assert_eq!(cell_size, (8.0, 16.0));
+    }
+
+    #[test]
+    fn the_visible_session_holds_the_self_boost_while_its_pty_is_still_opening() {
+        // Nothing to raise yet, so `set_priority_boost` answered false.
+        let visible = SessionBoost { raised: false, visible: true, pending: true };
+
+        assert!(holds_self_boost(visible));
+    }
+
+    #[test]
+    fn a_background_session_still_opening_its_pty_holds_no_self_boost() {
+        let background = SessionBoost { raised: false, visible: false, pending: true };
+
+        assert!(!holds_self_boost(background));
+    }
+
+    #[test]
+    fn a_session_whose_job_took_the_boost_holds_it_wherever_it_sits() {
+        let background = SessionBoost { raised: true, visible: false, pending: false };
+
+        assert!(holds_self_boost(background));
     }
 
     #[test]

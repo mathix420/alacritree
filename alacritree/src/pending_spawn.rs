@@ -175,6 +175,29 @@ mod tests {
     }
 
     #[test]
+    fn a_second_waiter_joins_the_open_already_running() {
+        let (open_tx, open_rx) = mpsc::channel();
+        let (first_tx, first_rx) = mpsc::channel();
+        let (second_tx, second_rx) = mpsc::channel();
+
+        let mut spawns = PendingSpawns::default();
+        spawns.start(1, open_rx);
+        assert!(spawns.watch(1, first_tx).is_none());
+        assert!(spawns.watch(1, second_tx).is_none());
+
+        open_tx.send(Err(std::io::Error::other("boom"))).unwrap();
+        let mut finished = spawns.take_finished();
+        assert_eq!(finished.len(), 1);
+        let Finished::Failed(_, e, waiters) = finished.remove(0) else {
+            panic!("expected Failed")
+        };
+        PendingSpawns::answer(waiters, Err(e.to_string()));
+
+        assert_eq!(first_rx.try_recv().unwrap(), Err("boom".to_string()));
+        assert_eq!(second_rx.try_recv().unwrap(), Err("boom".to_string()));
+    }
+
+    #[test]
     fn watching_an_id_nothing_is_opening_hands_the_channel_back() {
         let (reply_tx, _reply_rx) = mpsc::channel();
         let mut spawns = PendingSpawns::default();
