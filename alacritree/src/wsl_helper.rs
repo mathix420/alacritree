@@ -600,12 +600,65 @@ impl HelperClient {
             self.mark_down(&format!("write failed: {e}"));
             return Err(TransportError::NotWritten(e));
         }
-        match rx.recv_timeout(timeout) {
-            Ok(frame) => Ok(frame),
-            Err(_) => {
+        // Liveness is asked as "has anything arrived recently", not "was
+        // this reply on time": a loaded host delivers late, a wedged helper
+        // never delivers, and only the second is worth a teardown.
+        let sent_at = Instant::now();
+        let deadline = sent_at + timeout;
+        // Silence only counts while somebody was awake to observe it.  A
+        // slice that overran means the host was starved, and the quiet
+        // underneath it says nothing about the far end, so the window
+        // restarts rather than carrying that stretch forward.
+        let mut watching_since = sent_at;
+        loop {
+            let slice_start = Instant::now();
+            let remaining = deadline.saturating_duration_since(slice_start);
+            if remaining.is_zero() {
                 lock(&self.pending).remove(&id);
-                Err(TransportError::NoReply(format!("no reply from the {} helper", self.distro)))
-            },
+                return Err(TransportError::NoReply(format!(
+                    "no reply from the {} helper",
+                    self.distro
+                )));
+            }
+            let asked = remaining.min(self.timing.slice);
+            match rx.recv_timeout(asked) {
+                Ok(frame) => return Ok(frame),
+                // The sender is dropped by `mark_down`'s `pending.clear()`,
+                // so a disconnect means someone already tore this down.
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(TransportError::NoReply(format!(
+                        "the {} helper went down while waiting",
+                        self.distro
+                    )));
+                },
+                Err(mpsc::RecvTimeoutError::Timeout) => {},
+            }
+            let slept = slice_start.elapsed();
+            let silence = self.silent_for().min(watching_since.elapsed());
+            if slept > asked * 2 {
+                watching_since = Instant::now();
+            }
+            if wedged(&self.timing, asked, slept, silence) {
+                // The count is taken into a local first: passing
+                // `lock(...).len()` as an argument keeps the guard alive
+                // across the call, and `mark_down` takes the same mutex.
+                let outstanding = {
+                    let mut pending = lock(&self.pending);
+                    pending.remove(&id);
+                    pending.len()
+                };
+                self.mark_down(&format!(
+                    "silent for {:.0}s with {outstanding} outstanding",
+                    silence.as_secs_f64()
+                ));
+                return Err(TransportError::NoReply(format!(
+                    "no reply from the {} helper",
+                    self.distro
+                )));
+            }
+            // After the judgment, so the next slice reads the answer to this
+            // slice's question rather than to one sent moments ago.
+            self.ping();
         }
     }
 
@@ -1111,6 +1164,117 @@ mod tests {
         client.mark_down("test");
         client.ping();
         assert!(client.is_down());
+    }
+
+    #[test]
+    fn a_helper_that_stops_answering_is_torn_down_rather_than_waited_out() {
+        // Scaled down by two orders of magnitude: the decision is the same one
+        // production makes, taken in a third of a second.
+        let timing =
+            Timing { slice: Duration::from_millis(50), silence_limit: Duration::from_millis(300) };
+        let (client, helper) = FakeHelper::with_timing(timing);
+
+        let started = Instant::now();
+        let result = client.run("printf hi", &[]);
+
+        assert!(
+            matches!(result, Err(TransportError::NoReply(_))),
+            "a silent helper answers nothing"
+        );
+        assert!(client.is_down(), "a silent helper must be torn down, not merely reported");
+        assert!(lock(&client.pending).is_empty(), "the waiter left its channel behind");
+        assert!(
+            started.elapsed() < RUN_TIMEOUT,
+            "gave up on the run budget rather than on silence, after {:?}",
+            started.elapsed()
+        );
+
+        // The waiter asked the dispatcher to prove it was reading, which is the
+        // signal the old code had no way to send.
+        let mut pings = 0;
+        while let Ok(sent) = helper.from_client.try_recv() {
+            if sent == b"0\tPING\n" {
+                pings += 1;
+            }
+        }
+        assert!(pings > 0, "no ping was ever sent");
+    }
+
+    #[test]
+    fn a_slow_job_over_a_healthy_pipe_is_never_torn_down() {
+        // A silence limit far longer than the test's own runtime: a false
+        // teardown here would need the reader thread starved for five seconds
+        // inside a test that finishes in a fraction of one.
+        let timing =
+            Timing { slice: Duration::from_millis(50), silence_limit: Duration::from_secs(5) };
+        let (client, helper) = FakeHelper::with_timing(timing);
+
+        let answering = std::thread::spawn(move || {
+            let mut slices = 0;
+            while let Ok(sent) = helper.from_client.recv_timeout(Duration::from_secs(10)) {
+                if sent == b"0\tPING\n" {
+                    slices += 1;
+                    let _ = helper.to_client.send(b"0\t0\t0\n".to_vec());
+                    if slices < 4 {
+                        continue;
+                    }
+                }
+                // The job finishes after four answered pings: slow, but the
+                // pipe was never quiet.
+                let _ = helper.to_client.send(b"1\t0\t2\nhi".to_vec());
+                return helper;
+            }
+            helper
+        });
+
+        let (exit, payload) = client.run("printf hi", &[]).expect("a slow job still answers");
+        assert_eq!(exit, 0);
+        assert_eq!(payload, b"hi");
+        assert!(!client.is_down(), "a healthy pipe was torn down");
+        assert!(lock(&client.pending).is_empty());
+        let _ = answering.join();
+    }
+
+    /// A wedged helper is torn down rather than making every later caller pay
+    /// the full run budget.  Requires WSL, and it deliberately kills the shared
+    /// helper for the default distro, so run it on its own:
+    /// `cargo nextest run -p alacritree wsl_helper::tests::a_wedged_helper --run-ignored all`
+    #[test]
+    #[ignore]
+    fn a_wedged_helper_is_torn_down_once_it_stops_answering() {
+        let distro =
+            crate::wsl::distros().into_iter().find(|d| d.is_default).expect("a default distro");
+        let ready_by = Instant::now() + Duration::from_secs(120);
+        let client = loop {
+            if let Some(c) = client(&distro.name) {
+                break c;
+            }
+            assert!(Instant::now() < ready_by, "helper never became ready");
+            std::thread::sleep(Duration::from_millis(200));
+        };
+
+        // A job's stdout is `$t/<id>.out`, so its own fd 1 names the directory
+        // holding the completion fifo.  `$$` rather than `self`, because inside
+        // a command substitution `/proc/self` is the substitution's own pipe.
+        // Removing the fifo leaves the writer blocked on a deleted inode while
+        // later completions land in a regular file nobody reads, which is the
+        // wedge this test needs.  The removal is delayed so this request still
+        // gets its own answer back.
+        let (exit, _) = client
+            .run(
+                r#"d=$(readlink /proc/$$/fd/1); d=${d%/*}
+[ -p "$d/done" ] || exit 1
+( sleep 1; rm -f "$d/done" ) >/dev/null 2>&1 &"#,
+                &[],
+            )
+            .expect("the wedge request is answered before the fifo goes");
+        assert_eq!(exit, 0, "the job did not find the completion fifo");
+
+        let down_by = Instant::now() + Duration::from_secs(90);
+        while !client.is_down() {
+            assert!(Instant::now() < down_by, "a wedged helper was never marked down");
+            let _ = client.run("printf x", &[]);
+        }
     }
 
     /// Live round trip against the default distro.  Requires WSL; run
