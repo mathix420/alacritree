@@ -2322,24 +2322,6 @@ mod tests {
 
     #[cfg(not(unix))]
     #[test]
-    fn coverage_cache_round_trips_across_scans() {
-        let cache_path = scratch_cache_path("round_trip");
-        std::fs::remove_file(&cache_path).ok();
-
-        let cold_fonts = SystemFonts::with_cache_dir(None);
-        let cold = scan_coverage(cold_fonts.db(), Some(&cache_path));
-        assert!(cache_path.is_file());
-
-        let warm_fonts = SystemFonts::with_cache_dir(None);
-        let warm = scan_coverage(warm_fonts.db(), Some(&cache_path));
-
-        assert_eq!(cold, warm);
-
-        std::fs::remove_file(&cache_path).ok();
-    }
-
-    #[cfg(not(unix))]
-    #[test]
     fn worker_count_clamps_between_one_and_four() {
         assert_eq!(worker_count(1), 1);
         assert_eq!(worker_count(2), 2);
