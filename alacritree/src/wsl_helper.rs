@@ -327,6 +327,36 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// A broken distro must not cause a spawn storm.
 const RESPAWN_COOLDOWN: Duration = Duration::from_secs(30);
 
+/// The two periods the liveness decision reads.  A struct rather than
+/// constants so a test can drive the wait loop in milliseconds; production
+/// only ever uses `DEFAULT`.
+struct Timing {
+    /// How often a waiter pings and re-examines the transport.  Matches the
+    /// period zed's remote client uses for the same job.
+    slice: Duration,
+    /// Six slices.  VS Code's equivalent tolerates four and AMQP two, both
+    /// against peers that are not sharing vCPUs with the judge.
+    silence_limit: Duration,
+}
+
+impl Timing {
+    const DEFAULT: Self = Self {
+        slice: Duration::from_secs(5),
+        silence_limit: Duration::from_secs(30),
+    };
+}
+
+/// Whether an expired slice is evidence the transport is dead.
+///
+/// `slept` past twice `asked` means the waiter's own sleep overran, so the
+/// host was starved and nothing measured under it is evidence of anything.
+/// `silence` is how long the caller has *observed* no bytes, which is not
+/// the same as how old the last byte is: after a resume the last byte is
+/// legitimately hours old with nobody watching.
+fn wedged(timing: &Timing, asked: Duration, slept: Duration, silence: Duration) -> bool {
+    slept <= asked * 2 && silence > timing.silence_limit
+}
+
 static ENABLED: AtomicBool = AtomicBool::new(true);
 
 pub fn set_enabled(enabled: bool) {
@@ -845,6 +875,60 @@ mod tests {
         assert_ne!(a, b);
         let prefix = format!("{}-", std::process::id());
         assert!(a.starts_with(&prefix), "{a} should start with {prefix}");
+    }
+
+    #[test]
+    fn a_starved_slice_never_condemns_the_helper() {
+        // The waiter asked for five seconds and the host handed it back twenty,
+        // so the silence it measured under that is not evidence of anything.
+        assert!(!wedged(
+            &Timing::DEFAULT,
+            Duration::from_secs(5),
+            Duration::from_secs(20),
+            Duration::from_secs(300),
+        ));
+    }
+
+    #[test]
+    fn silence_past_the_limit_in_a_punctual_slice_condemns_the_helper() {
+        assert!(wedged(
+            &Timing::DEFAULT,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(31),
+        ));
+    }
+
+    #[test]
+    fn silence_inside_the_limit_is_not_evidence() {
+        assert!(!wedged(
+            &Timing::DEFAULT,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(29),
+        ));
+    }
+
+    #[test]
+    fn a_test_timing_scales_the_whole_decision_down() {
+        // The loop under test has to run in milliseconds, so the limit the
+        // predicate reads has to come from the struct rather than a constant.
+        let fast = Timing {
+            slice: Duration::from_millis(50),
+            silence_limit: Duration::from_millis(300),
+        };
+        assert!(wedged(
+            &fast,
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            Duration::from_millis(301)
+        ));
+        assert!(!wedged(
+            &fast,
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            Duration::from_millis(299)
+        ));
     }
 
     /// Live round trip against the default distro.  Requires WSL; run
