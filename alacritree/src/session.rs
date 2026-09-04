@@ -1491,6 +1491,9 @@ impl Session {
         }
         self.size = size;
         self.cell_size = cell_size;
+        // Upstream resizes the PTY first and the terminal second; here the
+        // order is reversed so the grid tracks the pane whether or not a PTY
+        // exists yet.
         self.term.lock().resize(size);
         let Some(sender) = &self.sender else {
             return;
@@ -2745,6 +2748,7 @@ mod tests {
     /// Poll the grid until `needle` appears, or fail saying what was there
     /// instead.  A deadline rather than a sleep: the shells these tests drive
     /// take wildly different times to come up on a loaded runner.
+    #[cfg(windows)]
     fn grid_contains(session: &Session, needle: &str, patience: Duration) -> bool {
         let deadline = Instant::now() + patience;
         while Instant::now() < deadline {

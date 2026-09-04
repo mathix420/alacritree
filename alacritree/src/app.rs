@@ -8776,7 +8776,7 @@ impl AlacritreeApp {
         // Nothing is opening for this id when the gate is off, since
         // `spawn_session` attaches inline before returning: `watch` hands
         // the channel straight back and it is answered the same way the
-        // gate-off path answers today.
+        // gate-off path answers it.
         if let Some(reply_tx) = self.pending_spawns.watch(id, reply_tx) {
             let _ = reply_tx.send(Ok(json!({ "session_id": id })));
         }
