@@ -132,7 +132,9 @@ use std::path::Path;
 /// The distro-side helper, passed verbatim as the single argument of
 /// `wsl.exe --exec sh -c`.  POSIX sh only — dash and busybox ash both run
 /// it.  Shape: capability hello, dead-pidfile GC, a background writer that
-/// owns stdout, then the request dispatcher on stdin.  Responses all leave
+/// owns stdout, then the request dispatcher on stdin, whose `PING` answers
+/// with an unrouted frame so a caller can tell a stalled dispatcher from a
+/// slow one.  Responses all leave
 /// through the writer, whose FIFO completion lines are far under PIPE_BUF,
 /// so concurrent jobs never interleave frames.  Commentary lives here, not
 /// in the script, so every byte shipped into the distro earns its keep.
@@ -228,6 +230,7 @@ while IFS=$TAB read -r id kind rest; do
     printf %s "$comm" > "$t/$id.out"
     printf '%s 0\n' "$id" >> "$t/done"
     ;;
+  PING) printf '0 0\n' >> "$t/done" & ;;
   esac
 done
 "##;
@@ -529,6 +532,18 @@ impl HelperClient {
     fn silent_for(&self) -> Duration {
         let now = self.started.elapsed().as_millis() as u64;
         Duration::from_millis(now.saturating_sub(self.last_bytes_at.load(Ordering::Relaxed)))
+    }
+
+    /// Ask the dispatcher to prove it is still reading.  The reply is a
+    /// frame nothing routes; its only effect is refreshing `last_bytes_at`.
+    fn ping(&self) {
+        // A held stdin lock is a reason to skip, never to wait: blocking
+        // here would park the waiter inside the failure it came to detect,
+        // and the thread holding the lock is itself proof of a live write.
+        let Ok(mut guard) = self.stdin.try_lock() else { return };
+        if let Some(stdin) = guard.as_mut() {
+            let _ = stdin.write_all(b"0\tPING\n").and_then(|()| stdin.flush());
+        }
     }
 
     /// A client over arbitrary pipes, so a test can be the helper.  Starts
@@ -1076,6 +1091,26 @@ mod tests {
         // A stamp at any point after construction leaves less silence behind it
         // than the client has been alive, whatever the scheduler does next.
         assert!(client.silent_for() < client.started.elapsed());
+    }
+
+    #[test]
+    fn a_ping_reaches_the_far_end_as_a_reserved_id_zero_line() {
+        let (client, helper) = FakeHelper::silent();
+        client.ping();
+        let sent =
+            helper.from_client.recv_timeout(Duration::from_secs(5)).expect("a ping was sent");
+        assert_eq!(sent, b"0\tPING\n");
+    }
+
+    #[test]
+    fn a_ping_with_nowhere_to_write_is_silently_skipped() {
+        let (client, _helper) = FakeHelper::silent();
+        // A torn-down client has no stdin.  A ping that cannot be sent is one
+        // more slice of silence, which the wait loop already handles; it must
+        // not panic and must not report anything new.
+        client.mark_down("test");
+        client.ping();
+        assert!(client.is_down());
     }
 
     /// Live round trip against the default distro.  Requires WSL; run
