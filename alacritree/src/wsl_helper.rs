@@ -375,7 +375,9 @@ pub enum TransportError {
 
 pub struct HelperClient {
     distro: String,
-    stdin: Mutex<Option<std::process::ChildStdin>>,
+    /// Boxed rather than a `ChildStdin` so a test can stand a fake helper
+    /// behind the same client the app uses.
+    stdin: Mutex<Option<Box<dyn Write + Send>>>,
     pending: Mutex<HashMap<u64, mpsc::Sender<Frame>>>,
     next_id: AtomicU64,
     capabilities: OnceLock<Capabilities>,
@@ -384,6 +386,14 @@ pub struct HelperClient {
     /// pipes.  Dropping stdin only reaches a helper still listening for the
     /// EOF.
     child: Mutex<Option<std::process::Child>>,
+    /// Monotonic base for `last_bytes_at`, which is stored as elapsed
+    /// milliseconds so the read path stays lock-free.
+    started: Instant,
+    /// Milliseconds since `started` at the last successful read off the
+    /// helper's stdout.  Bytes, not frames: a partially delivered frame is
+    /// still proof the far end is producing output.
+    last_bytes_at: AtomicU64,
+    timing: Timing,
 }
 
 fn lock<'a, T>(mutex: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
@@ -407,6 +417,9 @@ impl HelperClient {
             capabilities: OnceLock::new(),
             down: AtomicBool::new(false),
             child: Mutex::new(None),
+            started: Instant::now(),
+            last_bytes_at: AtomicU64::new(0),
+            timing: Timing::DEFAULT,
         });
         let mut child = match wsl::command(distro, None)
             .arg("sh")
@@ -424,8 +437,9 @@ impl HelperClient {
                 return client;
             },
         };
-        *lock(&client.stdin) = child.stdin.take();
-        let stdout = child.stdout.take().expect("stdout piped above");
+        *lock(&client.stdin) = child.stdin.take().map(|w| Box::new(w) as Box<dyn Write + Send>);
+        let stdout =
+            Box::new(child.stdout.take().expect("stdout piped above")) as Box<dyn Read + Send>;
         *lock(&client.child) = Some(child);
         let reader = client.clone();
         let spawned =
@@ -445,7 +459,7 @@ impl HelperClient {
         client
     }
 
-    fn read_loop(&self, stdout: std::process::ChildStdout) {
+    fn read_loop(&self, stdout: Box<dyn Read + Send>) {
         let mut reader = std::io::BufReader::new(stdout);
         let mut hello = String::new();
         match reader.read_line(&mut hello) {
@@ -462,15 +476,18 @@ impl HelperClient {
             match reader.read(&mut chunk) {
                 Ok(0) => return self.mark_down("closed its pipe"),
                 Err(e) => return self.mark_down(&format!("read failed: {e}")),
-                Ok(n) => match frames.push(&chunk[..n]) {
-                    Ok(done) => {
-                        for frame in done {
-                            if let Some(tx) = lock(&self.pending).remove(&frame.id) {
-                                let _ = tx.send(frame);
+                Ok(n) => {
+                    self.stamp_bytes();
+                    match frames.push(&chunk[..n]) {
+                        Ok(done) => {
+                            for frame in done {
+                                if let Some(tx) = lock(&self.pending).remove(&frame.id) {
+                                    let _ = tx.send(frame);
+                                }
                             }
-                        }
-                    },
-                    Err(e) => return self.mark_down(&e),
+                        },
+                        Err(e) => return self.mark_down(&e),
+                    }
                 },
             }
         }
@@ -500,6 +517,45 @@ impl HelperClient {
 
     fn is_ready(&self) -> bool {
         !self.is_down() && self.capabilities.get().is_some()
+    }
+
+    fn stamp_bytes(&self) {
+        self.last_bytes_at.store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// How long the helper has produced nothing at all.  `Relaxed` is
+    /// enough because no other memory is published under the stamp, and a
+    /// waiter that observes a stale value only defers judgment by one slice.
+    fn silent_for(&self) -> Duration {
+        let now = self.started.elapsed().as_millis() as u64;
+        Duration::from_millis(now.saturating_sub(self.last_bytes_at.load(Ordering::Relaxed)))
+    }
+
+    /// A client over arbitrary pipes, so a test can be the helper.  Starts
+    /// the reader thread the same way `spawn` does; there is no child to
+    /// reap, so teardown finds `None` and skips the kill.
+    #[cfg(test)]
+    fn over(
+        distro: &str,
+        reader: Box<dyn Read + Send>,
+        writer: Box<dyn Write + Send>,
+        timing: Timing,
+    ) -> Arc<Self> {
+        let client = Arc::new(Self {
+            distro: distro.to_string(),
+            stdin: Mutex::new(Some(writer)),
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+            capabilities: OnceLock::new(),
+            down: AtomicBool::new(false),
+            child: Mutex::new(None),
+            started: Instant::now(),
+            last_bytes_at: AtomicU64::new(0),
+            timing,
+        });
+        let owner = client.clone();
+        std::thread::spawn(move || owner.read_loop(reader));
+        client
     }
 
     pub fn capabilities(&self) -> Option<&Capabilities> {
@@ -709,6 +765,79 @@ fn ensure_poller() {
 #[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+
+    /// A hello `parse_hello` accepts: protocol 1, all four capability
+    /// fields empty.
+    const HELLO_LINE: &str = "hello\t1\t\t\t\t\n";
+
+    /// One end of a pipe pair standing in for the helper's stdio.
+    struct FakePipe {
+        rx: mpsc::Receiver<Vec<u8>>,
+        buf: std::collections::VecDeque<u8>,
+    }
+
+    impl Read for FakePipe {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            while self.buf.is_empty() {
+                // A disconnected sender is the far end closing its pipe,
+                // which `read_loop` reads as EOF exactly as it would from a
+                // real one.
+                let Ok(chunk) = self.rx.recv() else { return Ok(0) };
+                self.buf.extend(chunk);
+            }
+            let n = out.len().min(self.buf.len());
+            for slot in out.iter_mut().take(n) {
+                *slot = self.buf.pop_front().expect("checked above");
+            }
+            Ok(n)
+        }
+    }
+
+    struct FakeSink(mpsc::Sender<Vec<u8>>);
+
+    impl Write for FakeSink {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            let _ = self.0.send(data.to_vec());
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A client wired to a fake helper, plus the two ends the test drives it
+    /// from: `to_client` writes what the helper says, `from_client` reads
+    /// what the client sent.
+    struct FakeHelper {
+        to_client: mpsc::Sender<Vec<u8>>,
+        from_client: mpsc::Receiver<Vec<u8>>,
+    }
+
+    impl FakeHelper {
+        /// A helper that says hello and then never speaks again.
+        fn silent() -> (Arc<HelperClient>, FakeHelper) {
+            Self::with_timing(Timing::DEFAULT)
+        }
+
+        fn with_timing(timing: Timing) -> (Arc<HelperClient>, FakeHelper) {
+            let (to_client, client_reads) = mpsc::channel();
+            let (client_writes, from_client) = mpsc::channel();
+            to_client.send(HELLO_LINE.as_bytes().to_vec()).expect("client not started yet");
+            let client = HelperClient::over(
+                "fake",
+                Box::new(FakePipe { rx: client_reads, buf: Default::default() }),
+                Box::new(FakeSink(client_writes)),
+                timing,
+            );
+            let ready_by = Instant::now() + Duration::from_secs(5);
+            while !client.is_ready() {
+                assert!(Instant::now() < ready_by, "fake hello was never parsed");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            (client, FakeHelper { to_client, from_client })
+        }
+    }
 
     #[test]
     fn run_request_encodes_base64_fields() {
@@ -931,6 +1060,22 @@ mod tests {
             Duration::from_millis(50),
             Duration::from_millis(299)
         ));
+    }
+
+    #[test]
+    fn a_client_that_has_never_read_reports_its_whole_life_as_silence() {
+        // The helper end is bound rather than dropped: dropping it closes the
+        // pipe, which the reader would correctly read as EOF and tear down.
+        let (client, _helper) = FakeHelper::silent();
+        std::thread::sleep(Duration::from_millis(20));
+        // Never stamped past the hello, so the silence covers the sleep.  The
+        // clock only moves forward, so this bound cannot invert under load.
+        assert!(client.silent_for() >= Duration::from_millis(20));
+
+        client.stamp_bytes();
+        // A stamp at any point after construction leaves less silence behind it
+        // than the client has been alive, whatever the scheduler does next.
+        assert!(client.silent_for() < client.started.elapsed());
     }
 
     /// Live round trip against the default distro.  Requires WSL; run
