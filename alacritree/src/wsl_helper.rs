@@ -1212,12 +1212,13 @@ mod tests {
         let answering = std::thread::spawn(move || {
             let mut slices = 0;
             while let Ok(sent) = helper.from_client.recv_timeout(Duration::from_secs(10)) {
-                if sent == b"0\tPING\n" {
-                    slices += 1;
-                    let _ = helper.to_client.send(b"0\t0\t0\n".to_vec());
-                    if slices < 4 {
-                        continue;
-                    }
+                if sent != b"0\tPING\n" {
+                    continue;
+                }
+                slices += 1;
+                let _ = helper.to_client.send(b"0\t0\t0\n".to_vec());
+                if slices < 4 {
+                    continue;
                 }
                 // The job finishes after four answered pings: slow, but the
                 // pipe was never quiet.
@@ -1232,6 +1233,28 @@ mod tests {
         assert_eq!(payload, b"hi");
         assert!(!client.is_down(), "a healthy pipe was torn down");
         assert!(lock(&client.pending).is_empty());
+        let _ = answering.join();
+    }
+
+    #[test]
+    fn silence_older_than_the_wait_is_not_the_waiter_s_to_judge() {
+        let timing =
+            Timing { slice: Duration::from_millis(50), silence_limit: Duration::from_millis(300) };
+        let (client, helper) = FakeHelper::with_timing(timing);
+        // The client has been quiet longer than the limit before the request is
+        // even sent; only silence observed after it counts.
+        std::thread::sleep(Duration::from_millis(400));
+        let answering = std::thread::spawn(move || {
+            while let Ok(sent) = helper.from_client.recv_timeout(Duration::from_secs(10)) {
+                if sent == b"0\tPING\n" {
+                    let _ = helper.to_client.send(b"1\t0\t2\nhi".to_vec());
+                    return helper;
+                }
+            }
+            helper
+        });
+        assert_eq!(client.run("printf hi", &[]).expect("answered"), (0, b"hi".to_vec()));
+        assert!(!client.is_down());
         let _ = answering.join();
     }
 
