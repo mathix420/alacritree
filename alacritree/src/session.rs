@@ -1081,23 +1081,20 @@ pub struct OpenRequest {
 pub struct Attachment {
     shell_pid: Option<u32>,
     priority_job: Option<crate::focus_priority::PriorityJob>,
-    sender: EventLoopSender,
+    /// `None` only between `into_parts` and the drop that follows it, which
+    /// is what keeps the adopting session's own PTY out of `Drop`'s reach.
+    sender: Option<EventLoopSender>,
 }
 
 impl Attachment {
-    /// Take the pieces apart without running `Drop`.  `attach` is what adopts
-    /// an opened PTY, so running the "nobody adopted this" shutdown on the
-    /// very attachment being adopted would tear down the PTY under it.
+    /// Take the pieces apart.  `attach` is what adopts an opened PTY, so
+    /// taking the sender out is what stops the "nobody adopted this" shutdown
+    /// running on the very attachment being adopted.
     fn into_parts(
-        self,
+        mut self,
     ) -> (Option<u32>, Option<crate::focus_priority::PriorityJob>, EventLoopSender) {
-        let mut this = std::mem::ManuallyDrop::new(self);
-        let shell_pid = this.shell_pid;
-        let priority_job = this.priority_job.take();
-        // SAFETY: `this` is a `ManuallyDrop`, so its `Drop` impl never runs
-        // and `sender` is never read again after this.
-        let sender = unsafe { std::ptr::read(&this.sender) };
-        (shell_pid, priority_job, sender)
+        let sender = self.sender.take().expect("an attachment is taken apart once");
+        (self.shell_pid, self.priority_job.take(), sender)
     }
 }
 
@@ -1106,7 +1103,9 @@ impl Drop for Attachment {
     /// PTY was opening.  Shutting the loop down here rather than at the call
     /// site means a quit mid-open, or a receiver that hung up, cleans up too.
     fn drop(&mut self) {
-        let _ = self.sender.send(Msg::Shutdown);
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(Msg::Shutdown);
+        }
     }
 }
 
@@ -1145,7 +1144,7 @@ pub fn open(request: OpenRequest) -> std::io::Result<Attachment> {
     event_loop.spawn();
     crate::frame_log::spawn_phase(Some(id), "open", started.elapsed());
 
-    Ok(Attachment { shell_pid, priority_job, sender })
+    Ok(Attachment { shell_pid, priority_job, sender: Some(sender) })
 }
 
 impl Session {
