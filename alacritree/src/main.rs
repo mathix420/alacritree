@@ -52,6 +52,7 @@ mod session;
 mod sidebar_focus;
 mod sidebar_nav;
 mod stale_exe;
+mod startup_log;
 mod state;
 #[cfg(test)]
 mod steady_state;
@@ -150,7 +151,7 @@ fn main() -> eframe::Result<()> {
         crash_log::install(dir, env!("CARGO_PKG_VERSION"));
     }
 
-    let config = config::load();
+    let (config, config_files) = config::load();
 
     // The gate defaults on so a panic in `config::load` above is still
     // recorded; that is the one case where `crash_log = false` leaves a file.
@@ -164,11 +165,14 @@ fn main() -> eframe::Result<()> {
     // `gpu_timing` reports through the log stream, and a GUI-subsystem binary
     // has no console for stderr to reach.  Asking for the report has to open
     // the file it lands in, or it is written where nothing can read it.
-    if (config.debug.persistent_logging || config.debug.gpu_timing)
-        && let Some(dir) = &log_dir
-    {
+    let logging_to_file = config.debug.persistent_logging || config.debug.gpu_timing;
+    if logging_to_file && let Some(dir) = &log_dir {
         *log_sink.lock().unwrap_or_else(|e| e.into_inner()) = logging::open_session_log(dir);
     }
+    // After the sink rather than before it: everything logged while the sink is
+    // empty reaches stderr only, and a release build has no console for stderr
+    // to reach.
+    startup_log::emit(&config, &config_files, logging_to_file);
 
     wsl::set_automount_root(config.wsl_automount_root.clone());
     wsl_helper::set_enabled(config.wsl_resident_helper);

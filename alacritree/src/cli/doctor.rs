@@ -93,7 +93,7 @@ pub fn run(as_json: bool, socket: Option<&Path>) -> i32 {
 }
 
 fn report(socket: Option<&Path>) -> Vec<Check> {
-    let config = config::load();
+    let (config, _) = config::load();
 
     // Rows are grouped by section on the way out, so each section has to be
     // added in one run — a section split in two prints its header twice.

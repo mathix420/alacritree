@@ -5,18 +5,25 @@ use egui::{Key, Modifiers};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct KeyBinding {
     pub key: Key,
     pub mods: Modifiers,
     pub action: BindingAction,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub enum BindingAction {
-    Chars(Vec<u8>),
+    Chars(#[serde(serialize_with = "chars_as_string")] Vec<u8>),
     Named(NamedAction),
     Unsupported(String),
+}
+
+/// The bytes a binding writes are an escape sequence, which reads as an
+/// escaped string rather than as the array of integers a byte vector
+/// serialises to by default.
+fn chars_as_string<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&String::from_utf8_lossy(bytes).escape_default().to_string())
 }
 
 /// A `Copy` stand-in for an action's identity, for logs that outlive the
@@ -49,7 +56,7 @@ impl BindingAction {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum NamedAction {
     Paste,
     PasteSelection,

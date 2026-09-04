@@ -25,7 +25,12 @@ use serde::Deserialize;
 use crate::bindings::{self, KeyBinding};
 use crate::path_style::PathStyle;
 
-#[derive(Debug, Clone)]
+/// `[env]` carries whatever the user's environment carries, and a config dump
+/// ends up attached to bug reports.  Key names survive: that `FOO` was set is
+/// diagnostic, what it was set to is not.
+const REDACTED_VALUE: &str = "<redacted>";
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Config {
     pub palette: Palette,
     pub ui: UiTheme,
@@ -35,6 +40,7 @@ pub struct Config {
     pub cursor: CursorConfig,
     pub scrolling: ScrollingConfig,
     pub window: WindowConfig,
+    #[serde(serialize_with = "redacted_env")]
     pub env: HashMap<String, String>,
     pub shell: Option<ShellConfig>,
     pub selection: SelectionConfig,
@@ -61,8 +67,73 @@ pub struct Config {
     pub default_profile: Option<String>,
 }
 
+/// Environment values never serialise.  Enforced on the field rather than by
+/// the caller, so no dump of a `Config` can leak one by forgetting to ask.
+fn redacted_env<S: serde::Serializer>(
+    env: &HashMap<String, String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let mut map = serializer.serialize_map(Some(env.len()))?;
+    for key in env.keys() {
+        map.serialize_entry(key, REDACTED_VALUE)?;
+    }
+    map.end()
+}
+
+impl Config {
+    /// The effective config as one line of JSON, carrying only what differs
+    /// from the defaults; `None` when nothing does.  Follows ghostty's
+    /// `+show-config`, whose `changes-only` is on by default.
+    ///
+    /// Effective values rather than the config file as written, so reading one
+    /// out of a log needs no knowledge of this version's defaults.  Diffed
+    /// against the defaults because a whole config is mostly the 256-entry
+    /// indexed palette and the sidebar colours, which almost nobody touches
+    /// and which would bury the handful of keys that explain a run.
+    ///
+    /// One line because a log file interleaves writers, and a pretty-printed
+    /// block is a block another thread can land in the middle of.
+    pub fn changed_from_defaults(&self) -> Option<String> {
+        let mine = serde_json::to_value(self).ok()?;
+        let stock = serde_json::to_value(stock_config()).ok()?;
+        let changed = changes(&mine, &stock)?;
+        Some(changed.to_string())
+    }
+}
+
+/// The config an install with no config file gets.  Not `Config::default`,
+/// which carries no key bindings: the built-in bindings are filled in on the
+/// way through `RawConfig`, so diffing against `Config::default` would report
+/// every one of them as a change on a stock install.
+fn stock_config() -> Config {
+    RawConfig::default().into_config()
+}
+
+/// Every key of `mine` whose value differs from `stock`, recursing into
+/// objects so one changed field does not drag its whole section along.
+/// Arrays compare whole: a changed element is a changed list, and an index
+/// diff would print something that is not a config value.
+fn changes(mine: &serde_json::Value, stock: &serde_json::Value) -> Option<serde_json::Value> {
+    use serde_json::Value;
+
+    if mine == stock {
+        return None;
+    }
+    let (Value::Object(mine), Value::Object(stock)) = (mine, stock) else {
+        return Some(mine.clone());
+    };
+    Some(Value::Object(
+        mine.iter()
+            .filter_map(|(key, value)| {
+                Some((key.clone(), changes(value, stock.get(key).unwrap_or(&Value::Null))?))
+            })
+            .collect(),
+    ))
+}
+
 /// alacritty's `[debug]` section, plus one alacritree-only key.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DebugConfig {
     /// alacritree-only, set in `alacritree.toml`.  Default on: a crash that
     /// leaves no record is the failure this exists to prevent.
@@ -85,7 +156,7 @@ impl Default for DebugConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FontConfig {
     pub size: f32,
     pub normal: FontFace,
@@ -121,7 +192,7 @@ pub struct FontConfig {
 /// Pixel delta with x/y, mirroring alacritty's `Delta<i8>` for `font.offset`
 /// and `font.glyph_offset`.  Kept as `i8` because that's the type alacritty's
 /// schema accepts and going wider would silently lose round-trip equivalence.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct FontDelta {
     pub x: i8,
     pub y: i8,
@@ -159,33 +230,50 @@ impl FontConfig {
 /// `style` mirrors `[font.*].style` (e.g. "Bold", "Italic", "Bold Italic"), and
 /// is used both as a hint to the font matcher and to disambiguate faces that
 /// only differ by style within a family.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct FontFace {
     pub family: Option<String>,
     pub style: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// `CursorShape` comes from `vte` and carries no serde derives, so it is
+/// written by name.  The spellings are the ones `alacritty.toml` accepts, so a
+/// dumped value can be pasted back into a config file.
+fn cursor_shape_name<S: serde::Serializer>(
+    shape: &CursorShape,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(match shape {
+        CursorShape::Block => "Block",
+        CursorShape::Underline => "Underline",
+        CursorShape::Beam => "Beam",
+        CursorShape::HollowBlock => "HollowBlock",
+        CursorShape::Hidden => "Hidden",
+    })
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct CursorConfig {
+    #[serde(serialize_with = "cursor_shape_name")]
     pub shape: CursorShape,
     pub blinking: bool,
     pub unfocused_hollow: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct ScrollingConfig {
     pub history: usize,
     pub multiplier: u8,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct WindowConfig {
     pub padding_x: f32,
     pub padding_y: f32,
     pub opacity: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ShellConfig {
     pub program: String,
     pub args: Vec<String>,
@@ -193,14 +281,14 @@ pub struct ShellConfig {
 
 /// A named shell launch profile from `[[ui.profiles]]`.  Program + args
 /// only; cwd and env come from the session as usual.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Profile {
     pub name: String,
     pub program: String,
     pub args: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SelectionConfig {
     pub semantic_escape_chars: String,
     /// Mirror auto-copy of selections to the regular clipboard.  Off by default
@@ -229,7 +317,7 @@ pub fn profile_command(p: &Profile) -> String {
         .join(" ")
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Palette {
     pub fg: Rgb,
     pub bg: Rgb,
@@ -249,7 +337,7 @@ pub struct Palette {
 /// When the sidebar's per-session `×` asks before killing the PTY.
 /// Confirmations otherwise exist only at worktree/app level, so the
 /// default keeps session close immediate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub enum ConfirmSessionClose {
     #[default]
     Never,
@@ -285,7 +373,7 @@ fn parse_confirm_session_close(raw: Option<&str>) -> ConfirmSessionClose {
 /// `[ui.drop] quote` as written in the config.  The five concrete modes are
 /// ported from wezterm's `quote_dropped_files` so an existing wezterm config
 /// carries over unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub enum Quoting {
     /// Decide per session: a path headed into a distro is a POSIX shell word
     /// no matter what the host OS is.
@@ -299,7 +387,7 @@ pub enum Quoting {
 }
 
 /// `Quoting` with `Auto` already decided against the receiving shell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ShellQuoting {
     None,
     SpacesOnly,
@@ -364,7 +452,7 @@ fn parse_quoting(raw: Option<&str>) -> Quoting {
 /// How a path is written for the shell that receives it.  Separate from
 /// `DropConfig` because a paste spells paths too, and must not be handed flags
 /// about whether drops are accepted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct PathSpelling {
     pub quote: Quoting,
     /// Rewrite a Windows path to its distro-side spelling before it reaches a
@@ -381,7 +469,7 @@ impl Default for PathSpelling {
 /// `[ui.drop]`: what dragging files onto the window does.  Every target
 /// accepts drops by default; each one can be switched off on its own, and
 /// `enabled` turns the lot off.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct DropConfig {
     /// Master switch; false ignores every drop.
     pub enabled: bool,
@@ -409,7 +497,7 @@ impl Default for DropConfig {
 /// `[ui.paste]`: what Paste does when the clipboard holds no text.  Both
 /// fallbacks are independent — one can be off without affecting the other, and
 /// both off leaves Paste exactly as it was.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PasteConfig {
     /// Paste the paths of files and folders copied in a file manager.
     pub files: bool,
@@ -464,7 +552,7 @@ pub fn default_image_dir() -> PathBuf {
 }
 
 /// How the sidebar scroll areas draw their scrollbar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub enum ScrollbarStyle {
     /// egui's default: a thin bar overlaying the content edge, expanding on
     /// hover — which covers the icons at the right end of sidebar rows.
@@ -589,7 +677,7 @@ baked_glyphs! {
 
 /// What happens when the on-screen workspace stops having sessions, whether a
 /// close or a worktree deletion took the last one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub enum LastSessionClose {
     /// Recycle a shell in place — the workspace always has a live session,
     /// so the last session is by design unclosable.
@@ -637,7 +725,7 @@ fn parse_last_session_close(raw: Option<&str>) -> LastSessionClose {
 /// How far the projects sidebar goes when the cursor's row stops being
 /// rendered.  Both values keep the cursor; they differ only in whether the
 /// terminal comes along.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub enum SidebarFocus {
     /// A filtered-out cursor climbs to its nearest visible ancestor and is
     /// restored when the filter widens; a removed cursor slides to a sibling
@@ -704,7 +792,7 @@ fn parse_scroll_align(raw: Option<&str>) -> ScrollAlign {
 
 /// `[ui] search_scope`: whether a fuzzy query is confined by the panel's active
 /// toggle filters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub enum SearchScope {
     /// A query narrows the rows the toggles already allow.
     #[default]
@@ -767,7 +855,7 @@ pub struct SessionReorder {
 /// `[ui] sidebar_tooltips`: when a sidebar row offers its full name on hover.
 /// Governs both sidebars — a git panel row's path answers to it the same way a
 /// worktree or session name does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
 pub enum SidebarTooltips {
     /// Never — a name the panel cut off stays cut off.
     Off,
@@ -798,7 +886,7 @@ fn parse_sidebar_tooltips(raw: Option<&str>) -> SidebarTooltips {
 /// for a single-session workspace instead of waiting for the two-session
 /// threshold.  These are startup defaults only: the app copies them into
 /// runtime state that key bindings can toggle, and nothing is persisted.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct SessionDisplay {
     pub sidebar_always: bool,
     pub tabs_always: bool,
@@ -807,7 +895,7 @@ pub struct SessionDisplay {
 /// alacritree-only `[ui.font]`: font family/size for the chrome (sidebars,
 /// modals — everything that isn't the terminal grid).  Both fields default
 /// to deriving from `[font]`, so an absent table changes nothing.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct UiFont {
     pub family: Option<String>,
     /// Typographic points, same unit as `[font] size`; clamped to ≥ 1.0.
@@ -846,7 +934,7 @@ impl Default for UiFont {
 /// delete a worktree and its branch, and close a session, so only separate
 /// keys let the destructive one be marked. `reorder` and `upstream_diverged`
 /// share a default glyph and are otherwise unrelated.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Icons {
     /// Glyph prefixing the sidebar search prompt.
     pub search: IconStyle,
@@ -878,7 +966,7 @@ pub struct Icons {
 /// keyboard focus.  Per-panel toggles (`sidebar` covers both side panels),
 /// shared color/thickness; both toggles default off so unmodified config
 /// keeps today's look.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct FocusOutline {
     pub sidebar: bool,
     pub terminal: bool,
@@ -933,7 +1021,7 @@ impl Default for Icons {
 /// A sidebar icon's glyph and how to paint it.  Parses from a bare string,
 /// accepted as glyph-only, or a table that also styles color, weight, slant,
 /// and size.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct IconStyle {
     pub glyph: Option<String>,
     pub color: Option<Color32>,
@@ -952,7 +1040,7 @@ impl IconStyle {
 /// How one text span is emphasized.  `color: None` inherits whatever color the
 /// site normally paints, so an emphasis that sets only `bold` still tracks the
 /// theme.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub struct TextEmphasis {
     pub color: Option<Color32>,
     pub bold: bool,
@@ -961,7 +1049,7 @@ pub struct TextEmphasis {
 
 /// `[ui.path_style]`: how each site spells a path, plus the two emphases the
 /// `Zed` style paints with.  Every field defaults to today's rendering.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct PathStyleConfig {
     /// The `diff: <path>` pane title.
     pub diff_title: PathStyle,
@@ -980,7 +1068,7 @@ pub struct PathStyleConfig {
 /// differ: kitty derives its double and curly underline positions from the
 /// face's underline position, while here those two styles are placed from
 /// the descent instead, so `underline_position` does not reach them.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub enum Adjust {
     Pixels(f32),
     Points(f32),
@@ -1024,7 +1112,7 @@ fn finite(raw: &str) -> Option<f32> {
 /// `[ui.decorations]`: corrections to what the font reports for its underline
 /// and strikeout, for a face whose tables are wrong.  Every knob is a no-op by
 /// default, so an unmodified config draws what the face asked for.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct Decorations {
     pub underline_position: Adjust,
     pub underline_thickness: Adjust,
@@ -1055,7 +1143,7 @@ fn parse_adjust(field: &str, raw: Option<&str>) -> Adjust {
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct UiTheme {
     pub sidebar_background: Option<Color32>,
     pub sidebar_foreground: Option<Color32>,
@@ -1226,7 +1314,7 @@ impl Default for UiTheme {
 /// global, or override — gets the `<project>-<hash>/<branch>` layout beneath
 /// it; changing these options never moves existing worktrees because
 /// discovery goes through `git worktree list`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct WorkspaceConfig {
     /// Global base directory for new worktrees; `None` means the built-in
     /// `~/.alacritree/worktrees`.
@@ -1235,7 +1323,7 @@ pub struct WorkspaceConfig {
 }
 
 /// Per-project base-directory override, matched against the project root.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct WorktreeOverride {
     pub project: PathBuf,
     pub worktree_dir: PathBuf,
@@ -1448,7 +1536,9 @@ fn alacritty_config_dir() -> PathBuf {
     std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_default().join("alacritty")
 }
 
-pub fn load() -> Config {
+/// Load the config, and report which files it came from so the startup log
+/// can record them.
+pub fn load() -> (Config, Vec<ConfigFile>) {
     let (files, merged) = assemble();
     for file in &files {
         if let (Some(path), Some(e)) = (&file.path, &file.error) {
@@ -1460,11 +1550,11 @@ pub fn load() -> Config {
         Ok(r) => r,
         Err(e) => {
             log::warn!("invalid alacritty/alacritree config, using defaults: {e}");
-            return Config::default();
+            return (Config::default(), files);
         },
     };
 
-    raw.into_config()
+    (raw.into_config(), files)
 }
 
 /// One of the two config files alacritree reads.
@@ -2847,6 +2937,78 @@ fn build_profiles(raw: Vec<RawProfile>) -> Vec<Profile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `Config` `toml` resolves to, defaults filled in as `load` fills
+    /// them.
+    fn config_from(toml: &str) -> Config {
+        let raw: RawConfig = toml::from_str(toml).expect("valid TOML");
+        raw.into_config()
+    }
+
+    /// The changes `toml` makes to a stock config, as JSON.
+    fn changed(toml: &str) -> serde_json::Value {
+        let dump = config_from(toml).changed_from_defaults().expect("something changed");
+        serde_json::from_str(&dump).expect("valid JSON")
+    }
+
+    /// An install with no config file writes nothing.  The baseline has to be
+    /// the config that path produces, not `Config::default`, which carries no
+    /// key bindings and would report all of the built-in ones as changes.
+    #[test]
+    fn a_stock_install_reports_no_changes_at_all() {
+        assert_eq!(config_from("").changed_from_defaults(), None);
+    }
+
+    #[test]
+    fn one_changed_key_brings_nothing_else_with_it() {
+        let json = changed("[ui]\ngpu_grid = true\n");
+
+        assert_eq!(json["ui"]["gpu_grid"], serde_json::json!(true));
+        assert!(json.get("palette").is_none(), "an untouched section must not be dumped");
+        assert!(
+            json["ui"].get("async_session_spawn").is_none(),
+            "an untouched sibling must not ride along with its section"
+        );
+    }
+
+    /// The effective value is what lands in the dump, whatever spelling the
+    /// config file used to ask for it.
+    #[test]
+    fn a_changed_value_is_dumped_resolved() {
+        let json = changed("[cursor.style]\nshape = \"Beam\"\n");
+
+        assert_eq!(json["cursor"]["shape"], serde_json::json!("Beam"));
+    }
+
+    #[test]
+    fn changed_env_values_are_redacted_but_their_names_survive() {
+        let json = changed("[env]\nGITHUB_TOKEN = \"ghp_secret\"\n");
+
+        assert_eq!(json["env"]["GITHUB_TOKEN"], serde_json::json!(REDACTED_VALUE));
+        assert!(
+            !json.to_string().contains("ghp_secret"),
+            "a token in [env] must not reach the log"
+        );
+    }
+
+    /// The shell is a path like every project root already in the log, and
+    /// which shell ran is most of a terminal bug report.
+    #[test]
+    fn the_changed_shell_is_not_redacted() {
+        let json = changed("[terminal.shell]\nprogram = \"nu\"\nargs = [\"-l\"]\n");
+
+        assert_eq!(json["shell"]["program"], serde_json::json!("nu"));
+        assert_eq!(json["shell"]["args"], serde_json::json!(["-l"]));
+    }
+
+    #[test]
+    fn the_dump_is_one_line() {
+        let dump = config_from("[ui]\ngpu_grid = true\n")
+            .changed_from_defaults()
+            .expect("something changed");
+
+        assert!(!dump.contains('\n'), "a multi-line dump can be interleaved");
+    }
 
     fn ui_from_toml(input: &str) -> UiTheme {
         let value: toml::Value = toml::from_str(input).expect("valid toml");
