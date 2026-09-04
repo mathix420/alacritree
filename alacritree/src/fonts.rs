@@ -175,8 +175,9 @@ impl SystemFonts {
 
 /// How many faces to scan at once.  Four is where the measured curve
 /// flattens; the work is memory-bound, so more cores stop helping well
-/// before they run out.  The floor keeps a restricted container from
-/// asking for a pool with no threads.
+/// before they run out.  The floor matters because rayon reads a thread
+/// count of zero as "choose automatically", so a caller that mapped an
+/// error to zero would get every logical CPU instead of the cap.
 #[cfg(not(unix))]
 fn worker_count(reported: usize) -> usize {
     reported.clamp(1, 4)
@@ -313,7 +314,10 @@ fn scan_coverage_with_workers(
 
     // A cache that was absent or invalid produced zero hits, so every face that parsed
     // above went through the fresh-parse branch and `any_fresh` is already
-    // true; no separate "was the cache valid" bookkeeping is needed.
+    // true; no separate "was the cache valid" bookkeeping is needed.  A face
+    // that fails to parse never reaches the loop, so a scan that is otherwise
+    // all hits writes nothing, and entries for fonts deleted since the last
+    // write survive until some face parses fresh.
     if any_fresh {
         if let Some(cache_path) = cache_path {
             disk_cache::write(cache_path, &fresh_files);
@@ -2328,7 +2332,8 @@ mod tests {
         assert_eq!(worker_count(4), 4);
         assert_eq!(worker_count(36), 4);
         // `available_parallelism` cannot report zero, but a caller mapping an
-        // error to zero would build a pool with no threads.
+        // error to zero would reach rayon's "choose automatically" mode and
+        // escape the cap entirely.
         assert_eq!(worker_count(0), 1);
     }
 
@@ -2835,8 +2840,9 @@ mod coverage {
         /// Build from a walk that emits codepoints in ascending order, folding
         /// them into ranges as they arrive rather than sorting them afterwards.
         ///
-        /// cmap subtables are required to enumerate ascending, so this is the
-        /// normal path.  A walk that turns out not to be ascending is re-run
+        /// Every cmap format but 2 walks ascending in ttf-parser, and a
+        /// well-formed format 4/12/13 table does too, so this is the normal
+        /// path.  A walk that turns out not to be ascending is re-run
         /// through `from_codepoints`, which is why `walk` is `Fn`: `codepoints`
         /// has no early exit, so the first pass has to finish before the second
         /// can start.
