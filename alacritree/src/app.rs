@@ -4801,6 +4801,14 @@ fn holds_self_boost(session: SessionBoost) -> bool {
     session.raised || (session.visible && session.pending)
 }
 
+/// Whether a frame's sessions, taken together, are a reason for the GUI to
+/// stay boosted.  Folded rather than `any`, because the caller computes each
+/// `SessionBoost` by asking a session to raise or drop its own boost: every
+/// session has to be reached, whatever the sessions before it answered.
+fn frame_holds_self_boost(boosts: impl Iterator<Item = SessionBoost>) -> bool {
+    boosts.fold(false, |held, session| held | holds_self_boost(session))
+}
+
 /// git arguments (everything after `git`) for the requested diff — shared
 /// by the Windows and WSL pane commands.
 fn diff_args(req: &DiffRequest) -> Vec<String> {
@@ -7324,15 +7332,15 @@ impl AlacritreeApp {
         // no boost to give — the feature off, or a platform that has none —
         // answers false without a call of any kind.
         let target = visible_idx.filter(|_| focused);
-        let mut anything_raised = false;
-        for (idx, session) in self.sessions.iter().enumerate() {
-            let wanted = Some(idx) == target;
-            anything_raised |= holds_self_boost(SessionBoost {
-                raised: session.set_priority_boost(wanted),
-                visible: wanted,
-                pending: session.is_pending(),
-            });
-        }
+        let anything_raised =
+            frame_holds_self_boost(self.sessions.iter().enumerate().map(|(idx, session)| {
+                let wanted = Some(idx) == target;
+                SessionBoost {
+                    raised: session.set_priority_boost(wanted),
+                    visible: wanted,
+                    pending: session.is_pending(),
+                }
+            }));
         // A boost covers every depth, so a focused tab running
         // `cargo build -j16` raises all sixteen compilers.  The GUI left at
         // normal would then lose to the tree it is drawing.
@@ -9463,6 +9471,29 @@ mod tests {
         let background = SessionBoost { raised: true, visible: false, pending: false };
 
         assert!(holds_self_boost(background));
+    }
+
+    #[test]
+    fn a_frame_whose_visible_session_is_still_pending_leaves_the_self_boost_where_it_was() {
+        let frame = [
+            SessionBoost { raised: false, visible: false, pending: false },
+            // On screen, its PTY still opening: no job exists to answer for
+            // it, and the boost must survive the gap until one does.
+            SessionBoost { raised: false, visible: true, pending: true },
+            SessionBoost { raised: false, visible: false, pending: true },
+        ];
+
+        assert!(frame_holds_self_boost(frame.into_iter()));
+    }
+
+    #[test]
+    fn a_frame_of_idle_background_sessions_drops_the_self_boost() {
+        let frame = [
+            SessionBoost { raised: false, visible: false, pending: false },
+            SessionBoost { raised: false, visible: false, pending: true },
+        ];
+
+        assert!(!frame_holds_self_boost(frame.into_iter()));
     }
 
     #[test]
