@@ -143,7 +143,14 @@ use std::path::Path;
 /// lose trailing newlines to command substitution, which no current caller
 /// passes.  Stdin EOF ends the dispatcher; the EXIT trap removes the temp
 /// dir and `kill 0` takes the writer and any in-flight jobs down with the
-/// process group, so a job can never deadlock on the deleted FIFO.
+/// process group, so a job can never deadlock on the deleted FIFO.  Relay
+/// death normally arrives as SIGHUP (every `--exec` session gets a
+/// controlling pty the shell owns, and losing it signals the foreground
+/// group), which the HUP trap below routes through the same EXIT trap —
+/// but a dispatcher that is already dead under a still-live relay, or one
+/// killed outright before the signal lands, reaches no trap at all.  A
+/// start sweeps those predecessors' directories the way the pidfile GC
+/// already sweeps stale session pids.
 pub(crate) const HELPER_SCRIPT: &str = r##"
 set -u
 b64() { printf %s "$1" | base64 | tr -d '\n'; }
@@ -163,9 +170,24 @@ for f in "$rt"/session-*.pid; do
   case $p in ''|*[!0-9]*) rm -f "$f"; continue;; esac
   [ -d "/proc/$p" ] || rm -f "$f"
 done
-t=$(mktemp -d) || exit 1
+for d in "$rt"/helper-*; do
+  [ -d "$d" ] || continue
+  p=${d##*helper-}
+  case $p in ''|*[!0-9]*) continue;; esac
+  [ -d "/proc/$p" ] && continue
+  [ -p "$d/done" ] && ( exec 3<>"$d/done" ) 2>/dev/null
+  rm -rf "$d"
+done
+t=$rt/helper-$$
+[ -p "$t/done" ] && ( exec 3<>"$t/done" ) 2>/dev/null
+rm -rf "$t"
+mkdir -m 700 "$t" || exit 1
 mkfifo "$t/done" || exit 1
 trap 'rm -rf "$t"; kill 0 2>/dev/null' EXIT
+# Losing the pty (every --exec session gets one) delivers SIGHUP to the
+# foreground group; without this, dash and busybox ash both terminate on an
+# untrapped HUP without running the EXIT trap above.
+trap 'exit' HUP
 (
   exec 3<>"$t/done"
   while read -r id code <&3; do
@@ -971,6 +993,26 @@ mod tests {
             exit: 1,
             payload: Vec::new()
         },]);
+    }
+
+    #[test]
+    fn the_helper_script_reclaims_a_dead_predecessors_directory() {
+        // The temp dir has to be named by dispatcher pid, or a start cannot tell
+        // a dead predecessor's directory from a live sibling's.
+        assert!(HELPER_SCRIPT.contains("t=$rt/helper-$$"));
+        assert!(!HELPER_SCRIPT.contains("mktemp -d"));
+
+        // Liveness comes from /proc, checked before anything is removed, and the
+        // stale FIFO is opened before the directory goes, so a job subshell
+        // parked in open(O_WRONLY) is released rather than orphaned.
+        let sweep =
+            HELPER_SCRIPT.split_once("for d in \"$rt\"/helper-*").expect("the startup sweep").1;
+        let body = sweep.split_once("done\n").expect("the sweep body").0;
+        let live = body.find("[ -d \"/proc/$p\" ] && continue").expect("the liveness check");
+        let fifo = body.find("exec 3<>").expect("the fifo release");
+        let remove = body.find("rm -rf \"$d\"").expect("the directory removal");
+        assert!(live < remove, "liveness must be checked before the directory is removed");
+        assert!(fifo < remove, "the FIFO must be opened before the directory is removed");
     }
 
     #[test]
