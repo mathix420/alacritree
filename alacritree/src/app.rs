@@ -1423,10 +1423,11 @@ impl AlacritreeApp {
         self.spawn_session_with_shell(ctx, ws, shell, wsl_probe)
     }
 
-    /// Shell for a workspace; `None` means "no override" — `Session::spawn`
-    /// falls through to alacritty's config-driven shell with its
-    /// OS-guaranteed fallback.  The home tab (`None` workspace) has no
-    /// project or location, so only the default profile can apply there.
+    /// Shell for a workspace; `None` means "no override" —
+    /// `Session::pending_shell` falls through to alacritty's config-driven
+    /// shell with its OS-guaranteed fallback.  The home tab (`None`
+    /// workspace) has no project or location, so only the default profile can
+    /// apply there.
     fn resolve_shell(&self, workspace: &WorkspaceKey) -> (Option<Shell>, Option<WslProbe>) {
         let path = workspace.as_deref();
         let choice = path.and_then(|p| {
@@ -4868,7 +4869,7 @@ fn profile_session_shell(profile: &crate::config::Profile) -> (Option<Shell>, Op
 
 /// `[terminal.shell] program = "wsl.exe"` gets the same shim as a wsl.exe
 /// profile; any other config shell (or none) spawns unchanged through
-/// `Session::spawn`'s own config-shell default.
+/// `Session::pending_shell`'s own config-shell default.
 fn config_session_shell(config: &crate::config::Config) -> (Option<Shell>, Option<WslProbe>) {
     match &config.shell {
         Some(s) => match shimmed_wsl_argv(&s.program, &s.args) {

@@ -1149,28 +1149,6 @@ pub fn open(request: OpenRequest) -> std::io::Result<Attachment> {
 }
 
 impl Session {
-    pub fn spawn(
-        ctx: egui::Context,
-        config: &Config,
-        working_directory: Option<PathBuf>,
-        size: TermSize,
-        cell_size: (f32, f32),
-        shell_override: Option<Shell>,
-        wsl_probe: Option<WslProbe>,
-    ) -> std::io::Result<Self> {
-        let (mut session, request) = Self::pending_shell(
-            ctx,
-            config,
-            working_directory,
-            size,
-            cell_size,
-            shell_override,
-            wsl_probe,
-        );
-        session.attach(open(request)?);
-        Ok(session)
-    }
-
     pub fn spawn_scratchpad(
         ctx: egui::Context,
         config: &Config,
@@ -1208,9 +1186,10 @@ impl Session {
         })
     }
 
-    /// Spawn a session running `program args` instead of the user's shell.
-    /// Used by the git sidebar to drop into `delta` for an inline diff view —
-    /// once the command exits, `reap_exited_sessions` removes the tab.
+    /// A session running `program args` instead of the user's shell, opened
+    /// and attached in one call.  Test-only: the app reaches the same place
+    /// through `pending_command`, so that a slow open cannot cost a frame.
+    #[cfg(test)]
     pub fn spawn_command(
         ctx: egui::Context,
         config: &Config,
@@ -1237,8 +1216,8 @@ impl Session {
         Ok(session)
     }
 
-    /// The `spawn` half of the split: a pending shell session plus what its
-    /// PTY will need, without opening it.
+    /// A pending shell session plus what its PTY will need, without opening
+    /// it: the shell resolution and the title, and nothing that costs a frame.
     pub fn pending_shell(
         ctx: egui::Context,
         config: &Config,

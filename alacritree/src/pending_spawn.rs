@@ -33,10 +33,6 @@ pub enum Finished {
 }
 
 impl PendingSpawns {
-    pub fn is_empty(&self) -> bool {
-        self.pending.is_empty()
-    }
-
     pub fn start(&mut self, id: SessionId, rx: Receiver<std::io::Result<Attachment>>) {
         self.pending.insert(id, Pending { rx, waiters: Vec::new() });
     }
@@ -113,6 +109,13 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
+    /// Nothing is opening for `id` any more: `watch` hands a waiter straight
+    /// back rather than parking it on an entry that will never resolve.
+    fn forgotten(spawns: &mut PendingSpawns, id: SessionId) -> bool {
+        let (reply_tx, _reply_rx) = mpsc::channel();
+        spawns.watch(id, reply_tx).is_some()
+    }
+
     #[test]
     fn a_finished_open_comes_back_failed_with_its_id() {
         let (open_tx, open_rx) = mpsc::channel();
@@ -130,7 +133,7 @@ mod tests {
             },
             Finished::Opened(..) => panic!("expected Failed"),
         }
-        assert!(spawns.is_empty(), "a finished open is forgotten");
+        assert!(forgotten(&mut spawns, 1), "a finished open is forgotten");
     }
 
     #[test]
@@ -145,7 +148,7 @@ mod tests {
         assert_eq!(finished.len(), 1);
         assert!(matches!(&finished[0], Finished::Failed(1, _, _)));
         assert!(
-            spawns.is_empty(),
+            forgotten(&mut spawns, 1),
             "a dropped sender must not leave a pending entry that never resolves"
         );
     }
