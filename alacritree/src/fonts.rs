@@ -311,7 +311,7 @@ fn scan_coverage_with_workers(
         scanned.push((candidate, cov));
     }
 
-    // A cache that was absent or invalid produced zero hits, so every face
+    // A cache that was absent or invalid produced zero hits, so every face that parsed
     // above went through the fresh-parse branch and `any_fresh` is already
     // true; no separate "was the cache valid" bookkeeping is needed.
     if any_fresh {
@@ -2340,7 +2340,7 @@ mod tests {
 
     #[cfg(not(unix))]
     #[test]
-    fn worker_count_clamps_to_the_measured_knee() {
+    fn worker_count_clamps_between_one_and_four() {
         assert_eq!(worker_count(1), 1);
         assert_eq!(worker_count(2), 2);
         assert_eq!(worker_count(4), 4);
@@ -2356,11 +2356,9 @@ mod tests {
         // Both runs pass `None`, so neither writes a cache the other could
         // read back: a second scan against a populated cache takes the
         // stored-ranges branch and parses no cmap at all.
-        let serial_fonts = SystemFonts::with_cache_dir(None);
-        let (serial, _) = scan_coverage_with_workers(serial_fonts.db(), None, 1);
-
-        let parallel_fonts = SystemFonts::with_cache_dir(None);
-        let (parallel, _) = scan_coverage_with_workers(parallel_fonts.db(), None, 4);
+        let fonts = SystemFonts::with_cache_dir(None);
+        let (serial, _) = scan_coverage_with_workers(fonts.db(), None, 1);
+        let (parallel, _) = scan_coverage_with_workers(fonts.db(), None, 4);
 
         assert_eq!(serial, parallel);
         assert!(!serial.is_empty(), "no faces were scanned, so this proved nothing");
@@ -2684,9 +2682,9 @@ mod tests {
         assert!(is_mapped(&path), "face_coverage read the file instead of mapping it");
     }
 
-    /// Today's collect-and-sort body, kept so the fold has something to be
-    /// equivalent to.  If this and `cmap_coverage` ever disagree, the fold is
-    /// wrong, not this.
+    /// The collect-and-sort construction, kept as an oracle for the fold.
+    /// If this and `cmap_coverage` ever disagree, the fold is wrong, not
+    /// this.
     #[cfg(not(unix))]
     fn cmap_coverage_by_sorting(face: &ttf_parser::Face) -> Option<coverage::Coverage> {
         let cmap = face.tables().cmap?;
