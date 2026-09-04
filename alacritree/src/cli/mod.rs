@@ -28,6 +28,19 @@ use crate::ipc::{self, IpcRequest, SendError};
 /// installation copies only the executable — so the text ships inside it.
 const FONT_LICENSE: &str = include_str!("../../assets/FONT-LICENSE.txt");
 
+/// One `-o` fragment, which is a whole TOML document rather than a bare
+/// `key=value`, so a dotted key does the nesting: `ui.gpu_grid=false` parses to
+/// `{ui = {gpu_grid = false}}`.  Mirrors alacritty's `ParsedOptions`.
+///
+/// Alacritty warns and skips a fragment it cannot parse, because the same
+/// values also arrive at runtime over IPC, where refusing would kill a live
+/// window.  These only arrive at launch, so refusing is safe here, and a
+/// measurement run that silently dropped the setting it was varying is worse
+/// than one that never started.
+fn parse_override(fragment: &str) -> Result<toml::Value, String> {
+    toml::from_str(fragment).map_err(|e| e.to_string())
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "alacritree", version, about = "Alacritty fork with worktree-aware sidebars")]
 pub struct Cli {
@@ -52,6 +65,17 @@ pub struct Cli {
     /// logging on by itself, so the file is never empty.
     #[arg(long, global = true, value_name = "PATH")]
     pub log_file: Option<PathBuf>,
+
+    /// Override a config value, repeatable: `-o 'ui.gpu_grid=false'`. Merged
+    /// over both config files.
+    #[arg(
+        short = 'o',
+        long = "option",
+        global = true,
+        value_name = "TOML",
+        value_parser = parse_override
+    )]
+    pub options: Vec<toml::Value>,
 
     /// Print the licence for the bundled symbol font and exit.
     #[arg(long)]
@@ -252,7 +276,12 @@ pub fn run(cli: Cli) -> Option<i32> {
         // Diagnosing the machine is not something a running instance can answer:
         // the report has to be truthful when there is nothing to ask.
         Command::Doctor => {
-            return Some(doctor::run(cli.json, cli.socket.as_deref(), cli.config_dir.as_deref()));
+            return Some(doctor::run(
+                cli.json,
+                cli.socket.as_deref(),
+                cli.config_dir.as_deref(),
+                &cli.options,
+            ));
         },
         // Reads files rather than asking an instance, so it answers when
         // nothing is running — which is exactly when a crash is being chased.
@@ -414,6 +443,37 @@ mod tests {
     #[test]
     fn the_command_tree_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    fn options_of(args: &[&str]) -> Vec<toml::Value> {
+        Cli::try_parse_from(args).expect("parses").options
+    }
+
+    /// The whole point of the short form: an agent varies one key per run
+    /// without writing a file, and `-o` twice is two independent settings.
+    #[test]
+    fn repeated_options_each_become_a_document() {
+        let options = options_of(&["alacritree", "-o", "ui.gpu_grid=false", "-o", "font.size=14"]);
+
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0]["ui"]["gpu_grid"].as_bool(), Some(false));
+        assert_eq!(options[1]["font"]["size"].as_integer(), Some(14));
+    }
+
+    /// A run that quietly dropped the setting it was varying reports a
+    /// measurement of the default and calls it the feature.
+    #[test]
+    fn a_fragment_that_is_not_toml_fails_the_launch() {
+        assert!(Cli::try_parse_from(["alacritree", "-o", "ui.gpu_grid"]).is_err());
+    }
+
+    /// Global, so it reaches `doctor`, which resolves the same config a launch
+    /// would.
+    #[test]
+    fn options_are_accepted_after_a_subcommand() {
+        let options = options_of(&["alacritree", "doctor", "-o", "ui.gpu_grid=false"]);
+
+        assert_eq!(options.len(), 1);
     }
 
     #[test]

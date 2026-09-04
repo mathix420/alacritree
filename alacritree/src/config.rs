@@ -1548,8 +1548,8 @@ fn alacritty_config_dir() -> PathBuf {
 
 /// Load the config, and report which files it came from so the startup log
 /// can record them.
-pub fn load(config_dir: Option<&Path>) -> (Config, Vec<ConfigFile>) {
-    let (files, merged) = assemble(config_dir);
+pub fn load(config_dir: Option<&Path>, overrides: &[toml::Value]) -> (Config, Vec<ConfigFile>) {
+    let (files, merged) = assemble(config_dir, overrides);
     for file in &files {
         if let (Some(path), Some(e)) = (&file.path, &file.error) {
             log::warn!("failed to load {}: {e}", path.display());
@@ -1595,16 +1595,19 @@ pub struct ConfigDiagnosis {
     pub schema_error: Option<String>,
 }
 
-pub fn diagnose(config_dir: Option<&Path>) -> ConfigDiagnosis {
-    let (files, merged) = assemble(config_dir);
+pub fn diagnose(config_dir: Option<&Path>, overrides: &[toml::Value]) -> ConfigDiagnosis {
+    let (files, merged) = assemble(config_dir, overrides);
     let schema_error = merged.try_into::<RawConfig>().err().map(|e| e.to_string());
     ConfigDiagnosis { files, schema_error }
 }
 
 /// Read both config files off the search path and merge them, alacritree over
-/// alacritty.  A file that fails to parse contributes nothing and is reported
-/// through its [`ConfigFile::error`].
-fn assemble(config_dir: Option<&Path>) -> (Vec<ConfigFile>, toml::Value) {
+/// alacritty, then the `-o` overrides over both.  A file that fails to parse
+/// contributes nothing and is reported through its [`ConfigFile::error`].
+fn assemble(
+    config_dir: Option<&Path>,
+    overrides: &[toml::Value],
+) -> (Vec<ConfigFile>, toml::Value) {
     let mut merged = toml::Value::Table(toml::value::Table::new());
     let mut files = Vec::new();
 
@@ -1620,6 +1623,14 @@ fn assemble(config_dir: Option<&Path>) -> (Vec<ConfigFile>, toml::Value) {
             _ => {},
         }
         files.push(ConfigFile { stem, path, error });
+    }
+
+    // Through the same merge as the files, so `-o` and a line in
+    // `alacritree.toml` mean the same thing.  One consequence worth knowing:
+    // arrays concatenate, so `-o` adds a key binding rather than replacing the
+    // list, exactly as writing it into the file would.
+    for value in overrides {
+        merged = merge(merged, value.clone());
     }
 
     (files, merged)
@@ -2970,7 +2981,7 @@ mod tests {
             ("alacritree.toml", "[ui]\nasync_session_spawn = true\n"),
         ]);
 
-        let (config, files) = super::load(Some(dir.path()));
+        let (config, files) = super::load(Some(dir.path()), &[]);
 
         assert!(config.ui.async_session_spawn, "alacritree.toml applies");
         assert_eq!(
@@ -2995,17 +3006,66 @@ mod tests {
     fn a_file_absent_from_the_named_directory_is_not_looked_up_elsewhere() {
         let dir = config_dir(&[("alacritree.toml", "[ui]\ngpu_grid = true\n")]);
 
-        let (_, files) = super::load(Some(dir.path()));
+        let (_, files) = super::load(Some(dir.path()), &[]);
 
         let alacritty = files.iter().find(|f| f.stem == "alacritty").expect("both stems reported");
         assert_eq!(alacritty.path, None, "the installed alacritty.toml is not reached");
+    }
+
+    /// A fragment is a whole TOML document, so a dotted key nests on its own.
+    #[test]
+    fn an_override_beats_the_file_that_set_the_same_key() {
+        let dir = config_dir(&[("alacritree.toml", "[ui]\ngpu_grid = true\n")]);
+        let off = toml::from_str("ui.gpu_grid=false").expect("a valid fragment");
+
+        let (config, _) = super::load(Some(dir.path()), &[off]);
+
+        assert!(!config.ui.gpu_grid, "the file won over the override");
+    }
+
+    /// Automated runs vary one key against no config at all, so an override
+    /// has to apply with nothing underneath it to merge into.
+    #[test]
+    fn an_override_applies_with_no_config_file_present() {
+        let dir = config_dir(&[]);
+        let on = toml::from_str("ui.async_session_spawn=true").expect("a valid fragment");
+
+        let (config, _) = super::load(Some(dir.path()), &[on]);
+
+        assert!(config.ui.async_session_spawn);
+    }
+
+    /// `-o` twice over one key is a command line the caller edited without
+    /// deleting the old value; the one they typed last is the one they meant.
+    #[test]
+    fn the_last_override_of_a_key_wins() {
+        let dir = config_dir(&[]);
+        let first = toml::from_str("ui.gpu_grid=true").expect("a valid fragment");
+        let second = toml::from_str("ui.gpu_grid=false").expect("a valid fragment");
+
+        let (config, _) = super::load(Some(dir.path()), &[first, second]);
+
+        assert!(!config.ui.gpu_grid);
+    }
+
+    /// The startup log diffs the resolved config, so an override reaches it
+    /// with no separate reporting path of its own.
+    #[test]
+    fn an_override_shows_up_in_the_settings_dump() {
+        let dir = config_dir(&[]);
+        let on = toml::from_str("ui.async_session_spawn=true").expect("a valid fragment");
+
+        let (config, _) = super::load(Some(dir.path()), &[on]);
+
+        let dumped = config.changed_from_defaults().expect("the override is a change");
+        assert!(dumped.contains("async_session_spawn"), "{dumped}");
     }
 
     #[test]
     fn an_empty_named_directory_yields_the_stock_config() {
         let dir = config_dir(&[]);
 
-        let (config, _) = super::load(Some(dir.path()));
+        let (config, _) = super::load(Some(dir.path()), &[]);
 
         assert_eq!(config.changed_from_defaults(), None);
     }
@@ -3018,7 +3078,7 @@ mod tests {
     fn a_config_that_fails_the_schema_still_leaves_the_built_in_bindings() {
         let dir = config_dir(&[("alacritree.toml", "[ui]\nasync_session_spawn = \"yes\"\n")]);
 
-        let (config, _) = super::load(Some(dir.path()));
+        let (config, _) = super::load(Some(dir.path()), &[]);
 
         assert!(!config.ui.async_session_spawn, "the unusable setting is dropped");
         assert_eq!(

@@ -82,8 +82,13 @@ struct Found {
     version: Option<String>,
 }
 
-pub fn run(as_json: bool, socket: Option<&Path>, config_dir: Option<&Path>) -> i32 {
-    let checks = report(socket, config_dir);
+pub fn run(
+    as_json: bool,
+    socket: Option<&Path>,
+    config_dir: Option<&Path>,
+    overrides: &[toml::Value],
+) -> i32 {
+    let checks = report(socket, config_dir, overrides);
     if as_json {
         println!("{:#}", to_json(&checks));
     } else {
@@ -92,8 +97,12 @@ pub fn run(as_json: bool, socket: Option<&Path>, config_dir: Option<&Path>) -> i
     exit_code(&checks)
 }
 
-fn report(socket: Option<&Path>, config_dir: Option<&Path>) -> Vec<Check> {
-    let (config, _) = config::load(config_dir);
+fn report(
+    socket: Option<&Path>,
+    config_dir: Option<&Path>,
+    overrides: &[toml::Value],
+) -> Vec<Check> {
+    let (config, _) = config::load(config_dir, overrides);
 
     // Rows are grouped by section on the way out, so each section has to be
     // added in one run — a section split in two prints its header twice.
@@ -101,7 +110,7 @@ fn report(socket: Option<&Path>, config_dir: Option<&Path>) -> Vec<Check> {
     checks.extend(gh_auth_check());
     checks.push(shell_check(config.shell.as_ref()));
     checks.extend(wsl_checks(&wsl::distros()));
-    checks.extend(config_checks(&config::diagnose(config_dir)));
+    checks.extend(config_checks(&config::diagnose(config_dir, overrides)));
     checks.extend(persisted_state_checks(&config));
     checks.extend(ipc_checks(socket, config.ipc_socket));
     checks.extend(crash_checks());

@@ -142,6 +142,7 @@ fn main() -> eframe::Result<()> {
     let cli = cli::Cli::parse();
     let config_dir = cli.config_dir.clone();
     let log_file = cli.log_file.clone();
+    let options = cli.options.clone();
     if let Some(code) = cli::run(cli) {
         std::process::exit(code);
     }
@@ -154,7 +155,7 @@ fn main() -> eframe::Result<()> {
         crash_log::install(dir, env!("CARGO_PKG_VERSION"));
     }
 
-    let (config, config_files) = config::load(config_dir.as_deref());
+    let (config, config_files) = config::load(config_dir.as_deref(), &options);
 
     // The gate defaults on so a panic in `config::load` above is still
     // recorded; that is the one case where `crash_log = false` leaves a file.
