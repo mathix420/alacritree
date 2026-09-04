@@ -2681,6 +2681,36 @@ mod coverage {
             Self { ranges }
         }
 
+        /// Build from a walk that emits codepoints in ascending order, folding
+        /// them into ranges as they arrive rather than sorting them afterwards.
+        ///
+        /// cmap subtables are required to enumerate ascending, so this is the
+        /// normal path.  A walk that turns out not to be ascending is re-run
+        /// through `from_codepoints`, which is why `walk` is `Fn`: `codepoints`
+        /// has no early exit, so the first pass has to finish before the second
+        /// can start.
+        pub fn from_ascending_walk(walk: impl Fn(&mut dyn FnMut(u32))) -> Self {
+            let mut ranges: Vec<(u32, u32)> = Vec::new();
+            let mut ascending = true;
+            walk(&mut |cp| {
+                match ranges.last_mut() {
+                    Some((_, end)) if cp.checked_sub(1) == Some(*end) => *end = cp,
+                    // Equality counts: a repeat would otherwise push a range that
+                    // overlaps the one before it.  Rejecting `cp <= end` is also
+                    // what keeps `end` the maximum seen so far, which is what
+                    // makes this check total.
+                    Some((_, end)) if cp <= *end => ascending = false,
+                    _ => ranges.push((cp, cp)),
+                }
+            });
+            if ascending {
+                return Self { ranges };
+            }
+            let mut codepoints = Vec::new();
+            walk(&mut |cp| codepoints.push(cp));
+            Self::from_codepoints(codepoints)
+        }
+
         /// Rebuild from ranges that were produced by `from_codepoints` and stored;
         /// validated so a corrupt cache cannot break the sortedness invariant.
         /// The Unicode bound matters too: a well-formed but bogus range like
@@ -2932,6 +2962,65 @@ mod coverage {
             let mut a = Coverage::from_codepoints(vec![1, 2, 10]);
             a.merge(&Coverage::from_codepoints(vec![3, 4, 9]));
             assert_eq!(a, Coverage { ranges: vec![(1, 4), (9, 10)] });
+        }
+
+        #[test]
+        fn ascending_walk_folds_runs_into_ranges() {
+            let cov = Coverage::from_ascending_walk(|emit| {
+                for cp in [1u32, 2, 3, 10, 11, 50] {
+                    emit(cp);
+                }
+            });
+            assert_eq!(cov.ranges(), &[(1, 3), (10, 11), (50, 50)]);
+        }
+
+        #[test]
+        fn ascending_walk_matches_from_codepoints() {
+            let cps: Vec<u32> = (0..500).chain(1000..1200).chain([9000, 9001, 65535]).collect();
+            let folded = Coverage::from_ascending_walk(|emit| {
+                for &cp in &cps {
+                    emit(cp);
+                }
+            });
+            assert_eq!(folded, Coverage::from_codepoints(cps));
+        }
+
+        #[test]
+        fn ascending_walk_falls_back_when_a_codepoint_repeats() {
+            // A repeat is not a regression, but folding it blindly would push
+            // (5, 5) after a range already ending at 5 and produce an overlap.
+            let cov = Coverage::from_ascending_walk(|emit| {
+                for cp in [1u32, 2, 5, 5, 6] {
+                    emit(cp);
+                }
+            });
+            assert_eq!(cov.ranges(), &[(1, 2), (5, 6)]);
+        }
+
+        #[test]
+        fn ascending_walk_falls_back_when_the_walk_goes_backwards() {
+            let cov = Coverage::from_ascending_walk(|emit| {
+                for cp in [10u32, 11, 3, 4] {
+                    emit(cp);
+                }
+            });
+            assert_eq!(cov.ranges(), &[(3, 4), (10, 11)]);
+        }
+
+        #[test]
+        fn ascending_walk_handles_a_codepoint_at_the_top_of_the_range() {
+            // `end + 1` would overflow here; the fold compares the other way around.
+            let cov = Coverage::from_ascending_walk(|emit| {
+                emit(u32::MAX - 1);
+                emit(u32::MAX);
+            });
+            assert_eq!(cov.ranges(), &[(u32::MAX - 1, u32::MAX)]);
+        }
+
+        #[test]
+        fn ascending_walk_over_nothing_is_empty() {
+            let cov = Coverage::from_ascending_walk(|_emit| {});
+            assert_eq!(cov, Coverage::default());
         }
 
         #[test]
