@@ -1286,16 +1286,15 @@ impl AlacritreeApp {
     /// since no frame has painted yet to leave a better number behind.  Never
     /// `self.sessions.last()`, an arbitrary session possibly in another
     /// workspace at a different pane size.
-    ///
-    /// A scratchpad is skipped: its size is fixed at construction and never
-    /// follows the pane, so an active scratchpad tab would otherwise shadow
-    /// the pane geometry with a constant worse than the tier below it.
     fn next_spawn_geometry(&self) -> (TermSize, (f32, f32)) {
-        let active = self
-            .active_session_index()
-            .map(|idx| &self.sessions[idx])
-            .filter(|session| session.scratchpad.is_none())
-            .map(|session| (session.size, session.cell_size));
+        let active = self.active_session_index().map(|idx| {
+            let session = &self.sessions[idx];
+            ActiveGeometry {
+                size: session.size,
+                cell_size: session.cell_size,
+                is_scratchpad: session.scratchpad.is_some(),
+            }
+        });
         spawn_geometry(active, self.last_pane_geometry)
     }
 
@@ -4757,14 +4756,31 @@ impl AlacritreeApp {
     }
 }
 
+/// What the session on screen contributes to a spawn's geometry.
+struct ActiveGeometry {
+    size: TermSize,
+    cell_size: (f32, f32),
+    /// A scratchpad's size is fixed at construction: it takes the editor
+    /// branch, so the pane never resizes it.
+    is_scratchpad: bool,
+}
+
 /// Geometry a new PTY is born at, most exact source first: the active
 /// session's own numbers, then the terminal pane's last painted size, then
 /// the constant neither has anything to improve on.
+///
+/// A scratchpad drops out of the first tier, since its pinned size would
+/// otherwise shadow the pane geometry with a constant worse than the tier
+/// below it.
 fn spawn_geometry(
-    active: Option<(TermSize, (f32, f32))>,
+    active: Option<ActiveGeometry>,
     last_pane: Option<(TermSize, (f32, f32))>,
 ) -> (TermSize, (f32, f32)) {
-    active.or(last_pane).unwrap_or((TermSize::new(80, 24), (8.0, 16.0)))
+    active
+        .filter(|active| !active.is_scratchpad)
+        .map(|active| (active.size, active.cell_size))
+        .or(last_pane)
+        .unwrap_or((TermSize::new(80, 24), (8.0, 16.0)))
 }
 
 /// What one session contributes to the GUI's own priority boost for a frame.
@@ -9380,8 +9396,28 @@ mod tests {
 
     #[test]
     fn spawn_geometry_prefers_the_active_session_over_the_last_painted_pane() {
-        let active = Some((TermSize::new(120, 40), (9.0, 18.0)));
+        let active = Some(ActiveGeometry {
+            size: TermSize::new(120, 40),
+            cell_size: (9.0, 18.0),
+            is_scratchpad: false,
+        });
         let last_pane = Some((TermSize::new(80, 24), (8.0, 16.0)));
+
+        let (size, cell_size) = spawn_geometry(active, last_pane);
+
+        assert_eq!((size.columns, size.screen_lines), (120, 40));
+        assert_eq!(cell_size, (9.0, 18.0));
+    }
+
+    #[test]
+    fn an_active_scratchpad_does_not_shadow_the_last_painted_pane() {
+        // The size every scratchpad keeps for its whole life.
+        let active = Some(ActiveGeometry {
+            size: TermSize::new(80, 24),
+            cell_size: (8.0, 16.0),
+            is_scratchpad: true,
+        });
+        let last_pane = Some((TermSize::new(120, 40), (9.0, 18.0)));
 
         let (size, cell_size) = spawn_geometry(active, last_pane);
 
