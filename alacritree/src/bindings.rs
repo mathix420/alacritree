@@ -411,12 +411,13 @@ pub struct RawBinding {
     /// Bytes to write to the PTY, with the usual escapes (`\x1b`, `\u001b`).
     #[serde(default)]
     pub chars: Option<String>,
-    /// Named action to run, e.g. `"Paste"`, `"ToggleLeftSidebar"`.  Not
-    /// enumerated here: the shared `alacritty.toml` legitimately carries
-    /// actions only the real alacritty implements, and alacritree ignores
-    /// those rather than rejecting them.  `docs/keyboard-shortcuts.md` lists
-    /// what alacritree acts on.
+    /// Named action to run, e.g. `"Paste"`, `"ToggleLeftSidebar"`.  The schema
+    /// suggests every name alacritree implements without rejecting the rest:
+    /// the shared `alacritty.toml` legitimately carries actions only the real
+    /// alacritty implements, and alacritree ignores those rather than
+    /// rejecting them.  `docs/keyboard-shortcuts.md` says what each one does.
     #[serde(default)]
+    #[schemars(schema_with = "action_schema")]
     pub action: Option<String>,
     /// External program to run.  alacritree parses it so the binding still
     /// displaces alacritty's default for that key, but never runs it.
@@ -949,6 +950,102 @@ fn parse_mods(s: &str) -> Option<Modifiers> {
         return None;
     }
     Some(m)
+}
+
+/// Every simple (non-parametrized) `NamedAction`, kept in sync with the enum by
+/// hand. Mirrors the old shortcuts window's bindable list; `SelectTab`/
+/// `SpawnProfile` are excluded here because they carry an index.
+pub fn bindable_actions() -> [NamedAction; 63] {
+    use NamedAction::*;
+    [
+        Paste,
+        PasteSelection,
+        Copy,
+        CopySelection,
+        ScrollPageUp,
+        ScrollPageDown,
+        ScrollHalfPageUp,
+        ScrollHalfPageDown,
+        ScrollLineUp,
+        ScrollLineDown,
+        ScrollToTop,
+        ScrollToBottom,
+        ClearHistory,
+        SpawnNewInstance,
+        IncreaseFontSize,
+        DecreaseFontSize,
+        ResetFontSize,
+        ToggleFullscreen,
+        ToggleMaximized,
+        Minimize,
+        SelectNextTab,
+        SelectPreviousTab,
+        SelectLastTab,
+        SelectNextSession,
+        SelectPreviousSession,
+        SelectNextWorkspace,
+        SelectPreviousWorkspace,
+        OpenScratchpad,
+        ToggleLeftSidebar,
+        ToggleRightSidebar,
+        AddProject,
+        ToggleSidebarFocus,
+        CloseSession,
+        SidebarTop,
+        SidebarBottom,
+        SidebarNextProject,
+        SidebarPreviousProject,
+        FocusProjectsSidebar,
+        FocusGitSidebar,
+        FocusTerminal,
+        FocusLeft,
+        FocusRight,
+        ToggleSessionRows,
+        ToggleSessionTabs,
+        SetBaseBranch,
+        SidebarSearchConfirm,
+        SidebarSearchCancel,
+        SidebarSearchCancelToTerminal,
+        Quit,
+        TogglePalette,
+        ToggleSessionsFilter,
+        ToggleAttentionFilter,
+        TogglePrOpenFilter,
+        TogglePrDraftFilter,
+        TogglePrMergedFilter,
+        TogglePrClosedFilter,
+        ClearProjectFilters,
+        ToggleModifiedFilter,
+        ToggleDeletedFilter,
+        ToggleUntrackedFilter,
+        ClearGitFilters,
+        ToggleSearchScope,
+        RefreshPrStatus,
+    ]
+}
+
+/// Every name `parse_action` accepts for an action alacritree implements.
+/// `NoOp` and `ReceiveChar` are missing from `bindable_actions` because the
+/// palette can run neither, but both are ordinary config vocabulary, and
+/// `NoOp` is spelled `None` in a binding.
+fn action_names() -> Vec<String> {
+    let mut names: Vec<String> = bindable_actions().iter().map(NamedAction::config_name).collect();
+    names.extend((1u8..=9).map(|n| NamedAction::SelectTab(n).config_name()));
+    names.extend((1u8..=9).map(|n| NamedAction::SpawnProfile(n).config_name()));
+    names.push("None".into());
+    names.push("ReceiveChar".into());
+    names
+}
+
+/// The schema for a binding's `action`: every name alacritree implements as an
+/// `enum`, beside an open string branch.  The `enum` alone would be wrong —
+/// the shared `alacritty.toml` legitimately carries actions only the real
+/// alacritty implements, which alacritree ignores rather than rejects — so an
+/// editor completes from the names while every other value still validates.
+fn action_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "anyOf": [{ "enum": action_names() }, { "type": "string" }],
+    })
 }
 
 pub fn parse_action(name: &str) -> BindingAction {

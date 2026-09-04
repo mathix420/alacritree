@@ -13,9 +13,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
-use crate::command_ext::CommandExt;
+use crate::{command_ext, jobs};
 
 /// `enclave.*` is doppler's on-disk spelling of the `project`/`config`
 /// options (a leftover from when the product was called Enclave).
@@ -27,9 +27,11 @@ type Scopes = HashMap<String, HashMap<String, serde_json::Value>>;
 /// Copy every scope at or under `main_checkout` to the equivalent path under
 /// `worktree`.  Scopes the worktree already defines are left untouched so a
 /// deliberate per-worktree `doppler setup` (e.g. pointing at a different
-/// config) survives.  Returns how many scopes were written.
-pub fn mirror_scopes(main_checkout: &Path, worktree: &Path) -> usize {
-    let Some(scopes) = all_scopes() else {
+/// config) survives.  Returns how many scopes were written.  Takes
+/// `&jobs::Blocking` because it shells out — call it from a pool job, never
+/// from the UI thread.
+pub fn mirror_scopes(main_checkout: &Path, worktree: &Path, blocking: &jobs::Blocking) -> usize {
+    let Some(scopes) = all_scopes(blocking) else {
         return 0;
     };
     let main = canonical(main_checkout);
@@ -60,7 +62,7 @@ pub fn mirror_scopes(main_checkout: &Path, worktree: &Path) -> usize {
         if let Some(pair) = &config_pair {
             args.push(pair);
         }
-        match run(&args, Some(&target)) {
+        match run(&args, Some(&target), blocking) {
             Some(_) => written += 1,
             None => log::warn!("doppler: failed to set scope for {}", target.display()),
         }
@@ -71,9 +73,11 @@ pub fn mirror_scopes(main_checkout: &Path, worktree: &Path) -> usize {
 /// Drop the project/config options from every scope at or under `worktree`,
 /// so deleting a worktree doesn't grow doppler's config file forever.  Other
 /// options (tokens, hosts) are preserved; doppler prunes scope entries that
-/// end up empty.  Returns how many scopes were cleaned.
-pub fn forget_scopes(worktree: &Path) -> usize {
-    let Some(scopes) = all_scopes() else {
+/// end up empty.  Returns how many scopes were cleaned.  Takes
+/// `&jobs::Blocking` because it shells out — call it from a pool job, never
+/// from the UI thread.
+pub fn forget_scopes(worktree: &Path, blocking: &jobs::Blocking) -> usize {
+    let Some(scopes) = all_scopes(blocking) else {
         return 0;
     };
     let worktree = canonical(worktree);
@@ -86,7 +90,7 @@ pub fn forget_scopes(worktree: &Path) -> usize {
         if !options.contains_key(PROJECT_KEY) && !options.contains_key(CONFIG_KEY) {
             continue;
         }
-        match run(&["configure", "unset", "project", "config"], Some(Path::new(scope))) {
+        match run(&["configure", "unset", "project", "config"], Some(Path::new(scope)), blocking) {
             Some(_) => cleaned += 1,
             None => log::warn!("doppler: failed to unset scope {scope}"),
         }
@@ -102,18 +106,18 @@ fn rebase_scope(scope: &str, main: &Path, worktree: &Path) -> Option<PathBuf> {
 }
 
 /// Every scope in doppler's config file, keyed by absolute directory path.
-fn all_scopes() -> Option<Scopes> {
-    let stdout = run(&["configure", "--all", "--json"], None)?;
+fn all_scopes(blocking: &jobs::Blocking) -> Option<Scopes> {
+    let stdout = run(&["configure", "--all", "--json"], None, blocking)?;
     serde_json::from_slice(&stdout).ok()
 }
 
 /// Run doppler with `args`, returning stdout on success and `None` on any
 /// failure — including the binary not being installed, which is the common
 /// case and must stay quiet.
-fn run(args: &[&str], scope: Option<&Path>) -> Option<Vec<u8>> {
-    let mut cmd = Command::new("doppler");
-    cmd.hide_console()
-        .args(args)
+#[allow(clippy::disallowed_methods)] // Running the doppler CLI is this function's job.
+fn run(args: &[&str], scope: Option<&Path>, _blocking: &jobs::Blocking) -> Option<Vec<u8>> {
+    let mut cmd = command_ext::hidden("doppler");
+    cmd.args(args)
         .arg("--no-check-version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

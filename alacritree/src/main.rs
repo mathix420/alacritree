@@ -12,17 +12,23 @@ mod command_ext;
 mod command_palette;
 mod config;
 mod crash_log;
+mod decoration_sprites;
 mod digest;
 mod doppler;
 mod file_drop;
+mod focus_priority;
 mod fonts;
 mod frame_log;
 mod git_nav;
 mod git_status;
 mod glyph_cache;
+mod gpu_timing;
+mod grid_gl;
+mod grid_instances;
 mod ime;
 mod input;
 mod ipc;
+mod jobs;
 mod links;
 mod logdir;
 mod logging;
@@ -33,6 +39,7 @@ mod notify_macos;
 mod panel_filter;
 mod paste;
 mod path_style;
+mod pr_query;
 mod pr_status;
 mod project_refresh;
 mod projects;
@@ -78,17 +85,31 @@ const WINDOW_ICON: &[u8] = include_bytes!("../assets/icon-256.png");
 /// terminal's console server.  WezTerm's blocks the child process for three
 /// seconds waiting on a device-attributes reply, which shows up as a multi-second
 /// stall opening any pane.
+///
+/// The first `LoadLibraryW` decides which module answers every later one, so
+/// this has to run before the first pseudoconsole opens.  `main` does it at
+/// startup and every pseudoconsole open repeats it, because a test binary has
+/// no `main` to do it for them.
 #[cfg(windows)]
 fn harden_dll_search_path() {
+    use std::sync::Once;
+
     use windows_sys::Win32::System::LibraryLoader::{
         LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, SetDefaultDllDirectories,
     };
 
-    // Failure only leaves the default search order in place, which is what we
-    // had before, so it is not worth refusing to start over.
-    if unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) } == 0 {
-        log::warn!("failed to restrict the DLL search path: {}", std::io::Error::last_os_error());
-    }
+    static HARDENED: Once = Once::new();
+
+    HARDENED.call_once(|| {
+        // Failure only leaves the default search order in place, which is what
+        // we had before, so it is not worth refusing to start over.
+        if unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) } == 0 {
+            log::warn!(
+                "failed to restrict the DLL search path: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    });
 }
 
 #[cfg(not(windows))]
@@ -139,7 +160,10 @@ fn main() -> eframe::Result<()> {
     if let Some(dir) = &log_dir {
         logging::prune_session_logs(dir);
     }
-    if config.debug.persistent_logging
+    // `gpu_timing` reports through the log stream, and a GUI-subsystem binary
+    // has no console for stderr to reach.  Asking for the report has to open
+    // the file it lands in, or it is written where nothing can read it.
+    if (config.debug.persistent_logging || config.debug.gpu_timing)
         && let Some(dir) = &log_dir
     {
         *log_sink.lock().unwrap_or_else(|e| e.into_inner()) = logging::open_session_log(dir);
