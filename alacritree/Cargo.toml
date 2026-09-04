@@ -110,6 +110,13 @@ winreg = "0.55"
 # expose toast activation — needed to focus the pinging session on click.
 tauri-winrt-notification = "0.7"
 
+# The coverage scan is the only parallel work in this crate and it is
+# `cfg(not(unix))`, so the gate matches the code rather than the platform
+# name: a target that is neither unix nor windows would otherwise compile
+# the scan without its executor.
+[target.'cfg(not(unix))'.dependencies]
+rayon = "1"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # dlopen libfontconfig at runtime instead of linking it at build time. macOS
 # ships no system fontconfig, and the Homebrew bottle on the CI runners is not
