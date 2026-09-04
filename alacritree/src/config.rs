@@ -102,10 +102,11 @@ impl Config {
     }
 }
 
-/// The config an install with no config file gets.  Not `Config::default`,
-/// which carries no key bindings: the built-in bindings are filled in on the
-/// way through `RawConfig`, so diffing against `Config::default` would report
-/// every one of them as a change on a stock install.
+/// The config an install with no config file gets, and what "defaults" means
+/// anywhere the real config cannot be used.  Not `Config::default`: the
+/// built-in key bindings are filled in on the way through `RawConfig`, so the
+/// bare struct default carries none, which makes it both the wrong baseline to
+/// diff a dump against and the wrong config to hand a running window.
 fn stock_config() -> Config {
     RawConfig::default().into_config()
 }
@@ -1558,8 +1559,13 @@ pub fn load(config_dir: Option<&Path>) -> (Config, Vec<ConfigFile>) {
     let raw: RawConfig = match merged.try_into() {
         Ok(r) => r,
         Err(e) => {
+            // `stock_config`, not `Config::default`: the built-in key bindings
+            // are filled in on the way through `RawConfig`, so falling back to
+            // the bare struct default would answer a typo in the config with a
+            // terminal that has no bindings at all — no paste, no copy, no font
+            // size, and no way to reach the config to fix it.
             log::warn!("invalid alacritty/alacritree config, using defaults: {e}");
-            return (Config::default(), files);
+            return (stock_config(), files);
         },
     };
 
@@ -3002,6 +3008,24 @@ mod tests {
         let (config, _) = super::load(Some(dir.path()));
 
         assert_eq!(config.changed_from_defaults(), None);
+    }
+
+    /// A config that parses as TOML but does not fit the schema drops *every*
+    /// setting in *both* files.  The fallback has to be the config a fresh
+    /// install runs, or one mistyped value answers with a terminal that cannot
+    /// paste, copy, or resize its font — and cannot reach the file to fix it.
+    #[test]
+    fn a_config_that_fails_the_schema_still_leaves_the_built_in_bindings() {
+        let dir = config_dir(&[("alacritree.toml", "[ui]\nasync_session_spawn = \"yes\"\n")]);
+
+        let (config, _) = super::load(Some(dir.path()));
+
+        assert!(!config.ui.async_session_spawn, "the unusable setting is dropped");
+        assert_eq!(
+            config.bindings.len(),
+            super::stock_config().bindings.len(),
+            "a broken config keeps every built-in binding"
+        );
     }
 
     use super::*;
