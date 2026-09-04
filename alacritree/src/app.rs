@@ -1275,6 +1275,30 @@ impl AlacritreeApp {
         self.spawn_session_with_shell(ctx, working_directory, shell, wsl_probe)
     }
 
+    /// The geometry to open a PTY at, so it is born at the size it will keep.
+    /// Under the gate this matters: a session that opened at 80x24 and was
+    /// resized on attach makes a fast child print its first output into a grid
+    /// that is about to be reflowed under it.  Three tiers, most exact first:
+    /// the active session's own numbers when one exists; the terminal pane's
+    /// last painted size when it doesn't, which covers a respawn after
+    /// `close_session` removes the active entry before the replacement spawns;
+    /// 80x24 when neither is available, which only the constructor reaches,
+    /// since no frame has painted yet to leave a better number behind.  Never
+    /// `self.sessions.last()`, an arbitrary session possibly in another
+    /// workspace at a different pane size.
+    ///
+    /// A scratchpad is skipped: its size is fixed at construction and never
+    /// follows the pane, so an active scratchpad tab would otherwise shadow
+    /// the pane geometry with a constant worse than the tier below it.
+    fn next_spawn_geometry(&self) -> (TermSize, (f32, f32)) {
+        let active = self
+            .active_session_index()
+            .map(|idx| &self.sessions[idx])
+            .filter(|session| session.scratchpad.is_none())
+            .map(|session| (session.size, session.cell_size));
+        spawn_geometry(active, self.last_pane_geometry)
+    }
+
     /// The one path every shell reaches, which is why the checkout guard and
     /// the Doppler sync live here rather than in `spawn_session`: a named
     /// profile arrives with its shell already chosen and would otherwise open
@@ -1306,21 +1330,7 @@ impl AlacritreeApp {
             // not lost work.
             self.sync_doppler_scopes(dir.clone());
         }
-        // The PTY is born at the geometry it will keep.  Under the gate this
-        // matters: a session that opened at 80x24 and was resized on attach
-        // makes a fast shell print its first prompt into a grid that is about
-        // to be reflowed under it.  Three tiers, most exact first: the active
-        // session's own numbers when one exists; the terminal pane's last
-        // painted size when it doesn't, which covers a respawn after
-        // `close_session` removes the active entry before the replacement
-        // spawns; 80x24 when neither is available, which only the
-        // constructor reaches, since no frame has painted yet to leave a
-        // better number behind.  Never `self.sessions.last()`, an arbitrary
-        // session possibly in another workspace at a different pane size.
-        let active = self
-            .active_session_index()
-            .map(|idx| (self.sessions[idx].size, self.sessions[idx].cell_size));
-        let (size, cell_size) = spawn_geometry(active, self.last_pane_geometry);
+        let (size, cell_size) = self.next_spawn_geometry();
         let (session, request) = Session::pending_shell(
             ctx.clone(),
             &self.config,
@@ -4673,12 +4683,13 @@ impl AlacritreeApp {
             "diff: {}",
             path_style::render(&req.file, self.config.ui.path_style.diff_title, None)
         );
+        let (size, cell_size) = self.next_spawn_geometry();
         let (session, request) = Session::pending_command(
             ctx.clone(),
             &self.config,
             Some(workspace.clone()),
-            TermSize::new(80, 24),
-            (8.0, 16.0),
+            size,
+            cell_size,
             program,
             args,
             title,
