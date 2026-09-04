@@ -244,21 +244,18 @@ pub(crate) const SHIM_SCRIPT: &str = r##"d=${XDG_RUNTIME_DIR:-/tmp}/alacritree; 
 /// argv for a session alacritree constructs itself (`ShellChoice::Wsl`,
 /// auto-by-location): the shim with the probe key as `$1`.
 pub fn shim_invocation(distro: &str, workdir: &Path, probe_key: &str) -> (String, Vec<String>) {
-    (
-        "wsl.exe".to_string(),
-        vec![
-            "-d".to_string(),
-            distro.to_string(),
-            "--cd".to_string(),
-            workdir.to_string_lossy().into_owned(),
-            "--exec".to_string(),
-            "sh".to_string(),
-            "-c".to_string(),
-            SHIM_SCRIPT.to_string(),
-            "sh".to_string(),
-            probe_key.to_string(),
-        ],
-    )
+    ("wsl.exe".to_string(), vec![
+        "-d".to_string(),
+        distro.to_string(),
+        "--cd".to_string(),
+        workdir.to_string_lossy().into_owned(),
+        "--exec".to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        SHIM_SCRIPT.to_string(),
+        "sh".to_string(),
+        probe_key.to_string(),
+    ])
 }
 
 /// Probe-key shim for a `[[ui.profiles]]` entry that launches wsl.exe.
@@ -340,10 +337,8 @@ struct Timing {
 }
 
 impl Timing {
-    const DEFAULT: Self = Self {
-        slice: Duration::from_secs(5),
-        silence_limit: Duration::from_secs(30),
-    };
+    const DEFAULT: Self =
+        Self { slice: Duration::from_secs(5), silence_limit: Duration::from_secs(30) };
 }
 
 /// Whether an expired slice is evidence the transport is dead.
@@ -385,6 +380,10 @@ pub struct HelperClient {
     next_id: AtomicU64,
     capabilities: OnceLock<Capabilities>,
     down: AtomicBool,
+    /// Kept so a teardown can end a `wsl.exe` that stopped draining its
+    /// pipes.  Dropping stdin only reaches a helper still listening for the
+    /// EOF.
+    child: Mutex<Option<std::process::Child>>,
 }
 
 fn lock<'a, T>(mutex: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
@@ -407,6 +406,7 @@ impl HelperClient {
             next_id: AtomicU64::new(1),
             capabilities: OnceLock::new(),
             down: AtomicBool::new(false),
+            child: Mutex::new(None),
         });
         let mut child = match wsl::command(distro, None)
             .arg("sh")
@@ -426,13 +426,18 @@ impl HelperClient {
         };
         *lock(&client.stdin) = child.stdin.take();
         let stdout = child.stdout.take().expect("stdout piped above");
+        *lock(&client.child) = Some(child);
         let reader = client.clone();
         let spawned =
             std::thread::Builder::new().name(format!("wsl-helper-{distro}")).spawn(move || {
                 reader.read_loop(stdout);
-                // Stdin is closed by mark_down; reap so a dead helper never
-                // lingers as a zombie in the process table.
-                let _ = child.wait();
+                // Reap so a dead helper never lingers as a zombie in the
+                // process table.  Taking it also releases the handle a
+                // teardown would otherwise still be able to kill.
+                let finished = lock(&reader.child).take();
+                if let Some(mut child) = finished {
+                    let _ = child.wait();
+                }
             });
         if let Err(e) = spawned {
             client.mark_down(&format!("failed to start reader thread: {e}"));
@@ -475,7 +480,14 @@ impl HelperClient {
         if !self.down.swap(true, Ordering::AcqRel) {
             log::warn!("wsl helper for {}: {why}; falling back to one-shot spawns", self.distro);
         }
-        // Closing stdin EOFs the helper, which cleans up and exits.
+        // Closing stdin cannot be the teardown: a writer parked inside
+        // `write_all` holds the stdin lock until its write fails, and a relay
+        // whose Linux side is already gone forwards no EOF at all.  Killing
+        // first bounds both.  The close below lands microseconds later, so no
+        // ordering here gives the helper's EXIT trap a real chance to run.
+        if let Some(child) = lock(&self.child).as_mut() {
+            let _ = child.kill();
+        }
         *lock(&self.stdin) = None;
         // Waiters whose request was already written see the hangup as a
         // dropped sender — NoReply, never a retry.
@@ -753,13 +765,11 @@ mod tests {
         for byte in stream {
             frames.extend(reader.push(&[byte]).unwrap());
         }
-        assert_eq!(
-            frames,
-            vec![
-                Frame { id: 4, exit: 0, payload: b"hello".to_vec() },
-                Frame { id: 9, exit: 1, payload: Vec::new() },
-            ]
-        );
+        assert_eq!(frames, vec![Frame { id: 4, exit: 0, payload: b"hello".to_vec() }, Frame {
+            id: 9,
+            exit: 1,
+            payload: Vec::new()
+        },]);
     }
 
     #[test]
@@ -791,21 +801,18 @@ mod tests {
     fn shim_invocation_builds_expected_argv() {
         let (program, args) = shim_invocation("kali-linux", Path::new(r"C:\proj"), "1234-1");
         assert_eq!(program, "wsl.exe");
-        assert_eq!(
-            args,
-            vec![
-                "-d",
-                "kali-linux",
-                "--cd",
-                r"C:\proj",
-                "--exec",
-                "sh",
-                "-c",
-                SHIM_SCRIPT,
-                "sh",
-                "1234-1",
-            ]
-        );
+        assert_eq!(args, vec![
+            "-d",
+            "kali-linux",
+            "--cd",
+            r"C:\proj",
+            "--exec",
+            "sh",
+            "-c",
+            SHIM_SCRIPT,
+            "sh",
+            "1234-1",
+        ]);
     }
 
     #[test]
@@ -822,21 +829,18 @@ mod tests {
         let (args, distro) =
             wrap_profile_argv(r"C:\Windows\System32\wsl.exe", &profile_args, "9-9").unwrap();
         assert_eq!(distro.as_deref(), Some("kali-linux"));
-        assert_eq!(
-            args,
-            vec![
-                "-d",
-                "kali-linux",
-                "--cd",
-                "/home",
-                "--exec",
-                "sh",
-                "-c",
-                SHIM_SCRIPT,
-                "sh",
-                "9-9"
-            ]
-        );
+        assert_eq!(args, vec![
+            "-d",
+            "kali-linux",
+            "--cd",
+            "/home",
+            "--exec",
+            "sh",
+            "-c",
+            SHIM_SCRIPT,
+            "sh",
+            "9-9"
+        ]);
     }
 
     #[test]
@@ -913,10 +917,8 @@ mod tests {
     fn a_test_timing_scales_the_whole_decision_down() {
         // The loop under test has to run in milliseconds, so the limit the
         // predicate reads has to come from the struct rather than a constant.
-        let fast = Timing {
-            slice: Duration::from_millis(50),
-            silence_limit: Duration::from_millis(300),
-        };
+        let fast =
+            Timing { slice: Duration::from_millis(50), silence_limit: Duration::from_millis(300) };
         assert!(wedged(
             &fast,
             Duration::from_millis(50),
@@ -1014,5 +1016,93 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// Killing the child is what frees a writer parked inside `write_all` on a
+    /// pipe nobody is draining.  Requires WSL and kills the shared helper for
+    /// the default distro, so run it on its own:
+    /// `cargo nextest run -p alacritree wsl_helper::tests::killing_a_helper --run-ignored all`
+    #[test]
+    #[ignore]
+    fn killing_a_helper_frees_a_writer_blocked_on_its_pipe() {
+        let distro =
+            crate::wsl::distros().into_iter().find(|d| d.is_default).expect("a default distro");
+        let ready_by = Instant::now() + Duration::from_secs(120);
+        let client = loop {
+            if let Some(c) = client(&distro.name) {
+                break c;
+            }
+            assert!(Instant::now() < ready_by, "helper never became ready");
+            std::thread::sleep(Duration::from_millis(200));
+        };
+
+        // A job's parent is the backgrounded subshell and *its* parent is the
+        // dispatcher, which is the process that has to stop reading stdin for a
+        // write to block.  Field 4 of /proc/<pid>/stat is the ppid.  The pid is
+        // handed back so a panic anywhere below can still resume it.
+        let (exit, pid_out) = client
+            .run(r#"p=$(awk '{print $4}' /proc/$PPID/stat); kill -STOP "$p"; printf '%s' "$p""#, &[
+            ])
+            .expect("the stop request is answered before the dispatcher freezes");
+        assert_eq!(exit, 0, "the dispatcher was never stopped");
+        let dispatcher_pid = String::from_utf8_lossy(&pid_out).trim().to_string();
+        assert!(
+            !dispatcher_pid.is_empty() && dispatcher_pid.chars().all(|c| c.is_ascii_digit()),
+            "dispatcher pid: {dispatcher_pid:?}"
+        );
+
+        // The client is deliberately unusable by the time teardown or a panic
+        // runs, so resuming goes through a fresh one-shot command straight to
+        // the distro instead.  Drop covers every exit, panics included, so the
+        // dispatcher is never left frozen for the next test to trip over.
+        struct ResumeStoppedDispatcher {
+            distro: String,
+            pid: String,
+        }
+        impl Drop for ResumeStoppedDispatcher {
+            fn drop(&mut self) {
+                let _ = crate::wsl::command(&self.distro, None)
+                    .arg("sh")
+                    .arg("-c")
+                    .arg("kill -CONT \"$1\" 2>/dev/null")
+                    .arg("sh")
+                    .arg(&self.pid)
+                    .output();
+            }
+        }
+        let _resume_dispatcher =
+            ResumeStoppedDispatcher { distro: distro.name.clone(), pid: dispatcher_pid };
+
+        // Measured empirically: a few hundred KiB fits inside the combined
+        // buffering of the Windows pipe, wsl.exe's relay, the hvsocket, and
+        // the Linux pipe without ever pushing back, so `write_all` returns
+        // long before the stopped dispatcher would matter.  1 MiB is the
+        // smallest size found to exceed all of that and genuinely park the
+        // writer; anything smaller passes without exercising the kill at all.
+        let writer = client.clone();
+        let blocked = std::thread::spawn(move || {
+            let big = "x".repeat(1024 * 1024);
+            // A `NoReply` here means the write never blocked at all — it
+            // reached the helper and `mark_down` cleared the pending map out
+            // from under it, which proves nothing about killing the child.
+            let err =
+                writer.run("printf ''", &[&big]).expect_err("the killed helper cannot answer");
+            assert!(
+                matches!(err, TransportError::NotWritten(_)),
+                "the write never blocked: {err:?}"
+            );
+        });
+
+        std::thread::sleep(Duration::from_secs(1));
+        let tore_down = std::thread::spawn(move || client.mark_down("blocked-write test"));
+
+        assert!(!blocked.is_finished(), "the write completed instead of blocking");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !(blocked.is_finished() && tore_down.is_finished()) {
+            assert!(Instant::now() < deadline, "kill did not free the blocked writer");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        blocked.join().expect("writer thread");
+        tore_down.join().expect("teardown thread");
     }
 }
