@@ -4168,9 +4168,15 @@ impl AlacritreeApp {
         }
         if let Some(ws) = spawn_shell_request.take() {
             // Spawning activates the workspace and the new session, matching
-            // Ctrl+T and worktree-creation's open-on-done.  A failed spawn
-            // hands the workspace back rather than stranding the user on one
-            // with no shell — the same reasoning as `activate_worktree`.
+            // Ctrl+T and worktree-creation's open-on-done.  An `Err` here
+            // arrived before the session record did — a checkout git has
+            // forgotten, or a PTY opened inline — and hands the workspace
+            // back rather than stranding the user on one with no shell, the
+            // same reasoning as `activate_worktree`.  A PTY opened on a
+            // worker fails after the record exists, so the switch stands and
+            // `poll_pending_spawns` leaves the pane on the "no session"
+            // placeholder: every workspace it could hand back to is one
+            // `ensure_active_session` would spawn into and fail identically.
             let previous = std::mem::replace(&mut self.current_workspace, ws.clone());
             match self.spawn_session(ctx, ws.clone()) {
                 Ok(_) => workspace_activated = true,

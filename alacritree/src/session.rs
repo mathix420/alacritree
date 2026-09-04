@@ -1252,8 +1252,10 @@ impl Session {
         )
     }
 
-    /// The `spawn_command` half of the split: a pending session running
-    /// `program args`, without opening its PTY.
+    /// A pending session running `program args` instead of the user's shell,
+    /// without opening its PTY.  The git sidebar drops into `delta` this way
+    /// for an inline diff view; once the command exits, `reap_exited_sessions`
+    /// removes the tab.
     pub fn pending_command(
         ctx: egui::Context,
         config: &Config,
