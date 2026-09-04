@@ -1183,12 +1183,11 @@ impl AlacritreeApp {
     }
 
     /// Push a session record and get its PTY opened: inline when the gate is
-    /// off, on a worker when it is on.  The record exists before this returns
-    /// either way, so a caller can activate the tab without waiting for a
-    /// shell.  Callers own `active_session`; this owns `self.sessions`.
+    /// off, on the job pool when it is on.  The record exists before this
+    /// returns either way, so a caller can activate the tab without waiting
+    /// for a shell.  Callers own `active_session`; this owns `self.sessions`.
     fn open_session(
         &mut self,
-        ctx: &Context,
         session: Session,
         request: session::OpenRequest,
     ) -> std::io::Result<SessionId> {
@@ -1212,15 +1211,13 @@ impl AlacritreeApp {
             }
         }
 
-        let (tx, rx) = mpsc::channel();
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(session::open(request));
-            // Without this the result waits for whatever wakes the loop next,
-            // which under load is the shell's own first output seconds later.
-            ctx.request_repaint();
-        });
-        self.pending_spawns.start(id, rx);
+        // Interactive: an empty pane is on screen until this lands.  The pool
+        // repaints once the job returns, so nothing here has to — without that
+        // the result would wait for whatever wakes the loop next, which under
+        // load is the shell's own first output seconds later.
+        let job = jobs::pool()
+            .spawn(jobs::Priority::Interactive, move |_blocking| session::open(request));
+        self.pending_spawns.start(id, job);
         Ok(id)
     }
 
@@ -1339,7 +1336,7 @@ impl AlacritreeApp {
             shell,
             wsl_probe,
         );
-        let id = self.open_session(ctx, session, request)?;
+        let id = self.open_session(session, request)?;
         self.active_session.insert(working_directory, id);
         Ok(id)
     }
@@ -4694,7 +4691,7 @@ impl AlacritreeApp {
             title,
             SessionKind::Diff { key: new_key },
         );
-        match self.open_session(ctx, session, request) {
+        match self.open_session(session, request) {
             Ok(id) => {
                 self.active_session.insert(Some(workspace), id);
             },

@@ -258,6 +258,27 @@ impl<T> Drop for Job<T> {
     }
 }
 
+/// Handles that already carry their outcome, so a module built on `Job` can
+/// test its own logic without a pool and the scheduling that comes with one.
+#[cfg(test)]
+impl<T> Job<T> {
+    pub fn ready(value: T) -> Self {
+        Self::settled(Ok(value))
+    }
+
+    /// Reports the way a worker reports a closure that unwound.
+    pub fn panicked() -> Self {
+        Self::settled(Err(JobFailed))
+    }
+
+    fn settled(result: Result<T, JobFailed>) -> Self {
+        let (tx, rx) = mpsc::channel();
+        // The sender drops here; `try_recv` still hands back what it buffered.
+        let _ = tx.send(result);
+        Job { rx, cancel: Arc::new(Cancel::default()), failed: Cell::new(false) }
+    }
+}
+
 impl Pool {
     /// `workers` is clamped to at least two: each class's ceiling needs one
     /// worker beyond the one it holds free.

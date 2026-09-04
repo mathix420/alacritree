@@ -1,19 +1,20 @@
 //! Bookkeeping for PTYs opened on a worker.
 //!
 //! A session's record exists from the frame that asked for it, but its PTY
-//! arrives some frames later.  This holds the receivers in between, and the
+//! arrives some frames later.  This holds the open jobs in between, and the
 //! IPC replies parked until a caller's session is actually live — a client
 //! that creates a session in order to write to it would otherwise race its
 //! own PTY.
 
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::mpsc::Sender;
 
 use crate::ipc::IpcResult;
+use crate::jobs::Job;
 use crate::session::{Attachment, SessionId};
 
 struct Pending {
-    rx: Receiver<std::io::Result<Attachment>>,
+    job: Job<std::io::Result<Attachment>>,
     waiters: Vec<Sender<IpcResult>>,
 }
 
@@ -33,8 +34,8 @@ pub enum Finished {
 }
 
 impl PendingSpawns {
-    pub fn start(&mut self, id: SessionId, rx: Receiver<std::io::Result<Attachment>>) {
-        self.pending.insert(id, Pending { rx, waiters: Vec::new() });
+    pub fn start(&mut self, id: SessionId, job: Job<std::io::Result<Attachment>>) {
+        self.pending.insert(id, Pending { job, waiters: Vec::new() });
     }
 
     /// Park `reply_tx` until the session's PTY is live.  Hands the channel
@@ -64,10 +65,13 @@ impl PendingSpawns {
         // entries out whole.
         let mut resolved = Vec::new();
         for (id, pending) in self.pending.iter_mut() {
-            match pending.rx.try_recv() {
-                Ok(result) => resolved.push((*id, Some(result))),
-                Err(TryRecvError::Empty) => {},
-                Err(TryRecvError::Disconnected) => resolved.push((*id, None)),
+            match pending.job.poll() {
+                Some(result) => resolved.push((*id, Some(result))),
+                // A worker that unwound reports through `failed`, and only
+                // after the `poll` that drains the failure off the channel —
+                // so this order is the one that sees it.
+                None if pending.job.failed() => resolved.push((*id, None)),
+                None => {},
             }
         }
 
@@ -80,7 +84,7 @@ impl PendingSpawns {
                     Some(Err(e)) => Finished::Failed(id, e, waiters),
                     None => Finished::Failed(
                         id,
-                        std::io::Error::other("the session's PTY worker stopped"),
+                        std::io::Error::other("the session's PTY worker panicked"),
                         waiters,
                     ),
                 }
@@ -101,13 +105,17 @@ impl PendingSpawns {
 mod tests {
     //! `Attachment` only comes from `session::open`, which spawns a real PTY —
     //! too slow and too platform-dependent for this module's tests. Every
-    //! case here drives the `Failed` path instead: `take_finished` treats a
-    //! `Err` from the worker and a dropped sender the same way it treats
+    //! case here drives the `Failed` path instead: `take_finished` treats an
+    //! `Err` from the worker and a panicked worker the same way it treats
     //! `Ok`, so `Failed` alone exercises the retain/remove/answer plumbing
-    //! this module owns. `Finished::Opened` is covered app-side in Task 6,
-    //! where a real session is already being spawned for other reasons.
+    //! this module owns. `Finished::Opened` is covered app-side, where a real
+    //! session is already being spawned for other reasons.
     use super::*;
     use std::sync::mpsc;
+
+    fn refused(reason: &str) -> Job<std::io::Result<Attachment>> {
+        Job::ready(Err(std::io::Error::other(reason)))
+    }
 
     /// Nothing is opening for `id` any more: `watch` hands a waiter straight
     /// back rather than parking it on an entry that will never resolve.
@@ -118,11 +126,9 @@ mod tests {
 
     #[test]
     fn a_finished_open_comes_back_failed_with_its_id() {
-        let (open_tx, open_rx) = mpsc::channel();
         let mut spawns = PendingSpawns::default();
-        spawns.start(1, open_rx);
+        spawns.start(1, refused("no such shell"));
 
-        open_tx.send(Err(std::io::Error::other("no such shell"))).unwrap();
         let finished = spawns.take_finished();
 
         assert_eq!(finished.len(), 1);
@@ -137,11 +143,9 @@ mod tests {
     }
 
     #[test]
-    fn a_worker_that_drops_its_sender_comes_back_failed_not_stuck_pending() {
-        let (open_tx, open_rx) = mpsc::channel::<std::io::Result<Attachment>>();
+    fn a_worker_that_panicked_comes_back_failed_not_stuck_pending() {
         let mut spawns = PendingSpawns::default();
-        spawns.start(1, open_rx);
-        drop(open_tx);
+        spawns.start(1, Job::panicked());
 
         let finished = spawns.take_finished();
 
@@ -149,20 +153,18 @@ mod tests {
         assert!(matches!(&finished[0], Finished::Failed(1, _, _)));
         assert!(
             forgotten(&mut spawns, 1),
-            "a dropped sender must not leave a pending entry that never resolves"
+            "a panicked open must not leave a pending entry that never resolves"
         );
     }
 
     #[test]
     fn a_waiter_parked_with_watch_is_answered_once_the_open_resolves() {
-        let (open_tx, open_rx) = mpsc::channel();
         let (reply_tx, reply_rx) = mpsc::channel();
 
         let mut spawns = PendingSpawns::default();
-        spawns.start(1, open_rx);
+        spawns.start(1, refused("boom"));
         assert!(spawns.watch(1, reply_tx).is_none(), "a pending open takes the waiter");
 
-        open_tx.send(Err(std::io::Error::other("boom"))).unwrap();
         let mut finished = spawns.take_finished();
         assert_eq!(finished.len(), 1);
         let Finished::Failed(id, e, waiters) = finished.remove(0) else {
@@ -176,21 +178,17 @@ mod tests {
 
     #[test]
     fn a_second_waiter_joins_the_open_already_running() {
-        let (open_tx, open_rx) = mpsc::channel();
         let (first_tx, first_rx) = mpsc::channel();
         let (second_tx, second_rx) = mpsc::channel();
 
         let mut spawns = PendingSpawns::default();
-        spawns.start(1, open_rx);
+        spawns.start(1, refused("boom"));
         assert!(spawns.watch(1, first_tx).is_none());
         assert!(spawns.watch(1, second_tx).is_none());
 
-        open_tx.send(Err(std::io::Error::other("boom"))).unwrap();
         let mut finished = spawns.take_finished();
         assert_eq!(finished.len(), 1);
-        let Finished::Failed(_, e, waiters) = finished.remove(0) else {
-            panic!("expected Failed")
-        };
+        let Finished::Failed(_, e, waiters) = finished.remove(0) else { panic!("expected Failed") };
         PendingSpawns::answer(waiters, Err(e.to_string()));
 
         assert_eq!(first_rx.try_recv().unwrap(), Err("boom".to_string()));
