@@ -7101,7 +7101,8 @@ struct DeferredClose {
     verdict: CloseFallback,
     /// Set when an asynchronous worktree deletion is in flight: `projects`
     /// still lists it, so without this the reconciler would see an intact row
-    /// and could spawn a shell inside the directory being removed.
+    /// and could spawn a shell inside the directory being removed.  It pairs
+    /// with any verdict, including a ring landing in another project.
     removed_worktree: Option<PathBuf>,
 }
 
@@ -8446,23 +8447,50 @@ impl AlacritreeApp {
             return;
         };
         let project_root = self.projects[req.project_idx].root.clone();
+        let policy = self.config.ui.last_session_close;
+        let ring = policy.rings().then(|| self.session_ring()).unwrap_or_default();
+        let removed: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|s| s.working_directory.as_deref() == Some(&req.worktree_path))
+            .map(|s| s.id)
+            .collect();
 
         // Drop sessions whose cwd is the worktree before deleting it; the PTY
         // would otherwise block the directory removal on some filesystems.
         self.sessions.retain(|s| s.working_directory.as_deref() != Some(&req.worktree_path));
         self.active_session.remove(&Some(req.worktree_path.clone()));
         if self.current_workspace.as_deref() == Some(&req.worktree_path) {
+            let landing = policy
+                .rings()
+                .then(|| {
+                    let prefer = policy
+                        .prefers_project()
+                        .then(|| {
+                            sidebar_nav::project_of(
+                                &self.projects,
+                                &Some(req.worktree_path.clone()),
+                            )
+                        })
+                        .flatten();
+                    ring_landing(&ring, &removed, prefer)
+                })
+                .flatten();
+            let verdict = match landing {
+                Some((_, id)) => CloseFallback::ActivateSession(id),
+                None => CloseFallback::Home,
+            };
             if defers_close_navigation(self.config.ui.sidebar_focus) {
                 self.sidebar_deferred_close = Some(DeferredClose {
-                    verdict: CloseFallback::Home,
+                    verdict,
                     removed_worktree: Some(req.worktree_path.clone()),
                 });
                 ctx.request_repaint();
             } else {
                 // Deleting the on-screen worktree is an explicit user action,
-                // so home should greet with a live shell rather than the "no
-                // session" placeholder.
-                self.activate_home(ctx);
+                // so the view should greet with a live shell rather than the
+                // "no session" placeholder.
+                self.apply_close_fallback(ctx, verdict);
             }
         }
 
