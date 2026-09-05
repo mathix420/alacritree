@@ -7,7 +7,10 @@
 //! prints success on stdout and errors on stderr, which is why callers
 //! capture both.
 
-use crate::wsl;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+
+use crate::{command_ext, jobs, wsl};
 use serde::Deserialize;
 
 /// Which herdr server an agent belongs to.  Two servers on one machine
@@ -166,6 +169,159 @@ pub fn error_code(stderr: &str) -> Option<String> {
     serde_json::from_str::<ErrEnvelope>(stderr).ok().map(|e| e.error.code)
 }
 
+/// How long a server that has answered before waits before being retried.
+const RECOVERY_RETRY: Duration = Duration::from_secs(30);
+
+/// Whether an endpoint is worth talking to.  An endpoint that has never
+/// answered is abandoned, so a machine with no herdr pays one failed spawn
+/// rather than one per tick; an endpoint that answered and then stopped is
+/// retried forever, because `herdr update` restarts the server.
+#[derive(Debug, Default)]
+pub struct Reach {
+    ever_answered: bool,
+    failing: bool,
+    last_error: Option<String>,
+}
+
+impl Reach {
+    /// Whether to poll again, given how long it has been since the last try.
+    pub fn should_retry(&self, since_last: Duration) -> bool {
+        match (self.failing, self.ever_answered) {
+            (false, _) => true,
+            (true, true) => since_last >= RECOVERY_RETRY,
+            (true, false) => false,
+        }
+    }
+
+    pub fn record_success(&mut self) {
+        self.ever_answered = true;
+        self.failing = false;
+        self.last_error = None;
+    }
+
+    /// Records a failure, returning whether it is worth logging — a code
+    /// repeating every tick is logged once, not once per poll.
+    pub fn record_failure(&mut self, code: &str) -> bool {
+        self.failing = true;
+        let novel = self.last_error.as_deref() != Some(code);
+        self.last_error = Some(code.to_string());
+        novel
+    }
+}
+
+/// One herdr server's agents, refreshed off the UI thread.
+pub struct EndpointCache {
+    side: Side,
+    agents: Vec<Agent>,
+    generation: u64,
+    reach: Reach,
+    last_attempt: Option<Instant>,
+    pending: Option<jobs::Job<Result<Vec<Agent>, String>>>,
+}
+
+impl EndpointCache {
+    pub fn new(side: Side) -> Self {
+        Self {
+            side,
+            agents: Vec::new(),
+            generation: 0,
+            reach: Reach::default(),
+            last_attempt: None,
+            pending: None,
+        }
+    }
+
+    /// Bumped only when a rendered field changes, so the sidebar's per-frame
+    /// comparison does not rebuild for `revision` churn nobody can see.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn agents(&self) -> &[Agent] {
+        &self.agents
+    }
+
+    /// Adopts a landed result and starts a new poll when due.  Never blocks.
+    pub fn poll(&mut self, interval: Duration) {
+        if let Some(job) = &self.pending {
+            match job.poll() {
+                Some(Ok(agents)) => {
+                    self.reach.record_success();
+                    if rendered_differs(&self.agents, &agents) {
+                        self.generation = self.generation.wrapping_add(1);
+                    }
+                    self.agents = agents;
+                    self.pending = None;
+                },
+                Some(Err(code)) => {
+                    if self.reach.record_failure(&code) && code != "server_not_running" {
+                        log::warn!("herdr ({:?}): {code}", self.side);
+                    }
+                    if !self.agents.is_empty() {
+                        self.agents.clear();
+                        self.generation = self.generation.wrapping_add(1);
+                    }
+                    self.pending = None;
+                },
+                None if job.failed() => self.pending = None,
+                None => return,
+            }
+        }
+
+        let since = self.last_attempt.map_or(interval, |t| t.elapsed());
+        if since < interval || !self.reach.should_retry(since) {
+            return;
+        }
+        self.last_attempt = Some(Instant::now());
+        let side = self.side.clone();
+        self.pending = Some(
+            jobs::pool()
+                .spawn(jobs::Priority::Background, move |blocking| list_agents(&side, blocking)),
+        );
+    }
+}
+
+/// Whether anything the sidebar draws changed.  `revision` and
+/// `state_change_seq` deliberately do not count: they move on output the row
+/// does not show.
+fn rendered_differs(was: &[Agent], now: &[Agent]) -> bool {
+    was.len() != now.len()
+        || was.iter().zip(now).any(|(a, b)| {
+            a.terminal_id != b.terminal_id
+                || a.status != b.status
+                || a.kind != b.kind
+                || a.cwd != b.cwd
+                || a.foreground_cwd != b.foreground_cwd
+                || a.pane_id != b.pane_id
+        })
+}
+
+/// Runs `herdr agent list` on one side.  Success is on stdout, errors are on
+/// stderr, so both are captured; the exit status decides which to read.
+///
+/// wsl.exe's own failure messages (a missing distro, for instance) come back
+/// UTF-16LE unless WSL_UTF8 is set, and `from_utf8_lossy` mangles them without
+/// it, so they never match an error code and degrade to `server_not_running`.
+/// herdr's own output is a relayed Linux byte stream and is unaffected either
+/// way.
+#[allow(clippy::disallowed_methods)] // Running herdr is this function's job.
+fn list_agents(side: &Side, _blocking: &jobs::Blocking) -> Result<Vec<Agent>, String> {
+    let (program, args) = side.command(&["agent", "list"]);
+    let output = command_ext::hidden(program)
+        .args(args)
+        .env("WSL_UTF8", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|_| "spawn_failed".to_string())?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(error_code(&stderr).unwrap_or_else(|| "server_not_running".to_string()));
+    }
+    Ok(parse_agent_list(&String::from_utf8_lossy(&output.stdout)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +436,67 @@ mod tests {
             session_attach_script("w5:p1", "default"),
             "herdr agent focus 'w5:p1' && herdr session attach default"
         );
+    }
+
+    use std::time::Duration;
+
+    #[test]
+    fn an_endpoint_that_never_answered_is_given_up_on() {
+        let mut reach = Reach::default();
+        reach.record_failure("server_not_running");
+        assert!(!reach.should_retry(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn an_endpoint_that_answered_once_keeps_retrying() {
+        let mut reach = Reach::default();
+        reach.record_success();
+        reach.record_failure("server_not_running");
+        assert!(!reach.should_retry(Duration::from_secs(5)));
+        assert!(reach.should_retry(Duration::from_secs(31)));
+    }
+
+    #[test]
+    fn a_recovered_endpoint_polls_at_the_normal_interval_again() {
+        let mut reach = Reach::default();
+        reach.record_success();
+        reach.record_failure("server_not_running");
+        reach.record_success();
+        assert!(reach.should_retry(Duration::from_secs(0)));
+    }
+
+    #[test]
+    fn a_repeated_error_is_logged_once() {
+        let mut reach = Reach::default();
+        assert!(reach.record_failure("protocol_mismatch"));
+        assert!(!reach.record_failure("protocol_mismatch"));
+        assert!(reach.record_failure("server_not_running"));
+    }
+
+    fn agent(id: &str, status: Status) -> Agent {
+        Agent {
+            terminal_id: id.into(),
+            pane_id: "w1:p1".into(),
+            kind: Some("claude".into()),
+            status,
+            cwd: Some("/repo".into()),
+            foreground_cwd: None,
+            state_change_seq: 0,
+        }
+    }
+
+    #[test]
+    fn churn_the_sidebar_cannot_see_does_not_count_as_a_change() {
+        let was = vec![agent("t1", Status::Idle)];
+        let mut now = was.clone();
+        now[0].state_change_seq = 99;
+        assert!(!rendered_differs(&was, &now));
+    }
+
+    #[test]
+    fn a_status_change_counts() {
+        let was = vec![agent("t1", Status::Idle)];
+        let now = vec![agent("t1", Status::Working)];
+        assert!(rendered_differs(&was, &now));
     }
 }
