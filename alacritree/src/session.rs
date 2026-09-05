@@ -1374,22 +1374,11 @@ impl Session {
         self.shell_pid = shell_pid;
         self.priority_job = priority_job;
         self.notifier = Some(Notifier(sender.clone()));
+
+        for msg in attach_replay(self.size, self.cell_size, self.pending_writes.take()) {
+            let _ = sender.send(msg);
+        }
         self.sender = Some(sender);
-
-        // The pane may have been resized while the PTY was opening, and the
-        // size the request carried is the one it was born with.
-        if let Some(sender) = &self.sender {
-            let _ = sender.send(Msg::Resize(window_size(self.size, self.cell_size)));
-        }
-
-        // After the resize and before anything the app writes this frame, so
-        // the shell answers a buffered command at the size the pane is at
-        // rather than the one the PTY was opened with.
-        if let Some(pending) = self.pending_writes.take() {
-            if !pending.is_empty() {
-                self.notifier.as_ref().expect("attach set the notifier").notify(pending);
-            }
-        }
 
         // Registered here rather than where the PTY is opened: `Session::drop`
         // is the only unregister, so a probe registered for a session that no
@@ -1686,6 +1675,19 @@ fn clipboard_target(ty: ClipboardType) -> Target {
         ClipboardType::Clipboard => Target::Clipboard,
         ClipboardType::Selection => Target::Primary,
     }
+}
+
+/// What `attach` replays into a PTY that was opened at an older size.  The
+/// resize leads so that input typed while the PTY was opening is answered at
+/// the size the pane ended up at rather than the one the PTY was born with;
+/// an empty buffer sends nothing, because a zero-byte write hangs the
+/// terminal.
+fn attach_replay(size: TermSize, cell_size: (f32, f32), pending: Option<Vec<u8>>) -> Vec<Msg> {
+    let mut replay = vec![Msg::Resize(window_size(size, cell_size))];
+    if let Some(input) = pending.filter(|bytes| !bytes.is_empty()) {
+        replay.push(Msg::Input(input.into()));
+    }
+    replay
 }
 
 fn window_size(size: TermSize, cell_size: (f32, f32)) -> WindowSize {
@@ -2823,30 +2825,27 @@ mod tests {
     /// The size the PTY is opened at is the size the request carried, so a
     /// pane resized while it was opening has to be replayed — and replayed
     /// before any buffered input, or the shell answers at the old width.
-    #[cfg(windows)]
     #[test]
-    fn a_resize_before_attach_reaches_the_pty() {
-        let mut config = Config::default();
-        config.env.insert("TERM".to_string(), "xterm-256color".to_string());
-        let (mut session, request) = Session::pending_command(
-            egui::Context::default(),
-            &config,
-            std::env::current_dir().ok(),
-            TermSize::new(80, 24),
-            (8.0, 16.0),
-            "cmd.exe".to_string(),
-            vec!["/q".to_string(), "/k".to_string(), "prompt $g".to_string()],
-            "probe".to_string(),
-            SessionKind::Shell,
-        );
+    fn a_resize_before_attach_leads_the_buffered_input() {
+        let input = b"typed while opening\r\n".to_vec();
+        let replay = attach_replay(TermSize::new(120, 40), (8.0, 16.0), Some(input.clone()));
 
-        session.resize(TermSize::new(120, 40), (8.0, 16.0));
-        session.write(b"mode con\r\n".to_vec());
-        session.attach(open(request).expect("open the pty"));
+        match replay.as_slice() {
+            [Msg::Resize(size), Msg::Input(replayed)] => {
+                assert_eq!((size.num_cols, size.num_lines), (120, 40));
+                assert_eq!(replayed.as_ref(), input.as_slice());
+            },
+            other => panic!("expected the resize then the buffered input, got {other:?}"),
+        }
+    }
 
-        assert!(
-            grid_contains(&session, "120", Duration::from_secs(20)),
-            "the child sees the size the PTY was opened at, not the one the pane ended up at"
-        );
+    /// A zero-byte write hangs the terminal, so a session that buffered
+    /// nothing replays only its size.
+    #[test]
+    fn attach_replays_no_input_when_nothing_was_buffered() {
+        for pending in [None, Some(Vec::new())] {
+            let replay = attach_replay(TermSize::new(80, 24), (8.0, 16.0), pending);
+            assert!(matches!(replay.as_slice(), [Msg::Resize(_)]), "{replay:?}");
+        }
     }
 }
