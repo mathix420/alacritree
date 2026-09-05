@@ -9,6 +9,7 @@ use crate::{command_ext, jobs};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 /// Per-project shell override, persisted in state.toml as `"windows"`,
 /// `"wsl:<distro>"`, or `"profile:<name>"`.  Absent means auto-by-location.
@@ -331,6 +332,11 @@ pub fn shell_invocation(distro: &str, workdir: &Path) -> (String, Vec<String>) {
 /// section's own trailing newline when it has one.
 pub const SECTION_SEP: &[u8] = b"\n@@ALACRITREE@@\n";
 
+/// The same budget the resident transport gives a request, for the same
+/// reason: a cold WSL VM can take seconds to answer, and nothing healthy
+/// takes longer.
+const ONE_SHOT_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Run `script` through `sh -c` inside `distro`, with `args` bound to
 /// `$1..`.  Rides the resident helper's pipe when it is up; otherwise one
 /// wsl.exe round trip (~400 ms warm on a dev machine, seconds while the VM
@@ -349,7 +355,7 @@ pub fn run_batch(
     if let Some(result) = crate::wsl_helper::try_run(distro, script, args) {
         return result;
     }
-    let output = command(distro, None)
+    let mut child = command(distro, None)
         .arg("sh")
         .arg("-c")
         .arg(script)
@@ -358,16 +364,44 @@ pub fn run_batch(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
         .map_err(|e| format!("failed to run wsl.exe: {e}"))?;
+
+    // `output()` waits for exit with no deadline, so a wsl.exe that never
+    // exits pins this thread for the life of the process.  Draining on
+    // workers and bounding the wait here mirrors how the ipc client bounds a
+    // named-pipe request from its own side.  One thread per pipe, because a
+    // child that fills whichever pipe is drained second blocks there while
+    // the reader is still emptying the first.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut stdout = child.stdout.take().expect("stdout piped above");
+    let mut stderr = child.stderr.take().expect("stderr piped above");
+    let errors = std::thread::spawn(move || {
+        let mut err = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stderr, &mut err);
+        err
+    });
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut out);
+        let _ = tx.send(out);
+    });
+
+    let Ok(stdout_bytes) = rx.recv_timeout(ONE_SHOT_TIMEOUT) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("wsl.exe did not finish within {}s", ONE_SHOT_TIMEOUT.as_secs()));
+    };
+    let stderr_bytes = errors.join().unwrap_or_default();
+    let status = child.wait().map_err(|e| format!("failed to wait on wsl.exe: {e}"))?;
     // Scripts guard individual commands with `2>/dev/null || true`-style
     // fallbacks; a hard failure with no stdout means wsl.exe itself refused
     // (deregistered distro, WSL not installed).
-    if !output.status.success() && output.stdout.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !status.success() && stdout_bytes.is_empty() {
+        let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
         return Err(if stderr.is_empty() { "wsl.exe failed".to_string() } else { stderr });
     }
-    Ok(output.stdout)
+    Ok(stdout_bytes)
 }
 
 /// Resolve `delta`'s absolute path inside `distro`.  Returns `None` when delta
@@ -715,5 +749,28 @@ mod tests {
         })
         .unwrap();
         assert_eq!(out, b"hello");
+    }
+
+    /// A one-shot that never exits must not pin its caller.  Requires WSL;
+    /// run manually:
+    /// `cargo nextest run -p alacritree wsl::tests::a_one_shot --run-ignored all`
+    #[test]
+    #[ignore]
+    fn a_one_shot_that_never_exits_gives_up_rather_than_hanging() {
+        use std::time::Instant;
+
+        let distro = distros().into_iter().find(|d| d.is_default).expect("a default distro");
+        // The resident helper would answer this on its own thread and never
+        // reach the fallback, so it has to be off for the duration.
+        crate::wsl_helper::set_enabled(false);
+
+        let started = Instant::now();
+        let result =
+            jobs::on_this_thread(|blocking| run_batch(&distro.name, "sleep 3600", &[], blocking));
+        let waited = started.elapsed();
+
+        crate::wsl_helper::set_enabled(true);
+        assert!(result.is_err(), "a child that never exits is not a success");
+        assert!(waited < ONE_SHOT_TIMEOUT * 2, "gave up only after {waited:?}");
     }
 }
