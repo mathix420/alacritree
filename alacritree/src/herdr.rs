@@ -148,12 +148,54 @@ pub fn attach_args(pane_id: &str) -> Vec<String> {
     vec!["agent".into(), "attach".into(), pane_id.into()]
 }
 
-/// The native-Windows fallback: focus the pane, then attach to the whole
-/// herdr session.  Two commands, so this returns a shell line rather than an
-/// argv.  herdr's focus is server-global, so this moves the pane the user's
-/// own herdr window is showing.
-pub fn session_attach_script(pane_id: &str, session: &str) -> String {
-    format!("herdr agent focus {} && herdr session attach {}", sh_quote(pane_id), sh_quote(session))
+/// Whether direct per-agent attach works on this side.  herdr's
+/// `run_terminal_attach` is a `#[cfg(windows)]` refusal, so a native Windows
+/// server falls back to focusing the pane and attaching the whole session.
+pub fn can_attach(side: &Side) -> bool {
+    match side {
+        Side::Native => !cfg!(windows),
+        Side::Wsl(_) => true,
+    }
+}
+
+#[derive(Deserialize)]
+struct SessionList {
+    #[serde(default)]
+    sessions: Vec<RawSession>,
+}
+
+#[derive(Deserialize)]
+struct RawSession {
+    name: String,
+    #[serde(default)]
+    running: bool,
+}
+
+/// The running session to attach to on this side.  `herdr session list
+/// --json` is a flat object rather than the `result`-wrapped envelope
+/// `agent list` uses.  Falls back to `default`, which is the name herdr
+/// gives an unnamed session.
+#[allow(clippy::disallowed_methods)] // Running herdr is this function's job.
+pub fn running_session_name(side: &Side) -> String {
+    let (program, args) = side.command(&["session", "list", "--json"]);
+    let fallback = || "default".to_string();
+    let Ok(output) = command_ext::hidden(program)
+        .args(args)
+        .env("WSL_UTF8", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return fallback();
+    };
+    if !output.status.success() {
+        return fallback();
+    }
+    serde_json::from_slice::<SessionList>(&output.stdout)
+        .ok()
+        .and_then(|list| list.sessions.into_iter().find(|s| s.running).map(|s| s.name))
+        .unwrap_or_else(fallback)
 }
 
 /// Identifies one herdr agent across polls.
@@ -464,6 +506,17 @@ mod tests {
     }
 
     #[test]
+    fn native_windows_cannot_attach_directly() {
+        assert_eq!(can_attach(&Side::Native), !cfg!(windows));
+    }
+
+    /// A WSL server runs herdr's unix build whatever the host is.
+    #[test]
+    fn wsl_can_always_attach() {
+        assert!(can_attach(&Side::Wsl("d".into())));
+    }
+
+    #[test]
     fn native_runs_herdr_directly() {
         let (program, args) = Side::Native.command(&["agent", "list"]);
         assert_eq!(program, "herdr");
@@ -488,14 +541,6 @@ mod tests {
     #[test]
     fn direct_attach_targets_the_pane_id() {
         assert_eq!(attach_args("w5:p1"), vec!["agent", "attach", "w5:p1"]);
-    }
-
-    #[test]
-    fn the_windows_fallback_focuses_then_attaches_the_session() {
-        assert_eq!(
-            session_attach_script("w5:p1", "default"),
-            "herdr agent focus 'w5:p1' && herdr session attach default"
-        );
     }
 
     use std::time::Duration;

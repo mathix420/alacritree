@@ -1,6 +1,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -203,7 +204,7 @@ pub struct Session {
     /// Shares this session's on-screen flag with the `EventProxy` its PTY
     /// thread posts events through.
     proxy: EventProxy,
-    exited: bool,
+    exit_status: Option<ExitStatus>,
     /// Set when this session is a shell attached to a herdr agent, so the
     /// sidebar draws one row for that agent rather than two.  Dies with the
     /// session, which is why it lives here and not in a map.
@@ -1186,7 +1187,7 @@ impl Session {
             sender: None,
             pending_writes: None,
             proxy,
-            exited: false,
+            exit_status: None,
             herdr_key: None,
         })
     }
@@ -1355,7 +1356,7 @@ impl Session {
             sender: None,
             pending_writes: Some(Vec::new()),
             proxy: proxy.clone(),
-            exited: false,
+            exit_status: None,
             herdr_key: None,
         };
 
@@ -1467,7 +1468,7 @@ impl Session {
                         event,
                         &mut self.title,
                         title_pinned,
-                        &mut self.exited,
+                        &mut self.exit_status,
                         &mut outcome,
                     ) {
                         self.write(bytes);
@@ -1499,7 +1500,14 @@ impl Session {
     }
 
     pub fn is_exited(&self) -> bool {
-        self.exited
+        self.exit_status.is_some()
+    }
+
+    /// Whether an exited child left cleanly.  A herdr agent that refuses to
+    /// attach exits within a frame, and only a non-zero exit distinguishes
+    /// that refusal from an ordinary shell the user closed.
+    pub fn exit_was_clean(&self) -> bool {
+        self.exit_status.is_none_or(|status| status.success())
     }
 
     /// The distro a shimmed WSL session runs in.  Dropped paths need it to
@@ -1652,7 +1660,7 @@ fn apply_term_event(
     event: TermEvent,
     title: &mut String,
     pinned: bool,
-    exited: &mut bool,
+    exit_status: &mut Option<ExitStatus>,
     outcome: &mut DrainOutcome,
 ) -> Option<Vec<u8>> {
     match event {
@@ -1666,7 +1674,7 @@ fn apply_term_event(
             }
             *title = t;
         },
-        TermEvent::ChildExit(_) => *exited = true,
+        TermEvent::ChildExit(status) => *exit_status = Some(status),
         TermEvent::Bell => outcome.attention = true,
         // OSC 52.  Apps that copy this way (Claude Code, tmux, vim) get no
         // acknowledgement, so dropping it leaves them reporting a successful
@@ -2038,8 +2046,8 @@ mod tests {
         let event = events.try_recv().expect("terminal emitted no event for OSC 52");
         let mut outcome = DrainOutcome::default();
         let mut title = String::new();
-        let mut exited = false;
-        apply_term_event(event, &mut title, false, &mut exited, &mut outcome);
+        let mut exit_status = None;
+        apply_term_event(event, &mut title, false, &mut exit_status, &mut outcome);
 
         assert_eq!(outcome.clipboard, vec![(Target::Clipboard, "hello".to_owned())]);
     }
@@ -2076,7 +2084,7 @@ mod tests {
             sender: None,
             pending_writes: None,
             proxy,
-            exited: false,
+            exit_status: None,
             herdr_key: None,
         }
     }
@@ -2120,32 +2128,55 @@ mod tests {
     #[test]
     fn a_pinned_session_still_reports_bells_and_exit() {
         #[cfg(windows)]
-        let exit_status = {
+        let status = {
             use std::os::windows::process::ExitStatusExt;
             std::process::ExitStatus::from_raw(0)
         };
         #[cfg(not(windows))]
-        let exit_status = {
+        let status = {
             use std::os::unix::process::ExitStatusExt;
             std::process::ExitStatus::from_raw(0)
         };
 
         let mut outcome = DrainOutcome::default();
         let mut title = "diff: src/app.rs".to_string();
-        let mut exited = false;
+        let mut exit_status = None;
 
-        apply_term_event(TermEvent::Bell, &mut title, true, &mut exited, &mut outcome);
+        apply_term_event(TermEvent::Bell, &mut title, true, &mut exit_status, &mut outcome);
         apply_term_event(
-            TermEvent::ChildExit(exit_status),
+            TermEvent::ChildExit(status),
             &mut title,
             true,
-            &mut exited,
+            &mut exit_status,
             &mut outcome,
         );
 
         assert!(outcome.attention);
-        assert!(exited);
+        assert_eq!(exit_status, Some(status));
         assert_eq!(title, "diff: src/app.rs");
+    }
+
+    /// A refused herdr attach exits non-zero; an ordinary shell the user
+    /// closed exits zero.  `reap_exited_sessions` tells them apart by this.
+    #[test]
+    fn exit_was_clean_reflects_the_captured_status() {
+        #[cfg(not(windows))]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+
+        let mut session = pty_less_probe(SessionKind::Shell, "shell");
+        assert!(session.exit_was_clean(), "a session that has not exited counts as clean");
+
+        session.exit_status = Some(std::process::ExitStatus::from_raw(0));
+        assert!(session.exit_was_clean());
+
+        #[cfg(windows)]
+        let failure = std::process::ExitStatus::from_raw(1);
+        #[cfg(not(windows))]
+        let failure = std::process::ExitStatus::from_raw(1 << 8);
+        session.exit_status = Some(failure);
+        assert!(!session.exit_was_clean());
     }
 
     /// Zero grace is the config default and must keep the pre-debounce

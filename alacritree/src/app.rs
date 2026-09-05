@@ -43,8 +43,8 @@ use crate::worktree::{self as wt, CreateRequest, Progress};
 use crate::wsl::{self, ShellChoice};
 use crate::wsl_helper::{self, WslProbe};
 use crate::{
-    clipboard_image, doppler, file_drop, herdr, ipc, jobs, paste, path_style, scratchpad,
-    sidebar_focus, terminal_view, worktree_liveness,
+    clipboard_image, command_ext, doppler, file_drop, herdr, ipc, jobs, paste, path_style,
+    scratchpad, sidebar_focus, terminal_view, worktree_liveness,
 };
 
 /// `None` is the home workspace (sessions inherit `$PWD`); `Some` is a worktree path.
@@ -1373,6 +1373,62 @@ impl AlacritreeApp {
         let id = self.open_session(session, request)?;
         self.active_session.insert(working_directory, id);
         Ok(id)
+    }
+
+    /// Opens a herdr agent in a session running herdr's attach client.  The
+    /// session is an ordinary shell, so nothing in the grid or input path
+    /// treats it specially; only the key marks it as this agent's row.
+    fn attach_herdr_agent(
+        &mut self,
+        ctx: &Context,
+        key: herdr::HerdrKey,
+        pane_id: &str,
+        workspace: WorkspaceKey,
+    ) {
+        let (program, argv) = if herdr::can_attach(&key.side) {
+            let args = herdr::attach_args(pane_id);
+            let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+            key.side.command(&borrowed)
+        } else {
+            // herdr's attach client is a `#[cfg(windows)]` refusal, so the
+            // pane is focused in the user's own herdr window first and this
+            // session attaches to the whole herdr session instead of one
+            // agent. Two argv spawns, no shell — the only shell a `Native`
+            // command could reach on this side is cmd.exe, which does not
+            // understand `sh_quote`'s single-quoting.
+            let (focus_program, focus_args) = key.side.command(&["agent", "focus", pane_id]);
+            let focus = command_ext::hidden(focus_program)
+                .args(focus_args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .output();
+            match focus {
+                Ok(output) if output.status.success() => {},
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    self.error_dialog = Some(format!("herdr refused to focus the pane: {stderr}"));
+                    return;
+                },
+                Err(e) => {
+                    self.error_dialog = Some(format!("failed to focus herdr pane: {e}"));
+                    return;
+                },
+            }
+            let session = herdr::running_session_name(&key.side);
+            key.side.command(&["session", "attach", &session])
+        };
+        // `alacritty_terminal::tty::Shell`'s fields are crate-private, so
+        // this goes through the constructor rather than a struct literal.
+        let shell = Shell::new(program, argv);
+        match self.spawn_session_with_shell(ctx, workspace, Some(shell), None) {
+            Ok(id) => {
+                if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
+                    session.herdr_key = Some(key);
+                }
+            },
+            Err(e) => self.error_dialog = Some(format!("failed to attach herdr agent: {e}")),
+        }
     }
 
     fn toggle_scratchpad_tab(&mut self, ctx: &Context) {
@@ -7814,8 +7870,17 @@ fn session_row(
 
 impl AlacritreeApp {
     fn reap_exited_sessions(&mut self, ctx: &Context) {
-        let exited_ids: Vec<SessionId> =
-            self.sessions.iter().filter(|s| s.is_exited()).map(|s| s.id).collect();
+        let exited_ids: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|s| s.is_exited())
+            // A refused attach — the agent already has a client, or herdr
+            // refuses on this platform — exits within a frame.  Reaping it
+            // would take herdr's message with it and leave only a flash, so
+            // the shell stays until the user closes it.
+            .filter(|s| s.herdr_key.is_none() || s.exit_was_clean())
+            .map(|s| s.id)
+            .collect();
         for id in exited_ids {
             self.close_session(ctx, id);
         }
