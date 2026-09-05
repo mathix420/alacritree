@@ -538,6 +538,15 @@ mod tests {
     }
 
     #[test]
+    fn status_label_names_each_variant() {
+        assert_eq!(Status::Idle.label(), "idle");
+        assert_eq!(Status::Working.label(), "working");
+        assert_eq!(Status::Blocked.label(), "blocked");
+        assert_eq!(Status::Done.label(), "done");
+        assert_eq!(Status::Unknown.label(), "unknown");
+    }
+
+    #[test]
     fn native_windows_cannot_attach_directly() {
         assert_eq!(can_attach(&Side::Native), !cfg!(windows));
     }

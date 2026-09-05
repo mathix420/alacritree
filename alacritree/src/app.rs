@@ -1378,13 +1378,18 @@ impl AlacritreeApp {
     /// Opens a herdr agent in a session running herdr's attach client.  The
     /// session is an ordinary shell, so nothing in the grid or input path
     /// treats it specially; only the key marks it as this agent's row.
+    /// Returns whether the attach succeeded so the caller can switch
+    /// `current_workspace` to `workspace` first and restore it on failure —
+    /// the same replace-and-restore shape `spawn_shell_request` uses, needed
+    /// here for the same reason: a refusal is only readable in the
+    /// workspace it happened in.
     fn attach_herdr_agent(
         &mut self,
         ctx: &Context,
         key: herdr::HerdrKey,
         pane_id: &str,
         workspace: WorkspaceKey,
-    ) {
+    ) -> bool {
         let (program, argv) = if herdr::can_attach(&key.side) {
             let args = herdr::attach_args(pane_id);
             let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -1398,7 +1403,7 @@ impl AlacritreeApp {
             // understand `sh_quote`'s single-quoting.
             if let Err(e) = herdr::focus_agent(&key.side, pane_id) {
                 self.error_dialog = Some(e);
-                return;
+                return false;
             }
             let session = herdr::running_session_name(&key.side);
             key.side.command(&["session", "attach", &session])
@@ -1411,8 +1416,12 @@ impl AlacritreeApp {
                 if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
                     session.herdr_key = Some(key);
                 }
+                true
             },
-            Err(e) => self.error_dialog = Some(format!("failed to attach herdr agent: {e}")),
+            Err(e) => {
+                self.error_dialog = Some(format!("failed to attach herdr agent: {e}"));
+                false
+            },
         }
     }
 
@@ -2857,12 +2866,20 @@ impl AlacritreeApp {
             SidebarRow::HerdrAgent(side, terminal_id) => {
                 let side = side.clone();
                 let terminal_id = terminal_id.clone();
-                let agent = self.find_herdr_agent(&side, &terminal_id).cloned();
+                let pane_id = self.find_herdr_agent(&side, &terminal_id).map(|a| a.pane_id.clone());
                 let workspace = self.herdr_row_workspace(&side, &terminal_id);
-                if let (Some(agent), Some(workspace)) = (agent, workspace) {
+                if let (Some(pane_id), Some(workspace)) = (pane_id, workspace) {
                     let key = herdr::HerdrKey { side, terminal_id };
-                    self.attach_herdr_agent(ctx, key, &agent.pane_id, workspace);
-                    self.focus_terminal();
+                    // Switches first, same as the click path: a refusal is
+                    // only visible if the workspace it happened in is on
+                    // screen.
+                    let previous =
+                        std::mem::replace(&mut self.current_workspace, workspace.clone());
+                    if self.attach_herdr_agent(ctx, key, &pane_id, workspace) {
+                        self.focus_terminal();
+                    } else {
+                        self.current_workspace = previous;
+                    }
                 }
             },
         }
@@ -3831,7 +3848,9 @@ impl AlacritreeApp {
                     SidebarRow::Worktree(path) => {
                         visible_worktrees.insert(path);
                     },
-                    // Session and herdr agent rows follow their workspace row's visibility.
+                    // Session rows follow their workspace row's visibility.
+                    // `filtered_rows` never emits `HerdrAgent`, so this arm
+                    // never actually sees one while filtering.
                     SidebarRow::Session(_) | SidebarRow::HerdrAgent(..) => {},
                 }
             }
@@ -3855,7 +3874,13 @@ impl AlacritreeApp {
                     .collect()
             })
             .collect();
-        let listed_herdr_agents = self.listed_herdr_agents();
+        // `sidebar_nav::filtered_rows` never emits `SidebarRow::HerdrAgent`
+        // (it would need the agent's display name, which the row's `(Side,
+        // String)` payload doesn't carry), so a herdr row painted while
+        // filtering would have no cursor path to reach it. An empty map
+        // keeps the paint in agreement with the nav model instead.
+        let listed_herdr_agents =
+            if filtering { sidebar_nav::ListedAgents::new() } else { self.listed_herdr_agents() };
         let home_herdr_rows = self.workspace_herdr_rows(&None, &listed_herdr_agents);
         let worktree_herdr_rows: Vec<Vec<Vec<HerdrRowData>>> = self
             .projects
@@ -3863,7 +3888,9 @@ impl AlacritreeApp {
             .map(|p| {
                 p.worktrees
                     .iter()
-                    .map(|wt| self.workspace_herdr_rows(&Some(wt.path.clone()), &listed_herdr_agents))
+                    .map(|wt| {
+                        self.workspace_herdr_rows(&Some(wt.path.clone()), &listed_herdr_agents)
+                    })
                     .collect()
             })
             .collect();
@@ -4629,8 +4656,14 @@ impl AlacritreeApp {
             self.request_close_session(ctx, id);
         }
         if let Some((ws, key, pane_id)) = attach_herdr_request.take() {
-            self.attach_herdr_agent(ctx, key, &pane_id, ws);
-            workspace_activated = true;
+            // Switches first, same as `spawn_shell_request` below: a refusal
+            // is only visible if the workspace it happened in is on screen.
+            let previous = std::mem::replace(&mut self.current_workspace, ws.clone());
+            if self.attach_herdr_agent(ctx, key, &pane_id, ws) {
+                workspace_activated = true;
+            } else {
+                self.current_workspace = previous;
+            }
         }
         if let Some(ws) = spawn_shell_request.take() {
             // Spawning activates the workspace and the new session, matching
@@ -8020,8 +8053,7 @@ fn herdr_row(
         })
         .response
         .interact(egui::Sense::click());
-    let resp =
-        if theme.icon_tooltips { resp.on_hover_text(herdr_row_tooltip(row)) } else { resp };
+    let resp = if theme.icon_tooltips { resp.on_hover_text(herdr_row_tooltip(row)) } else { resp };
 
     let bg = if resp.hovered() { theme.row_hover_bg } else { Color32::TRANSPARENT };
     let full_rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
@@ -11089,6 +11121,34 @@ mod tests {
 
         let wsl = HerdrRowData::from_agent(&herdr_agent(None), &herdr::Side::Wsl("d".into()));
         assert!(!wsl.shared_view);
+    }
+
+    #[test]
+    fn herdr_row_name_keeps_a_short_terminal_id_whole() {
+        // `saturating_sub(6)` exists precisely for ids shorter than the tail
+        // it takes; a plain `- 6` would panic on this one.
+        let agent = herdr::Agent {
+            terminal_id: "t1".into(),
+            pane_id: "w1:p1".into(),
+            kind: None,
+            status: herdr::Status::Idle,
+            cwd: None,
+            foreground_cwd: None,
+            state_change_seq: 0,
+        };
+        let row = HerdrRowData::from_agent(&agent, &herdr::Side::Native);
+        assert_eq!(row.name, "t1");
+    }
+
+    #[test]
+    fn herdr_row_label_names_the_status_and_marks_a_shared_view() {
+        let side = herdr::Side::Wsl("d".into());
+        let mut row = HerdrRowData::from_agent(&herdr_agent(Some("claude")), &side);
+        row.status = herdr::Status::Working;
+        assert_eq!(herdr_row_label(&row), "claude — working · herdr");
+
+        row.shared_view = true;
+        assert_eq!(herdr_row_label(&row), "claude — working · herdr · shared view");
     }
 
     #[test]
