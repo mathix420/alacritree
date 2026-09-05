@@ -449,6 +449,25 @@
       },
       "type": "object"
     },
+    "RawHerdr": {
+      "properties": {
+        "enabled": {
+          "description": "Discover herdr servers and list their agents in the sidebar.  Inert\nwhen no herdr binary or server is present.",
+          "type": "boolean"
+        },
+        "poll_interval_ms": {
+          "description": "How often a reachable herdr server is re-polled for agent state.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "show_unmatched": {
+          "description": "List agents whose working directory matches no worktree, under Home.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "RawIconStyle": {
       "anyOf": [
         {
@@ -1110,6 +1129,10 @@
         "gpu_grid": {
           "description": "Draw the terminal grid through an OpenGL paint callback instead of\nhanding epaint a mesh.  Default `false`: it needs a GL 3 context and\nbypasses the renderer every other panel goes through, so an\nunmodified config keeps the path that has always drawn the grid.  A\ncontext too old for instanced arrays logs once and paints the mesh\nfrom the next frame on.",
           "type": "boolean"
+        },
+        "herdr": {
+          "$ref": "#/$defs/RawHerdr",
+          "description": "Whether agents running under a herdr server appear in the sidebar."
         },
         "icon_tooltips": {
           "description": "Whether a sidebar icon explains itself on hover: `true` (default).",

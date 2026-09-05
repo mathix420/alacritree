@@ -546,6 +546,25 @@ impl PasteConfig {
     }
 }
 
+/// `[ui.herdr]`: whether alacritree lists agents running under a herdr server
+/// in the sidebar. On by default; a probe with no herdr binary or server
+/// present costs nothing, so an unmodified config pays no price for it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HerdrConfig {
+    /// Discover herdr servers and list their agents in the sidebar.
+    pub enabled: bool,
+    /// How often a reachable herdr server is re-polled for agent state.
+    pub poll_interval: Duration,
+    /// List agents whose working directory matches no worktree, under Home.
+    pub show_unmatched: bool,
+}
+
+impl Default for HerdrConfig {
+    fn default() -> Self {
+        Self { enabled: true, poll_interval: Duration::from_millis(2000), show_unmatched: true }
+    }
+}
+
 /// Disposable by nature.  Unix keeps captures in the user's cache rather than
 /// a shared fixed-name tmp directory; Windows' `%TEMP%` is already per-user and
 /// remains reachable from WSL through the usual automount.
@@ -1280,6 +1299,9 @@ pub struct UiTheme {
     pub drop: DropConfig,
     /// `[ui.paste]`: what Paste does with a clipboard that holds no text.
     pub paste: PasteConfig,
+    /// `[ui.herdr]`: whether agents running under a herdr server appear in
+    /// the sidebar, and how often their state is re-polled.
+    pub herdr: HerdrConfig,
 }
 
 impl Default for UiTheme {
@@ -1321,6 +1343,7 @@ impl Default for UiTheme {
             path_style: PathStyleConfig::default(),
             drop: DropConfig::default(),
             paste: PasteConfig::default(),
+            herdr: HerdrConfig::default(),
         }
     }
 }
@@ -2380,6 +2403,18 @@ struct RawUiPaste {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
+struct RawHerdr {
+    /// Discover herdr servers and list their agents in the sidebar.  Inert
+    /// when no herdr binary or server is present.
+    enabled: Option<bool>,
+    /// How often a reachable herdr server is re-polled for agent state.
+    poll_interval_ms: Option<u64>,
+    /// List agents whose working directory matches no worktree, under Home.
+    show_unmatched: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default)]
 struct RawUi {
     /// Sidebar background.  Unset derives it from the terminal palette.
     sidebar_background: Option<RgbStr>,
@@ -2513,6 +2548,8 @@ struct RawUi {
     drop: RawUiDrop,
     /// What the clipboard's non-text contents paste as.
     paste: RawUiPaste,
+    /// Whether agents running under a herdr server appear in the sidebar.
+    herdr: RawHerdr,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -2777,6 +2814,13 @@ impl RawConfig {
                     .as_deref()
                     .and_then(|raw| parse_config_path(raw, "ui.paste.image_dir")),
                 image_keep: self.ui.paste.image_keep.unwrap_or(20).max(1),
+            },
+            herdr: HerdrConfig {
+                enabled: self.ui.herdr.enabled.unwrap_or(true),
+                poll_interval: Duration::from_millis(
+                    self.ui.herdr.poll_interval_ms.unwrap_or(2000),
+                ),
+                show_unmatched: self.ui.herdr.show_unmatched.unwrap_or(true),
             },
         };
 
@@ -3230,6 +3274,21 @@ mod tests {
         assert!(!dump.contains('\n'), "a multi-line dump can be interleaved");
     }
 
+    #[test]
+    fn herdr_defaults_to_enabled_with_a_two_second_poll() {
+        let config = Config::default();
+        assert!(config.ui.herdr.enabled);
+        assert_eq!(config.ui.herdr.poll_interval, Duration::from_millis(2000));
+        assert!(config.ui.herdr.show_unmatched);
+    }
+
+    #[test]
+    fn herdr_can_be_turned_off() {
+        let toml = "[ui.herdr]\nenabled = false\npoll_interval_ms = 5000\n";
+        let config = config_from(toml);
+        assert!(!config.ui.herdr.enabled);
+        assert_eq!(config.ui.herdr.poll_interval, Duration::from_millis(5000));
+    }
     fn ui_from_toml(input: &str) -> UiTheme {
         let value: toml::Value = toml::from_str(input).expect("valid toml");
         let raw: RawConfig = value.try_into().expect("valid config");
