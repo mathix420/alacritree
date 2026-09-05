@@ -918,19 +918,12 @@ impl AlacritreeApp {
             config.ui.project_name.clone(),
         );
 
-        // A WSL distro's herdr path comes from its resident helper's hello
-        // line, which a reader thread parses only after the helper this call
-        // spawns has had time to answer — so on a fresh process this always
-        // reads `None`, and no `Side::Wsl` endpoint is ever added.  Known gap:
-        // WSL-side herdr agents do not appear until this is reworked to defer
-        // the check rather than sample it once, synchronously, at startup.
+        // Unfiltered: a distro without herdr on its login PATH just never
+        // answers, and `Reach` abandons an endpoint after its first failed
+        // spawn rather than retrying it every tick, so listing every distro
+        // costs at most one failed spawn per process on a machine with none.
         let herdr_endpoints: Vec<herdr::EndpointCache> = std::iter::once(herdr::Side::Native)
-            .chain(
-                wsl::distros()
-                    .into_iter()
-                    .filter(|d| wsl_helper::capability_herdr(&d.name).is_some())
-                    .map(|d| herdr::Side::Wsl(d.name)),
-            )
+            .chain(wsl::distros().into_iter().map(|d| herdr::Side::Wsl(d.name)))
             .map(herdr::EndpointCache::new)
             .collect();
 
