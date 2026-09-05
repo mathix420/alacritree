@@ -107,6 +107,57 @@ pub fn parse_agent_list(stdout: &str) -> Vec<Agent> {
         .collect()
 }
 
+/// Single-quote a POSIX argument, since WSL invocations are one `sh -lc`
+/// string rather than an argv.
+fn sh_quote(arg: &str) -> String {
+    if !arg.is_empty() && arg.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=".contains(c)) {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', r"'\''"))
+}
+
+impl Side {
+    /// Program and argv that run `herdr <args>` on this side.  WSL goes
+    /// through a login shell because herdr lives in `~/.local/bin`, which is
+    /// not on the PATH `wsl.exe -e` inherits.
+    pub fn command(&self, args: &[&str]) -> (String, Vec<String>) {
+        match self {
+            Self::Native => ("herdr".to_string(), args.iter().map(|a| (*a).to_string()).collect()),
+            Self::Wsl(distro) => {
+                let script = std::iter::once("herdr".to_string())
+                    .chain(args.iter().map(|a| sh_quote(a)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (
+                    "wsl.exe".to_string(),
+                    vec![
+                        "-d".to_string(),
+                        distro.clone(),
+                        "--exec".to_string(),
+                        "sh".to_string(),
+                        "-lc".to_string(),
+                        script,
+                    ],
+                )
+            },
+        }
+    }
+}
+
+/// Direct attach to one agent.  Unsupported on native Windows, where
+/// `run_terminal_attach` is a `#[cfg(windows)]` refusal.
+pub fn attach_args(pane_id: &str) -> Vec<String> {
+    vec!["agent".into(), "attach".into(), pane_id.into()]
+}
+
+/// The native-Windows fallback: focus the pane, then attach to the whole
+/// herdr session.  Two commands, so this returns a shell line rather than an
+/// argv.  herdr's focus is server-global, so this moves the pane the user's
+/// own herdr window is showing.
+pub fn session_attach_script(pane_id: &str, session: &str) -> String {
+    format!("herdr agent focus {} && herdr session attach {}", sh_quote(pane_id), sh_quote(session))
+}
+
 /// The `code` from an error envelope on stderr, for deciding whether a
 /// failure is the ordinary "no server" case or worth a log line.
 pub fn error_code(stderr: &str) -> Option<String> {
@@ -200,5 +251,40 @@ mod tests {
         let stderr = r#"{"error":{"code":"server_not_running","message":"no herdr server"},"id":"cli:agent:list"}"#;
         assert_eq!(error_code(stderr).as_deref(), Some("server_not_running"));
         assert!(parse_agent_list("").is_empty());
+    }
+
+    #[test]
+    fn native_runs_herdr_directly() {
+        let (program, args) = Side::Native.command(&["agent", "list"]);
+        assert_eq!(program, "herdr");
+        assert_eq!(args, vec!["agent", "list"]);
+    }
+
+    /// herdr installs to ~/.local/bin, which reaches PATH only under a login
+    /// shell.  `wsl.exe -e herdr` fails with execvpe ENOENT.
+    #[test]
+    fn wsl_wraps_in_a_login_shell() {
+        let (program, args) = Side::Wsl("kali-linux".into()).command(&["agent", "list"]);
+        assert_eq!(program, "wsl.exe");
+        assert_eq!(args, vec!["-d", "kali-linux", "--exec", "sh", "-lc", "herdr agent list"]);
+    }
+
+    #[test]
+    fn wsl_quotes_arguments_that_need_it() {
+        let (_, args) = Side::Wsl("d".into()).command(&["agent", "attach", "w1:p1"]);
+        assert_eq!(args.last().unwrap(), "herdr agent attach 'w1:p1'");
+    }
+
+    #[test]
+    fn direct_attach_targets_the_pane_id() {
+        assert_eq!(attach_args("w5:p1"), vec!["agent", "attach", "w5:p1"]);
+    }
+
+    #[test]
+    fn the_windows_fallback_focuses_then_attaches_the_session() {
+        assert_eq!(
+            session_attach_script("w5:p1", "default"),
+            "herdr agent focus 'w5:p1' && herdr session attach default"
+        );
     }
 }
