@@ -83,7 +83,8 @@ fn section_of(a: NamedAction) -> PaletteSection {
         SpawnNewInstance | SpawnProfile(_) | CloseSession => Sessions,
         SelectNextTab | SelectPreviousTab | SelectTab(_) | SelectLastTab => Sessions,
         SelectNextSession | SelectPreviousSession => Sessions,
-        ToggleSessionRows | ToggleSessionTabs => Sessions,
+        ToggleSessionRows | ToggleSessionTabs | ToggleSessionDrag => Sessions,
+        MoveSessionUp | MoveSessionDown => Sessions,
         SelectNextWorkspace | SelectPreviousWorkspace => Workspaces,
         AddProject | RefreshProjects | SetBaseBranch => Workspaces,
         ToggleLeftSidebar | ToggleRightSidebar | ToggleSidebarFocus => Sidebar,
@@ -565,6 +566,17 @@ mod tests {
         }
         let refresh = find(&items, "RefreshPrStatus").expect("RefreshPrStatus missing");
         assert_eq!(refresh.section, PaletteSection::Sidebar);
+    }
+
+    #[test]
+    fn session_reorder_actions_file_under_sessions() {
+        for action in [
+            NamedAction::ToggleSessionDrag,
+            NamedAction::MoveSessionUp,
+            NamedAction::MoveSessionDown,
+        ] {
+            assert_eq!(section_of(action), PaletteSection::Sessions, "{action:?}");
+        }
     }
 
     /// The PR filters ship keyless, so the palette is the only place they are

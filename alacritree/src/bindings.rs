@@ -122,6 +122,15 @@ pub enum NamedAction {
     ToggleSessionRows,
     /// Flip the runtime `session_display.tabs_always` value.
     ToggleSessionTabs,
+    /// Flip whether session rows can be dragged with the mouse.
+    ToggleSessionDrag,
+    /// Move a session one position earlier in the sidebar and tab strip,
+    /// continuing into the previous workspace when `[ui.session_reorder]
+    /// scope` allows it.
+    MoveSessionUp,
+    /// Move a session one position later, continuing into the next workspace
+    /// when the scope allows it.
+    MoveSessionDown,
     /// Open the base-branch picker for the sidebar-cursored or current worktree.
     SetBaseBranch,
     /// 1-indexed into the `[[ui.profiles]]` order.
@@ -351,6 +360,9 @@ impl NamedAction {
             Self::PalettePageDown => "Move the palette cursor a screenful down".into(),
             Self::ToggleSessionRows => "Toggle single-session sidebar rows".into(),
             Self::ToggleSessionTabs => "Toggle single-session tab segments".into(),
+            Self::ToggleSessionDrag => "Toggle dragging session rows to reorder".into(),
+            Self::MoveSessionUp => "Move the session one position up".into(),
+            Self::MoveSessionDown => "Move the session one position down".into(),
             Self::SetBaseBranch => "Choose the branch the git panel diffs against".into(),
             Self::FocusLeft => "Move panel focus left (TUIs get the key first)".into(),
             Self::FocusRight => "Move panel focus right (TUIs get the key first)".into(),
@@ -955,7 +967,7 @@ fn parse_mods(s: &str) -> Option<Modifiers> {
 /// Every simple (non-parametrized) `NamedAction`, kept in sync with the enum by
 /// hand. Mirrors the old shortcuts window's bindable list; `SelectTab`/
 /// `SpawnProfile` are excluded here because they carry an index.
-pub fn bindable_actions() -> [NamedAction; 63] {
+pub fn bindable_actions() -> [NamedAction; 66] {
     use NamedAction::*;
     [
         Paste,
@@ -1002,6 +1014,9 @@ pub fn bindable_actions() -> [NamedAction; 63] {
         FocusRight,
         ToggleSessionRows,
         ToggleSessionTabs,
+        ToggleSessionDrag,
+        MoveSessionUp,
+        MoveSessionDown,
         SetBaseBranch,
         SidebarSearchConfirm,
         SidebarSearchCancel,
@@ -1113,6 +1128,9 @@ pub fn parse_action(name: &str) -> BindingAction {
         "FocusTerminal" => BindingAction::Named(FocusTerminal),
         "ToggleSessionRows" => BindingAction::Named(ToggleSessionRows),
         "ToggleSessionTabs" => BindingAction::Named(ToggleSessionTabs),
+        "ToggleSessionDrag" => BindingAction::Named(ToggleSessionDrag),
+        "MoveSessionUp" => BindingAction::Named(MoveSessionUp),
+        "MoveSessionDown" => BindingAction::Named(MoveSessionDown),
         "SetBaseBranch" => BindingAction::Named(SetBaseBranch),
         "SpawnProfile1" => BindingAction::Named(SpawnProfile(1)),
         "SpawnProfile2" => BindingAction::Named(SpawnProfile(2)),
@@ -1422,6 +1440,9 @@ mod tests {
             ("FocusGitSidebar", NamedAction::FocusGitSidebar),
             ("ToggleSessionRows", NamedAction::ToggleSessionRows),
             ("ToggleSessionTabs", NamedAction::ToggleSessionTabs),
+            ("ToggleSessionDrag", NamedAction::ToggleSessionDrag),
+            ("MoveSessionUp", NamedAction::MoveSessionUp),
+            ("MoveSessionDown", NamedAction::MoveSessionDown),
             ("FocusLeft", NamedAction::FocusLeft),
             ("FocusRight", NamedAction::FocusRight),
             ("SetBaseBranch", NamedAction::SetBaseBranch),
@@ -1440,6 +1461,20 @@ mod tests {
         ] {
             let b = parse_bindings(vec![raw_action("F1", None, name)]);
             assert_eq!(named_matches(&b, Key::F1, Modifiers::NONE), vec![expected], "{name}");
+        }
+    }
+
+    #[test]
+    fn session_reorder_actions_parse_from_config_names() {
+        for (name, expected) in [
+            ("ToggleSessionDrag", NamedAction::ToggleSessionDrag),
+            ("MoveSessionUp", NamedAction::MoveSessionUp),
+            ("MoveSessionDown", NamedAction::MoveSessionDown),
+        ] {
+            assert!(
+                matches!(parse_action(name), BindingAction::Named(a) if a == expected),
+                "{name} does not parse"
+            );
         }
     }
 
