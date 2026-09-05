@@ -10,7 +10,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 /// Bumped only when the request/response framing changes incompatibly; a
 /// client seeing any other version treats the helper as unusable and stays
 /// on one-shot spawns.
-pub const PROTOCOL_VERSION: &str = "1";
+pub const PROTOCOL_VERSION: &str = "2";
 
 /// Login-shell-resolved tool paths and the distro-side runtime dir, from
 /// the helper's hello line.  `None` means the tool wasn't on the login
@@ -20,6 +20,7 @@ pub struct Capabilities {
     pub git: Option<String>,
     pub delta: Option<String>,
     pub gh: Option<String>,
+    pub herdr: Option<String>,
     pub runtime_dir: String,
 }
 
@@ -59,9 +60,16 @@ pub fn parse_hello(line: &str) -> Option<Capabilities> {
     let git = decode()?;
     let delta = decode()?;
     let gh = decode()?;
+    let herdr = decode()?;
     let runtime_dir = decode()?;
     let some = |s: String| (!s.is_empty()).then_some(s);
-    Some(Capabilities { git: some(git), delta: some(delta), gh: some(gh), runtime_dir })
+    Some(Capabilities {
+        git: some(git),
+        delta: some(delta),
+        gh: some(gh),
+        herdr: some(herdr),
+        runtime_dir,
+    })
 }
 
 /// One response off the helper's stdout: `<id>\t<exit>\t<len>\n` followed
@@ -156,12 +164,13 @@ set -u
 b64() { printf %s "$1" | base64 | tr -d '\n'; }
 s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)
 [ -x "$s" ] || s=${SHELL:-/bin/sh}
-caps=$("$s" -lc 'command -v git || echo; command -v delta || echo; command -v gh || echo' 2>/dev/null)
+caps=$("$s" -lc 'command -v git || echo; command -v delta || echo; command -v gh || echo; command -v herdr || echo' 2>/dev/null)
 rt=${XDG_RUNTIME_DIR:-/tmp}/alacritree
-printf 'hello\t1\t%s\t%s\t%s\t%s\n' \
+printf 'hello\t2\t%s\t%s\t%s\t%s\t%s\n' \
   "$(b64 "$(printf %s "$caps" | sed -n 1p)")" \
   "$(b64 "$(printf %s "$caps" | sed -n 2p)")" \
   "$(b64 "$(printf %s "$caps" | sed -n 3p)")" \
+  "$(b64 "$(printf %s "$caps" | sed -n 4p)")" \
   "$(b64 "$rt")"
 mkdir -m 700 -p "$rt"
 for f in "$rt"/session-*.pid; do
@@ -773,6 +782,10 @@ pub fn capability_gh(distro: &str) -> Option<String> {
     client(distro)?.capabilities()?.gh.clone()
 }
 
+pub fn capability_herdr(distro: &str) -> Option<String> {
+    client(distro)?.capabilities()?.herdr.clone()
+}
+
 /// Identity of a shimmed WSL session for the foreground probe.
 #[derive(Debug, Clone)]
 pub struct WslProbe {
@@ -863,9 +876,9 @@ fn ensure_poller() {
 mod tests {
     use super::*;
 
-    /// A hello `parse_hello` accepts: protocol 1, all four capability
+    /// A hello `parse_hello` accepts: protocol 2, all five capability
     /// fields empty.
-    const HELLO_LINE: &str = "hello\t1\t\t\t\t\n";
+    const HELLO_LINE: &str = "hello\t2\t\t\t\t\t\n";
 
     /// One end of a pipe pair standing in for the helper's stdio.
     struct FakePipe {
@@ -957,27 +970,54 @@ mod tests {
 
     #[test]
     fn parses_hello_with_missing_tools() {
-        // git and runtime dir present, delta and gh absent (empty fields).
-        let line = "hello\t1\tL3Vzci9iaW4vZ2l0\t\t\tL3J1bi91c2VyLzEwMDAvYWxhY3JpdHJlZQ==\n";
+        // git and runtime dir present, delta, gh and herdr absent (empty fields).
+        let line = "hello\t2\tL3Vzci9iaW4vZ2l0\t\t\t\tL3J1bi91c2VyLzEwMDAvYWxhY3JpdHJlZQ==\n";
         let caps = parse_hello(line).unwrap();
         assert_eq!(caps.git.as_deref(), Some("/usr/bin/git"));
         assert_eq!(caps.delta, None);
         assert_eq!(caps.gh, None);
+        assert_eq!(caps.herdr, None);
         assert_eq!(caps.runtime_dir, "/run/user/1000/alacritree");
     }
 
     #[test]
     fn rejects_unknown_hello_version() {
-        assert!(parse_hello("hello\t2\t\t\t\t\n").is_none());
-        assert!(parse_hello("goodbye\t1\t\t\t\t\n").is_none());
-        assert!(parse_hello("hello\t1\t\t\n").is_none());
+        assert!(parse_hello("hello\t3\t\t\t\t\t\n").is_none());
+        assert!(parse_hello("goodbye\t2\t\t\t\t\t\n").is_none());
+        assert!(parse_hello("hello\t2\t\t\t\n").is_none());
     }
 
     #[test]
     fn hello_with_empty_trailing_field_still_parses() {
-        let caps = parse_hello("hello\t1\t\t\t\t\n").expect("empty fields are valid");
+        let caps = parse_hello("hello\t2\t\t\t\t\t\n").expect("empty fields are valid");
         assert_eq!(caps.git, None);
         assert_eq!(caps.runtime_dir, "");
+    }
+
+    #[test]
+    fn parses_a_herdr_path_from_the_hello() {
+        let git = B64.encode("/usr/bin/git");
+        let herdr = B64.encode("/home/lev/.local/bin/herdr");
+        let rt = B64.encode("/run/user/1000/alacritree");
+        let line = format!("hello\t2\t{git}\t\t\t{herdr}\t{rt}\n");
+        let caps = parse_hello(&line).expect("hello should parse");
+        assert_eq!(caps.herdr.as_deref(), Some("/home/lev/.local/bin/herdr"));
+        assert_eq!(caps.git.as_deref(), Some("/usr/bin/git"));
+        assert_eq!(caps.delta, None);
+    }
+
+    #[test]
+    fn a_distro_without_herdr_reports_none() {
+        let rt = B64.encode("/tmp/alacritree");
+        let line = format!("hello\t2\t\t\t\t\t{rt}\n");
+        assert_eq!(parse_hello(&line).expect("hello should parse").herdr, None);
+    }
+
+    /// The old five-field hello is not silently accepted with a shifted
+    /// runtime_dir; a stale helper is torn down and respawned instead.
+    #[test]
+    fn the_previous_protocol_version_is_rejected() {
+        assert!(parse_hello("hello\t1\t\t\t\t\n").is_none());
     }
 
     #[test]
