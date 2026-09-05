@@ -158,6 +158,27 @@ pub fn can_attach(side: &Side) -> bool {
     }
 }
 
+/// Focuses one pane in the user's own herdr window, the first half of the
+/// native-Windows attach fallback.  A non-zero exit carries herdr's stderr
+/// verbatim rather than `error_code`'s parsed code, since a user-facing
+/// message wants herdr's human-readable text, not its machine code.
+#[allow(clippy::disallowed_methods)] // Running herdr is this function's job.
+pub fn focus_agent(side: &Side, pane_id: &str) -> Result<(), String> {
+    let (program, args) = side.command(&["agent", "focus", pane_id]);
+    let output = command_ext::hidden(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to focus herdr pane: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("herdr refused to focus the pane: {stderr}"));
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct SessionList {
     #[serde(default)]

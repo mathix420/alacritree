@@ -1510,6 +1510,15 @@ impl Session {
         self.exit_status.is_none_or(|status| status.success())
     }
 
+    /// Whether `reap_exited_sessions` should close this session.  A refused
+    /// attach — the agent already has a client, or herdr refuses on this
+    /// platform — exits within a frame; reaping it would take herdr's
+    /// message with it and leave only a flash, so a session holding a herdr
+    /// key stays until the user closes it, unless it exited cleanly.
+    pub fn should_reap(&self) -> bool {
+        self.is_exited() && (self.herdr_key.is_none() || self.exit_was_clean())
+    }
+
     /// The distro a shimmed WSL session runs in.  Dropped paths need it to
     /// decide whether a `C:\` path has to be rewritten before a shell sees it.
     pub fn wsl_distro(&self) -> Option<&str> {
@@ -2177,6 +2186,45 @@ mod tests {
         let failure = std::process::ExitStatus::from_raw(1 << 8);
         session.exit_status = Some(failure);
         assert!(!session.exit_was_clean());
+    }
+
+    /// A refused herdr attach must outlive the flash `reap_exited_sessions`
+    /// would otherwise give it; every other combination reaps normally.
+    #[test]
+    fn should_reap_keeps_only_a_dirty_herdr_exit_on_screen() {
+        #[cfg(not(windows))]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+
+        let clean = std::process::ExitStatus::from_raw(0);
+        #[cfg(windows)]
+        let dirty = std::process::ExitStatus::from_raw(1);
+        #[cfg(not(windows))]
+        let dirty = std::process::ExitStatus::from_raw(1 << 8);
+
+        let key = || herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
+
+        let not_exited = pty_less_probe(SessionKind::Shell, "shell");
+        assert!(!not_exited.should_reap());
+
+        let mut plain_clean = pty_less_probe(SessionKind::Shell, "shell");
+        plain_clean.exit_status = Some(clean);
+        assert!(plain_clean.should_reap());
+
+        let mut plain_dirty = pty_less_probe(SessionKind::Shell, "shell");
+        plain_dirty.exit_status = Some(dirty);
+        assert!(plain_dirty.should_reap(), "an ordinary shell reaps whatever its exit code");
+
+        let mut herdr_clean = pty_less_probe(SessionKind::Shell, "shell");
+        herdr_clean.herdr_key = Some(key());
+        herdr_clean.exit_status = Some(clean);
+        assert!(herdr_clean.should_reap());
+
+        let mut herdr_dirty = pty_less_probe(SessionKind::Shell, "shell");
+        herdr_dirty.herdr_key = Some(key());
+        herdr_dirty.exit_status = Some(dirty);
+        assert!(!herdr_dirty.should_reap(), "a refused attach must stay on screen to be read");
     }
 
     /// Zero grace is the config default and must keep the pre-debounce

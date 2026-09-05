@@ -43,8 +43,8 @@ use crate::worktree::{self as wt, CreateRequest, Progress};
 use crate::wsl::{self, ShellChoice};
 use crate::wsl_helper::{self, WslProbe};
 use crate::{
-    clipboard_image, command_ext, doppler, file_drop, herdr, ipc, jobs, paste, path_style,
-    scratchpad, sidebar_focus, terminal_view, worktree_liveness,
+    clipboard_image, doppler, file_drop, herdr, ipc, jobs, paste, path_style, scratchpad,
+    sidebar_focus, terminal_view, worktree_liveness,
 };
 
 /// `None` is the home workspace (sessions inherit `$PWD`); `Some` is a worktree path.
@@ -1396,24 +1396,9 @@ impl AlacritreeApp {
             // agent. Two argv spawns, no shell — the only shell a `Native`
             // command could reach on this side is cmd.exe, which does not
             // understand `sh_quote`'s single-quoting.
-            let (focus_program, focus_args) = key.side.command(&["agent", "focus", pane_id]);
-            let focus = command_ext::hidden(focus_program)
-                .args(focus_args)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
-                .output();
-            match focus {
-                Ok(output) if output.status.success() => {},
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    self.error_dialog = Some(format!("herdr refused to focus the pane: {stderr}"));
-                    return;
-                },
-                Err(e) => {
-                    self.error_dialog = Some(format!("failed to focus herdr pane: {e}"));
-                    return;
-                },
+            if let Err(e) = herdr::focus_agent(&key.side, pane_id) {
+                self.error_dialog = Some(e);
+                return;
             }
             let session = herdr::running_session_name(&key.side);
             key.side.command(&["session", "attach", &session])
@@ -7870,17 +7855,8 @@ fn session_row(
 
 impl AlacritreeApp {
     fn reap_exited_sessions(&mut self, ctx: &Context) {
-        let exited_ids: Vec<SessionId> = self
-            .sessions
-            .iter()
-            .filter(|s| s.is_exited())
-            // A refused attach — the agent already has a client, or herdr
-            // refuses on this platform — exits within a frame.  Reaping it
-            // would take herdr's message with it and leave only a flash, so
-            // the shell stays until the user closes it.
-            .filter(|s| s.herdr_key.is_none() || s.exit_was_clean())
-            .map(|s| s.id)
-            .collect();
+        let exited_ids: Vec<SessionId> =
+            self.sessions.iter().filter(|s| s.should_reap()).map(|s| s.id).collect();
         for id in exited_ids {
             self.close_session(ctx, id);
         }
