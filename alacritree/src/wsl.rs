@@ -6,10 +6,11 @@
 //! dormant without cfg-gating at call sites.
 
 use crate::{command_ext, jobs};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Per-project shell override, persisted in state.toml as `"windows"`,
 /// `"wsl:<distro>"`, or `"profile:<name>"`.  Absent means auto-by-location.
@@ -334,8 +335,24 @@ pub const SECTION_SEP: &[u8] = b"\n@@ALACRITREE@@\n";
 
 /// The same budget the resident transport gives a request, for the same
 /// reason: a cold WSL VM can take seconds to answer, and nothing healthy
-/// takes longer.
+/// takes longer.  Spent once, as a single deadline, across every wait
+/// `run_batch`'s fallback does — reading stdout, reading stderr, and
+/// reaping the child — rather than reset per wait, or a wedged wsl.exe
+/// could cost up to three times the budget before anything gives up.
 const ONE_SHOT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How often the fallback polls a killed child for its exit, once its
+/// deadline has already passed.  `Child::wait` has no timed variant, so
+/// reaping under a deadline means polling `try_wait` instead.
+const ONE_SHOT_REAP_POLL: Duration = Duration::from_millis(20);
+
+/// Caps how much a drainer thread will buffer.  `child.kill()` only closes
+/// the handles wsl.exe itself owns; if something else inherited the other
+/// end of a pipe (a known wsl.exe failure mode), the drainer reading it
+/// never sees EOF and is abandoned on the timeout path.  The cap is what
+/// bounds that thread's memory rather than anything about a real batch
+/// script, whose output is orders of magnitude smaller.
+const MAX_ONE_SHOT_OUTPUT: u64 = 64 * 1024 * 1024;
 
 /// Run `script` through `sh -c` inside `distro`, with `args` bound to
 /// `$1..`.  Rides the resident helper's pipe when it is up; otherwise one
@@ -366,34 +383,66 @@ pub fn run_batch(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to run wsl.exe: {e}"))?;
+    let deadline = Instant::now() + ONE_SHOT_TIMEOUT;
 
     // `output()` waits for exit with no deadline, so a wsl.exe that never
     // exits pins this thread for the life of the process.  Draining on
     // workers and bounding the wait here mirrors how the ipc client bounds a
     // named-pipe request from its own side.  One thread per pipe, because a
     // child that fills whichever pipe is drained second blocks there while
-    // the reader is still emptying the first.
-    let (tx, rx) = std::sync::mpsc::channel();
-    let mut stdout = child.stdout.take().expect("stdout piped above");
-    let mut stderr = child.stderr.take().expect("stderr piped above");
-    let errors = std::thread::spawn(move || {
-        let mut err = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut stderr, &mut err);
-        err
-    });
+    // the reader is still emptying the first.  Each reader is capped at
+    // `MAX_ONE_SHOT_OUTPUT`: on the timeout path below, `kill` closes only
+    // the handles wsl.exe owns, so a reader stuck on a pipe inherited by
+    // something else is abandoned rather than joined — the cap is what
+    // bounds it, not the kill.
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    let (err_tx, err_rx) = std::sync::mpsc::channel();
+    let stdout = child.stdout.take().expect("stdout piped above");
+    let stderr = child.stderr.take().expect("stderr piped above");
     std::thread::spawn(move || {
         let mut out = Vec::new();
-        let _ = std::io::Read::read_to_end(&mut stdout, &mut out);
-        let _ = tx.send(out);
+        let result = stdout.take(MAX_ONE_SHOT_OUTPUT).read_to_end(&mut out).map(|_| out);
+        let _ = out_tx.send(result);
+    });
+    std::thread::spawn(move || {
+        let mut err = Vec::new();
+        let result = stderr.take(MAX_ONE_SHOT_OUTPUT).read_to_end(&mut err).map(|_| err);
+        let _ = err_tx.send(result);
     });
 
-    let Ok(stdout_bytes) = rx.recv_timeout(ONE_SHOT_TIMEOUT) else {
+    let timed_out =
+        || Err(format!("wsl.exe did not finish within {}s", ONE_SHOT_TIMEOUT.as_secs()));
+    let remaining = || deadline.saturating_duration_since(Instant::now());
+
+    let Ok(stdout_read) = out_rx.recv_timeout(remaining()) else {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(format!("wsl.exe did not finish within {}s", ONE_SHOT_TIMEOUT.as_secs()));
+        return timed_out();
     };
-    let stderr_bytes = errors.join().unwrap_or_default();
-    let status = child.wait().map_err(|e| format!("failed to wait on wsl.exe: {e}"))?;
+    let stdout_bytes = stdout_read.map_err(|e| format!("failed to read wsl.exe stdout: {e}"))?;
+
+    let Ok(stderr_read) = err_rx.recv_timeout(remaining()) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return timed_out();
+    };
+    let stderr_bytes = stderr_read.map_err(|e| format!("failed to read wsl.exe stderr: {e}"))?;
+
+    // `Child::wait` has no timed variant, so reaping under the same deadline
+    // means polling instead of blocking on it directly.
+    let status = loop {
+        if let Some(status) =
+            child.try_wait().map_err(|e| format!("failed to wait on wsl.exe: {e}"))?
+        {
+            break status;
+        }
+        if remaining() == Duration::ZERO {
+            let _ = child.kill();
+            let _ = child.wait();
+            return timed_out();
+        }
+        std::thread::sleep(ONE_SHOT_REAP_POLL.min(remaining()));
+    };
     // Scripts guard individual commands with `2>/dev/null || true`-style
     // fallbacks; a hard failure with no stdout means wsl.exe itself refused
     // (deregistered distro, WSL not installed).
@@ -751,26 +800,53 @@ mod tests {
         assert_eq!(out, b"hello");
     }
 
+    /// Restores the resident helper's global enabled flag on drop, so a test
+    /// that disables it for the duration of one call cannot leave it off for
+    /// the rest of the process if the call under test panics.
+    struct RestoreHelperEnabled;
+
+    impl Drop for RestoreHelperEnabled {
+        fn drop(&mut self) {
+            crate::wsl_helper::set_enabled(true);
+        }
+    }
+
     /// A one-shot that never exits must not pin its caller.  Requires WSL;
     /// run manually:
     /// `cargo nextest run -p alacritree wsl::tests::a_one_shot --run-ignored all`
     #[test]
     #[ignore]
     fn a_one_shot_that_never_exits_gives_up_rather_than_hanging() {
-        use std::time::Instant;
-
         let distro = distros().into_iter().find(|d| d.is_default).expect("a default distro");
         // The resident helper would answer this on its own thread and never
         // reach the fallback, so it has to be off for the duration.
         crate::wsl_helper::set_enabled(false);
+        let _restore = RestoreHelperEnabled;
 
         let started = Instant::now();
         let result =
             jobs::on_this_thread(|blocking| run_batch(&distro.name, "sleep 3600", &[], blocking));
         let waited = started.elapsed();
 
-        crate::wsl_helper::set_enabled(true);
         assert!(result.is_err(), "a child that never exits is not a success");
         assert!(waited < ONE_SHOT_TIMEOUT * 2, "gave up only after {waited:?}");
+    }
+
+    /// Draining stdout to EOF before touching stderr blocks the child on a
+    /// full stderr pipe while the reader waits on stdout, and neither side
+    /// moves — the trap a single sequential drain would fall into.  Pipe
+    /// buffers are typically 64 KiB, so the script below writes well past
+    /// that to stderr before it can print the stdout marker this test
+    /// checks for; a regression to sequential draining deadlocks here
+    /// rather than merely running slow.  Requires WSL; run manually:
+    /// `cargo nextest run -p alacritree wsl::tests::a_batch_that_overflows --run-ignored all`
+    #[test]
+    #[ignore]
+    fn a_batch_that_overflows_stderrs_pipe_still_delivers_stdout() {
+        let distro = distros().into_iter().find(|d| d.is_default).expect("a default distro");
+        let script = "dd if=/dev/zero bs=1024 count=200 status=none 1>&2; printf marker";
+        let out = jobs::on_this_thread(|blocking| run_batch(&distro.name, script, &[], blocking))
+            .expect("both pipes should drain without deadlocking");
+        assert_eq!(out, b"marker");
     }
 }
