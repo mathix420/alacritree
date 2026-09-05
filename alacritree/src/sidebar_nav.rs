@@ -145,6 +145,18 @@ pub fn step_target(
     }
 }
 
+/// The project whose worktree list contains `ws`, or None for home and for a
+/// workspace no listed project owns.  A path two projects both list belongs to
+/// the first in sidebar order; the session records a directory, not a project,
+/// so nothing better is available.
+pub fn project_of<'a>(projects: &'a [Project], ws: &WorkspaceKey) -> Option<&'a Path> {
+    let path = ws.as_deref()?;
+    projects
+        .iter()
+        .find(|p| p.worktrees.iter().any(|w| w.path == path))
+        .map(|p| p.root.as_path())
+}
+
 /// The row `delta` steps away from `cursor`, clamped to the list ends.
 /// A cursor no longer in `rows` (worktree removed, project collapsed) falls
 /// back to Home rather than guessing a neighbor.
@@ -454,6 +466,33 @@ pub(crate) mod tests {
         let range = vec![ws("/a")];
         let lens = vec![2];
         assert_eq!(step_target(&range, &lens, &ws("/b"), 0, 1), None);
+    }
+
+    #[test]
+    fn project_of_finds_the_owner_of_a_worktree() {
+        let projects = vec![project("/p1", true, &["/p1", "/p1-wt/a"])];
+        assert_eq!(
+            project_of(&projects, &Some(PathBuf::from("/p1-wt/a"))),
+            Some(Path::new("/p1"))
+        );
+    }
+
+    #[test]
+    fn home_and_unlisted_paths_belong_to_no_project() {
+        let projects = vec![project("/p1", true, &["/p1"])];
+        assert_eq!(project_of(&projects, &None), None);
+        assert_eq!(project_of(&projects, &Some(PathBuf::from("/elsewhere"))), None);
+    }
+
+    /// git lets two projects list the same path.  The session records a
+    /// directory, not a project, so sidebar order is the only tiebreak
+    /// available and the first listing owns it.
+    #[test]
+    fn a_path_two_projects_list_belongs_to_the_first() {
+        let shared = "/shared/wt";
+        let projects =
+            vec![project("/p1", true, &["/p1", shared]), project("/p2", true, &["/p2", shared])];
+        assert_eq!(project_of(&projects, &Some(PathBuf::from(shared))), Some(Path::new("/p1")));
     }
 
     #[test]

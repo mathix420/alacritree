@@ -7052,7 +7052,8 @@ fn plan_move(
 /// is the main (including non-git roots, whose single pseudo-worktree is
 /// its own main) or belongs to no known project.
 fn project_main_for(projects: &[Project], ws: &Path) -> Option<PathBuf> {
-    let project = projects.iter().find(|p| p.worktrees.iter().any(|w| w.path == ws))?;
+    let root = sidebar_nav::project_of(projects, &Some(ws.to_path_buf()))?;
+    let project = projects.iter().find(|p| p.root == root)?;
     let main = project.worktrees.iter().find(|w| w.is_main)?;
     if main.path == ws { None } else { Some(main.path.clone()) }
 }
