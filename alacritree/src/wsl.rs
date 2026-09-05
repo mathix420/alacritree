@@ -360,22 +360,25 @@ const MAX_ONE_SHOT_OUTPUT: u64 = 64 * 1024 * 1024;
 /// the caller is already reporting failure and has no next step for either.
 fn kill_and_reap(child: &mut Child) {
     let _ = child.kill();
+    // Unbounded, but safe here in a way the removed `output()` wait was not:
+    // that one waited on a child still running normally, with no bound on how
+    // long it could take.  This one waits on a child this process just killed
+    // and owns the only handle to, so it can only be slow if the kernel is
+    // slow to reap a process that no longer has anywhere else to go.
     let _ = child.wait();
 }
 
-/// Reads `pipe` to EOF, capped at [`MAX_ONE_SHOT_OUTPUT`].  A read that
-/// lands exactly on the cap is reported as an error rather than a success:
-/// `Read::take` cannot distinguish a batch that filled the cap from one
-/// that happened to stop there, and a batch script's output silently
-/// truncated at 64 MiB reads to a caller (like `git_status`'s porcelain
-/// parser) as a complete, merely wrong, answer — worse than a loud failure.
-fn drain_capped(pipe: impl Read) -> std::io::Result<Vec<u8>> {
+/// Reads `pipe` to EOF, capped at `cap` bytes.  A read that lands exactly on
+/// the cap is reported as an error rather than a success: `Read::take`
+/// cannot distinguish a batch that filled the cap from one that happened to
+/// stop there, and a batch script's output silently truncated at the cap
+/// reads to a caller (like `git_status`'s porcelain parser) as a complete,
+/// merely wrong, answer — worse than a loud failure.
+fn drain_capped(pipe: impl Read, cap: u64) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    pipe.take(MAX_ONE_SHOT_OUTPUT).read_to_end(&mut buf)?;
-    if buf.len() as u64 >= MAX_ONE_SHOT_OUTPUT {
-        return Err(std::io::Error::other(format!(
-            "wsl.exe output exceeded the {MAX_ONE_SHOT_OUTPUT} byte limit"
-        )));
+    pipe.take(cap).read_to_end(&mut buf)?;
+    if buf.len() as u64 >= cap {
+        return Err(std::io::Error::other(format!("wsl.exe output exceeded the {cap} byte limit")));
     }
     Ok(buf)
 }
@@ -385,6 +388,16 @@ fn drain_capped(pipe: impl Read) -> std::io::Result<Vec<u8>> {
 /// wsl.exe round trip (~400 ms warm on a dev machine, seconds while the VM
 /// cold-boots) — callers batch every query for a repo into a single script
 /// and must never call this on the UI thread.
+///
+/// Deliberately not `Blocking::run_cancellable`, whose own doc says it
+/// leaves its pipes undrained until the child exits — fine for a bounded
+/// probe, wrong for a `git status` on a large repo, which can produce more
+/// output than a pipe buffer holds before this child would ever be asked to
+/// wait.  `_blocking` is unused because of that: the one-shot fallback below
+/// hand-rolls its own drain-and-wait instead, so it never registers in the
+/// cancel slot.  Consequence, not a regression — `.output()` had the same
+/// gap — a workspace switch that drops the `Job` handle leaves this `wsl.exe`
+/// running to its own deadline rather than being killed early.
 #[allow(clippy::disallowed_methods)] // Running wsl.exe is this function's job.
 pub fn run_batch(
     distro: &str,
@@ -422,19 +435,26 @@ pub fn run_batch(
     let stdout = child.stdout.take().expect("stdout piped above");
     let stderr = child.stderr.take().expect("stderr piped above");
     std::thread::spawn(move || {
-        let _ = out_tx.send(drain_capped(stdout));
+        let _ = out_tx.send(drain_capped(stdout, MAX_ONE_SHOT_OUTPUT));
     });
     std::thread::spawn(move || {
-        let _ = err_tx.send(drain_capped(stderr));
+        let _ = err_tx.send(drain_capped(stderr, MAX_ONE_SHOT_OUTPUT));
     });
 
     let timed_out =
         || Err(format!("wsl.exe did not finish within {}s", ONE_SHOT_TIMEOUT.as_secs()));
     let remaining = || deadline.saturating_duration_since(Instant::now());
 
-    let Ok(stdout_read) = out_rx.recv_timeout(remaining()) else {
-        kill_and_reap(&mut child);
-        return timed_out();
+    let stdout_read = match out_rx.recv_timeout(remaining()) {
+        Ok(read) => read,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            kill_and_reap(&mut child);
+            return timed_out();
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            kill_and_reap(&mut child);
+            return Err("wsl.exe stdout drainer thread panicked".to_string());
+        },
     };
     let stdout_bytes = match stdout_read {
         Ok(bytes) => bytes,
@@ -444,9 +464,16 @@ pub fn run_batch(
         },
     };
 
-    let Ok(stderr_read) = err_rx.recv_timeout(remaining()) else {
-        kill_and_reap(&mut child);
-        return timed_out();
+    let stderr_read = match err_rx.recv_timeout(remaining()) {
+        Ok(read) => read,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            kill_and_reap(&mut child);
+            return timed_out();
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            kill_and_reap(&mut child);
+            return Err("wsl.exe stderr drainer thread panicked".to_string());
+        },
     };
     let stderr_bytes = match stderr_read {
         Ok(bytes) => bytes,
@@ -566,7 +593,20 @@ pub fn split_sections(stdout: &[u8]) -> Vec<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn drain_capped_rejects_output_that_fills_the_cap() {
+        let pipe = Cursor::new(vec![0u8; 8]);
+        assert!(drain_capped(pipe, 8).is_err());
+    }
+
+    #[test]
+    fn drain_capped_accepts_output_under_the_cap() {
+        let pipe = Cursor::new(vec![0u8; 8]);
+        assert_eq!(drain_capped(pipe, 9).unwrap(), vec![0u8; 8]);
+    }
 
     #[cfg(windows)]
     #[test]

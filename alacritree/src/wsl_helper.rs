@@ -134,10 +134,10 @@ use std::path::Path;
 /// it.  Shape: capability hello, dead-pidfile GC, a background writer that
 /// owns stdout, then the request dispatcher on stdin, whose `PING` answers
 /// with an unrouted frame so a caller can tell a stalled dispatcher from a
-/// slow one.  Responses all leave
-/// through the writer, whose FIFO completion lines are far under PIPE_BUF,
-/// so concurrent jobs never interleave frames.  Commentary lives here, not
-/// in the script, so every byte shipped into the distro earns its keep.
+/// slow one.  Responses all leave through the writer, whose FIFO completion
+/// lines are far under PIPE_BUF, so concurrent jobs never interleave frames.
+/// Commentary lives here, not in the script, so every byte shipped into the
+/// distro earns its keep.
 ///
 /// Empty request fields arrive as `-` (see `encode_field`); decoded args
 /// lose trailing newlines to command substitution, which no current caller
@@ -163,7 +163,7 @@ printf 'hello\t1\t%s\t%s\t%s\t%s\n' \
   "$(b64 "$(printf %s "$caps" | sed -n 2p)")" \
   "$(b64 "$(printf %s "$caps" | sed -n 3p)")" \
   "$(b64 "$rt")"
-mkdir -p "$rt" 2>/dev/null
+mkdir -m 700 -p "$rt"
 for f in "$rt"/session-*.pid; do
   [ -e "$f" ] || continue
   p=$(cat "$f" 2>/dev/null)
@@ -269,18 +269,21 @@ pub(crate) const SHIM_SCRIPT: &str = r##"d=${XDG_RUNTIME_DIR:-/tmp}/alacritree; 
 /// argv for a session alacritree constructs itself (`ShellChoice::Wsl`,
 /// auto-by-location): the shim with the probe key as `$1`.
 pub fn shim_invocation(distro: &str, workdir: &Path, probe_key: &str) -> (String, Vec<String>) {
-    ("wsl.exe".to_string(), vec![
-        "-d".to_string(),
-        distro.to_string(),
-        "--cd".to_string(),
-        workdir.to_string_lossy().into_owned(),
-        "--exec".to_string(),
-        "sh".to_string(),
-        "-c".to_string(),
-        SHIM_SCRIPT.to_string(),
-        "sh".to_string(),
-        probe_key.to_string(),
-    ])
+    (
+        "wsl.exe".to_string(),
+        vec![
+            "-d".to_string(),
+            distro.to_string(),
+            "--cd".to_string(),
+            workdir.to_string_lossy().into_owned(),
+            "--exec".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            SHIM_SCRIPT.to_string(),
+            "sh".to_string(),
+            probe_key.to_string(),
+        ],
+    )
 }
 
 /// Probe-key shim for a `[[ui.profiles]]` entry that launches wsl.exe.
@@ -988,11 +991,13 @@ mod tests {
         for byte in stream {
             frames.extend(reader.push(&[byte]).unwrap());
         }
-        assert_eq!(frames, vec![Frame { id: 4, exit: 0, payload: b"hello".to_vec() }, Frame {
-            id: 9,
-            exit: 1,
-            payload: Vec::new()
-        },]);
+        assert_eq!(
+            frames,
+            vec![
+                Frame { id: 4, exit: 0, payload: b"hello".to_vec() },
+                Frame { id: 9, exit: 1, payload: Vec::new() },
+            ]
+        );
     }
 
     #[test]
@@ -1013,6 +1018,24 @@ mod tests {
         let remove = body.find("rm -rf \"$d\"").expect("the directory removal");
         assert!(live < remove, "liveness must be checked before the directory is removed");
         assert!(fifo < remove, "the FIFO must be opened before the directory is removed");
+    }
+
+    #[test]
+    fn the_hup_trap_runs_the_exit_trap_on_a_dead_relay() {
+        // Measured under load (30 relay kills per configuration): closing
+        // stdin before killing left 19/30 temp dirs behind, killing first
+        // brought that to 16/30, and this trap is what took it to 0/30 — the
+        // startup sweep is only the backstop for what this line prevents.
+        assert!(HELPER_SCRIPT.contains("trap 'exit' HUP"));
+    }
+
+    #[test]
+    fn the_dispatcher_answers_a_ping_on_the_reserved_id() {
+        // Without this arm a wedged dispatcher and a merely quiet one look
+        // identical from the client's side, and the wait loop would tear
+        // down every long-running job the moment it outlasted the silence
+        // limit.
+        assert!(HELPER_SCRIPT.contains("PING) printf '0 0\\n'"));
     }
 
     #[test]
@@ -1044,18 +1067,21 @@ mod tests {
     fn shim_invocation_builds_expected_argv() {
         let (program, args) = shim_invocation("kali-linux", Path::new(r"C:\proj"), "1234-1");
         assert_eq!(program, "wsl.exe");
-        assert_eq!(args, vec![
-            "-d",
-            "kali-linux",
-            "--cd",
-            r"C:\proj",
-            "--exec",
-            "sh",
-            "-c",
-            SHIM_SCRIPT,
-            "sh",
-            "1234-1",
-        ]);
+        assert_eq!(
+            args,
+            vec![
+                "-d",
+                "kali-linux",
+                "--cd",
+                r"C:\proj",
+                "--exec",
+                "sh",
+                "-c",
+                SHIM_SCRIPT,
+                "sh",
+                "1234-1",
+            ]
+        );
     }
 
     #[test]
@@ -1072,18 +1098,21 @@ mod tests {
         let (args, distro) =
             wrap_profile_argv(r"C:\Windows\System32\wsl.exe", &profile_args, "9-9").unwrap();
         assert_eq!(distro.as_deref(), Some("kali-linux"));
-        assert_eq!(args, vec![
-            "-d",
-            "kali-linux",
-            "--cd",
-            "/home",
-            "--exec",
-            "sh",
-            "-c",
-            SHIM_SCRIPT,
-            "sh",
-            "9-9"
-        ]);
+        assert_eq!(
+            args,
+            vec![
+                "-d",
+                "kali-linux",
+                "--cd",
+                "/home",
+                "--exec",
+                "sh",
+                "-c",
+                SHIM_SCRIPT,
+                "sh",
+                "9-9"
+            ]
+        );
     }
 
     #[test]

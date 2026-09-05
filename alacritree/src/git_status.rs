@@ -788,24 +788,38 @@ mod tests {
         let mut cache = StatusCache::new(PathBuf::from("/nonexistent"));
         assert_eq!(cache.stalled_for(), None, "nothing in flight yet");
 
-        // A job that parks forever instead of returning is a compute that
-        // has neither answered nor died, which is the state that freezes
-        // the panel. Leaking a permanently parked worker only costs this
-        // one test because nextest runs each test in its own process;
-        // running this module under `cargo test`, which shares one process
-        // across every test in the binary, would leave it parked for the
-        // rest of that run.
-        let job =
-            jobs::pool().spawn(jobs::Priority::Background, |_: &jobs::Blocking| -> GitStatus {
-                loop {
-                    std::thread::park();
-                }
-            });
-        cache.pending = Some(Pending { hint: None, job, started: Instant::now(), warned: false });
-        std::thread::sleep(Duration::from_millis(20));
+        // A gated worker rather than one that parks forever: the test drops
+        // the sender before returning, so the worker exits instead of
+        // costing one of the pool's fixed slots for the rest of the process.
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let job = jobs::pool().spawn(
+            jobs::Priority::Background,
+            move |_: &jobs::Blocking| -> GitStatus {
+                let _ = release_rx.recv();
+                GitStatus::default()
+            },
+        );
+
+        // Backdated past STALL_WARNING rather than slept past it, so the
+        // warn-once assertions below need no sleep of their own.
+        let started = Instant::now()
+            .checked_sub(STALL_WARNING + Duration::from_secs(1))
+            .expect("the process has not been up for STALL_WARNING yet");
+        cache.pending = Some(Pending { hint: None, job, started, warned: false });
 
         let stalled = cache.stalled_for().expect("a held compute is in flight");
-        assert!(stalled >= Duration::from_millis(20));
+        assert!(stalled > STALL_WARNING);
+
+        let ctx = egui::Context::default();
+        let pending_warned =
+            |cache: &StatusCache| cache.pending.as_ref().expect("still in flight").warned;
+        assert!(!pending_warned(&cache), "not warned before the first poll");
+        let _ = cache.poll(None, &ctx);
+        assert!(pending_warned(&cache), "a stall past STALL_WARNING must be logged");
+        let _ = cache.poll(None, &ctx);
+        assert!(pending_warned(&cache), "the warning must not repeat on every frame");
+
+        let _ = release_tx.send(());
     }
 
     /// The regression this guards: a failure that leaves the cache looking
