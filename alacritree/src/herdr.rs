@@ -272,7 +272,7 @@ impl EndpointCache {
     }
 
     /// Bumped only when a rendered field changes, so the sidebar's per-frame
-    /// comparison does not rebuild for `revision` churn nobody can see.
+    /// comparison does not rebuild for `state_change_seq` churn nobody can see.
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -321,9 +321,8 @@ impl EndpointCache {
     }
 }
 
-/// Whether anything the sidebar draws changed.  `revision` and
-/// `state_change_seq` deliberately do not count: they move on output the row
-/// does not show.
+/// Whether anything the sidebar draws changed.  `state_change_seq`
+/// deliberately does not count: it moves on output the row does not show.
 fn rendered_differs(was: &[Agent], now: &[Agent]) -> bool {
     was.len() != now.len()
         || was.iter().zip(now).any(|(a, b)| {

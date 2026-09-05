@@ -2482,7 +2482,11 @@ impl AlacritreeApp {
     fn current_project_rows(&mut self) -> Vec<SidebarRow> {
         let listed_sessions = self.listed_session_ids();
         if !self.project_filter.is_filtering() {
-            return sidebar_nav::visible_rows(&self.projects, &listed_sessions);
+            return sidebar_nav::visible_rows(
+                &self.projects,
+                &listed_sessions,
+                &sidebar_nav::ListedAgents::new(),
+            );
         }
 
         let apply = self.project_filter.toggles_apply(self.search_scope);
@@ -2603,6 +2607,7 @@ impl AlacritreeApp {
                 ),
                 active_workspace,
                 active_branch,
+                herdr_generation: 0,
             },
         );
         let rows = self.current_project_rows();
@@ -2653,6 +2658,7 @@ impl AlacritreeApp {
                         ),
                         active_workspace,
                         active_branch,
+                        herdr_generation: 0,
                     },
                 );
                 if unchanged {
@@ -2760,7 +2766,7 @@ impl AlacritreeApp {
                         self.set_sidebar_cursor(target);
                     }
                 },
-                SidebarRow::Home => {},
+                SidebarRow::Home | SidebarRow::HerdrAgent(..) => {},
             },
             Key::Enter => self.activate_sidebar_row(ctx, &cursor),
             Key::Escape => self.focus_terminal(),
@@ -2792,6 +2798,8 @@ impl AlacritreeApp {
                     self.projects.iter().find(|p| p.root == root).is_some_and(|p| p.expanded);
                 self.set_project_expanded(&root, !expanded);
             },
+            // Herdr agent rows have no keyboard activation yet.
+            SidebarRow::HerdrAgent(..) => {},
         }
     }
 
@@ -3179,7 +3187,7 @@ impl AlacritreeApp {
                             });
                         }
                     },
-                    Some(SidebarRow::Home) | None => {},
+                    Some(SidebarRow::Home) | Some(SidebarRow::HerdrAgent(..)) | None => {},
                 }
             },
             BindingAction::Named(NamedAction::RenameSelected) => {
@@ -3756,8 +3764,8 @@ impl AlacritreeApp {
                     SidebarRow::Worktree(path) => {
                         visible_worktrees.insert(path);
                     },
-                    // Session rows follow their workspace row's visibility.
-                    SidebarRow::Session(_) => {},
+                    // Session and herdr agent rows follow their workspace row's visibility.
+                    SidebarRow::Session(_) | SidebarRow::HerdrAgent(..) => {},
                 }
             }
         }
@@ -7227,7 +7235,7 @@ fn row_project_root(
         SidebarRow::Project(root) => return Some(root.clone()),
         SidebarRow::Worktree(path) => path.clone(),
         SidebarRow::Session(id) => session_workspace(*id).flatten()?,
-        SidebarRow::Home => return None,
+        SidebarRow::Home | SidebarRow::HerdrAgent(..) => return None,
     };
     projects
         .iter()
@@ -12750,7 +12758,7 @@ mod tests {
             (None, vec![1]),
             (Some(PathBuf::from("/a/wt1")), vec![2, 3]),
         ]);
-        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let rows = sidebar_nav::visible_rows(&projects, &listed, &sidebar_nav::ListedAgents::new());
         let snapshot = build_sidebar_snapshot(&projects, &live, &rows, None, Default::default());
 
         for row in &rows {
@@ -12791,7 +12799,7 @@ mod tests {
             }
             l
         };
-        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let rows = sidebar_nav::visible_rows(&projects, &listed, &sidebar_nav::ListedAgents::new());
         let snapshot = build_sidebar_snapshot(&projects, &live, &rows, None, Default::default());
 
         let id = snapshot
@@ -12809,7 +12817,7 @@ mod tests {
         let projects: Vec<crate::projects::Project> = vec![];
         let live = vec![(Some(PathBuf::from("/orphan/wt1")), 5)];
         let listed = sidebar_nav::ListedSessions::new();
-        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let rows = sidebar_nav::visible_rows(&projects, &listed, &sidebar_nav::ListedAgents::new());
         let snapshot = build_sidebar_snapshot(&projects, &live, &rows, None, Default::default());
 
         let id = snapshot.find(&SidebarRow::Session(5)).expect("the session is still running");
@@ -12826,7 +12834,7 @@ mod tests {
 
         let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2"])];
         let listed = sidebar_nav::ListedSessions::new();
-        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let rows = sidebar_nav::visible_rows(&projects, &listed, &sidebar_nav::ListedAgents::new());
         let doomed = PathBuf::from("/a/wt2");
         let snapshot = build_sidebar_snapshot(
             &projects,
@@ -12859,7 +12867,7 @@ mod tests {
         let projects =
             vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2", "/a/wt3"])];
         let listed = sidebar_nav::ListedSessions::new();
-        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let rows = sidebar_nav::visible_rows(&projects, &listed, &sidebar_nav::ListedAgents::new());
         let doomed = PathBuf::from("/a/wt2");
         let snapshot = build_sidebar_snapshot(
             &projects,
