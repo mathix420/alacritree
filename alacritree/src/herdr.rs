@@ -45,6 +45,17 @@ impl Status {
             _ => Self::Unknown,
         }
     }
+
+    /// Word the sidebar paints for this status.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Blocked => "blocked",
+            Self::Done => "done",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// One agent as herdr reports it.  `terminal_id` is the identity because

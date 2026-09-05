@@ -2854,8 +2854,17 @@ impl AlacritreeApp {
                     self.projects.iter().find(|p| p.root == root).is_some_and(|p| p.expanded);
                 self.set_project_expanded(&root, !expanded);
             },
-            // Herdr agent rows have no keyboard activation.
-            SidebarRow::HerdrAgent(..) => {},
+            SidebarRow::HerdrAgent(side, terminal_id) => {
+                let side = side.clone();
+                let terminal_id = terminal_id.clone();
+                let agent = self.find_herdr_agent(&side, &terminal_id).cloned();
+                let workspace = self.herdr_row_workspace(&side, &terminal_id);
+                if let (Some(agent), Some(workspace)) = (agent, workspace) {
+                    let key = herdr::HerdrKey { side, terminal_id };
+                    self.attach_herdr_agent(ctx, key, &agent.pane_id, workspace);
+                    self.focus_terminal();
+                }
+            },
         }
     }
 
@@ -3728,6 +3737,8 @@ impl AlacritreeApp {
         let activate_session_request: std::cell::Cell<Option<(WorkspaceKey, SessionId)>> =
             std::cell::Cell::new(None);
         let close_session_request: std::cell::Cell<Option<SessionId>> = std::cell::Cell::new(None);
+        let attach_herdr_request: std::cell::Cell<Option<(WorkspaceKey, herdr::HerdrKey, String)>> =
+            std::cell::Cell::new(None);
         let base_picker_request: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
         // Drag-to-reorder: (dragged root, insert-before display index).
         let reorder_request: std::cell::Cell<Option<(PathBuf, usize)>> = std::cell::Cell::new(None);
@@ -3841,6 +3852,18 @@ impl AlacritreeApp {
                 p.worktrees
                     .iter()
                     .map(|wt| self.workspace_session_rows(&Some(wt.path.clone())))
+                    .collect()
+            })
+            .collect();
+        let listed_herdr_agents = self.listed_herdr_agents();
+        let home_herdr_rows = self.workspace_herdr_rows(&None, &listed_herdr_agents);
+        let worktree_herdr_rows: Vec<Vec<Vec<HerdrRowData>>> = self
+            .projects
+            .iter()
+            .map(|p| {
+                p.worktrees
+                    .iter()
+                    .map(|wt| self.workspace_herdr_rows(&Some(wt.path.clone()), &listed_herdr_agents))
                     .collect()
             })
             .collect();
@@ -4118,6 +4141,25 @@ impl AlacritreeApp {
                                 close_session_request.set(Some(row.id));
                             }
                             session_drop(ui, act.rect, &None, Some((display_idx, row.id)));
+                        }
+                        for row in &home_herdr_rows {
+                            let is_cursor = matches!(
+                                &cursor_row,
+                                Some(SidebarRow::HerdrAgent(side, id))
+                                    if *side == row.side && *id == row.terminal_id
+                            );
+                            let scroll = scrolls(is_cursor);
+                            let act = herdr_row(ui, row, is_cursor, scroll, &theme);
+                            if act.attach {
+                                attach_herdr_request.set(Some((
+                                    None,
+                                    herdr::HerdrKey {
+                                        side: row.side.clone(),
+                                        terminal_id: row.terminal_id.clone(),
+                                    },
+                                    row.pane_id.clone(),
+                                )));
+                            }
                         }
                         group_gap = 2.0;
                     }
@@ -4488,6 +4530,30 @@ impl AlacritreeApp {
                                         Some((display_idx, row.id)),
                                     );
                                 }
+                                let herdr_rows = worktree_herdr_rows
+                                    .get(idx)
+                                    .and_then(|v| v.get(wt_idx))
+                                    .map(Vec::as_slice)
+                                    .unwrap_or(&[]);
+                                for row in herdr_rows {
+                                    let is_cursor = matches!(
+                                        &cursor_row,
+                                        Some(SidebarRow::HerdrAgent(side, id))
+                                            if *side == row.side && *id == row.terminal_id
+                                    );
+                                    let scroll = scrolls(is_cursor);
+                                    let act = herdr_row(ui, row, is_cursor, scroll, &theme);
+                                    if act.attach {
+                                        attach_herdr_request.set(Some((
+                                            Some(wt.path.clone()),
+                                            herdr::HerdrKey {
+                                                side: row.side.clone(),
+                                                terminal_id: row.terminal_id.clone(),
+                                            },
+                                            row.pane_id.clone(),
+                                        )));
+                                    }
+                                }
                             }
                             for (_, branch) in creating.iter().filter(|(pi, _)| *pi == idx) {
                                 creating_row(ui, branch, &icons, &theme);
@@ -4561,6 +4627,10 @@ impl AlacritreeApp {
         }
         if let Some(id) = close_session_request.take() {
             self.request_close_session(ctx, id);
+        }
+        if let Some((ws, key, pane_id)) = attach_herdr_request.take() {
+            self.attach_herdr_agent(ctx, key, &pane_id, ws);
+            workspace_activated = true;
         }
         if let Some(ws) = spawn_shell_request.take() {
             // Spawning activates the workspace and the new session, matching
@@ -6908,6 +6978,39 @@ struct SessionRowData {
     is_displayed: bool,
 }
 
+/// Everything a sidebar herdr-agent row needs, snapshotted before the panel
+/// closure so rendering doesn't borrow `self.herdr_endpoints`.
+struct HerdrRowData {
+    side: herdr::Side,
+    terminal_id: String,
+    pane_id: String,
+    /// The agent's reported kind, or the last six characters of its terminal
+    /// id when herdr hasn't identified it yet.
+    name: String,
+    status: herdr::Status,
+    /// Set when herdr can't attach this agent directly on `side`, so
+    /// attaching instead focuses the pane and shares the whole herdr window.
+    shared_view: bool,
+}
+
+impl HerdrRowData {
+    fn from_agent(agent: &herdr::Agent, side: &herdr::Side) -> Self {
+        let name = agent.kind.clone().unwrap_or_else(|| {
+            let id = &agent.terminal_id;
+            let skip = id.chars().count().saturating_sub(6);
+            id.chars().skip(skip).collect()
+        });
+        Self {
+            side: side.clone(),
+            terminal_id: agent.terminal_id.clone(),
+            pane_id: agent.pane_id.clone(),
+            name,
+            status: agent.status,
+            shared_view: !herdr::can_attach(side),
+        }
+    }
+}
+
 /// Spawn-ordered ids of the sessions in `ws`, or empty below the list
 /// threshold.  The threshold is normally two — a single-session workspace row
 /// keeps its compact form, mirroring the tab strip — and `always` lowers it
@@ -7853,6 +7956,87 @@ fn session_row(
     }
 }
 
+struct HerdrRowAction {
+    attach: bool,
+}
+
+/// The row's label: name first, then status, then the `herdr` marker that
+/// distinguishes it from an ordinary session, then `shared view` when the
+/// agent can only be reached through a shared herdr window.
+fn herdr_row_label(row: &HerdrRowData) -> String {
+    let shared = if row.shared_view { " · shared view" } else { "" };
+    format!("{} — {} · herdr{shared}", row.name, row.status.label())
+}
+
+/// What hovering the row explains — herdr's detach chord has no other
+/// surface in alacritree, so it goes on every herdr row rather than only the
+/// ones with something else to say.
+fn herdr_row_tooltip(row: &HerdrRowData) -> String {
+    format!("{}. Detach with Ctrl+B q.", herdr_row_label(row))
+}
+
+/// A herdr agent nothing is attached to.  Drawn in `theme.text_dim` because
+/// it is listed but not live — the same weight `worktree_gone` gives a row
+/// whose checkout has been removed.  An attached agent has an ordinary
+/// session row instead, so no agent is ever drawn twice.
+///
+/// Not draggable and carries no drop-target rect: a herdr agent has no
+/// position in the session order to reorder into.
+fn herdr_row(
+    ui: &mut egui::Ui,
+    row: &HerdrRowData,
+    is_cursor: bool,
+    scroll_into_view: bool,
+    theme: &Theme,
+) -> HerdrRowAction {
+    // Reserve a slot *before* the label so the hover bg paints beneath it.
+    let bg_idx = ui.painter().add(egui::Shape::Noop);
+    let panel_x = ui.max_rect().x_range();
+
+    let frame = Frame::default().inner_margin(Margin { left: 28, right: 0, top: 3, bottom: 3 });
+    let resp = frame
+        .show(ui, |ui| {
+            row_with_trailing(
+                ui,
+                |ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
+                    ui.painter().text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        DEFAULT_AGENT_ICON.as_str(),
+                        egui::FontId::proportional(10.0 * theme.ui_scale),
+                        theme.text_dim,
+                    );
+                    let _ = truncating_label(
+                        ui,
+                        RichText::new(herdr_row_label(row)).small().color(theme.text_dim),
+                        theme.text_dim,
+                        egui::Sense::hover(),
+                    );
+                },
+                |_ui| {},
+            );
+        })
+        .response
+        .interact(egui::Sense::click());
+    let resp =
+        if theme.icon_tooltips { resp.on_hover_text(herdr_row_tooltip(row)) } else { resp };
+
+    let bg = if resp.hovered() { theme.row_hover_bg } else { Color32::TRANSPARENT };
+    let full_rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
+    if bg != Color32::TRANSPARENT {
+        ui.painter().set(bg_idx, egui::Shape::rect_filled(full_rect, 0.0, bg));
+    }
+    if is_cursor {
+        paint_cursor_outline(ui, full_rect, theme);
+    }
+    if scroll_into_view {
+        ui.scroll_to_rect(full_rect, None);
+    }
+    HerdrRowAction { attach: resp.clicked() }
+}
+
 impl AlacritreeApp {
     fn reap_exited_sessions(&mut self, ctx: &Context) {
         let exited_ids: Vec<SessionId> =
@@ -8033,6 +8217,43 @@ impl AlacritreeApp {
             }
         }
         listed
+    }
+
+    /// The agent behind `(side, terminal_id)`, if its endpoint still has it
+    /// cached.  A stale key (the agent exited between poll and paint, or an
+    /// Enter that outraced this frame's own listing) yields no row rather
+    /// than a panic; the next poll drops it from `listed_herdr_agents` for
+    /// good.
+    fn find_herdr_agent(&self, side: &herdr::Side, terminal_id: &str) -> Option<&herdr::Agent> {
+        self.herdr_endpoints
+            .iter()
+            .find(|cache| cache.side() == side)
+            .and_then(|cache| cache.agents().iter().find(|a| a.terminal_id == terminal_id))
+    }
+
+    /// The workspace a herdr row is currently listed under, for the keyboard
+    /// path: `SidebarRow::HerdrAgent` itself carries no workspace, unlike a
+    /// click, which already knows which panel section it landed in.
+    fn herdr_row_workspace(&self, side: &herdr::Side, terminal_id: &str) -> Option<WorkspaceKey> {
+        self.listed_herdr_agents()
+            .into_iter()
+            .find(|(_, keys)| keys.iter().any(|(s, id)| s == side && id == terminal_id))
+            .map(|(ws, _)| ws)
+    }
+
+    /// Herdr rows for `ws`'s sidebar list, in `listed`'s order.
+    fn workspace_herdr_rows(
+        &self,
+        ws: &WorkspaceKey,
+        listed: &sidebar_nav::ListedAgents,
+    ) -> Vec<HerdrRowData> {
+        let Some(keys) = listed.get(ws) else { return Vec::new() };
+        keys.iter()
+            .filter_map(|(side, terminal_id)| {
+                self.find_herdr_agent(side, terminal_id)
+                    .map(|agent| HerdrRowData::from_agent(agent, side))
+            })
+            .collect()
     }
 
     /// One number standing for every endpoint's rendered state, so the
@@ -10835,6 +11056,39 @@ mod tests {
         assert_eq!(session_row_title("node build", agent), "node build");
         // Never strip down to an empty label.
         assert_eq!(session_row_title("✳ ", agent), "✳ ");
+    }
+
+    fn herdr_agent(kind: Option<&str>) -> herdr::Agent {
+        herdr::Agent {
+            terminal_id: "term_65abfc8e300361".into(),
+            pane_id: "w5:p1".into(),
+            kind: kind.map(String::from),
+            status: herdr::Status::Idle,
+            cwd: None,
+            foreground_cwd: None,
+            state_change_seq: 0,
+        }
+    }
+
+    #[test]
+    fn herdr_row_name_prefers_the_reported_kind() {
+        let row = HerdrRowData::from_agent(&herdr_agent(Some("claude")), &herdr::Side::Native);
+        assert_eq!(row.name, "claude");
+    }
+
+    #[test]
+    fn herdr_row_name_falls_back_to_the_terminal_id_tail() {
+        let row = HerdrRowData::from_agent(&herdr_agent(None), &herdr::Side::Native);
+        assert_eq!(row.name, "300361");
+    }
+
+    #[test]
+    fn herdr_row_shared_view_follows_can_attach() {
+        let native = HerdrRowData::from_agent(&herdr_agent(None), &herdr::Side::Native);
+        assert_eq!(native.shared_view, cfg!(windows));
+
+        let wsl = HerdrRowData::from_agent(&herdr_agent(None), &herdr::Side::Wsl("d".into()));
+        assert!(!wsl.shared_view);
     }
 
     #[test]
