@@ -268,15 +268,19 @@ impl StatusCache {
         // request and the fallback is a single wsl.exe round trip.  Past it
         // the panel is frozen on a stale answer rather than waiting on a
         // slow one, and that difference is invisible from outside.
-        if let Some(pending) = self.pending.as_mut() {
-            if !pending.warned && pending.started.elapsed() > STALL_WARNING {
-                pending.warned = true;
-                log::warn!(
-                    "git status for {} has been computing for {:.0}s; the panel is showing a \
-                     stale result",
-                    self.path.display(),
-                    pending.started.elapsed().as_secs_f64()
-                );
+        if let Some(stalled) = self.stalled_for() {
+            if stalled > STALL_WARNING {
+                if let Some(pending) = self.pending.as_mut() {
+                    if !pending.warned {
+                        pending.warned = true;
+                        log::warn!(
+                            "git status for {} has been computing for {:.0}s; the panel is \
+                             showing a stale result",
+                            self.path.display(),
+                            stalled.as_secs_f64()
+                        );
+                    }
+                }
             }
         }
 
@@ -786,9 +790,13 @@ mod tests {
 
         // A job that parks forever instead of returning is a compute that
         // has neither answered nor died, which is the state that freezes
-        // the panel.
-        let job = jobs::pool()
-            .spawn(jobs::Priority::Background, |_: &jobs::Blocking| -> GitStatus {
+        // the panel. Leaking a permanently parked worker only costs this
+        // one test because nextest runs each test in its own process;
+        // running this module under `cargo test`, which shares one process
+        // across every test in the binary, would leave it parked for the
+        // rest of that run.
+        let job =
+            jobs::pool().spawn(jobs::Priority::Background, |_: &jobs::Blocking| -> GitStatus {
                 loop {
                     std::thread::park();
                 }
