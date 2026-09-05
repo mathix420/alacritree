@@ -2026,37 +2026,31 @@ impl AlacritreeApp {
         }
     }
 
-    /// Every workspace the app is willing to switch to, in sidebar order,
-    /// each paired with its owning project's root.  Duplicates are kept:
-    /// git lets two projects list one path, and dropping the second would
-    /// change what `cycle_workspaces` visits for a user who configured
-    /// nothing.
-    fn workspace_order_with_projects(&self) -> Vec<(Option<PathBuf>, WorkspaceKey)> {
-        let mut order: Vec<(Option<PathBuf>, WorkspaceKey)> = vec![(None, None)];
+    /// Every workspace the app is willing to switch to, in sidebar order.
+    /// Duplicates are kept: git lets two projects list one path, and
+    /// dropping the second would change what `cycle_workspaces` visits for
+    /// a user who configured nothing.
+    fn workspace_order(&self) -> Vec<WorkspaceKey> {
+        let mut order: Vec<WorkspaceKey> = vec![None];
         for project in &self.projects {
             for wt in &project.worktrees {
                 let has_sessions = self.workspace_has_sessions(&Some(wt.path.clone()));
                 if worktree_is_switchable(wt, self.liveness.missing(&wt.path), has_sessions) {
-                    let key = Some(wt.path.clone());
-                    let owner =
-                        sidebar_nav::project_of(&self.projects, &key).map(Path::to_path_buf);
-                    order.push((owner, key));
+                    order.push(Some(wt.path.clone()));
                 }
             }
         }
         order
     }
 
-    fn workspace_order(&self) -> Vec<WorkspaceKey> {
-        self.workspace_order_with_projects().into_iter().map(|(_, ws)| ws).collect()
-    }
-
     /// The flat session ring, tagged with each workspace's owning project.
     /// Callers build it only under a ring policy: it allocates per removal.
     fn session_ring(&self) -> Vec<RingEntry> {
-        self.workspace_order_with_projects()
+        self.workspace_order()
             .into_iter()
-            .flat_map(|(project, workspace)| {
+            .flat_map(|workspace| {
+                let project =
+                    sidebar_nav::project_of(&self.projects, &workspace).map(Path::to_path_buf);
                 self.workspace_session_indices(&workspace)
                     .into_iter()
                     .map(|i| RingEntry {
@@ -8497,12 +8491,16 @@ impl AlacritreeApp {
         let project_root = self.projects[req.project_idx].root.clone();
         let policy = self.config.ui.last_session_close;
         let ring = policy.rings().then(|| self.session_ring()).unwrap_or_default();
-        let removed: Vec<SessionId> = self
-            .sessions
-            .iter()
-            .filter(|s| s.working_directory.as_deref() == Some(&req.worktree_path))
-            .map(|s| s.id)
-            .collect();
+        let removed: Vec<SessionId> = policy
+            .rings()
+            .then(|| {
+                self.sessions
+                    .iter()
+                    .filter(|s| s.working_directory.as_deref() == Some(&req.worktree_path))
+                    .map(|s| s.id)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Drop sessions whose cwd is the worktree before deleting it; the PTY
         // would otherwise block the directory removal on some filesystems.
