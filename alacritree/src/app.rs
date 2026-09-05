@@ -1820,6 +1820,64 @@ impl AlacritreeApp {
         self.reorder_session_within_workspace(id, target.position);
     }
 
+    /// One `MoveSessionUp` / `MoveSessionDown` press.  Every refusal is a
+    /// silent no-op: a clamped end, a boundary the scope forbids, a scratchpad
+    /// asked to leave its workspace.  None of those is a failure — each is a
+    /// move with nowhere to go.
+    fn step_session(&mut self, delta: i32) {
+        let sidebar_focused = self.focus == PaneFocus::ProjectsSidebar;
+        let Some(id) = reorder_subject(
+            sidebar_focused,
+            self.sidebar_cursor.as_ref(),
+            || self.active_session.get(&None).copied(),
+            |path| self.active_session.get(&Some(path.to_path_buf())).copied(),
+            || self.active_session_index().map(|idx| self.sessions[idx].id),
+        ) else {
+            return;
+        };
+        let Some(abs) = self.sessions.iter().position(|s| s.id == id) else { return };
+        let origin = self.sessions[abs].working_directory.clone();
+        let range = sidebar_nav::move_range(
+            &self.projects,
+            &self.reorderable_workspaces(),
+            &origin,
+            self.config.ui.session_reorder.scope,
+        );
+        let lens: Vec<usize> =
+            range.iter().map(|ws| self.workspace_session_indices(ws).len()).collect();
+        let indices = self.workspace_session_indices(&origin);
+        let Some(index) = indices.iter().position(|i| *i == abs) else { return };
+        let Some(target) = sidebar_nav::step_target(&range, &lens, &origin, index, delta) else {
+            return;
+        };
+        let landed_in = target.workspace.clone();
+        self.apply_session_move(id, target);
+        if sidebar_focused {
+            self.follow_moved_session(id, &landed_in);
+        }
+    }
+
+    /// Keep the sidebar pointed at the session a key just moved.
+    ///
+    /// The cursor key is unchanged across a move inside one workspace, so
+    /// neither `set_sidebar_cursor` nor the focus reconciler would notice the
+    /// row moved and scroll after it — this sets the one-shot itself.  A
+    /// landing inside a collapsed project expands it, because a cursor with no
+    /// painted row is the state the reconciler treats as a row that went away.
+    fn follow_moved_session(&mut self, id: SessionId, landed_in: &WorkspaceKey) {
+        self.sidebar_cursor = Some(SidebarRow::Session(id));
+        self.sidebar_cursor_moved = true;
+        let Some(path) = landed_in.as_deref() else { return };
+        let root = self
+            .projects
+            .iter()
+            .find(|p| p.worktrees.iter().any(|w| w.path == path))
+            .map(|p| p.root.clone());
+        if let Some(root) = root {
+            self.set_project_expanded(&root, true);
+        }
+    }
+
     fn scratchpad_session_index(&self, ws: &WorkspaceKey) -> Option<usize> {
         self.sessions.iter().position(|session| {
             session.working_directory == *ws
@@ -2967,6 +3025,8 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::ToggleSessionTabs) => {
                 self.session_tabs_always = !self.session_tabs_always;
             },
+            BindingAction::Named(NamedAction::MoveSessionUp) => self.step_session(-1),
+            BindingAction::Named(NamedAction::MoveSessionDown) => self.step_session(1),
             BindingAction::Named(NamedAction::SelectNextWorkspace) => {
                 self.cycle_workspaces(ctx, 1);
             },
@@ -6119,6 +6179,43 @@ fn walk_swaps(indices: &[usize], j: usize, position: usize) -> Vec<(usize, usize
         j += 1;
     }
     swaps
+}
+
+/// The session a reorder key acts on.
+///
+/// A cursored session wins, then the workspace the cursor is resting on lends
+/// its active session, and otherwise the session on screen moves.  The middle
+/// case is what makes a held key work across a workspace boundary: a session
+/// arriving alone in a workspace paints no row of its own, so the cursor
+/// climbs to that workspace's row, and the next press must still find it.
+///
+/// `CloseSession` has the same first-and-last shape; `DeleteSelected` reads
+/// the cursor whatever has focus, which is the wrong convention here — a key
+/// pressed at the terminal should move the terminal you are looking at.
+fn reorder_subject(
+    sidebar_focused: bool,
+    cursor: Option<&SidebarRow>,
+    home_active: impl Fn() -> Option<SessionId>,
+    worktree_active: impl Fn(&Path) -> Option<SessionId>,
+    on_screen: impl Fn() -> Option<SessionId>,
+) -> Option<SessionId> {
+    if sidebar_focused {
+        match cursor {
+            Some(SidebarRow::Session(id)) => return Some(*id),
+            Some(SidebarRow::Home) => {
+                if let Some(id) = home_active() {
+                    return Some(id);
+                }
+            },
+            Some(SidebarRow::Worktree(path)) => {
+                if let Some(id) = worktree_active(path) {
+                    return Some(id);
+                }
+            },
+            _ => {},
+        }
+    }
+    on_screen()
 }
 
 /// A grip that a project row can be dragged by to reorder it.  Drag-sensing
@@ -10044,6 +10141,44 @@ mod tests {
         // A position past the end clamps to the last slot, which is a no-op
         // for the element already there.
         assert!(walk_swaps(&[0, 1, 2], 2, 9).is_empty());
+    }
+
+    #[test]
+    fn reorder_subject_prefers_the_cursored_session() {
+        assert_eq!(
+            reorder_subject(true, Some(&SidebarRow::Session(7)), || None, |_| None, || Some(3)),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn reorder_subject_takes_a_workspace_rows_active_session() {
+        // The landing after a cross-workspace step: the session paints no row
+        // yet, so the cursor sits on the worktree it arrived in.
+        let row = SidebarRow::Worktree(PathBuf::from("/b"));
+        assert_eq!(
+            reorder_subject(true, Some(&row), || None, |p| (p == Path::new("/b")).then_some(9), || Some(3)),
+            Some(9)
+        );
+        assert_eq!(
+            reorder_subject(true, Some(&SidebarRow::Home), || Some(4), |_| None, || Some(3)),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn reorder_subject_falls_back_to_the_session_on_screen() {
+        // Terminal focused: the cursor is ignored entirely.
+        assert_eq!(
+            reorder_subject(false, Some(&SidebarRow::Session(7)), || None, |_| None, || Some(3)),
+            Some(3)
+        );
+        // Sidebar focused on a project header, which owns no session.
+        let row = SidebarRow::Project(PathBuf::from("/a"));
+        assert_eq!(reorder_subject(true, Some(&row), || None, |_| None, || Some(3)), Some(3));
+        // And an empty workspace row falls through rather than refusing.
+        let row = SidebarRow::Worktree(PathBuf::from("/b"));
+        assert_eq!(reorder_subject(true, Some(&row), || None, |_| None, || Some(3)), Some(3));
     }
 
     #[test]
