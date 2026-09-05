@@ -2798,7 +2798,7 @@ impl AlacritreeApp {
                     self.projects.iter().find(|p| p.root == root).is_some_and(|p| p.expanded);
                 self.set_project_expanded(&root, !expanded);
             },
-            // Herdr agent rows have no keyboard activation yet.
+            // Herdr agent rows have no keyboard activation.
             SidebarRow::HerdrAgent(..) => {},
         }
     }
@@ -7235,7 +7235,10 @@ fn row_project_root(
         SidebarRow::Project(root) => return Some(root.clone()),
         SidebarRow::Worktree(path) => path.clone(),
         SidebarRow::Session(id) => session_workspace(*id).flatten()?,
-        SidebarRow::Home | SidebarRow::HerdrAgent(..) => return None,
+        SidebarRow::Home => return None,
+        // Carries a (Side, terminal id) pair, not a workspace or a SessionId,
+        // so unlike a session row there is nothing here to resolve against.
+        SidebarRow::HerdrAgent(..) => return None,
     };
     projects
         .iter()
