@@ -540,8 +540,6 @@ mod tests {
         assert!(rendered_differs(&was, &now));
     }
 
-    use std::path::PathBuf;
-
     fn at(cwd: &str, foreground: Option<&str>) -> Agent {
         Agent {
             terminal_id: "t1".into(),
@@ -593,5 +591,23 @@ mod tests {
         let spaces = vec![PathBuf::from(r"C:\Users\Lev\repo")];
         let matched = match_workspace(&at(r"c:\users\lev\repo\src", None), &Side::Native, &spaces);
         assert_eq!(matched, Some(PathBuf::from(r"C:\Users\Lev\repo")));
+    }
+
+    #[test]
+    fn wsl_agent_matches_by_the_translated_windows_path() {
+        let distro = "kali-linux";
+        let workspace = wsl::linux_to_windows("/mnt/c/Users/Lev/repo", distro);
+        let spaces = vec![workspace.clone()];
+        let matched =
+            match_workspace(&at("/mnt/c/Users/Lev/repo/src", None), &Side::Wsl(distro.into()), &spaces);
+        assert_eq!(matched, Some(workspace));
+    }
+
+    #[test]
+    fn a_wsl_agent_outside_every_workspace_still_has_none() {
+        let distro = "kali-linux";
+        let spaces = vec![wsl::linux_to_windows("/mnt/c/Users/Lev/repo", distro)];
+        let matched = match_workspace(&at("/mnt/d/elsewhere", None), &Side::Wsl(distro.into()), &spaces);
+        assert_eq!(matched, None);
     }
 }
