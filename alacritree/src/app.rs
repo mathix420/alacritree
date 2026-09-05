@@ -1805,6 +1805,29 @@ impl AlacritreeApp {
             .collect()
     }
 
+    /// The workspace a session sits in, and the workspaces a reorder may carry
+    /// it through.  A scratchpad or diff pane belongs to its workspace, so its
+    /// range is that workspace alone whatever the scope says — the keyboard and
+    /// the mouse both read the rule from here so neither can offer a landing
+    /// the move would refuse.
+    fn reorder_range(&self, id: SessionId) -> Option<(WorkspaceKey, Vec<WorkspaceKey>)> {
+        let idx = self.sessions.iter().position(|s| s.id == id)?;
+        let origin = self.sessions[idx].working_directory.clone();
+        if matches!(
+            &self.sessions[idx].kind,
+            SessionKind::Scratchpad { .. } | SessionKind::Diff { .. }
+        ) {
+            return Some((origin.clone(), vec![origin]));
+        }
+        let range = sidebar_nav::move_range(
+            &self.projects,
+            &self.reorderable_workspaces(),
+            &origin,
+            self.config.ui.session_reorder.scope,
+        );
+        Some((origin, range))
+    }
+
     /// Walk `id` to `position` among its own workspace's sessions.
     fn reorder_session_within_workspace(&mut self, id: SessionId, position: usize) {
         let Some(abs) = self.sessions.iter().position(|s| s.id == id) else { return };
@@ -1817,31 +1840,34 @@ impl AlacritreeApp {
     }
 
     /// Apply a decided move: change the workspace first when the target is a
-    /// different one, then walk the session to its position there.  A refused
-    /// workspace change leaves the session where it was.
-    fn apply_session_move(&mut self, id: SessionId, target: StepTarget) {
-        let Some(abs) = self.sessions.iter().position(|s| s.id == id) else { return };
-        if self.sessions[abs].working_directory != target.workspace
-            && self.move_session_to_key(id, target.workspace).is_err()
-        {
-            return;
-        }
+    /// different one, then walk the session to its position there.  Reports the
+    /// workspace the session actually ended up in, or `None` when the move was
+    /// refused and the session stayed where it was.
+    fn apply_session_move(&mut self, id: SessionId, target: StepTarget) -> Option<WorkspaceKey> {
+        let abs = self.sessions.iter().position(|s| s.id == id)?;
+        let landed_in = if self.sessions[abs].working_directory == target.workspace {
+            target.workspace
+        } else {
+            self.move_session_to_key(id, target.workspace).ok()?
+        };
         self.reorder_session_within_workspace(id, target.position);
+        Some(landed_in)
     }
 
-    /// Apply a mouse drop.  A drop inside the session's own workspace is the
-    /// same remove-then-insert the project rows do, so it goes through
-    /// `move_target`; a drop from elsewhere inserts into a list the session is
-    /// not in yet, where the display slot is already the position.
+    /// Apply a mouse drop, whose slot arithmetic `drop_position` decides.
     fn apply_session_drop(&mut self, id: SessionId, workspace: WorkspaceKey, insert_before: usize) {
         let Some(abs) = self.sessions.iter().position(|s| s.id == id) else { return };
-        if self.sessions[abs].working_directory == workspace {
-            let indices = self.workspace_session_indices(&workspace);
-            let Some(from) = indices.iter().position(|i| *i == abs) else { return };
-            let Some(to) = move_target(indices.len(), from, insert_before) else { return };
-            self.reorder_session_within_workspace(id, to);
+        let same_workspace = self.sessions[abs].working_directory == workspace;
+        let indices = self.workspace_session_indices(&workspace);
+        let from = indices.iter().position(|i| *i == abs).unwrap_or(indices.len());
+        let Some(position) = drop_position(same_workspace, indices.len(), from, insert_before)
+        else {
+            return;
+        };
+        if same_workspace {
+            self.reorder_session_within_workspace(id, position);
         } else {
-            self.apply_session_move(id, StepTarget { workspace, position: insert_before });
+            let _ = self.apply_session_move(id, StepTarget { workspace, position });
         }
     }
 
@@ -1861,13 +1887,7 @@ impl AlacritreeApp {
             return;
         };
         let Some(abs) = self.sessions.iter().position(|s| s.id == id) else { return };
-        let origin = self.sessions[abs].working_directory.clone();
-        let range = sidebar_nav::move_range(
-            &self.projects,
-            &self.reorderable_workspaces(),
-            &origin,
-            self.config.ui.session_reorder.scope,
-        );
+        let Some((origin, range)) = self.reorder_range(id) else { return };
         let lens: Vec<usize> =
             range.iter().map(|ws| self.workspace_session_indices(ws).len()).collect();
         let indices = self.workspace_session_indices(&origin);
@@ -1875,8 +1895,10 @@ impl AlacritreeApp {
         let Some(target) = sidebar_nav::step_target(&range, &lens, &origin, index, delta) else {
             return;
         };
-        let landed_in = target.workspace.clone();
-        self.apply_session_move(id, target);
+        // Follow the landing the move reports, not the one it was asked for:
+        // expanding a project is persisted, so a refusal that still ran this
+        // would leave a trace of a move that never happened.
+        let Some(landed_in) = self.apply_session_move(id, target) else { return };
         if sidebar_focused {
             self.follow_moved_session(id, &landed_in);
         }
@@ -3611,17 +3633,8 @@ impl AlacritreeApp {
         // no indicator and never becomes a drop.
         let drag_range: Option<(SessionId, Vec<WorkspaceKey>)> =
             egui::DragAndDrop::payload::<DraggedSession>(ctx).and_then(|dragged| {
-                let idx = self.sessions.iter().position(|s| s.id == dragged.0)?;
-                let origin = self.sessions[idx].working_directory.clone();
-                Some((
-                    dragged.0,
-                    sidebar_nav::move_range(
-                        &self.projects,
-                        &self.reorderable_workspaces(),
-                        &origin,
-                        self.config.ui.session_reorder.scope,
-                    ),
-                ))
+                let (_, range) = self.reorder_range(dragged.0)?;
+                Some((dragged.0, range))
             });
         let session_drop_request: std::cell::Cell<Option<(SessionId, WorkspaceKey, usize)>> =
             std::cell::Cell::new(None);
@@ -3858,11 +3871,18 @@ impl AlacritreeApp {
                 });
                 ui.separator();
 
+                // `slot` carries a session row's display index and id; `None`
+                // is a workspace row.
                 let session_drop = |ui: &egui::Ui,
                                     row_rect: egui::Rect,
                                     ws: &WorkspaceKey,
-                                    slot: Option<usize>| {
+                                    slot: Option<(usize, SessionId)>| {
                     let Some((dragged, range)) = drag_range.as_ref() else { return };
+                    // The dragged row's own edges are no-ops, so offering them
+                    // as targets would paint a drop that does nothing.
+                    if slot.is_some_and(|(_, id)| id == *dragged) {
+                        return;
+                    }
                     if !range.contains(ws) {
                         return;
                     }
@@ -3872,7 +3892,7 @@ impl AlacritreeApp {
                     }
                     let position = match slot {
                         // A session row: the half the pointer is in decides.
-                        Some(idx) => {
+                        Some((idx, _)) => {
                             if draw_drop_indicator(ui, row_rect, pointer, &theme) {
                                 idx
                             } else {
@@ -3888,7 +3908,7 @@ impl AlacritreeApp {
                             ui.painter().hline(
                                 row_rect.x_range(),
                                 row_rect.bottom(),
-                                Stroke::new(2.0 * theme.ui_scale, theme.accent),
+                                drop_indicator_stroke(&theme),
                             );
                             0
                         },
@@ -3946,7 +3966,7 @@ impl AlacritreeApp {
                             if act.close {
                                 close_session_request.set(Some(row.id));
                             }
-                            session_drop(ui, act.rect, &None, Some(display_idx));
+                            session_drop(ui, act.rect, &None, Some((display_idx, row.id)));
                         }
                         group_gap = 2.0;
                     }
@@ -4314,7 +4334,7 @@ impl AlacritreeApp {
                                         ui,
                                         act.rect,
                                         &Some(wt.path.clone()),
-                                        Some(display_idx),
+                                        Some((display_idx, row.id)),
                                     );
                                 }
                             }
@@ -6260,6 +6280,26 @@ fn move_target(len: usize, from: usize, insert_before: usize) -> Option<usize> {
     (to != from).then_some(to)
 }
 
+/// Position a session dropped before display slot `insert_before` should walk
+/// to.  Inside its own workspace the session is removed before it is inserted,
+/// so `move_target` compensates for the slots that shift down; coming from
+/// another workspace it is inserted into a list it is not in yet, where the
+/// display slot already is the position.
+fn drop_position(
+    same_workspace: bool,
+    len: usize,
+    from: usize,
+    insert_before: usize,
+) -> Option<usize> {
+    if same_workspace { move_target(len, from, insert_before) } else { Some(insert_before) }
+}
+
+/// The weight and colour every reorder drop line is drawn with, shared so the
+/// project and session drags cannot drift apart.
+fn drop_indicator_stroke(theme: &Theme) -> Stroke {
+    Stroke::new(2.0 * theme.ui_scale, theme.accent)
+}
+
 /// Paint the line a reorder drop would land on, at the row edge nearest the
 /// pointer, and report whether that edge is the top — which is what "insert
 /// before this row" means for both the project and the session drag.
@@ -6271,7 +6311,7 @@ fn draw_drop_indicator(
 ) -> bool {
     let before = pointer.y < row_rect.center().y;
     let y = if before { row_rect.top() } else { row_rect.bottom() };
-    ui.painter().hline(row_rect.x_range(), y, Stroke::new(2.0 * theme.ui_scale, theme.accent));
+    ui.painter().hline(row_rect.x_range(), y, drop_indicator_stroke(theme));
     before
 }
 
@@ -7488,6 +7528,9 @@ struct SessionRowAction {
     rect: egui::Rect,
 }
 
+/// `draggable` makes the whole row the drag handle rather than adding a grip:
+/// a session row is a tab, where a project row's own controls are what a click
+/// there is usually for.
 fn session_row(
     ui: &mut egui::Ui,
     row: &SessionRowData,
@@ -10284,13 +10327,26 @@ mod tests {
     #[test]
     fn a_same_workspace_drop_uses_the_move_target_arithmetic() {
         // Dropping below your own row is a no-op, the same as for projects.
-        assert_eq!(move_target(3, 1, 2), None);
+        assert_eq!(drop_position(true, 3, 1, 2), None);
         // Dropping onto the row below moves you past it.
+        assert_eq!(drop_position(true, 3, 1, 3), Some(2));
         assert_eq!(moved(&["a", "b", "c"], 1, 3), vec!["a", "c", "b"]);
     }
 
     #[test]
-    fn a_cross_workspace_drop_lands_at_the_stated_position() {
+    fn a_cross_workspace_drop_takes_the_display_slot_as_the_position() {
+        // The session is not in that workspace's list yet, so nothing shifts
+        // down and every slot passes through — including the two the same
+        // workspace answers differently, which is what tells the branches
+        // apart.
+        assert_eq!(drop_position(false, 3, 1, 2), Some(2));
+        assert_eq!(drop_position(false, 3, 1, 3), Some(3));
+        // A drop onto the front of a workspace whose rows are all below it.
+        assert_eq!(drop_position(false, 0, 0, 0), Some(0));
+    }
+
+    #[test]
+    fn walk_swaps_places_an_arrival_at_the_stated_position() {
         // Arriving from another workspace, the display slot is the position:
         // nothing was removed from this list first, so there is no off-by-one.
         assert_eq!(walk_swaps(&[0, 1, 2], 2, 0), vec![(1, 2), (0, 1)]);

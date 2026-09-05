@@ -483,6 +483,11 @@ bold_italic_family = "Inter Display"  # unset falls back to family
 sidebar_always = false      # keep a sidebar session row even with one session
 tabs_always    = false      # keep a tab-strip segment even with one session
 
+[ui.session_reorder]        # startup default; ToggleSessionDrag flips drag at runtime
+drag  = false               # drag a session row with the mouse to reorder it
+scope = "workspace"         # how far a reorder may carry a session:
+                            # "workspace" | "project" | "anywhere"
+
 [ui.focus_outline]          # off by default, which keeps the current look
 sidebar   = false           # outline the projects sidebar when it has focus
 terminal  = false           # outline the terminal when it has focus
