@@ -1829,6 +1829,22 @@ impl AlacritreeApp {
         self.reorder_session_within_workspace(id, target.position);
     }
 
+    /// Apply a mouse drop.  A drop inside the session's own workspace is the
+    /// same remove-then-insert the project rows do, so it goes through
+    /// `move_target`; a drop from elsewhere inserts into a list the session is
+    /// not in yet, where the display slot is already the position.
+    fn apply_session_drop(&mut self, id: SessionId, workspace: WorkspaceKey, insert_before: usize) {
+        let Some(abs) = self.sessions.iter().position(|s| s.id == id) else { return };
+        if self.sessions[abs].working_directory == workspace {
+            let indices = self.workspace_session_indices(&workspace);
+            let Some(from) = indices.iter().position(|i| *i == abs) else { return };
+            let Some(to) = move_target(indices.len(), from, insert_before) else { return };
+            self.reorder_session_within_workspace(id, to);
+        } else {
+            self.apply_session_move(id, StepTarget { workspace, position: insert_before });
+        }
+    }
+
     /// One `MoveSessionUp` / `MoveSessionDown` press.  Every refusal is a
     /// silent no-op: a clamped end, a boundary the scope forbids, a scratchpad
     /// asked to leave its workspace.  None of those is a failure — each is a
@@ -3590,6 +3606,25 @@ impl AlacritreeApp {
         let scrollbar = self.config.ui.scrollbar;
         let reorder_mode = self.reorder_mode;
         let session_drag = self.session_drag;
+        // The render pass cannot borrow `self.sessions`, so the dragged
+        // session's own scope is resolved here: a row outside this range draws
+        // no indicator and never becomes a drop.
+        let drag_range: Option<(SessionId, Vec<WorkspaceKey>)> =
+            egui::DragAndDrop::payload::<DraggedSession>(ctx).and_then(|dragged| {
+                let idx = self.sessions.iter().position(|s| s.id == dragged.0)?;
+                let origin = self.sessions[idx].working_directory.clone();
+                Some((
+                    dragged.0,
+                    sidebar_nav::move_range(
+                        &self.projects,
+                        &self.reorderable_workspaces(),
+                        &origin,
+                        self.config.ui.session_reorder.scope,
+                    ),
+                ))
+            });
+        let session_drop_request: std::cell::Cell<Option<(SessionId, WorkspaceKey, usize)>> =
+            std::cell::Cell::new(None);
         let cursor_row = if self.focus == PaneFocus::ProjectsSidebar {
             self.sidebar_cursor.clone()
         } else {
@@ -3823,6 +3858,47 @@ impl AlacritreeApp {
                 });
                 ui.separator();
 
+                let session_drop = |ui: &egui::Ui,
+                                    row_rect: egui::Rect,
+                                    ws: &WorkspaceKey,
+                                    slot: Option<usize>| {
+                    let Some((dragged, range)) = drag_range.as_ref() else { return };
+                    if !range.contains(ws) {
+                        return;
+                    }
+                    let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) else { return };
+                    if !row_rect.contains(pointer) {
+                        return;
+                    }
+                    let position = match slot {
+                        // A session row: the half the pointer is in decides.
+                        Some(idx) => {
+                            if draw_drop_indicator(ui, row_rect, pointer, &theme) {
+                                idx
+                            } else {
+                                idx + 1
+                            }
+                        },
+                        // A workspace row: its sessions start under it, so a
+                        // drop here means the front of that workspace.  This is
+                        // the only way to reach a workspace listing no session
+                        // rows — an empty one, or a single-session one below the
+                        // display threshold.
+                        None => {
+                            ui.painter().hline(
+                                row_rect.x_range(),
+                                row_rect.bottom(),
+                                Stroke::new(2.0 * theme.ui_scale, theme.accent),
+                            );
+                            0
+                        },
+                    };
+                    if ui.input(|i| i.pointer.any_released()) {
+                        session_drop_request.set(Some((*dragged, ws.clone(), position)));
+                        egui::DragAndDrop::clear_payload(ui.ctx());
+                    }
+                };
+
                 ScrollArea::vertical().show(ui, |ui| {
                     // Inter-group spacing is emitted above the group that
                     // follows, never after the last one: trailing padding
@@ -3848,7 +3924,8 @@ impl AlacritreeApp {
                         if home_action.spawn {
                             spawn_shell_request.set(Some(None));
                         }
-                        for row in &home_session_rows {
+                        session_drop(ui, home_action.rect, &None, None);
+                        for (display_idx, row) in home_session_rows.iter().enumerate() {
                             let is_cursor = matches!(
                                 &cursor_row,
                                 Some(SidebarRow::Session(id)) if *id == row.id
@@ -3869,6 +3946,7 @@ impl AlacritreeApp {
                             if act.close {
                                 close_session_request.set(Some(row.id));
                             }
+                            session_drop(ui, act.rect, &None, Some(display_idx));
                         }
                         group_gap = 2.0;
                     }
@@ -4040,13 +4118,7 @@ impl AlacritreeApp {
                             if let Some(pointer) = pointer
                                 .filter(|p| row_rect.contains(*p) && dragged.0 != project.root)
                             {
-                                let before = pointer.y < row_rect.center().y;
-                                let y = if before { row_rect.top() } else { row_rect.bottom() };
-                                ui.painter().hline(
-                                    row_rect.x_range(),
-                                    y,
-                                    Stroke::new(2.0 * theme.ui_scale, theme.accent),
-                                );
+                                let before = draw_drop_indicator(ui, row_rect, pointer, &theme);
                                 if ui.input(|i| i.pointer.any_released()) {
                                     let insert_before = if before { idx } else { idx + 1 };
                                     reorder_request.set(Some((dragged.0.clone(), insert_before)));
@@ -4210,12 +4282,13 @@ impl AlacritreeApp {
                                 if let Some(name) = action.spawn_profile {
                                     spawn_profile_request.set(Some((wt.path.clone(), name)));
                                 }
+                                session_drop(ui, action.rect, &Some(wt.path.clone()), None);
                                 let session_rows = worktree_session_rows
                                     .get(idx)
                                     .and_then(|v| v.get(wt_idx))
                                     .map(Vec::as_slice)
                                     .unwrap_or(&[]);
-                                for row in session_rows {
+                                for (display_idx, row) in session_rows.iter().enumerate() {
                                     let is_cursor = matches!(
                                         &cursor_row,
                                         Some(SidebarRow::Session(id)) if *id == row.id
@@ -4237,6 +4310,12 @@ impl AlacritreeApp {
                                     if act.close {
                                         close_session_request.set(Some(row.id));
                                     }
+                                    session_drop(
+                                        ui,
+                                        act.rect,
+                                        &Some(wt.path.clone()),
+                                        Some(display_idx),
+                                    );
                                 }
                             }
                             for (_, branch) in creating.iter().filter(|(pi, _)| *pi == idx) {
@@ -4262,6 +4341,9 @@ impl AlacritreeApp {
         }
         if let Some((root, insert_before)) = reorder_request.take() {
             self.move_project(&root, insert_before);
+        }
+        if let Some((id, workspace, position)) = session_drop_request.take() {
+            self.apply_session_drop(id, workspace, position);
         }
         if let Some((root, expanded)) = expand_toggled {
             state::mutate(|s| {
@@ -6178,6 +6260,21 @@ fn move_target(len: usize, from: usize, insert_before: usize) -> Option<usize> {
     (to != from).then_some(to)
 }
 
+/// Paint the line a reorder drop would land on, at the row edge nearest the
+/// pointer, and report whether that edge is the top — which is what "insert
+/// before this row" means for both the project and the session drag.
+fn draw_drop_indicator(
+    ui: &egui::Ui,
+    row_rect: egui::Rect,
+    pointer: egui::Pos2,
+    theme: &Theme,
+) -> bool {
+    let before = pointer.y < row_rect.center().y;
+    let y = if before { row_rect.top() } else { row_rect.bottom() };
+    ui.painter().hline(row_rect.x_range(), y, Stroke::new(2.0 * theme.ui_scale, theme.accent));
+    before
+}
+
 /// The neighbour swaps that walk the element at `indices[j]` to slot
 /// `position` of `indices`.
 ///
@@ -6493,6 +6590,8 @@ fn is_sidebar_nav_key(key: egui::Key) -> bool {
 struct HomeAction {
     activate: bool,
     spawn: bool,
+    /// Full-width row rect, for a drop target to test the pointer against.
+    rect: egui::Rect,
 }
 
 fn home_row(
@@ -6590,7 +6689,7 @@ fn home_row(
     if scroll_into_view {
         ui.scroll_to_rect(full_rect, None);
     }
-    HomeAction { activate: resp.clicked() && !spawn_clicked, spawn: spawn_clicked }
+    HomeAction { activate: resp.clicked() && !spawn_clicked, spawn: spawn_clicked, rect: full_rect }
 }
 
 struct WorktreeAction {
@@ -6600,6 +6699,8 @@ struct WorktreeAction {
     set_base: bool,
     /// Name of the profile picked from the row's "Open session" menu, if any.
     spawn_profile: Option<String>,
+    /// Full-width row rect, for a drop target to test the pointer against.
+    rect: egui::Rect,
 }
 
 /// Everything a sidebar session row needs, snapshotted before the panel
@@ -7364,6 +7465,7 @@ fn worktree_row(
         spawn: spawn_clicked,
         set_base: set_base_clicked,
         spawn_profile: spawn_profile_clicked,
+        rect: full_rect,
     }
 }
 
@@ -10177,6 +10279,21 @@ mod tests {
         // A position past the end clamps to the last slot, which is a no-op
         // for the element already there.
         assert!(walk_swaps(&[0, 1, 2], 2, 9).is_empty());
+    }
+
+    #[test]
+    fn a_same_workspace_drop_uses_the_move_target_arithmetic() {
+        // Dropping below your own row is a no-op, the same as for projects.
+        assert_eq!(move_target(3, 1, 2), None);
+        // Dropping onto the row below moves you past it.
+        assert_eq!(moved(&["a", "b", "c"], 1, 3), vec!["a", "c", "b"]);
+    }
+
+    #[test]
+    fn a_cross_workspace_drop_lands_at_the_stated_position() {
+        // Arriving from another workspace, the display slot is the position:
+        // nothing was removed from this list first, so there is no off-by-one.
+        assert_eq!(walk_swaps(&[0, 1, 2], 2, 0), vec![(1, 2), (0, 1)]);
     }
 
     #[test]
