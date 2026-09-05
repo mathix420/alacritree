@@ -476,6 +476,11 @@ pub struct AlacritreeApp {
     sidebar_auto_shown: bool,
     /// One-shot: scroll the cursor row into view on the next sidebar paint.
     sidebar_cursor_moved: bool,
+    /// The workspace and session the projects panel last scrolled to, so a
+    /// change is detected by comparison rather than by every writer of those
+    /// two fields remembering to raise a flag.  Written only once a scroll
+    /// actually fires, so a change whose row renders nowhere is retried.
+    last_followed: (WorkspaceKey, Option<SessionId>),
     /// Fuzzy-search query and `s`/`a` toggle state for the projects panel.
     /// Transient: never persisted, never touches the `expanded` flag.
     project_filter: PanelFilter,
@@ -916,6 +921,7 @@ impl AlacritreeApp {
             reorder_mode: false,
             sidebar_auto_shown: false,
             sidebar_cursor_moved: false,
+            last_followed: (None, None),
             project_filter: PanelFilter::new(project_filter_toggles(config.ui.pr_status)),
             git_filter: PanelFilter::new(GIT_FILTER_TOGGLES),
             search_scope: config.ui.search_scope,
@@ -3691,20 +3697,58 @@ impl AlacritreeApp {
         let cursor_moved = std::mem::take(&mut self.sidebar_cursor_moved);
         let scrolls = |is_cursor: bool| is_cursor && cursor_moved;
 
+        let filtering = self.project_filter.is_filtering();
+        let active_now = self.active_session.get(&self.current_workspace).copied();
+        // egui keeps one scroll target per frame and the last writer wins, so the
+        // two reasons to scroll are resolved here rather than by paint order.  An
+        // explicit cursor move outranks following the terminal.
+        let wants_follow = sidebar_nav::wants_follow(
+            self.config.ui.sidebar_follow_active,
+            cursor_moved,
+            &self.last_followed,
+            &self.current_workspace,
+            active_now,
+        );
+        let rows: Vec<SidebarRow> = if filtering || wants_follow {
+            match &self.sidebar_rows_cache {
+                Some(rows) => rows.clone(),
+                None => self.current_project_rows(),
+            }
+        } else {
+            Vec::new()
+        };
+        let follow_row = wants_follow
+            .then(|| {
+                let project_root = sidebar_nav::project_of(&self.projects, &self.current_workspace)
+                    .map(Path::to_path_buf);
+                sidebar_nav::follow_scroll_row(
+                    &rows,
+                    &self.current_workspace,
+                    active_now,
+                    project_root.as_deref(),
+                )
+            })
+            .flatten();
+        if follow_row.is_some() {
+            self.last_followed = (self.current_workspace.clone(), active_now);
+        }
+        // `Project`/`Worktree` rows carry a `PathBuf`; matching by reference
+        // here (mirroring the `cursor_row` matches below) keeps every scroll
+        // check on the paint path allocation-free, follow target or not.
+        let follows_home = follow_row == Some(SidebarRow::Home);
+        let follows_session = |id: SessionId| follow_row == Some(SidebarRow::Session(id));
+        let follows_project = |root: &Path| matches!(&follow_row, Some(SidebarRow::Project(r)) if r.as_path() == root);
+        let follows_worktree = |path: &Path| matches!(&follow_row, Some(SidebarRow::Worktree(p)) if p.as_path() == path);
+
         // Membership for the active filter, resolved once so paint can skip
         // non-surviving rows.  While filtering, matched projects render their
         // matched worktrees regardless of `expanded` (display-only — the flag
         // is never written).
-        let filtering = self.project_filter.is_filtering();
         let mut home_visible = true;
         let mut visible_projects: HashSet<PathBuf> = HashSet::new();
         let mut visible_worktrees: HashSet<PathBuf> = HashSet::new();
         if filtering {
             home_visible = false;
-            let rows = match &self.sidebar_rows_cache {
-                Some(rows) => rows.clone(),
-                None => self.current_project_rows(),
-            };
             for row in rows {
                 match row {
                     SidebarRow::Home => home_visible = true,
@@ -3977,7 +4021,7 @@ impl AlacritreeApp {
                             ui,
                             self.current_workspace.is_none(),
                             home_is_cursor,
-                            scrolls(home_is_cursor),
+                            scrolls(home_is_cursor) || follows_home,
                             home_attention,
                             home_activity,
                             &icons,
@@ -3995,7 +4039,7 @@ impl AlacritreeApp {
                                 &cursor_row,
                                 Some(SidebarRow::Session(id)) if *id == row.id
                             );
-                            let scroll = scrolls(is_cursor);
+                            let scroll = scrolls(is_cursor) || follows_session(row.id);
                             let act = session_row(
                                 ui,
                                 row,
@@ -4161,15 +4205,15 @@ impl AlacritreeApp {
                         );
                         let header_is_cursor =
                             matches!(&cursor_row, Some(SidebarRow::Project(r)) if *r == project.root);
+                        let header_rect = egui::Rect::from_x_y_ranges(
+                            ui.max_rect().x_range(),
+                            row_rect.y_range(),
+                        );
                         if header_is_cursor {
-                            let rect = egui::Rect::from_x_y_ranges(
-                                ui.max_rect().x_range(),
-                                row_rect.y_range(),
-                            );
-                            paint_cursor_outline(ui, rect, &theme);
-                            if scrolls(header_is_cursor) {
-                                ui.scroll_to_rect(rect, None);
-                            }
+                            paint_cursor_outline(ui, header_rect, &theme);
+                        }
+                        if scrolls(header_is_cursor) || follows_project(&project.root) {
+                            ui.scroll_to_rect(header_rect, None);
                         }
 
                         // Drop target for a reorder drag.  Detected against the
@@ -4294,7 +4338,7 @@ impl AlacritreeApp {
                                     &cursor_row,
                                     Some(SidebarRow::Worktree(p)) if *p == wt.path
                                 );
-                                let wt_scroll = scrolls(is_cursor);
+                                let wt_scroll = scrolls(is_cursor) || follows_worktree(&wt.path);
                                 let is_deleting = deleting_paths.contains(&wt.path);
                                 // A `\\wsl.localhost\` stat boots the distro's
                                 // 9P server, so probing one would restart a VM
@@ -4358,7 +4402,7 @@ impl AlacritreeApp {
                                         &cursor_row,
                                         Some(SidebarRow::Session(id)) if *id == row.id
                                     );
-                                    let scroll = scrolls(is_cursor);
+                                    let scroll = scrolls(is_cursor) || follows_session(row.id);
                                     let act = session_row(
                                         ui,
                                         row,

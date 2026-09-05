@@ -1222,6 +1222,10 @@
           ],
           "type": "string"
         },
+        "sidebar_follow_active": {
+          "description": "Whether the projects sidebar scrolls to the session on screen whenever\nit changes — a cycling key, a click, the palette, an IPC request.\nThe sidebar cursor is left where it was: `false` (default).",
+          "type": "boolean"
+        },
         "sidebar_foreground": {
           "anyOf": [
             {

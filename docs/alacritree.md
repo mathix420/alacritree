@@ -379,6 +379,10 @@ sidebar_focus      = "preserve"  # how far the projects sidebar goes when the
                                   # landing that has a live session, and lands a
                                   # closed session on its neighbour instead of on
                                   # the workspace's first session
+sidebar_follow_active = false  # scroll the projects sidebar to the session on
+                                # screen whenever it changes — a cycling key, a
+                                # click, the palette, an IPC request (default
+                                # false); the cursor is left where it was
 vsync              = true   # restart required — wait for the display's refresh
                             # before showing a finished frame (default true).
                             # false presents each frame as soon as it is drawn,

@@ -151,10 +151,45 @@ pub fn step_target(
 /// so nothing better is available.
 pub fn project_of<'a>(projects: &'a [Project], ws: &WorkspaceKey) -> Option<&'a Path> {
     let path = ws.as_deref()?;
-    projects
-        .iter()
-        .find(|p| p.worktrees.iter().any(|w| w.path == path))
-        .map(|p| p.root.as_path())
+    projects.iter().find(|p| p.worktrees.iter().any(|w| w.path == path)).map(|p| p.root.as_path())
+}
+
+/// The row the panel scrolls to when the session on screen changes: the
+/// displayed session's own row, else the nearest ancestor `rows` renders.
+/// None when none of them do — a session whose project was removed has no
+/// row at all — which tells the caller to leave its comparison unwritten and
+/// try again once the tree renders it.
+pub fn follow_scroll_row(
+    rows: &[SidebarRow],
+    workspace: &WorkspaceKey,
+    displayed: Option<SessionId>,
+    project_root: Option<&Path>,
+) -> Option<SidebarRow> {
+    let candidates = [
+        displayed.map(SidebarRow::Session),
+        Some(match workspace {
+            None => SidebarRow::Home,
+            Some(path) => SidebarRow::Worktree(path.clone()),
+        }),
+        project_root.map(|r| SidebarRow::Project(r.to_path_buf())),
+    ];
+    candidates.into_iter().flatten().find(|row| rows.contains(row))
+}
+
+/// Whether the panel should retarget its scroll to the session on screen
+/// this frame, rather than leave it wherever an explicit cursor move already
+/// pointed it.  `false` whenever the feature is off, an explicit cursor move
+/// happened this frame, or the last followed pair already matches — so a
+/// change whose row renders nowhere keeps retrying every frame instead of
+/// resolving once and going quiet.
+pub fn wants_follow(
+    follow_active: bool,
+    cursor_moved: bool,
+    last_followed: &(WorkspaceKey, Option<SessionId>),
+    workspace: &WorkspaceKey,
+    active: Option<SessionId>,
+) -> bool {
+    follow_active && !cursor_moved && (last_followed.0 != *workspace || last_followed.1 != active)
 }
 
 /// The row `delta` steps away from `cursor`, clamped to the list ends.
@@ -471,10 +506,7 @@ pub(crate) mod tests {
     #[test]
     fn project_of_finds_the_owner_of_a_worktree() {
         let projects = vec![project("/p1", true, &["/p1", "/p1-wt/a"])];
-        assert_eq!(
-            project_of(&projects, &Some(PathBuf::from("/p1-wt/a"))),
-            Some(Path::new("/p1"))
-        );
+        assert_eq!(project_of(&projects, &Some(PathBuf::from("/p1-wt/a"))), Some(Path::new("/p1")));
     }
 
     #[test]
@@ -829,5 +861,102 @@ pub(crate) mod tests {
         let gone = SidebarRow::Worktree(PathBuf::from("/gone"));
         assert_eq!(next_project(&rows, &gone), None);
         assert_eq!(previous_project(&rows, &gone), None);
+    }
+
+    #[test]
+    fn the_displayed_session_row_is_the_target() {
+        let rows = vec![
+            SidebarRow::Home,
+            SidebarRow::Project(PathBuf::from("/p1")),
+            SidebarRow::Worktree(PathBuf::from("/p1/w1")),
+            SidebarRow::Session(7),
+        ];
+        assert_eq!(
+            follow_scroll_row(
+                &rows,
+                &Some(PathBuf::from("/p1/w1")),
+                Some(7),
+                Some(Path::new("/p1"))
+            ),
+            Some(SidebarRow::Session(7))
+        );
+    }
+
+    /// A workspace under the listing threshold, or one whose session a search
+    /// filtered out, paints no session row.
+    #[test]
+    fn an_unpainted_session_falls_back_to_its_workspace_row() {
+        let rows = vec![
+            SidebarRow::Home,
+            SidebarRow::Project(PathBuf::from("/p1")),
+            SidebarRow::Worktree(PathBuf::from("/p1/w1")),
+        ];
+        assert_eq!(
+            follow_scroll_row(
+                &rows,
+                &Some(PathBuf::from("/p1/w1")),
+                Some(7),
+                Some(Path::new("/p1"))
+            ),
+            Some(SidebarRow::Worktree(PathBuf::from("/p1/w1")))
+        );
+    }
+
+    #[test]
+    fn a_collapsed_project_falls_back_to_its_header() {
+        let rows = vec![SidebarRow::Home, SidebarRow::Project(PathBuf::from("/p1"))];
+        assert_eq!(
+            follow_scroll_row(
+                &rows,
+                &Some(PathBuf::from("/p1/w1")),
+                Some(7),
+                Some(Path::new("/p1"))
+            ),
+            Some(SidebarRow::Project(PathBuf::from("/p1")))
+        );
+    }
+
+    #[test]
+    fn home_resolves_to_its_own_row() {
+        let rows = vec![SidebarRow::Home];
+        assert_eq!(follow_scroll_row(&rows, &None, None, None), Some(SidebarRow::Home));
+    }
+
+    /// A session whose project was removed renders on no row at all, so
+    /// there is nothing to scroll to and the caller must retry later.
+    #[test]
+    fn a_detached_session_has_no_target() {
+        let rows = vec![SidebarRow::Home];
+        assert_eq!(follow_scroll_row(&rows, &Some(PathBuf::from("/gone")), Some(7), None), None);
+    }
+
+    /// With the feature off, nothing else about the frame can make it want to
+    /// follow — the caller skips resolving a target at all.
+    #[test]
+    fn follow_off_never_wants_to_follow() {
+        assert!(!wants_follow(
+            false,
+            false,
+            &(None, None),
+            &Some(PathBuf::from("/p1/w1")),
+            Some(7)
+        ));
+    }
+
+    #[test]
+    fn an_explicit_cursor_move_outranks_following() {
+        assert!(!wants_follow(true, true, &(None, None), &Some(PathBuf::from("/p1/w1")), Some(7)));
+    }
+
+    #[test]
+    fn an_already_followed_pair_does_not_want_to_follow_again() {
+        let ws = Some(PathBuf::from("/p1/w1"));
+        assert!(!wants_follow(true, false, &(ws.clone(), Some(7)), &ws, Some(7)));
+    }
+
+    #[test]
+    fn a_changed_session_wants_to_follow() {
+        let ws = Some(PathBuf::from("/p1/w1"));
+        assert!(wants_follow(true, false, &(ws.clone(), Some(3)), &ws, Some(7)));
     }
 }

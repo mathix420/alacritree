@@ -1038,6 +1038,9 @@ pub struct UiTheme {
     pub last_session_close: LastSessionClose,
     /// How the projects sidebar repairs a cursor whose row stopped rendering.
     pub sidebar_focus: SidebarFocus,
+    /// Whether the projects sidebar scrolls to the session on screen when it
+    /// changes.
+    pub sidebar_follow_active: bool,
     /// Whether a fuzzy query is confined by the panel's active toggle filters.
     pub search_scope: SearchScope,
     /// When a sidebar row spells its full name out on hover.
@@ -1151,6 +1154,7 @@ impl Default for UiTheme {
             confirm_session_close: ConfirmSessionClose::Never,
             last_session_close: LastSessionClose::Respawn,
             sidebar_focus: SidebarFocus::default(),
+            sidebar_follow_active: false,
             search_scope: SearchScope::default(),
             sidebar_tooltips: SidebarTooltips::default(),
             icon_tooltips: true,
@@ -2194,6 +2198,10 @@ struct RawUi {
     /// rendered: "preserve" (default) | "follow".
     #[schemars(extend("enum" = ["preserve", "follow"]))]
     sidebar_focus: Option<String>,
+    /// Whether the projects sidebar scrolls to the session on screen whenever
+    /// it changes — a cycling key, a click, the palette, an IPC request.
+    /// The sidebar cursor is left where it was: `false` (default).
+    sidebar_follow_active: Option<bool>,
     /// Whether a fuzzy query is confined by the panel's active toggle filters:
     /// "filtered" (default) | "all".
     #[schemars(extend("enum" = ["filtered", "all"]))]
@@ -2470,6 +2478,7 @@ impl RawConfig {
             ),
             last_session_close: parse_last_session_close(self.ui.last_session_close.as_deref()),
             sidebar_focus: parse_sidebar_focus(self.ui.sidebar_focus.as_deref()),
+            sidebar_follow_active: self.ui.sidebar_follow_active.unwrap_or(false),
             search_scope: parse_search_scope(self.ui.search_scope.as_deref()),
             sidebar_tooltips: parse_sidebar_tooltips(self.ui.sidebar_tooltips.as_deref()),
             icon_tooltips: self.ui.icon_tooltips.unwrap_or(true),
@@ -3091,6 +3100,16 @@ mod tests {
     fn only_follow_moves_the_terminal() {
         assert!(!SidebarFocus::Preserve.follows());
         assert!(SidebarFocus::Follow.follows());
+    }
+
+    #[test]
+    fn sidebar_follow_active_defaults_to_off() {
+        assert!(!ui_from_toml("").sidebar_follow_active);
+    }
+
+    #[test]
+    fn sidebar_follow_active_parses() {
+        assert!(ui_from_toml("[ui]\nsidebar_follow_active = true").sidebar_follow_active);
     }
 
     /// The hints are what an unmodified config already shows, so the key has
