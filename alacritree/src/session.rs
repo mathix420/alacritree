@@ -19,6 +19,7 @@ use alacritty_terminal::vte::ansi::Rgb;
 use crate::clipboard::Target;
 use crate::colors;
 use crate::config::{Config, Palette};
+use crate::herdr;
 use crate::scratchpad;
 use crate::wsl_helper::{self, WslProbe};
 
@@ -203,6 +204,10 @@ pub struct Session {
     /// thread posts events through.
     proxy: EventProxy,
     exited: bool,
+    /// Set when this session is a shell attached to a herdr agent, so the
+    /// sidebar draws one row for that agent rather than two.  Dies with the
+    /// session, which is why it lives here and not in a map.
+    pub herdr_key: Option<herdr::HerdrKey>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1182,6 +1187,7 @@ impl Session {
             pending_writes: None,
             proxy,
             exited: false,
+            herdr_key: None,
         })
     }
 
@@ -1350,6 +1356,7 @@ impl Session {
             pending_writes: Some(Vec::new()),
             proxy: proxy.clone(),
             exited: false,
+            herdr_key: None,
         };
 
         let request = OpenRequest {
@@ -2070,6 +2077,7 @@ mod tests {
             pending_writes: None,
             proxy,
             exited: false,
+            herdr_key: None,
         }
     }
 

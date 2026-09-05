@@ -43,8 +43,8 @@ use crate::worktree::{self as wt, CreateRequest, Progress};
 use crate::wsl::{self, ShellChoice};
 use crate::wsl_helper::{self, WslProbe};
 use crate::{
-    clipboard_image, doppler, file_drop, ipc, jobs, paste, path_style, scratchpad, sidebar_focus,
-    terminal_view, worktree_liveness,
+    clipboard_image, doppler, file_drop, herdr, ipc, jobs, paste, path_style, scratchpad,
+    sidebar_focus, terminal_view, worktree_liveness,
 };
 
 /// `None` is the home workspace (sessions inherit `$PWD`); `Some` is a worktree path.
@@ -624,6 +624,11 @@ pub struct AlacritreeApp {
     sidebar_focus_written: Option<SidebarFocusWrite>,
     /// A close verdict the reconciler still owes the terminal.
     sidebar_deferred_close: Option<DeferredClose>,
+    /// One entry per herdr server this app talks to: native plus one per WSL
+    /// distro whose helper reports a herdr install.  Fixed at startup — a
+    /// distro registered afterward is picked up only on restart, matching
+    /// `wsl::distros`.
+    herdr_endpoints: Vec<herdr::EndpointCache>,
 }
 
 struct DeleteRequest {
@@ -913,6 +918,22 @@ impl AlacritreeApp {
             config.ui.project_name.clone(),
         );
 
+        // A WSL distro's herdr path comes from its resident helper's hello
+        // line, which a reader thread parses only after the helper this call
+        // spawns has had time to answer — so on a fresh process this always
+        // reads `None`, and no `Side::Wsl` endpoint is ever added.  Known gap:
+        // WSL-side herdr agents do not appear until this is reworked to defer
+        // the check rather than sample it once, synchronously, at startup.
+        let herdr_endpoints: Vec<herdr::EndpointCache> = std::iter::once(herdr::Side::Native)
+            .chain(
+                wsl::distros()
+                    .into_iter()
+                    .filter(|d| wsl_helper::capability_herdr(&d.name).is_some())
+                    .map(|d| herdr::Side::Wsl(d.name)),
+            )
+            .map(herdr::EndpointCache::new)
+            .collect();
+
         let pr_status_concurrency = config.ui.pr_status_concurrency;
         let mut app = Self {
             show_left_sidebar: persisted.show_left_sidebar,
@@ -991,6 +1012,7 @@ impl AlacritreeApp {
             sidebar_anchor: None,
             sidebar_focus_written: None,
             sidebar_deferred_close: None,
+            herdr_endpoints,
         };
 
         app.pr_cache.set_concurrency(pr_status_concurrency);
@@ -2485,7 +2507,7 @@ impl AlacritreeApp {
             return sidebar_nav::visible_rows(
                 &self.projects,
                 &listed_sessions,
-                &sidebar_nav::ListedAgents::new(),
+                &self.listed_herdr_agents(),
             );
         }
 
@@ -2607,7 +2629,7 @@ impl AlacritreeApp {
                 ),
                 active_workspace,
                 active_branch,
-                herdr_generation: 0,
+                herdr_generation: self.herdr_generation(),
             },
         );
         let rows = self.current_project_rows();
@@ -2658,7 +2680,7 @@ impl AlacritreeApp {
                         ),
                         active_workspace,
                         active_branch,
-                        herdr_generation: 0,
+                        herdr_generation: self.herdr_generation(),
                     },
                 );
                 if unchanged {
@@ -7946,6 +7968,54 @@ impl AlacritreeApp {
         listed
     }
 
+    /// Rows for every herdr agent no session is attached to, bucketed by the
+    /// workspace it is working in.  Unmatched agents land under Home, which
+    /// is the common case: an agent in a repository alacritree does not
+    /// track still belongs somewhere.
+    fn listed_herdr_agents(&self) -> sidebar_nav::ListedAgents {
+        let mut listed = sidebar_nav::ListedAgents::new();
+        if !self.config.ui.herdr.enabled {
+            return listed;
+        }
+        let claimed: Vec<herdr::HerdrKey> =
+            self.sessions.iter().filter_map(|s| s.herdr_key.clone()).collect();
+        let workspaces: Vec<PathBuf> = self
+            .projects
+            .iter()
+            .flat_map(|p| p.worktrees.iter().map(|wt| wt.path.clone()))
+            .collect();
+
+        for cache in &self.herdr_endpoints {
+            let side = cache.side();
+            for agent in herdr::unattached(cache.agents(), side, &claimed) {
+                let workspace = herdr::match_workspace(agent, side, &workspaces);
+                if workspace.is_none() && !self.config.ui.herdr.show_unmatched {
+                    continue;
+                }
+                listed
+                    .entry(workspace)
+                    .or_default()
+                    .push((side.clone(), agent.terminal_id.clone()));
+            }
+        }
+        listed
+    }
+
+    /// One number standing for every endpoint's rendered state, so the
+    /// sidebar's per-frame comparison stays a `u64` compare.
+    fn herdr_generation(&self) -> u64 {
+        self.herdr_endpoints.iter().map(herdr::EndpointCache::generation).sum()
+    }
+
+    /// Refreshes every herdr endpoint's agent list on its own clock; a no-op
+    /// per endpoint until its poll interval elapses.
+    fn poll_herdr_endpoints(&mut self) {
+        let interval = self.config.ui.herdr.poll_interval;
+        for cache in &mut self.herdr_endpoints {
+            cache.poll(interval);
+        }
+    }
+
     /// Session rows for `ws`'s sidebar list, per `sidebar_session_ids`'s
     /// list threshold.
     fn workspace_session_rows(&self, ws: &WorkspaceKey) -> Vec<SessionRowData> {
@@ -9570,6 +9640,7 @@ impl eframe::App for AlacritreeApp {
         self.pr_cache.drain_completed(ctx);
         self.poll_pending_deletes(ctx);
         self.poll_pending_creates(ctx);
+        self.poll_herdr_endpoints();
         // Poll first, then check `failed`: a panicked job's `poll` returns
         // `None` forever, so `failed` is what stops its handle from sitting
         // here for the rest of the process.

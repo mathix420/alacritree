@@ -156,6 +156,23 @@ pub fn session_attach_script(pane_id: &str, session: &str) -> String {
     format!("herdr agent focus {} && herdr session attach {}", sh_quote(pane_id), sh_quote(session))
 }
 
+/// Identifies one herdr agent across polls.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HerdrKey {
+    pub side: Side,
+    pub terminal_id: String,
+}
+
+/// The agents on `side` that no live session is attached to.  These are the
+/// ones that get a sidebar row; an attached agent is drawn by its session
+/// row instead, so each agent appears exactly once.
+pub fn unattached<'a>(agents: &'a [Agent], side: &Side, claimed: &[HerdrKey]) -> Vec<&'a Agent> {
+    agents
+        .iter()
+        .filter(|a| !claimed.iter().any(|k| k.side == *side && k.terminal_id == a.terminal_id))
+        .collect()
+}
+
 /// The `code` from an error envelope on stderr, for deciding whether a
 /// failure is the ordinary "no server" case or worth a log line.
 pub fn error_code(stderr: &str) -> Option<String> {
@@ -275,6 +292,10 @@ impl EndpointCache {
     /// comparison does not rebuild for `state_change_seq` churn nobody can see.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub fn side(&self) -> &Side {
+        &self.side
     }
 
     pub fn agents(&self) -> &[Agent] {
@@ -608,5 +629,29 @@ mod tests {
         let spaces = vec![wsl::linux_to_windows("/mnt/c/Users/Lev/repo", distro)];
         let matched = match_workspace(&at("/mnt/d/elsewhere", None), &Side::Wsl(distro.into()), &spaces);
         assert_eq!(matched, None);
+    }
+
+    #[test]
+    fn an_attached_agent_yields_no_row() {
+        let agents = vec![agent("t1", Status::Idle), agent("t2", Status::Working)];
+        let claimed = [HerdrKey { side: Side::Native, terminal_id: "t1".into() }];
+        let rows = unattached(&agents, &Side::Native, &claimed);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].terminal_id, "t2");
+    }
+
+    #[test]
+    fn detaching_brings_the_row_back() {
+        let agents = vec![agent("t1", Status::Idle)];
+        assert_eq!(unattached(&agents, &Side::Native, &[]).len(), 1);
+    }
+
+    /// Terminal ids are unique only within one server, so a claim on one side
+    /// must not hide the same id on another.
+    #[test]
+    fn a_claim_on_one_side_does_not_hide_the_other_side() {
+        let agents = vec![agent("t1", Status::Idle)];
+        let claimed = [HerdrKey { side: Side::Wsl("d".into()), terminal_id: "t1".into() }];
+        assert_eq!(unattached(&agents, &Side::Native, &claimed).len(), 1);
     }
 }
