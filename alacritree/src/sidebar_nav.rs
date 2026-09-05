@@ -99,6 +99,52 @@ pub fn move_range(
     if range.contains(origin) { range } else { vec![origin.clone()] }
 }
 
+/// Where a session lands after one reorder step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepTarget {
+    pub workspace: WorkspaceKey,
+    /// Position among that workspace's sessions once the move is applied.
+    pub position: usize,
+}
+
+/// One reorder step for the session sitting at `index` of `origin`.
+///
+/// `range` comes from [`move_range`] and `lens[i]` is the current session
+/// count of `range[i]`.  `delta` is negative for up and positive for down.
+///
+/// A step off either end of a workspace continues into the neighbouring one:
+/// up lands past the last session there, down lands before the first.  An
+/// empty neighbour resolves to position 0 either way, so it needs no case of
+/// its own.  `None` is every refusal — both ends of the range are clamped and
+/// nothing wraps.
+pub fn step_target(
+    range: &[WorkspaceKey],
+    lens: &[usize],
+    origin: &WorkspaceKey,
+    index: usize,
+    delta: i32,
+) -> Option<StepTarget> {
+    debug_assert_eq!(range.len(), lens.len(), "one length per workspace in the range");
+    let k = range.iter().position(|ws| ws == origin)?;
+    if index >= *lens.get(k)? {
+        return None;
+    }
+    if delta < 0 {
+        if index > 0 {
+            return Some(StepTarget { workspace: origin.clone(), position: index - 1 });
+        }
+        let prev = k.checked_sub(1)?;
+        Some(StepTarget { workspace: range[prev].clone(), position: lens[prev] })
+    } else if delta > 0 {
+        if index + 1 < lens[k] {
+            return Some(StepTarget { workspace: origin.clone(), position: index + 1 });
+        }
+        Some(StepTarget { workspace: range.get(k + 1)?.clone(), position: 0 })
+    } else {
+        None
+    }
+}
+
 /// The row `delta` steps away from `cursor`, clamped to the list ends.
 /// A cursor no longer in `rows` (worktree removed, project collapsed) falls
 /// back to Home rather than guessing a neighbor.
@@ -330,6 +376,84 @@ pub(crate) mod tests {
             let range = move_range(&two_projects(), &order, &ws("/gone"), scope);
             assert_eq!(range, vec![ws("/gone")], "scope {scope:?}");
         }
+    }
+
+    #[test]
+    fn step_swaps_with_the_neighbour_inside_a_workspace() {
+        let range = vec![ws("/a"), ws("/b")];
+        let lens = vec![3, 1];
+        assert_eq!(
+            step_target(&range, &lens, &ws("/a"), 1, -1),
+            Some(StepTarget { workspace: ws("/a"), position: 0 })
+        );
+        assert_eq!(
+            step_target(&range, &lens, &ws("/a"), 1, 1),
+            Some(StepTarget { workspace: ws("/a"), position: 2 })
+        );
+    }
+
+    #[test]
+    fn step_down_off_the_end_lands_at_the_front_of_the_next_workspace() {
+        let range = vec![ws("/a"), ws("/b")];
+        let lens = vec![2, 2];
+        assert_eq!(
+            step_target(&range, &lens, &ws("/a"), 1, 1),
+            Some(StepTarget { workspace: ws("/b"), position: 0 })
+        );
+    }
+
+    #[test]
+    fn step_up_off_the_front_lands_at_the_end_of_the_previous_workspace() {
+        let range = vec![ws("/a"), ws("/b")];
+        let lens = vec![2, 2];
+        assert_eq!(
+            step_target(&range, &lens, &ws("/b"), 0, -1),
+            Some(StepTarget { workspace: ws("/a"), position: 2 })
+        );
+    }
+
+    #[test]
+    fn step_into_an_empty_workspace_lands_at_position_zero() {
+        let range = vec![ws("/a"), ws("/b")];
+        let lens = vec![1, 0];
+        assert_eq!(
+            step_target(&range, &lens, &ws("/a"), 0, 1),
+            Some(StepTarget { workspace: ws("/b"), position: 0 })
+        );
+        // And the same landing read from the other direction: appending to an
+        // empty workspace is position 0 too.
+        let lens = vec![0, 1];
+        assert_eq!(
+            step_target(&range, &lens, &ws("/b"), 0, -1),
+            Some(StepTarget { workspace: ws("/a"), position: 0 })
+        );
+    }
+
+    #[test]
+    fn step_clamps_at_both_ends_of_the_range() {
+        let range = vec![ws("/a"), ws("/b")];
+        let lens = vec![2, 2];
+        assert_eq!(step_target(&range, &lens, &ws("/a"), 0, -1), None);
+        assert_eq!(step_target(&range, &lens, &ws("/b"), 1, 1), None);
+    }
+
+    #[test]
+    fn step_in_a_single_workspace_range_never_crosses() {
+        let range = vec![ws("/a")];
+        let lens = vec![2];
+        assert_eq!(step_target(&range, &lens, &ws("/a"), 1, 1), None);
+        assert_eq!(step_target(&range, &lens, &ws("/a"), 0, -1), None);
+        assert_eq!(
+            step_target(&range, &lens, &ws("/a"), 0, 1),
+            Some(StepTarget { workspace: ws("/a"), position: 1 })
+        );
+    }
+
+    #[test]
+    fn step_rejects_an_origin_the_range_does_not_list() {
+        let range = vec![ws("/a")];
+        let lens = vec![2];
+        assert_eq!(step_target(&range, &lens, &ws("/b"), 0, 1), None);
     }
 
     #[test]
