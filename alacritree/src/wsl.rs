@@ -434,10 +434,10 @@ pub fn run_batch(
     let (err_tx, err_rx) = std::sync::mpsc::channel();
     let stdout = child.stdout.take().expect("stdout piped above");
     let stderr = child.stderr.take().expect("stderr piped above");
-    std::thread::spawn(move || {
+    let out_handle = std::thread::spawn(move || {
         let _ = out_tx.send(drain_capped(stdout, MAX_ONE_SHOT_OUTPUT));
     });
-    std::thread::spawn(move || {
+    let err_handle = std::thread::spawn(move || {
         let _ = err_tx.send(drain_capped(stderr, MAX_ONE_SHOT_OUTPUT));
     });
 
@@ -456,6 +456,9 @@ pub fn run_batch(
             return Err("wsl.exe stdout drainer thread panicked".to_string());
         },
     };
+    // The drainer has sent, so its only remaining work is dropping locals and
+    // returning — bounded, unlike joining a drainer that never sent.
+    let _ = out_handle.join();
     let stdout_bytes = match stdout_read {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -475,6 +478,7 @@ pub fn run_batch(
             return Err("wsl.exe stderr drainer thread panicked".to_string());
         },
     };
+    let _ = err_handle.join();
     let stderr_bytes = match stderr_read {
         Ok(bytes) => bytes,
         Err(e) => {
