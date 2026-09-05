@@ -8,7 +8,7 @@
 use crate::{command_ext, jobs};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf, Prefix};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -354,6 +354,32 @@ const ONE_SHOT_REAP_POLL: Duration = Duration::from_millis(20);
 /// script, whose output is orders of magnitude smaller.
 const MAX_ONE_SHOT_OUTPUT: u64 = 64 * 1024 * 1024;
 
+/// Kill and reap the child on every path that gives up on it — timeout, a
+/// failed read, a failed `try_wait` — so none of them leaves an unmanaged
+/// `wsl.exe` running.  Both errors are ignored: whichever way this returns,
+/// the caller is already reporting failure and has no next step for either.
+fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Reads `pipe` to EOF, capped at [`MAX_ONE_SHOT_OUTPUT`].  A read that
+/// lands exactly on the cap is reported as an error rather than a success:
+/// `Read::take` cannot distinguish a batch that filled the cap from one
+/// that happened to stop there, and a batch script's output silently
+/// truncated at 64 MiB reads to a caller (like `git_status`'s porcelain
+/// parser) as a complete, merely wrong, answer — worse than a loud failure.
+fn drain_capped(pipe: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    pipe.take(MAX_ONE_SHOT_OUTPUT).read_to_end(&mut buf)?;
+    if buf.len() as u64 >= MAX_ONE_SHOT_OUTPUT {
+        return Err(std::io::Error::other(format!(
+            "wsl.exe output exceeded the {MAX_ONE_SHOT_OUTPUT} byte limit"
+        )));
+    }
+    Ok(buf)
+}
+
 /// Run `script` through `sh -c` inside `distro`, with `args` bound to
 /// `$1..`.  Rides the resident helper's pipe when it is up; otherwise one
 /// wsl.exe round trip (~400 ms warm on a dev machine, seconds while the VM
@@ -390,24 +416,16 @@ pub fn run_batch(
     // workers and bounding the wait here mirrors how the ipc client bounds a
     // named-pipe request from its own side.  One thread per pipe, because a
     // child that fills whichever pipe is drained second blocks there while
-    // the reader is still emptying the first.  Each reader is capped at
-    // `MAX_ONE_SHOT_OUTPUT`: on the timeout path below, `kill` closes only
-    // the handles wsl.exe owns, so a reader stuck on a pipe inherited by
-    // something else is abandoned rather than joined — the cap is what
-    // bounds it, not the kill.
+    // the reader is still emptying the first.
     let (out_tx, out_rx) = std::sync::mpsc::channel();
     let (err_tx, err_rx) = std::sync::mpsc::channel();
     let stdout = child.stdout.take().expect("stdout piped above");
     let stderr = child.stderr.take().expect("stderr piped above");
     std::thread::spawn(move || {
-        let mut out = Vec::new();
-        let result = stdout.take(MAX_ONE_SHOT_OUTPUT).read_to_end(&mut out).map(|_| out);
-        let _ = out_tx.send(result);
+        let _ = out_tx.send(drain_capped(stdout));
     });
     std::thread::spawn(move || {
-        let mut err = Vec::new();
-        let result = stderr.take(MAX_ONE_SHOT_OUTPUT).read_to_end(&mut err).map(|_| err);
-        let _ = err_tx.send(result);
+        let _ = err_tx.send(drain_capped(stderr));
     });
 
     let timed_out =
@@ -415,30 +433,42 @@ pub fn run_batch(
     let remaining = || deadline.saturating_duration_since(Instant::now());
 
     let Ok(stdout_read) = out_rx.recv_timeout(remaining()) else {
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_and_reap(&mut child);
         return timed_out();
     };
-    let stdout_bytes = stdout_read.map_err(|e| format!("failed to read wsl.exe stdout: {e}"))?;
+    let stdout_bytes = match stdout_read {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            kill_and_reap(&mut child);
+            return Err(format!("failed to read wsl.exe stdout: {e}"));
+        },
+    };
 
     let Ok(stderr_read) = err_rx.recv_timeout(remaining()) else {
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_and_reap(&mut child);
         return timed_out();
     };
-    let stderr_bytes = stderr_read.map_err(|e| format!("failed to read wsl.exe stderr: {e}"))?;
+    let stderr_bytes = match stderr_read {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            kill_and_reap(&mut child);
+            return Err(format!("failed to read wsl.exe stderr: {e}"));
+        },
+    };
 
     // `Child::wait` has no timed variant, so reaping under the same deadline
     // means polling instead of blocking on it directly.
     let status = loop {
-        if let Some(status) =
-            child.try_wait().map_err(|e| format!("failed to wait on wsl.exe: {e}"))?
-        {
-            break status;
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {},
+            Err(e) => {
+                kill_and_reap(&mut child);
+                return Err(format!("failed to wait on wsl.exe: {e}"));
+            },
         }
         if remaining() == Duration::ZERO {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_reap(&mut child);
             return timed_out();
         }
         std::thread::sleep(ONE_SHOT_REAP_POLL.min(remaining()));
