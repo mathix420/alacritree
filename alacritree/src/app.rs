@@ -1551,6 +1551,8 @@ impl AlacritreeApp {
             return;
         };
         let workspace = self.sessions[idx].working_directory.clone();
+        let policy = self.config.ui.last_session_close;
+        let ring = policy.rings().then(|| self.session_ring()).unwrap_or_default();
         self.sessions.remove(idx);
 
         let remaining: Vec<(WorkspaceKey, SessionId)> =
@@ -1570,15 +1572,24 @@ impl AlacritreeApp {
         // Closing the on-screen workspace's last session must not strand the
         // view on an empty pane. What happens instead is policy: `respawn`
         // recycles a shell in place (the last session is by design
-        // unclosable), `navigate` falls back to the project main, then home.
+        // unclosable), `navigate` falls back to the project main, then home,
+        // and the ring policies land on the nearest surviving session in the
+        // flat session ring instead.
         let main = workspace.as_deref().and_then(|p| project_main_for(&self.projects, p));
-        let verdict = close_navigation(
+        let mut verdict = close_navigation(
             reason,
             close_fallback(&workspace, &self.current_workspace, &remaining, main),
         );
-        if verdict != CloseFallback::Stay
-            && self.config.ui.last_session_close == LastSessionClose::Respawn
-        {
+        if verdict != CloseFallback::Stay && policy.rings() {
+            let prefer = policy
+                .prefers_project()
+                .then(|| sidebar_nav::project_of(&self.projects, &workspace))
+                .flatten();
+            if let Some((_, landing)) = ring_landing(&ring, &[id], prefer) {
+                verdict = CloseFallback::ActivateSession(landing);
+            }
+        }
+        if verdict != CloseFallback::Stay && policy == LastSessionClose::Respawn {
             if let Err(e) = self.spawn_session(ctx, workspace.clone()) {
                 self.report_spawn_failure(ctx, &workspace, &e);
             }
@@ -1595,8 +1606,8 @@ impl AlacritreeApp {
         self.apply_close_fallback(ctx, verdict);
     }
 
-    /// Act on a close verdict: stay put, move to the project's main checkout,
-    /// or go home.
+    /// Act on a removal verdict: stay put, move to the project's main
+    /// checkout, move to a session the ring chose, or go home.
     fn apply_close_fallback(&mut self, ctx: &Context, verdict: CloseFallback) {
         match verdict {
             CloseFallback::Stay => {},
@@ -1604,6 +1615,10 @@ impl AlacritreeApp {
                 self.activate_worktree(ctx, &main);
                 // Adopting an existing idle session produces no PTY event, so
                 // nothing else would wake the paint that shows it.
+                ctx.request_repaint();
+            },
+            CloseFallback::ActivateSession(id) => {
+                self.activate_session_by_id(id);
                 ctx.request_repaint();
             },
             CloseFallback::Home => {
@@ -2001,17 +2016,47 @@ impl AlacritreeApp {
         }
     }
 
-    fn workspace_order(&self) -> Vec<WorkspaceKey> {
-        let mut order: Vec<WorkspaceKey> = vec![None];
+    /// Every workspace the app is willing to switch to, in sidebar order,
+    /// each paired with its owning project's root.  Duplicates are kept:
+    /// git lets two projects list one path, and dropping the second would
+    /// change what `cycle_workspaces` visits for a user who configured
+    /// nothing.
+    fn workspace_order_with_projects(&self) -> Vec<(Option<PathBuf>, WorkspaceKey)> {
+        let mut order: Vec<(Option<PathBuf>, WorkspaceKey)> = vec![(None, None)];
         for project in &self.projects {
             for wt in &project.worktrees {
                 let has_sessions = self.workspace_has_sessions(&Some(wt.path.clone()));
                 if worktree_is_switchable(wt, self.liveness.missing(&wt.path), has_sessions) {
-                    order.push(Some(wt.path.clone()));
+                    let key = Some(wt.path.clone());
+                    let owner =
+                        sidebar_nav::project_of(&self.projects, &key).map(Path::to_path_buf);
+                    order.push((owner, key));
                 }
             }
         }
         order
+    }
+
+    fn workspace_order(&self) -> Vec<WorkspaceKey> {
+        self.workspace_order_with_projects().into_iter().map(|(_, ws)| ws).collect()
+    }
+
+    /// The flat session ring, tagged with each workspace's owning project.
+    /// Callers build it only under a ring policy: it allocates per removal.
+    fn session_ring(&self) -> Vec<RingEntry> {
+        self.workspace_order_with_projects()
+            .into_iter()
+            .flat_map(|(project, workspace)| {
+                self.workspace_session_indices(&workspace)
+                    .into_iter()
+                    .map(|i| RingEntry {
+                        project: project.clone(),
+                        workspace: workspace.clone(),
+                        id: self.sessions[i].id,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     fn add_project_via_dialog(&mut self, ctx: &Context) {
@@ -6914,6 +6959,8 @@ enum CloseFallback {
     Stay,
     /// Switch to the project's main checkout, which still has a session.
     Activate(PathBuf),
+    /// A session in another workspace, chosen by `ring_landing`.
+    ActivateSession(SessionId),
     /// Switch to home; `activate_home` spawns a shell there if none exists.
     Home,
 }
@@ -6993,6 +7040,56 @@ fn close_fallback(
         },
         _ => CloseFallback::Home,
     }
+}
+
+/// One session's place in the flat ring: workspaces in sidebar order, each
+/// workspace's sessions in spawn order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RingEntry {
+    /// The owning project's root, from `project_of`.  None for home.
+    project: Option<PathBuf>,
+    workspace: WorkspaceKey,
+    id: SessionId,
+}
+
+/// The session a removal lands on under the `ring_*` policies.  `ring` is the
+/// flat session ring captured before the removal and `removed` is what left
+/// it: one session for a close, a worktree's whole list for a delete.
+/// Successor first, the earliest survivor past the last removed entry, else
+/// the latest survivor before the first.
+///
+/// `prefer` is the removed workspace's owning project under `ring_project`,
+/// and None under `ring_global` and for home.  When set, the search runs over
+/// that project's entries before running over the whole ring.
+///
+/// A path two projects both list appears in the ring twice.  Both entries
+/// carry the same `project_of` tag and name the same session, so a duplicate
+/// changes no answer; indices are taken by first occurrence, the way
+/// `session_ring_target` takes them.
+fn ring_landing(
+    ring: &[RingEntry],
+    removed: &[SessionId],
+    prefer: Option<&Path>,
+) -> Option<(WorkspaceKey, SessionId)> {
+    let positions: Vec<usize> =
+        removed.iter().filter_map(|id| ring.iter().position(|e| e.id == *id)).collect();
+    let first = *positions.iter().min()?;
+    let last = *positions.iter().max()?;
+
+    let search = |group: Option<&Path>| {
+        let in_group = |e: &RingEntry| match group {
+            Some(root) => e.project.as_deref() == Some(root),
+            None => true,
+        };
+        let survives = |e: &RingEntry| !removed.contains(&e.id);
+        ring[last + 1..]
+            .iter()
+            .find(|e| in_group(e) && survives(e))
+            .or_else(|| ring[..first].iter().rev().find(|e| in_group(e) && survives(e)))
+            .map(|e| (e.workspace.clone(), e.id))
+    };
+
+    prefer.and_then(|root| search(Some(root))).or_else(|| search(None))
 }
 
 /// A close-fallback verdict the reconciler owes the terminal, and the worktree
@@ -10281,6 +10378,97 @@ mod tests {
         assert_eq!(session_ring_target(&ring, None, 1), Some((None, 1)));
         // An active session missing from the ring does nothing.
         assert_eq!(session_ring_target(&ring, Some(9), 1), None);
+    }
+
+    fn entry(project: Option<&str>, workspace: &str, id: SessionId) -> RingEntry {
+        RingEntry { project: project.map(PathBuf::from), workspace: ws(workspace), id }
+    }
+
+    /// The tree from the spec: home holds nothing, p1 owns w1 and w2, p2 owns
+    /// w3.  Ring order is sidebar order, so p1's sessions precede p2's.
+    fn spec_ring() -> Vec<RingEntry> {
+        vec![
+            entry(Some("/p1"), "/p1/w1", 1),
+            entry(Some("/p1"), "/p1/w2", 2),
+            entry(Some("/p2"), "/p2/w3", 3),
+        ]
+    }
+
+    #[test]
+    fn a_close_lands_on_the_successor() {
+        assert_eq!(ring_landing(&spec_ring(), &[1], None), Some((ws("/p1/w2"), 2)));
+    }
+
+    #[test]
+    fn a_close_at_the_tail_lands_on_the_predecessor() {
+        assert_eq!(ring_landing(&spec_ring(), &[3], None), Some((ws("/p1/w2"), 2)));
+    }
+
+    /// A worktree deletion takes every session in the workspace at once, so
+    /// the successor is measured past the last of them and the predecessor
+    /// before the first.
+    #[test]
+    fn a_deletion_steps_over_every_session_it_removed() {
+        let ring = vec![
+            entry(Some("/p1"), "/p1/w1", 1),
+            entry(Some("/p1"), "/p1/w2", 2),
+            entry(Some("/p1"), "/p1/w2", 3),
+            entry(Some("/p2"), "/p2/w3", 4),
+        ];
+        assert_eq!(ring_landing(&ring, &[2, 3], None), Some((ws("/p2/w3"), 4)));
+    }
+
+    #[test]
+    fn an_empty_ring_and_an_unknown_removal_have_no_landing() {
+        assert_eq!(ring_landing(&[], &[1], None), None);
+        assert_eq!(ring_landing(&spec_ring(), &[99], None), None);
+    }
+
+    #[test]
+    fn removing_everything_leaves_no_landing() {
+        assert_eq!(ring_landing(&spec_ring(), &[1, 2, 3], None), None);
+    }
+
+    #[test]
+    fn prefer_project_takes_its_own_project_over_a_nearer_neighbour() {
+        // p2's session sits between the two p1 sessions, so a global search
+        // from id 1 finds id 9 and a project-preferring one finds id 2.
+        let ring = vec![
+            entry(Some("/p1"), "/p1/w1", 1),
+            entry(Some("/p2"), "/p2/w3", 9),
+            entry(Some("/p1"), "/p1/w2", 2),
+        ];
+        assert_eq!(ring_landing(&ring, &[1], None), Some((ws("/p2/w3"), 9)));
+        assert_eq!(ring_landing(&ring, &[1], Some(Path::new("/p1"))), Some((ws("/p1/w2"), 2)));
+    }
+
+    /// `ring_project` is `ring_global` plus a first pass, so the two must
+    /// agree whenever that pass finds nothing.
+    #[test]
+    fn prefer_project_falls_through_to_the_whole_ring() {
+        let ring = spec_ring();
+        assert_eq!(
+            ring_landing(&ring, &[3], Some(Path::new("/p2"))),
+            ring_landing(&ring, &[3], None),
+        );
+    }
+
+    #[test]
+    fn home_has_no_project_to_prefer() {
+        let ring = vec![entry(None, "/home-placeholder", 1), entry(Some("/p1"), "/p1/w1", 2)];
+        assert_eq!(ring_landing(&ring, &[1], None), Some((ws("/p1/w1"), 2)));
+    }
+
+    /// A path two projects list is in the ring twice with one owner, so
+    /// either occurrence resolves to the same landing.
+    #[test]
+    fn a_duplicated_workspace_changes_no_landing() {
+        let ring = vec![
+            entry(Some("/p1"), "/shared", 1),
+            entry(Some("/p1"), "/shared", 1),
+            entry(Some("/p2"), "/p2/w", 2),
+        ];
+        assert_eq!(ring_landing(&ring, &[1], None), Some((ws("/p2/w"), 2)));
     }
 
     #[test]
