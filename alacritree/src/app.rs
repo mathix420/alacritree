@@ -36,7 +36,7 @@ use crate::session::{
     self, AttentionVerdict, Session, SessionActivity, SessionId, SessionKind, TermSize,
     poll_attention_debounce,
 };
-use crate::sidebar_nav::{self, SidebarRow};
+use crate::sidebar_nav::{self, SidebarRow, StepTarget};
 use crate::state::{self, PersistedProject};
 use crate::upstream::UpstreamState;
 use crate::worktree::{self as wt, CreateRequest, Progress};
@@ -1246,8 +1246,8 @@ impl AlacritreeApp {
                 },
                 Finished::Failed(id, e, waiters) => {
                     // The workspace comes off the record rather than off the
-                    // pending entry: `move_session_to` can re-key a session
-                    // while its PTY is opening.
+                    // pending entry: `move_session_to_key` can re-key a
+                    // session while its PTY is opening.
                     let ws = self
                         .sessions
                         .iter()
@@ -1678,10 +1678,14 @@ impl AlacritreeApp {
         });
     }
 
-    /// Re-home `id` to `target`'s workspace.  A re-keying only: the PTY, its
-    /// threads, and the scrollback are untouched — the session must survive
-    /// a move the same way it survives a workspace switch.
-    fn move_session_to(&mut self, id: SessionId, target: PathBuf) -> Result<WorkspaceKey, String> {
+    /// Re-key `id` to `target`, repairing both workspaces' active-session
+    /// entries and following the move with the view when the session was the
+    /// one on screen.
+    fn move_session_to_key(
+        &mut self,
+        id: SessionId,
+        target: WorkspaceKey,
+    ) -> Result<WorkspaceKey, String> {
         let idx = self
             .sessions
             .iter()
@@ -1690,8 +1694,13 @@ impl AlacritreeApp {
         if matches!(&self.sessions[idx].kind, SessionKind::Scratchpad { .. }) {
             return Err("scratchpads belong to their backing workspace and cannot be moved".into());
         }
+        // A workspace's diff pane is found by workspace plus kind, so a pane
+        // carried elsewhere becomes the one the next git click closes while
+        // the workspace it left opens a second.
+        if matches!(&self.sessions[idx].kind, SessionKind::Diff { .. }) {
+            return Err("diff panes belong to the workspace they were opened from".into());
+        }
         let source = self.sessions[idx].working_directory.clone();
-        let target: WorkspaceKey = Some(target);
         if source == target {
             return Ok(target);
         }
@@ -1772,6 +1781,43 @@ impl AlacritreeApp {
             .filter(|(_, s)| s.working_directory == *ws)
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// The workspaces a reorder may use: those the app is willing to switch
+    /// to, minus any whose delete is already running.  A session landing on a
+    /// spinner row is a session that delete is about to reap.
+    fn reorderable_workspaces(&self) -> Vec<WorkspaceKey> {
+        self.workspace_order()
+            .into_iter()
+            .filter(|ws| match ws {
+                None => true,
+                Some(path) => !self.pending_deletes.iter().any(|t| t.worktree_path == *path),
+            })
+            .collect()
+    }
+
+    /// Walk `id` to `position` among its own workspace's sessions.
+    fn reorder_session_within_workspace(&mut self, id: SessionId, position: usize) {
+        let Some(abs) = self.sessions.iter().position(|s| s.id == id) else { return };
+        let ws = self.sessions[abs].working_directory.clone();
+        let indices = self.workspace_session_indices(&ws);
+        let Some(j) = indices.iter().position(|i| *i == abs) else { return };
+        for (a, b) in walk_swaps(&indices, j, position) {
+            self.sessions.swap(a, b);
+        }
+    }
+
+    /// Apply a decided move: change the workspace first when the target is a
+    /// different one, then walk the session to its position there.  A refused
+    /// workspace change leaves the session where it was.
+    fn apply_session_move(&mut self, id: SessionId, target: StepTarget) {
+        let Some(abs) = self.sessions.iter().position(|s| s.id == id) else { return };
+        if self.sessions[abs].working_directory != target.workspace
+            && self.move_session_to_key(id, target.workspace).is_err()
+        {
+            return;
+        }
+        self.reorder_session_within_workspace(id, target.position);
     }
 
     fn scratchpad_session_index(&self, ws: &WorkspaceKey) -> Option<usize> {
@@ -6050,6 +6096,31 @@ fn move_target(len: usize, from: usize, insert_before: usize) -> Option<usize> {
     (to != from).then_some(to)
 }
 
+/// The neighbour swaps that walk the element at `indices[j]` to slot
+/// `position` of `indices`.
+///
+/// `indices` are the absolute positions one workspace occupies inside the
+/// session vector, which are not contiguous: swapping only across them keeps
+/// every other workspace's sessions at the index they were at.  Swapping is
+/// also what avoids a `Clone` bound on `Session`, which owns a PTY.
+fn walk_swaps(indices: &[usize], j: usize, position: usize) -> Vec<(usize, usize)> {
+    let mut swaps = Vec::new();
+    if indices.is_empty() || j >= indices.len() {
+        return swaps;
+    }
+    let position = position.min(indices.len() - 1);
+    let mut j = j;
+    while j > position {
+        swaps.push((indices[j - 1], indices[j]));
+        j -= 1;
+    }
+    while j < position {
+        swaps.push((indices[j], indices[j + 1]));
+        j += 1;
+    }
+    swaps
+}
+
 /// A grip that a project row can be dragged by to reorder it.  Drag-sensing
 /// only, so a plain click still falls through to the row's other controls.
 fn drag_handle(ui: &mut egui::Ui, theme: &Theme) -> egui::Response {
@@ -8864,7 +8935,7 @@ impl AlacritreeApp {
             Req::MoveSession { session_id, path } => {
                 let target =
                     self.workspace_for_path(&path).ok_or_else(|| unknown_worktree(&path))?;
-                let workspace = self.move_session_to(session_id, target)?;
+                let workspace = self.move_session_to_key(session_id, Some(target))?;
                 // A silent re-grouping produces no PTY events, so nothing
                 // else would wake the next paint.
                 ctx.request_repaint();
@@ -9533,6 +9604,16 @@ mod tests {
         v
     }
 
+    /// Apply `walk_swaps` to a concrete list, with `indices` standing in for
+    /// the absolute slots one workspace occupies inside the session vector.
+    fn walked(items: &[&str], indices: &[usize], j: usize, position: usize) -> Vec<String> {
+        let mut v: Vec<String> = items.iter().map(|s| s.to_string()).collect();
+        for (a, b) in walk_swaps(indices, j, position) {
+            v.swap(a, b);
+        }
+        v
+    }
+
     fn key_ev(key: egui::Key, pressed: bool) -> egui::Event {
         egui::Event::Key {
             key,
@@ -9942,6 +10023,27 @@ mod tests {
         assert_eq!(move_target(3, 0, 0), None);
         // A stale source index (list shrank mid-drag) is ignored.
         assert_eq!(move_target(2, 5, 0), None);
+    }
+
+    #[test]
+    fn walk_swaps_moves_within_a_contiguous_workspace() {
+        assert_eq!(walked(&["a", "b", "c"], &[0, 1, 2], 0, 2), vec!["b", "c", "a"]);
+        assert_eq!(walked(&["a", "b", "c"], &[0, 1, 2], 2, 0), vec!["c", "a", "b"]);
+    }
+
+    #[test]
+    fn walk_swaps_leaves_interleaved_workspaces_in_place() {
+        // Slots 0 and 2 belong to one workspace, slot 1 to another; moving the
+        // first workspace's second session to the front must not disturb it.
+        assert_eq!(walked(&["a", "x", "b"], &[0, 2], 1, 0), vec!["b", "x", "a"]);
+    }
+
+    #[test]
+    fn walk_swaps_is_empty_when_nothing_moves() {
+        assert!(walk_swaps(&[0, 1, 2], 1, 1).is_empty());
+        // A position past the end clamps to the last slot, which is a no-op
+        // for the element already there.
+        assert!(walk_swaps(&[0, 1, 2], 2, 9).is_empty());
     }
 
     #[test]
