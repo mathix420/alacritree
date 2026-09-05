@@ -463,6 +463,9 @@ pub struct AlacritreeApp {
     /// startup default; toggles flip these and are never persisted.
     session_rows_always: bool,
     session_tabs_always: bool,
+    /// Runtime copy of `[ui.session_reorder] drag`.  Like the display toggles
+    /// above, the config is only the startup default and nothing is persisted.
+    session_drag: bool,
     sidebar_cursor: Option<SidebarRow>,
     /// Reveals the project rows' drag grips.  A transient mode, not persisted:
     /// reordering is a rare, deliberate act, and a grip on every row the rest
@@ -727,6 +730,11 @@ struct BaseBranchPicker {
 #[derive(Clone)]
 struct DraggedProject(PathBuf);
 
+/// Drag-and-drop payload for reordering sessions.  Carries the id rather than
+/// a position so a spawn, close or reorder mid-drag can't retarget the drop.
+#[derive(Clone)]
+struct DraggedSession(SessionId);
+
 /// Which `git diff` flavor a sidebar click should open in delta.
 enum DiffSource {
     Staged,
@@ -903,6 +911,7 @@ impl AlacritreeApp {
             focus: PaneFocus::Terminal,
             session_rows_always: config.ui.session_display.sidebar_always,
             session_tabs_always: config.ui.session_display.tabs_always,
+            session_drag: config.ui.session_reorder.drag,
             sidebar_cursor: None,
             reorder_mode: false,
             sidebar_auto_shown: false,
@@ -3027,6 +3036,9 @@ impl AlacritreeApp {
             },
             BindingAction::Named(NamedAction::MoveSessionUp) => self.step_session(-1),
             BindingAction::Named(NamedAction::MoveSessionDown) => self.step_session(1),
+            BindingAction::Named(NamedAction::ToggleSessionDrag) => {
+                self.session_drag = !self.session_drag;
+            },
             BindingAction::Named(NamedAction::SelectNextWorkspace) => {
                 self.cycle_workspaces(ctx, 1);
             },
@@ -3577,6 +3589,7 @@ impl AlacritreeApp {
         let theme = self.theme;
         let scrollbar = self.config.ui.scrollbar;
         let reorder_mode = self.reorder_mode;
+        let session_drag = self.session_drag;
         let cursor_row = if self.focus == PaneFocus::ProjectsSidebar {
             self.sidebar_cursor.clone()
         } else {
@@ -3841,7 +3854,15 @@ impl AlacritreeApp {
                                 Some(SidebarRow::Session(id)) if *id == row.id
                             );
                             let scroll = scrolls(is_cursor);
-                            let act = session_row(ui, row, is_cursor, scroll, &icons, &theme);
+                            let act = session_row(
+                                ui,
+                                row,
+                                is_cursor,
+                                scroll,
+                                session_drag,
+                                &icons,
+                                &theme,
+                            );
                             if act.activate {
                                 activate_session_request.set(Some((None, row.id)));
                             }
@@ -4205,6 +4226,7 @@ impl AlacritreeApp {
                                         row,
                                         is_cursor,
                                         scroll,
+                                        session_drag,
                                         &icons,
                                         &theme,
                                     );
@@ -7360,6 +7382,8 @@ fn worktree_is_switchable(wt: &Worktree, missing: Option<bool>, has_sessions: bo
 struct SessionRowAction {
     activate: bool,
     close: bool,
+    /// Full-width row rect, for a drop target to test the pointer against.
+    rect: egui::Rect,
 }
 
 fn session_row(
@@ -7367,6 +7391,7 @@ fn session_row(
     row: &SessionRowData,
     is_cursor: bool,
     scroll_into_view: bool,
+    draggable: bool,
     icons: &Icons,
     theme: &Theme,
 ) -> SessionRowAction {
@@ -7424,7 +7449,11 @@ fn session_row(
             );
         })
         .response
-        .interact(egui::Sense::click());
+        .interact(if draggable {
+            egui::Sense::click_and_drag()
+        } else {
+            egui::Sense::click()
+        });
     if let Some((rect, hint)) = status_hint {
         hints.add(rect, hint);
     }
@@ -7461,7 +7490,14 @@ fn session_row(
     if scroll_into_view {
         ui.scroll_to_rect(full_rect, None);
     }
-    SessionRowAction { activate: resp.clicked() && !close_clicked, close: close_clicked }
+    if draggable {
+        resp.dnd_set_drag_payload(DraggedSession(row.id));
+    }
+    SessionRowAction {
+        activate: resp.clicked() && !close_clicked,
+        close: close_clicked,
+        rect: full_rect,
+    }
 }
 
 impl AlacritreeApp {
@@ -11775,7 +11811,7 @@ mod tests {
                 is_displayed: true,
             };
             let mut session = |ui: &mut egui::Ui| {
-                session_row(ui, &row, false, false, &icons, &theme);
+                session_row(ui, &row, false, false, false, &icons, &theme);
             };
             assert_eq!(
                 hint_painted_over(&mut session, "×", "close session"),
@@ -11870,7 +11906,7 @@ mod tests {
 
             let agent = session(false, SessionActivity::Agent(Some("claude")));
             let mut agent_row = |ui: &mut egui::Ui| {
-                session_row(ui, &agent, false, false, &icons, &theme);
+                session_row(ui, &agent, false, false, false, &icons, &theme);
             };
             assert_eq!(
                 hint_painted_over(&mut agent_row, DEFAULT_AGENT_ICON.as_str(), "claude is running",),
@@ -11885,7 +11921,7 @@ mod tests {
 
             let loading = session(false, SessionActivity::Loading(Some("claude")));
             let texts = texts_while_hovering_at(slot, WIDTH, |ui| {
-                session_row(ui, &loading, false, false, &icons, &theme);
+                session_row(ui, &loading, false, false, false, &icons, &theme);
             });
             assert_eq!(
                 texts.iter().flatten().any(|(text, _)| text == "claude is working"),
@@ -11895,7 +11931,7 @@ mod tests {
 
             let waiting = session(true, SessionActivity::Idle);
             let texts = texts_while_hovering_at(slot, WIDTH, |ui| {
-                session_row(ui, &waiting, false, false, &icons, &theme);
+                session_row(ui, &waiting, false, false, false, &icons, &theme);
             });
             assert_eq!(
                 texts.iter().flatten().any(|(text, _)| text == "needs attention"),
@@ -12197,7 +12233,7 @@ mod tests {
         };
 
         let texts = texts_while_hovering(140.0, |ui| {
-            session_row(ui, &row, false, false, &icons, &theme);
+            session_row(ui, &row, false, false, false, &icons, &theme);
         });
 
         assert!(
