@@ -587,7 +587,8 @@ baked_glyphs! {
     DEFAULT_CURSOR_BLOCK_GLYPH = "▌";
 }
 
-/// What happens when the on-screen workspace's last session closes.
+/// What happens when the on-screen workspace stops having sessions, whether a
+/// close or a worktree deletion took the last one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LastSessionClose {
     /// Recycle a shell in place — the workspace always has a live session,
@@ -597,6 +598,26 @@ pub enum LastSessionClose {
     /// Move to the project's main checkout when it has a live session,
     /// otherwise home (which spawns a shell only if it has none).
     Navigate,
+    /// Move to the nearest session in the flat session ring, otherwise home.
+    RingGlobal,
+    /// Move to the nearest session in the removed workspace's own project,
+    /// then to the nearest anywhere in the ring, otherwise home.
+    RingProject,
+}
+
+impl LastSessionClose {
+    /// Whether the destination comes from the session ring.  Both removal
+    /// paths build that ring only when this is true, so the default costs
+    /// no allocation.
+    pub fn rings(self) -> bool {
+        matches!(self, Self::RingGlobal | Self::RingProject)
+    }
+
+    /// Whether the search is confined to the removed workspace's project
+    /// before it widens to the whole ring.
+    pub fn prefers_project(self) -> bool {
+        matches!(self, Self::RingProject)
+    }
 }
 
 fn parse_last_session_close(raw: Option<&str>) -> LastSessionClose {
@@ -604,6 +625,8 @@ fn parse_last_session_close(raw: Option<&str>) -> LastSessionClose {
         None => LastSessionClose::default(),
         Some("respawn") => LastSessionClose::Respawn,
         Some("navigate") => LastSessionClose::Navigate,
+        Some("ring_global") => LastSessionClose::RingGlobal,
+        Some("ring_project") => LastSessionClose::RingProject,
         Some(other) => {
             log::warn!("unknown ui.last_session_close value {other:?}, using \"respawn\"");
             LastSessionClose::default()
@@ -2162,9 +2185,10 @@ struct RawUi {
     /// "never" (default) | "busy" | "always".
     #[schemars(extend("enum" = ["never", "busy", "always"]))]
     confirm_session_close: Option<String>,
-    /// What closing the on-screen workspace's last session does:
-    /// "respawn" (default) | "navigate".
-    #[schemars(extend("enum" = ["respawn", "navigate"]))]
+    /// What happens when the on-screen workspace stops having sessions,
+    /// whether a close or a worktree deletion took the last one:
+    /// "respawn" (default) | "navigate" | "ring_global" | "ring_project".
+    #[schemars(extend("enum" = ["respawn", "navigate", "ring_global", "ring_project"]))]
     last_session_close: Option<String>,
     /// How far the projects sidebar goes when the cursor's row stops being
     /// rendered: "preserve" (default) | "follow".
@@ -3008,9 +3032,12 @@ mod tests {
 
     #[test]
     fn last_session_close_parses_all_values() {
-        for (raw, expected) in
-            [("respawn", LastSessionClose::Respawn), ("navigate", LastSessionClose::Navigate)]
-        {
+        for (raw, expected) in [
+            ("respawn", LastSessionClose::Respawn),
+            ("navigate", LastSessionClose::Navigate),
+            ("ring_global", LastSessionClose::RingGlobal),
+            ("ring_project", LastSessionClose::RingProject),
+        ] {
             let ui = ui_from_toml(&format!("[ui]\nlast_session_close = \"{raw}\""));
             assert_eq!(ui.last_session_close, expected, "value {raw:?}");
         }
@@ -3020,6 +3047,14 @@ mod tests {
     fn last_session_close_invalid_falls_back_to_respawn() {
         let ui = ui_from_toml("[ui]\nlast_session_close = \"panic\"");
         assert_eq!(ui.last_session_close, LastSessionClose::Respawn);
+    }
+
+    #[test]
+    fn only_the_ring_values_ring() {
+        assert!(!LastSessionClose::Respawn.rings());
+        assert!(!LastSessionClose::Navigate.rings());
+        assert!(LastSessionClose::RingGlobal.rings());
+        assert!(LastSessionClose::RingProject.rings());
     }
 
     #[test]

@@ -1108,10 +1108,12 @@
           "description": "Sidebar glyph overrides."
         },
         "last_session_close": {
-          "description": "What closing the on-screen workspace's last session does:\n\"respawn\" (default) | \"navigate\".",
+          "description": "What happens when the on-screen workspace stops having sessions,\nwhether a close or a worktree deletion took the last one:\n\"respawn\" (default) | \"navigate\" | \"ring_global\" | \"ring_project\".",
           "enum": [
             "respawn",
-            "navigate"
+            "navigate",
+            "ring_global",
+            "ring_project"
           ],
           "type": "string"
         },
