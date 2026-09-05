@@ -25,6 +25,7 @@ mod glyph_cache;
 mod gpu_timing;
 mod grid_gl;
 mod grid_instances;
+mod herdr;
 mod ime;
 mod input;
 mod ipc;
