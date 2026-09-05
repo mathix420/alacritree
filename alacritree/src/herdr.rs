@@ -7,6 +7,7 @@
 //! prints success on stdout and errors on stderr, which is why callers
 //! capture both.
 
+use crate::wsl;
 use serde::Deserialize;
 
 /// Which herdr server an agent belongs to.  Two servers on one machine
@@ -128,17 +129,10 @@ impl Side {
                     .chain(args.iter().map(|a| sh_quote(a)))
                     .collect::<Vec<_>>()
                     .join(" ");
-                (
-                    "wsl.exe".to_string(),
-                    vec![
-                        "-d".to_string(),
-                        distro.clone(),
-                        "--exec".to_string(),
-                        "sh".to_string(),
-                        "-lc".to_string(),
-                        script,
-                    ],
-                )
+                // `--exec` hands wsl.exe a bare program lookup, and herdr
+                // installs to ~/.local/bin, which is off that PATH; routing
+                // through `sh -lc` sources the login shell that puts it back.
+                wsl::exec_invocation(distro, &["sh", "-lc", &script])
             },
         }
     }

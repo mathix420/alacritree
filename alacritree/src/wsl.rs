@@ -326,6 +326,18 @@ pub fn shell_invocation(distro: &str, workdir: &Path) -> (String, Vec<String>) {
     )
 }
 
+/// Program + args for `-d <distro> --exec <argv...>`, tuple-shaped like
+/// `shell_invocation` rather than a `Command` like `command`: this feeds a
+/// PTY spawn, which has no creation-flags concept of its own, while `command`
+/// feeds a child process spawned through `std::process`, where
+/// `CREATE_NO_WINDOW` and `WSL_UTF8` matter and would not survive a
+/// `(String, Vec<String>)` round trip.
+pub fn exec_invocation(distro: &str, argv: &[&str]) -> (String, Vec<String>) {
+    let mut args = vec!["-d".to_string(), distro.to_string(), "--exec".to_string()];
+    args.extend(argv.iter().map(|a| a.to_string()));
+    ("wsl.exe".to_string(), args)
+}
+
 /// Separates the outputs of the individual commands a batch script runs.
 /// Scripts emit it between sections via `sep() { printf '\n@@ALACRITREE@@\n'; }`;
 /// NUL-delimited porcelain payloads pass through untouched because the
@@ -791,6 +803,13 @@ mod tests {
         let (program, args) = shell_invocation("kali-linux", Path::new(r"C:\proj"));
         assert_eq!(program, "wsl.exe");
         assert_eq!(args, vec!["-d", "kali-linux", "--cd", r"C:\proj"]);
+    }
+
+    #[test]
+    fn exec_invocation_builds_expected_argv() {
+        let (program, args) = exec_invocation("kali-linux", &["sh", "-lc", "herdr agent list"]);
+        assert_eq!(program, "wsl.exe");
+        assert_eq!(args, vec!["-d", "kali-linux", "--exec", "sh", "-lc", "herdr agent list"]);
     }
 
     #[test]
