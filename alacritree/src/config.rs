@@ -667,6 +667,41 @@ fn parse_sidebar_focus(raw: Option<&str>) -> SidebarFocus {
     }
 }
 
+/// `[ui] sidebar_scroll_align`: where a row a sidebar scrolled to is parked.
+/// Governs both panels and both reasons to scroll, because it describes the
+/// resting position rather than what chose the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub enum ScrollAlign {
+    /// egui's minimal scroll: move just far enough to bring the row into
+    /// view, which leaves it against whichever edge it entered from.
+    #[default]
+    Minimal,
+    /// Park the row in the middle of the panel.  egui clamps to the scroll
+    /// range, so a short list stays put instead of overscrolling.
+    Center,
+}
+
+impl ScrollAlign {
+    pub fn align(self) -> Option<egui::Align> {
+        match self {
+            Self::Minimal => None,
+            Self::Center => Some(egui::Align::Center),
+        }
+    }
+}
+
+fn parse_scroll_align(raw: Option<&str>) -> ScrollAlign {
+    match raw {
+        None => ScrollAlign::default(),
+        Some("minimal") => ScrollAlign::Minimal,
+        Some("center") => ScrollAlign::Center,
+        Some(other) => {
+            log::warn!("unknown ui.sidebar_scroll_align value {other:?}, using \"minimal\"");
+            ScrollAlign::default()
+        },
+    }
+}
+
 /// `[ui] search_scope`: whether a fuzzy query is confined by the panel's active
 /// toggle filters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1041,6 +1076,8 @@ pub struct UiTheme {
     /// Whether the projects sidebar scrolls to the session on screen when it
     /// changes.
     pub sidebar_follow_active: bool,
+    /// Where a row a sidebar scrolled to is parked.
+    pub sidebar_scroll_align: ScrollAlign,
     /// Whether a fuzzy query is confined by the panel's active toggle filters.
     pub search_scope: SearchScope,
     /// When a sidebar row spells its full name out on hover.
@@ -1155,6 +1192,7 @@ impl Default for UiTheme {
             last_session_close: LastSessionClose::Respawn,
             sidebar_focus: SidebarFocus::default(),
             sidebar_follow_active: false,
+            sidebar_scroll_align: ScrollAlign::default(),
             search_scope: SearchScope::default(),
             sidebar_tooltips: SidebarTooltips::default(),
             icon_tooltips: true,
@@ -2202,6 +2240,12 @@ struct RawUi {
     /// it changes — a cycling key, a click, the palette, an IPC request.
     /// The sidebar cursor is left where it was: `false` (default).
     sidebar_follow_active: Option<bool>,
+    /// Where a row the sidebar scrolled to is parked:
+    /// "minimal" (default) | "center".  Under "center" every cursor step
+    /// re-centres the list, and clicking a row near the panel edge scrolls it
+    /// out from under the pointer.
+    #[schemars(extend("enum" = ["minimal", "center"]))]
+    sidebar_scroll_align: Option<String>,
     /// Whether a fuzzy query is confined by the panel's active toggle filters:
     /// "filtered" (default) | "all".
     #[schemars(extend("enum" = ["filtered", "all"]))]
@@ -2479,6 +2523,7 @@ impl RawConfig {
             last_session_close: parse_last_session_close(self.ui.last_session_close.as_deref()),
             sidebar_focus: parse_sidebar_focus(self.ui.sidebar_focus.as_deref()),
             sidebar_follow_active: self.ui.sidebar_follow_active.unwrap_or(false),
+            sidebar_scroll_align: parse_scroll_align(self.ui.sidebar_scroll_align.as_deref()),
             search_scope: parse_search_scope(self.ui.search_scope.as_deref()),
             sidebar_tooltips: parse_sidebar_tooltips(self.ui.sidebar_tooltips.as_deref()),
             icon_tooltips: self.ui.icon_tooltips.unwrap_or(true),
@@ -3110,6 +3155,26 @@ mod tests {
     #[test]
     fn sidebar_follow_active_parses() {
         assert!(ui_from_toml("[ui]\nsidebar_follow_active = true").sidebar_follow_active);
+    }
+
+    #[test]
+    fn sidebar_scroll_align_defaults_to_minimal() {
+        assert_eq!(ui_from_toml("").sidebar_scroll_align, ScrollAlign::Minimal);
+    }
+
+    #[test]
+    fn sidebar_scroll_align_parses_all_values() {
+        for (raw, expected) in [("minimal", ScrollAlign::Minimal), ("center", ScrollAlign::Center)]
+        {
+            let ui = ui_from_toml(&format!("[ui]\nsidebar_scroll_align = \"{raw}\""));
+            assert_eq!(ui.sidebar_scroll_align, expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn sidebar_scroll_align_invalid_falls_back_to_minimal() {
+        let ui = ui_from_toml("[ui]\nsidebar_scroll_align = \"middle-ish\"");
+        assert_eq!(ui.sidebar_scroll_align, ScrollAlign::Minimal);
     }
 
     /// The hints are what an unmodified config already shows, so the key has

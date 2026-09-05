@@ -383,6 +383,13 @@ sidebar_follow_active = false  # scroll the projects sidebar to the session on
                                 # screen whenever it changes — a cycling key, a
                                 # click, the palette, an IPC request (default
                                 # false); the cursor is left where it was
+sidebar_scroll_align = "minimal"  # where a row a sidebar scrolled to is
+                                   # parked. "minimal" (default) rests it
+                                   # against whichever edge it entered from.
+                                   # "center" re-centres the list on every
+                                   # cursor step, and scrolls a clicked row
+                                   # out from under the pointer — not a
+                                   # scrolloff, the row always lands mid-panel
 vsync              = true   # restart required — wait for the display's refresh
                             # before showing a finished frame (default true).
                             # false presents each frame as soon as it is drawn,
@@ -660,14 +667,7 @@ Two things worth knowing about what the schema does and does not do:
   `alacritty.toml` legitimately carries keys only the real alacritty acts on —
   `[hints]`, `[bell]`, `[mouse]`, `[general] import`. Those get no completion,
   but they are not flagged.
-- **Closed-value keys are completed.** `confirm_session_close`, `scrollbar`,
-  `sidebar_focus`, `search_scope`, `sidebar_tooltips`, `last_session_close`,
-  `path_style.*` and `drop.quote` offer their accepted spellings. A binding's
-  `action` completes from every action alacritree implements but rejects
-  nothing, so an alacritty-only action still validates. Cursor `shape` and
-  `blinking`, where Alacritty accepts more than one spelling for the same
-  value, are deliberately left unconstrained, so a working config is never
-  marked wrong.
+- **Closed-value keys are completed.** `confirm_session_close`, `scrollbar`, `sidebar_focus`, `sidebar_scroll_align`, `search_scope`, `sidebar_tooltips`, `last_session_close`, `path_style.*` and `drop.quote` offer their accepted spellings. A binding's `action` completes from every action alacritree implements but rejects nothing, so an alacritty-only action still validates. Cursor `shape` and `blinking`, where Alacritty accepts more than one spelling for the same value, are deliberately left unconstrained, so a working config is never marked wrong.
 
 [taplo]: https://taplo.tamasfe.dev/
 [ebt]: https://marketplace.visualstudio.com/items?itemName=tamasfe.even-better-toml

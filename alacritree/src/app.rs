@@ -108,6 +108,9 @@ struct Theme {
     sidebar_tooltips: SidebarTooltips,
     /// Whether a sidebar button says what it does on hover.
     icon_tooltips: bool,
+    /// Where a row a sidebar scrolled to is parked; `None` is egui's own
+    /// minimal scroll.
+    scroll_align: Option<egui::Align>,
 }
 
 /// Logical-pixel (normal, heading) sizes for UI text.  `[ui.font] size`
@@ -169,6 +172,7 @@ impl Theme {
             path_style: config.ui.path_style,
             sidebar_tooltips: config.ui.sidebar_tooltips,
             icon_tooltips: config.ui.icon_tooltips,
+            scroll_align: config.ui.sidebar_scroll_align.align(),
         }
     }
 }
@@ -4213,7 +4217,7 @@ impl AlacritreeApp {
                             paint_cursor_outline(ui, header_rect, &theme);
                         }
                         if scrolls(header_is_cursor) || follows_project(&project.root) {
-                            ui.scroll_to_rect(header_rect, None);
+                            ui.scroll_to_rect(header_rect, theme.scroll_align);
                         }
 
                         // Drop target for a reorder drag.  Detected against the
@@ -6559,7 +6563,7 @@ fn paint_git_row_cursor(
     let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), resp.rect.y_range());
     paint_cursor_outline(ui, rect, theme);
     if scroll_into_view {
-        ui.scroll_to_rect(rect, None);
+        ui.scroll_to_rect(rect, theme.scroll_align);
     }
 }
 
@@ -6816,7 +6820,7 @@ fn home_row(
         paint_cursor_outline(ui, full_rect, theme);
     }
     if scroll_into_view {
-        ui.scroll_to_rect(full_rect, None);
+        ui.scroll_to_rect(full_rect, theme.scroll_align);
     }
     HomeAction { activate: resp.clicked() && !spawn_clicked, spawn: spawn_clicked, rect: full_rect }
 }
@@ -7638,7 +7642,7 @@ fn worktree_row(
         paint_cursor_outline(ui, full_rect, theme);
     }
     if scroll_into_view {
-        ui.scroll_to_rect(full_rect, None);
+        ui.scroll_to_rect(full_rect, theme.scroll_align);
     }
     WorktreeAction {
         // A prunable row is still worth clicking when shells are homed there;
@@ -7776,7 +7780,7 @@ fn session_row(
         paint_cursor_outline(ui, full_rect, theme);
     }
     if scroll_into_view {
-        ui.scroll_to_rect(full_rect, None);
+        ui.scroll_to_rect(full_rect, theme.scroll_align);
     }
     if draggable {
         resp.dnd_set_drag_payload(DraggedSession(row.id));
