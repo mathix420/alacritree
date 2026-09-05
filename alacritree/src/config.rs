@@ -668,6 +668,44 @@ fn parse_search_scope(raw: Option<&str>) -> SearchScope {
     }
 }
 
+/// `[ui.session_reorder] scope`: how far a session may travel when the user
+/// reorders it.  Widening it makes a reorder step able to change which
+/// workspace a session belongs to, which is why the default keeps a session
+/// inside the one it was spawned in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub enum ReorderScope {
+    /// Only among the sessions of its own workspace.
+    #[default]
+    Workspace,
+    /// Across the worktrees of the project that owns its workspace.  Home
+    /// belongs to no project, so a home session stays home.
+    Project,
+    /// Home and every project's worktrees, in sidebar order.
+    Anywhere,
+}
+
+fn parse_reorder_scope(raw: Option<&str>) -> ReorderScope {
+    match raw {
+        None => ReorderScope::default(),
+        Some("workspace") => ReorderScope::Workspace,
+        Some("project") => ReorderScope::Project,
+        Some("anywhere") => ReorderScope::Anywhere,
+        Some(other) => {
+            log::warn!("unknown ui.session_reorder.scope value {other:?}, using \"workspace\"");
+            ReorderScope::default()
+        },
+    }
+}
+
+/// Whether session rows can be dragged, and how far a reorder may carry a
+/// session.  `drag` is a startup default only: the app copies it into runtime
+/// state that `ToggleSessionDrag` flips, and nothing is persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub struct SessionReorder {
+    pub drag: bool,
+    pub scope: ReorderScope,
+}
+
 /// `[ui] sidebar_tooltips`: when a sidebar row offers its full name on hover.
 /// Governs both sidebars — a git panel row's path answers to it the same way a
 /// worktree or session name does.
@@ -988,6 +1026,9 @@ pub struct UiTheme {
     pub icon_tooltips: bool,
     /// Show single-session sidebar rows / tab segments ([`SessionDisplay`]).
     pub session_display: SessionDisplay,
+    /// Mouse-drag gate and travel limit for reordering sessions
+    /// ([`SessionReorder`]).
+    pub session_reorder: SessionReorder,
     /// Draw the terminal grid through an OpenGL paint callback instead of
     /// handing epaint a mesh: one twelve-byte record per cell, and the vertex
     /// shader derives the quads.  Off by default — it needs a GL 3 context and
@@ -1091,6 +1132,7 @@ impl Default for UiTheme {
             sidebar_tooltips: SidebarTooltips::default(),
             icon_tooltips: true,
             session_display: SessionDisplay::default(),
+            session_reorder: SessionReorder::default(),
             gpu_grid: false,
             decorations: Decorations::default(),
             pr_status: false,
@@ -1984,6 +2026,17 @@ struct RawSessionDisplay {
     tabs_always: Option<bool>,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default)]
+struct RawSessionReorder {
+    /// Let a session row be dragged with the mouse to reorder it.
+    drag: Option<bool>,
+    /// How far a reorder may carry a session: "workspace" (default) |
+    /// "project" | "anywhere".
+    #[schemars(extend("enum" = ["workspace", "project", "anywhere"]))]
+    scope: Option<String>,
+}
+
 /// Corrections applied to what the font reports for its underline and
 /// strikeout.  Each value is `"2px"` (physical pixels, added), `"2pt"` or a
 /// bare `"2"` (points, added), or `"150%"` (a multiplier).  Positive moves a
@@ -2130,6 +2183,9 @@ struct RawUi {
     /// Whether per-session rows and tabs appear before a workspace has two
     /// sessions.
     session_display: RawSessionDisplay,
+    /// Whether session rows can be dragged, and how far a reorder may carry
+    /// a session.
+    session_reorder: RawSessionReorder,
     /// Explicit `delta` program for the diff pane.  Set, it is used verbatim
     /// in git's `core.pager` and skips WSL delta autodiscovery; unset, native
     /// diffs run bare `delta` from PATH.
@@ -2396,6 +2452,10 @@ impl RawConfig {
             session_display: SessionDisplay {
                 sidebar_always: self.ui.session_display.sidebar_always.unwrap_or(false),
                 tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
+            },
+            session_reorder: SessionReorder {
+                drag: self.ui.session_reorder.drag.unwrap_or(false),
+                scope: parse_reorder_scope(self.ui.session_reorder.scope.as_deref()),
             },
             gpu_grid: self.ui.gpu_grid.unwrap_or(false),
             decorations: Decorations {
@@ -3324,6 +3384,38 @@ program = "second"
         let sd = raw.into_config().ui.session_display;
         assert!(sd.sidebar_always);
         assert!(sd.tabs_always);
+    }
+
+    #[test]
+    fn session_reorder_defaults_to_off_and_workspace_scope() {
+        let ui = ui_from_toml("");
+        assert!(!ui.session_reorder.drag);
+        assert_eq!(ui.session_reorder.scope, ReorderScope::Workspace);
+    }
+
+    #[test]
+    fn session_reorder_parses_every_scope() {
+        for (raw, expected) in [
+            ("workspace", ReorderScope::Workspace),
+            ("project", ReorderScope::Project),
+            ("anywhere", ReorderScope::Anywhere),
+        ] {
+            let ui = ui_from_toml(&format!("[ui.session_reorder]\nscope = \"{raw}\""));
+            assert_eq!(ui.session_reorder.scope, expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn session_reorder_invalid_scope_falls_back_to_workspace() {
+        let ui = ui_from_toml("[ui.session_reorder]\nscope = \"everywhere\"");
+        assert_eq!(ui.session_reorder.scope, ReorderScope::Workspace);
+    }
+
+    #[test]
+    fn session_reorder_partial_table_leaves_the_other_key_alone() {
+        let ui = ui_from_toml("[ui.session_reorder]\ndrag = true");
+        assert!(ui.session_reorder.drag);
+        assert_eq!(ui.session_reorder.scope, ReorderScope::Workspace);
     }
 
     #[test]

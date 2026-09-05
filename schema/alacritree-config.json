@@ -893,6 +893,24 @@
       },
       "type": "object"
     },
+    "RawSessionReorder": {
+      "properties": {
+        "drag": {
+          "description": "Let a session row be dragged with the mouse to reorder it.",
+          "type": "boolean"
+        },
+        "scope": {
+          "description": "How far a reorder may carry a session: \"workspace\" (default) |\n\"project\" | \"anywhere\".",
+          "enum": [
+            "workspace",
+            "project",
+            "anywhere"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "RawSet": {
       "properties": {
         "black": {
@@ -1150,6 +1168,10 @@
         "session_display": {
           "$ref": "#/$defs/RawSessionDisplay",
           "description": "Whether per-session rows and tabs appear before a workspace has two\nsessions."
+        },
+        "session_reorder": {
+          "$ref": "#/$defs/RawSessionReorder",
+          "description": "Whether session rows can be dragged, and how far a reorder may carry\na session."
         },
         "sidebar_accent": {
           "anyOf": [
