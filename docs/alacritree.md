@@ -455,10 +455,13 @@ icon_tooltips      = true        # whether a sidebar icon explains itself on
 confirm_session_close = "never"  # when the sidebar × asks before killing a PTY:
                                  # "never" (default) | "busy" | "always"
 last_session_close = "respawn"   # what happens when the on-screen workspace
-                                 # stops having sessions: "respawn" (default)
-                                 # starts a fresh one, "navigate" moves to
-                                 # another workspace, "ring_global" and
-                                 # "ring_project" move along the session ring
+                                 # stops having sessions, whether the last one
+                                 # closed or the worktree was deleted:
+                                 # "respawn" (default) starts a fresh one,
+                                 # "navigate" moves to another workspace,
+                                 # "ring_global" and "ring_project" move to the
+                                 # nearest surviving session in the ring, else
+                                 # home
 pr_status          = false  # poll `gh` for each branch's open PR, which drives
                             # the PR row icons, the PR-state filters, and $pr
                             # below (default false)
