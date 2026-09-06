@@ -1743,7 +1743,7 @@ impl AlacritreeApp {
     /// workspace either navigated away in `close_session` or shows the
     /// "no session" placeholder.
     fn adopt_active_session(&mut self) {
-        let ws_idx = self.workspace_session_indices(&self.current_workspace);
+        let ws_idx = self.workspace_display_indices(&self.current_workspace);
         if let Some(&idx) = ws_idx.first() {
             let id = self.sessions[idx].id;
             self.active_session.insert(self.current_workspace.clone(), id);
@@ -2008,15 +2008,6 @@ impl AlacritreeApp {
         }
     }
 
-    fn workspace_session_indices(&self, ws: &WorkspaceKey) -> Vec<usize> {
-        self.sessions
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.working_directory == *ws)
-            .map(|(i, _)| i)
-            .collect()
-    }
-
     /// The sessions of `ws` a reorder may move, in the order they are drawn.
     ///
     /// A session attached to a harness pane is not among them: its place in
@@ -2035,9 +2026,18 @@ impl AlacritreeApp {
 
     /// `ws`'s sessions in the order the sidebar and the tab strip draw them:
     /// alacritree's own first, then the harness-backed ones in the harness's
-    /// order, so cycling tabs walks the list the user is looking at.
+    /// order.  Every ring the user steps through is built from here, so a
+    /// press walks the list on screen rather than the order the sessions
+    /// happened to open in — the two part company as soon as a harness pane
+    /// is attached out of the harness's own order.
     fn workspace_display_indices(&self, ws: &WorkspaceKey) -> Vec<usize> {
-        let mut indices = self.workspace_session_indices(ws);
+        let mut indices: Vec<usize> = self
+            .sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.working_directory == *ws)
+            .map(|(i, _)| i)
+            .collect();
         indices.sort_by_key(|i| match self.sessions[*i].herdr_key.clone() {
             Some(key) => (1, self.herdr_pane_index(&key).unwrap_or(usize::MAX)),
             None => (0, 0),
@@ -2241,7 +2241,7 @@ impl AlacritreeApp {
             .into_iter()
             .flat_map(|ws| {
                 let entries: Vec<_> = self
-                    .workspace_session_indices(&ws)
+                    .workspace_display_indices(&ws)
                     .into_iter()
                     .map(|i| (ws.clone(), self.sessions[i].id))
                     .collect();
@@ -2286,7 +2286,7 @@ impl AlacritreeApp {
             .flat_map(|workspace| {
                 let project =
                     sidebar_nav::project_of(&self.projects, &workspace).map(Path::to_path_buf);
-                self.workspace_session_indices(&workspace)
+                self.workspace_display_indices(&workspace)
                     .into_iter()
                     .map(|i| RingEntry {
                         project: project.clone(),
@@ -7916,7 +7916,7 @@ fn base_branch_target(
 
 /// The session a SelectNextSession/SelectPreviousSession press lands on:
 /// one flat ring over every open session, workspaces in sidebar order and
-/// each workspace's sessions in spawn order.  `None` means stay put — a
+/// each workspace's sessions in the order its rows are drawn.  `None` means stay put — a
 /// ring too small to cycle, or an active session missing from the ring
 /// (its worktree turned prunable).  With no active session (an emptied
 /// workspace on screen) the first entry re-anchors the cycle.
