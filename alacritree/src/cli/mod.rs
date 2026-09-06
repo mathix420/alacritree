@@ -28,6 +28,19 @@ use crate::ipc::{self, IpcRequest, SendError};
 /// installation copies only the executable — so the text ships inside it.
 const FONT_LICENSE: &str = include_str!("../../assets/FONT-LICENSE.txt");
 
+/// One `-o` fragment, which is a whole TOML document rather than a bare
+/// `key=value`, so a dotted key does the nesting: `ui.gpu_grid=false` parses to
+/// `{ui = {gpu_grid = false}}`.  Mirrors alacritty's `ParsedOptions`.
+///
+/// Alacritty warns and skips a fragment it cannot parse, because the same
+/// values also arrive at runtime over IPC, where refusing would kill a live
+/// window.  These only arrive at launch, so refusing is safe here, and a
+/// measurement run that silently dropped the setting it was varying is worse
+/// than one that never started.
+fn parse_override(fragment: &str) -> Result<toml::Value, String> {
+    toml::from_str(fragment).map_err(|e| e.to_string())
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "alacritree", version, about = "Alacritty fork with worktree-aware sidebars")]
 pub struct Cli {
@@ -41,6 +54,28 @@ pub struct Cli {
     /// Talk to the instance listening on this socket rather than finding one.
     #[arg(long, global = true, value_name = "PATH")]
     socket: Option<PathBuf>,
+
+    /// Read alacritty.toml and alacritree.toml from this directory instead of
+    /// the search path. A file missing there is missing, not looked up
+    /// elsewhere.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub config_dir: Option<PathBuf>,
+
+    /// Write this session's log here instead of under the log directory. Turns
+    /// logging on by itself, so the file is never empty.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub log_file: Option<PathBuf>,
+
+    /// Override a config value, repeatable: `-o 'ui.gpu_grid=false'`. Merged
+    /// over both config files.
+    #[arg(
+        short = 'o',
+        long = "option",
+        global = true,
+        value_name = "TOML",
+        value_parser = parse_override
+    )]
+    pub options: Vec<toml::Value>,
 
     /// Print the licence for the bundled symbol font and exit.
     #[arg(long)]
@@ -240,14 +275,23 @@ pub fn run(cli: Cli) -> Option<i32> {
         },
         // Diagnosing the machine is not something a running instance can answer:
         // the report has to be truthful when there is nothing to ask.
-        Command::Doctor => return Some(doctor::run(cli.json, cli.socket.as_deref())),
+        Command::Doctor => {
+            return Some(doctor::run(
+                cli.json,
+                cli.socket.as_deref(),
+                cli.config_dir.as_deref(),
+                &cli.options,
+            ));
+        },
         // Reads files rather than asking an instance, so it answers when
         // nothing is running — which is exactly when a crash is being chased.
         Command::Crashes { all } => return Some(crashes::run(cli.json, all)),
         Command::Install { dest } => return Some(install::run(dest, cli.json)),
         // Generated from the config types in this binary, so it answers with
         // no instance running and no config on disk.
-        Command::Schema { command } => return Some(run_schema(command)),
+        Command::Schema { command } => {
+            return Some(run_schema(command, cli.config_dir.as_deref()));
+        },
         #[cfg(debug_assertions)]
         Command::ProvokeLockPanic => {
             crate::crash_log::provoke_lock_panic();
@@ -256,17 +300,26 @@ pub fn run(cli: Cli) -> Option<i32> {
         other => to_request(other),
     };
 
-    Some(execute(&request, cli.socket.as_deref(), cli.json))
+    let config = ConfigSource { dir: cli.config_dir.as_deref(), overrides: &cli.options };
+    Some(execute(&request, cli.socket.as_deref(), cli.json, config))
 }
 
-fn run_schema(command: Option<SchemaCommand>) -> i32 {
+/// Where the offline path reads config from, carried down from the CLI args.
+/// A request a running instance answers never reads config at all.
+#[derive(Clone, Copy)]
+struct ConfigSource<'a> {
+    dir: Option<&'a Path>,
+    overrides: &'a [toml::Value],
+}
+
+fn run_schema(command: Option<SchemaCommand>, config_dir: Option<&Path>) -> i32 {
     match command {
         None => {
             schema::print();
             0
         },
         Some(SchemaCommand::Init { path }) => {
-            let path = path.unwrap_or_else(schema::default_config_path);
+            let path = path.unwrap_or_else(|| schema::default_config_path(config_dir));
             match schema::init(&path) {
                 Ok(()) => 0,
                 Err(e) => {
@@ -278,8 +331,13 @@ fn run_schema(command: Option<SchemaCommand>) -> i32 {
     }
 }
 
-fn execute(request: &IpcRequest, socket: Option<&Path>, as_json: bool) -> i32 {
-    match dispatch(request, socket) {
+fn execute(
+    request: &IpcRequest,
+    socket: Option<&Path>,
+    as_json: bool,
+    config: ConfigSource<'_>,
+) -> i32 {
+    match dispatch(request, socket, config) {
         Ok(value) => {
             if as_json {
                 println!("{:#}", value);
@@ -302,9 +360,22 @@ fn execute(request: &IpcRequest, socket: Option<&Path>, as_json: bool) -> i32 {
 }
 
 /// Ask a running alacritree, falling back to serving the request ourselves.
-fn dispatch(request: &IpcRequest, socket: Option<&Path>) -> Result<serde_json::Value, SendError> {
+fn dispatch(
+    request: &IpcRequest,
+    socket: Option<&Path>,
+    config: ConfigSource<'_>,
+) -> Result<serde_json::Value, SendError> {
     match ipc::send_request(socket, request, timeout_for(request)) {
-        Err(SendError::NoInstance) => offline::handle(request).map_err(SendError::Failed),
+        Err(SendError::NoInstance) => {
+            // Serving the request ourselves means resolving `[general]
+            // state_dir` the way the window does, or we answer from a file
+            // nothing is writing.  Resolved here rather than in `run` because
+            // a request a running instance answers never needs the config.
+            if let Some(dir) = crate::config::load(config.dir, config.overrides).0.state_dir {
+                crate::state::set_dir(dir);
+            }
+            offline::handle(request).map_err(SendError::Failed)
+        },
         result => result,
     }
 }
@@ -399,6 +470,37 @@ mod tests {
     #[test]
     fn the_command_tree_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    fn options_of(args: &[&str]) -> Vec<toml::Value> {
+        Cli::try_parse_from(args).expect("parses").options
+    }
+
+    /// The whole point of the short form: an agent varies one key per run
+    /// without writing a file, and `-o` twice is two independent settings.
+    #[test]
+    fn repeated_options_each_become_a_document() {
+        let options = options_of(&["alacritree", "-o", "ui.gpu_grid=false", "-o", "font.size=14"]);
+
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0]["ui"]["gpu_grid"].as_bool(), Some(false));
+        assert_eq!(options[1]["font"]["size"].as_integer(), Some(14));
+    }
+
+    /// A run that quietly dropped the setting it was varying reports a
+    /// measurement of the default and calls it the feature.
+    #[test]
+    fn a_fragment_that_is_not_toml_fails_the_launch() {
+        assert!(Cli::try_parse_from(["alacritree", "-o", "ui.gpu_grid"]).is_err());
+    }
+
+    /// Global, so it reaches `doctor`, which resolves the same config a launch
+    /// would.
+    #[test]
+    fn options_are_accepted_after_a_subcommand() {
+        let options = options_of(&["alacritree", "doctor", "-o", "ui.gpu_grid=false"]);
+
+        assert_eq!(options.len(), 1);
     }
 
     #[test]
@@ -547,7 +649,9 @@ mod tests {
                 .unwrap();
         });
 
-        let reply = dispatch(&IpcRequest::ListProjects, Some(socket.path())).expect("a reply");
+        let config = ConfigSource { dir: None, overrides: &[] };
+        let reply =
+            dispatch(&IpcRequest::ListProjects, Some(socket.path()), config).expect("a reply");
 
         // The offline path would answer with the real project list, so this
         // sentinel is only reachable through the socket.

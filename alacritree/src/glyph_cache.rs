@@ -124,7 +124,7 @@ pub fn growth_offset(glyph_w: f32, cell_w: f32, spare: usize) -> f32 {
 /// stores atlas positions, so it only means anything while that atlas is the
 /// one being sampled.
 #[derive(Clone, Copy, PartialEq)]
-struct AtlasState {
+pub(crate) struct AtlasState {
     pixels_per_point: f32,
     max_texture_side: usize,
     image_size: [usize; 2],
@@ -132,7 +132,7 @@ struct AtlasState {
 }
 
 impl AtlasState {
-    fn read(ctx: &Context) -> Self {
+    pub(crate) fn read(ctx: &Context) -> Self {
         ctx.fonts(|f| Self {
             pixels_per_point: f.pixels_per_point(),
             max_texture_side: f.max_texture_side(),
@@ -146,7 +146,7 @@ impl AtlasState {
     /// growth moves nothing and is folded in anyway: it costs one relayout of
     /// the visible glyphs on a frame the atlas changed shape, and keeping the
     /// rule to "anything moved" leaves no repack unnoticed.
-    fn outlived_by(self, now: Self) -> bool {
+    pub(crate) fn outlived_by(self, now: Self) -> bool {
         self.pixels_per_point != now.pixels_per_point
             || self.max_texture_side != now.max_texture_side
             || self.image_size != now.image_size

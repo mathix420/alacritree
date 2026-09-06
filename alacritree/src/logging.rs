@@ -89,6 +89,20 @@ pub fn open_session_log(dir: &Path) -> Option<File> {
     None
 }
 
+/// This process's log at a path the caller named.  Truncates rather than
+/// refusing a file that exists, so re-running a measurement overwrites its own
+/// output instead of failing on the second attempt.
+///
+/// Outside retention: [`prune_session_logs`] only considers names carrying the
+/// generated `alacritree-<start>-<pid>` shape, and a file the user named is
+/// theirs to delete.
+pub fn open_log_at(path: &Path) -> Option<File> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    File::create(path).ok()
+}
+
 /// Liveness first, age second.  An idle window can leave a week-old mtime while
 /// still running, and Windows honors a delete against an open handle — the
 /// process would keep writing into a file no path reaches.
@@ -116,6 +130,44 @@ mod tests {
     use super::*;
     use crate::logdir::ProcessId;
     use std::fs::OpenOptions;
+
+    #[test]
+    fn a_named_log_replaces_what_an_earlier_run_left() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("measurement.log");
+        std::fs::write(&path, b"stale output from the previous run").expect("seed the file");
+
+        let mut file = open_log_at(&path).expect("the named log opens");
+        file.write_all(b"fresh").expect("write");
+        drop(file);
+
+        assert_eq!(std::fs::read_to_string(&path).expect("read back"), "fresh");
+    }
+
+    /// A path a shell tab-completed into a directory that does not exist yet
+    /// should still produce a log rather than silently nothing.
+    #[test]
+    fn a_named_log_creates_the_directories_leading_to_it() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("runs").join("gate-off").join("session.log");
+
+        assert!(open_log_at(&path).is_some(), "the named log opens");
+        assert!(path.exists(), "the file exists at the path asked for");
+    }
+
+    /// Retention reads the generated `alacritree-<start>-<pid>` shape, so a
+    /// file the caller named is never a deletion candidate.
+    #[test]
+    fn retention_leaves_a_named_log_alone() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("keep-me.log");
+        drop(open_log_at(&path).expect("the named log opens"));
+        set_mtime_days_ago(&path, RETAIN_DAYS + 30);
+
+        prune_session_logs(dir.path());
+
+        assert!(path.exists(), "a named log outlives retention");
+    }
 
     /// A sink filled after `Target::Pipe` has already moved the writer is the
     /// whole reason the handle is shared.

@@ -17,7 +17,7 @@ use crate::ipc::{IpcRequest, IpcResult};
 use crate::projects::{self, Project, project_json};
 use crate::state::{self, PersistedProject, PersistedState};
 use crate::worktree::{self as wt, CreateRequest};
-use crate::{git_status, ipc, scratchpad};
+use crate::{git_status, ipc, jobs, scratchpad};
 
 pub fn handle(request: &IpcRequest) -> IpcResult {
     let Some(path) = state::config_path() else {
@@ -58,7 +58,9 @@ fn handle_at(state_path: &Path, request: &IpcRequest) -> IpcResult {
             Ok(project_json(&known))
         },
         IpcRequest::GitStatus { path } => {
-            Ok(ipc::git_status_json(&git_status::compute(path, None)))
+            Ok(ipc::git_status_json(&jobs::on_this_thread(|blocking| {
+                git_status::compute(path, None, blocking)
+            })))
         },
         IpcRequest::CreateWorktree { project_root, branch } => {
             create_worktree(project_root.clone(), branch.clone())
@@ -88,7 +90,7 @@ fn add(state_path: &Path, path: &Path) -> Project {
             s.projects.push(PersistedProject { root, expanded: true, shell: None, label: None });
         }
     });
-    Project::discover(path.to_path_buf(), false).project
+    jobs::on_this_thread(|blocking| Project::discover(path.to_path_buf(), false, blocking)).project
 }
 
 fn remove(state_path: &Path, root: &Path) -> Result<(), String> {
@@ -123,7 +125,8 @@ fn discover_all(state_path: &Path) -> Vec<Project> {
     projects
         .into_iter()
         .map(|p| {
-            let mut project = Project::discover(p.root, false).project;
+            let mut project =
+                jobs::on_this_thread(|blocking| Project::discover(p.root, false, blocking)).project;
             project.expanded = p.expanded;
             project.label = p.label;
             project
@@ -138,7 +141,9 @@ fn create_worktree(project_root: PathBuf, branch: String) -> IpcResult {
     wt::validate_branch_name(&branch)?;
     let request = CreateRequest { project_root, default_branch: None, branch, base_dir: None };
     let mut steps = Vec::new();
-    let path = wt::create(&request, |step| steps.push(step.to_string()))?;
+    let path = jobs::on_this_thread(|blocking| {
+        wt::create(&request, |step| steps.push(step.to_string()), blocking)
+    })?;
     Ok(json!({ "path": path, "steps": steps }))
 }
 
@@ -216,13 +221,10 @@ mod tests {
     }
 
     fn rename_project(state_path: &Path, root: &Path, label: Option<&str>) -> IpcResult {
-        handle_at(
-            state_path,
-            &IpcRequest::RenameProject {
-                root: root.to_path_buf(),
-                label: label.map(str::to_string),
-            },
-        )
+        handle_at(state_path, &IpcRequest::RenameProject {
+            root: root.to_path_buf(),
+            label: label.map(str::to_string),
+        })
     }
 
     /// The label is display state in `state.toml`, so it must stick — and

@@ -5,18 +5,25 @@ use egui::{Key, Modifiers};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct KeyBinding {
     pub key: Key,
     pub mods: Modifiers,
     pub action: BindingAction,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub enum BindingAction {
-    Chars(Vec<u8>),
+    Chars(#[serde(serialize_with = "chars_as_string")] Vec<u8>),
     Named(NamedAction),
     Unsupported(String),
+}
+
+/// The bytes a binding writes are an escape sequence, which reads as an
+/// escaped string rather than as the array of integers a byte vector
+/// serialises to by default.
+fn chars_as_string<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&String::from_utf8_lossy(bytes).escape_default().to_string())
 }
 
 /// A `Copy` stand-in for an action's identity, for logs that outlive the
@@ -49,7 +56,7 @@ impl BindingAction {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum NamedAction {
     Paste,
     PasteSelection,
@@ -122,6 +129,15 @@ pub enum NamedAction {
     ToggleSessionRows,
     /// Flip the runtime `session_display.tabs_always` value.
     ToggleSessionTabs,
+    /// Flip whether session rows can be dragged with the mouse.
+    ToggleSessionDrag,
+    /// Move a session one position earlier in the sidebar and tab strip,
+    /// continuing into the previous workspace when `[ui.session_reorder]
+    /// scope` allows it.
+    MoveSessionUp,
+    /// Move a session one position later, continuing into the next workspace
+    /// when the scope allows it.
+    MoveSessionDown,
     /// Open the base-branch picker for the sidebar-cursored or current worktree.
     SetBaseBranch,
     /// 1-indexed into the `[[ui.profiles]]` order.
@@ -351,6 +367,9 @@ impl NamedAction {
             Self::PalettePageDown => "Move the palette cursor a screenful down".into(),
             Self::ToggleSessionRows => "Toggle single-session sidebar rows".into(),
             Self::ToggleSessionTabs => "Toggle single-session tab segments".into(),
+            Self::ToggleSessionDrag => "Toggle dragging session rows to reorder".into(),
+            Self::MoveSessionUp => "Move the session one position up".into(),
+            Self::MoveSessionDown => "Move the session one position down".into(),
             Self::SetBaseBranch => "Choose the branch the git panel diffs against".into(),
             Self::FocusLeft => "Move panel focus left (TUIs get the key first)".into(),
             Self::FocusRight => "Move panel focus right (TUIs get the key first)".into(),
@@ -411,12 +430,13 @@ pub struct RawBinding {
     /// Bytes to write to the PTY, with the usual escapes (`\x1b`, `\u001b`).
     #[serde(default)]
     pub chars: Option<String>,
-    /// Named action to run, e.g. `"Paste"`, `"ToggleLeftSidebar"`.  Not
-    /// enumerated here: the shared `alacritty.toml` legitimately carries
-    /// actions only the real alacritty implements, and alacritree ignores
-    /// those rather than rejecting them.  `docs/keyboard-shortcuts.md` lists
-    /// what alacritree acts on.
+    /// Named action to run, e.g. `"Paste"`, `"ToggleLeftSidebar"`.  The schema
+    /// suggests every name alacritree implements without rejecting the rest:
+    /// the shared `alacritty.toml` legitimately carries actions only the real
+    /// alacritty implements, and alacritree ignores those rather than
+    /// rejecting them.  `docs/keyboard-shortcuts.md` says what each one does.
     #[serde(default)]
+    #[schemars(schema_with = "action_schema")]
     pub action: Option<String>,
     /// External program to run.  alacritree parses it so the binding still
     /// displaces alacritty's default for that key, but never runs it.
@@ -951,6 +971,105 @@ fn parse_mods(s: &str) -> Option<Modifiers> {
     Some(m)
 }
 
+/// Every simple (non-parametrized) `NamedAction`, kept in sync with the enum by
+/// hand. Mirrors the old shortcuts window's bindable list; `SelectTab`/
+/// `SpawnProfile` are excluded here because they carry an index.
+pub fn bindable_actions() -> [NamedAction; 66] {
+    use NamedAction::*;
+    [
+        Paste,
+        PasteSelection,
+        Copy,
+        CopySelection,
+        ScrollPageUp,
+        ScrollPageDown,
+        ScrollHalfPageUp,
+        ScrollHalfPageDown,
+        ScrollLineUp,
+        ScrollLineDown,
+        ScrollToTop,
+        ScrollToBottom,
+        ClearHistory,
+        SpawnNewInstance,
+        IncreaseFontSize,
+        DecreaseFontSize,
+        ResetFontSize,
+        ToggleFullscreen,
+        ToggleMaximized,
+        Minimize,
+        SelectNextTab,
+        SelectPreviousTab,
+        SelectLastTab,
+        SelectNextSession,
+        SelectPreviousSession,
+        SelectNextWorkspace,
+        SelectPreviousWorkspace,
+        OpenScratchpad,
+        ToggleLeftSidebar,
+        ToggleRightSidebar,
+        AddProject,
+        ToggleSidebarFocus,
+        CloseSession,
+        SidebarTop,
+        SidebarBottom,
+        SidebarNextProject,
+        SidebarPreviousProject,
+        FocusProjectsSidebar,
+        FocusGitSidebar,
+        FocusTerminal,
+        FocusLeft,
+        FocusRight,
+        ToggleSessionRows,
+        ToggleSessionTabs,
+        ToggleSessionDrag,
+        MoveSessionUp,
+        MoveSessionDown,
+        SetBaseBranch,
+        SidebarSearchConfirm,
+        SidebarSearchCancel,
+        SidebarSearchCancelToTerminal,
+        Quit,
+        TogglePalette,
+        ToggleSessionsFilter,
+        ToggleAttentionFilter,
+        TogglePrOpenFilter,
+        TogglePrDraftFilter,
+        TogglePrMergedFilter,
+        TogglePrClosedFilter,
+        ClearProjectFilters,
+        ToggleModifiedFilter,
+        ToggleDeletedFilter,
+        ToggleUntrackedFilter,
+        ClearGitFilters,
+        ToggleSearchScope,
+        RefreshPrStatus,
+    ]
+}
+
+/// Every name `parse_action` accepts for an action alacritree implements.
+/// `NoOp` and `ReceiveChar` are missing from `bindable_actions` because the
+/// palette can run neither, but both are ordinary config vocabulary, and
+/// `NoOp` is spelled `None` in a binding.
+fn action_names() -> Vec<String> {
+    let mut names: Vec<String> = bindable_actions().iter().map(NamedAction::config_name).collect();
+    names.extend((1u8..=9).map(|n| NamedAction::SelectTab(n).config_name()));
+    names.extend((1u8..=9).map(|n| NamedAction::SpawnProfile(n).config_name()));
+    names.push("None".into());
+    names.push("ReceiveChar".into());
+    names
+}
+
+/// The schema for a binding's `action`: every name alacritree implements as an
+/// `enum`, beside an open string branch.  The `enum` alone would be wrong —
+/// the shared `alacritty.toml` legitimately carries actions only the real
+/// alacritty implements, which alacritree ignores rather than rejects — so an
+/// editor completes from the names while every other value still validates.
+fn action_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "anyOf": [{ "enum": action_names() }, { "type": "string" }],
+    })
+}
+
 pub fn parse_action(name: &str) -> BindingAction {
     use NamedAction::*;
     match name {
@@ -1016,6 +1135,9 @@ pub fn parse_action(name: &str) -> BindingAction {
         "FocusTerminal" => BindingAction::Named(FocusTerminal),
         "ToggleSessionRows" => BindingAction::Named(ToggleSessionRows),
         "ToggleSessionTabs" => BindingAction::Named(ToggleSessionTabs),
+        "ToggleSessionDrag" => BindingAction::Named(ToggleSessionDrag),
+        "MoveSessionUp" => BindingAction::Named(MoveSessionUp),
+        "MoveSessionDown" => BindingAction::Named(MoveSessionDown),
         "SetBaseBranch" => BindingAction::Named(SetBaseBranch),
         "SpawnProfile1" => BindingAction::Named(SpawnProfile(1)),
         "SpawnProfile2" => BindingAction::Named(SpawnProfile(2)),
@@ -1325,6 +1447,9 @@ mod tests {
             ("FocusGitSidebar", NamedAction::FocusGitSidebar),
             ("ToggleSessionRows", NamedAction::ToggleSessionRows),
             ("ToggleSessionTabs", NamedAction::ToggleSessionTabs),
+            ("ToggleSessionDrag", NamedAction::ToggleSessionDrag),
+            ("MoveSessionUp", NamedAction::MoveSessionUp),
+            ("MoveSessionDown", NamedAction::MoveSessionDown),
             ("FocusLeft", NamedAction::FocusLeft),
             ("FocusRight", NamedAction::FocusRight),
             ("SetBaseBranch", NamedAction::SetBaseBranch),
@@ -1343,6 +1468,20 @@ mod tests {
         ] {
             let b = parse_bindings(vec![raw_action("F1", None, name)]);
             assert_eq!(named_matches(&b, Key::F1, Modifiers::NONE), vec![expected], "{name}");
+        }
+    }
+
+    #[test]
+    fn session_reorder_actions_parse_from_config_names() {
+        for (name, expected) in [
+            ("ToggleSessionDrag", NamedAction::ToggleSessionDrag),
+            ("MoveSessionUp", NamedAction::MoveSessionUp),
+            ("MoveSessionDown", NamedAction::MoveSessionDown),
+        ] {
+            assert!(
+                matches!(parse_action(name), BindingAction::Named(a) if a == expected),
+                "{name} does not parse"
+            );
         }
     }
 
