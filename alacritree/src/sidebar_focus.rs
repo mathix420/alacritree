@@ -313,9 +313,9 @@ pub struct UiInputs<'a> {
     /// moves every PR lookup key while nothing observed changes.
     pub active_workspace: Option<&'a Path>,
     pub active_branch: Option<&'a str>,
-    /// Advances when a herdr poll changes something a row draws.  `state_change_seq`
-    /// churn deliberately does not move it, so an idle agent repainting does not
-    /// rebuild the tree.
+    /// Advances when a herdr poll changes something a row draws.  Agent churn
+    /// no row shows deliberately does not move it, so an idle agent repainting
+    /// does not rebuild the tree.
     pub herdr_generation: u64,
 }
 

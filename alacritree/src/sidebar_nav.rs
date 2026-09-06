@@ -228,16 +228,16 @@ pub fn step(rows: &[SidebarRow], cursor: &SidebarRow, delta: i32) -> SidebarRow 
 }
 
 /// The row owning `cursor` — the standard tree-view "Left jumps to parent"
-/// idiom.  A worktree's parent is its project header; a session's parent is
-/// the worktree (or Home) row it's listed under.  `None` for Home and
-/// project cursors.
+/// idiom.  A worktree's parent is its project header; a session's or herdr
+/// agent's parent is the worktree (or Home) row it's listed under.  `None`
+/// for Home and project cursors.
 pub fn left_target(rows: &[SidebarRow], cursor: &SidebarRow) -> Option<SidebarRow> {
     let pos = rows.iter().position(|r| r == cursor)?;
     match cursor {
         SidebarRow::Worktree(_) => {
             rows[..pos].iter().rev().find(|r| matches!(r, SidebarRow::Project(_))).cloned()
         },
-        SidebarRow::Session(_) => rows[..pos]
+        SidebarRow::Session(_) | SidebarRow::HerdrAgent(..) => rows[..pos]
             .iter()
             .rev()
             .find(|r| matches!(r, SidebarRow::Worktree(_) | SidebarRow::Home))

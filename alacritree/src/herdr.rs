@@ -69,7 +69,6 @@ pub struct Agent {
     pub status: Status,
     pub cwd: Option<String>,
     pub foreground_cwd: Option<String>,
-    pub state_change_seq: u64,
 }
 
 #[derive(Deserialize)]
@@ -94,8 +93,6 @@ struct RawAgent {
     display_agent: Option<String>,
     cwd: Option<String>,
     foreground_cwd: Option<String>,
-    #[serde(default)]
-    state_change_seq: u64,
 }
 
 /// Agents from one `herdr agent list` reply.  An agent missing an identity
@@ -117,7 +114,6 @@ pub fn parse_agent_list(stdout: &str) -> Vec<Agent> {
                 kind: raw.display_agent.or(raw.agent),
                 cwd: raw.cwd,
                 foreground_cwd: raw.foreground_cwd,
-                state_change_seq: raw.state_change_seq,
             })
         })
         .collect()
@@ -169,20 +165,50 @@ pub fn can_attach(side: &Side) -> bool {
     }
 }
 
+/// How long the attach gesture waits for herdr before calling it a refusal.
+/// These two calls run on the UI thread, and herdr answers a socket on the
+/// same machine in milliseconds; three seconds covers a cold process start
+/// behind an on-access scanner and still keeps a wedged server from taking
+/// the window with it.
+const GESTURE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Runs `f` on a worker thread and gives up on it after [`GESTURE_TIMEOUT`].
+/// `Command::output` has no timeout of its own, so the bound comes from this
+/// side, as the IPC client's does.  A call that times out leaves its thread
+/// parked until the child exits, which is only reachable when herdr is
+/// already wedged.
+fn bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("alacritree-herdr-gesture".into())
+        .spawn(move || {
+            let _ = tx.send(f());
+        })
+        .ok()?;
+    rx.recv_timeout(GESTURE_TIMEOUT).ok()
+}
+
 /// Focuses one pane in the user's own herdr window, the first half of the
 /// native-Windows attach fallback.  A non-zero exit carries herdr's stderr
 /// verbatim rather than `error_code`'s parsed code, since a user-facing
-/// message wants herdr's human-readable text, not its machine code.
-#[allow(clippy::disallowed_methods)] // Running herdr is this function's job.
+/// message wants herdr's human-readable text, not its machine code, and a
+/// server that does not answer inside [`GESTURE_TIMEOUT`] refuses the same
+/// way.
 pub fn focus_agent(side: &Side, pane_id: &str) -> Result<(), String> {
     let (program, args) = side.command(&["agent", "focus", pane_id]);
-    let output = command_ext::hidden(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("failed to focus herdr pane: {e}"))?;
+    #[allow(clippy::disallowed_methods)] // Running herdr is this function's job.
+    let run = move || {
+        command_ext::hidden(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+    };
+    let Some(output) = bounded(run) else {
+        return Err("herdr did not answer while focusing the pane".to_string());
+    };
+    let output = output.map_err(|e| format!("failed to focus herdr pane: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("herdr refused to focus the pane: {stderr}"));
@@ -205,29 +231,36 @@ struct RawSession {
 
 /// The running session to attach to on this side.  `herdr session list
 /// --json` is a flat object rather than the `result`-wrapped envelope
-/// `agent list` uses.  Falls back to `default`, which is the name herdr
-/// gives an unnamed session.
-#[allow(clippy::disallowed_methods)] // Running herdr is this function's job.
-pub fn running_session_name(side: &Side) -> String {
+/// `agent list` uses.  An answer that names nothing falls back to `default`,
+/// the name herdr gives an unnamed session; a server that does not answer
+/// inside [`GESTURE_TIMEOUT`] is an `Err`, because attaching to a guessed
+/// name would only park the wedged wait inside the new session.
+pub fn running_session_name(side: &Side) -> Result<String, String> {
     let (program, args) = side.command(&["session", "list", "--json"]);
+    #[allow(clippy::disallowed_methods)] // Running herdr is this function's job.
+    let run = move || {
+        command_ext::hidden(program)
+            .args(args)
+            .env("WSL_UTF8", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+    };
     let fallback = || "default".to_string();
-    let Ok(output) = command_ext::hidden(program)
-        .args(args)
-        .env("WSL_UTF8", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-    else {
-        return fallback();
+    let Some(output) = bounded(run) else {
+        return Err("herdr did not answer while listing its sessions".to_string());
+    };
+    let Ok(output) = output else {
+        return Ok(fallback());
     };
     if !output.status.success() {
-        return fallback();
+        return Ok(fallback());
     }
-    serde_json::from_slice::<SessionList>(&output.stdout)
+    Ok(serde_json::from_slice::<SessionList>(&output.stdout)
         .ok()
         .and_then(|list| list.sessions.into_iter().find(|s| s.running).map(|s| s.name))
-        .unwrap_or_else(fallback)
+        .unwrap_or_else(fallback))
 }
 
 /// Identifies one herdr agent across polls.
@@ -324,6 +357,12 @@ impl Reach {
         }
     }
 
+    /// Whether this endpoint has been given up on for the process lifetime:
+    /// it failed without ever having answered, so nothing will poll it again.
+    pub fn abandoned(&self) -> bool {
+        self.failing && !self.ever_answered
+    }
+
     pub fn record_success(&mut self) {
         self.ever_answered = true;
         self.failing = false;
@@ -363,7 +402,7 @@ impl EndpointCache {
     }
 
     /// Bumped only when a rendered field changes, so the sidebar's per-frame
-    /// comparison does not rebuild for `state_change_seq` churn nobody can see.
+    /// comparison does not rebuild for agent churn nobody can see.
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -389,16 +428,20 @@ impl EndpointCache {
                     self.pending = None;
                 },
                 Some(Err(code)) => {
-                    if self.reach.record_failure(&code) && code != "server_not_running" {
-                        log::warn!("herdr ({:?}): {code}", self.side);
-                    }
+                    self.note_failure(&code);
                     if !self.agents.is_empty() {
                         self.agents.clear();
                         self.generation = self.generation.wrapping_add(1);
                     }
                     self.pending = None;
                 },
-                None if job.failed() => self.pending = None,
+                // A closure that unwound answered nothing, which is what
+                // `Reach` tracks, and recording it is what stops a panicking
+                // poll from being respawned every tick for the process life.
+                None if job.failed() => {
+                    self.note_failure("poll_panicked");
+                    self.pending = None;
+                },
                 None => return,
             }
         }
@@ -414,10 +457,123 @@ impl EndpointCache {
                 .spawn(jobs::Priority::Background, move |blocking| list_agents(&side, blocking)),
         );
     }
+
+    /// Records one poll that produced no agents, and says so once.  A novel
+    /// code that is not the ordinary "no server here" is a warning; giving up
+    /// on an endpoint is a debug line, so a herdr that is installed but never
+    /// answers can still be explained from a log rather than only by an empty
+    /// sidebar.  Both fire at most once per endpoint, since an endpoint that
+    /// never answered is never polled again.
+    fn note_failure(&mut self, code: &str) {
+        if self.reach.record_failure(code) && code != "server_not_running" {
+            log::warn!("herdr ({:?}): {code}", self.side);
+        }
+        if self.reach.abandoned() {
+            log::debug!("herdr ({:?}): {code}; not polling this endpoint again", self.side);
+        }
+    }
 }
 
-/// Whether anything the sidebar draws changed.  `state_change_seq`
-/// deliberately does not count: it moves on output the row does not show.
+/// How long a listing of running distros stands before it is taken again.
+/// Starting a distro is a human action, so noticing one on a slower clock
+/// than the agent poll's is enough, and each listing is its own `wsl.exe`
+/// spawn.
+const DISTRO_REFRESH: Duration = Duration::from_secs(10);
+
+/// Every herdr server alacritree talks to.  The native side is permanent; a
+/// WSL side exists only while its distro's VM is up, because reaching into a
+/// stopped distro boots it — seconds of disk I/O and a VM's worth of memory —
+/// only to find that nothing is listening there.
+pub struct Endpoints {
+    caches: Vec<EndpointCache>,
+    /// Moves whenever an endpoint joins or leaves, so a set change reaches the
+    /// sidebar even when the generations it replaces happen to sum the same.
+    membership: u64,
+    running: Option<jobs::Job<Vec<String>>>,
+    last_refresh: Option<Instant>,
+}
+
+impl Default for Endpoints {
+    fn default() -> Self {
+        Self {
+            caches: vec![EndpointCache::new(Side::Native)],
+            membership: 0,
+            running: None,
+            last_refresh: None,
+        }
+    }
+}
+
+impl Endpoints {
+    pub fn caches(&self) -> &[EndpointCache] {
+        &self.caches
+    }
+
+    /// One number standing for every endpoint's rendered state, so the
+    /// sidebar's per-frame comparison stays a `u64` compare.
+    pub fn generation(&self) -> u64 {
+        self.caches.iter().map(EndpointCache::generation).fold(self.membership, u64::wrapping_add)
+    }
+
+    /// Refreshes the endpoint set and each endpoint's agents.  Never blocks.
+    pub fn poll(&mut self, interval: Duration) {
+        self.refresh_running();
+        for cache in &mut self.caches {
+            cache.poll(interval);
+        }
+    }
+
+    /// Keeps the endpoint set in step with which distros are running.  The
+    /// listing itself spawns `wsl.exe`, so it goes through the pool.
+    fn refresh_running(&mut self) {
+        if let Some(job) = &self.running {
+            match job.poll() {
+                Some(running) => {
+                    self.adopt_running(&running);
+                    self.running = None;
+                },
+                None if job.failed() => self.running = None,
+                None => return,
+            }
+        }
+        if self.last_refresh.is_some_and(|t| t.elapsed() < DISTRO_REFRESH) {
+            return;
+        }
+        self.last_refresh = Some(Instant::now());
+        // A machine with nothing registered has nothing to start, so it never
+        // pays for the listing at all.
+        if wsl::distros().is_empty() {
+            return;
+        }
+        self.running = Some(jobs::pool().spawn(jobs::Priority::Background, wsl::running_distros));
+    }
+
+    /// Adopts a listing of running distros: an endpoint appears when its
+    /// distro starts and goes when it stops, since a stopped distro's agents
+    /// went down with its VM.  The native endpoint is never one of them.
+    fn adopt_running(&mut self, running: &[String]) {
+        let before = self.caches.len();
+        self.caches.retain(|cache| match cache.side() {
+            Side::Native => true,
+            Side::Wsl(distro) => running.iter().any(|name| name == distro),
+        });
+        let mut changed = self.caches.len() != before;
+        for distro in running {
+            let side = Side::Wsl(distro.clone());
+            if !self.caches.iter().any(|cache| *cache.side() == side) {
+                self.caches.push(EndpointCache::new(side));
+                changed = true;
+            }
+        }
+        if changed {
+            self.membership = self.membership.wrapping_add(1);
+        }
+    }
+}
+
+/// Whether anything the sidebar draws changed.  Named field by field rather
+/// than a whole-struct compare, so a field herdr reports that no row shows
+/// cannot force the tree to rebuild.
 fn rendered_differs(was: &[Agent], now: &[Agent]) -> bool {
     was.len() != now.len()
         || was.iter().zip(now).any(|(a, b)| {
@@ -612,6 +768,40 @@ mod tests {
     }
 
     #[test]
+    fn an_endpoint_is_abandoned_only_after_a_failure_it_never_answered() {
+        let mut reach = Reach::default();
+        assert!(!reach.abandoned());
+        reach.record_success();
+        reach.record_failure("server_not_running");
+        assert!(!reach.abandoned(), "a server that answered once is retried, not given up on");
+
+        let mut never = Reach::default();
+        never.record_failure("server_not_running");
+        assert!(never.abandoned());
+    }
+
+    /// A stopped distro cannot be running a server, and polling one boots its
+    /// VM, so the endpoint set follows the running distros rather than the
+    /// registered ones.
+    #[test]
+    fn an_endpoint_follows_its_distro_starting_and_stopping() {
+        let mut endpoints = Endpoints::default();
+        assert_eq!(endpoints.caches().len(), 1);
+
+        endpoints.adopt_running(&["kali-linux".to_string()]);
+        let started = endpoints.generation();
+        assert!(endpoints.caches().iter().any(|c| *c.side() == Side::Wsl("kali-linux".into())));
+
+        endpoints.adopt_running(&["kali-linux".to_string()]);
+        assert_eq!(endpoints.generation(), started, "an unchanged set is not a change");
+
+        endpoints.adopt_running(&[]);
+        assert_eq!(endpoints.caches().len(), 1);
+        assert_eq!(*endpoints.caches()[0].side(), Side::Native, "the native side is permanent");
+        assert_ne!(endpoints.generation(), started, "the rows the endpoint carried are gone");
+    }
+
+    #[test]
     fn a_repeated_error_is_logged_once() {
         let mut reach = Reach::default();
         assert!(reach.record_failure("protocol_mismatch"));
@@ -627,16 +817,13 @@ mod tests {
             status,
             cwd: Some("/repo".into()),
             foreground_cwd: None,
-            state_change_seq: 0,
         }
     }
 
     #[test]
-    fn churn_the_sidebar_cannot_see_does_not_count_as_a_change() {
+    fn an_unchanged_agent_list_is_not_a_change() {
         let was = vec![agent("t1", Status::Idle)];
-        let mut now = was.clone();
-        now[0].state_change_seq = 99;
-        assert!(!rendered_differs(&was, &now));
+        assert!(!rendered_differs(&was, &was));
     }
 
     #[test]
@@ -654,7 +841,6 @@ mod tests {
             status: Status::Idle,
             cwd: Some(cwd.into()),
             foreground_cwd: foreground.map(str::to_string),
-            state_change_seq: 0,
         }
     }
 
@@ -704,8 +890,11 @@ mod tests {
         let distro = "kali-linux";
         let workspace = wsl::linux_to_windows("/mnt/c/Users/Lev/repo", distro);
         let spaces = vec![workspace.clone()];
-        let matched =
-            match_workspace(&at("/mnt/c/Users/Lev/repo/src", None), &Side::Wsl(distro.into()), &spaces);
+        let matched = match_workspace(
+            &at("/mnt/c/Users/Lev/repo/src", None),
+            &Side::Wsl(distro.into()),
+            &spaces,
+        );
         assert_eq!(matched, Some(workspace));
     }
 
@@ -713,7 +902,8 @@ mod tests {
     fn a_wsl_agent_outside_every_workspace_still_has_none() {
         let distro = "kali-linux";
         let spaces = vec![wsl::linux_to_windows("/mnt/c/Users/Lev/repo", distro)];
-        let matched = match_workspace(&at("/mnt/d/elsewhere", None), &Side::Wsl(distro.into()), &spaces);
+        let matched =
+            match_workspace(&at("/mnt/d/elsewhere", None), &Side::Wsl(distro.into()), &spaces);
         assert_eq!(matched, None);
     }
 

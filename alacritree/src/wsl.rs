@@ -269,6 +269,42 @@ fn cli_distros(_blocking: &jobs::Blocking) -> Vec<WslDistro> {
     }
 }
 
+/// The distros whose VM is up right now.  Unlike [`distros`], which reads the
+/// registry and describes what is *installed*, this spawns `wsl.exe`, so it
+/// takes a [`jobs::Blocking`] and the answer is deliberately not cached: a
+/// distro starts and stops while alacritree runs.
+#[cfg(windows)]
+#[allow(clippy::disallowed_methods)] // Running wsl.exe is this function's job.
+pub fn running_distros(_blocking: &jobs::Blocking) -> Vec<String> {
+    let output = command_bare()
+        .args(["-l", "-q", "--running"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    match output {
+        Ok(o) if o.status.success() => running_names(&o.stdout, &distros()),
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(not(windows))]
+pub fn running_distros(_: &jobs::Blocking) -> Vec<String> {
+    Vec::new()
+}
+
+/// Names from a `--running` listing, kept only where they name a registered
+/// distro.  With nothing running, wsl.exe prints a sentence in place of the
+/// list, and every line of that output otherwise reads as a distro name.
+#[cfg(any(windows, test))]
+fn running_names(stdout: &[u8], registered: &[WslDistro]) -> Vec<String> {
+    parse_distro_list(stdout)
+        .into_iter()
+        .map(|d| d.name)
+        .filter(|name| registered.iter().any(|d| d.name == *name))
+        .collect()
+}
+
 /// `wsl -l -q` lists the default distro first.  Output is UTF-8 when
 /// WSL_UTF8=1 is honored (WSL 0.64.0+); older versions emit UTF-16LE,
 /// detected by the NUL bytes ASCII names acquire in that encoding.
@@ -785,6 +821,23 @@ mod tests {
         let bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
         let distros = parse_distro_list(&bytes);
         assert_eq!(distros, vec![WslDistro { name: "kali-linux".to_string(), is_default: true }]);
+    }
+
+    #[test]
+    fn running_names_keeps_only_registered_distros() {
+        let registered = vec![
+            WslDistro { name: "kali-linux".to_string(), is_default: true },
+            WslDistro { name: "Ubuntu".to_string(), is_default: false },
+        ];
+        assert_eq!(running_names(b"Ubuntu\r\n", &registered), vec!["Ubuntu".to_string()]);
+    }
+
+    /// With nothing running, wsl.exe prints prose where the list would be.
+    #[test]
+    fn a_message_in_place_of_a_list_names_no_distro() {
+        let registered = vec![WslDistro { name: "kali-linux".to_string(), is_default: true }];
+        let out = b"There are no running distributions.\r\n";
+        assert!(running_names(out, &registered).is_empty());
     }
 
     #[test]

@@ -624,11 +624,9 @@ pub struct AlacritreeApp {
     sidebar_focus_written: Option<SidebarFocusWrite>,
     /// A close verdict the reconciler still owes the terminal.
     sidebar_deferred_close: Option<DeferredClose>,
-    /// One entry per herdr server this app talks to: native plus one per WSL
-    /// distro whose helper reports a herdr install.  Fixed at startup — a
-    /// distro registered afterward is picked up only on restart, matching
-    /// `wsl::distros`.
-    herdr_endpoints: Vec<herdr::EndpointCache>,
+    /// The herdr servers this app talks to: the native side plus one per
+    /// running WSL distro, kept in step with which distros are up.
+    herdr_endpoints: herdr::Endpoints,
 }
 
 struct DeleteRequest {
@@ -918,15 +916,6 @@ impl AlacritreeApp {
             config.ui.project_name.clone(),
         );
 
-        // Unfiltered: a distro without herdr on its login PATH just never
-        // answers, and `Reach` abandons an endpoint after its first failed
-        // spawn rather than retrying it every tick, so listing every distro
-        // costs at most one failed spawn per process on a machine with none.
-        let herdr_endpoints: Vec<herdr::EndpointCache> = std::iter::once(herdr::Side::Native)
-            .chain(wsl::distros().into_iter().map(|d| herdr::Side::Wsl(d.name)))
-            .map(herdr::EndpointCache::new)
-            .collect();
-
         let pr_status_concurrency = config.ui.pr_status_concurrency;
         let mut app = Self {
             show_left_sidebar: persisted.show_left_sidebar,
@@ -1005,7 +994,7 @@ impl AlacritreeApp {
             sidebar_anchor: None,
             sidebar_focus_written: None,
             sidebar_deferred_close: None,
-            herdr_endpoints,
+            herdr_endpoints: herdr::Endpoints::default(),
         };
 
         app.pr_cache.set_concurrency(pr_status_concurrency);
@@ -1405,7 +1394,13 @@ impl AlacritreeApp {
                 self.error_dialog = Some(e);
                 return false;
             }
-            let session = herdr::running_session_name(&key.side);
+            let session = match herdr::running_session_name(&key.side) {
+                Ok(session) => session,
+                Err(e) => {
+                    self.error_dialog = Some(e);
+                    return false;
+                },
+            };
             key.side.command(&["session", "attach", &session])
         };
         // `alacritty_terminal::tty::Shell`'s fields are crate-private, so
@@ -2677,7 +2672,9 @@ impl AlacritreeApp {
         );
         let rows = self.current_project_rows();
         let live = self.session_pairs();
-        let snapshot = build_sidebar_snapshot(&self.projects, &live, &rows, skip_worktree, inputs);
+        let agents = self.listed_herdr_agents();
+        let snapshot =
+            build_sidebar_snapshot(&self.projects, &live, &agents, &rows, skip_worktree, inputs);
         // Paint reuses these until the next rebuild, so an unchanged filtering
         // frame runs no fuzzy matching at all.
         self.sidebar_rows_cache = Some(rows);
@@ -2826,12 +2823,12 @@ impl AlacritreeApp {
             },
             Key::ArrowLeft => match &cursor {
                 SidebarRow::Project(root) => self.set_project_expanded(root, false),
-                SidebarRow::Worktree(_) | SidebarRow::Session(_) => {
+                SidebarRow::Worktree(_) | SidebarRow::Session(_) | SidebarRow::HerdrAgent(..) => {
                     if let Some(target) = sidebar_nav::left_target(&rows, &cursor) {
                         self.set_sidebar_cursor(target);
                     }
                 },
-                SidebarRow::Home | SidebarRow::HerdrAgent(..) => {},
+                SidebarRow::Home => {},
             },
             Key::Enter => self.activate_sidebar_row(ctx, &cursor),
             Key::Escape => self.focus_terminal(),
@@ -7062,13 +7059,14 @@ fn sidebar_session_ids(
 /// Step the lockstep index over the rows a skipped worktree owns.
 ///
 /// The projection is built before the deletion is known, so it still lists
-/// the worktree and any sessions under it.  Leaving the index parked on a row
-/// no node will match again would mark every later node unprojected, and the
-/// cursor repair reads an unprojected row as one that has gone away.
+/// the worktree with its sessions and herdr agents.  Leaving the index parked
+/// on a row no node will match again would mark every later node unprojected,
+/// and the cursor repair reads an unprojected row as one that has gone away.
 fn skip_projected_rows(
     rows: &[SidebarRow],
     next_row: &mut usize,
     live: &[(WorkspaceKey, SessionId)],
+    agents: &sidebar_nav::ListedAgents,
     path: &Path,
 ) {
     if rows.get(*next_row) != Some(&SidebarRow::Worktree(path.to_path_buf())) {
@@ -7081,6 +7079,13 @@ fn skip_projected_rows(
         }
         *next_row += 1;
     }
+    let listed = agents.get(&Some(path.to_path_buf())).map_or(0, Vec::len);
+    for _ in 0..listed {
+        if !matches!(rows.get(*next_row), Some(SidebarRow::HerdrAgent(..))) {
+            break;
+        }
+        *next_row += 1;
+    }
 }
 
 /// Assemble the model arena and the projection.  `rows` is the projection —
@@ -7088,6 +7093,10 @@ fn skip_projected_rows(
 /// session, whatever the listing threshold or the filter says.  Building
 /// membership from `listed` instead would make the last session in a workspace
 /// read as deleted the moment its sibling closed.
+///
+/// `agents` is the herdr listing the projection was built from.  A herdr row
+/// exists only while its agent is listed, so there is no wider model to take
+/// it from, and reading a second listing here could disagree with `rows`.
 ///
 /// `skip_worktree` drops a worktree whose deletion is already committed but
 /// whose git operation has not finished, so nothing lands the cursor — or a
@@ -7100,6 +7109,7 @@ fn skip_projected_rows(
 fn build_sidebar_snapshot(
     projects: &[Project],
     live: &[(WorkspaceKey, SessionId)],
+    agents: &sidebar_nav::ListedAgents,
     rows: &[SidebarRow],
     skip_worktree: Option<&Path>,
     inputs: sidebar_focus::ObservedInputs,
@@ -7122,6 +7132,15 @@ fn build_sidebar_snapshot(
         }
         b.push(row, parent, projected)
     };
+    let push_agents = |b: &mut sidebar_focus::SnapshotBuilder,
+                       next_row: &mut usize,
+                       ws: &WorkspaceKey,
+                       parent: Parent| {
+        for (side, terminal_id) in agents.get(ws).into_iter().flatten() {
+            let row = SidebarRow::HerdrAgent(side.clone(), terminal_id.clone());
+            push(b, next_row, row, parent);
+        }
+    };
 
     let home_id = push(&mut b, &mut next_row, SidebarRow::Home, Parent::Root);
     for (i, (ws, id)) in live.iter().enumerate() {
@@ -7130,13 +7149,14 @@ fn build_sidebar_snapshot(
             placed[i] = true;
         }
     }
+    push_agents(&mut b, &mut next_row, &None, Parent::Node(home_id));
 
     for p in projects {
         let project_id =
             push(&mut b, &mut next_row, SidebarRow::Project(p.root.clone()), Parent::Root);
         for wt in &p.worktrees {
             if skip_worktree == Some(wt.path.as_path()) {
-                skip_projected_rows(rows, &mut next_row, live, &wt.path);
+                skip_projected_rows(rows, &mut next_row, live, agents, &wt.path);
                 continue;
             }
             let wt_id = push(
@@ -7151,6 +7171,8 @@ fn build_sidebar_snapshot(
                     placed[i] = true;
                 }
             }
+            let ws = Some(wt.path.clone());
+            push_agents(&mut b, &mut next_row, &ws, Parent::Node(wt_id));
         }
     }
 
@@ -8222,6 +8244,11 @@ impl AlacritreeApp {
     /// workspace it is working in.  Unmatched agents land under Home, which
     /// is the common case: an agent in a repository alacritree does not
     /// track still belongs somewhere.
+    ///
+    /// A checkout that has gone is not offered as a workspace: a shell cannot
+    /// start there, so an agent whose directory matches it is unmatched and
+    /// lands under Home like any other, rather than under a row whose Enter
+    /// can only refuse.
     fn listed_herdr_agents(&self) -> sidebar_nav::ListedAgents {
         let mut listed = sidebar_nav::ListedAgents::new();
         if !self.config.ui.herdr.enabled {
@@ -8232,10 +8259,12 @@ impl AlacritreeApp {
         let workspaces: Vec<PathBuf> = self
             .projects
             .iter()
-            .flat_map(|p| p.worktrees.iter().map(|wt| wt.path.clone()))
+            .flat_map(|p| p.worktrees.iter())
+            .filter(|wt| !worktree_looks_gone(wt, self.liveness.missing(&wt.path)))
+            .map(|wt| wt.path.clone())
             .collect();
 
-        for cache in &self.herdr_endpoints {
+        for cache in self.herdr_endpoints.caches() {
             let side = cache.side();
             for agent in herdr::unattached(cache.agents(), side, &claimed) {
                 let workspace = herdr::match_workspace(agent, side, &workspaces);
@@ -8258,6 +8287,7 @@ impl AlacritreeApp {
     /// good.
     fn find_herdr_agent(&self, side: &herdr::Side, terminal_id: &str) -> Option<&herdr::Agent> {
         self.herdr_endpoints
+            .caches()
             .iter()
             .find(|cache| cache.side() == side)
             .and_then(|cache| cache.agents().iter().find(|a| a.terminal_id == terminal_id))
@@ -8291,16 +8321,18 @@ impl AlacritreeApp {
     /// One number standing for every endpoint's rendered state, so the
     /// sidebar's per-frame comparison stays a `u64` compare.
     fn herdr_generation(&self) -> u64 {
-        self.herdr_endpoints.iter().map(herdr::EndpointCache::generation).sum()
+        self.herdr_endpoints.generation()
     }
 
-    /// Refreshes every herdr endpoint's agent list on its own clock; a no-op
-    /// per endpoint until its poll interval elapses.
+    /// Refreshes the herdr endpoints on their own clock; a no-op per endpoint
+    /// until its poll interval elapses.  Disabled stops the polling, not just
+    /// the rows: the subprocesses are the whole cost of the feature, so an
+    /// opt-out that kept running them would opt out of nothing.
     fn poll_herdr_endpoints(&mut self) {
-        let interval = self.config.ui.herdr.poll_interval;
-        for cache in &mut self.herdr_endpoints {
-            cache.poll(interval);
+        if !self.config.ui.herdr.enabled {
+            return;
         }
+        self.herdr_endpoints.poll(self.config.ui.herdr.poll_interval);
     }
 
     /// Session rows for `ws`'s sidebar list, per `sidebar_session_ids`'s
@@ -11098,7 +11130,6 @@ mod tests {
             status: herdr::Status::Idle,
             cwd: None,
             foreground_cwd: None,
-            state_change_seq: 0,
         }
     }
 
@@ -11134,7 +11165,6 @@ mod tests {
             status: herdr::Status::Idle,
             cwd: None,
             foreground_cwd: None,
-            state_change_seq: 0,
         };
         let row = HerdrRowData::from_agent(&agent, &herdr::Side::Native);
         assert_eq!(row.name, "t1");
@@ -13181,7 +13211,14 @@ mod tests {
             (Some(PathBuf::from("/a/wt1")), vec![2, 3]),
         ]);
         let rows = sidebar_nav::visible_rows(&projects, &listed, &sidebar_nav::ListedAgents::new());
-        let snapshot = build_sidebar_snapshot(&projects, &live, &rows, None, Default::default());
+        let snapshot = build_sidebar_snapshot(
+            &projects,
+            &live,
+            &sidebar_nav::ListedAgents::new(),
+            &rows,
+            None,
+            Default::default(),
+        );
 
         for row in &rows {
             let id = snapshot.find(row).expect("every projected row is in the model");
@@ -13204,6 +13241,56 @@ mod tests {
         assert!(!snapshot.is_projected(hidden));
     }
 
+    /// Herdr rows are navigable rows, so the arena has to carry them in the
+    /// order the projection lists them.  Missing them parks the lockstep index
+    /// on the first agent row, which marks every row below it unprojected and
+    /// leaves the cursor with no node to sit on.
+    #[test]
+    fn herdr_rows_are_projected_under_the_workspace_they_are_listed_in() {
+        use crate::sidebar_focus::Parent;
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2"])];
+        let live: Vec<(WorkspaceKey, SessionId)> = vec![(Some(PathBuf::from("/a/wt1")), 1)];
+        let listed = sidebar_nav::ListedSessions::from([(Some(PathBuf::from("/a/wt1")), vec![1])]);
+        let home_agent = SidebarRow::HerdrAgent(herdr::Side::Native, "term_home".into());
+        let worktree_agent = SidebarRow::HerdrAgent(herdr::Side::Wsl("d".into()), "term_wt".into());
+        let agents = sidebar_nav::ListedAgents::from([
+            (None, vec![(herdr::Side::Native, "term_home".to_string())]),
+            (
+                Some(PathBuf::from("/a/wt1")),
+                vec![(herdr::Side::Wsl("d".into()), "term_wt".to_string())],
+            ),
+        ]);
+        let rows = sidebar_nav::visible_rows(&projects, &listed, &agents);
+        let snapshot =
+            build_sidebar_snapshot(&projects, &live, &agents, &rows, None, Default::default());
+
+        for row in &rows {
+            let id = snapshot.find(row).expect("every projected row is in the model");
+            assert!(snapshot.is_projected(id), "{row:?} must stay navigable");
+            let arena_parent = match snapshot.parent(id) {
+                Parent::Root => None,
+                Parent::Node(p) => Some(snapshot.row(p).clone()),
+                Parent::Detached => panic!("a projected row is never detached: {row:?}"),
+            };
+            assert_eq!(
+                arena_parent,
+                sidebar_nav::left_target(&rows, row),
+                "arena parent must agree with the row model for {row:?}"
+            );
+        }
+
+        assert_eq!(
+            snapshot.parent(snapshot.find(&home_agent).unwrap()),
+            Parent::Node(snapshot.find(&SidebarRow::Home).unwrap()),
+        );
+        assert_eq!(
+            snapshot.parent(snapshot.find(&worktree_agent).unwrap()),
+            Parent::Node(snapshot.find(&SidebarRow::Worktree(PathBuf::from("/a/wt1"))).unwrap()),
+        );
+    }
+
     #[test]
     fn a_session_below_the_listing_threshold_is_still_in_the_model() {
         use crate::sidebar_nav::{self, SidebarRow};
@@ -13222,7 +13309,14 @@ mod tests {
             l
         };
         let rows = sidebar_nav::visible_rows(&projects, &listed, &sidebar_nav::ListedAgents::new());
-        let snapshot = build_sidebar_snapshot(&projects, &live, &rows, None, Default::default());
+        let snapshot = build_sidebar_snapshot(
+            &projects,
+            &live,
+            &sidebar_nav::ListedAgents::new(),
+            &rows,
+            None,
+            Default::default(),
+        );
 
         let id = snapshot
             .find(&SidebarRow::Session(7))
@@ -13240,7 +13334,14 @@ mod tests {
         let live = vec![(Some(PathBuf::from("/orphan/wt1")), 5)];
         let listed = sidebar_nav::ListedSessions::new();
         let rows = sidebar_nav::visible_rows(&projects, &listed, &sidebar_nav::ListedAgents::new());
-        let snapshot = build_sidebar_snapshot(&projects, &live, &rows, None, Default::default());
+        let snapshot = build_sidebar_snapshot(
+            &projects,
+            &live,
+            &sidebar_nav::ListedAgents::new(),
+            &rows,
+            None,
+            Default::default(),
+        );
 
         let id = snapshot.find(&SidebarRow::Session(5)).expect("the session is still running");
         assert_eq!(
@@ -13261,6 +13362,7 @@ mod tests {
         let snapshot = build_sidebar_snapshot(
             &projects,
             &[],
+            &sidebar_nav::ListedAgents::new(),
             &rows,
             Some(doomed.as_path()),
             Default::default(),
@@ -13294,6 +13396,7 @@ mod tests {
         let snapshot = build_sidebar_snapshot(
             &projects,
             &[],
+            &sidebar_nav::ListedAgents::new(),
             &rows,
             Some(doomed.as_path()),
             Default::default(),
@@ -13306,6 +13409,36 @@ mod tests {
             snapshot.is_projected(below),
             "a row below the one being deleted must still be navigable"
         );
+    }
+
+    /// Same lockstep hazard, with the doomed worktree carrying a herdr row:
+    /// the agent rows it owns have to be stepped over as well.
+    #[test]
+    fn rows_below_a_deleted_worktree_with_a_herdr_row_stay_navigable() {
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        let projects =
+            vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2", "/a/wt3"])];
+        let listed = sidebar_nav::ListedSessions::new();
+        let doomed = PathBuf::from("/a/wt2");
+        let agents = sidebar_nav::ListedAgents::from([(
+            Some(doomed.clone()),
+            vec![(herdr::Side::Native, "term_doomed".to_string())],
+        )]);
+        let rows = sidebar_nav::visible_rows(&projects, &listed, &agents);
+        let snapshot = build_sidebar_snapshot(
+            &projects,
+            &[],
+            &agents,
+            &rows,
+            Some(doomed.as_path()),
+            Default::default(),
+        );
+
+        let below = snapshot
+            .find(&SidebarRow::Worktree(PathBuf::from("/a/wt3")))
+            .expect("the worktree below the deleted one is still in the tree");
+        assert!(snapshot.is_projected(below));
     }
 
     /// Dispatch cannot catch a wrong pairing: `toggle` drops an identity the

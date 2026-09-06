@@ -74,6 +74,14 @@ project, its Git worktrees.
   `$XDG_CONFIG_HOME/alacritree/state.toml`. Failures are logged and ignored —
   a missing or corrupt state file never crashes the app.
 
+### herdr agents
+
+herdr is a terminal workspace manager for coding agents. When a herdr server is running, the agents it manages appear in the sidebar under the worktree each agent's working directory matches, dimmed and marked `herdr`. An agent whose directory matches no worktree — including one whose checkout has been removed — is listed under Home.
+
+- **Attaching.** Enter or a click opens a session attached to that agent, and the row is replaced by the session's own row until you detach. Detach with herdr's own chord, `Ctrl+B q`.
+- **Native Windows.** herdr cannot attach a single agent there, so attaching focuses the pane in your own herdr window and shares the whole herdr session — the view resizes with the alacritree pane. Such rows are marked `shared view`.
+- **Discovery.** Alacritree asks the native `herdr` on your `PATH` and each running WSL distro. Nothing is installed or started; a machine without herdr sees no rows and stops asking after one failed attempt per server. See `[ui.herdr]` under [Configuration](#configuration) for the poll interval and the opt-out.
+
 ### Creating a worktree
 
 The create modal validates the proposed branch name against `git
@@ -580,6 +588,18 @@ image_dir   = "~/shots"     # where those PNGs go (default: the per-user cache
 image_keep  = 20            # how many PNGs the default directory keeps.
                             # Minimum 1 — the image a paste just handed to the
                             # shell always survives the sweep
+
+[ui.herdr]                  # agents running under a herdr server, listed in
+                            # the sidebar under the worktree each agent's
+                            # working directory matches
+enabled          = true     # false does no herdr work at all: no polling,
+                            # no rows
+poll_interval_ms = 2000     # how often a reachable server is asked for its
+                            # agents. A server that never answers is given up
+                            # on after one attempt, so a machine without herdr
+                            # pays a single failed spawn
+show_unmatched   = true     # list an agent whose directory matches no
+                            # worktree under Home; false hides it instead
 
 [workspace]
 worktree_dir = "~/dev/worktrees"   # base dir for new worktrees (default ~/.alacritree/worktrees)
