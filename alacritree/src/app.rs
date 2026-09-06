@@ -15,14 +15,15 @@ use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
 use crate::config::{
-    BakedGlyph, Config, DEFAULT_ADD_ICON, DEFAULT_AGENT_ICON, DEFAULT_CLOSE_ICON,
-    DEFAULT_HOME_ICON, DEFAULT_PR_CLOSED_ICON, DEFAULT_PR_DRAFT_ICON, DEFAULT_PR_MERGED_ICON,
-    DEFAULT_PR_OPEN_ICON, DEFAULT_PROJECT_COLLAPSED_ICON, DEFAULT_PROJECT_EXPANDED_ICON,
-    DEFAULT_REFRESH_ICON, DEFAULT_REORDER_ICON, DEFAULT_SEARCH_ICON, DEFAULT_SESSION_ICON,
-    DEFAULT_UPSTREAM_DIVERGED_ICON, DEFAULT_UPSTREAM_GONE_ICON, DEFAULT_UPSTREAM_LEVEL_ICON,
-    DEFAULT_UPSTREAM_UNTRACKED_ICON, DEFAULT_WORKTREE_ICON, DEFAULT_WORKTREE_MAIN_ICON, FontConfig,
-    IconStyle, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SearchScope, SidebarFocus,
-    SidebarTooltips, TextEmphasis, UiFont, profile_command,
+    BakedGlyph, Config, DEFAULT_ADD_ICON, DEFAULT_AGENT_ICON, DEFAULT_BLOCKED_ICON,
+    DEFAULT_CLOSE_ICON, DEFAULT_HOME_ICON, DEFAULT_PR_CLOSED_ICON, DEFAULT_PR_DRAFT_ICON,
+    DEFAULT_PR_MERGED_ICON, DEFAULT_PR_OPEN_ICON, DEFAULT_PROJECT_COLLAPSED_ICON,
+    DEFAULT_PROJECT_EXPANDED_ICON, DEFAULT_REFRESH_ICON, DEFAULT_REORDER_ICON, DEFAULT_SEARCH_ICON,
+    DEFAULT_SESSION_ICON, DEFAULT_UPSTREAM_DIVERGED_ICON, DEFAULT_UPSTREAM_GONE_ICON,
+    DEFAULT_UPSTREAM_LEVEL_ICON, DEFAULT_UPSTREAM_UNTRACKED_ICON, DEFAULT_WORKTREE_ICON,
+    DEFAULT_WORKTREE_MAIN_ICON, FontConfig, IconStyle, Icons, LastSessionClose, PathStyleConfig,
+    ScrollbarStyle, SearchScope, SidebarFocus, SidebarTooltips, TextEmphasis, UiFont,
+    profile_command,
 };
 use crate::crash_log::{self, ExitReason};
 use crate::git_nav::{self, GitSection, SectionCount};
@@ -33,7 +34,7 @@ use crate::pending_spawn::{Finished, PendingSpawns};
 use crate::pr_status::{self, PrCache, PrInfo, PrState};
 use crate::projects::{Project, Worktree, project_json};
 use crate::session::{
-    self, AttentionVerdict, Session, SessionActivity, SessionId, SessionKind, TermSize,
+    self, AttentionVerdict, LiveState, Session, SessionActivity, SessionId, SessionKind, TermSize,
     poll_attention_debounce,
 };
 use crate::sidebar_nav::{self, SidebarRow, StepTarget};
@@ -3905,7 +3906,7 @@ impl AlacritreeApp {
         let home_activity = if home_session_rows.is_empty() {
             self.workspace_activity(&None)
         } else {
-            SessionActivity::Idle
+            SessionActivity::Shell
         };
         let project_attention: Vec<bool> =
             self.projects.iter().map(|p| self.project_needs_attention(p)).collect();
@@ -3943,7 +3944,7 @@ impl AlacritreeApp {
                             .copied()
                             .unwrap_or(false);
                         if listed {
-                            SessionActivity::Idle
+                            SessionActivity::Shell
                         } else {
                             self.workspace_activity(&Some(wt.path.clone()))
                         }
@@ -6408,7 +6409,57 @@ fn braille_loader(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Respons
     response
 }
 
-/// Priority: attention dot > loader > generic agent > active highlight > the
+/// What the status slot draws for an agent's live state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentMark {
+    /// Live work animates.  A static glyph would have to blink to say as much.
+    Loader,
+    Glyph(BakedGlyph, Color32),
+}
+
+/// `quiet` is the row's own weight for an agent with nothing to report — dim
+/// on a listed herdr row, ordinary text on a live session.  Blocked takes
+/// `attention` wherever it appears, an active row's accent included: a state
+/// that wants a human cannot also be quiet.
+fn agent_mark(live: LiveState, quiet: Color32, attention: Color32) -> AgentMark {
+    match live {
+        LiveState::Idle => AgentMark::Glyph(DEFAULT_AGENT_ICON, quiet),
+        LiveState::Working => AgentMark::Loader,
+        LiveState::Blocked => AgentMark::Glyph(DEFAULT_BLOCKED_ICON, attention),
+    }
+}
+
+/// What the status slot says on hover.  A named agent is named, so a
+/// workspace running several can be told apart without opening any of them.
+fn agent_hint(live: LiveState, name: Option<&str>) -> String {
+    let doing = match live {
+        LiveState::Idle => "is running",
+        LiveState::Working => "is working",
+        LiveState::Blocked => "is waiting for you",
+    };
+    format!("{} {doing}", name.unwrap_or("agent"))
+}
+
+/// Draw one agent mark into an already-allocated slot.
+fn paint_agent_mark(ui: &mut egui::Ui, mark: AgentMark, rect: egui::Rect, theme: &Theme) {
+    let s = theme.ui_scale;
+    match mark {
+        AgentMark::Loader => {
+            paint_braille_loader(ui, rect, 10.0 * s, theme.accent);
+        },
+        AgentMark::Glyph(glyph, color) => {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                glyph.as_str(),
+                egui::FontId::proportional(10.0 * s),
+                color,
+            );
+        },
+    }
+}
+
+/// Priority: attention dot > the agent's live state > active highlight > the
 /// configured color > the built-in default.
 ///
 /// Returns what the slot has to say on hover, for the row to register with the
@@ -6426,36 +6477,23 @@ fn paint_row_status_icon(
     if attention {
         return Some((attention_dot(ui, theme).rect, ATTENTION_HINT.to_owned()));
     }
-    let s = theme.ui_scale;
-    if let SessionActivity::Loading(agent) = activity {
-        let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
-        paint_braille_loader(ui, rect, 10.0 * s, theme.accent);
-        let hint = agent.map_or_else(|| "working".to_owned(), |name| format!("{name} is working"));
-        return Some((rect, hint));
-    }
-    let (glyph, font, color, hint) = match activity {
-        SessionActivity::Agent(agent) => (
-            DEFAULT_AGENT_ICON.as_str(),
-            egui::FontId::proportional(10.0 * s),
-            if is_active { theme.accent } else { theme.text },
-            Some(agent.map_or_else(
-                || "agent is running".to_owned(),
-                |name| format!("{name} is running"),
-            )),
-        ),
-        SessionActivity::Idle => {
+    // Centered into the fixed slot: laying a glyph out as text would size the
+    // slot to its advance width and shift the label with it.
+    let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
+    match activity {
+        SessionActivity::Agent { name, live } => {
+            let quiet = if is_active { theme.accent } else { theme.text };
+            paint_agent_mark(ui, agent_mark(live, quiet, theme.attention), rect, theme);
+            Some((rect, agent_hint(live, name)))
+        },
+        SessionActivity::Shell => {
             let (glyph, font, resolved) =
                 resolve_icon(style, default_glyph, theme.text_muted, 10.0, 10.0, theme);
             let color = if is_active { theme.accent } else { resolved };
-            (glyph, font, color, None)
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, glyph, font, color);
+            None
         },
-        SessionActivity::Loading(_) => unreachable!(),
-    };
-    // Centered into the fixed slot: laying the glyph out as text would size
-    // the slot to its advance width and shift the label with it.
-    let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
-    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, glyph, font, color);
-    hint.map(|hint| (rect, hint))
+    }
 }
 
 /// Gap between adjacent action buttons. They already pad their own glyph, so
@@ -7538,11 +7576,24 @@ fn picker_cursor(
     }
 }
 
+/// The activity a session's row paints.  A session attached to a herdr agent
+/// takes herdr's word, because herdr watches the pane from outside and sees an
+/// approval dialog no title heuristic can reach.
+///
+/// `unknown` is herdr declining to say, so the session's own reading stands.
+/// The gate closes either way: an attached pane holds an agent whether or not
+/// the process probe recognized one.
+fn herdr_backed_activity(own: SessionActivity, status: Option<herdr::Status>) -> SessionActivity {
+    let Some(status) = status else { return own };
+    let live = LiveState::from_herdr(status).unwrap_or(own.live().unwrap_or_default());
+    own.with_live(live)
+}
+
 /// Agent titles commonly lead with their own decorative mark. Once the row
 /// paints a semantic agent/loader status, retaining that mark beside it would
 /// reintroduce the vendor-specific icon set this status model replaces.
 fn session_row_title(title: &str, activity: SessionActivity) -> String {
-    if activity != SessionActivity::Idle {
+    if activity.is_agent() {
         let trimmed = title.trim_start();
         if let Some(first) = trimmed.chars().next() {
             let rest = &trimmed[first.len_utf8()..];
@@ -8070,13 +8121,12 @@ fn herdr_row(
                 |ui| {
                     let (rect, _) =
                         ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        DEFAULT_AGENT_ICON.as_str(),
-                        egui::FontId::proportional(10.0 * theme.ui_scale),
-                        theme.text_dim,
-                    );
+                    // Dim is this row's weight for an agent with nothing to
+                    // report; working and blocked override it, so a listed
+                    // agent that wants a human is as loud as an attached one.
+                    let live = LiveState::from_herdr(row.status).unwrap_or_default();
+                    let mark = agent_mark(live, theme.text_dim, theme.attention);
+                    paint_agent_mark(ui, mark, rect, theme);
                     let _ = truncating_label(
                         ui,
                         RichText::new(herdr_row_label(row)).small().color(theme.text_dim),
@@ -8213,23 +8263,24 @@ impl AlacritreeApp {
     }
 
     /// Prefer the active session's status so parallel agents do not fight over
-    /// the parent row. If that session is idle, a loading background session
-    /// wins over a merely present agent because it communicates live work.
+    /// the parent row. If that session has nothing to report, a background
+    /// session that is working or blocked wins over a merely present agent,
+    /// because a collapsed row is the only place either state can surface.
     fn workspace_activity(&self, ws: &WorkspaceKey) -> SessionActivity {
         let active_id = self.active_session.get(ws).copied();
-        let mut other = SessionActivity::Idle;
+        let mut other = SessionActivity::Shell;
         for s in &self.sessions {
             if s.working_directory != *ws {
                 continue;
             }
-            let activity = s.activity();
-            if activity == SessionActivity::Idle {
+            let activity = herdr_backed_activity(s.activity(), self.session_herdr_status(s));
+            let Some(live) = activity.live() else {
                 continue;
-            }
+            };
             if Some(s.id) == active_id {
                 return activity;
             }
-            if matches!(activity, SessionActivity::Loading(_)) || other == SessionActivity::Idle {
+            if live > LiveState::Idle || !other.is_agent() {
                 other = activity;
             }
         }
@@ -8301,6 +8352,13 @@ impl AlacritreeApp {
             .and_then(|cache| cache.agents().iter().find(|a| a.terminal_id == terminal_id))
     }
 
+    /// herdr's word on a session's agent: `Some` only while this session is
+    /// attached to one the endpoint listing still carries.
+    fn session_herdr_status(&self, session: &Session) -> Option<herdr::Status> {
+        let key = session.herdr_key.as_ref()?;
+        self.find_herdr_agent(&key.side, &key.terminal_id).map(|agent| agent.status)
+    }
+
     /// The workspace a herdr row is currently listed under, for the keyboard
     /// path: `SidebarRow::HerdrAgent` itself carries no workspace, unlike a
     /// click, which already knows which panel section it landed in.
@@ -8354,7 +8412,7 @@ impl AlacritreeApp {
         ids.iter()
             .filter_map(|id| self.sessions.iter().find(|s| s.id == *id))
             .map(|s| {
-                let activity = s.activity();
+                let activity = herdr_backed_activity(s.activity(), self.session_herdr_status(s));
                 SessionRowData {
                     id: s.id,
                     title: session_row_title(&s.title, activity),
@@ -11118,16 +11176,82 @@ mod tests {
 
     #[test]
     fn session_row_title_drops_an_agents_decorative_prefix() {
-        let agent = SessionActivity::Agent(Some("claude"));
+        let agent = SessionActivity::agent(Some("claude"), LiveState::Idle);
         assert_eq!(session_row_title("✳ claude", agent), "claude");
-        assert_eq!(session_row_title("⠋ Thinking…", SessionActivity::Loading(None)), "Thinking…");
+        assert_eq!(
+            session_row_title("⠋ Thinking…", SessionActivity::agent(None, LiveState::Working)),
+            "Thinking…"
+        );
         // An ordinary session title owns its decoration because the status
         // slot is not replacing it with an agent mark.
-        assert_eq!(session_row_title("✳ favorite", SessionActivity::Idle), "✳ favorite");
+        assert_eq!(session_row_title("✳ favorite", SessionActivity::Shell), "✳ favorite");
         // A recognized agent with a plain title strips nothing.
         assert_eq!(session_row_title("node build", agent), "node build");
         // Never strip down to an empty label.
         assert_eq!(session_row_title("✳ ", agent), "✳ ");
+    }
+
+    /// The status slot is the only place a blocked agent announces itself, so
+    /// the three live states must not collapse into the same mark.
+    #[test]
+    fn each_live_state_draws_its_own_mark() {
+        let quiet = Color32::from_rgb(1, 1, 1);
+        let attention = Color32::from_rgb(2, 2, 2);
+        assert_eq!(
+            agent_mark(LiveState::Idle, quiet, attention),
+            AgentMark::Glyph(DEFAULT_AGENT_ICON, quiet)
+        );
+        assert_eq!(agent_mark(LiveState::Working, quiet, attention), AgentMark::Loader);
+        assert_eq!(
+            agent_mark(LiveState::Blocked, quiet, attention),
+            AgentMark::Glyph(DEFAULT_BLOCKED_ICON, attention)
+        );
+    }
+
+    /// A blocked agent stays amber on the row the user is looking at, where
+    /// the accent would otherwise claim the slot.
+    #[test]
+    fn blocked_keeps_its_color_over_the_active_rows_accent() {
+        let accent = Color32::from_rgb(3, 3, 3);
+        let attention = Color32::from_rgb(4, 4, 4);
+        assert_eq!(
+            agent_mark(LiveState::Blocked, accent, attention),
+            AgentMark::Glyph(DEFAULT_BLOCKED_ICON, attention)
+        );
+    }
+
+    #[test]
+    fn the_status_hint_names_the_agent_and_what_it_is_doing() {
+        assert_eq!(agent_hint(LiveState::Idle, Some("claude")), "claude is running");
+        assert_eq!(agent_hint(LiveState::Working, Some("codex")), "codex is working");
+        assert_eq!(agent_hint(LiveState::Blocked, Some("claude")), "claude is waiting for you");
+        assert_eq!(agent_hint(LiveState::Blocked, None), "agent is waiting for you");
+    }
+
+    #[test]
+    fn an_attached_herdr_session_takes_herdrs_live_state() {
+        let claude = SessionActivity::agent(Some("claude"), LiveState::Idle);
+
+        // Not attached to herdr: nothing overrides the session's own reading.
+        assert_eq!(herdr_backed_activity(claude, None), claude);
+
+        // herdr sees the approval dialog no title heuristic can.
+        assert_eq!(
+            herdr_backed_activity(claude, Some(herdr::Status::Blocked)),
+            SessionActivity::agent(Some("claude"), LiveState::Blocked)
+        );
+
+        // An attached pane holds an agent even when the process probe missed
+        // one, so the gate closes on herdr's word alone.
+        assert_eq!(
+            herdr_backed_activity(SessionActivity::Shell, Some(herdr::Status::Working)),
+            SessionActivity::agent(None, LiveState::Working)
+        );
+
+        // `unknown` is herdr declining to say, not a claim of idleness: the
+        // session keeps whatever it already knew.
+        let working = SessionActivity::agent(Some("claude"), LiveState::Working);
+        assert_eq!(herdr_backed_activity(working, Some(herdr::Status::Unknown)), working);
     }
 
     fn herdr_agent(kind: Option<&str>) -> herdr::Agent {
@@ -12329,7 +12453,7 @@ mod tests {
                 false,
                 false,
                 false,
-                SessionActivity::Idle,
+                SessionActivity::Shell,
                 false,
                 &[],
                 &icons,
@@ -12502,7 +12626,7 @@ mod tests {
                     false,
                     false,
                     false,
-                    SessionActivity::Idle,
+                    SessionActivity::Shell,
                     false,
                     &[],
                     &icons,
@@ -12636,7 +12760,7 @@ mod tests {
                 false,
                 false,
                 false,
-                SessionActivity::Idle,
+                SessionActivity::Shell,
                 false,
                 &[],
                 &icons,
@@ -12710,7 +12834,7 @@ mod tests {
                 id: 1,
                 title: "zsh".to_owned(),
                 needs_attention: false,
-                activity: SessionActivity::Idle,
+                activity: SessionActivity::Shell,
                 is_active: true,
                 is_displayed: true,
             };
@@ -12724,7 +12848,7 @@ mod tests {
             );
 
             let mut home = |ui: &mut egui::Ui| {
-                home_row(ui, true, false, false, false, SessionActivity::Idle, &icons, &theme);
+                home_row(ui, true, false, false, false, SessionActivity::Shell, &icons, &theme);
             };
             assert_eq!(
                 hint_painted_over(&mut home, "+", "new shell"),
@@ -12808,7 +12932,7 @@ mod tests {
             config.ui.sidebar_tooltips = SidebarTooltips::Off;
             let theme = Theme::from_config(&config);
 
-            let agent = session(false, SessionActivity::Agent(Some("claude")));
+            let agent = session(false, SessionActivity::agent(Some("claude"), LiveState::Idle));
             let mut agent_row = |ui: &mut egui::Ui| {
                 session_row(ui, &agent, false, false, false, &icons, &theme);
             };
@@ -12823,7 +12947,8 @@ mod tests {
             let slot = painted_glyph_positions(probe.last().expect("the row painted"))
                 [DEFAULT_AGENT_ICON.as_str()];
 
-            let loading = session(false, SessionActivity::Loading(Some("claude")));
+            let loading =
+                session(false, SessionActivity::agent(Some("claude"), LiveState::Working));
             let texts = texts_while_hovering_at(slot, WIDTH, |ui| {
                 session_row(ui, &loading, false, false, false, &icons, &theme);
             });
@@ -12833,7 +12958,7 @@ mod tests {
                 "loading status, icon_tooltips = {icon_tooltips}"
             );
 
-            let waiting = session(true, SessionActivity::Idle);
+            let waiting = session(true, SessionActivity::Shell);
             let texts = texts_while_hovering_at(slot, WIDTH, |ui| {
                 session_row(ui, &waiting, false, false, false, &icons, &theme);
             });
@@ -12959,7 +13084,7 @@ mod tests {
                     false,
                     false,
                     false,
-                    SessionActivity::Idle,
+                    SessionActivity::Shell,
                     false,
                     &[],
                     &icons,
@@ -13025,7 +13150,7 @@ mod tests {
                     false,
                     false,
                     false,
-                    SessionActivity::Idle,
+                    SessionActivity::Shell,
                     false,
                     &[],
                     &icons,
@@ -13098,7 +13223,7 @@ mod tests {
                     false,
                     false,
                     false,
-                    SessionActivity::Idle,
+                    SessionActivity::Shell,
                     false,
                     &[],
                     &icons,
@@ -13131,7 +13256,7 @@ mod tests {
             id: 1,
             title: "cargo test --workspace --all-features -- --nocapture".to_owned(),
             needs_attention: false,
-            activity: SessionActivity::Idle,
+            activity: SessionActivity::Shell,
             is_active: true,
             is_displayed: true,
         };

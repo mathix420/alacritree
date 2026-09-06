@@ -683,6 +683,13 @@ baked_glyphs! {
     /// Every recognized agent shares one status mark; identity belongs in the
     /// tooltip and title instead of changing the sidebar's visual grammar.
     DEFAULT_AGENT_ICON = "◇";
+    /// An agent held at a dialog it needs a human to answer.  Solid against
+    /// the idle diamond's outline, so the two read apart before the attention
+    /// color does any work.  Deliberately the codepoint
+    /// `DEFAULT_WORKTREE_MAIN_ICON` already carries: the two never share a
+    /// slot, and a new one would mean rebuilding the baked face for a shape
+    /// it already has.
+    DEFAULT_BLOCKED_ICON = "●";
     /// Action buttons.  Each takes a config key of its own; the glyphs are
     /// declared here because coverage is owed regardless of who names them.
     DEFAULT_ADD_ICON = "+";
@@ -4426,6 +4433,9 @@ program = "second"
         for g in ["◇", "+", "×", "↻", "⇅", "·", "—", "•", "…", "↓", "⠿", "▌"] {
             assert!(chrome.contains(&g), "{g} is missing from CHROME_GLYPHS");
         }
+        // The blocked mark shares `DEFAULT_WORKTREE_MAIN_ICON`'s codepoint, so
+        // the icon slice's own multiset check cannot notice it going missing.
+        assert!(chrome.contains(&"●"), "● is missing from CHROME_GLYPHS");
     }
 
     /// A derived `Default` on a bare `bool` would make this false and silently

@@ -137,19 +137,95 @@ pub enum SessionKind {
     },
 }
 
-/// What the sidebar needs to communicate about a live session.  Agent
-/// identity remains available for hover text, but every agent shares the same
-/// visual language instead of each CLI bringing its own status glyph.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SessionActivity {
+/// What an agent is doing right now.  Mutually exclusive and recomputed from
+/// whatever signal the session has, so nothing here latches — the flag that
+/// does, `Session::needs_attention`, is a separate axis and coexists with all
+/// three.
+///
+/// Ordered by how much a state wants a human, which is what an aggregate row
+/// ranks by when several sessions report at once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LiveState {
+    /// Present and waiting on you, with nothing in flight.
     #[default]
     Idle,
-    /// A recognized name enriches the tooltip; `None` is an agent inferred
-    /// only from the conventional decorative title prefix.
-    Agent(Option<&'static str>),
     /// A Braille spinner in the title is the cross-agent signal for active
-    /// work. Unknown agents can therefore still report loading.
-    Loading(Option<&'static str>),
+    /// work, so an unrecognized agent can report working too.
+    Working,
+    /// An approval or permission dialog is on screen right now.  Unlike the
+    /// latched attention flag, this clears itself when the dialog does, so an
+    /// agent that auto-approves after you walk away stops claiming to want
+    /// you.  Only a watcher outside the pane can see it, and no native
+    /// alacritree signal reaches inside one yet.
+    Blocked,
+}
+
+impl LiveState {
+    /// The live state a herdr status reports.  `None` is herdr declining to
+    /// say rather than a claim that the agent is idle, so a caller that
+    /// already has a reading of its own keeps it.
+    ///
+    /// `done` collapses to `Idle`: a finished turn is not work in flight.
+    /// The word survives in the row's label, which is where the distinction
+    /// is worth drawing.
+    pub fn from_herdr(status: herdr::Status) -> Option<Self> {
+        match status {
+            herdr::Status::Idle | herdr::Status::Done => Some(Self::Idle),
+            herdr::Status::Working => Some(Self::Working),
+            herdr::Status::Blocked => Some(Self::Blocked),
+            herdr::Status::Unknown => None,
+        }
+    }
+}
+
+/// What the sidebar needs to communicate about a live session.  Presence is a
+/// gate rather than a state: a plain shell has no agent, so there is no agent
+/// state to draw.  Agent identity remains available for hover text, but every
+/// agent shares the same visual language instead of each CLI bringing its own
+/// status glyph.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SessionActivity {
+    /// Nothing agent-shaped in the foreground.
+    #[default]
+    Shell,
+    /// A recognized `name` enriches the tooltip; `None` is an agent inferred
+    /// only from the conventional decorative title prefix, or one herdr
+    /// vouches for that no process probe recognized.
+    Agent { name: Option<&'static str>, live: LiveState },
+}
+
+impl SessionActivity {
+    pub fn agent(name: Option<&'static str>, live: LiveState) -> Self {
+        Self::Agent { name, live }
+    }
+
+    /// Whether an agent holds the foreground at all — the gate the row's
+    /// title cleanup and the workspace aggregate both key on.
+    pub fn is_agent(self) -> bool {
+        matches!(self, Self::Agent { .. })
+    }
+
+    /// The live state, or `None` when no agent is present to have one.
+    pub fn live(self) -> Option<LiveState> {
+        match self {
+            Self::Shell => None,
+            Self::Agent { live, .. } => Some(live),
+        }
+    }
+
+    pub fn name(self) -> Option<&'static str> {
+        match self {
+            Self::Shell => None,
+            Self::Agent { name, .. } => name,
+        }
+    }
+
+    /// The same agent, re-reported as doing something else.  A plain shell
+    /// gains the gate: whoever supplies a live state has already established
+    /// that an agent is there.
+    pub fn with_live(self, live: LiveState) -> Self {
+        Self::Agent { name: self.name(), live }
+    }
 }
 
 /// One tab in a workspace. Shell/diff tabs own a PTY and parsed terminal;
@@ -427,11 +503,11 @@ fn title_decorative_glyph(title: &str) -> Option<char> {
 
 fn session_activity(agent_name: Option<&'static str>, title: &str) -> SessionActivity {
     if is_spinner_title(title) {
-        SessionActivity::Loading(agent_name)
+        SessionActivity::agent(agent_name, LiveState::Working)
     } else if agent_name.is_some() || title_decorative_glyph(title).is_some() {
-        SessionActivity::Agent(agent_name)
+        SessionActivity::agent(agent_name, LiveState::Idle)
     } else {
-        SessionActivity::Idle
+        SessionActivity::Shell
     }
 }
 
@@ -1530,7 +1606,7 @@ impl Session {
     /// active work even for an agent the process list does not recognize.
     pub fn activity(&self) -> SessionActivity {
         if self.scratchpad.is_some() {
-            return SessionActivity::Idle;
+            return SessionActivity::Shell;
         }
         session_activity(self.process_agent_name(), &self.title)
     }
@@ -2666,18 +2742,47 @@ mod tests {
     }
 
     #[test]
+    fn a_herdr_status_maps_onto_the_live_axis() {
+        assert_eq!(LiveState::from_herdr(herdr::Status::Idle), Some(LiveState::Idle));
+        assert_eq!(LiveState::from_herdr(herdr::Status::Working), Some(LiveState::Working));
+        assert_eq!(LiveState::from_herdr(herdr::Status::Blocked), Some(LiveState::Blocked));
+        // A finished turn is not work in flight.  The word itself survives in
+        // the row's label, which is where `done` is worth distinguishing.
+        assert_eq!(LiveState::from_herdr(herdr::Status::Done), Some(LiveState::Idle));
+        // herdr declining to say is not a claim that the agent is idle.
+        assert_eq!(LiveState::from_herdr(herdr::Status::Unknown), None);
+    }
+
+    #[test]
+    fn the_live_axis_ranks_by_how_much_a_state_wants_a_human() {
+        assert!(LiveState::Idle < LiveState::Working);
+        assert!(LiveState::Working < LiveState::Blocked);
+    }
+
+    #[test]
     fn session_activity_uses_one_cross_agent_status_set() {
-        assert_eq!(session_activity(None, "zsh"), SessionActivity::Idle);
+        assert_eq!(session_activity(None, "zsh"), SessionActivity::Shell);
         assert_eq!(
             session_activity(Some("claude"), "✳ waiting"),
-            SessionActivity::Agent(Some("claude"))
+            SessionActivity::agent(Some("claude"), LiveState::Idle)
         );
-        assert_eq!(session_activity(None, "✦ waiting"), SessionActivity::Agent(None));
+        assert_eq!(
+            session_activity(None, "✦ waiting"),
+            SessionActivity::agent(None, LiveState::Idle)
+        );
         assert_eq!(
             session_activity(Some("codex"), "⠋ working"),
-            SessionActivity::Loading(Some("codex"))
+            SessionActivity::agent(Some("codex"), LiveState::Working)
         );
-        assert_eq!(session_activity(None, "⠋ working"), SessionActivity::Loading(None));
+        assert_eq!(
+            session_activity(None, "⠋ working"),
+            SessionActivity::agent(None, LiveState::Working)
+        );
+        // No native signal reaches inside a pane, so nothing here reports
+        // blocked; herdr is the only source of that state today.
+        for title in ["zsh", "✳ waiting", "⠋ working", "✦ Allow this edit? (y/n)"] {
+            assert_ne!(session_activity(None, title).live(), Some(LiveState::Blocked));
+        }
     }
 
     #[test]
