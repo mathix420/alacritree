@@ -344,7 +344,7 @@ pub fn match_workspace(agent: &Agent, side: &Side, workspaces: &[PathBuf]) -> Op
 
 /// Component-wise prefix test.  Case-insensitive on Windows, where herdr
 /// reports the cwd as the shell spelled it and `Path::starts_with` would
-/// refuse `c:\users\lev` against `C:\Users\Lev`.
+/// refuse `c:\users\dev` against `C:\Users\Dev`.
 fn starts_with(cwd: &Path, workspace: &Path) -> bool {
     if cfg!(windows) {
         let mut want = workspace.components();
@@ -1140,7 +1140,7 @@ status_indicators = \"symbols\"
     const WINDOWS: &str = r#"{"id":"cli:agent:list","result":{"agents":[
         {"agent":"claude","agent_status":"idle","pane_id":"w5:p1",
          "terminal_id":"term_65abfc8e300361","revision":7,"state_change_seq":3,
-         "cwd":"C:\\Users\\Lev\\Git\\github\\alacritree","focused":true,
+         "cwd":"C:\\projects\\alacritree","focused":true,
          "tab_id":"w5:t1","workspace_id":"w5"}],"type":"agent_list"}}"#;
 
     #[test]
@@ -1158,13 +1158,13 @@ status_indicators = \"symbols\"
     const WSL: &str = r#"{"id":"cli:agent:list","result":{"agents":[
         {"agent":"codex","agent_status":"idle","pane_id":"w4:p1",
          "terminal_id":"term_65ab9ae95a74d2","revision":9,"state_change_seq":9,
-         "cwd":"/home/lev/Git/lev/devkit","foreground_cwd":"/home/lev/Git/lev/devkit",
+         "cwd":"/home/dev/Git/devkit","foreground_cwd":"/home/dev/Git/devkit",
          "focused":true,"tab_id":"w4:t1","workspace_id":"w4"}],"type":"agent_list"}}"#;
 
     #[test]
     fn parses_a_wsl_agent_with_foreground_cwd() {
         let agents = parse_agent_list(WSL);
-        assert_eq!(agents[0].foreground_cwd.as_deref(), Some("/home/lev/Git/lev/devkit"));
+        assert_eq!(agents[0].foreground_cwd.as_deref(), Some("/home/dev/Git/devkit"));
         assert_eq!(agents[0].kind.as_deref(), Some("codex"));
     }
 
@@ -1457,18 +1457,18 @@ status_indicators = \"symbols\"
     #[cfg(windows)]
     #[test]
     fn windows_prefixes_compare_case_insensitively() {
-        let spaces = vec![PathBuf::from(r"C:\Users\Lev\repo")];
-        let matched = match_workspace(&at(r"c:\users\lev\repo\src", None), &Side::Native, &spaces);
-        assert_eq!(matched, Some(PathBuf::from(r"C:\Users\Lev\repo")));
+        let spaces = vec![PathBuf::from(r"C:\Users\Dev\repo")];
+        let matched = match_workspace(&at(r"c:\users\dev\repo\src", None), &Side::Native, &spaces);
+        assert_eq!(matched, Some(PathBuf::from(r"C:\Users\Dev\repo")));
     }
 
     #[test]
     fn wsl_agent_matches_by_the_translated_windows_path() {
         let distro = "kali-linux";
-        let workspace = wsl::linux_to_windows("/mnt/c/Users/Lev/repo", distro);
+        let workspace = wsl::linux_to_windows("/mnt/c/Users/dev/repo", distro);
         let spaces = vec![workspace.clone()];
         let matched = match_workspace(
-            &at("/mnt/c/Users/Lev/repo/src", None),
+            &at("/mnt/c/Users/dev/repo/src", None),
             &Side::Wsl(distro.into()),
             &spaces,
         );
@@ -1478,7 +1478,7 @@ status_indicators = \"symbols\"
     #[test]
     fn a_wsl_agent_outside_every_workspace_still_has_none() {
         let distro = "kali-linux";
-        let spaces = vec![wsl::linux_to_windows("/mnt/c/Users/Lev/repo", distro)];
+        let spaces = vec![wsl::linux_to_windows("/mnt/c/Users/dev/repo", distro)];
         let matched =
             match_workspace(&at("/mnt/d/elsewhere", None), &Side::Wsl(distro.into()), &spaces);
         assert_eq!(matched, None);
