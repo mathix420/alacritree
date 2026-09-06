@@ -628,6 +628,10 @@ pub struct AlacritreeApp {
     project_refresh_jobs: HashMap<PathBuf, jobs::Job<()>>,
     /// PTYs opened on a worker, adopted in `poll_pending_spawns`.
     pending_spawns: PendingSpawns,
+    /// A shared-view attach whose herdr calls are running on the pool,
+    /// adopted in `poll_herdr_attach`.  One at a time, because the side it
+    /// runs against has room for one client.
+    pending_herdr_attach: Option<PendingHerdrAttach>,
     /// Resolved absolute path of `delta` inside each WSL distro, so diff panes
     /// stop re-sourcing a login profile on every open.  Successes only: a miss
     /// is never stored, so installing delta mid-session is picked up later.
@@ -1018,6 +1022,7 @@ impl AlacritreeApp {
             project_refreshes: Default::default(),
             project_refresh_jobs: HashMap::new(),
             pending_spawns: Default::default(),
+            pending_herdr_attach: None,
             wsl_delta_paths: HashMap::new(),
             pending_delta: HashMap::new(),
             liveness: Default::default(),
@@ -1413,50 +1418,93 @@ impl AlacritreeApp {
         pane_id: &str,
         workspace: WorkspaceKey,
     ) -> bool {
-        // The client this replaces, once its own is up.  A shared view is one
-        // window on the whole herdr session, so a side has room for exactly
-        // one: a second would show the same herdr twice and leave the pane
-        // the first is no longer on looking unattached.
-        let mut replacing = None;
-        let (program, argv) = if herdr::can_attach(&key.side) {
+        if herdr::can_attach(&key.side) {
+            // Nothing to ask herdr first: the pane id is the whole target,
+            // and the client attaches to it directly.
             let args = herdr::attach_args(pane_id);
             let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-            key.side.command(&borrowed)
-        } else {
-            // herdr's attach client is a `#[cfg(windows)]` refusal, so the
-            // pane is focused in the user's own herdr window first and this
-            // session attaches to the whole herdr session instead of one
-            // agent. Two argv spawns, no shell — the only shell a `Native`
-            // command could reach on this side is cmd.exe, which does not
-            // understand `sh_quote`'s single-quoting.
-            // herdr's client reads the focused pane when it starts and holds
-            // that view: a focus moved from outside afterwards reaches the
-            // server, and the running client keeps drawing the pane it opened
-            // on.  So a view already on the pane is brought up as it is, and
-            // one on another pane is replaced rather than redirected.
-            if let Some(id) = self.herdr_view_showing(&key) {
-                self.activate_session_by_id(id);
-                return true;
-            }
-            if let Err(e) = herdr::focus_agent(&key.side, pane_id) {
+            let (program, argv) = key.side.command(&borrowed);
+            return self.open_herdr_session(ctx, key, workspace, program, argv, None);
+        }
+
+        // herdr's client reads the focused pane when it starts and holds that
+        // view: a focus moved from outside afterwards reaches the server, and
+        // the running client keeps drawing the pane it opened on.  So a view
+        // already on the pane is brought up as it is, and one on another pane
+        // is replaced rather than redirected.
+        if let Some(id) = self.herdr_view_showing(&key) {
+            self.activate_session_by_id(id);
+            return true;
+        }
+        // A second gesture would focus a second pane and start a second
+        // client for a side with room for one, so a click that lands while
+        // one is running is left to the one already running.
+        if self.pending_herdr_attach.is_some() {
+            return false;
+        }
+        // The client this replaces, once its own is up.  A side has room for
+        // exactly one shared view: a second would show the same herdr twice
+        // and leave the pane the first is no longer on looking unattached.
+        let replacing = self.herdr_view_session(&key.side);
+        let name = self.herdr_session_name(&key.side);
+        if self.config.ui.async_session_spawn {
+            let side = key.side.clone();
+            let pane = pane_id.to_string();
+            let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
+                herdr_attach_gesture(&side, &pane, name)
+            });
+            self.pending_herdr_attach = Some(PendingHerdrAttach { job, key, workspace, replacing });
+            return true;
+        }
+        match herdr_attach_gesture(&key.side, pane_id, name) {
+            Ok((program, argv)) => {
+                self.open_herdr_session(ctx, key, workspace, program, argv, replacing)
+            },
+            Err(e) => {
                 self.error_dialog = Some(e);
-                return false;
-            }
-            replacing = self.herdr_view_session(&key.side);
-            // The background read usually has it; a click that beats the
-            // first one still asks, since a wait is better than a refusal.
-            let session = match self.herdr_session_name(&key.side) {
-                Some(session) => session,
-                None => match herdr::running_session_name(&key.side) {
-                    Ok(session) => session,
-                    Err(e) => {
-                        self.error_dialog = Some(e);
-                        return false;
-                    },
-                },
-            };
-            key.side.command(&["session", "attach", &session])
+                false
+            },
+        }
+    }
+
+    /// Adopt a shared-view attach whose herdr calls have landed.  The session
+    /// opens in the workspace the click came from, which the click switched to
+    /// before handing the gesture over.
+    fn poll_herdr_attach(&mut self, ctx: &Context) {
+        let Some(pending) = self.pending_herdr_attach.take() else {
+            return;
         };
+        match pending.job.poll() {
+            Some(Ok((program, argv))) => {
+                self.open_herdr_session(
+                    ctx,
+                    pending.key,
+                    pending.workspace,
+                    program,
+                    argv,
+                    pending.replacing,
+                );
+            },
+            Some(Err(e)) => self.error_dialog = Some(e),
+            None if pending.job.failed() => {
+                self.error_dialog = Some("the herdr attach did not finish".to_string());
+            },
+            None => self.pending_herdr_attach = Some(pending),
+        }
+    }
+
+    /// Open the session that runs an attach client, and retire the view it
+    /// replaces once its successor is up: closing first would land the
+    /// workspace on some other session in between.
+    fn open_herdr_session(
+        &mut self,
+        ctx: &Context,
+        key: herdr::HerdrKey,
+        workspace: WorkspaceKey,
+        program: String,
+        argv: Vec<String>,
+        replacing: Option<SessionId>,
+    ) -> bool {
         // `alacritty_terminal::tty::Shell`'s fields are crate-private, so
         // this goes through the constructor rather than a struct literal.
         let shell = Shell::new(program, argv);
@@ -1465,8 +1513,6 @@ impl AlacritreeApp {
                 if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
                     session.herdr_key = Some(key);
                 }
-                // Only redundant once its replacement is up: closing first
-                // would land the workspace on some other session in between.
                 if let Some(old) = replacing {
                     self.close_session(ctx, old);
                 }
@@ -8482,6 +8528,42 @@ fn managed_tooltip(managed: &Managed) -> String {
     hint
 }
 
+/// A shared-view attach waiting on herdr.  The gesture answers with the argv
+/// its client runs, so everything the session needs is in hand by the time it
+/// opens.
+struct PendingHerdrAttach {
+    job: jobs::Job<Result<(String, Vec<String>), String>>,
+    key: herdr::HerdrKey,
+    workspace: WorkspaceKey,
+    replacing: Option<SessionId>,
+}
+
+/// What a shared-view attach asks herdr before its client can start: focus
+/// the pane, since the client reads the focused one when it starts, then name
+/// the session, since that is what it attaches to.  Both are process spawns,
+/// and on native Windows both are herdr starting behind whatever the machine
+/// charges for it, which is why this runs on the pool wherever the spawn gate
+/// allows.
+///
+/// `cached_name` is what the endpoint learned in the background.  A gesture
+/// that beats the first read asks herdr itself: a wait is better than a
+/// refusal.
+fn herdr_attach_gesture(
+    side: &herdr::Side,
+    pane_id: &str,
+    cached_name: Option<String>,
+) -> Result<(String, Vec<String>), String> {
+    // Two argv spawns, no shell: the only shell a `Native` command could
+    // reach on this side is cmd.exe, which does not understand `sh_quote`'s
+    // single-quoting.
+    herdr::focus_agent(side, pane_id)?;
+    let session = match cached_name {
+        Some(session) => session,
+        None => herdr::running_session_name(side)?,
+    };
+    Ok(side.command(&["session", "attach", &session]))
+}
+
 /// Whether ending a session asks first.  A harness-managed one is a detach
 /// rather than a kill, so it answers to its own switch: the attach client is
 /// always running, which would make the busy question a close asks fire every
@@ -10547,6 +10629,7 @@ impl eframe::App for AlacritreeApp {
         }
         self.poll_project_refreshes();
         self.poll_pending_spawns(ctx);
+        self.poll_herdr_attach(ctx);
         // Unconditional: either sidebar can be hidden, and a drain hung off one
         // of them would strand every entry the other polled.
         self.pr_cache.drain_completed(ctx);
