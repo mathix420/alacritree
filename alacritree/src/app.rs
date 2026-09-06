@@ -7887,6 +7887,20 @@ fn worktree_is_switchable(wt: &Worktree, missing: Option<bool>, has_sessions: bo
     !worktree_looks_gone(wt, missing) || has_sessions
 }
 
+/// The workspaces a herdr agent may be matched against.  A checkout that
+/// looks gone offers none, which is what makes an agent working there
+/// unmatched rather than parked under a row that can only refuse it.
+/// `missing` is the liveness cache's word for a path, `None` where it has
+/// none, so the row's grey and this list agree about the same directory.
+fn herdr_workspaces(projects: &[Project], missing: impl Fn(&Path) -> Option<bool>) -> Vec<PathBuf> {
+    projects
+        .iter()
+        .flat_map(|p| p.worktrees.iter())
+        .filter(|wt| !worktree_looks_gone(wt, missing(&wt.path)))
+        .map(|wt| wt.path.clone())
+        .collect()
+}
+
 struct SessionRowAction {
     activate: bool,
     close: bool,
@@ -8256,13 +8270,7 @@ impl AlacritreeApp {
         }
         let claimed: Vec<herdr::HerdrKey> =
             self.sessions.iter().filter_map(|s| s.herdr_key.clone()).collect();
-        let workspaces: Vec<PathBuf> = self
-            .projects
-            .iter()
-            .flat_map(|p| p.worktrees.iter())
-            .filter(|wt| !worktree_looks_gone(wt, self.liveness.missing(&wt.path)))
-            .map(|wt| wt.path.clone())
-            .collect();
+        let workspaces = herdr_workspaces(&self.projects, |path| self.liveness.missing(path));
 
         for cache in self.herdr_endpoints.caches() {
             let side = cache.side();
@@ -13408,6 +13416,33 @@ mod tests {
         assert!(
             snapshot.is_projected(below),
             "a row below the one being deleted must still be navigable"
+        );
+    }
+
+    /// A checkout the liveness cache calls gone offers no workspace, so the
+    /// agent working in it matches nothing and lists under Home.  Matched to
+    /// the removed worktree instead, its row's Enter could only refuse.
+    #[test]
+    fn a_gone_worktree_offers_no_workspace_to_an_agent() {
+        use crate::sidebar_nav;
+
+        let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2"])];
+        let gone = PathBuf::from("/a/wt2");
+        let workspaces = herdr_workspaces(&projects, |path| Some(path == gone));
+        assert_eq!(workspaces, vec![PathBuf::from("/a/wt1")]);
+
+        let agent = herdr::Agent {
+            terminal_id: "t1".into(),
+            pane_id: "w1:p1".into(),
+            kind: None,
+            status: herdr::Status::Idle,
+            cwd: Some(gone.to_string_lossy().into_owned()),
+            foreground_cwd: None,
+        };
+        assert_eq!(
+            herdr::match_workspace(&agent, &herdr::Side::Native, &workspaces),
+            None,
+            "an agent under a removed checkout falls back to Home"
         );
     }
 

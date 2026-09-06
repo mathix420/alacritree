@@ -480,6 +480,10 @@ impl EndpointCache {
 /// spawn.
 const DISTRO_REFRESH: Duration = Duration::from_secs(10);
 
+/// Odd multiplier (the 64-bit golden ratio) that lifts a membership change
+/// clear of the per-endpoint generation steps it is summed with.
+const MEMBERSHIP_SCALE: u64 = 0x9E37_79B9_7F4A_7C15;
+
 /// Every herdr server alacritree talks to.  The native side is permanent; a
 /// WSL side exists only while its distro's VM is up, because reaching into a
 /// stopped distro boots it — seconds of disk I/O and a VM's worth of memory —
@@ -489,7 +493,10 @@ pub struct Endpoints {
     /// Moves whenever an endpoint joins or leaves, so a set change reaches the
     /// sidebar even when the generations it replaces happen to sum the same.
     membership: u64,
-    running: Option<jobs::Job<Vec<String>>>,
+    running: Option<jobs::Job<Option<Vec<String>>>>,
+    /// Latches while listings keep failing, so the reason is logged once
+    /// rather than every refresh.
+    listing_failed: bool,
     last_refresh: Option<Instant>,
 }
 
@@ -499,6 +506,7 @@ impl Default for Endpoints {
             caches: vec![EndpointCache::new(Side::Native)],
             membership: 0,
             running: None,
+            listing_failed: false,
             last_refresh: None,
         }
     }
@@ -511,8 +519,14 @@ impl Endpoints {
 
     /// One number standing for every endpoint's rendered state, so the
     /// sidebar's per-frame comparison stays a `u64` compare.
+    ///
+    /// Membership enters scaled rather than added: an endpoint leaving takes
+    /// its own generation out of the sum, and a membership step of one would
+    /// cancel exactly against the endpoint whose generation is one — which is
+    /// what a cache holds the moment its first agent lands.
     pub fn generation(&self) -> u64 {
-        self.caches.iter().map(EndpointCache::generation).fold(self.membership, u64::wrapping_add)
+        let membership = self.membership.wrapping_mul(MEMBERSHIP_SCALE);
+        self.caches.iter().map(EndpointCache::generation).fold(membership, u64::wrapping_add)
     }
 
     /// Refreshes the endpoint set and each endpoint's agents.  Never blocks.
@@ -528,8 +542,8 @@ impl Endpoints {
     fn refresh_running(&mut self) {
         if let Some(job) = &self.running {
             match job.poll() {
-                Some(running) => {
-                    self.adopt_running(&running);
+                Some(listing) => {
+                    self.adopt_listing(listing);
                     self.running = None;
                 },
                 None if job.failed() => self.running = None,
@@ -546,6 +560,27 @@ impl Endpoints {
             return;
         }
         self.running = Some(jobs::pool().spawn(jobs::Priority::Background, wsl::running_distros));
+    }
+
+    /// Takes what the listing job answered.  A listing that failed is not
+    /// evidence that nothing is running, so it leaves the endpoint set — and
+    /// every endpoint's cached agents and backoff state — exactly as it is;
+    /// only an answer may remove an endpoint.  The failure is logged once per
+    /// run of failures, so a `wsl.exe` that cannot list at all says so without
+    /// writing a line every refresh.
+    fn adopt_listing(&mut self, listing: Option<Vec<String>>) {
+        match listing {
+            Some(running) => {
+                self.listing_failed = false;
+                self.adopt_running(&running);
+            },
+            None => {
+                if !self.listing_failed {
+                    log::debug!("herdr: listing running distros failed; keeping the endpoints");
+                    self.listing_failed = true;
+                }
+            },
+        }
     }
 
     /// Adopts a listing of running distros: an endpoint appears when its
@@ -799,6 +834,38 @@ mod tests {
         assert_eq!(endpoints.caches().len(), 1);
         assert_eq!(*endpoints.caches()[0].side(), Side::Native, "the native side is permanent");
         assert_ne!(endpoints.generation(), started, "the rows the endpoint carried are gone");
+    }
+
+    /// The endpoint an adoption removes carries its own generation away with
+    /// it, and a set change has to outweigh that however far the endpoint had
+    /// counted — `1`, what a cache holds after its first agent lands, most of
+    /// all.
+    #[test]
+    fn removing_an_endpoint_that_landed_a_poll_is_still_observable() {
+        let mut endpoints = Endpoints::default();
+        endpoints.adopt_running(&["kali-linux".to_string()]);
+        endpoints.caches[1].generation = 1;
+        let with_agent = endpoints.generation();
+
+        endpoints.adopt_running(&[]);
+        assert_ne!(endpoints.generation(), with_agent);
+    }
+
+    /// A listing that failed says nothing about what is running, so it must
+    /// not read as "nothing is": one `wsl.exe` hiccup would otherwise drop
+    /// every WSL endpoint along with its agents and its backoff state.
+    #[test]
+    fn a_failed_listing_leaves_the_endpoint_set_alone() {
+        let mut endpoints = Endpoints::default();
+        endpoints.adopt_listing(Some(vec!["kali-linux".to_string()]));
+        let listed = endpoints.generation();
+
+        endpoints.adopt_listing(None);
+        assert_eq!(endpoints.caches().len(), 2);
+        assert_eq!(endpoints.generation(), listed);
+
+        endpoints.adopt_listing(Some(Vec::new()));
+        assert_eq!(endpoints.caches().len(), 1, "an answered empty listing does remove it");
     }
 
     #[test]

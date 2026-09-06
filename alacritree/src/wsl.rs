@@ -269,13 +269,16 @@ fn cli_distros(_blocking: &jobs::Blocking) -> Vec<WslDistro> {
     }
 }
 
-/// The distros whose VM is up right now.  Unlike [`distros`], which reads the
-/// registry and describes what is *installed*, this spawns `wsl.exe`, so it
-/// takes a [`jobs::Blocking`] and the answer is deliberately not cached: a
-/// distro starts and stops while alacritree runs.
+/// The distros whose VM is up right now, or `None` when `wsl.exe` could not
+/// be asked.  Unlike [`distros`], which reads the registry and describes what
+/// is *installed*, this spawns `wsl.exe`, so it takes a [`jobs::Blocking`] and
+/// the answer is deliberately not cached: a distro starts and stops while
+/// alacritree runs.  A listing that failed and a listing that came back empty
+/// are different answers — one says nothing, the other says nothing is
+/// running — so callers that act on emptiness need them apart.
 #[cfg(windows)]
 #[allow(clippy::disallowed_methods)] // Running wsl.exe is this function's job.
-pub fn running_distros(_blocking: &jobs::Blocking) -> Vec<String> {
+pub fn running_distros(_blocking: &jobs::Blocking) -> Option<Vec<String>> {
     let output = command_bare()
         .args(["-l", "-q", "--running"])
         .stdin(Stdio::null())
@@ -283,14 +286,15 @@ pub fn running_distros(_blocking: &jobs::Blocking) -> Vec<String> {
         .stderr(Stdio::null())
         .output();
     match output {
-        Ok(o) if o.status.success() => running_names(&o.stdout, &distros()),
-        _ => Vec::new(),
+        Ok(o) if o.status.success() => Some(running_names(&o.stdout, &distros())),
+        _ => None,
     }
 }
 
+/// No WSL here is an answer, not a failure.
 #[cfg(not(windows))]
-pub fn running_distros(_: &jobs::Blocking) -> Vec<String> {
-    Vec::new()
+pub fn running_distros(_: &jobs::Blocking) -> Option<Vec<String>> {
+    Some(Vec::new())
 }
 
 /// Names from a `--running` listing, kept only where they name a registered
