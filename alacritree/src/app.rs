@@ -7126,7 +7126,6 @@ struct HerdrRowData {
     terminal_id: String,
     pane_id: String,
     name: RowName,
-    status: herdr::Status,
     managed: Managed,
 }
 
@@ -7146,6 +7145,10 @@ struct Managed {
     /// The attach shares the harness's whole view rather than one pane, so
     /// the row says so before a resize reveals it.
     shared_view: bool,
+    /// The agent kind the harness detected, spelled the way it invokes it.
+    kind: Option<String>,
+    /// The pane's own title, when it says something the kind does not.
+    title: Option<String>,
     /// How the harness draws the state it reports.  `None` when it is no
     /// longer reporting one — a pane alacritree still holds open after its
     /// harness stopped listing it.
@@ -7169,8 +7172,7 @@ impl HerdrRowData {
             terminal_id: agent.terminal_id.clone(),
             pane_id: agent.pane_id.clone(),
             name,
-            status: agent.status,
-            managed: Managed::herdr(side, settings, Some(agent.status)),
+            managed: Managed::herdr(side, settings, Some(agent)),
         }
     }
 }
@@ -7202,16 +7204,31 @@ fn herdr_row_name(agent: &herdr::Agent) -> Option<RowName> {
 }
 
 impl Managed {
-    fn herdr(
-        side: &herdr::Side,
-        settings: &herdr::Settings,
-        status: Option<herdr::Status>,
-    ) -> Self {
+    /// `agent` is herdr's current word on the pane, and `None` once it stops
+    /// reporting one — a pane alacritree still holds open after its harness
+    /// let go of it, which has a harness and a way out but no state or name.
+    fn herdr(side: &herdr::Side, settings: &herdr::Settings, agent: Option<&herdr::Agent>) -> Self {
+        let kind = agent.and_then(|a| a.kind.clone());
+        let title =
+            agent.and_then(|a| a.title.clone()).filter(|t| Some(t.as_str()) != kind.as_deref());
         Self {
             harness: "herdr",
             detach: settings.detach.clone(),
             shared_view: !herdr::can_attach(side),
-            mark: status.map(|status| herdr_mark(status, settings.indicators)),
+            mark: agent.map(|a| herdr_mark(a.status, settings.indicators)),
+            kind,
+            title,
+        }
+    }
+
+    /// What the harness calls this pane: the agent kind backquoted as the
+    /// command it is, and the title quoted as the words it is.
+    fn pane_name(&self) -> Option<String> {
+        match (&self.kind, &self.title) {
+            (Some(kind), Some(title)) => Some(format!("`{kind}` \"{title}\"")),
+            (Some(kind), None) => Some(format!("`{kind}`")),
+            (None, Some(title)) => Some(format!("\"{title}\"")),
+            (None, None) => None,
         }
     }
 }
@@ -8210,7 +8227,7 @@ fn session_row(
                     );
                     if let Some(managed) = &row.managed {
                         let rect = paint_managed_mark(ui, icons, theme, theme.text_muted);
-                        managed_slot = Some((rect, managed_hint(managed)));
+                        managed_slot = Some((rect, managed_tooltip(managed)));
                     }
                     let (_, galley) = truncating_label(
                         ui,
@@ -8228,7 +8245,7 @@ fn session_row(
                         theme.text_muted,
                         theme,
                     );
-                    hints.add(btn.rect, "close session");
+                    hints.add(btn.rect, close_button_hint(row.managed.is_some()));
                     close_rect = Some(btn.rect);
                     if btn.clicked() {
                         close_clicked = true;
@@ -8248,8 +8265,12 @@ fn session_row(
     if let Some((rect, hint)) = managed_slot {
         hints.add(rect, hint);
     }
-    let resp = hints.apply(resp, theme.icon_tooltips, |resp| {
-        name_tooltip(resp, &row.name.text, title_elided, theme.sidebar_tooltips)
+    // A managed row answers with the harness's own sentence wherever the
+    // pointer is not on an icon: the row the user attached is the one they
+    // ask how to leave, and the name tooltip cannot say it.
+    let resp = hints.apply(resp, theme.icon_tooltips, |resp| match &row.managed {
+        Some(managed) if theme.icon_tooltips => resp.on_hover_text(managed_tooltip(managed)),
+        _ => name_tooltip(resp, &row.name.text, title_elided, theme.sidebar_tooltips),
     });
 
     // Frame allocates its space at end-of-show, so its retroactive `interact`
@@ -8329,34 +8350,43 @@ fn row_name_text(
     job.into()
 }
 
-/// What hovering the row explains — herdr's detach chord has no other
-/// surface in alacritree, so it goes on every herdr row rather than only the
-/// ones with something else to say.
-fn herdr_row_tooltip(row: &HerdrRowData) -> String {
-    let who = match &row.name.context {
-        Some(context) => format!("{context} {}", row.name.text),
-        None => row.name.text.clone(),
-    };
-    format!("{who}, {}. {}.", row.status.label(), managed_hint(&row.managed))
-}
-
-/// What a harness mark explains on hover.  The detach chord has no other
-/// surface in alacritree — it is the harness's key, not one of ours — so it
-/// travels with the mark wherever the mark goes.
-fn managed_hint(managed: &Managed) -> String {
-    let mut hint = managed.harness.to_string();
-    if managed.shared_view {
-        hint.push_str(", shared view");
+/// What a harness-managed row explains on hover, one fact per comma: the
+/// state, since that is what changes; who reports it; whether the attach is
+/// the harness's whole view; and what the harness calls the pane.  The way
+/// out follows in parentheses, since it is an instruction rather than
+/// another fact about the pane.
+///
+/// The same sentence serves a listed agent and an attached one.  Attaching
+/// changes how alacritree draws a pane, not what there is to say about it,
+/// and the chord has no other surface in alacritree — it is the harness's
+/// key, not one of ours — so it has to reach the row the user is sitting in.
+fn managed_tooltip(managed: &Managed) -> String {
+    let mut parts = Vec::new();
+    if let Some(mark) = managed.mark {
+        parts.push(mark.label.to_owned());
     }
+    parts.push(managed.harness.to_owned());
+    if managed.shared_view {
+        parts.push("shared view".to_owned());
+    }
+    parts.extend(managed.pane_name());
+    let mut hint = parts.join(", ");
+    hint.push('.');
     if let Some(chord) = &managed.detach {
         // Backquoted because the chord is a sequence, not one combination:
         // unquoted, "detach with Ctrl+B q" reads as a sentence whose last
         // word happens to be `q`.
-        hint.push_str(", detach with `");
-        hint.push_str(chord);
-        hint.push('`');
+        hint.push_str(&format!(" (detach with `{chord}`)"));
     }
     hint
+}
+
+/// What the × on a session row does.  Ending a harness-managed session ends
+/// the attach client and nothing else — the pane keeps running under the
+/// harness, and the row it came from comes back — so calling that a close
+/// promises a destruction that does not happen.
+fn close_button_hint(managed: bool) -> &'static str {
+    if managed { "detach session" } else { "close session" }
 }
 
 /// Paint the harness mark and return the rect it claimed, so the caller can
@@ -8411,7 +8441,8 @@ fn herdr_row(
         })
         .response
         .interact(egui::Sense::click());
-    let resp = if theme.icon_tooltips { resp.on_hover_text(herdr_row_tooltip(row)) } else { resp };
+    let resp =
+        if theme.icon_tooltips { resp.on_hover_text(managed_tooltip(&row.managed)) } else { resp };
 
     let bg = if resp.hovered() { theme.row_hover_bg } else { Color32::TRANSPARENT };
     let full_rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
@@ -8680,8 +8711,8 @@ impl AlacritreeApp {
     /// truth to keep in step.
     fn session_managed(&self, session: &Session) -> Option<Managed> {
         let key = session.herdr_key.as_ref()?;
-        let status = self.session_herdr_agent(session).map(|agent| agent.status);
-        Some(Managed::herdr(&key.side, &self.herdr_settings(&key.side), status))
+        let agent = self.session_herdr_agent(session);
+        Some(Managed::herdr(&key.side, &self.herdr_settings(&key.side), agent))
     }
 
     /// One number standing for every endpoint's rendered state, so the
@@ -8858,8 +8889,16 @@ impl AlacritreeApp {
             self.pending_session_close = None;
             return;
         };
-        let title = format!("Close session `{}`?", session.title);
-        let busy = session.is_busy();
+        // A managed session's attach client is always running, so the busy
+        // warning would fire every time and warn about nothing: what it
+        // guards against is losing work, and detaching loses none.
+        let managed = session.herdr_key.is_some();
+        let title = if managed {
+            format!("Detach from `{}`?", session.title)
+        } else {
+            format!("Close session `{}`?", session.title)
+        };
+        let busy = session.is_busy() && !managed;
 
         let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
         let frame = modal_frame(&theme);
@@ -8880,13 +8919,16 @@ impl AlacritreeApp {
                 }
                 ui.add_space(4.0 * s);
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Enter to close · Esc to cancel")
-                            .color(theme.text_muted)
-                            .small(),
-                    );
+                    let keys = if managed {
+                        "Enter to detach · Esc to cancel"
+                    } else {
+                        "Enter to close · Esc to cancel"
+                    };
+                    ui.label(RichText::new(keys).color(theme.text_muted).small());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let close_btn = modal_button(ui, &theme, "Close", danger);
+                        let (verb, tint) =
+                            if managed { ("Detach", theme.text) } else { ("Close", danger) };
+                        let close_btn = modal_button(ui, &theme, verb, tint);
                         if close_btn.clicked() {
                             confirmed = true;
                         }
@@ -11752,25 +11794,59 @@ mod tests {
         assert_eq!((row.name.context.as_deref(), row.name.text.as_str()), (None, "300361"));
     }
 
-    /// Everything the row's marks cannot say goes here, in sentences — the
-    /// status word, the shared view, the harness and the way out.
+    /// Everything the row's marks cannot say goes here, one fact per comma,
+    /// with the way out in parentheses after them: a mark can carry a state
+    /// but not the word for it, and nothing on the row can carry a chord.
     #[test]
-    fn the_tooltip_carries_what_the_marks_cannot() {
-        let mut row = row_of(Some("claude"), Some("primary"));
-        row.status = herdr::Status::Working;
-        assert_eq!(herdr_row_tooltip(&row), "claude primary, working. herdr.");
+    fn the_tooltip_spells_out_what_the_marks_cannot() {
+        let agent = herdr::Agent {
+            status: herdr::Status::Working,
+            ..titled(Some("claude"), Some("Claude Code"))
+        };
+        let mut row = HerdrRowData::from_agent(
+            &agent,
+            &herdr::Side::Wsl("d".into()),
+            &herdr::Settings::default(),
+        );
+        assert_eq!(managed_tooltip(&row.managed), r#"working, herdr, `claude` "Claude Code"."#);
 
         row.managed.detach = Some("Ctrl+B q".to_string());
         assert_eq!(
-            herdr_row_tooltip(&row),
-            "claude primary, working. herdr, detach with `Ctrl+B q`."
+            managed_tooltip(&row.managed),
+            r#"working, herdr, `claude` "Claude Code". (detach with `Ctrl+B q`)"#
         );
 
         row.managed.shared_view = true;
         assert_eq!(
-            herdr_row_tooltip(&row),
-            "claude primary, working. herdr, shared view, detach with `Ctrl+B q`."
+            managed_tooltip(&row.managed),
+            r#"working, herdr, shared view, `claude` "Claude Code". (detach with `Ctrl+B q`)"#
         );
+    }
+
+    /// A pane whose title says no more than its kind is named once.
+    #[test]
+    fn the_tooltip_does_not_say_the_kind_twice() {
+        let row = row_of(Some("codex"), Some("codex"));
+        assert_eq!(managed_tooltip(&row.managed), "idle, herdr, `codex`.");
+    }
+
+    /// A session alacritree still holds open after herdr stopped listing its
+    /// pane has no state and no name left to report, but it is still herdr's
+    /// and the user still has to know how to leave it.
+    #[test]
+    fn an_unlisted_pane_still_says_how_to_leave() {
+        let settings =
+            herdr::Settings { detach: Some("Ctrl+B q".into()), ..herdr::Settings::default() };
+        let managed = Managed::herdr(&herdr::Side::Wsl("d".into()), &settings, None);
+        assert_eq!(managed_tooltip(&managed), "herdr. (detach with `Ctrl+B q`)");
+    }
+
+    /// Ending a herdr-managed session ends the attach and leaves the pane
+    /// running, so the control cannot call itself a close.
+    #[test]
+    fn the_close_control_is_a_detach_on_a_managed_row() {
+        assert_eq!(close_button_hint(true), "detach session");
+        assert_eq!(close_button_hint(false), "close session");
     }
 
     #[test]
