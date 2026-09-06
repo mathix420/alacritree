@@ -89,6 +89,10 @@ pub struct Agent {
     /// and nothing else.
     pub title: Option<String>,
     pub status: Status,
+    /// The pane herdr's own window is showing.  A shared-view attach borrows
+    /// that window rather than one pane, so this is what such a session has
+    /// on screen.
+    pub focused: bool,
     pub cwd: Option<String>,
     pub foreground_cwd: Option<String>,
 }
@@ -114,6 +118,7 @@ struct RawAgent {
     agent: Option<String>,
     display_agent: Option<String>,
     terminal_title_stripped: Option<String>,
+    focused: Option<bool>,
     cwd: Option<String>,
     foreground_cwd: Option<String>,
 }
@@ -139,6 +144,7 @@ pub fn parse_agent_list(stdout: &str) -> Vec<Agent> {
                     .terminal_title_stripped
                     .map(|t| t.trim().to_string())
                     .filter(|t| !t.is_empty()),
+                focused: raw.focused.unwrap_or(false),
                 cwd: raw.cwd,
                 foreground_cwd: raw.foreground_cwd,
             })
@@ -295,6 +301,29 @@ pub fn running_session_name(side: &Side) -> Result<String, String> {
 pub struct HerdrKey {
     pub side: Side,
     pub terminal_id: String,
+}
+
+impl HerdrKey {
+    /// The pane the session holding this key currently stands for.
+    ///
+    /// A direct attach owns the pane it opened for its whole life.  A
+    /// shared-view attach borrows herdr's window instead and follows it, so
+    /// the pane on screen is whichever one herdr has focused — which changes
+    /// as the user moves around herdr, and outlives the pane the attach
+    /// started on.  Holding such a session to its original pane would let
+    /// herdr list the agent the user is looking at as one nothing is
+    /// attached to, and draw it a second row beside the session showing it.
+    ///
+    /// With no agent focused — herdr showing a pane that runs none — the
+    /// original pane stands, so the session claims one rather than none.
+    pub fn claim(&self, shared_view: bool, focused: Option<&Agent>) -> Self {
+        match focused {
+            Some(agent) if shared_view => {
+                Self { side: self.side.clone(), terminal_id: agent.terminal_id.clone() }
+            },
+            _ => self.clone(),
+        }
+    }
 }
 
 /// The agents on `side` that no live session is attached to.  These are the
@@ -713,6 +742,8 @@ fn rendered_differs(was: &[Agent], now: &[Agent]) -> bool {
             a.terminal_id != b.terminal_id
                 || a.status != b.status
                 || a.kind != b.kind
+                || a.title != b.title
+                || a.focused != b.focused
                 || a.cwd != b.cwd
                 || a.foreground_cwd != b.foreground_cwd
                 || a.pane_id != b.pane_id
@@ -1336,6 +1367,7 @@ status_indicators = \"symbols\"
             kind: Some("claude".into()),
             title: None,
             status,
+            focused: false,
             cwd: Some("/repo".into()),
             foreground_cwd: None,
         }
@@ -1361,6 +1393,7 @@ status_indicators = \"symbols\"
             kind: None,
             title: None,
             status: Status::Idle,
+            focused: false,
             cwd: Some(cwd.into()),
             foreground_cwd: foreground.map(str::to_string),
         }
@@ -1451,5 +1484,36 @@ status_indicators = \"symbols\"
         let agents = vec![agent("t1", Status::Idle)];
         let claimed = [HerdrKey { side: Side::Wsl("d".into()), terminal_id: "t1".into() }];
         assert_eq!(unattached(&agents, &Side::Native, &claimed).len(), 1);
+    }
+
+    fn focused(id: &str) -> Agent {
+        Agent { focused: true, ..agent(id, Status::Idle) }
+    }
+
+    /// A direct attach is wired to one pane, so herdr moving its own focus
+    /// changes nothing about what the session is showing.
+    #[test]
+    fn a_direct_attach_keeps_the_pane_it_opened() {
+        let key = HerdrKey { side: Side::Wsl("d".into()), terminal_id: "t1".into() };
+        assert_eq!(key.claim(false, Some(&focused("t2"))).terminal_id, "t1");
+    }
+
+    /// A shared-view attach is a window on herdr, not on a pane: whatever
+    /// herdr focuses is what the user is looking at, including an agent
+    /// started long after the attach.
+    #[test]
+    fn a_shared_view_follows_herdrs_focus() {
+        let key = HerdrKey { side: Side::Native, terminal_id: "t1".into() };
+        let claim = key.claim(true, Some(&focused("t2")));
+        assert_eq!(claim.terminal_id, "t2");
+        assert_eq!(claim.side, Side::Native);
+    }
+
+    /// herdr showing a pane that runs no agent leaves the session claiming
+    /// the pane it opened, rather than releasing it for a second row.
+    #[test]
+    fn a_shared_view_with_nothing_focused_keeps_its_pane() {
+        let key = HerdrKey { side: Side::Native, terminal_id: "t1".into() };
+        assert_eq!(key.claim(true, None).terminal_id, "t1");
     }
 }

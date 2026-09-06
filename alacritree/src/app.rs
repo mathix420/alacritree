@@ -8623,7 +8623,7 @@ impl AlacritreeApp {
             return listed;
         }
         let claimed: Vec<herdr::HerdrKey> =
-            self.sessions.iter().filter_map(|s| s.herdr_key.clone()).collect();
+            self.sessions.iter().filter_map(|s| self.session_claim(s)).collect();
         let workspaces = herdr_workspaces(&self.projects, |path| self.liveness.missing(path));
 
         for cache in self.herdr_endpoints.caches() {
@@ -8665,8 +8665,25 @@ impl AlacritreeApp {
     /// still carries it.  herdr watches the pane from outside, so it is the
     /// authority on both what the pane is called and what it is doing.
     fn session_herdr_agent(&self, session: &Session) -> Option<&herdr::Agent> {
-        let key = session.herdr_key.as_ref()?;
+        let key = self.session_claim(session)?;
         self.find_herdr_agent(&key.side, &key.terminal_id)
+    }
+
+    /// The agent a session currently stands for, per [`herdr::HerdrKey::claim`].
+    fn session_claim(&self, session: &Session) -> Option<herdr::HerdrKey> {
+        let key = session.herdr_key.as_ref()?;
+        let shared_view = !herdr::can_attach(&key.side);
+        let focused = shared_view.then(|| self.focused_herdr_agent(&key.side)).flatten();
+        Some(key.claim(shared_view, focused))
+    }
+
+    /// The agent herdr's own window on `side` is showing.
+    fn focused_herdr_agent(&self, side: &herdr::Side) -> Option<&herdr::Agent> {
+        self.herdr_endpoints
+            .caches()
+            .iter()
+            .find(|cache| cache.side() == side)
+            .and_then(|cache| cache.agents().iter().find(|agent| agent.focused))
     }
 
     /// The workspace a herdr row is currently listed under, for the keyboard
@@ -11604,6 +11621,7 @@ mod tests {
             kind: kind.map(String::from),
             title: None,
             status: herdr::Status::Idle,
+            focused: false,
             cwd: None,
             foreground_cwd: None,
         }
@@ -11707,6 +11725,7 @@ mod tests {
             kind: None,
             title: None,
             status: herdr::Status::Idle,
+            focused: false,
             cwd: None,
             foreground_cwd: None,
         };
@@ -14101,6 +14120,7 @@ mod tests {
             kind: None,
             title: None,
             status: herdr::Status::Idle,
+            focused: false,
             cwd: Some(gone.to_string_lossy().into_owned()),
             foreground_cwd: None,
         };
