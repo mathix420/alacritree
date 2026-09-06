@@ -14,18 +14,17 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use crate::app::{ShellDecision, shell_decision};
-use crate::command_ext::CommandExt;
 use crate::config::{self, Config, ConfigDiagnosis, ConfigFile, Profile, ShellConfig};
 use crate::crash_log::{Verdict, classify};
 use crate::ipc::{self, IpcRequest, SendError};
-use crate::state;
 use crate::wsl::{self, ShellChoice};
+use crate::{command_ext, jobs, state};
 
 /// An instance that is wedged should not wedge the report too.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -173,10 +172,12 @@ fn doppler_configured() -> bool {
 
 /// `gh` present but logged out fails exactly the way a missing `gh` does —
 /// silently — so it needs saying separately.
+// The report's job is to run the tools it reports on, from a CLI with no
+// window to stall.
+#[allow(clippy::disallowed_methods)]
 fn gh_auth_check() -> Option<Check> {
     locate("gh")?;
-    let authenticated = Command::new("gh")
-        .hide_console()
+    let authenticated = command_ext::hidden("gh")
         .args(["auth", "status"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -234,7 +235,8 @@ fn probe_distros(distros: &[wsl::WslDistro]) -> Vec<(String, Probe)> {
         let tx = tx.clone();
         let name = distro.name.clone();
         std::thread::spawn(move || {
-            let probe = wsl::probe_tools(&name, &WSL_TOOLS);
+            let probe =
+                jobs::on_this_thread(|blocking| wsl::probe_tools(&name, &WSL_TOOLS, blocking));
             let _ = tx.send((name, probe));
         });
     }
@@ -615,9 +617,9 @@ fn find(program: &str) -> Option<Found> {
 
 /// A tool that is on PATH but broken (a shim, a half-installed package) fails
 /// here rather than reporting a version, which is worth knowing on its own.
+#[allow(clippy::disallowed_methods)] // Running the tool is how its version is read.
 fn version_of(program: &Path) -> Option<String> {
-    let output = Command::new(program)
-        .hide_console()
+    let output = command_ext::hidden(program)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -379,10 +379,53 @@ sidebar_focus      = "preserve"  # how far the projects sidebar goes when the
                                   # landing that has a live session, and lands a
                                   # closed session on its neighbour instead of on
                                   # the workspace's first session
+sidebar_follow_active = false  # scroll the projects sidebar to the session on
+                                # screen whenever it changes — a cycling key, a
+                                # click, the palette, an IPC request (default
+                                # false); the cursor is left where it was
+sidebar_scroll_align = "minimal"  # where a row a sidebar scrolled to is
+                                   # parked. "minimal" (default) rests it
+                                   # against whichever edge it entered from.
+                                   # "center" re-centres the list on every
+                                   # cursor step, and scrolls a clicked row
+                                   # out from under the pointer — not a
+                                   # scrolloff, the row always lands mid-panel
 vsync              = true   # restart required — wait for the display's refresh
                             # before showing a finished frame (default true).
                             # false presents each frame as soon as it is drawn,
                             # trading tearing for lower keystroke-to-screen delay
+focus_priority_boost = false  # Windows only, restart required — put the
+                              # session on screen one scheduling class above
+                              # normal (default false).
+                              # A program that redraws its line as you type
+                              # needs CPU for every keystroke, and at normal
+                              # priority a build saturating every core starves
+                              # it: nushell echoed in 10 ms boosted, against up
+                              # to 1.9 s unboosted. Covers the shell and
+                              # everything it starts, at any depth, including
+                              # commands that live only a moment. Follows
+                              # focus, and raises nothing while the window is
+                              # in the background
+async_session_spawn = false   # open a session's PTY on a worker rather than
+                              # in the frame that asked for it, so spawning
+                              # does not stutter (default false).
+                              # Creating a console process costs milliseconds
+                              # when the machine is idle and hundreds when it is
+                              # busy, and the frame pays all of it. The tab
+                              # appears at once and starts painting when its PTY
+                              # attaches; anything typed in between is replayed
+reap_descendants_on_close = false  # Windows only, restart required — when a
+                              # session closes, end everything it started at
+                              # any depth (default false).
+                              # The console reaps only the programs attached to
+                              # it, so a helper that left the console — an
+                              # editor's background search, anything started
+                              # detached — outlives the terminal and keeps
+                              # piling up. This also covers alacritree being
+                              # killed or crashing, since the kernel does the
+                              # reaping when the last handle closes. A process
+                              # that means to outlive the terminal must ask
+                              # with CREATE_BREAKAWAY_FROM_JOB
 search_scope       = "filtered"  # whether a sidebar search is confined by the
                                  # active toggle filters
                                  # "filtered" (default): a query narrows what
@@ -411,9 +454,14 @@ icon_tooltips      = true        # whether a sidebar icon explains itself on
                                  # icon's hint never depends on panel width
 confirm_session_close = "never"  # when the sidebar × asks before killing a PTY:
                                  # "never" (default) | "busy" | "always"
-last_session_close = "respawn"   # closing the on-screen workspace's last
-                                 # session: "respawn" (default) starts a fresh
-                                 # one, "navigate" moves to another workspace
+last_session_close = "respawn"   # what happens when the on-screen workspace
+                                 # stops having sessions, whether the last one
+                                 # closed or the worktree was deleted:
+                                 # "respawn" (default) starts a fresh one,
+                                 # "navigate" moves to another workspace,
+                                 # "ring_global" and "ring_project" move to the
+                                 # nearest surviving session in the ring, else
+                                 # home
 pr_status          = false  # poll `gh` for each branch's open PR, which drives
                             # the PR row icons, the PR-state filters, and $pr
                             # below (default false)
@@ -450,6 +498,11 @@ bold_italic_family = "Inter Display"  # unset falls back to family
 [ui.session_display]        # startup defaults; key bindings toggle both at runtime
 sidebar_always = false      # keep a sidebar session row even with one session
 tabs_always    = false      # keep a tab-strip segment even with one session
+
+[ui.session_reorder]        # startup default; ToggleSessionDrag flips drag at runtime
+drag  = false               # drag a session row with the mouse to reorder it
+scope = "workspace"         # how far a reorder may carry a session:
+                            # "workspace" | "project" | "anywhere"
 
 [ui.focus_outline]          # off by default, which keeps the current look
 sidebar   = false           # outline the projects sidebar when it has focus
@@ -617,12 +670,7 @@ Two things worth knowing about what the schema does and does not do:
   `alacritty.toml` legitimately carries keys only the real alacritty acts on —
   `[hints]`, `[bell]`, `[mouse]`, `[general] import`. Those get no completion,
   but they are not flagged.
-- **Closed-value keys are completed.** `confirm_session_close`, `scrollbar`,
-  `sidebar_focus`, `search_scope`, `sidebar_tooltips`, `last_session_close`,
-  `path_style.*` and `drop.quote` offer their accepted spellings. Keys where
-  Alacritty accepts more than one spelling for the same value — cursor `shape`
-  and `blinking`, binding `action` — are deliberately left unconstrained, so a
-  working config is never marked wrong.
+- **Closed-value keys are completed.** `confirm_session_close`, `scrollbar`, `sidebar_focus`, `sidebar_scroll_align`, `search_scope`, `sidebar_tooltips`, `last_session_close`, `path_style.*` and `drop.quote` offer their accepted spellings. A binding's `action` completes from every action alacritree implements but rejects nothing, so an alacritty-only action still validates. Cursor `shape` and `blinking`, where Alacritty accepts more than one spelling for the same value, are deliberately left unconstrained, so a working config is never marked wrong.
 
 [taplo]: https://taplo.tamasfe.dev/
 [ebt]: https://marketplace.visualstudio.com/items?itemName=tamasfe.even-better-toml

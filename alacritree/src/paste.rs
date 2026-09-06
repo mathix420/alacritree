@@ -11,7 +11,7 @@ use crate::session::{EventProxy, Session};
 
 /// Pass `bracketed = true` for user-driven pastes; `false` is reserved for
 /// `Action::Esc` style writes that must reach the PTY verbatim.
-pub fn paste(session: &Session, text: &str, bracketed: bool) {
+pub fn paste(session: &mut Session, text: &str, bracketed: bool) {
     let bracketed_active = session.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
 
     on_terminal_input_start(session);

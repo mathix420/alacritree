@@ -92,6 +92,7 @@ polling = "3.11"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Console",
+    "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
@@ -108,6 +109,13 @@ winreg = "0.55"
 # notify-rust's own WinRT backend, used directly because notify-rust doesn't
 # expose toast activation — needed to focus the pinging session on click.
 tauri-winrt-notification = "0.7"
+
+# The coverage scan is the only parallel work in this crate and it is
+# `cfg(not(unix))`, so the gate matches the code rather than the platform
+# name: a target that is neither unix nor windows would otherwise compile
+# the scan without its executor.
+[target.'cfg(not(unix))'.dependencies]
+rayon = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # dlopen libfontconfig at runtime instead of linking it at build time. macOS

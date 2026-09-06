@@ -24,7 +24,6 @@ use serde::Deserialize;
 
 use crate::bindings::{self, KeyBinding};
 use crate::path_style::PathStyle;
-use crate::pr_status::DEFAULT_CONCURRENCY;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -70,11 +69,19 @@ pub struct DebugConfig {
     pub crash_log: bool,
     /// Upstream's name and upstream's default.
     pub persistent_logging: bool,
+    /// alacritree-only, set in `alacritree.toml`.  Log what the GPU grid's
+    /// paint callback costs: the wall time of issuing a frame, and the GPU's
+    /// own time for the upload and each of the three draws.  Off by default;
+    /// timer queries are cheap but not free, and the line is only meaningful
+    /// to someone reading it.  Needs `[ui] gpu_grid` and a GL 3.3 context.
+    /// Keeps this session's log file for as long as it is on, since the
+    /// report has nowhere else to go.
+    pub gpu_timing: bool,
 }
 
 impl Default for DebugConfig {
     fn default() -> Self {
-        Self { crash_log: true, persistent_logging: false }
+        Self { crash_log: true, persistent_logging: false, gpu_timing: false }
     }
 }
 
@@ -125,7 +132,6 @@ impl FontConfig {
     /// Headings stay close to the grid's size for visual weight without
     /// crowding the chrome.
     pub const UI_HEADING_RATIO: f32 = 0.9;
-
     /// Normal UI text (rows, captions, button labels) is this fraction of the
     /// terminal font size so the chrome reads as secondary to the grid.
     pub const UI_NORMAL_RATIO: f32 = 0.8;
@@ -223,7 +229,7 @@ pub fn profile_command(p: &Profile) -> String {
         .join(" ")
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Palette {
     pub fg: Rgb,
     pub bg: Rgb,
@@ -581,7 +587,8 @@ baked_glyphs! {
     DEFAULT_CURSOR_BLOCK_GLYPH = "▌";
 }
 
-/// What happens when the on-screen workspace's last session closes.
+/// What happens when the on-screen workspace stops having sessions, whether a
+/// close or a worktree deletion took the last one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LastSessionClose {
     /// Recycle a shell in place — the workspace always has a live session,
@@ -591,6 +598,26 @@ pub enum LastSessionClose {
     /// Move to the project's main checkout when it has a live session,
     /// otherwise home (which spawns a shell only if it has none).
     Navigate,
+    /// Move to the nearest session in the flat session ring, otherwise home.
+    RingGlobal,
+    /// Move to the nearest session in the removed workspace's own project,
+    /// then to the nearest anywhere in the ring, otherwise home.
+    RingProject,
+}
+
+impl LastSessionClose {
+    /// Whether the destination comes from the session ring.  Both removal
+    /// paths build that ring only when this is true, so the default costs
+    /// no allocation.
+    pub fn rings(self) -> bool {
+        matches!(self, Self::RingGlobal | Self::RingProject)
+    }
+
+    /// Whether the search is confined to the removed workspace's project
+    /// before it widens to the whole ring.
+    pub fn prefers_project(self) -> bool {
+        matches!(self, Self::RingProject)
+    }
 }
 
 fn parse_last_session_close(raw: Option<&str>) -> LastSessionClose {
@@ -598,6 +625,8 @@ fn parse_last_session_close(raw: Option<&str>) -> LastSessionClose {
         None => LastSessionClose::default(),
         Some("respawn") => LastSessionClose::Respawn,
         Some("navigate") => LastSessionClose::Navigate,
+        Some("ring_global") => LastSessionClose::RingGlobal,
+        Some("ring_project") => LastSessionClose::RingProject,
         Some(other) => {
             log::warn!("unknown ui.last_session_close value {other:?}, using \"respawn\"");
             LastSessionClose::default()
@@ -638,6 +667,41 @@ fn parse_sidebar_focus(raw: Option<&str>) -> SidebarFocus {
     }
 }
 
+/// `[ui] sidebar_scroll_align`: where a row a sidebar scrolled to is parked.
+/// Governs both panels and both reasons to scroll, because it describes the
+/// resting position rather than what chose the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub enum ScrollAlign {
+    /// egui's minimal scroll: move just far enough to bring the row into
+    /// view, which leaves it against whichever edge it entered from.
+    #[default]
+    Minimal,
+    /// Park the row in the middle of the panel.  egui clamps to the scroll
+    /// range, so a short list stays put instead of overscrolling.
+    Center,
+}
+
+impl ScrollAlign {
+    pub fn align(self) -> Option<egui::Align> {
+        match self {
+            Self::Minimal => None,
+            Self::Center => Some(egui::Align::Center),
+        }
+    }
+}
+
+fn parse_scroll_align(raw: Option<&str>) -> ScrollAlign {
+    match raw {
+        None => ScrollAlign::default(),
+        Some("minimal") => ScrollAlign::Minimal,
+        Some("center") => ScrollAlign::Center,
+        Some(other) => {
+            log::warn!("unknown ui.sidebar_scroll_align value {other:?}, using \"minimal\"");
+            ScrollAlign::default()
+        },
+    }
+}
+
 /// `[ui] search_scope`: whether a fuzzy query is confined by the panel's active
 /// toggle filters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -660,6 +724,44 @@ fn parse_search_scope(raw: Option<&str>) -> SearchScope {
             SearchScope::default()
         },
     }
+}
+
+/// `[ui.session_reorder] scope`: how far a session may travel when the user
+/// reorders it.  Widening it makes a reorder step able to change which
+/// workspace a session belongs to, which is why the default keeps a session
+/// inside the one it was spawned in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub enum ReorderScope {
+    /// Only among the sessions of its own workspace.
+    #[default]
+    Workspace,
+    /// Across the worktrees of the project that owns its workspace.  Home
+    /// belongs to no project, so a home session stays home.
+    Project,
+    /// Home and every project's worktrees, in sidebar order.
+    Anywhere,
+}
+
+fn parse_reorder_scope(raw: Option<&str>) -> ReorderScope {
+    match raw {
+        None => ReorderScope::default(),
+        Some("workspace") => ReorderScope::Workspace,
+        Some("project") => ReorderScope::Project,
+        Some("anywhere") => ReorderScope::Anywhere,
+        Some(other) => {
+            log::warn!("unknown ui.session_reorder.scope value {other:?}, using \"workspace\"");
+            ReorderScope::default()
+        },
+    }
+}
+
+/// Whether session rows can be dragged, and how far a reorder may carry a
+/// session.  `drag` is a startup default only: the app copies it into runtime
+/// state that `ToggleSessionDrag` flips, and nothing is persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub struct SessionReorder {
+    pub drag: bool,
+    pub scope: ReorderScope,
 }
 
 /// `[ui] sidebar_tooltips`: when a sidebar row offers its full name on hover.
@@ -872,6 +974,87 @@ pub struct PathStyleConfig {
     pub parent: TextEmphasis,
 }
 
+/// One correction to a decoration the font placed: a shift in physical pixels,
+/// a shift in points, or a multiplier.  kitty's grammar, so a value copied
+/// from a kitty config parses the same way here.  Where it lands can still
+/// differ: kitty derives its double and curly underline positions from the
+/// face's underline position, while here those two styles are placed from
+/// the descent instead, so `underline_position` does not reach them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Adjust {
+    Pixels(f32),
+    Points(f32),
+    Scale(f32),
+}
+
+impl Adjust {
+    /// Draw what the font asked for.
+    pub const NONE: Self = Self::Pixels(0.0);
+
+    /// `"2px"`, `"2pt"`, a bare `"2"` (points, which is how kitty spells it),
+    /// or `"150%"`.  `None` for anything else, a signed percentage included.
+    pub fn parse(raw: &str) -> Option<Self> {
+        if let Some(number) = raw.strip_suffix('%') {
+            let percent = finite(number)?;
+            return (percent >= 0.0).then_some(Self::Scale(percent / 100.0));
+        }
+        if let Some(number) = raw.strip_suffix("px") {
+            return finite(number).map(Self::Pixels);
+        }
+        finite(raw.strip_suffix("pt").unwrap_or(raw)).map(Self::Points)
+    }
+
+    /// `value` is already in physical pixels, so a point shift scales by
+    /// `pixels_per_point` and a percentage multiplies what the font resolved
+    /// to rather than the em fraction it was read from.
+    pub fn apply(self, value: f32, pixels_per_point: f32) -> f32 {
+        match self {
+            Self::Pixels(px) => value + px,
+            Self::Points(pt) => value + pt * pixels_per_point,
+            Self::Scale(factor) => value * factor,
+        }
+    }
+}
+
+/// `"inf"` and `"nan"` parse as `f32` and would put a line nowhere at all.
+fn finite(raw: &str) -> Option<f32> {
+    raw.parse::<f32>().ok().filter(|value| value.is_finite())
+}
+
+/// `[ui.decorations]`: corrections to what the font reports for its underline
+/// and strikeout, for a face whose tables are wrong.  Every knob is a no-op by
+/// default, so an unmodified config draws what the face asked for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Decorations {
+    pub underline_position: Adjust,
+    pub underline_thickness: Adjust,
+    pub strikeout_position: Adjust,
+    pub strikeout_thickness: Adjust,
+}
+
+impl Default for Decorations {
+    fn default() -> Self {
+        Self {
+            underline_position: Adjust::NONE,
+            underline_thickness: Adjust::NONE,
+            strikeout_position: Adjust::NONE,
+            strikeout_thickness: Adjust::NONE,
+        }
+    }
+}
+
+/// A knob that will not parse logs and behaves as `"0"`, the way the rest of
+/// this file treats a value it does not recognize.
+fn parse_adjust(field: &str, raw: Option<&str>) -> Adjust {
+    let Some(text) = raw else {
+        return Adjust::NONE;
+    };
+    Adjust::parse(text).unwrap_or_else(|| {
+        log::warn!("unusable ui.decorations.{field} value {text:?}, using \"0\"");
+        Adjust::NONE
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct UiTheme {
     pub sidebar_background: Option<Color32>,
@@ -890,6 +1073,11 @@ pub struct UiTheme {
     pub last_session_close: LastSessionClose,
     /// How the projects sidebar repairs a cursor whose row stopped rendering.
     pub sidebar_focus: SidebarFocus,
+    /// Whether the projects sidebar scrolls to the session on screen when it
+    /// changes.
+    pub sidebar_follow_active: bool,
+    /// Where a row a sidebar scrolled to is parked.
+    pub sidebar_scroll_align: ScrollAlign,
     /// Whether a fuzzy query is confined by the panel's active toggle filters.
     pub search_scope: SearchScope,
     /// When a sidebar row spells its full name out on hover.
@@ -901,6 +1089,21 @@ pub struct UiTheme {
     pub icon_tooltips: bool,
     /// Show single-session sidebar rows / tab segments ([`SessionDisplay`]).
     pub session_display: SessionDisplay,
+    /// Mouse-drag gate and travel limit for reordering sessions
+    /// ([`SessionReorder`]).
+    pub session_reorder: SessionReorder,
+    /// Draw the terminal grid through an OpenGL paint callback instead of
+    /// handing epaint a mesh: one twelve-byte record per cell, and the vertex
+    /// shader derives the quads.  Off by default — it needs a GL 3 context and
+    /// bypasses the renderer every other panel goes through, so an unmodified
+    /// config keeps the path that has always drawn the grid.  A context too
+    /// old for instanced arrays logs once, costs the frame it was found on,
+    /// and paints the mesh from the next one.
+    pub gpu_grid: bool,
+    /// Corrections applied to the underline and strikeout the font placed
+    /// ([`Decorations`]).  Only the GPU grid reads these; the mesh path draws
+    /// a straight rule at a fixed offset either way.
+    pub decorations: Decorations,
     /// Paint PR-status badges on worktree rows (and poll `gh` for expanded
     /// projects' worktrees).  Off by default so an unmodified config spawns
     /// no `gh` processes; when enabled it is best-effort like the diff-base
@@ -918,10 +1121,11 @@ pub struct UiTheme {
     /// listed row and an exotic filesystem could make that expensive.
     pub worktree_liveness: bool,
     /// `[ui] pr_status_concurrency`: max `gh` lookups in flight at once.
-    /// Defaults to 8; clamped to ≥ 1, since a cold cache spawns one lookup
-    /// per eligible worktree in a single frame and an unbounded cap would
-    /// fork a thread and a `gh` process for every one of them at once.
-    pub pr_status_concurrency: usize,
+    /// Unset lets the pool decide, which is one below its own background
+    /// ceiling so a lookup can never take the last slot local work needs.
+    /// A value lowers that; nothing raises it, because the pool's ceiling
+    /// binds underneath either way.
+    pub pr_status_concurrency: Option<usize>,
     pub icons: Icons,
     pub focus_outline: FocusOutline,
     /// `[ui] scrollbar`: sidebar scrollbar style, "floating" (default) or
@@ -931,6 +1135,26 @@ pub struct UiTheme {
     /// it (so filter typing works without the focus shortcut).  Off by default
     /// so unmodified configs keep click-through-to-terminal behavior.
     pub sidebar_click_focus: bool,
+    /// `[ui] focus_priority_boost`: put the session on screen one scheduling
+    /// class above normal — its shell and every process that shell starts, at
+    /// any depth — so a build saturating the machine cannot starve what the
+    /// user is typing into.  Follows focus, and raises nothing while the
+    /// window is in the background.  Off by default.  Windows only.
+    pub focus_priority_boost: bool,
+    /// `[ui] async_session_spawn`: open a session's PTY on a worker instead
+    /// of inside the frame that asked for it.  Creating a console process
+    /// costs milliseconds when the machine is idle and hundreds when it is
+    /// busy, and the frame pays all of it, so the click that opens a tab is
+    /// what stutters.  The tab appears at once and starts painting when its
+    /// PTY attaches; anything typed in between is replayed.  Off by default.
+    pub async_session_spawn: bool,
+    /// `[ui] reap_descendants_on_close`: end everything a session started when
+    /// that session closes, at any depth.  The console reaps only the clients
+    /// attached to it, so a process that left the console — an editor's search
+    /// helper, anything started detached — otherwise outlives the terminal.  A
+    /// process that means to survive can still say so with
+    /// `CREATE_BREAKAWAY_FROM_JOB`.  Off by default.  Windows only.
+    pub reap_descendants_on_close: bool,
     /// `[ui] vsync`: block each present until the display's next refresh.  On
     /// by default, as upstream eframe has it.  Turning it off presents a
     /// finished frame immediately, trading tearing for the queueing delay
@@ -967,18 +1191,26 @@ impl Default for UiTheme {
             confirm_session_close: ConfirmSessionClose::Never,
             last_session_close: LastSessionClose::Respawn,
             sidebar_focus: SidebarFocus::default(),
+            sidebar_follow_active: false,
+            sidebar_scroll_align: ScrollAlign::default(),
             search_scope: SearchScope::default(),
             sidebar_tooltips: SidebarTooltips::default(),
             icon_tooltips: true,
             session_display: SessionDisplay::default(),
+            session_reorder: SessionReorder::default(),
+            gpu_grid: false,
+            decorations: Decorations::default(),
             pr_status: false,
             upstream_status: false,
             worktree_liveness: true,
-            pr_status_concurrency: DEFAULT_CONCURRENCY,
+            pr_status_concurrency: None,
             icons: Icons::default(),
             focus_outline: FocusOutline::default(),
             scrollbar: ScrollbarStyle::Floating,
             sidebar_click_focus: false,
+            focus_priority_boost: false,
+            async_session_spawn: false,
+            reap_descendants_on_close: false,
             vsync: true,
             worktree_name: None,
             project_name: None,
@@ -1427,6 +1659,14 @@ struct RawDebug {
     /// Keep the log file after quitting.  Upstream's name and upstream's
     /// default (`false`).
     persistent_logging: Option<bool>,
+    /// Log what the GPU grid's paint callback costs: the wall time of
+    /// issuing a frame, and the GPU's own time for the upload and each of
+    /// the three draws.  alacritree-only, so it belongs in
+    /// `alacritree.toml`.  Default `false`; timer queries are cheap but not
+    /// free, and the line is only meaningful to someone reading it.  Needs
+    /// `[ui] gpu_grid` and a GL 3.3 context.  Keeps this session's log file
+    /// for as long as it is on, since the report has nowhere else to go.
+    gpu_timing: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1853,6 +2093,43 @@ struct RawSessionDisplay {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
+struct RawSessionReorder {
+    /// Let a session row be dragged with the mouse to reorder it.
+    drag: Option<bool>,
+    /// How far a reorder may carry a session: "workspace" (default) |
+    /// "project" | "anywhere".
+    #[schemars(extend("enum" = ["workspace", "project", "anywhere"]))]
+    scope: Option<String>,
+}
+
+/// Corrections applied to what the font reports for its underline and
+/// strikeout.  Each value is `"2px"` (physical pixels, added), `"2pt"` or a
+/// bare `"2"` (points, added), or `"150%"` (a multiplier).  Positive moves a
+/// line down, matching kitty and ghostty.  A percentage takes no sign.
+/// Default `"0"`, which draws what the font asked for.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default)]
+struct RawDecorations {
+    /// Shift or scale of how far the underline sits from the top of the
+    /// cell, for the straight, dotted and dashed styles.  The double and
+    /// curly styles are placed from the font's descent instead, so this
+    /// knob does not reach them.
+    #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
+    underline_position: Option<String>,
+    /// Shift or scale of the underline's stroke weight.  Every style draws
+    /// with this value, including double and curly.
+    #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
+    underline_thickness: Option<String>,
+    /// Shift or scale of how far the strikeout sits from the top of the cell.
+    #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
+    strikeout_position: Option<String>,
+    /// Shift or scale of the strikeout bar's weight.
+    #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
+    strikeout_thickness: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default)]
 struct RawUiFont {
     /// Family for sidebars, tabs and dialogs.  Unset uses the terminal font.
     family: Option<String>,
@@ -1950,14 +2227,25 @@ struct RawUi {
     /// "never" (default) | "busy" | "always".
     #[schemars(extend("enum" = ["never", "busy", "always"]))]
     confirm_session_close: Option<String>,
-    /// What closing the on-screen workspace's last session does:
-    /// "respawn" (default) | "navigate".
-    #[schemars(extend("enum" = ["respawn", "navigate"]))]
+    /// What happens when the on-screen workspace stops having sessions,
+    /// whether a close or a worktree deletion took the last one:
+    /// "respawn" (default) | "navigate" | "ring_global" | "ring_project".
+    #[schemars(extend("enum" = ["respawn", "navigate", "ring_global", "ring_project"]))]
     last_session_close: Option<String>,
     /// How far the projects sidebar goes when the cursor's row stops being
     /// rendered: "preserve" (default) | "follow".
     #[schemars(extend("enum" = ["preserve", "follow"]))]
     sidebar_focus: Option<String>,
+    /// Whether the projects sidebar scrolls to the session on screen whenever
+    /// it changes — a cycling key, a click, the palette, an IPC request.
+    /// The sidebar cursor is left where it was: `false` (default).
+    sidebar_follow_active: Option<bool>,
+    /// Where a row the sidebar scrolled to is parked:
+    /// "minimal" (default) | "center".  Under "center" every cursor step
+    /// re-centres the list, and clicking a row near the panel edge scrolls it
+    /// out from under the pointer.
+    #[schemars(extend("enum" = ["minimal", "center"]))]
+    sidebar_scroll_align: Option<String>,
     /// Whether a fuzzy query is confined by the panel's active toggle filters:
     /// "filtered" (default) | "all".
     #[schemars(extend("enum" = ["filtered", "all"]))]
@@ -1971,6 +2259,9 @@ struct RawUi {
     /// Whether per-session rows and tabs appear before a workspace has two
     /// sessions.
     session_display: RawSessionDisplay,
+    /// Whether session rows can be dragged, and how far a reorder may carry
+    /// a session.
+    session_reorder: RawSessionReorder,
     /// Explicit `delta` program for the diff pane.  Set, it is used verbatim
     /// in git's `core.pager` and skips WSL delta autodiscovery; unset, native
     /// diffs run bare `delta` from PATH.
@@ -1980,6 +2271,16 @@ struct RawUi {
     /// Sidebar scrollbar style: "floating" (default) | "solid".
     #[schemars(extend("enum" = ["floating", "solid"]))]
     scrollbar: Option<String>,
+    /// Draw the terminal grid through an OpenGL paint callback instead of
+    /// handing epaint a mesh.  Default `false`: it needs a GL 3 context and
+    /// bypasses the renderer every other panel goes through, so an
+    /// unmodified config keeps the path that has always drawn the grid.  A
+    /// context too old for instanced arrays logs once and paints the mesh
+    /// from the next frame on.
+    gpu_grid: Option<bool>,
+    /// Corrections to the underline and strikeout the font placed
+    /// ([`RawDecorations`]).
+    decorations: RawDecorations,
     /// Poll `gh` for each branch's open pull request, which drives the PR row
     /// icons, the PR-state filters, and `$pr` in row templates.
     pr_status: Option<bool>,
@@ -1993,7 +2294,10 @@ struct RawUi {
     /// `true`; the probe is one `stat` per listed row, which an exotic
     /// filesystem could make expensive.
     worktree_liveness: Option<bool>,
-    /// Max `gh` lookups in flight at once.  Defaults to 8; clamped to ≥ 1.
+    /// Max `gh` lookups in flight at once.  Unset lets the pool decide, which
+    /// is one below its own background ceiling so a lookup can never take
+    /// the last slot local work needs.  A value lowers that; nothing raises
+    /// it, because the pool's ceiling binds underneath either way.
     pr_status_concurrency: Option<usize>,
     /// The font sidebars, tabs and dialogs are drawn with.
     font: RawUiFont,
@@ -2012,6 +2316,18 @@ struct RawUi {
     focus_outline: RawFocusOutline,
     /// Clicking a sidebar moves keyboard focus to it.  Default false.
     sidebar_click_focus: Option<bool>,
+    /// Put the session on screen one scheduling class above normal — its
+    /// shell and every process that shell starts — so a busy machine cannot
+    /// starve what the user is typing into.  Follows focus.  Windows only.
+    /// Default false.
+    focus_priority_boost: Option<bool>,
+    /// Open a session's PTY on a worker rather than in the frame that asked
+    /// for it, so spawning does not stutter.  Default false.
+    async_session_spawn: Option<bool>,
+    /// End everything a session started when that session closes, at any
+    /// depth, except processes that ask to break away.  Windows only.
+    /// Default false.
+    reap_descendants_on_close: Option<bool>,
     /// Wait for the display's refresh before showing a finished frame.
     /// Default true.
     vsync: Option<bool>,
@@ -2206,6 +2522,8 @@ impl RawConfig {
             ),
             last_session_close: parse_last_session_close(self.ui.last_session_close.as_deref()),
             sidebar_focus: parse_sidebar_focus(self.ui.sidebar_focus.as_deref()),
+            sidebar_follow_active: self.ui.sidebar_follow_active.unwrap_or(false),
+            sidebar_scroll_align: parse_scroll_align(self.ui.sidebar_scroll_align.as_deref()),
             search_scope: parse_search_scope(self.ui.search_scope.as_deref()),
             sidebar_tooltips: parse_sidebar_tooltips(self.ui.sidebar_tooltips.as_deref()),
             icon_tooltips: self.ui.icon_tooltips.unwrap_or(true),
@@ -2213,14 +2531,33 @@ impl RawConfig {
                 sidebar_always: self.ui.session_display.sidebar_always.unwrap_or(false),
                 tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
             },
+            session_reorder: SessionReorder {
+                drag: self.ui.session_reorder.drag.unwrap_or(false),
+                scope: parse_reorder_scope(self.ui.session_reorder.scope.as_deref()),
+            },
+            gpu_grid: self.ui.gpu_grid.unwrap_or(false),
+            decorations: Decorations {
+                underline_position: parse_adjust(
+                    "underline_position",
+                    self.ui.decorations.underline_position.as_deref(),
+                ),
+                underline_thickness: parse_adjust(
+                    "underline_thickness",
+                    self.ui.decorations.underline_thickness.as_deref(),
+                ),
+                strikeout_position: parse_adjust(
+                    "strikeout_position",
+                    self.ui.decorations.strikeout_position.as_deref(),
+                ),
+                strikeout_thickness: parse_adjust(
+                    "strikeout_thickness",
+                    self.ui.decorations.strikeout_thickness.as_deref(),
+                ),
+            },
             pr_status: self.ui.pr_status.unwrap_or(false),
             upstream_status: self.ui.upstream_status.unwrap_or(false),
             worktree_liveness: self.ui.worktree_liveness.unwrap_or(true),
-            pr_status_concurrency: self
-                .ui
-                .pr_status_concurrency
-                .unwrap_or(DEFAULT_CONCURRENCY)
-                .max(1),
+            pr_status_concurrency: self.ui.pr_status_concurrency,
             icons: build_icons(self.ui.icons),
             focus_outline: FocusOutline {
                 sidebar: self.ui.focus_outline.sidebar.unwrap_or(false),
@@ -2230,6 +2567,9 @@ impl RawConfig {
             },
             scrollbar: parse_scrollbar(self.ui.scrollbar.as_deref()),
             sidebar_click_focus: self.ui.sidebar_click_focus.unwrap_or(false),
+            focus_priority_boost: self.ui.focus_priority_boost.unwrap_or(false),
+            async_session_spawn: self.ui.async_session_spawn.unwrap_or(false),
+            reap_descendants_on_close: self.ui.reap_descendants_on_close.unwrap_or(false),
             vsync: self.ui.vsync.unwrap_or(true),
             worktree_name: self.ui.worktree_name.clone().filter(|t| !t.trim().is_empty()),
             project_name: self.ui.project_name.clone().filter(|t| !t.trim().is_empty()),
@@ -2424,6 +2764,7 @@ impl RawConfig {
             debug: DebugConfig {
                 crash_log: self.debug.crash_log.unwrap_or(true),
                 persistent_logging: self.debug.persistent_logging.unwrap_or(false),
+                gpu_timing: self.debug.gpu_timing.unwrap_or(false),
             },
             working_directory: self
                 .general
@@ -2587,8 +2928,8 @@ mod tests {
     #[test]
     fn path_style_emphasis_parses_and_a_blank_color_is_an_error() {
         let ui = ui_from_toml(
-            "[ui.path_style.filename]\ncolor = \"#e6e6e6\"\nbold = true\n\
-             [ui.path_style.parent]\nitalic = true\n",
+            "[ui.path_style.filename]\ncolor = \"#e6e6e6\"\nbold = \
+             true\n[ui.path_style.parent]\nitalic = true\n",
         );
         assert_eq!(ui.path_style.filename.color, Some(Color32::from_rgb(0xe6, 0xe6, 0xe6)));
         assert!(ui.path_style.filename.bold);
@@ -2745,9 +3086,12 @@ mod tests {
 
     #[test]
     fn last_session_close_parses_all_values() {
-        for (raw, expected) in
-            [("respawn", LastSessionClose::Respawn), ("navigate", LastSessionClose::Navigate)]
-        {
+        for (raw, expected) in [
+            ("respawn", LastSessionClose::Respawn),
+            ("navigate", LastSessionClose::Navigate),
+            ("ring_global", LastSessionClose::RingGlobal),
+            ("ring_project", LastSessionClose::RingProject),
+        ] {
             let ui = ui_from_toml(&format!("[ui]\nlast_session_close = \"{raw}\""));
             assert_eq!(ui.last_session_close, expected, "value {raw:?}");
         }
@@ -2757,6 +3101,14 @@ mod tests {
     fn last_session_close_invalid_falls_back_to_respawn() {
         let ui = ui_from_toml("[ui]\nlast_session_close = \"panic\"");
         assert_eq!(ui.last_session_close, LastSessionClose::Respawn);
+    }
+
+    #[test]
+    fn only_the_ring_values_ring() {
+        assert!(!LastSessionClose::Respawn.rings());
+        assert!(!LastSessionClose::Navigate.rings());
+        assert!(LastSessionClose::RingGlobal.rings());
+        assert!(LastSessionClose::RingProject.rings());
     }
 
     #[test]
@@ -2793,6 +3145,36 @@ mod tests {
     fn only_follow_moves_the_terminal() {
         assert!(!SidebarFocus::Preserve.follows());
         assert!(SidebarFocus::Follow.follows());
+    }
+
+    #[test]
+    fn sidebar_follow_active_defaults_to_off() {
+        assert!(!ui_from_toml("").sidebar_follow_active);
+    }
+
+    #[test]
+    fn sidebar_follow_active_parses() {
+        assert!(ui_from_toml("[ui]\nsidebar_follow_active = true").sidebar_follow_active);
+    }
+
+    #[test]
+    fn sidebar_scroll_align_defaults_to_minimal() {
+        assert_eq!(ui_from_toml("").sidebar_scroll_align, ScrollAlign::Minimal);
+    }
+
+    #[test]
+    fn sidebar_scroll_align_parses_all_values() {
+        for (raw, expected) in [("minimal", ScrollAlign::Minimal), ("center", ScrollAlign::Center)]
+        {
+            let ui = ui_from_toml(&format!("[ui]\nsidebar_scroll_align = \"{raw}\""));
+            assert_eq!(ui.sidebar_scroll_align, expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn sidebar_scroll_align_invalid_falls_back_to_minimal() {
+        let ui = ui_from_toml("[ui]\nsidebar_scroll_align = \"middle-ish\"");
+        assert_eq!(ui.sidebar_scroll_align, ScrollAlign::Minimal);
     }
 
     /// The hints are what an unmodified config already shows, so the key has
@@ -3029,10 +3411,11 @@ args = ["-d", "ubuntu"]
         let raw: RawConfig = toml::from_str(toml_src).unwrap();
         let config = raw.into_config();
         assert_eq!(config.profiles.len(), 2);
-        assert_eq!(
-            config.profiles[0],
-            Profile { name: "pwsh".into(), program: "pwsh".into(), args: vec!["-NoLogo".into()] }
-        );
+        assert_eq!(config.profiles[0], Profile {
+            name: "pwsh".into(),
+            program: "pwsh".into(),
+            args: vec!["-NoLogo".into()]
+        });
         assert_eq!(config.default_profile.as_deref(), Some("pwsh"));
         assert_eq!(config.profile("ubuntu").unwrap().program, "wsl.exe");
         assert!(config.profile("nope").is_none());
@@ -3120,6 +3503,38 @@ program = "second"
         let sd = raw.into_config().ui.session_display;
         assert!(sd.sidebar_always);
         assert!(sd.tabs_always);
+    }
+
+    #[test]
+    fn session_reorder_defaults_to_off_and_workspace_scope() {
+        let ui = ui_from_toml("");
+        assert!(!ui.session_reorder.drag);
+        assert_eq!(ui.session_reorder.scope, ReorderScope::Workspace);
+    }
+
+    #[test]
+    fn session_reorder_parses_every_scope() {
+        for (raw, expected) in [
+            ("workspace", ReorderScope::Workspace),
+            ("project", ReorderScope::Project),
+            ("anywhere", ReorderScope::Anywhere),
+        ] {
+            let ui = ui_from_toml(&format!("[ui.session_reorder]\nscope = \"{raw}\""));
+            assert_eq!(ui.session_reorder.scope, expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn session_reorder_invalid_scope_falls_back_to_workspace() {
+        let ui = ui_from_toml("[ui.session_reorder]\nscope = \"everywhere\"");
+        assert_eq!(ui.session_reorder.scope, ReorderScope::Workspace);
+    }
+
+    #[test]
+    fn session_reorder_partial_table_leaves_the_other_key_alone() {
+        let ui = ui_from_toml("[ui.session_reorder]\ndrag = true");
+        assert!(ui.session_reorder.drag);
+        assert_eq!(ui.session_reorder.scope, ReorderScope::Workspace);
     }
 
     #[test]
@@ -3268,14 +3683,9 @@ program = "second"
     }
 
     #[test]
-    fn pr_status_concurrency_defaults_to_eight() {
-        assert_eq!(ui_from_toml("").pr_status_concurrency, 8);
-        assert_eq!(ui_from_toml("[ui]\npr_status_concurrency = 4").pr_status_concurrency, 4);
-    }
-
-    #[test]
-    fn pr_status_concurrency_clamps_to_one() {
-        assert_eq!(ui_from_toml("[ui]\npr_status_concurrency = 0").pr_status_concurrency, 1);
+    fn pr_status_concurrency_is_unset_by_default() {
+        assert_eq!(ui_from_toml("").pr_status_concurrency, None);
+        assert_eq!(ui_from_toml("[ui]\npr_status_concurrency = 4").pr_status_concurrency, Some(4));
     }
 
     #[test]
@@ -3290,7 +3700,8 @@ program = "second"
     #[test]
     fn focus_outline_parses_all_fields() {
         let fo = ui_from_toml(
-            "[ui.focus_outline]\nsidebar = true\nterminal = true\ncolor = \"#89b4fa\"\nthickness = 2.5",
+            "[ui.focus_outline]\nsidebar = true\nterminal = true\ncolor = \"#89b4fa\"\nthickness \
+             = 2.5",
         )
         .focus_outline;
         assert!(fo.sidebar);
@@ -3308,6 +3719,31 @@ program = "second"
     #[test]
     fn sidebar_click_focus_defaults_off() {
         assert!(!ui_from_toml("").sidebar_click_focus);
+    }
+
+    /// A boosted session outranks everything else the machine is doing, so an
+    /// unmodified config must never get it.
+    #[test]
+    fn focus_priority_boost_defaults_off() {
+        assert!(!ui_from_toml("").focus_priority_boost);
+    }
+
+    #[test]
+    fn focus_priority_boost_parses() {
+        assert!(ui_from_toml("[ui]\nfocus_priority_boost = true").focus_priority_boost);
+    }
+
+    /// Killing what a closing session started is a change of behavior the
+    /// killed process has no say in, so an unmodified config must not get it.
+    #[test]
+    fn reap_descendants_on_close_defaults_off() {
+        assert!(!ui_from_toml("").reap_descendants_on_close);
+    }
+
+    #[test]
+    fn reap_descendants_on_close_parses() {
+        let ui = ui_from_toml("[ui]\nreap_descendants_on_close = true");
+        assert!(ui.reap_descendants_on_close);
     }
 
     #[test]
@@ -3400,42 +3836,30 @@ program = "second"
     #[test]
     fn drop_options_default_to_on_with_auto_quoting() {
         let ui = ui_from_toml("");
-        assert_eq!(
-            ui.drop,
-            DropConfig {
-                enabled: true,
-                terminal: true,
-                sidebar: true,
-                scratchpad: true,
-                spelling: PathSpelling { quote: Quoting::Auto, wsl_translate: true },
-                highlight: true,
-            }
-        );
+        assert_eq!(ui.drop, DropConfig {
+            enabled: true,
+            terminal: true,
+            sidebar: true,
+            scratchpad: true,
+            spelling: PathSpelling { quote: Quoting::Auto, wsl_translate: true },
+            highlight: true,
+        });
     }
 
     #[test]
     fn drop_options_parse_from_the_ui_drop_table() {
         let ui = ui_from_toml(
-            "[ui.drop]\n\
-             enabled = false\n\
-             terminal = false\n\
-             sidebar = false\n\
-             scratchpad = false\n\
-             quote = \"posix\"\n\
-             wsl_translate = false\n\
-             highlight = false\n",
+            "[ui.drop]\nenabled = false\nterminal = false\nsidebar = false\nscratchpad = \
+             false\nquote = \"posix\"\nwsl_translate = false\nhighlight = false\n",
         );
-        assert_eq!(
-            ui.drop,
-            DropConfig {
-                enabled: false,
-                terminal: false,
-                sidebar: false,
-                scratchpad: false,
-                spelling: PathSpelling { quote: Quoting::Posix, wsl_translate: false },
-                highlight: false,
-            }
-        );
+        assert_eq!(ui.drop, DropConfig {
+            enabled: false,
+            terminal: false,
+            sidebar: false,
+            scratchpad: false,
+            spelling: PathSpelling { quote: Quoting::Posix, wsl_translate: false },
+            highlight: false,
+        });
     }
 
     #[test]
@@ -3450,10 +3874,12 @@ program = "second"
     #[test]
     fn paste_options_default_to_on_with_the_owned_image_dir() {
         let ui = ui_from_toml("");
-        assert_eq!(
-            ui.paste,
-            PasteConfig { files: true, image: true, image_dir: None, image_keep: 20 }
-        );
+        assert_eq!(ui.paste, PasteConfig {
+            files: true,
+            image: true,
+            image_dir: None,
+            image_keep: 20
+        });
         let (dir, owned) = ui.paste.image_target();
         assert_eq!(dir, default_image_dir());
         assert!(owned, "the default directory is alacritree's own");
@@ -3479,21 +3905,14 @@ program = "second"
     fn paste_options_parse_from_the_ui_paste_table() {
         let home = home::home_dir().expect("a home directory");
         let ui = ui_from_toml(
-            "[ui.paste]\n\
-             files = false\n\
-             image = false\n\
-             image_dir = \"~/shots\"\n\
-             image_keep = 5\n",
+            "[ui.paste]\nfiles = false\nimage = false\nimage_dir = \"~/shots\"\nimage_keep = 5\n",
         );
-        assert_eq!(
-            ui.paste,
-            PasteConfig {
-                files: false,
-                image: false,
-                image_dir: Some(home.join("shots")),
-                image_keep: 5,
-            }
-        );
+        assert_eq!(ui.paste, PasteConfig {
+            files: false,
+            image: false,
+            image_dir: Some(home.join("shots")),
+            image_keep: 5,
+        });
     }
 
     /// A directory the user chose may hold files alacritree never wrote, so it is
@@ -3595,6 +4014,15 @@ program = "second"
         assert!(raw.into_config().debug.persistent_logging);
     }
 
+    #[test]
+    fn gpu_timing_is_off_unless_asked_for() {
+        let off: RawConfig = toml::from_str("").unwrap();
+        let on: RawConfig = toml::from_str("[debug]\ngpu_timing = true").unwrap();
+
+        assert!(!off.into_config().debug.gpu_timing);
+        assert!(on.into_config().debug.gpu_timing);
+    }
+
     /// `[debug]` in both files merges key by key rather than the later table
     /// replacing the earlier one wholesale.
     #[test]
@@ -3608,5 +4036,52 @@ program = "second"
 
         assert!(config.debug.persistent_logging, "the alacritty.toml key was dropped");
         assert!(!config.debug.crash_log, "the alacritree.toml key was dropped");
+    }
+
+    #[test]
+    fn every_accepted_adjustment_spelling_parses() {
+        assert_eq!(Adjust::parse("0"), Some(Adjust::Points(0.0)));
+        assert_eq!(Adjust::parse("-2"), Some(Adjust::Points(-2.0)));
+        assert_eq!(Adjust::parse("1.5"), Some(Adjust::Points(1.5)));
+        assert_eq!(Adjust::parse("2pt"), Some(Adjust::Points(2.0)));
+        assert_eq!(Adjust::parse("2px"), Some(Adjust::Pixels(2.0)));
+        assert_eq!(Adjust::parse("-2px"), Some(Adjust::Pixels(-2.0)));
+        assert_eq!(Adjust::parse("150%"), Some(Adjust::Scale(1.5)));
+    }
+
+    /// A percentage is a magnitude.  kitty silently takes the absolute value of a
+    /// negative one, which gives back a line the user did not ask for and no way
+    /// to tell that happened.
+    #[test]
+    fn unusable_adjustment_spellings_are_rejected() {
+        for text in ["", "abc", "2 px", "-150%", "px", "%", "nan", "inf"] {
+            assert_eq!(Adjust::parse(text), None, "{text:?} should not parse");
+        }
+    }
+
+    /// The two spellings of "leave it alone" have to agree, since one is the
+    /// default and the other is what a user writes to say the same thing.
+    #[test]
+    fn a_zero_adjustment_is_the_identity_in_both_units() {
+        assert_eq!(Adjust::parse("0").unwrap().apply(7.0, 2.0), 7.0);
+        assert_eq!(Adjust::parse("100%").unwrap().apply(7.0, 2.0), 7.0);
+        assert_eq!(Adjust::NONE.apply(7.0, 2.0), 7.0);
+    }
+
+    /// Pixels are physical and points are not, which is the whole reason both
+    /// spellings exist.
+    #[test]
+    fn pixels_are_absolute_and_points_scale_with_the_display() {
+        assert_eq!(Adjust::parse("2px").unwrap().apply(10.0, 2.0), 12.0);
+        assert_eq!(Adjust::parse("2pt").unwrap().apply(10.0, 2.0), 14.0);
+        assert_eq!(Adjust::parse("150%").unwrap().apply(10.0, 2.0), 15.0);
+    }
+
+    /// A malformed knob must not fail the whole config load, and must not leave
+    /// the line somewhere the user cannot predict.
+    #[test]
+    fn a_malformed_adjustment_behaves_as_zero() {
+        assert_eq!(parse_adjust("underline_position", Some("2 px")), Adjust::NONE);
+        assert_eq!(parse_adjust("underline_position", None), Adjust::NONE);
     }
 }
