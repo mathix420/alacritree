@@ -24,8 +24,8 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant};
 
 use interprocess::local_socket::traits::{Listener as _, Stream as _};
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, ToFsName};
@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::git_status::{self, ChangeKind, GitStatus};
+use crate::jobs;
 use crate::worktree::{self as wt, CreateRequest, Progress};
 
 pub const SOCKET_ENV: &str = "ALACRITREE_SOCKET";
@@ -46,6 +47,17 @@ pub const EXE_ENV: &str = "ALACRITREE_EXE";
 /// enough for a busy frame, short enough that a wedged app doesn't hang
 /// clients forever.
 const APP_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long this process will hold a pool worker for one create request.
+/// The server's own limit, not a mirror of any client's: a client with a
+/// different timeout changes nothing here.
+///
+/// It sits under the 300s the CLI and the MCP bridge allow so that an overrun
+/// is reported by the side that knows why it overran.  A client's timer starts
+/// when it sends; this one starts after the request has been received, parsed
+/// and validated, so on an equal budget the client always gives up first and
+/// this message is never seen.
+const IPC_CREATE_BUDGET: Duration = Duration::from_secs(240);
 
 /// Everything a client can ask of a running alacritree.  Tagged so the wire
 /// format is `{"type": "list_sessions", …fields}` — the MCP bridge builds
@@ -284,7 +296,11 @@ fn dispatch(request: IpcRequest, app_tx: &Sender<AppCall>, ctx: &egui::Context) 
     match request {
         // `compute` walks the working tree — the same work StatusCache
         // pushes to a background thread — so keep it off the UI thread.
-        IpcRequest::GitStatus { path } => Ok(git_status_json(&git_status::compute(&path, None))),
+        // This is already the connection thread, not the UI thread; the
+        // token just proves that plainly rather than adding a real wait.
+        IpcRequest::GitStatus { path } => Ok(git_status_json(&jobs::on_this_thread(|blocking| {
+            git_status::compute(&path, None, blocking)
+        }))),
         IpcRequest::CreateWorktree { project_root, branch } => {
             create_worktree(project_root, branch, app_tx, ctx)
         },
@@ -321,19 +337,45 @@ fn create_worktree(
         branch,
         base_dir: None,
     };
-    let rx = wt::spawn_create(req, ctx.clone());
+    let (rx, job) = wt::spawn_create(req, ctx.clone());
+    let outcome = drain_create(&rx, IPC_CREATE_BUDGET);
+    // Dropping on every path, including the deadline, is what ends the fetch
+    // and returns the worker.  Holding it would leave the pool one worker
+    // smaller with nothing on screen or in the reply saying so.
+    drop(job);
+    match outcome {
+        Ok((path, steps)) => {
+            // Best-effort: if the project is in the sidebar, show the new
+            // worktree without waiting for a manual refresh.
+            let _ = call_app(IpcRequest::RefreshProject { root: project_root }, app_tx, ctx);
+            Ok(json!({ "path": path, "steps": steps }))
+        },
+        Err(e) => Err(e),
+    }
+}
+
+/// Collect a create's progress until it finishes or the budget runs out.
+///
+/// The deadline is computed once.  A per-message timeout would reset on every
+/// step, so a job that keeps reporting would hold its worker past any budget.
+fn drain_create(
+    rx: &Receiver<Progress>,
+    budget: Duration,
+) -> Result<(PathBuf, Vec<String>), String> {
+    let deadline = Instant::now() + budget;
     let mut steps = Vec::new();
     loop {
-        match rx.recv() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
             Ok(Progress::Step(s)) => steps.push(s),
-            Ok(Progress::Done(Ok(path))) => {
-                // Best-effort: if the project is in the sidebar, show the
-                // new worktree without waiting for a manual refresh.
-                let _ = call_app(IpcRequest::RefreshProject { root: project_root }, app_tx, ctx);
-                return Ok(json!({ "path": path, "steps": steps }));
-            },
+            Ok(Progress::Done(Ok(path))) => return Ok((path, steps)),
             Ok(Progress::Done(Err(e))) => return Err(e),
-            Err(_) => return Err("worktree creation worker died".to_string()),
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(format!("worktree create exceeded {}s", budget.as_secs()));
+            },
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err("the worktree create ended without reporting".into());
+            },
         }
     }
 }
@@ -629,6 +671,41 @@ mod tests {
             std::env::var_os(EXE_ENV).map(PathBuf::from),
             std::env::current_exe().ok(),
             "a shell needs the binary path to exec the CLI back"
+        );
+    }
+
+    /// The deadline is absolute.  A per-message timeout resets on every progress
+    /// step, so a job that keeps reporting outlives the budget indefinitely: the
+    /// same parked worker, reached more slowly.
+    #[test]
+    fn a_dribbling_create_still_ends_at_the_budget() {
+        let (tx, rx) = mpsc::channel::<wt::Progress>();
+        let budget = Duration::from_millis(300);
+        let step = Duration::from_millis(50);
+        let steps = 100u32;
+
+        std::thread::spawn(move || {
+            // Never sends `Done`; a real hung fetch reports and then stops.
+            for _ in 0..steps {
+                if tx.send(wt::Progress::Step("working".into())).is_err() {
+                    return;
+                }
+                std::thread::sleep(step);
+            }
+        });
+
+        let started = Instant::now();
+        let outcome = drain_create(&rx, budget);
+        let elapsed = started.elapsed();
+
+        assert!(outcome.is_err(), "a create that never finished reported success");
+        // The two behaviours are seconds apart: a per-message timeout runs the
+        // whole dribble, an absolute deadline stops at the budget.  Splitting
+        // that gap separates them without measuring `recv_timeout`'s precision.
+        let dribble = step * steps;
+        assert!(
+            elapsed < dribble / 2,
+            "the deadline reset on every step: took {elapsed:?} against a {budget:?} budget"
         );
     }
 }

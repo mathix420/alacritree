@@ -5,10 +5,12 @@
 //! empty and `classify` never returns `Wsl`, so all WSL code paths are
 //! dormant without cfg-gating at call sites.
 
-use crate::command_ext::CommandExt;
+use crate::{command_ext, jobs};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf, Prefix};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 /// Per-project shell override, persisted in state.toml as `"windows"`,
 /// `"wsl:<distro>"`, or `"profile:<name>"`.  Absent means auto-by-location.
@@ -183,32 +185,53 @@ fn is_utility_distro(name: &str) -> bool {
     name.starts_with("docker-desktop") || name.starts_with("rancher-desktop")
 }
 
-/// Registered distros, default first-classed.  Registry is the primary
-/// source (no process spawn, knows the default); `wsl -l -q` is the
-/// fallback when the key is unreadable.  Empty means WSL features stay
-/// dormant.
-///
-/// Cached for the process lifetime: one caller is a per-frame UI path (the
-/// sidebar), and the CLI fallback spawns `wsl.exe` — without caching, every
-/// repaint would probe the registry or shell out. A distro registered or
-/// unregistered after startup is picked up only on restart; that's an
-/// acceptable trade since mid-session registration churn is rare, and a
-/// stale entry just falls through the existing spawn-failure/degrade paths.
+/// The answer every caller shares once one of the two sources has produced
+/// a non-empty one.  A distro registered or unregistered afterwards is picked
+/// up only on restart; that's an acceptable trade since mid-session
+/// registration churn is rare, and a stale entry just falls through the
+/// existing spawn-failure/degrade paths.
+#[cfg(windows)]
+static DISTROS: OnceLock<Vec<WslDistro>> = OnceLock::new();
+
+/// Registered distros, default first-classed.  Reading the `Lxss` registry key
+/// costs microseconds and knows which distro is the default, so it is the only
+/// source this reaches for: the `wsl -l -q` fallback spawns a process, and the
+/// sidebar asks for this list every frame.  Until
+/// [`prime_distros_from_cli`] has filled that fallback in, a machine whose
+/// registry key is unreadable sees an empty list — the same answer it gets
+/// with no distros installed, which leaves WSL features dormant.
 #[cfg(windows)]
 pub fn distros() -> Vec<WslDistro> {
-    static DISTROS: OnceLock<Vec<WslDistro>> = OnceLock::new();
-    DISTROS
-        .get_or_init(|| match registry_distros() {
-            Some(list) if !list.is_empty() => list,
-            _ => cli_distros(),
-        })
-        .clone()
+    if let Some(list) = DISTROS.get() {
+        return list.clone();
+    }
+    match registry_distros() {
+        Some(list) if !list.is_empty() => DISTROS.get_or_init(|| list).clone(),
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(not(windows))]
 pub fn distros() -> Vec<WslDistro> {
     Vec::new()
 }
+
+/// Fill the shared list from `wsl.exe` when the registry has no answer.
+/// Submitted once at startup rather than reached from a draw path: `wsl.exe`
+/// costs hundreds of milliseconds warm and seconds while a distro VM boots.
+#[cfg(windows)]
+pub fn prime_distros_from_cli(blocking: &jobs::Blocking) {
+    if !distros().is_empty() {
+        return;
+    }
+    let list = cli_distros(blocking);
+    if !list.is_empty() {
+        let _ = DISTROS.set(list);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn prime_distros_from_cli(_: &jobs::Blocking) {}
 
 #[cfg(windows)]
 fn registry_distros() -> Option<Vec<WslDistro>> {
@@ -232,7 +255,8 @@ fn registry_distros() -> Option<Vec<WslDistro>> {
 }
 
 #[cfg(windows)]
-fn cli_distros() -> Vec<WslDistro> {
+#[allow(clippy::disallowed_methods)] // Running wsl.exe is this function's job.
+fn cli_distros(_blocking: &jobs::Blocking) -> Vec<WslDistro> {
     let output = command_bare()
         .args(["-l", "-q"])
         .stdin(Stdio::null())
@@ -282,8 +306,8 @@ pub fn command(distro: &str, cd: Option<&Path>) -> Command {
 }
 
 fn command_bare() -> Command {
-    let mut cmd = Command::new("wsl.exe");
-    cmd.hide_console().env("WSL_UTF8", "1");
+    let mut cmd = command_ext::hidden("wsl.exe");
+    cmd.env("WSL_UTF8", "1");
     cmd
 }
 
@@ -309,19 +333,85 @@ pub fn shell_invocation(distro: &str, workdir: &Path) -> (String, Vec<String>) {
 /// section's own trailing newline when it has one.
 pub const SECTION_SEP: &[u8] = b"\n@@ALACRITREE@@\n";
 
+/// The same budget the resident transport gives a request, for the same
+/// reason: a cold WSL VM can take seconds to answer, and nothing healthy
+/// takes longer.  Spent once, as a single deadline, across every wait
+/// `run_batch`'s fallback does — reading stdout, reading stderr, and
+/// reaping the child — rather than reset per wait, or a wedged wsl.exe
+/// could cost up to three times the budget before anything gives up.
+const ONE_SHOT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How often the fallback polls a killed child for its exit, once its
+/// deadline has already passed.  `Child::wait` has no timed variant, so
+/// reaping under a deadline means polling `try_wait` instead.
+const ONE_SHOT_REAP_POLL: Duration = Duration::from_millis(20);
+
+/// Caps how much a drainer thread will buffer.  `child.kill()` only closes
+/// the handles wsl.exe itself owns; if something else inherited the other
+/// end of a pipe (a known wsl.exe failure mode), the drainer reading it
+/// never sees EOF and is abandoned on the timeout path.  The cap is what
+/// bounds that thread's memory rather than anything about a real batch
+/// script, whose output is orders of magnitude smaller.
+const MAX_ONE_SHOT_OUTPUT: u64 = 64 * 1024 * 1024;
+
+/// Kill and reap the child on every path that gives up on it — timeout, a
+/// failed read, a failed `try_wait` — so none of them leaves an unmanaged
+/// `wsl.exe` running.  Both errors are ignored: whichever way this returns,
+/// the caller is already reporting failure and has no next step for either.
+fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    // Unbounded, but safe here in a way the removed `output()` wait was not:
+    // that one waited on a child still running normally, with no bound on how
+    // long it could take.  This one waits on a child this process just killed
+    // and owns the only handle to, so it can only be slow if the kernel is
+    // slow to reap a process that no longer has anywhere else to go.
+    let _ = child.wait();
+}
+
+/// Reads `pipe` to EOF, capped at `cap` bytes.  A read that lands exactly on
+/// the cap is reported as an error rather than a success: `Read::take`
+/// cannot distinguish a batch that filled the cap from one that happened to
+/// stop there, and a batch script's output silently truncated at the cap
+/// reads to a caller (like `git_status`'s porcelain parser) as a complete,
+/// merely wrong, answer — worse than a loud failure.
+fn drain_capped(pipe: impl Read, cap: u64) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    pipe.take(cap).read_to_end(&mut buf)?;
+    if buf.len() as u64 >= cap {
+        return Err(std::io::Error::other(format!("wsl.exe output exceeded the {cap} byte limit")));
+    }
+    Ok(buf)
+}
+
 /// Run `script` through `sh -c` inside `distro`, with `args` bound to
 /// `$1..`.  Rides the resident helper's pipe when it is up; otherwise one
 /// wsl.exe round trip (~400 ms warm on a dev machine, seconds while the VM
 /// cold-boots) — callers batch every query for a repo into a single script
 /// and must never call this on the UI thread.
-pub fn run_batch(distro: &str, script: &str, args: &[&str]) -> Result<Vec<u8>, String> {
+///
+/// Deliberately not `Blocking::run_cancellable`, whose own doc says it
+/// leaves its pipes undrained until the child exits — fine for a bounded
+/// probe, wrong for a `git status` on a large repo, which can produce more
+/// output than a pipe buffer holds before this child would ever be asked to
+/// wait.  `_blocking` is unused because of that: the one-shot fallback below
+/// hand-rolls its own drain-and-wait instead, so it never registers in the
+/// cancel slot.  Consequence, not a regression — `.output()` had the same
+/// gap — a workspace switch that drops the `Job` handle leaves this `wsl.exe`
+/// running to its own deadline rather than being killed early.
+#[allow(clippy::disallowed_methods)] // Running wsl.exe is this function's job.
+pub fn run_batch(
+    distro: &str,
+    script: &str,
+    args: &[&str],
+    _blocking: &jobs::Blocking,
+) -> Result<Vec<u8>, String> {
     // A request the helper may have executed is never re-run as a one-shot
     // (batch scripts have side effects); only a transport that failed
     // before the write falls through to the spawn below.
     if let Some(result) = crate::wsl_helper::try_run(distro, script, args) {
         return result;
     }
-    let output = command(distro, None)
+    let mut child = command(distro, None)
         .arg("sh")
         .arg("-c")
         .arg(script)
@@ -330,29 +420,111 @@ pub fn run_batch(distro: &str, script: &str, args: &[&str]) -> Result<Vec<u8>, S
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
         .map_err(|e| format!("failed to run wsl.exe: {e}"))?;
+    let deadline = Instant::now() + ONE_SHOT_TIMEOUT;
+
+    // `output()` waits for exit with no deadline, so a wsl.exe that never
+    // exits pins this thread for the life of the process.  Draining on
+    // workers and bounding the wait here mirrors how the ipc client bounds a
+    // named-pipe request from its own side.  One thread per pipe, because a
+    // child that fills whichever pipe is drained second blocks there while
+    // the reader is still emptying the first.
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    let (err_tx, err_rx) = std::sync::mpsc::channel();
+    let stdout = child.stdout.take().expect("stdout piped above");
+    let stderr = child.stderr.take().expect("stderr piped above");
+    let out_handle = std::thread::spawn(move || {
+        let _ = out_tx.send(drain_capped(stdout, MAX_ONE_SHOT_OUTPUT));
+    });
+    let err_handle = std::thread::spawn(move || {
+        let _ = err_tx.send(drain_capped(stderr, MAX_ONE_SHOT_OUTPUT));
+    });
+
+    let timed_out =
+        || Err(format!("wsl.exe did not finish within {}s", ONE_SHOT_TIMEOUT.as_secs()));
+    let remaining = || deadline.saturating_duration_since(Instant::now());
+
+    let stdout_read = match out_rx.recv_timeout(remaining()) {
+        Ok(read) => read,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            kill_and_reap(&mut child);
+            return timed_out();
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            kill_and_reap(&mut child);
+            return Err("wsl.exe stdout drainer thread panicked".to_string());
+        },
+    };
+    // The drainer has sent, so its only remaining work is dropping locals and
+    // returning — bounded, unlike joining a drainer that never sent.
+    let _ = out_handle.join();
+    let stdout_bytes = match stdout_read {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            kill_and_reap(&mut child);
+            return Err(format!("failed to read wsl.exe stdout: {e}"));
+        },
+    };
+
+    let stderr_read = match err_rx.recv_timeout(remaining()) {
+        Ok(read) => read,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            kill_and_reap(&mut child);
+            return timed_out();
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            kill_and_reap(&mut child);
+            return Err("wsl.exe stderr drainer thread panicked".to_string());
+        },
+    };
+    let _ = err_handle.join();
+    let stderr_bytes = match stderr_read {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            kill_and_reap(&mut child);
+            return Err(format!("failed to read wsl.exe stderr: {e}"));
+        },
+    };
+
+    // `Child::wait` has no timed variant, so reaping under the same deadline
+    // means polling instead of blocking on it directly.
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {},
+            Err(e) => {
+                kill_and_reap(&mut child);
+                return Err(format!("failed to wait on wsl.exe: {e}"));
+            },
+        }
+        if remaining() == Duration::ZERO {
+            kill_and_reap(&mut child);
+            return timed_out();
+        }
+        std::thread::sleep(ONE_SHOT_REAP_POLL.min(remaining()));
+    };
     // Scripts guard individual commands with `2>/dev/null || true`-style
     // fallbacks; a hard failure with no stdout means wsl.exe itself refused
     // (deregistered distro, WSL not installed).
-    if !output.status.success() && output.stdout.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !status.success() && stdout_bytes.is_empty() {
+        let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
         return Err(if stderr.is_empty() { "wsl.exe failed".to_string() } else { stderr });
     }
-    Ok(output.stdout)
+    Ok(stdout_bytes)
 }
 
 /// Resolve `delta`'s absolute path inside `distro`.  Returns `None` when delta
 /// isn't found; callers must not cache that, so an install mid-session is
 /// picked up on the next attempt.
-pub fn discover_delta(distro: &str) -> Option<String> {
+pub fn discover_delta(distro: &str, blocking: &jobs::Blocking) -> Option<String> {
     // The helper's hello already resolved delta through the login shell; a
     // missing capability is not a cached miss — fall through and re-check
     // live so a mid-session install is still picked up.
     if let Some(path) = crate::wsl_helper::capability_delta(distro) {
         return Some(path);
     }
-    probe_tools(distro, &["delta"]).ok()?.into_iter().next().flatten()
+    probe_tools(distro, &["delta"], blocking).ok()?.into_iter().next().flatten()
 }
 
 /// Resolve each of `programs` inside `distro` as the user's login shell sees
@@ -368,7 +540,12 @@ pub fn discover_delta(distro: &str) -> Option<String> {
 ///
 /// Program names are interpolated into the script, so they must be literals —
 /// nothing a user typed belongs here.
-pub fn probe_tools(distro: &str, programs: &[&str]) -> Result<Vec<Option<String>>, String> {
+#[allow(clippy::disallowed_methods)] // Running wsl.exe is this function's job.
+pub fn probe_tools(
+    distro: &str,
+    programs: &[&str],
+    _blocking: &jobs::Blocking,
+) -> Result<Vec<Option<String>>, String> {
     let probes: Vec<String> = programs.iter().map(|p| format!("command -v {p} || echo")).collect();
     let script = format!(
         r#"s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=${{SHELL:-/bin/sh}}; exec "$s" -lc '{}'"#,
@@ -420,7 +597,20 @@ pub fn split_sections(stdout: &[u8]) -> Vec<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn drain_capped_rejects_output_that_fills_the_cap() {
+        let pipe = Cursor::new(vec![0u8; 8]);
+        assert!(drain_capped(pipe, 8).is_err());
+    }
+
+    #[test]
+    fn drain_capped_accepts_output_under_the_cap() {
+        let pipe = Cursor::new(vec![0u8; 8]);
+        assert_eq!(drain_capped(pipe, 9).unwrap(), vec![0u8; 8]);
+    }
 
     #[cfg(windows)]
     #[test]
@@ -677,7 +867,60 @@ mod tests {
     #[ignore]
     fn run_batch_round_trips() {
         let distro = distros().into_iter().find(|d| d.is_default).expect("a default distro");
-        let out = run_batch(&distro.name, r#"printf '%s' "$1""#, &["hello"]).unwrap();
+        let out = jobs::on_this_thread(|blocking| {
+            run_batch(&distro.name, r#"printf '%s' "$1""#, &["hello"], blocking)
+        })
+        .unwrap();
         assert_eq!(out, b"hello");
+    }
+
+    /// Restores the resident helper's global enabled flag on drop, so a test
+    /// that disables it for the duration of one call cannot leave it off for
+    /// the rest of the process if the call under test panics.
+    struct RestoreHelperEnabled;
+
+    impl Drop for RestoreHelperEnabled {
+        fn drop(&mut self) {
+            crate::wsl_helper::set_enabled(true);
+        }
+    }
+
+    /// A one-shot that never exits must not pin its caller.  Requires WSL;
+    /// run manually:
+    /// `cargo nextest run -p alacritree wsl::tests::a_one_shot --run-ignored all`
+    #[test]
+    #[ignore]
+    fn a_one_shot_that_never_exits_gives_up_rather_than_hanging() {
+        let distro = distros().into_iter().find(|d| d.is_default).expect("a default distro");
+        // The resident helper would answer this on its own thread and never
+        // reach the fallback, so it has to be off for the duration.
+        crate::wsl_helper::set_enabled(false);
+        let _restore = RestoreHelperEnabled;
+
+        let started = Instant::now();
+        let result =
+            jobs::on_this_thread(|blocking| run_batch(&distro.name, "sleep 3600", &[], blocking));
+        let waited = started.elapsed();
+
+        assert!(result.is_err(), "a child that never exits is not a success");
+        assert!(waited < ONE_SHOT_TIMEOUT * 2, "gave up only after {waited:?}");
+    }
+
+    /// Draining stdout to EOF before touching stderr blocks the child on a
+    /// full stderr pipe while the reader waits on stdout, and neither side
+    /// moves — the trap a single sequential drain would fall into.  Pipe
+    /// buffers are typically 64 KiB, so the script below writes well past
+    /// that to stderr before it can print the stdout marker this test
+    /// checks for; a regression to sequential draining deadlocks here
+    /// rather than merely running slow.  Requires WSL; run manually:
+    /// `cargo nextest run -p alacritree wsl::tests::a_batch_that_overflows --run-ignored all`
+    #[test]
+    #[ignore]
+    fn a_batch_that_overflows_stderrs_pipe_still_delivers_stdout() {
+        let distro = distros().into_iter().find(|d| d.is_default).expect("a default distro");
+        let script = "dd if=/dev/zero bs=1024 count=200 status=none 1>&2; printf marker";
+        let out = jobs::on_this_thread(|blocking| run_batch(&distro.name, script, &[], blocking))
+            .expect("both pipes should drain without deadlocking");
+        assert_eq!(out, b"marker");
     }
 }

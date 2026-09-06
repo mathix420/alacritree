@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::app::WorkspaceKey;
+use crate::config::ReorderScope;
 use crate::projects::{Project, Worktree};
 use crate::session::SessionId;
 
@@ -52,6 +53,96 @@ pub fn visible_rows(projects: &[Project], sessions: &ListedSessions) -> Vec<Side
         }
     }
     rows
+}
+
+/// The project whose worktree list contains `path`.  A path two projects both
+/// list resolves to the first in sidebar order: a session records a directory,
+/// not a project, so there is nothing better to go on.
+fn owning_project<'a>(projects: &'a [Project], path: &Path) -> Option<&'a Project> {
+    projects.iter().find(|p| p.worktrees.iter().any(|w| w.path == path))
+}
+
+/// The workspaces a session living in `origin` may move through, in sidebar
+/// order.  `order` is the caller's live workspace list — the workspaces it is
+/// willing to switch to, minus any whose delete is already running — so a
+/// reorder can never land a session somewhere the rest of the app refuses to
+/// go.
+///
+/// Expansion is deliberately not consulted: a collapsed project's worktrees
+/// are destinations like any other, or the set of them would depend on which
+/// projects happen to be open.
+///
+/// The result always contains `origin`.  When the scope's list does not, it
+/// collapses to `origin` alone: a detached session, or one in a worktree being
+/// deleted, has no position in a list it is not in, and must still be free to
+/// move inside its own workspace.
+pub fn move_range(
+    projects: &[Project],
+    order: &[WorkspaceKey],
+    origin: &WorkspaceKey,
+    scope: ReorderScope,
+) -> Vec<WorkspaceKey> {
+    let range: Vec<WorkspaceKey> = match scope {
+        ReorderScope::Workspace => Vec::new(),
+        ReorderScope::Project => match origin.as_deref().and_then(|p| owning_project(projects, p)) {
+            Some(project) => order
+                .iter()
+                .filter(|ws| {
+                    ws.as_deref().is_some_and(|p| project.worktrees.iter().any(|w| w.path == p))
+                })
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        },
+        ReorderScope::Anywhere => order.to_vec(),
+    };
+    if range.contains(origin) { range } else { vec![origin.clone()] }
+}
+
+/// Where a session lands after one reorder step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepTarget {
+    pub workspace: WorkspaceKey,
+    /// Position among that workspace's sessions once the move is applied.
+    pub position: usize,
+}
+
+/// One reorder step for the session sitting at `index` of `origin`.
+///
+/// `range` comes from [`move_range`] and `lens[i]` is the current session
+/// count of `range[i]`.  `delta` is negative for up and positive for down.
+///
+/// A step off either end of a workspace continues into the neighbouring one:
+/// up lands past the last session there, down lands before the first.  An
+/// empty neighbour resolves to position 0 either way, so it needs no case of
+/// its own.  `None` is every refusal — both ends of the range are clamped and
+/// nothing wraps.
+pub fn step_target(
+    range: &[WorkspaceKey],
+    lens: &[usize],
+    origin: &WorkspaceKey,
+    index: usize,
+    delta: i32,
+) -> Option<StepTarget> {
+    debug_assert_eq!(range.len(), lens.len(), "one length per workspace in the range");
+    let k = range.iter().position(|ws| ws == origin)?;
+    if index >= *lens.get(k)? {
+        return None;
+    }
+    if delta < 0 {
+        if index > 0 {
+            return Some(StepTarget { workspace: origin.clone(), position: index - 1 });
+        }
+        let prev = k.checked_sub(1)?;
+        Some(StepTarget { workspace: range[prev].clone(), position: lens[prev] })
+    } else if delta > 0 {
+        if index + 1 < lens[k] {
+            return Some(StepTarget { workspace: origin.clone(), position: index + 1 });
+        }
+        Some(StepTarget { workspace: range.get(k + 1)?.clone(), position: 0 })
+    } else {
+        None
+    }
 }
 
 /// The row `delta` steps away from `cursor`, clamped to the list ends.
@@ -192,6 +283,20 @@ pub(crate) mod tests {
         HashMap::new()
     }
 
+    fn ws(path: &str) -> WorkspaceKey {
+        Some(PathBuf::from(path))
+    }
+
+    /// Home plus every worktree of both projects, the shape `workspace_order`
+    /// hands `move_range` when nothing is missing or being deleted.
+    fn full_order() -> Vec<WorkspaceKey> {
+        vec![None, ws("/a/wt1"), ws("/a/wt2"), ws("/b/wt1")]
+    }
+
+    fn two_projects() -> Vec<Project> {
+        vec![project("/a", true, &["/a/wt1", "/a/wt2"]), project("/b", true, &["/b/wt1"])]
+    }
+
     pub(crate) fn project(root: &str, expanded: bool, worktrees: &[&str]) -> Project {
         Project {
             root: PathBuf::from(root),
@@ -213,6 +318,142 @@ pub(crate) mod tests {
             shell_override: None,
             home: None,
         }
+    }
+
+    #[test]
+    fn move_range_workspace_scope_is_the_origin_alone() {
+        let range = move_range(
+            &two_projects(),
+            &full_order(),
+            &ws("/a/wt1"),
+            ReorderScope::Workspace,
+        );
+        assert_eq!(range, vec![ws("/a/wt1")]);
+    }
+
+    #[test]
+    fn move_range_project_scope_lists_the_owning_projects_worktrees() {
+        let range =
+            move_range(&two_projects(), &full_order(), &ws("/a/wt1"), ReorderScope::Project);
+        assert_eq!(range, vec![ws("/a/wt1"), ws("/a/wt2")]);
+    }
+
+    #[test]
+    fn move_range_project_scope_keeps_home_alone() {
+        let range = move_range(&two_projects(), &full_order(), &None, ReorderScope::Project);
+        assert_eq!(range, vec![None]);
+    }
+
+    #[test]
+    fn move_range_anywhere_scope_is_the_order_verbatim() {
+        let range = move_range(&two_projects(), &full_order(), &None, ReorderScope::Anywhere);
+        assert_eq!(range, full_order());
+    }
+
+    #[test]
+    fn move_range_ignores_project_expansion() {
+        let collapsed =
+            vec![project("/a", false, &["/a/wt1", "/a/wt2"]), project("/b", false, &["/b/wt1"])];
+        let range =
+            move_range(&collapsed, &full_order(), &ws("/a/wt1"), ReorderScope::Anywhere);
+        assert_eq!(range, full_order());
+    }
+
+    #[test]
+    fn move_range_omits_workspaces_absent_from_the_order() {
+        // /a/wt2 is gone or has a delete in flight, so the caller left it out.
+        let order = vec![None, ws("/a/wt1"), ws("/b/wt1")];
+        let range = move_range(&two_projects(), &order, &ws("/a/wt1"), ReorderScope::Project);
+        assert_eq!(range, vec![ws("/a/wt1")]);
+    }
+
+    #[test]
+    fn move_range_collapses_to_the_origin_when_the_order_omits_it() {
+        // A session whose project was removed keeps running and keeps its
+        // directory; it may still reorder inside it, and cross nothing.
+        let order = vec![None, ws("/a/wt1")];
+        for scope in [ReorderScope::Workspace, ReorderScope::Project, ReorderScope::Anywhere] {
+            let range = move_range(&two_projects(), &order, &ws("/gone"), scope);
+            assert_eq!(range, vec![ws("/gone")], "scope {scope:?}");
+        }
+    }
+
+    #[test]
+    fn step_swaps_with_the_neighbour_inside_a_workspace() {
+        let range = vec![ws("/a"), ws("/b")];
+        let lens = vec![3, 1];
+        assert_eq!(
+            step_target(&range, &lens, &ws("/a"), 1, -1),
+            Some(StepTarget { workspace: ws("/a"), position: 0 })
+        );
+        assert_eq!(
+            step_target(&range, &lens, &ws("/a"), 1, 1),
+            Some(StepTarget { workspace: ws("/a"), position: 2 })
+        );
+    }
+
+    #[test]
+    fn step_down_off_the_end_lands_at_the_front_of_the_next_workspace() {
+        let range = vec![ws("/a"), ws("/b")];
+        let lens = vec![2, 2];
+        assert_eq!(
+            step_target(&range, &lens, &ws("/a"), 1, 1),
+            Some(StepTarget { workspace: ws("/b"), position: 0 })
+        );
+    }
+
+    #[test]
+    fn step_up_off_the_front_lands_at_the_end_of_the_previous_workspace() {
+        let range = vec![ws("/a"), ws("/b")];
+        let lens = vec![2, 2];
+        assert_eq!(
+            step_target(&range, &lens, &ws("/b"), 0, -1),
+            Some(StepTarget { workspace: ws("/a"), position: 2 })
+        );
+    }
+
+    #[test]
+    fn step_into_an_empty_workspace_lands_at_position_zero() {
+        let range = vec![ws("/a"), ws("/b")];
+        let lens = vec![1, 0];
+        assert_eq!(
+            step_target(&range, &lens, &ws("/a"), 0, 1),
+            Some(StepTarget { workspace: ws("/b"), position: 0 })
+        );
+        // And the same landing read from the other direction: appending to an
+        // empty workspace is position 0 too.
+        let lens = vec![0, 1];
+        assert_eq!(
+            step_target(&range, &lens, &ws("/b"), 0, -1),
+            Some(StepTarget { workspace: ws("/a"), position: 0 })
+        );
+    }
+
+    #[test]
+    fn step_clamps_at_both_ends_of_the_range() {
+        let range = vec![ws("/a"), ws("/b")];
+        let lens = vec![2, 2];
+        assert_eq!(step_target(&range, &lens, &ws("/a"), 0, -1), None);
+        assert_eq!(step_target(&range, &lens, &ws("/b"), 1, 1), None);
+    }
+
+    #[test]
+    fn step_in_a_single_workspace_range_never_crosses() {
+        let range = vec![ws("/a")];
+        let lens = vec![2];
+        assert_eq!(step_target(&range, &lens, &ws("/a"), 1, 1), None);
+        assert_eq!(step_target(&range, &lens, &ws("/a"), 0, -1), None);
+        assert_eq!(
+            step_target(&range, &lens, &ws("/a"), 0, 1),
+            Some(StepTarget { workspace: ws("/a"), position: 1 })
+        );
+    }
+
+    #[test]
+    fn step_rejects_an_origin_the_range_does_not_list() {
+        let range = vec![ws("/a")];
+        let lens = vec![2];
+        assert_eq!(step_target(&range, &lens, &ws("/b"), 0, 1), None);
     }
 
     #[test]

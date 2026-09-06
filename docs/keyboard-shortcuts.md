@@ -240,6 +240,13 @@ caret there; bind them elsewhere if you want the caret back.
   `session_display.sidebar_always` / `session_display.tabs_always` values, which
   control whether a lone session still gets its own sidebar row or tab segment.
   No default keys.
+- `ToggleSessionDrag` — flip whether a session row can be dragged with the mouse
+  to reorder it. Starts from `[ui.session_reorder] drag`. No default key.
+- `MoveSessionUp` / `MoveSessionDown` — move a session one position in the sidebar
+  and the tab strip. With the sidebar focused this moves the cursored session, or
+  the cursored workspace's active session when the cursor is on a Home or worktree
+  row; from the terminal it moves the session on screen. How far a session may
+  travel is `[ui.session_reorder] scope`. No default keys.
 
 ### Focus navigation
 
