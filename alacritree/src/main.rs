@@ -157,6 +157,10 @@ fn main() -> eframe::Result<()> {
 
     let (config, config_files) = config::load(config_dir.as_deref(), &options);
 
+    // Before any session exists: the PTY threads read this flag without
+    // synchronizing against startup.
+    frame_log::set_enabled(config.debug.frame_log);
+
     // The gate defaults on so a panic in `config::load` above is still
     // recorded; that is the one case where `crash_log = false` leaves a file.
     crash_log::set_enabled(config.debug.crash_log);
@@ -166,14 +170,16 @@ fn main() -> eframe::Result<()> {
     if let Some(dir) = &log_dir {
         logging::prune_session_logs(dir);
     }
-    // `gpu_timing` reports through the log stream, and a GUI-subsystem binary
-    // has no console for stderr to reach.  Asking for the report has to open
-    // the file it lands in, or it is written where nothing can read it.
-    // `--log-file` turns logging on by itself: a flag naming a file that then
-    // stays empty because a config key was off is the trap the flag exists to
-    // avoid.
-    let logging_to_file =
-        log_file.is_some() || config.debug.persistent_logging || config.debug.gpu_timing;
+    // `gpu_timing` and `frame_log` report through the log stream, and a
+    // GUI-subsystem binary has no console for stderr to reach.  Asking for a
+    // report has to open the file it lands in, or it is written where nothing
+    // can read it.  `--log-file` turns logging on by itself: a flag naming a
+    // file that then stays empty because a config key was off is the trap the
+    // flag exists to avoid.
+    let logging_to_file = log_file.is_some()
+        || config.debug.persistent_logging
+        || config.debug.gpu_timing
+        || frame_log::enabled();
     if logging_to_file {
         let opened = match &log_file {
             Some(path) => logging::open_log_at(path),

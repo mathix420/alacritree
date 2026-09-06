@@ -571,7 +571,7 @@ pub struct AlacritreeApp {
     /// option is on: it allocates nothing until a frame writes to it, and
     /// the GL side is built on the first paint that needs it.
     gpu_grid: crate::grid_gl::GpuGrid,
-    /// Present only under `ALACRITREE_FRAME_LOG`; `None` is the normal run.
+    /// Present only when frame timing was asked for; `None` is the normal run.
     frame_log: Option<crate::frame_log::FrameLog>,
     phases: crate::frame_log::Phases,
     /// How much of the frame in progress went to painting the terminal grid,
@@ -974,7 +974,7 @@ impl AlacritreeApp {
             glyph_cache: crate::glyph_cache::GlyphCache::new(),
             grid_snapshot: crate::terminal_view::GridSnapshot::new(),
             gpu_grid: crate::grid_gl::GpuGrid::new(),
-            frame_log: crate::frame_log::FrameLog::from_env(),
+            frame_log: crate::frame_log::FrameLog::start(),
             phases: crate::frame_log::Phases::new(),
             grid_paint: std::time::Duration::ZERO,
             last_pane_geometry: None,

@@ -149,11 +149,16 @@ pub struct DebugConfig {
     /// Keeps this session's log file for as long as it is on, since the
     /// report has nowhere else to go.
     pub gpu_timing: bool,
+    /// alacritree-only, set in `alacritree.toml`.  Off by default.
+    /// `ALACRITREE_FRAME_LOG` outranks it, being the only switch that exists
+    /// before this file is read.  Like `gpu_timing`, keeps the session log
+    /// open, since the report has nowhere else to go.
+    pub frame_log: bool,
 }
 
 impl Default for DebugConfig {
     fn default() -> Self {
-        Self { crash_log: true, persistent_logging: false, gpu_timing: false }
+        Self { crash_log: true, persistent_logging: false, gpu_timing: false, frame_log: false }
     }
 }
 
@@ -1786,6 +1791,19 @@ struct RawDebug {
     /// `[ui] gpu_grid` and a GL 3.3 context.  Keeps this session's log file
     /// for as long as it is on, since the report has nowhere else to go.
     gpu_timing: Option<bool>,
+    /// Measure whole frames and report the period, CPU time, grid share and
+    /// keystroke echo every few seconds.  alacritree-only, so it belongs in
+    /// `alacritree.toml`.  Default `false`.
+    ///
+    /// `ALACRITREE_FRAME_LOG` overrides this in both directions: setting it to
+    /// `0` or the empty string turns measurements off however this key is set.
+    /// The variable is the only switch that exists before the config is read,
+    /// so a run that exported it means it.
+    ///
+    /// Keeps this session's log file for as long as it is on, since the report
+    /// goes to the log stream and a GUI-subsystem binary has no console for it
+    /// to reach otherwise.
+    frame_log: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -2884,6 +2902,7 @@ impl RawConfig {
                 crash_log: self.debug.crash_log.unwrap_or(true),
                 persistent_logging: self.debug.persistent_logging.unwrap_or(false),
                 gpu_timing: self.debug.gpu_timing.unwrap_or(false),
+                frame_log: self.debug.frame_log.unwrap_or(false),
             },
             working_directory: self
                 .general
@@ -4326,6 +4345,15 @@ program = "second"
         let raw: RawConfig = toml::from_str("[debug]\npersistent_logging = true").unwrap();
 
         assert!(raw.into_config().debug.persistent_logging);
+    }
+
+    #[test]
+    fn frame_logging_is_off_unless_asked_for() {
+        let off: RawConfig = toml::from_str("").unwrap();
+        let on: RawConfig = toml::from_str("[debug]\nframe_log = true").unwrap();
+
+        assert!(!off.into_config().debug.frame_log);
+        assert!(on.into_config().debug.frame_log);
     }
 
     #[test]

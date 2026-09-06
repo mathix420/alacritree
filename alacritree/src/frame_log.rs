@@ -1,4 +1,5 @@
-//! Opt-in frame timing, enabled with `ALACRITREE_FRAME_LOG=1`.
+//! Opt-in frame timing, enabled with `[debug] frame_log` or
+//! `ALACRITREE_FRAME_LOG=1`.
 //!
 //! The paint harnesses time the grid alone in a headless context, which says
 //! nothing about the sidebars, event draining, or git status that share the
@@ -15,21 +16,37 @@
 //! Disabled it costs one `Option` check per frame, one flag read per PTY
 //! wakeup, and never allocates.
 
+use std::ffi::OsStr;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// How often the accumulated frames are summarized.
 const REPORT_EVERY: Duration = Duration::from_secs(5);
 
-/// Whether `ALACRITREE_FRAME_LOG` asked for measurements.  Read by the PTY
-/// threads, which have no handle on the `FrameLog` the UI thread owns.
-fn enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("ALACRITREE_FRAME_LOG")
-            .is_some_and(|v| !matches!(v.to_str(), Some("0") | Some("")))
-    })
+/// Whether measurements were asked for.  Read by the PTY threads, which have no
+/// handle on the `FrameLog` the UI thread owns, so the answer lives beside them
+/// rather than on it.
+static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// What `ALACRITREE_FRAME_LOG` says, when it says anything.  It outranks
+/// `[debug] frame_log`: the variable is the only switch that exists before the
+/// config parses, so a run that exported it is asking for measurements whatever
+/// the file says.
+fn env_override(raw: Option<&OsStr>) -> Option<bool> {
+    raw.map(|v| !matches!(v.to_str(), Some("0") | Some("")))
+}
+
+/// Settle the flag from the loaded config.  Has to run before the first session
+/// spawns: the PTY threads read it without synchronizing against startup, and a
+/// value published after they start is silently ignored rather than refused.
+pub fn set_enabled(from_config: bool) {
+    let asked = env_override(std::env::var_os("ALACRITREE_FRAME_LOG").as_deref());
+    ENABLED.store(asked.unwrap_or(from_config), Ordering::Relaxed);
+}
+
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
 }
 
 /// Terminal output waiting to reach the screen, as nanoseconds since
@@ -245,9 +262,10 @@ pub struct FrameLog {
 }
 
 impl FrameLog {
-    /// A log if `ALACRITREE_FRAME_LOG` is set to anything but `0`, otherwise
-    /// nothing — the caller keeps an `Option` so a normal run pays nothing.
-    pub fn from_env() -> Option<Self> {
+    /// A log if measurements were asked for, otherwise nothing — the caller
+    /// keeps an `Option` so a normal run pays nothing.  Reads the flag
+    /// `set_enabled` settled, so constructing before that call measures nothing.
+    pub fn start() -> Option<Self> {
         enabled().then(|| Self {
             samples: Samples::default(),
             started_previous: None,
@@ -350,6 +368,19 @@ mod tests {
 
     fn frame(started: Instant) -> Timings {
         Timings { started, grid: Duration::ZERO, cpu: None, waited: None, echo: None }
+    }
+
+    #[test]
+    fn an_unset_variable_leaves_the_decision_to_the_config() {
+        assert_eq!(env_override(None), None);
+    }
+
+    #[test]
+    fn the_variable_turns_measurements_off_as_well_as_on() {
+        assert_eq!(env_override(Some(OsStr::new("0"))), Some(false));
+        assert_eq!(env_override(Some(OsStr::new(""))), Some(false));
+        assert_eq!(env_override(Some(OsStr::new("1"))), Some(true));
+        assert_eq!(env_override(Some(OsStr::new("yes"))), Some(true));
     }
 
     #[test]
