@@ -1462,6 +1462,9 @@ status_indicators = \"symbols\"
         assert_eq!(matched, Some(PathBuf::from(r"C:\Users\Dev\repo")));
     }
 
+    /// A translated WSL path is a Windows path, and off Windows that is one
+    /// opaque component which never prefixes another.
+    #[cfg(windows)]
     #[test]
     fn wsl_agent_matches_by_the_translated_windows_path() {
         let distro = "kali-linux";
@@ -1475,6 +1478,7 @@ status_indicators = \"symbols\"
         assert_eq!(matched, Some(workspace));
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_wsl_agent_outside_every_workspace_still_has_none() {
         let distro = "kali-linux";
