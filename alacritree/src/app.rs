@@ -1413,6 +1413,11 @@ impl AlacritreeApp {
         pane_id: &str,
         workspace: WorkspaceKey,
     ) -> bool {
+        // The client this replaces, once its own is up.  A shared view is one
+        // window on the whole herdr session, so a side has room for exactly
+        // one: a second would show the same herdr twice and leave the pane
+        // the first is no longer on looking unattached.
+        let mut replacing = None;
         let (program, argv) = if herdr::can_attach(&key.side) {
             let args = herdr::attach_args(pane_id);
             let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -1424,10 +1429,20 @@ impl AlacritreeApp {
             // agent. Two argv spawns, no shell — the only shell a `Native`
             // command could reach on this side is cmd.exe, which does not
             // understand `sh_quote`'s single-quoting.
+            // herdr's client reads the focused pane when it starts and holds
+            // that view: a focus moved from outside afterwards reaches the
+            // server, and the running client keeps drawing the pane it opened
+            // on.  So a view already on the pane is brought up as it is, and
+            // one on another pane is replaced rather than redirected.
+            if let Some(id) = self.herdr_view_showing(&key) {
+                self.activate_session_by_id(id);
+                return true;
+            }
             if let Err(e) = herdr::focus_agent(&key.side, pane_id) {
                 self.error_dialog = Some(e);
                 return false;
             }
+            replacing = self.herdr_view_session(&key.side);
             let session = match herdr::running_session_name(&key.side) {
                 Ok(session) => session,
                 Err(e) => {
@@ -1444,6 +1459,11 @@ impl AlacritreeApp {
             Ok(id) => {
                 if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
                     session.herdr_key = Some(key);
+                }
+                // Only redundant once its replacement is up: closing first
+                // would land the workspace on some other session in between.
+                if let Some(old) = replacing {
+                    self.close_session(ctx, old);
                 }
                 true
             },
@@ -8806,6 +8826,21 @@ impl AlacritreeApp {
         let shared_view = !herdr::can_attach(&key.side);
         let focused = shared_view.then(|| self.focused_herdr_agent(&key.side)).flatten();
         Some(key.claim(shared_view, focused))
+    }
+
+    /// This side's shared view, when it is already on `key`'s pane.
+    fn herdr_view_showing(&self, key: &herdr::HerdrKey) -> Option<SessionId> {
+        let id = self.herdr_view_session(&key.side)?;
+        let session = self.sessions.iter().find(|s| s.id == id)?;
+        (self.session_claim(session)?.terminal_id == key.terminal_id).then_some(id)
+    }
+
+    /// The session holding this side's shared view, if one is open.
+    fn herdr_view_session(&self, side: &herdr::Side) -> Option<SessionId> {
+        self.sessions
+            .iter()
+            .find(|s| s.herdr_key.as_ref().is_some_and(|key| key.side == *side))
+            .map(|s| s.id)
     }
 
     /// The agent herdr's own window on `side` is showing.
