@@ -469,7 +469,8 @@ pub struct EndpointCache {
     reach: Reach,
     last_attempt: Option<Instant>,
     pending: Option<jobs::Job<Result<Vec<Agent>, PollError>>>,
-    settings: Read,
+    settings: Read<Settings>,
+    session_name: Read<String>,
 }
 
 impl EndpointCache {
@@ -482,6 +483,7 @@ impl EndpointCache {
             last_attempt: None,
             pending: None,
             settings: Read::Unread,
+            session_name: Read::Unread,
         }
     }
 
@@ -509,6 +511,44 @@ impl EndpointCache {
             Read::Done(settings) => settings.clone(),
             Read::Unread | Read::Pending(_) => Settings::default(),
         }
+    }
+
+    /// The running session's name here, once the read has landed.  `None`
+    /// means the attach has to ask herdr itself.
+    pub fn session_name(&self) -> Option<String> {
+        match &self.session_name {
+            Read::Done(name) => Some(name.clone()),
+            Read::Unread | Read::Pending(_) => None,
+        }
+    }
+
+    /// Adopt a landed session-name read.  A read that answered nothing goes
+    /// back to unread rather than to a guess: the name is what an attach
+    /// targets, so asking again next tick beats attaching to a name herdr
+    /// never gave.
+    fn advance_session_name(&mut self) {
+        let Read::Pending(job) = &self.session_name else { return };
+        match job.poll() {
+            Some(Some(name)) => self.session_name = Read::Done(name),
+            Some(None) => self.session_name = Read::Unread,
+            None if job.failed() => self.session_name = Read::Unread,
+            None => {},
+        }
+    }
+
+    /// Learn the session name in the background.  The attach gesture runs on
+    /// the UI thread, and on a side where herdr cannot attach one agent it
+    /// already spends a spawn focusing the pane; asking for a name that is
+    /// the same on every click would double that wait.
+    fn start_session_name_read(&mut self) {
+        if !matches!(self.session_name, Read::Unread) {
+            return;
+        }
+        let side = self.side.clone();
+        self.session_name = Read::Pending(
+            jobs::pool()
+                .spawn(jobs::Priority::Background, move |_| running_session_name(&side).ok()),
+        );
     }
 
     /// Adopt a landed config read.  Both halves are part of what a row
@@ -542,11 +582,13 @@ impl EndpointCache {
     /// Adopts a landed result and starts a new poll when due.  Never blocks.
     pub fn poll(&mut self, interval: Duration) {
         self.advance_settings();
+        self.advance_session_name();
         if let Some(job) = &self.pending {
             match job.poll() {
                 Some(Ok(agents)) => {
                     self.reach.record_success();
                     self.start_settings_read();
+                    self.start_session_name_read();
                     if rendered_differs(&self.agents, &agents) {
                         self.generation = self.generation.wrapping_add(1);
                     }
@@ -555,6 +597,9 @@ impl EndpointCache {
                 },
                 Some(Err(error)) => {
                     self.note_failure(&error);
+                    // herdr restarting may name its session differently, and
+                    // attaching to the old name reaches nothing.
+                    self.session_name = Read::Unread;
                     if !self.agents.is_empty() {
                         self.agents.clear();
                         self.generation = self.generation.wrapping_add(1);
@@ -948,10 +993,10 @@ pub fn settings(side: &Side, blocking: &jobs::Blocking) -> Option<Settings> {
 /// A config read runs once per endpoint: herdr rereads its own config only on
 /// request, and re-running a shell inside every distro on the listing cadence
 /// would cost a process per distro per tick to learn values that do not move.
-enum Read {
+enum Read<T> {
     Unread,
-    Pending(jobs::Job<Option<Settings>>),
-    Done(Settings),
+    Pending(jobs::Job<Option<T>>),
+    Done(T),
 }
 
 #[cfg(test)]

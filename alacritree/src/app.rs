@@ -1443,11 +1443,16 @@ impl AlacritreeApp {
                 return false;
             }
             replacing = self.herdr_view_session(&key.side);
-            let session = match herdr::running_session_name(&key.side) {
-                Ok(session) => session,
-                Err(e) => {
-                    self.error_dialog = Some(e);
-                    return false;
+            // The background read usually has it; a click that beats the
+            // first one still asks, since a wait is better than a refusal.
+            let session = match self.herdr_session_name(&key.side) {
+                Some(session) => session,
+                None => match herdr::running_session_name(&key.side) {
+                    Ok(session) => session,
+                    Err(e) => {
+                        self.error_dialog = Some(e);
+                        return false;
+                    },
                 },
             };
             key.side.command(&["session", "attach", &session])
@@ -8826,6 +8831,15 @@ impl AlacritreeApp {
         let shared_view = !herdr::can_attach(&key.side);
         let focused = shared_view.then(|| self.focused_herdr_agent(&key.side)).flatten();
         Some(key.claim(shared_view, focused))
+    }
+
+    /// What the endpoint learned this side's herdr session is called.
+    fn herdr_session_name(&self, side: &herdr::Side) -> Option<String> {
+        self.herdr_endpoints
+            .caches()
+            .iter()
+            .find(|cache| cache.side() == side)
+            .and_then(herdr::EndpointCache::session_name)
     }
 
     /// This side's shared view, when it is already on `key`'s pane.
