@@ -1911,6 +1911,34 @@ impl AlacritreeApp {
             .collect()
     }
 
+    /// The sessions of `ws` a reorder may move, in the order they are drawn.
+    ///
+    /// A session attached to a harness pane is not among them: its place in
+    /// the sidebar is the pane's place in the harness, which alacritree does
+    /// not own and cannot write back.  Moving one inside `self.sessions`
+    /// would change nothing on screen and quietly change the tab order, so
+    /// every reorder path reads its subject and its landing slots from here.
+    fn workspace_reorder_indices(&self, ws: &WorkspaceKey) -> Vec<usize> {
+        self.sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.working_directory == *ws && s.herdr_key.is_none())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// `ws`'s sessions in the order the sidebar and the tab strip draw them:
+    /// alacritree's own first, then the harness-backed ones in the harness's
+    /// order, so cycling tabs walks the list the user is looking at.
+    fn workspace_display_indices(&self, ws: &WorkspaceKey) -> Vec<usize> {
+        let mut indices = self.workspace_session_indices(ws);
+        indices.sort_by_key(|i| match self.session_claim(&self.sessions[*i]) {
+            Some(key) => (1, self.herdr_pane_index(&key).unwrap_or(usize::MAX)),
+            None => (0, 0),
+        });
+        indices
+    }
+
     /// The workspaces a reorder may use: those the app is willing to switch
     /// to, minus any whose delete is already running.  A session landing on a
     /// spinner row is a session that delete is about to reap.
@@ -1951,7 +1979,7 @@ impl AlacritreeApp {
     fn reorder_session_within_workspace(&mut self, id: SessionId, position: usize) {
         let Some(abs) = self.sessions.iter().position(|s| s.id == id) else { return };
         let ws = self.sessions[abs].working_directory.clone();
-        let indices = self.workspace_session_indices(&ws);
+        let indices = self.workspace_reorder_indices(&ws);
         let Some(j) = indices.iter().position(|i| *i == abs) else { return };
         for (a, b) in walk_swaps(&indices, j, position) {
             self.sessions.swap(a, b);
@@ -1976,8 +2004,13 @@ impl AlacritreeApp {
     /// Apply a mouse drop, whose slot arithmetic `drop_position` decides.
     fn apply_session_drop(&mut self, id: SessionId, workspace: WorkspaceKey, insert_before: usize) {
         let Some(abs) = self.sessions.iter().position(|s| s.id == id) else { return };
+        // A harness owns this pane's place, so there is no slot to drop it
+        // into and no arithmetic to do.
+        if self.sessions[abs].herdr_key.is_some() {
+            return;
+        }
         let same_workspace = self.sessions[abs].working_directory == workspace;
-        let indices = self.workspace_session_indices(&workspace);
+        let indices = self.workspace_reorder_indices(&workspace);
         let from = indices.iter().position(|i| *i == abs).unwrap_or(indices.len());
         let Some(position) = drop_position(same_workspace, indices.len(), from, insert_before)
         else {
@@ -2008,8 +2041,10 @@ impl AlacritreeApp {
         let Some(abs) = self.sessions.iter().position(|s| s.id == id) else { return };
         let Some((origin, range)) = self.reorder_range(id) else { return };
         let lens: Vec<usize> =
-            range.iter().map(|ws| self.workspace_session_indices(ws).len()).collect();
-        let indices = self.workspace_session_indices(&origin);
+            range.iter().map(|ws| self.workspace_reorder_indices(ws).len()).collect();
+        let indices = self.workspace_reorder_indices(&origin);
+        // A harness-backed session is in no reorderable list, so the step has
+        // nowhere to start — the same silent no-op as a clamped end.
         let Some(index) = indices.iter().position(|i| *i == abs) else { return };
         let Some(target) = sidebar_nav::step_target(&range, &lens, &origin, index, delta) else {
             return;
@@ -2052,7 +2087,7 @@ impl AlacritreeApp {
     }
 
     fn current_session_indices(&self) -> Vec<usize> {
-        self.workspace_session_indices(&self.current_workspace)
+        self.workspace_display_indices(&self.current_workspace)
     }
 
     fn active_session_index(&self) -> Option<usize> {
@@ -2332,7 +2367,7 @@ impl AlacritreeApp {
         self.sidebar_cursor = Some(sidebar_nav::seed(
             &self.projects,
             self.current_workspace.as_deref(),
-            &self.listed_session_ids(),
+            &self.listed_workspace_rows(),
             self.active_session.get(&self.current_workspace).copied(),
         ));
         // Seeding reads the unfiltered tree, so a lingering filter from a prior
@@ -2574,13 +2609,9 @@ impl AlacritreeApp {
     /// Rows the sidebar cursor steps over this frame: the fuzzy/toggle-filtered
     /// set while a filter is active, the full visible set otherwise.
     fn current_project_rows(&mut self) -> Vec<SidebarRow> {
-        let listed_sessions = self.listed_session_ids();
+        let listed = self.listed_workspace_rows();
         if !self.project_filter.is_filtering() {
-            return sidebar_nav::visible_rows(
-                &self.projects,
-                &listed_sessions,
-                &self.listed_herdr_agents(),
-            );
+            return sidebar_nav::visible_rows(&self.projects, &listed);
         }
 
         let apply = self.project_filter.toggles_apply(self.search_scope);
@@ -2655,7 +2686,7 @@ impl AlacritreeApp {
                 && toggles_pass(&Some(wt.path.clone()))
                 && worktree_pr_passes(any_pr, &pr_matches, &wt.path)
         };
-        sidebar_nav::filtered_rows(&self.projects, &listed_sessions, sidebar_nav::RowPredicates {
+        sidebar_nav::filtered_rows(&self.projects, &listed, sidebar_nav::RowPredicates {
             home,
             project_self: &project_self,
             worktree: &mut worktree,
@@ -2667,7 +2698,7 @@ impl AlacritreeApp {
     }
 
     /// Every live session as a `(workspace, id)` pair — the same shape
-    /// `close_fallback` and `sidebar_session_ids` take, and the model the
+    /// `close_fallback` takes, and the model the
     /// focus reconciler observes.
     fn session_pairs(&self) -> Vec<(WorkspaceKey, SessionId)> {
         self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect()
@@ -2706,9 +2737,9 @@ impl AlacritreeApp {
         );
         let rows = self.current_project_rows();
         let live = self.session_pairs();
-        let agents = self.listed_herdr_agents();
+        let listed = self.listed_workspace_rows();
         let snapshot =
-            build_sidebar_snapshot(&self.projects, &live, &agents, &rows, skip_worktree, inputs);
+            build_sidebar_snapshot(&self.projects, &live, &listed, &rows, skip_worktree, inputs);
         // Paint reuses these until the next rebuild, so an unchanged filtering
         // frame runs no fuzzy matching at all.
         self.sidebar_rows_cache = Some(rows);
@@ -3580,7 +3611,7 @@ impl AlacritreeApp {
                 let seed = sidebar_nav::seed(
                     &self.projects,
                     self.current_workspace.as_deref(),
-                    &self.listed_session_ids(),
+                    &self.listed_workspace_rows(),
                     self.active_session.get(&self.current_workspace).copied(),
                 );
                 self.finish_project_search_at(Some(seed));
@@ -3894,52 +3925,45 @@ impl AlacritreeApp {
         // Snapshot attention + agent-glyph state up-front so the `iter_mut`
         // over projects below isn't blocked from calling back into `&self`
         // helpers.
-        let home_session_rows = self.workspace_session_rows(&None);
-        let worktree_session_rows: Vec<Vec<Vec<SessionRowData>>> = self
-            .projects
-            .iter()
-            .map(|p| {
-                p.worktrees
-                    .iter()
-                    .map(|wt| self.workspace_session_rows(&Some(wt.path.clone())))
-                    .collect()
-            })
-            .collect();
         // `sidebar_nav::filtered_rows` never emits `SidebarRow::HerdrAgent`
         // (it would need the agent's display name, which the row's `(Side,
         // String)` payload doesn't carry), so a herdr row painted while
-        // filtering would have no cursor path to reach it. An empty map
-        // keeps the paint in agreement with the nav model instead.
-        let listed_herdr_agents =
-            if filtering { sidebar_nav::ListedAgents::new() } else { self.listed_herdr_agents() };
-        let home_herdr_rows = self.workspace_herdr_rows(&None, &listed_herdr_agents);
-        let worktree_herdr_rows: Vec<Vec<Vec<HerdrRowData>>> = self
+        // filtering would have no cursor path to reach it.  Dropping them
+        // from the listing rather than rebuilding it keeps the sessions the
+        // filter does render in the positions the nav model gave them.
+        let mut listed = self.listed_workspace_rows();
+        if filtering {
+            for entries in listed.values_mut() {
+                entries.retain(|entry| entry.session().is_some());
+            }
+        }
+        let home_rows = self.workspace_rows(&None, &listed);
+        let worktree_rows: Vec<Vec<Vec<WorkspaceRowData>>> = self
             .projects
             .iter()
             .map(|p| {
                 p.worktrees
                     .iter()
-                    .map(|wt| {
-                        self.workspace_herdr_rows(&Some(wt.path.clone()), &listed_herdr_agents)
-                    })
+                    .map(|wt| self.workspace_rows(&Some(wt.path.clone()), &listed))
                     .collect()
             })
             .collect();
 
-        let worktree_listed: Vec<Vec<bool>> = worktree_session_rows
+        let worktree_listed: Vec<Vec<bool>> = worktree_rows
             .iter()
-            .map(|v| v.iter().map(|rows| !rows.is_empty()).collect())
+            .map(|v| v.iter().map(|rows| WorkspaceRowData::any_session(rows)).collect())
             .collect();
 
         // A rendered session list carries its own per-session status; repeating
         // it on the parent row reads as noise — the same
         // rule the project row applies when expanded.  Aggregates therefore
         // apply only while the list is hidden (fewer than two sessions).
-        let home_attention = home_session_rows.is_empty() && self.workspace_needs_attention(&None);
-        let home_activity = if home_session_rows.is_empty() {
-            self.workspace_activity(&None)
-        } else {
+        let home_lists_sessions = WorkspaceRowData::any_session(&home_rows);
+        let home_attention = !home_lists_sessions && self.workspace_needs_attention(&None);
+        let home_activity = if home_lists_sessions {
             SessionActivity::Shell
+        } else {
+            self.workspace_activity(&None)
         };
         let project_attention: Vec<bool> =
             self.projects.iter().map(|p| self.project_needs_attention(p)).collect();
@@ -4177,46 +4201,60 @@ impl AlacritreeApp {
                             spawn_shell_request.set(Some(None));
                         }
                         session_drop(ui, home_action.rect, &None, None);
-                        for (display_idx, row) in home_session_rows.iter().enumerate() {
-                            let is_cursor = matches!(
-                                &cursor_row,
-                                Some(SidebarRow::Session(id)) if *id == row.id
-                            );
-                            let scroll = scrolls(is_cursor) || follows_session(row.id);
-                            let act = session_row(
-                                ui,
-                                row,
-                                is_cursor,
-                                scroll,
-                                session_drag,
-                                &icons,
-                                &theme,
-                            );
-                            if act.activate {
-                                activate_session_request.set(Some((None, row.id)));
-                            }
-                            if act.close {
-                                close_session_request.set(Some(row.id));
-                            }
-                            session_drop(ui, act.rect, &None, Some((display_idx, row.id)));
-                        }
-                        for row in &home_herdr_rows {
-                            let is_cursor = matches!(
-                                &cursor_row,
-                                Some(SidebarRow::HerdrAgent(side, id))
-                                    if *side == row.side && *id == row.terminal_id
-                            );
-                            let scroll = scrolls(is_cursor);
-                            let act = herdr_row(ui, row, is_cursor, scroll, &icons, &theme);
-                            if act.attach {
-                                attach_herdr_request.set(Some((
-                                    None,
-                                    herdr::HerdrKey {
-                                        side: row.side.clone(),
-                                        terminal_id: row.terminal_id.clone(),
-                                    },
-                                    row.pane_id.clone(),
-                                )));
+                        // Only rows a reorder can move take a drop slot, and
+                        // the slot index counts those alone: a herdr pane's
+                        // place is herdr's to decide, so it is neither a drag
+                        // subject nor a landing.
+                        let mut slot = 0usize;
+                        for row in &home_rows {
+                            match row {
+                                WorkspaceRowData::Session(row) => {
+                                    let is_cursor = matches!(
+                                        &cursor_row,
+                                        Some(SidebarRow::Session(id)) if *id == row.id
+                                    );
+                                    let scroll = scrolls(is_cursor) || follows_session(row.id);
+                                    let movable = row.managed.is_none();
+                                    let act = session_row(
+                                        ui,
+                                        row,
+                                        is_cursor,
+                                        scroll,
+                                        session_drag && movable,
+                                        &icons,
+                                        &theme,
+                                    );
+                                    if act.activate {
+                                        activate_session_request.set(Some((None, row.id)));
+                                    }
+                                    if act.close {
+                                        close_session_request.set(Some(row.id));
+                                    }
+                                    if movable {
+                                        session_drop(ui, act.rect, &None, Some((slot, row.id)));
+                                        slot += 1;
+                                    }
+                                },
+                                WorkspaceRowData::Herdr(row) => {
+                                    let is_cursor = matches!(
+                                        &cursor_row,
+                                        Some(SidebarRow::HerdrAgent(side, id))
+                                            if *side == row.side && *id == row.terminal_id
+                                    );
+                                    let scroll = scrolls(is_cursor);
+                                    let act =
+                                        herdr_row(ui, row, is_cursor, scroll, &icons, &theme);
+                                    if act.attach {
+                                        attach_herdr_request.set(Some((
+                                            None,
+                                            herdr::HerdrKey {
+                                                side: row.side.clone(),
+                                                terminal_id: row.terminal_id.clone(),
+                                            },
+                                            row.pane_id.clone(),
+                                        )));
+                                    }
+                                },
                             }
                         }
                         group_gap = 2.0;
@@ -4554,62 +4592,70 @@ impl AlacritreeApp {
                                     spawn_profile_request.set(Some((wt.path.clone(), name)));
                                 }
                                 session_drop(ui, action.rect, &Some(wt.path.clone()), None);
-                                let session_rows = worktree_session_rows
+                                let listed_rows = worktree_rows
                                     .get(idx)
                                     .and_then(|v| v.get(wt_idx))
                                     .map(Vec::as_slice)
                                     .unwrap_or(&[]);
-                                for (display_idx, row) in session_rows.iter().enumerate() {
-                                    let is_cursor = matches!(
-                                        &cursor_row,
-                                        Some(SidebarRow::Session(id)) if *id == row.id
-                                    );
-                                    let scroll = scrolls(is_cursor) || follows_session(row.id);
-                                    let act = session_row(
-                                        ui,
-                                        row,
-                                        is_cursor,
-                                        scroll,
-                                        session_drag,
-                                        &icons,
-                                        &theme,
-                                    );
-                                    if act.activate {
-                                        activate_session_request
-                                            .set(Some((Some(wt.path.clone()), row.id)));
-                                    }
-                                    if act.close {
-                                        close_session_request.set(Some(row.id));
-                                    }
-                                    session_drop(
-                                        ui,
-                                        act.rect,
-                                        &Some(wt.path.clone()),
-                                        Some((display_idx, row.id)),
-                                    );
-                                }
-                                let herdr_rows = worktree_herdr_rows
-                                    .get(idx)
-                                    .and_then(|v| v.get(wt_idx))
-                                    .map(Vec::as_slice)
-                                    .unwrap_or(&[]);
-                                for row in herdr_rows {
-                                    let is_cursor = matches!(
-                                        &cursor_row,
-                                        Some(SidebarRow::HerdrAgent(side, id))
-                                            if *side == row.side && *id == row.terminal_id
-                                    );
-                                    let scroll = scrolls(is_cursor);
-                                    let act = herdr_row(ui, row, is_cursor, scroll, &icons, &theme);
-                                    if act.attach {
-                                        attach_herdr_request.set(Some((
-                                            Some(wt.path.clone()),
-                                            herdr::HerdrKey {
-                                                side: row.side.clone(),
-                                                terminal_id: row.terminal_id.clone(),
-                                            },
-                                            row.pane_id.clone(),
-                                        )));
+                                let mut slot = 0usize;
+                                for row in listed_rows {
+                                    match row {
+                                        WorkspaceRowData::Session(row) => {
+                                            let is_cursor = matches!(
+                                                &cursor_row,
+                                                Some(SidebarRow::Session(id)) if *id == row.id
+                                            );
+                                            let scroll =
+                                                scrolls(is_cursor) || follows_session(row.id);
+                                            let movable = row.managed.is_none();
+                                            let act = session_row(
+                                                ui,
+                                                row,
+                                                is_cursor,
+                                                scroll,
+                                                session_drag && movable,
+                                                &icons,
+                                                &theme,
+                                            );
+                                            if act.activate {
+                                                activate_session_request
+                                                    .set(Some((Some(wt.path.clone()), row.id)));
+                                            }
+                                            if act.close {
+                                                close_session_request.set(Some(row.id));
+                                            }
+                                            if movable {
+                                                session_drop(
+                                                    ui,
+                                                    act.rect,
+                                                    &Some(wt.path.clone()),
+                                                    Some((slot, row.id)),
+                                                );
+                                                slot += 1;
+                                            }
+                                        },
+                                        WorkspaceRowData::Herdr(row) => {
+                                            let is_cursor = matches!(
+                                                &cursor_row,
+                                                Some(SidebarRow::HerdrAgent(side, id))
+                                                    if *side == row.side
+                                                        && *id == row.terminal_id
+                                            );
+                                            let scroll = scrolls(is_cursor);
+                                            let act = herdr_row(
+                                                ui, row, is_cursor, scroll, &icons, &theme,
+                                            );
+                                            if act.attach {
+                                                attach_herdr_request.set(Some((
+                                                    Some(wt.path.clone()),
+                                                    herdr::HerdrKey {
+                                                        side: row.side.clone(),
+                                                        terminal_id: row.terminal_id.clone(),
+                                                    },
+                                                    row.pane_id.clone(),
+                                                )));
+                                            }
+                                        },
                                     }
                                 }
                             }
@@ -7119,6 +7165,23 @@ struct SessionRowData {
     managed: Option<Managed>,
 }
 
+/// One painted row under a workspace, in the order the sidebar draws them.
+/// Attaching turns a herdr row into a session row in place, so the two travel
+/// as one list rather than as two blocks that would reorder on attach.
+enum WorkspaceRowData {
+    Session(SessionRowData),
+    Herdr(HerdrRowData),
+}
+
+impl WorkspaceRowData {
+    /// Whether any of `rows` is a session of alacritree's own.  The workspace
+    /// row shows aggregate attention and activity only while none is: with a
+    /// list on screen, repeating its summary above it reads as noise.
+    fn any_session(rows: &[Self]) -> bool {
+        rows.iter().any(|row| matches!(row, Self::Session(_)))
+    }
+}
+
 /// Everything a sidebar herdr-agent row needs, snapshotted before the panel
 /// closure so rendering doesn't borrow `self.herdr_endpoints`.
 struct HerdrRowData {
@@ -7285,44 +7348,52 @@ fn herdr_mark(status: herdr::Status, indicators: herdr::Indicators) -> HarnessMa
 /// Spawn-ordered ids of the sessions in `ws`, or empty below the list
 /// threshold.  The threshold is normally two — a single-session workspace row
 /// keeps its compact form, mirroring the tab strip — and `always` lowers it
-/// to one.  Pure over (workspace, id) pairs so the grouping rule is testable
-/// without spawning PTYs.
-fn sidebar_session_ids(
-    pairs: &[(WorkspaceKey, SessionId)],
-    ws: &WorkspaceKey,
+/// to one.
+///
+/// herdr rows are never held back by it: a pane alacritree does not own has
+/// no other surface to appear on, and hiding it would hide the workspace's
+/// only row.  They do count toward the threshold, so a lone shell session
+/// beside one is listed rather than folded into the workspace row, which
+/// would leave a hole in a list its neighbours are already in.
+///
+/// `managed` carries herdr's own position for each of its rows, and sorts by
+/// it here so an attached session and a listed agent interleave the way herdr
+/// has them rather than by which kind of row they are.  The sort is stable,
+/// so panes herdr no longer lists keep the order they were spawned in.
+fn workspace_entries(
+    shells: &[SessionId],
+    managed: Vec<(usize, sidebar_nav::WorkspaceEntry)>,
     always: bool,
-) -> Vec<SessionId> {
-    let ids: Vec<SessionId> = pairs.iter().filter(|(w, _)| w == ws).map(|(_, id)| *id).collect();
+) -> Vec<sidebar_nav::WorkspaceEntry> {
     let threshold = if always { 1 } else { 2 };
-    if ids.len() < threshold { Vec::new() } else { ids }
+    let mut managed = managed;
+    managed.sort_by_key(|(at, _)| *at);
+    let mut entries = Vec::with_capacity(shells.len() + managed.len());
+    if shells.len() + managed.len() >= threshold {
+        entries.extend(shells.iter().copied().map(sidebar_nav::WorkspaceEntry::Session));
+    }
+    entries.extend(managed.into_iter().map(|(_, entry)| entry));
+    entries
 }
 
 /// Step the lockstep index over the rows a skipped worktree owns.
 ///
 /// The projection is built before the deletion is known, so it still lists
-/// the worktree with its sessions and herdr agents.  Leaving the index parked
-/// on a row no node will match again would mark every later node unprojected,
-/// and the cursor repair reads an unprojected row as one that has gone away.
+/// the worktree with everything under it.  Leaving the index parked on a row
+/// no node will match again would mark every later node unprojected, and the
+/// cursor repair reads an unprojected row as one that has gone away.
 fn skip_projected_rows(
     rows: &[SidebarRow],
     next_row: &mut usize,
-    live: &[(WorkspaceKey, SessionId)],
-    agents: &sidebar_nav::ListedAgents,
+    listed: &sidebar_nav::ListedRows,
     path: &Path,
 ) {
     if rows.get(*next_row) != Some(&SidebarRow::Worktree(path.to_path_buf())) {
         return;
     }
     *next_row += 1;
-    while let Some(SidebarRow::Session(id)) = rows.get(*next_row) {
-        if !live.iter().any(|(ws, live_id)| live_id == id && ws.as_deref() == Some(path)) {
-            break;
-        }
-        *next_row += 1;
-    }
-    let listed = agents.get(&Some(path.to_path_buf())).map_or(0, Vec::len);
-    for _ in 0..listed {
-        if !matches!(rows.get(*next_row), Some(SidebarRow::HerdrAgent(..))) {
+    for entry in listed.get(&Some(path.to_path_buf())).map_or(&[][..], Vec::as_slice) {
+        if rows.get(*next_row) != Some(&entry.row()) {
             break;
         }
         *next_row += 1;
@@ -7335,9 +7406,9 @@ fn skip_projected_rows(
 /// membership from `listed` instead would make the last session in a workspace
 /// read as deleted the moment its sibling closed.
 ///
-/// `agents` is the herdr listing the projection was built from.  A herdr row
-/// exists only while its agent is listed, so there is no wider model to take
-/// it from, and reading a second listing here could disagree with `rows`.
+/// `listed` is the listing the projection was built from.  A herdr row exists
+/// only while its agent is listed, so there is no wider model to take it from,
+/// and reading a second listing here could disagree with `rows`.
 ///
 /// `skip_worktree` drops a worktree whose deletion is already committed but
 /// whose git operation has not finished, so nothing lands the cursor — or a
@@ -7350,12 +7421,13 @@ fn skip_projected_rows(
 fn build_sidebar_snapshot(
     projects: &[Project],
     live: &[(WorkspaceKey, SessionId)],
-    agents: &sidebar_nav::ListedAgents,
+    listed: &sidebar_nav::ListedRows,
     rows: &[SidebarRow],
     skip_worktree: Option<&Path>,
     inputs: sidebar_focus::ObservedInputs,
 ) -> sidebar_focus::TreeSnapshot {
     use sidebar_focus::Parent;
+    use sidebar_nav::WorkspaceEntry;
 
     let mut b = sidebar_focus::SnapshotBuilder::default();
     let mut next_row = 0usize;
@@ -7373,31 +7445,40 @@ fn build_sidebar_snapshot(
         }
         b.push(row, parent, projected)
     };
-    let push_agents = |b: &mut sidebar_focus::SnapshotBuilder,
-                       next_row: &mut usize,
-                       ws: &WorkspaceKey,
-                       parent: Parent| {
-        for (side, terminal_id) in agents.get(ws).into_iter().flatten() {
-            let row = SidebarRow::HerdrAgent(side.clone(), terminal_id.clone());
-            push(b, next_row, row, parent);
+    let push_workspace = |b: &mut sidebar_focus::SnapshotBuilder,
+                          next_row: &mut usize,
+                          placed: &mut [bool],
+                          ws: &WorkspaceKey,
+                          parent: Parent| {
+        let entries = listed.get(ws).map_or(&[][..], Vec::as_slice);
+        for entry in entries {
+            push(b, next_row, entry.row(), parent);
+        }
+        // A workspace lists every shell session it has or none of them, and a
+        // session attached to a herdr pane is always listed, so a session
+        // reaching the second arm here belongs to a workspace that listed
+        // nothing at all.  It is running, so the model keeps it; it is drawn
+        // nowhere, so the projection does not.
+        for (i, (w, id)) in live.iter().enumerate() {
+            if w != ws {
+                continue;
+            }
+            placed[i] = true;
+            if !entries.contains(&WorkspaceEntry::Session(*id)) {
+                b.push(SidebarRow::Session(*id), parent, false);
+            }
         }
     };
 
     let home_id = push(&mut b, &mut next_row, SidebarRow::Home, Parent::Root);
-    for (i, (ws, id)) in live.iter().enumerate() {
-        if ws.is_none() {
-            push(&mut b, &mut next_row, SidebarRow::Session(*id), Parent::Node(home_id));
-            placed[i] = true;
-        }
-    }
-    push_agents(&mut b, &mut next_row, &None, Parent::Node(home_id));
+    push_workspace(&mut b, &mut next_row, &mut placed, &None, Parent::Node(home_id));
 
     for p in projects {
         let project_id =
             push(&mut b, &mut next_row, SidebarRow::Project(p.root.clone()), Parent::Root);
         for wt in &p.worktrees {
             if skip_worktree == Some(wt.path.as_path()) {
-                skip_projected_rows(rows, &mut next_row, live, agents, &wt.path);
+                skip_projected_rows(rows, &mut next_row, listed, &wt.path);
                 continue;
             }
             let wt_id = push(
@@ -7406,14 +7487,8 @@ fn build_sidebar_snapshot(
                 SidebarRow::Worktree(wt.path.clone()),
                 Parent::Node(project_id),
             );
-            for (i, (ws, id)) in live.iter().enumerate() {
-                if ws.as_deref() == Some(wt.path.as_path()) {
-                    push(&mut b, &mut next_row, SidebarRow::Session(*id), Parent::Node(wt_id));
-                    placed[i] = true;
-                }
-            }
             let ws = Some(wt.path.clone());
-            push_agents(&mut b, &mut next_row, &ws, Parent::Node(wt_id));
+            push_workspace(&mut b, &mut next_row, &mut placed, &ws, Parent::Node(wt_id));
         }
     }
 
@@ -7529,7 +7604,8 @@ fn close_landing(
 /// `remaining` is the session list after removal; `main_checkout` is the
 /// removed workspace's project main (None when the workspace *is* the main,
 /// is home, or belongs to no known project). Pure over (workspace, id)
-/// pairs for the same reason as `sidebar_session_ids`.
+/// pairs for the same reason the sidebar listing does: the rule stays
+/// testable without spawning PTYs.
 fn close_fallback(
     removed_ws: &WorkspaceKey,
     current_ws: &WorkspaceKey,
@@ -8590,63 +8666,110 @@ impl AlacritreeApp {
         other
     }
 
-    /// The session rows every workspace currently lists, for the keyboard
-    /// cursor model.  Built from the same `sidebar_session_ids` rule the
-    /// paint pass uses, so cursor rows and painted rows cannot drift.
-    fn listed_session_ids(&self) -> sidebar_nav::ListedSessions {
-        let pairs: Vec<(WorkspaceKey, SessionId)> =
-            self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect();
-        let mut listed = sidebar_nav::ListedSessions::new();
-        for (ws, _) in &pairs {
-            if !listed.contains_key(ws) {
-                let ids = sidebar_session_ids(&pairs, ws, self.session_rows_always);
-                if !ids.is_empty() {
-                    listed.insert(ws.clone(), ids);
+    /// Every row each workspace lists, in the order it draws them: its own
+    /// shell sessions first, then every herdr pane the workspace holds — the
+    /// sessions attached to one and the agents nothing is attached to alike —
+    /// in herdr's own order.
+    ///
+    /// Position comes from herdr rather than from alacritree because herdr is
+    /// the only party that has an opinion surviving all three moments: attach,
+    /// detach, and a restart, which leaves every pane unattached again.  An
+    /// order built from when a session was attached agrees with itself until
+    /// the first restart and then contradicts everything the user saw.
+    ///
+    /// Agents are bucketed by the directory they work in, and an agent whose
+    /// directory matches no worktree — including one whose checkout has been
+    /// removed — lands under Home, which is the common case: an agent in a
+    /// repository alacritree does not track still belongs somewhere, and a
+    /// checkout that has gone cannot start a shell.
+    fn listed_workspace_rows(&self) -> sidebar_nav::ListedRows {
+        use sidebar_nav::WorkspaceEntry;
+
+        // `usize::MAX` parks a pane herdr has stopped listing at the tail of
+        // its own block rather than letting it fall in among the shells: the
+        // session is still herdr's, and it goes back to its slot when the
+        // listing carries it again.
+        let mut shells: HashMap<WorkspaceKey, Vec<SessionId>> = HashMap::new();
+        let mut managed: HashMap<WorkspaceKey, Vec<(usize, WorkspaceEntry)>> = HashMap::new();
+        for session in &self.sessions {
+            let ws = session.working_directory.clone();
+            match self.session_claim(session) {
+                Some(key) => {
+                    let at = self.herdr_pane_index(&key).unwrap_or(usize::MAX);
+                    managed.entry(ws).or_default().push((at, WorkspaceEntry::Session(session.id)));
+                },
+                None => shells.entry(ws).or_default().push(session.id),
+            }
+        }
+
+        if self.config.ui.herdr.enabled {
+            let claimed: Vec<herdr::HerdrKey> =
+                self.sessions.iter().filter_map(|s| self.session_claim(s)).collect();
+            let workspaces = herdr_workspaces(&self.projects, |path| self.liveness.missing(path));
+            for cache in self.herdr_endpoints.caches() {
+                let side = cache.side();
+                for agent in herdr::unattached(cache.agents(), side, &claimed) {
+                    let ws = herdr::match_workspace(agent, side, &workspaces);
+                    if ws.is_none() && !self.config.ui.herdr.show_unmatched {
+                        continue;
+                    }
+                    let key = herdr::HerdrKey {
+                        side: side.clone(),
+                        terminal_id: agent.terminal_id.clone(),
+                    };
+                    let at = self.herdr_pane_index(&key).unwrap_or(usize::MAX);
+                    let entry = WorkspaceEntry::Agent(side.clone(), agent.terminal_id.clone());
+                    managed.entry(ws).or_default().push((at, entry));
                 }
+            }
+        }
+
+        let mut listed = sidebar_nav::ListedRows::new();
+        for ws in shells.keys().chain(managed.keys()).cloned().collect::<Vec<_>>() {
+            if listed.contains_key(&ws) {
+                continue;
+            }
+            let entries = workspace_entries(
+                shells.get(&ws).map_or(&[][..], Vec::as_slice),
+                managed.remove(&ws).unwrap_or_default(),
+                self.session_rows_always,
+            );
+            if !entries.is_empty() {
+                listed.insert(ws, entries);
             }
         }
         listed
     }
 
-    /// Rows for every herdr agent no session is attached to, bucketed by the
-    /// workspace it is working in.  Unmatched agents land under Home, which
-    /// is the common case: an agent in a repository alacritree does not
-    /// track still belongs somewhere.
-    ///
-    /// A checkout that has gone is not offered as a workspace: a shell cannot
-    /// start there, so an agent whose directory matches it is unmatched and
-    /// lands under Home like any other, rather than under a row whose Enter
-    /// can only refuse.
-    fn listed_herdr_agents(&self) -> sidebar_nav::ListedAgents {
-        let mut listed = sidebar_nav::ListedAgents::new();
-        if !self.config.ui.herdr.enabled {
-            return listed;
-        }
-        let claimed: Vec<herdr::HerdrKey> =
-            self.sessions.iter().filter_map(|s| self.session_claim(s)).collect();
-        let workspaces = herdr_workspaces(&self.projects, |path| self.liveness.missing(path));
-
+    /// Where a pane sits in herdr's own listing, counted across endpoints in
+    /// the order they are polled.  `None` for a pane no endpoint lists.
+    fn herdr_pane_index(&self, key: &herdr::HerdrKey) -> Option<usize> {
+        let mut before = 0;
         for cache in self.herdr_endpoints.caches() {
-            let side = cache.side();
-            for agent in herdr::unattached(cache.agents(), side, &claimed) {
-                let workspace = herdr::match_workspace(agent, side, &workspaces);
-                if workspace.is_none() && !self.config.ui.herdr.show_unmatched {
-                    continue;
-                }
-                listed
-                    .entry(workspace)
-                    .or_default()
-                    .push((side.clone(), agent.terminal_id.clone()));
+            if cache.side() == &key.side {
+                let at = cache.agents().iter().position(|a| a.terminal_id == key.terminal_id)?;
+                return Some(before + at);
             }
+            before += cache.agents().len();
         }
-        listed
+        None
+    }
+
+    /// The workspace a herdr row is currently listed under, for the keyboard
+    /// path: `SidebarRow::HerdrAgent` itself carries no workspace, unlike a
+    /// click, which already knows which panel section it landed in.
+    fn herdr_row_workspace(&self, side: &herdr::Side, terminal_id: &str) -> Option<WorkspaceKey> {
+        let wanted = sidebar_nav::WorkspaceEntry::Agent(side.clone(), terminal_id.to_string());
+        self.listed_workspace_rows()
+            .into_iter()
+            .find(|(_, entries)| entries.contains(&wanted))
+            .map(|(ws, _)| ws)
     }
 
     /// The agent behind `(side, terminal_id)`, if its endpoint still has it
     /// cached.  A stale key (the agent exited between poll and paint, or an
     /// Enter that outraced this frame's own listing) yields no row rather
-    /// than a panic; the next poll drops it from `listed_herdr_agents` for
-    /// good.
+    /// than a panic; the next poll drops it from the listing for good.
     fn find_herdr_agent(&self, side: &herdr::Side, terminal_id: &str) -> Option<&herdr::Agent> {
         self.herdr_endpoints
             .caches()
@@ -8684,31 +8807,6 @@ impl AlacritreeApp {
             .iter()
             .find(|cache| cache.side() == side)
             .and_then(|cache| cache.agents().iter().find(|agent| agent.focused))
-    }
-
-    /// The workspace a herdr row is currently listed under, for the keyboard
-    /// path: `SidebarRow::HerdrAgent` itself carries no workspace, unlike a
-    /// click, which already knows which panel section it landed in.
-    fn herdr_row_workspace(&self, side: &herdr::Side, terminal_id: &str) -> Option<WorkspaceKey> {
-        self.listed_herdr_agents()
-            .into_iter()
-            .find(|(_, keys)| keys.iter().any(|(s, id)| s == side && id == terminal_id))
-            .map(|(ws, _)| ws)
-    }
-
-    /// Herdr rows for `ws`'s sidebar list, in `listed`'s order.
-    fn workspace_herdr_rows(
-        &self,
-        ws: &WorkspaceKey,
-        listed: &sidebar_nav::ListedAgents,
-    ) -> Vec<HerdrRowData> {
-        let Some(keys) = listed.get(ws) else { return Vec::new() };
-        keys.iter()
-            .filter_map(|(side, terminal_id)| {
-                self.find_herdr_agent(side, terminal_id)
-                    .map(|agent| HerdrRowData::from_agent(agent, side, &self.herdr_settings(side)))
-            })
-            .collect()
     }
 
     /// herdr's detach chord on `side`, once that endpoint's config read has
@@ -8749,27 +8847,39 @@ impl AlacritreeApp {
         self.herdr_endpoints.poll(self.config.ui.herdr.poll_interval);
     }
 
-    /// Session rows for `ws`'s sidebar list, per `sidebar_session_ids`'s
-    /// list threshold.
-    fn workspace_session_rows(&self, ws: &WorkspaceKey) -> Vec<SessionRowData> {
-        let pairs: Vec<(WorkspaceKey, SessionId)> =
-            self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect();
-        let ids = sidebar_session_ids(&pairs, ws, self.session_rows_always);
+    /// The rows `ws` paints, in `listed`'s order.  An entry whose session or
+    /// agent has gone since the listing was built yields no row rather than a
+    /// panic; the next rebuild drops it for good.
+    fn workspace_rows(
+        &self,
+        ws: &WorkspaceKey,
+        listed: &sidebar_nav::ListedRows,
+    ) -> Vec<WorkspaceRowData> {
+        let Some(entries) = listed.get(ws) else { return Vec::new() };
         let active = self.active_session.get(ws).copied();
         let is_current = self.current_workspace == *ws;
-        ids.iter()
-            .filter_map(|id| self.sessions.iter().find(|s| s.id == *id))
-            .map(|s| {
-                let activity = herdr_backed_activity(s.activity(), self.session_herdr_status(s));
-                SessionRowData {
-                    id: s.id,
-                    name: session_row_name(&s.title, activity, self.session_herdr_agent(s)),
-                    needs_attention: s.needs_attention,
-                    activity,
-                    is_active: active == Some(s.id),
-                    is_displayed: is_current && active == Some(s.id),
-                    managed: self.session_managed(s),
-                }
+        entries
+            .iter()
+            .filter_map(|entry| match entry {
+                sidebar_nav::WorkspaceEntry::Session(id) => {
+                    let s = self.sessions.iter().find(|s| s.id == *id)?;
+                    let activity =
+                        herdr_backed_activity(s.activity(), self.session_herdr_status(s));
+                    Some(WorkspaceRowData::Session(SessionRowData {
+                        id: s.id,
+                        name: session_row_name(&s.title, activity, self.session_herdr_agent(s)),
+                        needs_attention: s.needs_attention,
+                        activity,
+                        is_active: active == Some(s.id),
+                        is_displayed: is_current && active == Some(s.id),
+                        managed: self.session_managed(s),
+                    }))
+                },
+                sidebar_nav::WorkspaceEntry::Agent(side, terminal_id) => {
+                    let agent = self.find_herdr_agent(side, terminal_id)?;
+                    let settings = self.herdr_settings(side);
+                    Some(WorkspaceRowData::Herdr(HerdrRowData::from_agent(agent, side, &settings)))
+                },
             })
             .collect()
     }
@@ -11480,19 +11590,26 @@ mod tests {
         assert_eq!(reorder_subject(true, Some(&row), || None, |_| None, || Some(3)), Some(3));
     }
 
-    #[test]
-    fn session_ids_filter_by_workspace_and_keep_spawn_order() {
-        let pairs = vec![(None, 1), (ws("/a"), 2), (None, 3), (ws("/b"), 4), (ws("/a"), 5)];
-        assert_eq!(sidebar_session_ids(&pairs, &None, false), vec![1, 3]);
-        assert_eq!(sidebar_session_ids(&pairs, &ws("/a"), false), vec![2, 5]);
-        // /b has a single session, below the two-session list threshold.
-        assert!(sidebar_session_ids(&pairs, &ws("/b"), false).is_empty());
+    fn entries(ids: &[SessionId]) -> Vec<sidebar_nav::WorkspaceEntry> {
+        ids.iter().copied().map(sidebar_nav::WorkspaceEntry::Session).collect()
+    }
+
+    /// herdr's index, paired with the row it belongs to, is what
+    /// `workspace_entries` sorts on.
+    fn at(
+        index: usize,
+        entry: sidebar_nav::WorkspaceEntry,
+    ) -> (usize, sidebar_nav::WorkspaceEntry) {
+        (index, entry)
+    }
+
+    fn agent_entry(terminal_id: &str) -> sidebar_nav::WorkspaceEntry {
+        sidebar_nav::WorkspaceEntry::Agent(herdr::Side::Native, terminal_id.to_string())
     }
 
     #[test]
-    fn session_ids_empty_for_unknown_workspace() {
-        let pairs = vec![(None, 1)];
-        assert!(sidebar_session_ids(&pairs, &ws("/missing"), false).is_empty());
+    fn workspace_entries_keep_shell_sessions_in_spawn_order() {
+        assert_eq!(workspace_entries(&[1, 3], Vec::new(), false), entries(&[1, 3]));
     }
 
     #[test]
@@ -11876,25 +11993,58 @@ mod tests {
     }
 
     #[test]
-    fn session_ids_apply_two_session_threshold() {
-        let no_match: Vec<(WorkspaceKey, SessionId)> = vec![(ws("/other"), 1)];
-        assert!(sidebar_session_ids(&no_match, &ws("/a"), false).is_empty());
-
-        let one_match = vec![(ws("/a"), 1), (ws("/other"), 2)];
-        assert!(sidebar_session_ids(&one_match, &ws("/a"), false).is_empty());
-
-        let two_match = vec![(ws("/a"), 1), (ws("/other"), 2), (ws("/a"), 3)];
-        assert_eq!(sidebar_session_ids(&two_match, &ws("/a"), false), vec![1, 3]);
+    fn workspace_entries_apply_the_two_row_threshold() {
+        assert!(workspace_entries(&[], Vec::new(), false).is_empty());
+        assert!(workspace_entries(&[1], Vec::new(), false).is_empty());
+        assert_eq!(workspace_entries(&[1, 3], Vec::new(), false), entries(&[1, 3]));
     }
 
     #[test]
-    fn session_ids_always_flag_lists_single_sessions() {
-        let one_match = vec![(ws("/a"), 1), (ws("/other"), 2)];
-        assert_eq!(sidebar_session_ids(&one_match, &ws("/a"), true), vec![1]);
+    fn workspace_entries_always_flag_lists_single_sessions() {
+        assert_eq!(workspace_entries(&[1], Vec::new(), true), entries(&[1]));
+        assert!(workspace_entries(&[], Vec::new(), true).is_empty());
+    }
 
-        // Zero sessions stays empty even with the flag on.
-        let no_match: Vec<(WorkspaceKey, SessionId)> = vec![(ws("/other"), 2)];
-        assert!(sidebar_session_ids(&no_match, &ws("/a"), true).is_empty());
+    /// A herdr pane has no other surface to appear on, so the threshold can
+    /// never hide one — and a lone shell session beside one is listed rather
+    /// than folded into the workspace row, which would leave a hole in a list
+    /// its neighbour is already in.
+    #[test]
+    fn a_herdr_row_is_listed_whatever_the_threshold_says() {
+        let lone = workspace_entries(&[], vec![at(0, agent_entry("t1"))], false);
+        assert_eq!(lone, vec![agent_entry("t1")]);
+
+        let beside = workspace_entries(&[1], vec![at(0, agent_entry("t1"))], false);
+        assert_eq!(beside, vec![sidebar_nav::WorkspaceEntry::Session(1), agent_entry("t1")]);
+    }
+
+    /// The whole point of the merged list: a pane keeps herdr's position
+    /// whether alacritree is attached to it or not, so attaching changes how
+    /// a row is drawn and never where it sits.
+    #[test]
+    fn herdr_rows_take_their_order_from_herdr_not_from_the_attach() {
+        // herdr lists t1 then t2; alacritree attached to t2 first, so the
+        // session vec has them the other way round.
+        let managed =
+            vec![at(1, sidebar_nav::WorkspaceEntry::Session(9)), at(0, agent_entry("t1"))];
+        assert_eq!(workspace_entries(&[], managed, false), vec![
+            agent_entry("t1"),
+            sidebar_nav::WorkspaceEntry::Session(9)
+        ]);
+    }
+
+    /// A pane herdr has stopped listing keeps its block rather than falling
+    /// in among the shells: the session is still herdr's, and it goes back to
+    /// its slot when the listing carries it again.
+    #[test]
+    fn an_unlisted_pane_waits_at_the_tail_of_its_own_block() {
+        let managed =
+            vec![at(usize::MAX, sidebar_nav::WorkspaceEntry::Session(9)), at(0, agent_entry("t1"))];
+        assert_eq!(workspace_entries(&[1], managed, false), vec![
+            sidebar_nav::WorkspaceEntry::Session(1),
+            agent_entry("t1"),
+            sidebar_nav::WorkspaceEntry::Session(9),
+        ]);
     }
 
     use crate::projects::{Project, Worktree};
@@ -13897,19 +14047,13 @@ mod tests {
         ];
         let live =
             vec![(None, 1), (Some(PathBuf::from("/a/wt1")), 2), (Some(PathBuf::from("/a/wt1")), 3)];
-        let listed = sidebar_nav::ListedSessions::from([
+        let listed = sidebar_nav::tests::sessions_only(HashMap::from([
             (None, vec![1]),
             (Some(PathBuf::from("/a/wt1")), vec![2, 3]),
-        ]);
-        let rows = sidebar_nav::visible_rows(&projects, &listed, &sidebar_nav::ListedAgents::new());
-        let snapshot = build_sidebar_snapshot(
-            &projects,
-            &live,
-            &sidebar_nav::ListedAgents::new(),
-            &rows,
-            None,
-            Default::default(),
-        );
+        ]));
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let snapshot =
+            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
 
         for row in &rows {
             let id = snapshot.find(row).expect("every projected row is in the model");
@@ -13943,19 +14087,24 @@ mod tests {
 
         let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2"])];
         let live: Vec<(WorkspaceKey, SessionId)> = vec![(Some(PathBuf::from("/a/wt1")), 1)];
-        let listed = sidebar_nav::ListedSessions::from([(Some(PathBuf::from("/a/wt1")), vec![1])]);
         let home_agent = SidebarRow::HerdrAgent(herdr::Side::Native, "term_home".into());
         let worktree_agent = SidebarRow::HerdrAgent(herdr::Side::Wsl("d".into()), "term_wt".into());
-        let agents = sidebar_nav::ListedAgents::from([
-            (None, vec![(herdr::Side::Native, "term_home".to_string())]),
-            (
-                Some(PathBuf::from("/a/wt1")),
-                vec![(herdr::Side::Wsl("d".into()), "term_wt".to_string())],
-            ),
+        let listed = sidebar_nav::ListedRows::from([
+            (None, vec![sidebar_nav::WorkspaceEntry::Agent(
+                herdr::Side::Native,
+                "term_home".to_string(),
+            )]),
+            (Some(PathBuf::from("/a/wt1")), vec![
+                sidebar_nav::WorkspaceEntry::Session(1),
+                sidebar_nav::WorkspaceEntry::Agent(
+                    herdr::Side::Wsl("d".into()),
+                    "term_wt".to_string(),
+                ),
+            ]),
         ]);
-        let rows = sidebar_nav::visible_rows(&projects, &listed, &agents);
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
         let snapshot =
-            build_sidebar_snapshot(&projects, &live, &agents, &rows, None, Default::default());
+            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
 
         for row in &rows {
             let id = snapshot.find(row).expect("every projected row is in the model");
@@ -13991,23 +14140,17 @@ mod tests {
         // lists any, so this one is live but unprojected.
         let live = vec![(Some(PathBuf::from("/a/wt1")), 7)];
         let listed = {
-            let mut l = sidebar_nav::ListedSessions::new();
-            let ids = sidebar_session_ids(&live, &Some(PathBuf::from("/a/wt1")), false);
-            assert!(ids.is_empty(), "the threshold rule must actually drop this session");
-            if !ids.is_empty() {
-                l.insert(Some(PathBuf::from("/a/wt1")), ids);
+            let mut l = sidebar_nav::ListedRows::new();
+            let entries = workspace_entries(&[7], Vec::new(), false);
+            assert!(entries.is_empty(), "the threshold rule must actually drop this session");
+            if !entries.is_empty() {
+                l.insert(Some(PathBuf::from("/a/wt1")), entries);
             }
             l
         };
-        let rows = sidebar_nav::visible_rows(&projects, &listed, &sidebar_nav::ListedAgents::new());
-        let snapshot = build_sidebar_snapshot(
-            &projects,
-            &live,
-            &sidebar_nav::ListedAgents::new(),
-            &rows,
-            None,
-            Default::default(),
-        );
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let snapshot =
+            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
 
         let id = snapshot
             .find(&SidebarRow::Session(7))
@@ -14023,16 +14166,10 @@ mod tests {
         // `remove_project` drops the project but keeps its sessions running.
         let projects: Vec<crate::projects::Project> = vec![];
         let live = vec![(Some(PathBuf::from("/orphan/wt1")), 5)];
-        let listed = sidebar_nav::ListedSessions::new();
-        let rows = sidebar_nav::visible_rows(&projects, &listed, &sidebar_nav::ListedAgents::new());
-        let snapshot = build_sidebar_snapshot(
-            &projects,
-            &live,
-            &sidebar_nav::ListedAgents::new(),
-            &rows,
-            None,
-            Default::default(),
-        );
+        let listed = sidebar_nav::ListedRows::new();
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let snapshot =
+            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
 
         let id = snapshot.find(&SidebarRow::Session(5)).expect("the session is still running");
         assert_eq!(
@@ -14047,13 +14184,13 @@ mod tests {
         use crate::sidebar_nav::{self, SidebarRow};
 
         let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2"])];
-        let listed = sidebar_nav::ListedSessions::new();
-        let rows = sidebar_nav::visible_rows(&projects, &listed, &sidebar_nav::ListedAgents::new());
+        let listed = sidebar_nav::ListedRows::new();
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
         let doomed = PathBuf::from("/a/wt2");
         let snapshot = build_sidebar_snapshot(
             &projects,
             &[],
-            &sidebar_nav::ListedAgents::new(),
+            &listed,
             &rows,
             Some(doomed.as_path()),
             Default::default(),
@@ -14081,13 +14218,13 @@ mod tests {
 
         let projects =
             vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2", "/a/wt3"])];
-        let listed = sidebar_nav::ListedSessions::new();
-        let rows = sidebar_nav::visible_rows(&projects, &listed, &sidebar_nav::ListedAgents::new());
+        let listed = sidebar_nav::ListedRows::new();
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
         let doomed = PathBuf::from("/a/wt2");
         let snapshot = build_sidebar_snapshot(
             &projects,
             &[],
-            &sidebar_nav::ListedAgents::new(),
+            &listed,
             &rows,
             Some(doomed.as_path()),
             Default::default(),
@@ -14131,6 +14268,41 @@ mod tests {
         );
     }
 
+    /// The lockstep walk follows the listing, not the session vector.
+    ///
+    /// Attaching to the second pane first leaves the two sessions in the
+    /// opposite order to herdr's, and a walk that trusted the vector would
+    /// push them the wrong way round, match neither against the projection
+    /// and trip its own assert.
+    #[test]
+    fn the_snapshot_walk_follows_the_listing_not_the_session_vector() {
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1"])];
+        let wt = Some(PathBuf::from("/a/wt1"));
+        // Attached in the order 9 then 4; herdr lists the panes 4 then 9.
+        let live = vec![(wt.clone(), 9), (wt.clone(), 4)];
+        let listed = sidebar_nav::ListedRows::from([(wt.clone(), vec![
+            sidebar_nav::WorkspaceEntry::Session(4),
+            sidebar_nav::WorkspaceEntry::Session(9),
+        ])]);
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let snapshot =
+            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
+
+        assert_eq!(rows, vec![
+            SidebarRow::Home,
+            SidebarRow::Project(PathBuf::from("/a")),
+            SidebarRow::Worktree(PathBuf::from("/a/wt1")),
+            SidebarRow::Session(4),
+            SidebarRow::Session(9),
+        ]);
+        for row in &rows {
+            let id = snapshot.find(row).expect("every projected row is in the model");
+            assert!(snapshot.is_projected(id), "{row:?} must stay navigable");
+        }
+    }
+
     /// Same lockstep hazard, with the doomed worktree carrying a herdr row:
     /// the agent rows it owns have to be stepped over as well.
     #[test]
@@ -14139,17 +14311,15 @@ mod tests {
 
         let projects =
             vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2", "/a/wt3"])];
-        let listed = sidebar_nav::ListedSessions::new();
         let doomed = PathBuf::from("/a/wt2");
-        let agents = sidebar_nav::ListedAgents::from([(
-            Some(doomed.clone()),
-            vec![(herdr::Side::Native, "term_doomed".to_string())],
-        )]);
-        let rows = sidebar_nav::visible_rows(&projects, &listed, &agents);
+        let listed = sidebar_nav::ListedRows::from([(Some(doomed.clone()), vec![
+            sidebar_nav::WorkspaceEntry::Agent(herdr::Side::Native, "term_doomed".to_string()),
+        ])]);
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
         let snapshot = build_sidebar_snapshot(
             &projects,
             &[],
-            &agents,
+            &listed,
             &rows,
             Some(doomed.as_path()),
             Default::default(),
