@@ -154,11 +154,21 @@ pub struct DebugConfig {
     /// before this file is read.  Like `gpu_timing`, keeps the session log
     /// open, since the report has nowhere else to go.
     pub frame_log: bool,
+    /// alacritree-only, set in `alacritree.toml`.  Where crash artifacts and
+    /// session logs are written.  `None` keeps the machine-local state
+    /// directory `logdir::log_dir` resolves.
+    pub log_dir: Option<PathBuf>,
 }
 
 impl Default for DebugConfig {
     fn default() -> Self {
-        Self { crash_log: true, persistent_logging: false, gpu_timing: false, frame_log: false }
+        Self {
+            crash_log: true,
+            persistent_logging: false,
+            gpu_timing: false,
+            frame_log: false,
+            log_dir: None,
+        }
     }
 }
 
@@ -1804,6 +1814,19 @@ struct RawDebug {
     /// goes to the log stream and a GUI-subsystem binary has no console for it
     /// to reach otherwise.
     frame_log: Option<bool>,
+    /// Where crash artifacts and session logs are written.  alacritree-only,
+    /// so it belongs in `alacritree.toml`.  A leading `~` expands to the home
+    /// directory; a relative path is ignored.
+    ///
+    /// Unset writes to the machine-local state directory: `%LOCALAPPDATA%\
+    /// alacritree` on Windows, `$XDG_STATE_HOME/alacritree` or
+    /// `~/.local/state/alacritree` elsewhere.  Logs are deliberately not kept
+    /// beside the config, which on Windows roams between machines.
+    ///
+    /// A panic raised before this file is parsed still lands in the default
+    /// directory, since nothing knows about this key yet when the crash hook
+    /// is armed.  Setting it does not move logs already written.
+    log_dir: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -2903,6 +2926,11 @@ impl RawConfig {
                 persistent_logging: self.debug.persistent_logging.unwrap_or(false),
                 gpu_timing: self.debug.gpu_timing.unwrap_or(false),
                 frame_log: self.debug.frame_log.unwrap_or(false),
+                log_dir: self
+                    .debug
+                    .log_dir
+                    .as_deref()
+                    .and_then(|raw| parse_config_path(raw, "debug.log_dir")),
             },
             working_directory: self
                 .general
@@ -4345,6 +4373,24 @@ program = "second"
         let raw: RawConfig = toml::from_str("[debug]\npersistent_logging = true").unwrap();
 
         assert!(raw.into_config().debug.persistent_logging);
+    }
+
+    #[test]
+    fn log_dir_defaults_to_none_and_expands_a_leading_tilde() {
+        let unset: RawConfig = toml::from_str("").unwrap();
+        let raw: RawConfig = toml::from_str("[debug]\nlog_dir = \"~/logs\"").unwrap();
+
+        assert_eq!(unset.into_config().debug.log_dir, None);
+        assert_eq!(raw.into_config().debug.log_dir, Some(home::home_dir().unwrap().join("logs")));
+    }
+
+    /// A relative path would resolve against the process CWD, which for a GUI
+    /// launch is wherever the desktop happened to start it.
+    #[test]
+    fn a_relative_log_dir_is_ignored() {
+        let raw: RawConfig = toml::from_str("[debug]\nlog_dir = \"logs\"").unwrap();
+
+        assert_eq!(raw.into_config().debug.log_dir, None);
     }
 
     #[test]

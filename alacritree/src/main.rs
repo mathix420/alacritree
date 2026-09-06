@@ -150,12 +150,21 @@ fn main() -> eframe::Result<()> {
     // Only the GUI path records crashes.  Every subcommand exits before config
     // is read, so no gate could govern them, and `alacritree mcp` is a
     // long-lived loop that would write records nothing could disable.
-    let log_dir = logdir::log_dir();
-    if let Some(dir) = &log_dir {
+    let default_log_dir = logdir::log_dir();
+    if let Some(dir) = &default_log_dir {
         crash_log::install(dir, env!("CARGO_PKG_VERSION"));
     }
 
     let (config, config_files) = config::load(config_dir.as_deref(), &options);
+
+    // `[debug] log_dir` cannot be known any earlier, so the hook above armed
+    // against the default directory and a panic in `config::load` lands there.
+    // Swapping now still precedes every artifact: `install` creates the
+    // directory but no file.
+    if let Some(dir) = &config.debug.log_dir {
+        crash_log::set_dir(dir);
+    }
+    let log_dir = config.debug.log_dir.clone().or(default_log_dir);
 
     // Before any session exists: the PTY threads read this flag without
     // synchronizing against startup.
