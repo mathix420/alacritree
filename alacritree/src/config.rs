@@ -55,6 +55,10 @@ pub struct Config {
     /// home directory (upstream only expands `~` in config imports) so one
     /// shared config works on every platform.
     pub working_directory: Option<PathBuf>,
+    /// Where `state.toml` and the scratchpad notes live, from `[general]
+    /// state_dir`.  `None` keeps the per-user config base they have always
+    /// used.
+    pub state_dir: Option<PathBuf>,
     pub wsl_automount_root: String,
     pub wsl_resident_helper: bool,
     /// Explicit `delta` program for the diff pane, from `[ui] delta_path`.
@@ -1380,6 +1384,7 @@ impl Default for Config {
             ipc_socket: true,
             debug: DebugConfig::default(),
             working_directory: None,
+            state_dir: None,
             wsl_automount_root: "/mnt".to_string(),
             wsl_resident_helper: true,
             delta_path: None,
@@ -1780,6 +1785,25 @@ struct RawGeneral {
     /// in their checkout.  A leading `~` expands to the home directory.  Unset
     /// inherits the launching process's directory.
     working_directory: Option<String>,
+    /// Where alacritree keeps what it remembers between runs: `state.toml`
+    /// (project roots, expanded rows, sidebar visibility, per-worktree base
+    /// branches) and the per-workspace scratchpad notes.  alacritree-only, so
+    /// it belongs in `alacritree.toml`.  A leading `~` expands to the home
+    /// directory; a relative path is ignored.
+    ///
+    /// Unset keeps the per-user config base: `%APPDATA%\alacritree` on
+    /// Windows, `$XDG_CONFIG_HOME/alacritree` or `~/.config/alacritree`
+    /// elsewhere.  That is where these files have always lived, so leaving
+    /// this unset changes nothing.
+    ///
+    /// Setting it moves nothing.  Existing state and notes stay at the old
+    /// path, and alacritree starts again from an empty sidebar and empty
+    /// scratchpads at the new one; move the files yourself if you want them to
+    /// follow.  Point every alacritree on the machine at the same directory:
+    /// the CLI resolves this key the same way the window does, so a command
+    /// run against a different config reads a different state file than the
+    /// window is writing.
+    state_dir: Option<String>,
 }
 
 /// alacritty's `[debug]` section, plus one alacritree-only key.
@@ -2937,6 +2961,11 @@ impl RawConfig {
                 .working_directory
                 .as_deref()
                 .and_then(|raw| parse_config_path(raw, "general.working_directory")),
+            state_dir: self
+                .general
+                .state_dir
+                .as_deref()
+                .and_then(|raw| parse_config_path(raw, "general.state_dir")),
             wsl_automount_root,
             wsl_resident_helper,
             delta_path: self.ui.delta_path.filter(|s| !s.trim().is_empty()),
@@ -4373,6 +4402,15 @@ program = "second"
         let raw: RawConfig = toml::from_str("[debug]\npersistent_logging = true").unwrap();
 
         assert!(raw.into_config().debug.persistent_logging);
+    }
+
+    #[test]
+    fn state_dir_defaults_to_none_and_expands_a_leading_tilde() {
+        let unset: RawConfig = toml::from_str("").unwrap();
+        let raw: RawConfig = toml::from_str("[general]\nstate_dir = \"~/alacritree\"").unwrap();
+
+        assert_eq!(unset.into_config().state_dir, None);
+        assert_eq!(raw.into_config().state_dir, Some(home::home_dir().unwrap().join("alacritree")));
     }
 
     #[test]

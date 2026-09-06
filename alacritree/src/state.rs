@@ -1,4 +1,5 @@
-//! Persists the sidebar across restarts at `$XDG_CONFIG_HOME/alacritree/state.toml`.
+//! Persists the sidebar across restarts at `state.toml`, in the per-user config
+//! base or wherever `[general] state_dir` points.
 //!
 //! The file is shared by every running alacritree, so it is never written from a
 //! snapshot: [`mutate`] re-reads it, applies one change, and writes it back.  A
@@ -6,6 +7,7 @@
 //! it read at startup, deleting whatever another window has added since.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -65,10 +67,29 @@ pub fn config_path() -> Option<PathBuf> {
     Some(config_dir()?.join("state.toml"))
 }
 
+/// What `[general] state_dir` named, once someone has read it.
+static CONFIGURED: OnceLock<PathBuf> = OnceLock::new();
+
+/// Publish `[general] state_dir`.  Both entry points call it, the window and
+/// the CLI answering with no window, because a command reading a different
+/// `state.toml` than the window writes would answer from a file nobody updates.
+pub fn set_dir(dir: PathBuf) {
+    let _ = CONFIGURED.set(dir);
+}
+
+/// Where `state.toml` and the scratchpad notes live: `[general] state_dir` when
+/// it is set, otherwise the per-user config base they have always used.
+pub(crate) fn config_dir() -> Option<PathBuf> {
+    if let Some(dir) = CONFIGURED.get() {
+        return Some(dir.clone());
+    }
+    default_config_dir()
+}
+
 /// Per-user config base: XDG on Unix, the roaming app-data dir on Windows
 /// (which has neither `$XDG_CONFIG_HOME` nor `$HOME`).
 #[cfg(not(windows))]
-pub(crate) fn config_dir() -> Option<PathBuf> {
+fn default_config_dir() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         return Some(PathBuf::from(xdg).join("alacritree"));
     }
@@ -77,7 +98,7 @@ pub(crate) fn config_dir() -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-pub(crate) fn config_dir() -> Option<PathBuf> {
+fn default_config_dir() -> Option<PathBuf> {
     std::env::var_os("APPDATA")
         .or_else(|| std::env::var_os("LOCALAPPDATA"))
         .map(PathBuf::from)
@@ -201,6 +222,25 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    /// One directory holds everything alacritree remembers, so `state.toml` and
+    /// the scratchpad notes have to move together rather than split across the
+    /// configured directory and the default one.
+    ///
+    /// Sets the process-wide directory, which is a `OnceLock`: no other test
+    /// may assert the unconfigured resolution, or the two race for which runs
+    /// first inside one test binary.
+    #[test]
+    fn a_configured_directory_takes_the_state_file_and_the_notes() {
+        let dir = TempDir::new().expect("a temp dir");
+        set_dir(dir.path().to_path_buf());
+
+        assert_eq!(config_path(), Some(dir.path().join("state.toml")));
+        assert!(
+            crate::scratchpad::path_for(&None).is_some_and(|p| p.starts_with(dir.path())),
+            "the notes did not follow the state file"
+        );
+    }
 
     fn project(root: &str) -> PersistedProject {
         PersistedProject { root: PathBuf::from(root), expanded: true, shell: None, label: None }

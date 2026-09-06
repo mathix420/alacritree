@@ -438,6 +438,10 @@
           "description": "Offer the local socket that `alacritree <command>` and the MCP bridge\nconnect to.  Default `true`.",
           "type": "boolean"
         },
+        "state_dir": {
+          "description": "Where alacritree keeps what it remembers between runs: `state.toml`\n(project roots, expanded rows, sidebar visibility, per-worktree base\nbranches) and the per-workspace scratchpad notes.  alacritree-only, so\nit belongs in `alacritree.toml`.  A leading `~` expands to the home\ndirectory; a relative path is ignored.\n\nUnset keeps the per-user config base: `%APPDATA%\\alacritree` on\nWindows, `$XDG_CONFIG_HOME/alacritree` or `~/.config/alacritree`\nelsewhere.  That is where these files have always lived, so leaving\nthis unset changes nothing.\n\nSetting it moves nothing.  Existing state and notes stay at the old\npath, and alacritree starts again from an empty sidebar and empty\nscratchpads at the new one; move the files yourself if you want them to\nfollow.  Point every alacritree on the machine at the same directory:\nthe CLI resolves this key the same way the window does, so a command\nrun against a different config reads a different state file than the\nwindow is writing.",
+          "type": "string"
+        },
         "working_directory": {
           "description": "Directory sessions on the home tab start in; worktree tabs always start\nin their checkout.  A leading `~` expands to the home directory.  Unset\ninherits the launching process's directory.",
           "type": "string"

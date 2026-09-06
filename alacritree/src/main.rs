@@ -201,6 +201,9 @@ fn main() -> eframe::Result<()> {
     // to reach.
     startup_log::emit(&config, &config_files, config_dir.as_deref(), logging_to_file);
 
+    if let Some(dir) = config.state_dir.clone() {
+        state::set_dir(dir);
+    }
     wsl::set_automount_root(config.wsl_automount_root.clone());
     wsl_helper::set_enabled(config.wsl_resident_helper);
     let translucent = config.window.opacity < 1.0;

@@ -300,7 +300,16 @@ pub fn run(cli: Cli) -> Option<i32> {
         other => to_request(other),
     };
 
-    Some(execute(&request, cli.socket.as_deref(), cli.json))
+    let config = ConfigSource { dir: cli.config_dir.as_deref(), overrides: &cli.options };
+    Some(execute(&request, cli.socket.as_deref(), cli.json, config))
+}
+
+/// Where to read config from, carried as far as the offline path in case the
+/// request reaches it.  A request a running instance answers never needs it.
+#[derive(Clone, Copy)]
+struct ConfigSource<'a> {
+    dir: Option<&'a Path>,
+    overrides: &'a [toml::Value],
 }
 
 fn run_schema(command: Option<SchemaCommand>, config_dir: Option<&Path>) -> i32 {
@@ -322,8 +331,13 @@ fn run_schema(command: Option<SchemaCommand>, config_dir: Option<&Path>) -> i32 
     }
 }
 
-fn execute(request: &IpcRequest, socket: Option<&Path>, as_json: bool) -> i32 {
-    match dispatch(request, socket) {
+fn execute(
+    request: &IpcRequest,
+    socket: Option<&Path>,
+    as_json: bool,
+    config: ConfigSource<'_>,
+) -> i32 {
+    match dispatch(request, socket, config) {
         Ok(value) => {
             if as_json {
                 println!("{:#}", value);
@@ -346,9 +360,23 @@ fn execute(request: &IpcRequest, socket: Option<&Path>, as_json: bool) -> i32 {
 }
 
 /// Ask a running alacritree, falling back to serving the request ourselves.
-fn dispatch(request: &IpcRequest, socket: Option<&Path>) -> Result<serde_json::Value, SendError> {
+fn dispatch(
+    request: &IpcRequest,
+    socket: Option<&Path>,
+    config: ConfigSource<'_>,
+) -> Result<serde_json::Value, SendError> {
     match ipc::send_request(socket, request, timeout_for(request)) {
-        Err(SendError::NoInstance) => offline::handle(request).map_err(SendError::Failed),
+        Err(SendError::NoInstance) => {
+            // Reading `state.toml` ourselves means resolving `[general]
+            // state_dir` the way the window does, or we answer from a file
+            // nothing is writing.  Only here: a request an instance answered
+            // never touched the config, and parsing it there would be latency
+            // on the common path.
+            if let Some(dir) = crate::config::load(config.dir, config.overrides).0.state_dir {
+                crate::state::set_dir(dir);
+            }
+            offline::handle(request).map_err(SendError::Failed)
+        },
         result => result,
     }
 }
@@ -622,7 +650,9 @@ mod tests {
                 .unwrap();
         });
 
-        let reply = dispatch(&IpcRequest::ListProjects, Some(socket.path())).expect("a reply");
+        let config = ConfigSource { dir: None, overrides: &[] };
+        let reply =
+            dispatch(&IpcRequest::ListProjects, Some(socket.path()), config).expect("a reply");
 
         // The offline path would answer with the real project list, so this
         // sentinel is only reachable through the socket.
