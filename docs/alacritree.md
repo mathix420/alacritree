@@ -81,7 +81,7 @@ herdr is a terminal workspace manager for coding agents. When a herdr server is 
 - **Attaching.** Enter or a click opens a session attached to that agent, and the row is replaced by the session's own row, which keeps the herdr mark so an attached agent still says where it lives. Detaching is herdr's own chord, not one of alacritree's: the mark's tooltip names it, read from herdr's `config.toml` so a rebound `keys.prefix` or `keys.detach` is what you are told.
 - **Status.** The row's mark follows what herdr reports: a working agent animates, an agent held at an approval dialog turns the attention color, and an idle one stays quiet. An attached agent's session row takes herdr's word too, so a dialog the pane title never mentions still reaches the sidebar.
 - **Native Windows.** herdr cannot attach a single agent there, so attaching focuses the pane in your own herdr window and shares the whole herdr session — the view resizes with the alacritree pane. The mark's tooltip says `shared view` on such rows.
-- **Discovery.** Alacritree asks the native `herdr` on your `PATH` and each running WSL distro. Nothing is installed or started; a machine without herdr sees no rows and stops asking after one failed attempt per server. See `[ui.herdr]` under [Configuration](#configuration) for the poll interval and the opt-out.
+- **Discovery.** Alacritree asks the native `herdr` on your `PATH` and each running WSL distro. Nothing is installed or started. A side with no herdr on it is asked once and then left alone, so a machine without herdr pays a single failed spawn; a side whose herdr answered, even to say its server is down, is retried on a slow clock, so starting herdr after alacritree brings its agents in without a restart. See `[ui.herdr]` under [Configuration](#configuration) for the poll interval and the opt-out.
 
 ### Creating a worktree
 
@@ -596,9 +596,10 @@ image_keep  = 20            # how many PNGs the default directory keeps.
 enabled          = true     # false does no herdr work at all: no polling,
                             # no rows
 poll_interval_ms = 2000     # how often a reachable server is asked for its
-                            # agents. A server that never answers is given up
-                            # on after one attempt, so a machine without herdr
-                            # pays a single failed spawn
+                            # agents. A side with no herdr on it is given up on
+                            # after one attempt, so a machine without herdr
+                            # pays a single failed spawn; a side that has one
+                            # is retried even while its server is down
 show_unmatched   = true     # list an agent whose directory matches no
                             # worktree under Home; false hides it instead
 

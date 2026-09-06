@@ -342,48 +342,74 @@ fn starts_with(cwd: &Path, workspace: &Path) -> bool {
     }
 }
 
-/// How long a server that has answered before waits before being retried.
+/// How long an endpoint known to have a herdr waits before being retried.
 const RECOVERY_RETRY: Duration = Duration::from_secs(30);
 
-/// Whether an endpoint is worth talking to.  An endpoint that has never
-/// answered is abandoned, so a machine with no herdr pays one failed spawn
-/// rather than one per tick; an endpoint that answered and then stopped is
-/// retried forever, because `herdr update` restarts the server.
+/// Why a poll produced no agents.  What separates the two is whether a herdr
+/// ran at all, because that is what says whether waiting can change the
+/// answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PollError {
+    /// herdr answered in its own voice, carrying the `code` from its error
+    /// envelope.  A herdr is installed here and something about this moment
+    /// stopped it — most often that its server is not up yet.
+    Server(String),
+    /// Nothing herdr-shaped answered: no binary, no distro, or output that
+    /// was not an envelope.  A property of the machine rather than the moment.
+    Absent(&'static str),
+}
+
+impl PollError {
+    pub fn code(&self) -> &str {
+        match self {
+            Self::Server(code) => code,
+            Self::Absent(code) => code,
+        }
+    }
+}
+
+/// Whether an endpoint is worth talking to.  A side with no herdr on it is
+/// abandoned, so a machine with none pays one failed spawn rather than one
+/// per tick; a side that has a herdr is retried forever, because starting the
+/// server is the ordinary thing to do after alacritree is already open.
 #[derive(Debug, Default)]
 pub struct Reach {
     ever_answered: bool,
     failing: bool,
+    /// Whether the last failure was one that waiting cannot fix.
+    absent: bool,
     last_error: Option<String>,
 }
 
 impl Reach {
     /// Whether to poll again, given how long it has been since the last try.
     pub fn should_retry(&self, since_last: Duration) -> bool {
-        match (self.failing, self.ever_answered) {
-            (false, _) => true,
-            (true, true) => since_last >= RECOVERY_RETRY,
-            (true, false) => false,
+        if !self.failing {
+            return true;
         }
+        !self.abandoned() && since_last >= RECOVERY_RETRY
     }
 
     /// Whether this endpoint has been given up on for the process lifetime:
-    /// it failed without ever having answered, so nothing will poll it again.
+    /// no herdr has ever spoken from it, and the last try found none there.
     pub fn abandoned(&self) -> bool {
-        self.failing && !self.ever_answered
+        self.failing && self.absent && !self.ever_answered
     }
 
     pub fn record_success(&mut self) {
         self.ever_answered = true;
         self.failing = false;
+        self.absent = false;
         self.last_error = None;
     }
 
     /// Records a failure, returning whether it is worth logging — a code
     /// repeating every tick is logged once, not once per poll.
-    pub fn record_failure(&mut self, code: &str) -> bool {
+    pub fn record_failure(&mut self, error: &PollError) -> bool {
         self.failing = true;
-        let novel = self.last_error.as_deref() != Some(code);
-        self.last_error = Some(code.to_string());
+        self.absent = matches!(error, PollError::Absent(_));
+        let novel = self.last_error.as_deref() != Some(error.code());
+        self.last_error = Some(error.code().to_string());
         novel
     }
 }
@@ -395,7 +421,7 @@ pub struct EndpointCache {
     generation: u64,
     reach: Reach,
     last_attempt: Option<Instant>,
-    pending: Option<jobs::Job<Result<Vec<Agent>, String>>>,
+    pending: Option<jobs::Job<Result<Vec<Agent>, PollError>>>,
     chord: Chord,
 }
 
@@ -477,8 +503,8 @@ impl EndpointCache {
                     self.agents = agents;
                     self.pending = None;
                 },
-                Some(Err(code)) => {
-                    self.note_failure(&code);
+                Some(Err(error)) => {
+                    self.note_failure(&error);
                     if !self.agents.is_empty() {
                         self.agents.clear();
                         self.generation = self.generation.wrapping_add(1);
@@ -489,7 +515,7 @@ impl EndpointCache {
                 // `Reach` tracks, and recording it is what stops a panicking
                 // poll from being respawned every tick for the process life.
                 None if job.failed() => {
-                    self.note_failure("poll_panicked");
+                    self.note_failure(&PollError::Absent("poll_panicked"));
                     self.pending = None;
                 },
                 None => return,
@@ -512,10 +538,11 @@ impl EndpointCache {
     /// code that is not the ordinary "no server here" is a warning; giving up
     /// on an endpoint is a debug line, so a herdr that is installed but never
     /// answers can still be explained from a log rather than only by an empty
-    /// sidebar.  Both fire at most once per endpoint, since an endpoint that
-    /// never answered is never polled again.
-    fn note_failure(&mut self, code: &str) {
-        if self.reach.record_failure(code) && code != "server_not_running" {
+    /// sidebar.  A code that repeats is logged the first time only, so an
+    /// endpoint retried for the whole session still costs one line.
+    fn note_failure(&mut self, error: &PollError) {
+        let code = error.code();
+        if self.reach.record_failure(error) && code != "server_not_running" {
             log::warn!("herdr ({:?}): {code}", self.side);
         }
         if self.reach.abandoned() {
@@ -676,11 +703,11 @@ fn rendered_differs(was: &[Agent], now: &[Agent]) -> bool {
 ///
 /// wsl.exe's own failure messages (a missing distro, for instance) come back
 /// UTF-16LE unless WSL_UTF8 is set, and `from_utf8_lossy` mangles them without
-/// it, so they never match an error code and degrade to `server_not_running`.
+/// it, so they never parse as an envelope and read as no herdr on that side.
 /// herdr's own output is a relayed Linux byte stream and is unaffected either
 /// way.
 #[allow(clippy::disallowed_methods)] // Running herdr is this function's job.
-fn list_agents(side: &Side, _blocking: &jobs::Blocking) -> Result<Vec<Agent>, String> {
+fn list_agents(side: &Side, _blocking: &jobs::Blocking) -> Result<Vec<Agent>, PollError> {
     let (program, args) = side.command(&["agent", "list"]);
     let output = command_ext::hidden(program)
         .args(args)
@@ -689,10 +716,13 @@ fn list_agents(side: &Side, _blocking: &jobs::Blocking) -> Result<Vec<Agent>, St
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .map_err(|_| "spawn_failed".to_string())?;
+        .map_err(|_| PollError::Absent("spawn_failed"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(error_code(&stderr).unwrap_or_else(|| "server_not_running".to_string()));
+        return Err(match error_code(&stderr) {
+            Some(code) => PollError::Server(code),
+            None => PollError::Absent("herdr_unavailable"),
+        });
     }
     Ok(parse_agent_list(&String::from_utf8_lossy(&output.stdout)))
 }
@@ -1093,17 +1123,40 @@ detach = []
     use std::time::Duration;
 
     #[test]
-    fn an_endpoint_that_never_answered_is_given_up_on() {
+    fn an_endpoint_with_no_herdr_is_given_up_on() {
         let mut reach = Reach::default();
-        reach.record_failure("server_not_running");
+        reach.record_failure(&PollError::Absent("spawn_failed"));
         assert!(!reach.should_retry(Duration::from_secs(3600)));
+    }
+
+    /// The common way to meet herdr is to start it after alacritree, and an
+    /// endpoint that has only ever answered "no server" has still proved a
+    /// herdr lives there.
+    #[test]
+    fn a_server_that_starts_later_is_still_found() {
+        let mut reach = Reach::default();
+        reach.record_failure(&PollError::Server("server_not_running".into()));
+        assert!(!reach.abandoned());
+        assert!(!reach.should_retry(Duration::from_secs(5)));
+        assert!(reach.should_retry(Duration::from_secs(31)));
+    }
+
+    /// A herdr that stops answering in its own voice, then stops answering at
+    /// all, is a herdr that went away — the endpoint follows the newer
+    /// evidence rather than the first thing it saw.
+    #[test]
+    fn a_side_that_loses_its_herdr_stops_being_polled() {
+        let mut reach = Reach::default();
+        reach.record_failure(&PollError::Server("server_not_running".into()));
+        reach.record_failure(&PollError::Absent("herdr_unavailable"));
+        assert!(reach.abandoned());
     }
 
     #[test]
     fn an_endpoint_that_answered_once_keeps_retrying() {
         let mut reach = Reach::default();
         reach.record_success();
-        reach.record_failure("server_not_running");
+        reach.record_failure(&PollError::Absent("spawn_failed"));
         assert!(!reach.should_retry(Duration::from_secs(5)));
         assert!(reach.should_retry(Duration::from_secs(31)));
     }
@@ -1112,7 +1165,7 @@ detach = []
     fn a_recovered_endpoint_polls_at_the_normal_interval_again() {
         let mut reach = Reach::default();
         reach.record_success();
-        reach.record_failure("server_not_running");
+        reach.record_failure(&PollError::Server("server_not_running".into()));
         reach.record_success();
         assert!(reach.should_retry(Duration::from_secs(0)));
     }
@@ -1122,11 +1175,11 @@ detach = []
         let mut reach = Reach::default();
         assert!(!reach.abandoned());
         reach.record_success();
-        reach.record_failure("server_not_running");
+        reach.record_failure(&PollError::Absent("spawn_failed"));
         assert!(!reach.abandoned(), "a server that answered once is retried, not given up on");
 
         let mut never = Reach::default();
-        never.record_failure("server_not_running");
+        never.record_failure(&PollError::Absent("spawn_failed"));
         assert!(never.abandoned());
     }
 
@@ -1186,9 +1239,9 @@ detach = []
     #[test]
     fn a_repeated_error_is_logged_once() {
         let mut reach = Reach::default();
-        assert!(reach.record_failure("protocol_mismatch"));
-        assert!(!reach.record_failure("protocol_mismatch"));
-        assert!(reach.record_failure("server_not_running"));
+        assert!(reach.record_failure(&PollError::Server("protocol_mismatch".into())));
+        assert!(!reach.record_failure(&PollError::Server("protocol_mismatch".into())));
+        assert!(reach.record_failure(&PollError::Server("server_not_running".into())));
     }
 
     fn agent(id: &str, status: Status) -> Agent {
