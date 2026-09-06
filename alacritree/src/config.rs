@@ -720,6 +720,13 @@ baked_glyphs! {
     DEFAULT_DRAG_HANDLE_GLYPH = "⠿";
     #[cfg(test)]
     DEFAULT_CURSOR_BLOCK_GLYPH = "▌";
+    /// herdr's "working" mark in the symbol set it offers alongside its dots.
+    /// A harness-owned row paints the state its harness reports in that
+    /// harness's vocabulary, so the glyph ships even though no alacritree
+    /// default names it.  The rest of that vocabulary is `● ○ · × ✓`, which
+    /// the slices above already carry.
+    #[cfg(test)]
+    DEFAULT_HALF_CIRCLE_GLYPH = "◐";
 }
 
 /// What happens when the on-screen workspace stops having sessions, whether a
@@ -4440,7 +4447,8 @@ program = "second"
     #[test]
     fn the_chrome_slice_carries_the_action_and_decorative_glyphs() {
         let chrome: Vec<&str> = CHROME_GLYPHS.iter().map(|g| g.as_str()).collect();
-        for g in ["◇", "+", "×", "↻", "⇅", "·", "—", "•", "…", "↓", "⠿", "▌"] {
+        for g in ["◇", "+", "×", "↻", "⇅", "·", "—", "•", "…", "↓", "⠿", "▌", "◐"]
+        {
             assert!(chrome.contains(&g), "{g} is missing from CHROME_GLYPHS");
         }
         // The blocked mark shares `DEFAULT_WORKTREE_MAIN_ICON`'s codepoint, so

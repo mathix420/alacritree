@@ -89,6 +89,9 @@ struct Theme {
     upstream_diverged: Color32,
     upstream_gone: Color32,
     upstream_untracked: Color32,
+    /// Colors for a harness's own state vocabulary, mapped from the ANSI
+    /// palette the way the PR and upstream badges are.
+    harness_state: StateColors,
     /// Logical-pixel size for headings (titles like "Projects", "Git").
     /// `FontConfig::UI_HEADING_RATIO` of the terminal font size.
     font_heading: f32,
@@ -112,6 +115,29 @@ struct Theme {
     /// Where a row a sidebar scrolled to is parked; `None` is egui's own
     /// minimal scroll.
     scroll_align: Option<egui::Align>,
+}
+
+/// One color per [`StateTone`], since a harness names its states rather than
+/// its colors and alacritree owns the palette they land in.
+#[derive(Debug, Clone, Copy)]
+struct StateColors {
+    blocked: Color32,
+    working: Color32,
+    done: Color32,
+    idle: Color32,
+    unclear: Color32,
+}
+
+impl StateColors {
+    fn of(&self, tone: StateTone) -> Color32 {
+        match tone {
+            StateTone::Blocked => self.blocked,
+            StateTone::Working => self.working,
+            StateTone::Done => self.done,
+            StateTone::Idle => self.idle,
+            StateTone::Unclear => self.unclear,
+        }
+    }
 }
 
 /// Logical-pixel (normal, heading) sizes for UI text.  `[ui.font] size`
@@ -161,6 +187,13 @@ impl Theme {
             upstream_diverged: rgb_to_color32(config.palette.normal[3]), // yellow
             upstream_gone: rgb_to_color32(config.palette.normal[1]), // red
             upstream_untracked: rgb_to_color32(config.palette.normal[4]), // blue
+            harness_state: StateColors {
+                blocked: rgb_to_color32(config.palette.normal[1]), // red
+                working: rgb_to_color32(config.palette.normal[3]), // yellow
+                done: rgb_to_color32(config.palette.normal[6]),    // cyan, herdr's teal
+                idle: rgb_to_color32(config.palette.normal[2]),    // green
+                unclear: text_muted,
+            },
             font_heading,
             font_normal,
             ui_scale: font_normal / 11.25,
@@ -6440,6 +6473,25 @@ fn agent_hint(live: LiveState, name: Option<&str>) -> String {
     format!("{} {doing}", name.unwrap_or("agent"))
 }
 
+/// Draw a harness's own state mark into an already-allocated slot.  A harness
+/// that has stopped reporting leaves the slot empty rather than inventing a
+/// state for it.
+fn paint_harness_mark(
+    ui: &mut egui::Ui,
+    mark: Option<HarnessMark>,
+    rect: egui::Rect,
+    theme: &Theme,
+) {
+    let Some(mark) = mark else { return };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        mark.glyph,
+        egui::FontId::new(10.0 * theme.ui_scale, crate::fonts::ui_variant_family(false, false)),
+        theme.harness_state.of(mark.tone),
+    );
+}
+
 /// Draw one agent mark into an already-allocated slot.
 fn paint_agent_mark(ui: &mut egui::Ui, mark: AgentMark, rect: egui::Rect, theme: &Theme) {
     let s = theme.ui_scale;
@@ -6459,8 +6511,22 @@ fn paint_agent_mark(ui: &mut egui::Ui, mark: AgentMark, rect: egui::Rect, theme:
     }
 }
 
-/// Priority: attention dot > the agent's live state > active highlight > the
-/// configured color > the built-in default.
+/// What a row knows about its own state, in the order the status slot ranks
+/// it.  Grouped rather than passed loose because the three answer one
+/// question between them, and the slot draws whichever ranks highest.
+struct RowStatus<'a> {
+    attention: bool,
+    activity: SessionActivity,
+    managed: Option<&'a Managed>,
+}
+
+/// Priority: attention dot > the harness's own state mark > the agent's live
+/// state > active highlight > the configured color > the built-in default.
+///
+/// A harness outranks the live axis because it watches the pane from outside
+/// and alacritree only reads its title, so where both have a reading the
+/// harness's is the better one — and drawing it in the harness's vocabulary is
+/// what keeps a pane looking the same listed and attached.
 ///
 /// Returns what the slot has to say on hover, for the row to register with the
 /// rest of its icons. The row icon proper reports nothing the row does not
@@ -6468,19 +6534,24 @@ fn paint_agent_mark(ui: &mut egui::Ui, mark: AgentMark, rect: egui::Rect, theme:
 fn paint_row_status_icon(
     ui: &mut egui::Ui,
     theme: &Theme,
-    attention: bool,
-    activity: SessionActivity,
+    status: RowStatus<'_>,
     style: &IconStyle,
     default_glyph: BakedGlyph,
     is_active: bool,
 ) -> Option<(egui::Rect, String)> {
-    if attention {
+    if status.attention {
         return Some((attention_dot(ui, theme).rect, ATTENTION_HINT.to_owned()));
     }
     // Centered into the fixed slot: laying a glyph out as text would size the
     // slot to its advance width and shift the label with it.
     let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
-    match activity {
+    if let Some(managed) = status.managed
+        && let Some(mark) = managed.mark
+    {
+        paint_harness_mark(ui, Some(mark), rect, theme);
+        return Some((rect, format!("{} says {}", managed.harness, mark.label)));
+    }
+    match status.activity {
         SessionActivity::Agent { name, live } => {
             let quiet = if is_active { theme.accent } else { theme.text };
             paint_agent_mark(ui, agent_mark(live, quiet, theme.attention), rect, theme);
@@ -6952,8 +7023,7 @@ fn home_row(
                     status_hint = paint_row_status_icon(
                         ui,
                         theme,
-                        attention,
-                        activity,
+                        RowStatus { attention, activity, managed: None },
                         &icons.home,
                         DEFAULT_HOME_ICON,
                         is_active,
@@ -7076,10 +7146,14 @@ struct Managed {
     /// The attach shares the harness's whole view rather than one pane, so
     /// the row says so before a resize reveals it.
     shared_view: bool,
+    /// How the harness draws the state it reports.  `None` when it is no
+    /// longer reporting one — a pane alacritree still holds open after its
+    /// harness stopped listing it.
+    mark: Option<HarnessMark>,
 }
 
 impl HerdrRowData {
-    fn from_agent(agent: &herdr::Agent, side: &herdr::Side, detach: Option<&str>) -> Self {
+    fn from_agent(agent: &herdr::Agent, side: &herdr::Side, settings: &herdr::Settings) -> Self {
         // A listed row has nothing better than the terminal id's tail behind
         // the kind, so the kind takes the name rather than standing in front
         // of six characters nobody reads.
@@ -7096,7 +7170,7 @@ impl HerdrRowData {
             pane_id: agent.pane_id.clone(),
             name,
             status: agent.status,
-            managed: Managed::herdr(side, detach),
+            managed: Managed::herdr(side, settings, Some(agent.status)),
         }
     }
 }
@@ -7128,13 +7202,67 @@ fn herdr_row_name(agent: &herdr::Agent) -> Option<RowName> {
 }
 
 impl Managed {
-    fn herdr(side: &herdr::Side, detach: Option<&str>) -> Self {
+    fn herdr(
+        side: &herdr::Side,
+        settings: &herdr::Settings,
+        status: Option<herdr::Status>,
+    ) -> Self {
         Self {
             harness: "herdr",
-            detach: detach.map(str::to_string),
+            detach: settings.detach.clone(),
             shared_view: !herdr::can_attach(side),
+            mark: status.map(|status| herdr_mark(status, settings.indicators)),
         }
     }
+}
+
+/// The mark a harness paints for the state it reports, in that harness's own
+/// vocabulary.  Resolved once per row, so a pane reads the same whether it is
+/// listed or attached — the two are drawn by different painters, and attaching
+/// must not repaint a pane in a language it does not speak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HarnessMark {
+    glyph: &'static str,
+    tone: StateTone,
+    /// The harness's own word for this state, for the hover text.
+    label: &'static str,
+}
+
+/// What a harness means by a state's color.  Named rather than carried as a
+/// `Color32` so the palette stays alacritree's and a row snapshot stays free
+/// of the theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateTone {
+    Blocked,
+    Working,
+    Done,
+    Idle,
+    /// The harness reported something alacritree does not recognise.
+    Unclear,
+}
+
+/// herdr's state vocabulary, taken from its own `state_icon_symbol` and
+/// `state_label_color`.  Which of the two sets applies is herdr's `[ui]
+/// status_indicators`, so a user who picked one in herdr gets it here too.
+///
+/// `done` is `idle` on herdr's internal axis and a status of its own over its
+/// API, which is the axis alacritree reads — so the two arrive already
+/// distinguished, without the "has a human looked at it yet" bit herdr tracks
+/// to tell them apart.
+fn herdr_mark(status: herdr::Status, indicators: herdr::Indicators) -> HarnessMark {
+    use herdr::Indicators::{Dots, Symbols};
+    use herdr::Status::{Blocked, Done, Idle, Unknown, Working};
+    let (glyph, tone) = match (indicators, status) {
+        (_, Idle) => ("○", StateTone::Idle),
+        (_, Unknown) => ("·", StateTone::Unclear),
+        (Dots, Blocked) => ("●", StateTone::Blocked),
+        (Dots, Working) => ("●", StateTone::Working),
+        (Dots, Done) => ("●", StateTone::Done),
+        (Symbols, Blocked) => ("×", StateTone::Blocked),
+        (Symbols, Working) => ("◐", StateTone::Working),
+        (Symbols, Done) => ("✓", StateTone::Done),
+    };
+    HarnessMark { glyph, tone, label: status.label() }
 }
 
 /// Spawn-ordered ids of the sessions in `ws`, or empty below the list
@@ -7842,8 +7970,7 @@ fn worktree_row(
                     status_hint = paint_row_status_icon(
                         ui,
                         theme,
-                        attention,
-                        activity,
+                        RowStatus { attention, activity, managed: None },
                         default_icon,
                         default_glyph,
                         is_active,
@@ -8072,8 +8199,11 @@ fn session_row(
                     status_hint = paint_row_status_icon(
                         ui,
                         theme,
-                        row.needs_attention,
-                        row.activity,
+                        RowStatus {
+                            attention: row.needs_attention,
+                            activity: row.activity,
+                            managed: row.managed.as_ref(),
+                        },
                         &icons.session,
                         DEFAULT_SESSION_ICON,
                         row.is_active,
@@ -8271,12 +8401,7 @@ fn herdr_row(
                 |ui| {
                     let (rect, _) =
                         ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
-                    // Dim is this row's weight for an agent with nothing to
-                    // report; working and blocked override it, so a listed
-                    // agent that wants a human is as loud as an attached one.
-                    let live = LiveState::from_herdr(row.status).unwrap_or_default();
-                    let mark = agent_mark(live, theme.text_dim, theme.attention);
-                    paint_agent_mark(ui, mark, rect, theme);
+                    paint_harness_mark(ui, row.managed.mark, rect, theme);
                     paint_managed_mark(ui, icons, theme, theme.text_dim);
                     let text = row_name_text(ui, &row.name, theme.text_dim, theme.text_muted);
                     let _ = truncating_label(ui, text, theme.text_dim, egui::Sense::hover());
@@ -8532,21 +8657,21 @@ impl AlacritreeApp {
         let Some(keys) = listed.get(ws) else { return Vec::new() };
         keys.iter()
             .filter_map(|(side, terminal_id)| {
-                self.find_herdr_agent(side, terminal_id).map(|agent| {
-                    HerdrRowData::from_agent(agent, side, self.herdr_detach_chord(side))
-                })
+                self.find_herdr_agent(side, terminal_id)
+                    .map(|agent| HerdrRowData::from_agent(agent, side, &self.herdr_settings(side)))
             })
             .collect()
     }
 
     /// herdr's detach chord on `side`, once that endpoint's config read has
     /// landed.
-    fn herdr_detach_chord(&self, side: &herdr::Side) -> Option<&str> {
+    fn herdr_settings(&self, side: &herdr::Side) -> herdr::Settings {
         self.herdr_endpoints
             .caches()
             .iter()
             .find(|cache| cache.side() == side)
-            .and_then(|cache| cache.detach())
+            .map(herdr::EndpointCache::settings)
+            .unwrap_or_default()
     }
 
     /// What supervises `session`, when anything does.  Derived per frame
@@ -8555,7 +8680,8 @@ impl AlacritreeApp {
     /// truth to keep in step.
     fn session_managed(&self, session: &Session) -> Option<Managed> {
         let key = session.herdr_key.as_ref()?;
-        Some(Managed::herdr(&key.side, self.herdr_detach_chord(&key.side)))
+        let status = self.session_herdr_agent(session).map(|agent| agent.status);
+        Some(Managed::herdr(&key.side, &self.herdr_settings(&key.side), status))
     }
 
     /// One number standing for every endpoint's rendered state, so the
@@ -11441,25 +11567,91 @@ mod tests {
         }
     }
 
+    /// herdr distinguishes four live states and says so on its own panes.
+    /// Collapsing any pair onto one mark would make the sidebar say less
+    /// about a pane than the window it came from.
+    #[test]
+    fn herdr_marks_keep_its_four_states_apart() {
+        for set in [herdr::Indicators::Dots, herdr::Indicators::Symbols] {
+            let marks: Vec<HarnessMark> = [
+                herdr::Status::Blocked,
+                herdr::Status::Working,
+                herdr::Status::Done,
+                herdr::Status::Idle,
+            ]
+            .into_iter()
+            .map(|status| herdr_mark(status, set))
+            .collect();
+            for (i, a) in marks.iter().enumerate() {
+                for b in &marks[i + 1..] {
+                    assert_ne!(a, b, "{set:?} draws two states the same");
+                }
+            }
+        }
+    }
+
+    /// Taken from herdr's own `state_icon_symbol`, so a pane carries one mark
+    /// whether it is read in herdr or in the sidebar.
+    #[test]
+    fn herdr_marks_are_the_ones_herdr_paints() {
+        let dots = |status| herdr_mark(status, herdr::Indicators::Dots).glyph;
+        assert_eq!(dots(herdr::Status::Blocked), "●");
+        assert_eq!(dots(herdr::Status::Working), "●");
+        assert_eq!(dots(herdr::Status::Done), "●");
+        assert_eq!(dots(herdr::Status::Idle), "○");
+
+        let symbols = |status| herdr_mark(status, herdr::Indicators::Symbols).glyph;
+        assert_eq!(symbols(herdr::Status::Blocked), "×");
+        assert_eq!(symbols(herdr::Status::Working), "◐");
+        assert_eq!(symbols(herdr::Status::Done), "✓");
+        assert_eq!(symbols(herdr::Status::Idle), "○");
+    }
+
+    /// A status alacritree does not recognise is herdr declining to say, and
+    /// the row says that rather than claiming the agent is idle.
+    #[test]
+    fn an_unknown_herdr_status_is_drawn_as_no_reading() {
+        for set in [herdr::Indicators::Dots, herdr::Indicators::Symbols] {
+            let mark = herdr_mark(herdr::Status::Unknown, set);
+            assert_eq!(mark.glyph, "·");
+            assert_eq!(mark.tone, StateTone::Unclear);
+        }
+    }
+
     #[test]
     fn herdr_row_name_prefers_the_reported_kind() {
-        let row =
-            HerdrRowData::from_agent(&herdr_agent(Some("claude")), &herdr::Side::Native, None);
+        let row = HerdrRowData::from_agent(
+            &herdr_agent(Some("claude")),
+            &herdr::Side::Native,
+            &herdr::Settings::default(),
+        );
         assert_eq!(row.name, RowName::plain("claude".into()));
     }
 
     #[test]
     fn herdr_row_name_falls_back_to_the_terminal_id_tail() {
-        let row = HerdrRowData::from_agent(&herdr_agent(None), &herdr::Side::Native, None);
+        let row = HerdrRowData::from_agent(
+            &herdr_agent(None),
+            &herdr::Side::Native,
+            &herdr::Settings::default(),
+        );
         assert_eq!(row.name, RowName::plain("300361".into()));
     }
 
     #[test]
     fn herdr_row_shared_view_follows_can_attach() {
-        let native = HerdrRowData::from_agent(&herdr_agent(None), &herdr::Side::Native, None);
+        let native = HerdrRowData::from_agent(
+            &herdr_agent(None),
+            &herdr::Side::Native,
+            &herdr::Settings::default(),
+        );
         assert_eq!(native.managed.shared_view, cfg!(windows));
 
-        let wsl = HerdrRowData::from_agent(&herdr_agent(None), &herdr::Side::Wsl("d".into()), None);
+        let wsl = HerdrRowData::from_agent(
+            &herdr_agent(None),
+            &herdr::Side::Wsl("d".into()),
+            &herdr::Settings::default(),
+        );
         assert!(!wsl.managed.shared_view);
     }
 
@@ -11476,7 +11668,8 @@ mod tests {
             cwd: None,
             foreground_cwd: None,
         };
-        let row = HerdrRowData::from_agent(&agent, &herdr::Side::Native, None);
+        let row =
+            HerdrRowData::from_agent(&agent, &herdr::Side::Native, &herdr::Settings::default());
         assert_eq!(row.name, RowName::plain("t1".into()));
     }
 
@@ -11513,7 +11706,11 @@ mod tests {
     }
 
     fn row_of(kind: Option<&str>, title: Option<&str>) -> HerdrRowData {
-        HerdrRowData::from_agent(&titled(kind, title), &herdr::Side::Wsl("d".into()), None)
+        HerdrRowData::from_agent(
+            &titled(kind, title),
+            &herdr::Side::Wsl("d".into()),
+            &herdr::Settings::default(),
+        )
     }
 
     /// The kind is a category and the title is an identity, so the title takes

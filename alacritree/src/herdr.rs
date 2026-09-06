@@ -23,6 +23,24 @@ pub enum Side {
     Wsl(String),
 }
 
+/// Which of herdr's two indicator sets its config selects.  Rows follow the
+/// user's own choice, so a pane's mark in the sidebar is the mark it carries
+/// in herdr itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Indicators {
+    #[default]
+    Dots,
+    Symbols,
+}
+
+/// What alacritree reads out of herdr's config: how to leave a pane, and how
+/// herdr draws the state it reports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Settings {
+    pub detach: Option<String>,
+    pub indicators: Indicators,
+}
+
 /// herdr's agent state.  An unrecognised string maps to `Unknown` so a value
 /// herdr adds later renders as a plain row instead of dropping the agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -422,7 +440,7 @@ pub struct EndpointCache {
     reach: Reach,
     last_attempt: Option<Instant>,
     pending: Option<jobs::Job<Result<Vec<Agent>, PollError>>>,
-    chord: Chord,
+    settings: Read,
 }
 
 impl EndpointCache {
@@ -434,7 +452,7 @@ impl EndpointCache {
             reach: Reach::default(),
             last_attempt: None,
             pending: None,
-            chord: Chord::Unread,
+            settings: Read::Unread,
         }
     }
 
@@ -452,51 +470,54 @@ impl EndpointCache {
         &self.agents
     }
 
-    /// herdr's detach chord here, once the config read has landed.  `None`
-    /// until then, and afterwards when herdr binds detach to nothing or the
-    /// side could not be read — all three are reasons to say nothing rather
-    /// than to name a chord the user may not have.
-    pub fn detach(&self) -> Option<&str> {
-        match &self.chord {
-            Chord::Read(chord) => chord.as_deref(),
-            Chord::Unread | Chord::Pending(_) => None,
+    /// What herdr's config here says, once the read has landed.  Before that
+    /// it is herdr's own defaults, which is what herdr would be running on if
+    /// its config said nothing — except for the chord, which stays `None`
+    /// until it is known, since naming one the user has rebound would be
+    /// worse than naming none.
+    pub fn settings(&self) -> Settings {
+        match &self.settings {
+            Read::Done(settings) => settings.clone(),
+            Read::Unread | Read::Pending(_) => Settings::default(),
         }
     }
 
-    /// Adopt a landed config read.  The chord is part of what a row renders,
-    /// so arriving late still has to invalidate the sidebar's comparison.
-    fn advance_chord(&mut self) {
-        let Chord::Pending(job) = &self.chord else { return };
-        if let Some(chord) = job.poll() {
-            self.chord = Chord::Read(chord);
+    /// Adopt a landed config read.  Both halves are part of what a row
+    /// renders, so arriving late still has to invalidate the sidebar's
+    /// comparison.  A side that could not be read falls back to herdr's own
+    /// defaults rather than to nothing.
+    fn advance_settings(&mut self) {
+        let Read::Pending(job) = &self.settings else { return };
+        if let Some(settings) = job.poll() {
+            self.settings = Read::Done(settings.unwrap_or_default());
             self.generation = self.generation.wrapping_add(1);
         } else if job.failed() {
-            self.chord = Chord::Read(None);
+            self.settings = Read::Done(Settings::default());
         }
     }
 
     /// Read the config once this endpoint has proved a herdr lives here.
     /// Starting at construction would run a shell inside every installed
-    /// distro to learn a chord no row will ever show.
-    fn start_chord_read(&mut self) {
-        if !matches!(self.chord, Chord::Unread) {
+    /// distro to learn values no row will ever show.
+    fn start_settings_read(&mut self) {
+        if !matches!(self.settings, Read::Unread) {
             return;
         }
         let side = self.side.clone();
-        self.chord = Chord::Pending(
+        self.settings = Read::Pending(
             jobs::pool()
-                .spawn(jobs::Priority::Background, move |blocking| detach_chord(&side, blocking)),
+                .spawn(jobs::Priority::Background, move |blocking| settings(&side, blocking)),
         );
     }
 
     /// Adopts a landed result and starts a new poll when due.  Never blocks.
     pub fn poll(&mut self, interval: Duration) {
-        self.advance_chord();
+        self.advance_settings();
         if let Some(job) = &self.pending {
             match job.poll() {
                 Some(Ok(agents)) => {
                     self.reach.record_success();
-                    self.start_chord_read();
+                    self.start_settings_read();
                     if rendered_differs(&self.agents, &agents) {
                         self.generation = self.generation.wrapping_add(1);
                     }
@@ -737,6 +758,13 @@ const DEFAULT_DETACH: &str = "prefix+q";
 struct RawHerdrConfig {
     #[serde(default)]
     keys: RawKeys,
+    #[serde(default)]
+    ui: RawUi,
+}
+
+#[derive(Deserialize, Default)]
+struct RawUi {
+    status_indicators: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -814,6 +842,18 @@ fn detach_chord_from(config: &str) -> Option<String> {
     })
 }
 
+fn indicators_from(config: &str) -> Indicators {
+    let parsed: RawHerdrConfig = toml::from_str(config).unwrap_or_default();
+    match parsed.ui.status_indicators.as_deref() {
+        Some("symbols") => Indicators::Symbols,
+        _ => Indicators::Dots,
+    }
+}
+
+fn settings_from(config: &str) -> Settings {
+    Settings { detach: detach_chord_from(config), indicators: indicators_from(config) }
+}
+
 /// Where herdr looks for its config, mirroring its own resolution so both
 /// programs read the same file.  `HERDR_CONFIG_PATH` wins everywhere, then
 /// `XDG_CONFIG_HOME` — herdr consults it on Windows too, before the platform
@@ -867,21 +907,20 @@ fn read_config(side: &Side, _blocking: &jobs::Blocking) -> Option<String> {
     }
 }
 
-/// herdr's detach chord on this side, spelled as herdr documents it.  Both
-/// halves are user-settable, so a hint naming a chord the user has rebound
-/// would be worse than no hint at all.
-pub fn detach_chord(side: &Side, blocking: &jobs::Blocking) -> Option<String> {
-    detach_chord_from(&read_config(side, blocking)?)
+/// What herdr's own config on this side says about leaving a pane and drawing
+/// its state.  Every part is user-settable, so a row spelling out a chord the
+/// user has rebound would be worse than a row that stays quiet.
+pub fn settings(side: &Side, blocking: &jobs::Blocking) -> Option<Settings> {
+    Some(settings_from(&read_config(side, blocking)?))
 }
 
 /// A config read runs once per endpoint: herdr rereads its own config only on
 /// request, and re-running a shell inside every distro on the listing cadence
-/// would cost a process per distro per tick to learn a string that does not
-/// move.
-enum Chord {
+/// would cost a process per distro per tick to learn values that do not move.
+enum Read {
     Unread,
-    Pending(jobs::Job<Option<String>>),
-    Read(Option<String>),
+    Pending(jobs::Job<Option<Settings>>),
+    Done(Settings),
 }
 
 #[cfg(test)]
@@ -994,6 +1033,52 @@ detach = []
     #[test]
     fn an_unparseable_config_falls_back_to_the_defaults() {
         assert_eq!(detach_chord_from("[keys"), Some("Ctrl+B q".to_string()));
+    }
+
+    /// herdr offers two indicator sets and ships the dotted one, so a config
+    /// that says nothing has still chosen it.
+    #[test]
+    fn the_indicator_set_follows_herdrs_own_choice() {
+        assert_eq!(indicators_from(""), Indicators::Dots);
+        assert_eq!(
+            indicators_from(
+                "[ui]
+status_indicators = \"symbols\"
+"
+            ),
+            Indicators::Symbols
+        );
+        assert_eq!(
+            indicators_from(
+                "[ui]
+status_indicators = \"dots\"
+"
+            ),
+            Indicators::Dots
+        );
+    }
+
+    /// A set herdr adds later is not a reason to paint nothing: the rows keep
+    /// the shipped vocabulary until alacritree learns the new one.
+    #[test]
+    fn an_unknown_indicator_set_keeps_the_shipped_one() {
+        let cfg = "[ui]
+status_indicators = \"runes\"
+";
+        assert_eq!(indicators_from(cfg), Indicators::Dots);
+    }
+
+    #[test]
+    fn settings_carry_both_halves_of_the_config() {
+        let cfg = "[keys]
+prefix = \"f12\"
+[ui]
+status_indicators = \"symbols\"
+";
+        assert_eq!(settings_from(cfg), Settings {
+            detach: Some("F12 q".into()),
+            indicators: Indicators::Symbols
+        });
     }
 
     /// Captured from a native Windows server.  `skip_serializing_if` drops
