@@ -200,6 +200,23 @@ pub fn note_if_slow(kind: &str, what: impl std::fmt::Debug, took: Duration) {
     }
 }
 
+/// One phase of opening a session, logged only under `ALACRITREE_FRAME_LOG`.
+///
+/// Spawn cost is charged to whichever frame phase happened to be running when
+/// the click arrived, so without a marker of its own it reads as a sidebar or
+/// shortcut problem.  The session id is what pairs a phase with the tab it
+/// belongs to when several are opening at once.
+pub fn spawn_phase(session: Option<u64>, phase: &str, elapsed: Duration) {
+    if !enabled() {
+        return;
+    }
+    let millis = elapsed.as_secs_f64() * 1000.0;
+    match session {
+        Some(id) => log::info!("spawn {phase} [{id}]: {millis:.1}ms"),
+        None => log::info!("spawn {phase}: {millis:.1}ms"),
+    }
+}
+
 #[derive(Default)]
 struct Samples {
     totals: Vec<Duration>,
@@ -465,18 +482,24 @@ mod tests {
 
     /// Each mark closes the phase that ran since the previous one, so the
     /// phases partition the frame instead of all dating from its start.
+    ///
+    /// The first phase is back-dated rather than slept through, so the second
+    /// one has seconds of room before it could be mistaken for a phase still
+    /// dating from the frame's start.
     #[test]
     fn each_phase_measures_only_its_own_span() {
+        const AGED: Duration = Duration::from_secs(5);
+
         let mut phases = Phases { on: true, ..Phases::new() };
 
         phases.restart();
-        std::thread::sleep(Duration::from_millis(20));
+        phases.since = phases.since.checked_sub(AGED).expect("a clock older than the back-date");
         phases.mark("first");
         phases.mark("second");
 
         let [(_, first), (_, second)] = phases.marks[..2] else { unreachable!() };
-        assert!(first >= Duration::from_millis(20), "{first:?}");
-        assert!(second < Duration::from_millis(10), "{second:?}");
+        assert!(first >= AGED, "the first phase lost the span it was given: {first:?}");
+        assert!(second < first, "the second phase still dated from the frame's start: {second:?}");
     }
 
     /// A frame with more phases than the breakdown holds must drop the extras

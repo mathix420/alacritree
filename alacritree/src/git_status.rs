@@ -2,15 +2,18 @@
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use git2::{Delta, DiffOptions, Repository, Status, StatusOptions};
 
-use crate::wsl;
+use crate::{jobs, wsl};
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
+
+/// What the panel shows for a compute whose worker unwound.  The panic itself
+/// is logged from the pool; the row only needs to stop claiming knowledge it
+/// does not have.
+const WORKER_DIED: &str = "the background worker did not finish";
 
 #[derive(Debug, Clone)]
 pub struct FileChange {
@@ -71,14 +74,25 @@ impl DirtyCounts {
     pub fn is_dirty(&self) -> bool {
         self.staged + self.modified + self.untracked > 0
     }
+
+    /// Derive the delete modal's counts from a status the git panel already
+    /// polled, so opening the dialog costs no repository walk.
+    pub fn from_status(status: &GitStatus) -> Self {
+        let untracked = status.unstaged.iter().filter(|c| c.kind == ChangeKind::Untracked).count();
+        Self { staged: status.staged.len(), modified: status.unstaged.len() - untracked, untracked }
+    }
 }
 
-/// Cheap dirty check used by the delete modal: avoids the branch-diff work
-/// that `compute` does, since we only need to know whether `git worktree
-/// remove` will refuse the path.
-pub fn dirty_counts(path: &Path) -> DirtyCounts {
+/// Cheap dirty check used by the delete modal when the git panel has never
+/// polled this worktree: avoids the branch-diff work that `compute` does,
+/// since we only need to know whether `git worktree remove` will refuse the
+/// path. Takes `&jobs::Blocking` because it shells out — call it from a pool
+/// job, never from the UI thread.
+pub fn dirty_counts(path: &Path, blocking: &jobs::Blocking) -> DirtyCounts {
     match wsl::classify(path) {
-        wsl::Location::Wsl { distro, linux_path } => dirty_counts_wsl(&distro, &linux_path),
+        wsl::Location::Wsl { distro, linux_path } => {
+            dirty_counts_wsl(&distro, &linux_path, blocking)
+        },
         wsl::Location::Windows(_) => dirty_counts_git2(path),
     }
 }
@@ -115,14 +129,14 @@ fn dirty_counts_git2(path: &Path) -> DirtyCounts {
     counts
 }
 
-/// Counts from one porcelain-v2 round trip.  Called synchronously when the
-/// delete modal opens — a warm wsl.exe call (~400 ms) is a tolerable
-/// one-shot stall for an explicit destructive action.
-fn dirty_counts_wsl(distro: &str, linux_path: &str) -> DirtyCounts {
+/// Counts from one porcelain-v2 round trip, run on a pool worker so a warm
+/// wsl.exe call (~400 ms) never stalls paint.
+fn dirty_counts_wsl(distro: &str, linux_path: &str, blocking: &jobs::Blocking) -> DirtyCounts {
     let Ok(stdout) = wsl::run_batch(
         distro,
         r#"git -C "$1" status --porcelain=v2 -z 2>/dev/null"#,
         &[linux_path],
+        blocking,
     ) else {
         return DirtyCounts::default();
     };
@@ -162,7 +176,7 @@ struct Pending {
     /// Hint the in-flight compute was started with, so we can tell whether
     /// the result that lands matches what the UI is currently asking for.
     hint: Option<String>,
-    rx: Receiver<GitStatus>,
+    job: jobs::Job<GitStatus>,
 }
 
 impl StatusCache {
@@ -189,6 +203,19 @@ impl StatusCache {
         &self.last
     }
 
+    /// Whether a compute has landed and actually knows the tree. A cache
+    /// entry exists the moment the git panel first renders a workspace,
+    /// before its first background compute finishes — `last()` answers
+    /// `GitStatus::default()` (all-zero counts) until then, which callers
+    /// must not read as "known clean". A compute that landed but failed
+    /// (`error: Some(..)`, e.g. the repository could not be opened) is the
+    /// same "don't know" case — as is a compute whose worker unwound, which
+    /// is banked the same way — it still sets `last_refreshed` so `poll`
+    /// doesn't retry every frame, but it answers `false` here too.
+    pub fn has_status(&self) -> bool {
+        self.last_refreshed.is_some() && self.last.error.is_none()
+    }
+
     /// Returns the most recent known status, kicking off a background refresh
     /// when stale or when the default-branch hint changed since the last
     /// completed compute.  Never blocks the caller.
@@ -197,8 +224,21 @@ impl StatusCache {
         // spawn another — a fresh answer shouldn't be ignored just because
         // the staleness timer also tripped.
         if let Some(pending) = &self.pending {
-            if let Ok(status) = pending.rx.try_recv() {
+            if let Some(status) = pending.job.poll() {
                 self.last = status;
+                self.last_refreshed = Some(Instant::now());
+                self.last_hint = pending.hint.clone();
+                self.pending = None;
+            } else if pending.job.failed() {
+                // A panicked compute reports no status, and merely forgetting
+                // it leaves the cache looking never-refreshed: the next poll
+                // starts another, and the pool wakes a frame at every job end,
+                // so a compute that fails every time would respawn at frame
+                // rate.  Bank it as the failure it is, on the clock a landed
+                // error already uses, and the retry lands one interval later
+                // like any other.
+                self.last =
+                    GitStatus { error: Some(WORKER_DIED.to_string()), ..Default::default() };
                 self.last_refreshed = Some(Instant::now());
                 self.last_hint = pending.hint.clone();
                 self.pending = None;
@@ -222,20 +262,23 @@ impl StatusCache {
 }
 
 fn spawn_compute(path: PathBuf, hint: Option<String>, ctx: egui::Context) -> Pending {
-    let (tx, rx) = mpsc::channel();
     let worker_hint = hint.clone();
-    thread::spawn(move || {
-        let status = compute(&path, worker_hint.as_deref());
-        let _ = tx.send(status);
+    let job = jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
+        let status = compute(&path, worker_hint.as_deref(), blocking);
         ctx.request_repaint();
+        status
     });
-    Pending { hint, rx }
+    Pending { hint, job }
 }
 
-pub fn compute(path: &Path, default_branch_hint: Option<&str>) -> GitStatus {
+pub fn compute(
+    path: &Path,
+    default_branch_hint: Option<&str>,
+    blocking: &jobs::Blocking,
+) -> GitStatus {
     match wsl::classify(path) {
         wsl::Location::Wsl { distro, linux_path } => {
-            compute_wsl(&distro, &linux_path, default_branch_hint)
+            compute_wsl(&distro, &linux_path, default_branch_hint, blocking)
         },
         wsl::Location::Windows(_) => match compute_inner(path, default_branch_hint) {
             Ok(s) => s,
@@ -476,11 +519,17 @@ if [ -n "$base" ]; then git -C "$p" diff --numstat -z "$base...HEAD" 2>/dev/null
 
 /// One wsl.exe round trip per refresh tick.  Runs on `spawn_compute`'s
 /// worker thread, so the ~400 ms round trip never blocks paint.
-fn compute_wsl(distro: &str, linux_path: &str, hint: Option<&str>) -> GitStatus {
-    let stdout = match wsl::run_batch(distro, STATUS_SCRIPT, &[linux_path, hint.unwrap_or("")]) {
-        Ok(s) => s,
-        Err(e) => return GitStatus { error: Some(e), ..Default::default() },
-    };
+fn compute_wsl(
+    distro: &str,
+    linux_path: &str,
+    hint: Option<&str>,
+    blocking: &jobs::Blocking,
+) -> GitStatus {
+    let stdout =
+        match wsl::run_batch(distro, STATUS_SCRIPT, &[linux_path, hint.unwrap_or("")], blocking) {
+            Ok(s) => s,
+            Err(e) => return GitStatus { error: Some(e), ..Default::default() },
+        };
     let sections = wsl::split_sections(&stdout);
     let text = |i: usize| {
         sections.get(i).map(|s| String::from_utf8_lossy(s).trim().to_string()).unwrap_or_default()
@@ -651,6 +700,150 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_status_poll_reports_without_blocking_its_caller() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        // A bare `Repository::init` leaves HEAD unborn (no commit for it to
+        // point at), and `compute` never reports a branch for that; give it
+        // one so the background result has a branch to land.
+        let repo = crate::test_util::init_repo(dir.path());
+        drop(repo);
+
+        let ctx = egui::Context::default();
+        let mut cache = StatusCache::new(dir.path().to_path_buf());
+        // The first poll has nothing banked and must return anyway.
+        let started = Instant::now();
+        let _ = cache.poll(None, &ctx);
+        assert!(started.elapsed() < Duration::from_millis(50), "poll blocked its caller");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while cache.last().branch.is_none() && Instant::now() < deadline {
+            let _ = cache.poll(None, &ctx);
+            std::thread::yield_now();
+        }
+        assert!(cache.last().branch.is_some(), "the background compute never landed");
+    }
+
+    /// A panicked compute must not wedge the cache: without clearing
+    /// `pending` on `Job::failed`, `needs_refresh && self.pending.is_none()`
+    /// would refuse every future refresh for this worktree.
+    #[test]
+    fn a_failed_compute_clears_pending_so_a_future_poll_is_not_blocked() {
+        let mut cache = StatusCache::new(PathBuf::from("/doesnt/matter"));
+        let job = jobs::pool()
+            .spawn(jobs::Priority::Background, |_: &jobs::Blocking| -> GitStatus {
+                panic!("boom")
+            });
+        cache.pending = Some(Pending { hint: None, job });
+
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cache.pending.is_some() {
+            let _ = cache.poll(None, &ctx);
+            assert!(Instant::now() < deadline, "pending was never cleared after the job failed");
+            std::thread::yield_now();
+        }
+    }
+
+    /// The regression this guards: a failure that leaves the cache looking
+    /// never-refreshed is spawned again by the very next poll, and the pool
+    /// wakes a frame at every job end — so a compute that panics every time
+    /// would respawn at frame rate, burning a worker for as long as the panel
+    /// is open.  A compute that fails must not be retried more often than one
+    /// that succeeds.
+    #[test]
+    fn a_failed_compute_backs_off_as_far_as_a_successful_one() {
+        let job = jobs::pool()
+            .spawn(jobs::Priority::Background, |_: &jobs::Blocking| -> GitStatus {
+                panic!("boom")
+            });
+        // Latch the failure before the cache sees it, so the poll below reads
+        // a settled job rather than racing the worker.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !job.failed() {
+            assert!(job.poll().is_none(), "a panicking job never reports a value");
+            assert!(Instant::now() < deadline, "the failure was never observed");
+            std::thread::yield_now();
+        }
+
+        let mut cache = StatusCache::new(PathBuf::from("/doesnt/matter"));
+        cache.pending = Some(Pending { hint: None, job });
+        let ctx = egui::Context::default();
+
+        let _ = cache.poll(None, &ctx);
+        assert!(cache.pending.is_none(), "the poll that banks a failure must not start another");
+        assert!(!cache.has_status(), "a compute that failed knows nothing about the tree");
+        let _ = cache.poll(None, &ctx);
+        assert!(cache.pending.is_none(), "nor may the frames that follow it inside the interval");
+    }
+
+    /// The regression this guards: a cache entry exists from the moment the
+    /// git panel first renders a workspace, before its first compute lands
+    /// -- `has_status` must read `false` for that entry so a caller deciding
+    /// whether to trust `last()` doesn't mistake "never checked" for "known
+    /// clean" (an all-zero `GitStatus::default()`).
+    #[test]
+    fn has_status_is_false_until_a_compute_lands() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let repo = crate::test_util::init_repo(dir.path());
+        drop(repo);
+
+        let ctx = egui::Context::default();
+        let mut cache = StatusCache::new(dir.path().to_path_buf());
+        assert!(!cache.has_status(), "a fresh cache has never completed a compute");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cache.has_status() && Instant::now() < deadline {
+            let _ = cache.poll(None, &ctx);
+            std::thread::yield_now();
+        }
+        assert!(cache.has_status(), "the background compute never landed");
+    }
+
+    /// The regression this guards: a compute that lands but fails to open
+    /// the repository still sets `last_refreshed` (so `poll` doesn't retry
+    /// every frame), which must not let `has_status` read it as a known,
+    /// clean tree -- a caller deciding whether to force a destructive action
+    /// needs "don't know" to stay "don't know" through this path too.
+    #[test]
+    fn has_status_is_false_for_an_errored_compute() {
+        // Not a git repository, so `compute` lands an error rather than a
+        // status.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let ctx = egui::Context::default();
+        let mut cache = StatusCache::new(dir.path().to_path_buf());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while cache.last().error.is_none() && Instant::now() < deadline {
+            let _ = cache.poll(None, &ctx);
+            std::thread::yield_now();
+        }
+        assert!(cache.last().error.is_some(), "the background compute never landed an error");
+        assert!(!cache.has_status(), "an errored compute must not read as a known status");
+    }
+
+    #[test]
+    fn dirty_counts_come_from_a_status_the_panel_already_has() {
+        let status = GitStatus {
+            branch: Some("main".into()),
+            default_branch: None,
+            default_branch_resolved: None,
+            staged: vec![FileChange { path: "a".into(), kind: ChangeKind::Added }],
+            unstaged: vec![
+                FileChange { path: "b".into(), kind: ChangeKind::Modified },
+                FileChange { path: "c".into(), kind: ChangeKind::Untracked },
+                FileChange { path: "d".into(), kind: ChangeKind::Untracked },
+            ],
+            branch_diff: Vec::new(),
+            error: None,
+        };
+        let counts = DirtyCounts::from_status(&status);
+        assert_eq!(counts.staged, 1);
+        assert_eq!(counts.modified, 1);
+        assert_eq!(counts.untracked, 2);
+        assert!(counts.is_dirty());
+    }
+
+    #[test]
     fn parses_porcelain_v2_z() {
         let bytes = b"1 .M N... 100644 100644 100644 aaaa bbbb src/main.rs\0\
 1 A. N... 000000 100644 100644 0000 1111 new.rs\0\
@@ -661,24 +854,18 @@ u UU N... 100644 100644 100644 100644 e1 e2 e3 conflicted.rs\0\
 
         let staged_pairs: Vec<(&str, ChangeKind)> =
             staged.iter().map(|c| (c.path.as_str(), c.kind)).collect();
-        assert_eq!(
-            staged_pairs,
-            vec![
-                ("new.rs", ChangeKind::Added),
-                ("renamed.rs", ChangeKind::Renamed),
-                ("conflicted.rs", ChangeKind::Conflicted),
-            ]
-        );
+        assert_eq!(staged_pairs, vec![
+            ("new.rs", ChangeKind::Added),
+            ("renamed.rs", ChangeKind::Renamed),
+            ("conflicted.rs", ChangeKind::Conflicted),
+        ]);
 
         let unstaged_pairs: Vec<(&str, ChangeKind)> =
             unstaged.iter().map(|c| (c.path.as_str(), c.kind)).collect();
-        assert_eq!(
-            unstaged_pairs,
-            vec![
-                ("src/main.rs", ChangeKind::Modified),
-                ("untracked with space.txt", ChangeKind::Untracked),
-            ]
-        );
+        assert_eq!(unstaged_pairs, vec![
+            ("src/main.rs", ChangeKind::Modified),
+            ("untracked with space.txt", ChangeKind::Untracked),
+        ]);
     }
 
     #[test]

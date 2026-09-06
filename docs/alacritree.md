@@ -383,6 +383,38 @@ vsync              = true   # restart required — wait for the display's refres
                             # before showing a finished frame (default true).
                             # false presents each frame as soon as it is drawn,
                             # trading tearing for lower keystroke-to-screen delay
+focus_priority_boost = false  # Windows only, restart required — put the
+                              # session on screen one scheduling class above
+                              # normal (default false).
+                              # A program that redraws its line as you type
+                              # needs CPU for every keystroke, and at normal
+                              # priority a build saturating every core starves
+                              # it: nushell echoed in 10 ms boosted, against up
+                              # to 1.9 s unboosted. Covers the shell and
+                              # everything it starts, at any depth, including
+                              # commands that live only a moment. Follows
+                              # focus, and raises nothing while the window is
+                              # in the background
+async_session_spawn = false   # open a session's PTY on a worker rather than
+                              # in the frame that asked for it, so spawning
+                              # does not stutter (default false).
+                              # Creating a console process costs milliseconds
+                              # when the machine is idle and hundreds when it is
+                              # busy, and the frame pays all of it. The tab
+                              # appears at once and starts painting when its PTY
+                              # attaches; anything typed in between is replayed
+reap_descendants_on_close = false  # Windows only, restart required — when a
+                              # session closes, end everything it started at
+                              # any depth (default false).
+                              # The console reaps only the programs attached to
+                              # it, so a helper that left the console — an
+                              # editor's background search, anything started
+                              # detached — outlives the terminal and keeps
+                              # piling up. This also covers alacritree being
+                              # killed or crashing, since the kernel does the
+                              # reaping when the last handle closes. A process
+                              # that means to outlive the terminal must ask
+                              # with CREATE_BREAKAWAY_FROM_JOB
 search_scope       = "filtered"  # whether a sidebar search is confined by the
                                  # active toggle filters
                                  # "filtered" (default): a query narrows what
@@ -619,10 +651,12 @@ Two things worth knowing about what the schema does and does not do:
   but they are not flagged.
 - **Closed-value keys are completed.** `confirm_session_close`, `scrollbar`,
   `sidebar_focus`, `search_scope`, `sidebar_tooltips`, `last_session_close`,
-  `path_style.*` and `drop.quote` offer their accepted spellings. Keys where
-  Alacritty accepts more than one spelling for the same value — cursor `shape`
-  and `blinking`, binding `action` — are deliberately left unconstrained, so a
-  working config is never marked wrong.
+  `path_style.*` and `drop.quote` offer their accepted spellings. A binding's
+  `action` completes from every action alacritree implements but rejects
+  nothing, so an alacritty-only action still validates. Cursor `shape` and
+  `blinking`, where Alacritty accepts more than one spelling for the same
+  value, are deliberately left unconstrained, so a working config is never
+  marked wrong.
 
 [taplo]: https://taplo.tamasfe.dev/
 [ebt]: https://marketplace.visualstudio.com/items?itemName=tamasfe.even-better-toml
