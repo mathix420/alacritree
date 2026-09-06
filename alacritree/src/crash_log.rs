@@ -89,6 +89,24 @@ pub fn install(dir: &Path, version: &'static str) {
     }));
 }
 
+/// Point the recorder at `[debug] log_dir`, which is only known once the config
+/// has been read.  Not a second `install`: `install` wraps the previous panic
+/// hook, so a second call chains two hooks and records every panic twice.
+///
+/// Declines a directory it cannot secure, leaving the recorder on the one it
+/// has.  Declines once an artifact exists, so one process cannot end up with
+/// its records split across two directories.
+pub fn set_dir(dir: &Path) {
+    if let Err(e) = logdir::prepare_log_dir(dir) {
+        let _ = writeln!(std::io::stderr(), "alacritree: cannot secure {}: {e}", dir.display());
+        return;
+    }
+    let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+    if state.artifact.is_none() {
+        state.dir = Some(dir.to_path_buf());
+    }
+}
+
 pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
 }
@@ -668,6 +686,50 @@ mod tests {
 
             let entries: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().collect();
             assert!(entries.is_empty(), "wrote {} files while disabled", entries.len());
+        });
+    }
+
+    /// The whole reason `set_dir` exists: the hook is armed against the default
+    /// directory before the config that renames it has been read.
+    #[test]
+    fn a_configured_directory_takes_the_artifact() {
+        let configured = tempfile::tempdir().expect("a temp dir");
+
+        with_recorder(|default| {
+            set_dir(configured.path());
+
+            let _ = std::panic::catch_unwind(|| panic!("relocated"));
+
+            assert!(artifact_text().contains("relocated"));
+            assert!(
+                artifact_path_for_tests().is_some_and(|p| p.starts_with(configured.path())),
+                "the artifact did not follow the configured directory"
+            );
+            let left_behind: Vec<_> = std::fs::read_dir(default).unwrap().flatten().collect();
+            assert!(left_behind.is_empty(), "wrote {} files to the default dir", left_behind.len());
+        });
+    }
+
+    /// A process that has already written commits to where it wrote.  Proving
+    /// that needs the artifact removed underneath the recorder, since that is
+    /// the one path on which `ensure_artifact` consults the directory again
+    /// rather than reopening the file it remembers.
+    #[test]
+    fn a_directory_that_arrives_after_the_artifact_is_refused() {
+        let configured = tempfile::tempdir().expect("a temp dir");
+
+        with_recorder(|default| {
+            let _ = std::panic::catch_unwind(|| panic!("already-written"));
+            std::fs::remove_file(artifact_path_for_tests().expect("an artifact")).unwrap();
+
+            set_dir(configured.path());
+            let _ = std::panic::catch_unwind(|| panic!("after-the-move"));
+
+            assert!(artifact_text().contains("after-the-move"));
+            assert!(
+                artifact_path_for_tests().is_some_and(|p| p.starts_with(default)),
+                "a late directory change split one process's records across two directories"
+            );
         });
     }
 

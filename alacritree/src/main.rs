@@ -12,17 +12,24 @@ mod command_ext;
 mod command_palette;
 mod config;
 mod crash_log;
+mod decoration_sprites;
 mod digest;
 mod doppler;
 mod file_drop;
+mod focus_priority;
 mod fonts;
 mod frame_log;
 mod git_nav;
 mod git_status;
 mod glyph_cache;
+mod gpu_timing;
+mod grid_gl;
+mod grid_instances;
+mod herdr;
 mod ime;
 mod input;
 mod ipc;
+mod jobs;
 mod links;
 mod logdir;
 mod logging;
@@ -33,6 +40,8 @@ mod notify_macos;
 mod panel_filter;
 mod paste;
 mod path_style;
+mod pending_spawn;
+mod pr_query;
 mod pr_status;
 mod project_refresh;
 mod projects;
@@ -44,6 +53,7 @@ mod session;
 mod sidebar_focus;
 mod sidebar_nav;
 mod stale_exe;
+mod startup_log;
 mod state;
 #[cfg(test)]
 mod steady_state;
@@ -78,17 +88,31 @@ const WINDOW_ICON: &[u8] = include_bytes!("../assets/icon-256.png");
 /// terminal's console server.  WezTerm's blocks the child process for three
 /// seconds waiting on a device-attributes reply, which shows up as a multi-second
 /// stall opening any pane.
+///
+/// The first `LoadLibraryW` decides which module answers every later one, so
+/// this has to run before the first pseudoconsole opens.  `main` does it at
+/// startup and every pseudoconsole open repeats it, because a test binary has
+/// no `main` to do it for them.
 #[cfg(windows)]
 fn harden_dll_search_path() {
+    use std::sync::Once;
+
     use windows_sys::Win32::System::LibraryLoader::{
         LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, SetDefaultDllDirectories,
     };
 
-    // Failure only leaves the default search order in place, which is what we
-    // had before, so it is not worth refusing to start over.
-    if unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) } == 0 {
-        log::warn!("failed to restrict the DLL search path: {}", std::io::Error::last_os_error());
-    }
+    static HARDENED: Once = Once::new();
+
+    HARDENED.call_once(|| {
+        // Failure only leaves the default search order in place, which is what
+        // we had before, so it is not worth refusing to start over.
+        if unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) } == 0 {
+            log::warn!(
+                "failed to restrict the DLL search path: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    });
 }
 
 #[cfg(not(windows))]
@@ -116,19 +140,36 @@ fn main() -> eframe::Result<()> {
     // always goes to stderr, whether or not `persistent_logging` also tees it
     // to a file, leaving stdout to the reply.
     attach_parent_console();
-    if let Some(code) = cli::run(cli::Cli::parse()) {
+    let cli = cli::Cli::parse();
+    let config_dir = cli.config_dir.clone();
+    let log_file = cli.log_file.clone();
+    let options = cli.options.clone();
+    if let Some(code) = cli::run(cli) {
         std::process::exit(code);
     }
 
     // Only the GUI path records crashes.  Every subcommand exits before config
     // is read, so no gate could govern them, and `alacritree mcp` is a
     // long-lived loop that would write records nothing could disable.
-    let log_dir = logdir::log_dir();
-    if let Some(dir) = &log_dir {
+    let default_log_dir = logdir::log_dir();
+    if let Some(dir) = &default_log_dir {
         crash_log::install(dir, env!("CARGO_PKG_VERSION"));
     }
 
-    let config = config::load();
+    let (config, config_files) = config::load(config_dir.as_deref(), &options);
+
+    // `[debug] log_dir` cannot be known any earlier, so the hook above armed
+    // against the default directory and a panic in `config::load` lands there.
+    // Swapping now still precedes every artifact: `install` creates the
+    // directory but no file.
+    if let Some(dir) = &config.debug.log_dir {
+        crash_log::set_dir(dir);
+    }
+    let log_dir = config.debug.log_dir.clone().or(default_log_dir);
+
+    // Before the first session: the PTY threads read this without
+    // synchronizing against startup.
+    frame_log::set_enabled(config.debug.frame_log);
 
     // The gate defaults on so a panic in `config::load` above is still
     // recorded; that is the one case where `crash_log = false` leaves a file.
@@ -139,12 +180,31 @@ fn main() -> eframe::Result<()> {
     if let Some(dir) = &log_dir {
         logging::prune_session_logs(dir);
     }
-    if config.debug.persistent_logging
-        && let Some(dir) = &log_dir
-    {
-        *log_sink.lock().unwrap_or_else(|e| e.into_inner()) = logging::open_session_log(dir);
+    // `gpu_timing` and `frame_log` report through the log stream, and a
+    // GUI-subsystem binary has no console for stderr to reach.  Asking for a
+    // report has to open the file it lands in, or it is written where nothing
+    // can read it.  `--log-file` turns logging on by itself: a flag naming a
+    // file that then stays empty because a config key was off is the trap the
+    // flag exists to avoid.
+    let logging_to_file = log_file.is_some()
+        || config.debug.persistent_logging
+        || config.debug.gpu_timing
+        || frame_log::enabled();
+    if logging_to_file {
+        let opened = match &log_file {
+            Some(path) => logging::open_log_at(path),
+            None => log_dir.as_deref().and_then(logging::open_session_log),
+        };
+        *log_sink.lock().unwrap_or_else(|e| e.into_inner()) = opened;
     }
+    // After the sink rather than before it: everything logged while the sink is
+    // empty reaches stderr only, and a release build has no console for stderr
+    // to reach.
+    startup_log::emit(&config, &config_files, config_dir.as_deref(), logging_to_file);
 
+    if let Some(dir) = config.state_dir.clone() {
+        state::set_dir(dir);
+    }
     wsl::set_automount_root(config.wsl_automount_root.clone());
     wsl_helper::set_enabled(config.wsl_resident_helper);
     let translucent = config.window.opacity < 1.0;

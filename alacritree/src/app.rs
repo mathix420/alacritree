@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -12,45 +12,41 @@ use serde_json::{Value, json};
 
 use crate::bindings::{self, BindingAction, KeyBinding, NamedAction};
 use crate::clipboard::{self, Target};
-use crate::clipboard_image;
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
 use crate::config::{
-    BakedGlyph, Config, DEFAULT_ADD_ICON, DEFAULT_AGENT_ICON, DEFAULT_CLOSE_ICON,
-    DEFAULT_HOME_ICON, DEFAULT_PR_CLOSED_ICON, DEFAULT_PR_DRAFT_ICON, DEFAULT_PR_MERGED_ICON,
-    DEFAULT_PR_OPEN_ICON, DEFAULT_PROJECT_COLLAPSED_ICON, DEFAULT_PROJECT_EXPANDED_ICON,
-    DEFAULT_REFRESH_ICON, DEFAULT_REORDER_ICON, DEFAULT_SEARCH_ICON, DEFAULT_SESSION_ICON,
+    BakedGlyph, Config, DEFAULT_ADD_ICON, DEFAULT_AGENT_ICON, DEFAULT_BLOCKED_ICON,
+    DEFAULT_CLOSE_ICON, DEFAULT_HERDR_ICON, DEFAULT_HOME_ICON, DEFAULT_PR_CLOSED_ICON,
+    DEFAULT_PR_DRAFT_ICON, DEFAULT_PR_MERGED_ICON, DEFAULT_PR_OPEN_ICON,
+    DEFAULT_PROJECT_COLLAPSED_ICON, DEFAULT_PROJECT_EXPANDED_ICON, DEFAULT_REFRESH_ICON,
+    DEFAULT_REORDER_ICON, DEFAULT_SEARCH_ICON, DEFAULT_SESSION_ICON,
     DEFAULT_UPSTREAM_DIVERGED_ICON, DEFAULT_UPSTREAM_GONE_ICON, DEFAULT_UPSTREAM_LEVEL_ICON,
     DEFAULT_UPSTREAM_UNTRACKED_ICON, DEFAULT_WORKTREE_ICON, DEFAULT_WORKTREE_MAIN_ICON, FontConfig,
     IconStyle, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SearchScope, SidebarFocus,
-    SidebarTooltips, TextEmphasis, UiFont, profile_command,
+    SidebarTooltips, TextEmphasis, UiFont, UiTheme, profile_command,
 };
 use crate::crash_log::{self, ExitReason};
-use crate::doppler;
-use crate::file_drop;
 use crate::git_nav::{self, GitSection, SectionCount};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
-use crate::ipc;
 use crate::panel_filter::{self, PanelFilter};
-use crate::paste;
-use crate::path_style;
 use crate::path_style::PathStyle;
+use crate::pending_spawn::{Finished, PendingSpawns};
 use crate::pr_status::{self, PrCache, PrInfo, PrState};
 use crate::projects::{Project, Worktree, project_json};
-use crate::scratchpad;
 use crate::session::{
-    AttentionVerdict, Session, SessionActivity, SessionId, SessionKind, TermSize,
+    self, AttentionVerdict, LiveState, Session, SessionActivity, SessionId, SessionKind, TermSize,
     poll_attention_debounce,
 };
-use crate::sidebar_focus;
-use crate::sidebar_nav::{self, SidebarRow};
+use crate::sidebar_nav::{self, SidebarRow, StepTarget};
 use crate::state::{self, PersistedProject};
-use crate::terminal_view;
 use crate::upstream::UpstreamState;
 use crate::worktree::{self as wt, CreateRequest, Progress};
-use crate::worktree_liveness;
 use crate::wsl::{self, ShellChoice};
 use crate::wsl_helper::{self, WslProbe};
+use crate::{
+    clipboard_image, doppler, file_drop, herdr, ipc, jobs, paste, path_style, scratchpad,
+    sidebar_focus, terminal_view, worktree_liveness,
+};
 
 /// `None` is the home workspace (sessions inherit `$PWD`); `Some` is a worktree path.
 pub type WorkspaceKey = Option<PathBuf>;
@@ -93,6 +89,9 @@ struct Theme {
     upstream_diverged: Color32,
     upstream_gone: Color32,
     upstream_untracked: Color32,
+    /// Colors for a harness's own state vocabulary, mapped from the ANSI
+    /// palette the way the PR and upstream badges are.
+    harness_state: StateColors,
     /// Logical-pixel size for headings (titles like "Projects", "Git").
     /// `FontConfig::UI_HEADING_RATIO` of the terminal font size.
     font_heading: f32,
@@ -113,6 +112,32 @@ struct Theme {
     sidebar_tooltips: SidebarTooltips,
     /// Whether a sidebar button says what it does on hover.
     icon_tooltips: bool,
+    /// Where a row a sidebar scrolled to is parked; `None` is egui's own
+    /// minimal scroll.
+    scroll_align: Option<egui::Align>,
+}
+
+/// One color per [`StateTone`], since a harness names its states rather than
+/// its colors and alacritree owns the palette they land in.
+#[derive(Debug, Clone, Copy)]
+struct StateColors {
+    blocked: Color32,
+    working: Color32,
+    done: Color32,
+    idle: Color32,
+    unclear: Color32,
+}
+
+impl StateColors {
+    fn of(&self, tone: StateTone) -> Color32 {
+        match tone {
+            StateTone::Blocked => self.blocked,
+            StateTone::Working => self.working,
+            StateTone::Done => self.done,
+            StateTone::Idle => self.idle,
+            StateTone::Unclear => self.unclear,
+        }
+    }
 }
 
 /// Logical-pixel (normal, heading) sizes for UI text.  `[ui.font] size`
@@ -162,6 +187,13 @@ impl Theme {
             upstream_diverged: rgb_to_color32(config.palette.normal[3]), // yellow
             upstream_gone: rgb_to_color32(config.palette.normal[1]), // red
             upstream_untracked: rgb_to_color32(config.palette.normal[4]), // blue
+            harness_state: StateColors {
+                blocked: rgb_to_color32(config.palette.normal[1]), // red
+                working: rgb_to_color32(config.palette.normal[3]), // yellow
+                done: rgb_to_color32(config.palette.normal[6]),    // cyan, herdr's teal
+                idle: rgb_to_color32(config.palette.normal[2]),    // green
+                unclear: text_muted,
+            },
             font_heading,
             font_normal,
             ui_scale: font_normal / 11.25,
@@ -174,6 +206,7 @@ impl Theme {
             path_style: config.ui.path_style,
             sidebar_tooltips: config.ui.sidebar_tooltips,
             icon_tooltips: config.ui.icon_tooltips,
+            scroll_align: config.ui.sidebar_scroll_align.align(),
         }
     }
 }
@@ -468,6 +501,9 @@ pub struct AlacritreeApp {
     /// startup default; toggles flip these and are never persisted.
     session_rows_always: bool,
     session_tabs_always: bool,
+    /// Runtime copy of `[ui.session_reorder] drag`.  Like the display toggles
+    /// above, the config is only the startup default and nothing is persisted.
+    session_drag: bool,
     sidebar_cursor: Option<SidebarRow>,
     /// Reveals the project rows' drag grips.  A transient mode, not persisted:
     /// reordering is a rare, deliberate act, and a grip on every row the rest
@@ -478,6 +514,11 @@ pub struct AlacritreeApp {
     sidebar_auto_shown: bool,
     /// One-shot: scroll the cursor row into view on the next sidebar paint.
     sidebar_cursor_moved: bool,
+    /// The workspace and session the projects panel last scrolled to, so a
+    /// change is detected by comparison rather than by every writer of those
+    /// two fields remembering to raise a flag.  Written only once a scroll
+    /// actually fires, so a change whose row renders nowhere is retried.
+    last_followed: (WorkspaceKey, Option<SessionId>),
     /// Fuzzy-search query and `s`/`a` toggle state for the projects panel.
     /// Transient: never persisted, never touches the `expanded` flag.
     project_filter: PanelFilter,
@@ -538,6 +579,11 @@ pub struct AlacritreeApp {
     /// Worktrees already given a Doppler scope pass this app run, so opening
     /// more shells there doesn't re-invoke the doppler CLI.
     doppler_synced: HashSet<PathBuf>,
+    /// Fire-and-forget jobs whose result nothing reads — Doppler scope syncs,
+    /// image-cache sweeps, link opens.  Held anyway: dropping a `Job` cancels
+    /// work that has not started yet, and a submission followed immediately
+    /// by drop would race the pool for nothing.  Drained once a frame.
+    detached_jobs: Vec<jobs::Job<()>>,
     pending_session_close: Option<SessionId>,
     notify_rx: Receiver<SessionId>,
     /// Requests from IPC connection threads, drained once per frame.
@@ -549,20 +595,46 @@ pub struct AlacritreeApp {
     ime: crate::ime::Ime,
     color_glyphs: crate::color_glyph::ColorGlyphCache,
     glyph_cache: crate::glyph_cache::GlyphCache,
+    /// The `[font.normal]` face's own decoration metrics, parsed once when the
+    /// fonts were installed.  Nothing re-reads the file per frame.
+    face_metrics: crate::fonts::FaceMetrics,
     /// Scratch buffers the painter copies the visible grid into, so the
     /// terminal lock is released before any shape is built.
     grid_snapshot: crate::terminal_view::GridSnapshot,
-    /// Present only under `ALACRITREE_FRAME_LOG`; `None` is the normal run.
+    /// Buffers and GL objects for `[ui] gpu_grid`.  Held whether or not the
+    /// option is on: it allocates nothing until a frame writes to it, and
+    /// the GL side is built on the first paint that needs it.
+    gpu_grid: crate::grid_gl::GpuGrid,
+    /// Present only when frame timing was asked for; `None` is the normal run.
     frame_log: Option<crate::frame_log::FrameLog>,
     phases: crate::frame_log::Phases,
     /// How much of the frame in progress went to painting the terminal grid,
     /// as opposed to the sidebars and everything else sharing it.
     grid_paint: std::time::Duration,
+    /// Geometry of the terminal pane as `terminal_view` last painted it.  A
+    /// session spawned into an empty workspace is born at this size rather
+    /// than at a constant, so a shell fast enough to print before the first
+    /// paint prints into the grid it will keep.
+    last_pane_geometry: Option<(TermSize, (f32, f32))>,
     /// In-flight background re-discoveries, keyed by project root.  Neither
     /// backend may block paint: wsl.exe takes seconds while the distro VM
     /// boots, and git2 takes tens of milliseconds on a project with many
     /// worktrees.  Results are adopted in `poll_project_refreshes`.
     project_refreshes: crate::project_refresh::ProjectRefreshes,
+    /// Keeps each `project_refreshes` job alive on the pool: `jobs::Job`
+    /// cancels its work on drop, so this is what stands between a refresh and
+    /// having it cancelled the instant `refresh_project` returns.  Cleared
+    /// alongside `project_refreshes` as each result is adopted.
+    project_refresh_jobs: HashMap<PathBuf, jobs::Job<()>>,
+    /// PTYs opened on a worker, adopted in `poll_pending_spawns`.
+    pending_spawns: PendingSpawns,
+    /// Shared-view attaches whose herdr calls are running on the pool,
+    /// adopted in `poll_herdr_attach`.
+    pending_herdr_attach: Vec<PendingHerdrAttach>,
+    /// The shared view herdr was last focused for, and the call still on its
+    /// way, both owned by `sync_herdr_view_focus`.
+    herdr_focused_view: Option<SessionId>,
+    herdr_view_focus: Option<HerdrViewFocus>,
     /// Resolved absolute path of `delta` inside each WSL distro, so diff panes
     /// stop re-sourcing a login profile on every open.  Successes only: a miss
     /// is never stored, so installing delta mid-session is picked up later.
@@ -570,13 +642,13 @@ pub struct AlacritreeApp {
     /// In-flight delta discoveries, keyed by distro, mirroring
     /// `pending_project_refresh` — resolved off the UI thread, adopted in
     /// `wsl_delta_path`.
-    pending_delta: HashMap<String, Receiver<Option<String>>>,
+    pending_delta: HashMap<String, jobs::Job<Option<String>>>,
     /// Row styling only — never `Worktree::prunable`, which the delete flow
     /// reads to choose between removing a worktree and pruning it.
     liveness: worktree_liveness::LivenessCache,
-    /// The probe worker in flight, if any.  One at a time: a path slower than
+    /// The probe job in flight, if any.  One at a time: a path slower than
     /// the interval stretches freshness rather than queueing more work.
-    liveness_probe: Option<Receiver<Vec<(PathBuf, worktree_liveness::Liveness)>>>,
+    liveness_probe: Option<jobs::Job<Vec<(PathBuf, worktree_liveness::Liveness)>>>,
     /// When the user last gave the app an event.  Timed wake-ups are armed
     /// only just after one, so an app left open overnight goes fully quiet.
     last_input: Instant,
@@ -593,6 +665,9 @@ pub struct AlacritreeApp {
     sidebar_focus_written: Option<SidebarFocusWrite>,
     /// A close verdict the reconciler still owes the terminal.
     sidebar_deferred_close: Option<DeferredClose>,
+    /// The herdr servers this app talks to: the native side plus one per
+    /// running WSL distro, kept in step with which distros are up.
+    herdr_endpoints: herdr::Endpoints,
 }
 
 struct DeleteRequest {
@@ -600,12 +675,22 @@ struct DeleteRequest {
     worktree_path: PathBuf,
     worktree_name: String,
     branch: Option<String>,
-    dirty: DirtyCounts,
+    /// `None` until a count lands. The cache answers for a worktree the git
+    /// panel has shown; one never selected has to wait for the job.
+    dirty: Option<DirtyCounts>,
+    /// Fills `dirty` when the cache was cold.
+    dirty_job: Option<jobs::Job<DirtyCounts>>,
     /// The checkout dir is already gone; confirm prunes metadata instead of
     /// removing a directory.
     prunable: bool,
     /// Checkbox state for the prune dialog's "also delete branch".
     delete_branch: bool,
+    /// Whether this confirm's removal passes `--force`: preset `true` when
+    /// the dirty count is already known dirty (a warm cache, or a cold
+    /// probe that landed before the confirm), left `false` while the count
+    /// is unknown, and set `true` when reopening as the retry after an
+    /// unforced removal was refused by git.
+    force: bool,
 }
 
 /// An in-flight background delete/prune awaiting its git result.
@@ -613,15 +698,41 @@ struct DeleteTask {
     project_idx: usize,
     /// Marks the matching sidebar row with a spinner while the removal runs.
     worktree_path: PathBuf,
+    worktree_name: String,
+    branch: Option<String>,
+    dirty: Option<DirtyCounts>,
+    delete_branch: bool,
     /// Distinguishes the "prune" vs "delete" wording in a failure message.
     prunable: bool,
-    result_rx: Receiver<Result<(), String>>,
+    job: jobs::Job<Result<(), String>>,
 }
 
+/// What a create reports when its worker unwound instead of returning: the
+/// pool records only that a panic happened, and the step list stops wherever
+/// it got to.
+const CREATE_WORKER_PANICKED: &str = "the background worker panicked";
+
 enum CreateState {
-    Prompt { project_idx: usize, branch: String, error: Option<String> },
-    Running { project_idx: usize, branch: String, steps: Vec<String>, rx: Receiver<Progress> },
-    Done { project_idx: usize, steps: Vec<String>, result: Result<PathBuf, String> },
+    Prompt {
+        project_idx: usize,
+        branch: String,
+        error: Option<String>,
+    },
+    Running {
+        project_idx: usize,
+        branch: String,
+        steps: Vec<String>,
+        rx: Receiver<Progress>,
+        /// Kept alive so dropping it doesn't cancel the still-running create
+        /// on the pool.  `rx` carries the result, so the handle is polled
+        /// only for the failure latch a panicked create reports through.
+        job: jobs::Job<()>,
+    },
+    Done {
+        project_idx: usize,
+        steps: Vec<String>,
+        result: Result<PathBuf, String>,
+    },
 }
 
 /// A worktree creation the user minimized from the running modal: it keeps
@@ -633,6 +744,8 @@ struct BackgroundCreate {
     /// replaces it on refresh.
     branch: String,
     rx: Receiver<Progress>,
+    /// See `CreateState::Running::job`.
+    job: jobs::Job<()>,
 }
 
 /// The rename dialog, keyed by root rather than index: an IPC `remove_project`
@@ -655,8 +768,10 @@ struct ProjectRemoveState {
 struct BaseBranchPicker {
     worktree: PathBuf,
     query: String,
+    /// `None` until the listing lands; the picker opens before git answers.
     /// `Err` is what git said when listing failed (not a repo, WSL down…).
-    branches: Result<Vec<String>, String>,
+    branches: Option<Result<Vec<String>, String>>,
+    branches_job: Option<jobs::Job<Result<Vec<String>, String>>>,
     /// Auto-detected base shown on the "Auto" row.
     detected: Option<String>,
     cursor: usize,
@@ -667,6 +782,11 @@ struct BaseBranchPicker {
 /// list mid-drag can't drop onto the wrong project.
 #[derive(Clone)]
 struct DraggedProject(PathBuf);
+
+/// Drag-and-drop payload for reordering sessions.  Carries the id rather than
+/// a position so a spawn, close or reorder mid-drag can't retarget the drop.
+#[derive(Clone)]
+struct DraggedSession(SessionId);
 
 /// Which `git diff` flavor a sidebar click should open in delta.
 enum DiffSource {
@@ -718,9 +838,14 @@ fn git_row_diff_request(row: &git_nav::GitRow, base: Option<&str>) -> Option<Dif
 
 impl AlacritreeApp {
     pub fn new(cc: &CreationContext<'_>, config: Config) -> Self {
+        // A job's own closure cannot wake the loop when it unwinds, and the
+        // failure it reports is only ever read from a frame.
+        let waker_ctx = cc.egui_ctx.clone();
+        jobs::pool().set_waker(move || waker_ctx.request_repaint());
+
         let theme = Theme::from_config(&config);
 
-        let font_chain =
+        let (font_chain, face_metrics) =
             crate::fonts::install_terminal_fonts(&cc.egui_ctx, &config.font, &config.ui_font);
         let color_glyph_budget_mb = config.font.color_glyph_cache_mb;
 
@@ -800,9 +925,9 @@ impl AlacritreeApp {
                 // background discovery later swaps in via `poll_project_refreshes`.
                 let root = wsl::normalize_root(p.root.clone());
                 let mut project = match wsl::classify(&root) {
-                    wsl::Location::Windows(_) => {
-                        Project::discover(root, config.ui.upstream_status).project
-                    },
+                    wsl::Location::Windows(_) => jobs::on_this_thread(|blocking| {
+                        Project::discover(root, config.ui.upstream_status, blocking).project
+                    }),
                     wsl::Location::Wsl { .. } => Project::placeholder(root),
                 };
                 project.expanded = p.expanded;
@@ -839,10 +964,12 @@ impl AlacritreeApp {
             focus: PaneFocus::Terminal,
             session_rows_always: config.ui.session_display.sidebar_always,
             session_tabs_always: config.ui.session_display.tabs_always,
+            session_drag: config.ui.session_reorder.drag,
             sidebar_cursor: None,
             reorder_mode: false,
             sidebar_auto_shown: false,
             sidebar_cursor_moved: false,
+            last_followed: (None, None),
             project_filter: PanelFilter::new(project_filter_toggles(config.ui.pr_status)),
             git_filter: PanelFilter::new(GIT_FILTER_TOGGLES),
             search_scope: config.ui.search_scope,
@@ -876,6 +1003,7 @@ impl AlacritreeApp {
             pending_base_branch: None,
             pending_project_remove: None,
             doppler_synced: HashSet::new(),
+            detached_jobs: Vec::new(),
             pending_session_close: None,
             notify_rx,
             ipc_rx,
@@ -886,12 +1014,20 @@ impl AlacritreeApp {
                 font_chain,
                 color_glyph_budget_mb,
             ),
+            face_metrics,
             glyph_cache: crate::glyph_cache::GlyphCache::new(),
             grid_snapshot: crate::terminal_view::GridSnapshot::new(),
-            frame_log: crate::frame_log::FrameLog::from_env(),
+            gpu_grid: crate::grid_gl::GpuGrid::new(),
+            frame_log: crate::frame_log::FrameLog::start(),
             phases: crate::frame_log::Phases::new(),
             grid_paint: std::time::Duration::ZERO,
+            last_pane_geometry: None,
             project_refreshes: Default::default(),
+            project_refresh_jobs: HashMap::new(),
+            pending_spawns: Default::default(),
+            pending_herdr_attach: Vec::new(),
+            herdr_focused_view: None,
+            herdr_view_focus: None,
             wsl_delta_paths: HashMap::new(),
             pending_delta: HashMap::new(),
             liveness: Default::default(),
@@ -902,9 +1038,17 @@ impl AlacritreeApp {
             sidebar_anchor: None,
             sidebar_focus_written: None,
             sidebar_deferred_close: None,
+            herdr_endpoints: herdr::Endpoints::default(),
         };
 
         app.pr_cache.set_concurrency(pr_status_concurrency);
+
+        // The sidebar reads the distro list every frame and the registry
+        // answers most machines outright; only the `wsl.exe` fallback for a
+        // machine whose registry key is unreadable needs a thread of its own.
+        app.detached_jobs.push(jobs::pool().spawn(jobs::Priority::Background, |blocking| {
+            wsl::prime_distros_from_cli(blocking);
+        }));
 
         let wsl_indices: Vec<usize> = app
             .projects
@@ -990,10 +1134,11 @@ impl AlacritreeApp {
         let ctx = ctx.clone();
         let worker_root = root.clone();
         let upstream = self.config.ui.upstream_status;
-        std::thread::spawn(move || {
-            let _ = tx.send(Project::discover(worker_root, upstream));
+        let job = jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
+            let _ = tx.send(Project::discover(worker_root, upstream, blocking));
             ctx.request_repaint();
         });
+        self.project_refresh_jobs.insert(root.clone(), job);
         self.project_refreshes.start(root, rx);
     }
 
@@ -1018,8 +1163,8 @@ impl AlacritreeApp {
     /// leave it alone.
     fn poll_worktree_liveness(&mut self, ctx: &Context, probing: bool, drawn: &[PathBuf]) {
         let now = Instant::now();
-        match self.liveness_probe.as_ref().map(Receiver::try_recv) {
-            Some(Ok(results)) => {
+        match self.liveness_probe.as_ref().map(|job| (job.poll(), job.failed())) {
+            Some((Some(results), _)) => {
                 self.liveness.adopt(results, now);
                 self.liveness_probe = None;
                 // This runs after the rows painted, so the answers that just
@@ -1028,29 +1173,36 @@ impl AlacritreeApp {
                 // all once the grace window has closed.
                 ctx.request_repaint();
             },
-            // A worker still running is the backpressure: a path slower than
+            // A job still running is the backpressure: a path slower than
             // the interval stretches freshness instead of stacking up probes,
             // and its own `request_repaint` brings us back here.
-            Some(Err(TryRecvError::Empty)) => return,
-            Some(Err(TryRecvError::Disconnected)) => self.liveness_probe = None,
+            Some((None, false)) => return,
+            // A panicked probe adopts nothing, and an interval that never
+            // restarts leaves `wants_probe` true: the next frame starts
+            // another batch, and the pool wakes a frame at every job end, so
+            // a probe that fails every time would run at frame rate.  An
+            // empty round restarts the interval the same way.
+            Some((None, true)) => {
+                self.liveness_probe = None;
+                self.liveness.adopt(Vec::new(), now);
+            },
             None => {},
         }
 
         if probing {
             let batch = self.liveness.batch(drawn);
             if batch.is_empty() {
-                // No worker will land to close the interval, so close it here.
+                // No job will land to close the interval, so close it here.
                 self.liveness.adopt(Vec::new(), now);
             } else {
-                let (tx, rx) = mpsc::channel();
                 let ctx = ctx.clone();
-                std::thread::spawn(move || {
-                    let results =
+                let job = jobs::pool().spawn(jobs::Priority::Background, move |_blocking| {
+                    let results: Vec<_> =
                         batch.iter().map(|p| (p.clone(), worktree_liveness::probe(p))).collect();
-                    let _ = tx.send(results);
                     ctx.request_repaint();
+                    results
                 });
-                self.liveness_probe = Some(rx);
+                self.liveness_probe = Some(job);
                 return;
             }
         }
@@ -1082,7 +1234,9 @@ impl AlacritreeApp {
     fn poll_project_refreshes(&mut self) {
         let sessions = &self.sessions;
         let projects = &mut self.projects;
+        let refresh_jobs = &mut self.project_refresh_jobs;
         self.project_refreshes.poll(|root, found| {
+            refresh_jobs.remove(root);
             match projects.iter_mut().find(|p| p.root == *root) {
                 Some(project) => {
                     let occupied: HashSet<PathBuf> =
@@ -1095,6 +1249,87 @@ impl AlacritreeApp {
         });
     }
 
+    /// Push a session record and get its PTY opened: inline when the gate is
+    /// off, on the job pool when it is on.  The record exists before this
+    /// returns either way, so a caller can activate the tab without waiting
+    /// for a shell.  Callers own `active_session`; this owns `self.sessions`.
+    fn open_session(
+        &mut self,
+        session: Session,
+        request: session::OpenRequest,
+    ) -> std::io::Result<SessionId> {
+        let id = session.id;
+        self.sessions.push(session);
+
+        if !self.config.ui.async_session_spawn {
+            match session::open(request) {
+                Ok(attachment) => {
+                    let idx = self.sessions.iter().position(|s| s.id == id).expect("just pushed");
+                    self.sessions[idx].attach(attachment);
+                    return Ok(id);
+                },
+                Err(e) => {
+                    // The record went in before the open, so it comes back out
+                    // before the error does: with the gate off, a caller that
+                    // gets `Err` must see no trace of the session.
+                    self.sessions.retain(|s| s.id != id);
+                    return Err(e);
+                },
+            }
+        }
+
+        // Interactive: an empty pane is on screen until this lands.  The pool
+        // repaints once the job returns, so nothing here has to — without that
+        // the result would wait for whatever wakes the loop next, which under
+        // load is the shell's own first output seconds later.
+        let job = jobs::pool()
+            .spawn(jobs::Priority::Interactive, move |_blocking| session::open(request));
+        self.pending_spawns.start(id, job);
+        Ok(id)
+    }
+
+    /// Adopt every PTY that finished opening.  A session whose record is gone
+    /// was closed while it was opening: dropping the attachment shuts its
+    /// shell down rather than resurrecting the tab.
+    fn poll_pending_spawns(&mut self, ctx: &Context) {
+        for finished in self.pending_spawns.take_finished() {
+            match finished {
+                Finished::Opened(id, attachment, waiters) => {
+                    match self.sessions.iter().position(|s| s.id == id) {
+                        Some(idx) => {
+                            let started = Instant::now();
+                            self.sessions[idx].attach(attachment);
+                            crate::frame_log::spawn_phase(Some(id), "attach", started.elapsed());
+                            PendingSpawns::answer(waiters, Ok(json!({ "session_id": id })));
+                        },
+                        None => {
+                            drop(attachment);
+                            PendingSpawns::answer(
+                                waiters,
+                                Err("the session was closed while its shell was starting".into()),
+                            );
+                        },
+                    }
+                },
+                Finished::Failed(id, e, waiters) => {
+                    // The workspace comes off the record rather than off the
+                    // pending entry: `move_session_to_key` can re-key a
+                    // session while its PTY is opening.
+                    let ws = self
+                        .sessions
+                        .iter()
+                        .find(|s| s.id == id)
+                        .map(|s| s.working_directory.clone());
+                    if let Some(ws) = ws {
+                        self.close_session_with(ctx, id, CloseReason::SpawnFailed);
+                        self.report_spawn_failure(ctx, &ws, &e);
+                    }
+                    PendingSpawns::answer(waiters, Err(format!("failed to spawn shell: {e}")));
+                },
+            }
+        }
+    }
+
     fn spawn_session(
         &mut self,
         ctx: &Context,
@@ -1102,6 +1337,29 @@ impl AlacritreeApp {
     ) -> std::io::Result<SessionId> {
         let (shell, wsl_probe) = self.resolve_shell(&working_directory);
         self.spawn_session_with_shell(ctx, working_directory, shell, wsl_probe)
+    }
+
+    /// The geometry to open a PTY at, so it is born at the size it will keep.
+    /// Under the gate this matters: a session that opened at 80x24 and was
+    /// resized on attach makes a fast child print its first output into a grid
+    /// that is about to be reflowed under it.  Three tiers, most exact first:
+    /// the active session's own numbers when one exists; the terminal pane's
+    /// last painted size when it doesn't, which covers a respawn after
+    /// `close_session` removes the active entry before the replacement spawns;
+    /// 80x24 when neither is available, which only the constructor reaches,
+    /// since no frame has painted yet to leave a better number behind.  Never
+    /// `self.sessions.last()`, an arbitrary session possibly in another
+    /// workspace at a different pane size.
+    fn next_spawn_geometry(&self) -> (TermSize, (f32, f32)) {
+        let active = self.active_session_index().map(|idx| {
+            let session = &self.sessions[idx];
+            ActiveGeometry {
+                size: session.size,
+                cell_size: session.cell_size,
+                is_scratchpad: session.scratchpad.is_some(),
+            }
+        });
+        spawn_geometry(active, self.last_pane_geometry)
     }
 
     /// The one path every shell reaches, which is why the checkout guard and
@@ -1117,7 +1375,7 @@ impl AlacritreeApp {
     ) -> std::io::Result<SessionId> {
         if let Some(dir) = &working_directory {
             // A checkout git has forgotten is refused here rather than in
-            // `Session::spawn`, which can only see whether the directory
+            // `session::open`, which can only see whether the directory
             // exists — a half-finished `git worktree remove` leaves one that
             // does.  Refusing here is what keeps the greyed row's promise.
             if self.worktree_gone(dir) {
@@ -1126,23 +1384,174 @@ impl AlacritreeApp {
                     format!("worktree is no longer checked out: {}", dir.display()),
                 ));
             }
-            // Before the PTY exists, so the shell can't race `doppler run`
-            // against the scope write.
+            // Called synchronously, so the once-per-worktree guard is set
+            // before a second rapid spawn for the same worktree can see it
+            // unset. The scope mirror itself runs off-thread, so a shell in
+            // a worktree git already knows about can still start before the
+            // mirrored scopes land, racing `doppler run` against the write.
+            // That costs one retryable "You must specify a project" failure,
+            // not lost work.
             self.sync_doppler_scopes(dir.clone());
         }
-        let session = Session::spawn(
+        let (size, cell_size) = self.next_spawn_geometry();
+        let (session, request) = Session::pending_shell(
             ctx.clone(),
             &self.config,
             working_directory.clone(),
-            TermSize::new(80, 24),
-            (8.0, 16.0),
+            size,
+            cell_size,
             shell,
             wsl_probe,
-        )?;
-        let id = session.id;
-        self.sessions.push(session);
+        );
+        let id = self.open_session(session, request)?;
         self.active_session.insert(working_directory, id);
         Ok(id)
+    }
+
+    /// Opens a herdr agent in a session running herdr's attach client.  The
+    /// session is an ordinary shell, so nothing in the grid or input path
+    /// treats it specially; only the key marks it as this agent's row.
+    /// Returns whether the attach succeeded so the caller can switch
+    /// `current_workspace` to `workspace` first and restore it on failure —
+    /// the same replace-and-restore shape `spawn_shell_request` uses, needed
+    /// here for the same reason: a refusal is only readable in the
+    /// workspace it happened in.
+    fn attach_herdr_agent(
+        &mut self,
+        ctx: &Context,
+        key: herdr::HerdrKey,
+        pane_id: &str,
+        workspace: WorkspaceKey,
+    ) -> bool {
+        if let Some(id) = self.herdr_session_for(&key) {
+            self.activate_session_by_id(id);
+            return true;
+        }
+        if herdr::can_attach(&key.side) {
+            // Nothing to ask herdr first: the pane id is the whole target,
+            // and the client attaches to it directly.
+            let args = herdr::attach_args(pane_id);
+            let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+            let (program, argv) = key.side.command(&borrowed);
+            return self.open_herdr_session(ctx, key, workspace, program, argv);
+        }
+
+        // Every one of herdr's app clients draws the same focused pane, so a
+        // shared view shows a row's pane only while herdr is focused there.
+        // The attach focuses it so the first frame is already right, and
+        // `sync_herdr_view_focus` focuses it again whenever the session comes
+        // back up, which is what lets a side hold one session per row.
+        if self.pending_herdr_attach.iter().any(|pending| pending.key == key) {
+            return true;
+        }
+        // The gesture is two herdr processes whatever `async_session_spawn`
+        // says, and running them from the click would hold the frame for as
+        // long as herdr takes to answer.
+        let name = self.herdr_session_name(&key.side);
+        let side = key.side.clone();
+        let pane = pane_id.to_string();
+        let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
+            herdr_attach_gesture(&side, &pane, name)
+        });
+        self.pending_herdr_attach.push(PendingHerdrAttach { job, key, workspace });
+        true
+    }
+
+    /// Adopt the shared-view attaches whose herdr calls have landed.  Each
+    /// session opens in the workspace its own click came from, which that
+    /// click switched to before handing the gesture over.
+    fn poll_herdr_attach(&mut self, ctx: &Context) {
+        let mut running = Vec::new();
+        for pending in std::mem::take(&mut self.pending_herdr_attach) {
+            match pending.job.poll() {
+                Some(Ok((program, argv))) => {
+                    self.open_herdr_session(ctx, pending.key, pending.workspace, program, argv);
+                },
+                Some(Err(e)) => self.error_dialog = Some(e),
+                None if pending.job.failed() => {
+                    self.error_dialog = Some("the herdr attach did not finish".to_string());
+                },
+                None => running.push(pending),
+            }
+        }
+        self.pending_herdr_attach = running;
+    }
+
+    /// Open the session that runs an attach client.  A shared view starts on
+    /// the pane the gesture just focused, so herdr is already where the new
+    /// session's row says it is and no second focus is owed.
+    fn open_herdr_session(
+        &mut self,
+        ctx: &Context,
+        key: herdr::HerdrKey,
+        workspace: WorkspaceKey,
+        program: String,
+        argv: Vec<String>,
+    ) -> bool {
+        let shared_view = !herdr::can_attach(&key.side);
+        // `alacritty_terminal::tty::Shell`'s fields are crate-private, so
+        // this goes through the constructor rather than a struct literal.
+        let shell = Shell::new(program, argv);
+        match self.spawn_session_with_shell(ctx, workspace, Some(shell), None) {
+            Ok(id) => {
+                if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
+                    session.herdr_key = Some(key);
+                }
+                if shared_view {
+                    self.herdr_focused_view = Some(id);
+                }
+                true
+            },
+            Err(e) => {
+                self.error_dialog = Some(format!("failed to attach herdr agent: {e}"));
+                false
+            },
+        }
+    }
+
+    /// Keep herdr focused on the pane the visible shared view stands for.
+    ///
+    /// herdr's app clients all render one shared state, so several shared
+    /// views on a side draw the same pane at any moment.  Asking herdr to
+    /// focus the pane of whichever one the user is looking at is what makes
+    /// them behave as one session per agent: the visible one is right, and
+    /// the rest are off screen.
+    ///
+    /// One call at a time, and the tracker moves only once herdr has answered
+    /// — two focuses in flight would land in whatever order herdr finished
+    /// them in.  A refusal still moves it, so a herdr that keeps saying no
+    /// costs one call rather than one per frame.
+    fn sync_herdr_view_focus(&mut self) {
+        if let Some(pending) = self.herdr_view_focus.take() {
+            match pending.job.poll() {
+                Some(result) => {
+                    if let Err(e) = result {
+                        log::warn!("{e}");
+                    }
+                    self.herdr_focused_view = Some(pending.session);
+                },
+                None if pending.job.failed() => self.herdr_focused_view = Some(pending.session),
+                None => self.herdr_view_focus = Some(pending),
+            }
+            return;
+        }
+        let Some(id) = self.active_session.get(&self.current_workspace).copied() else {
+            return;
+        };
+        let key = self.sessions.iter().find(|s| s.id == id).and_then(|s| s.herdr_key.clone());
+        if !needs_view_focus(key.as_ref(), id, self.herdr_focused_view) {
+            return;
+        }
+        let Some(key) = key else { return };
+        let Some(pane_id) =
+            self.find_herdr_agent(&key.side, &key.terminal_id).map(|agent| agent.pane_id.clone())
+        else {
+            return;
+        };
+        let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
+            herdr::focus_agent(&key.side, &pane_id)
+        });
+        self.herdr_view_focus = Some(HerdrViewFocus { session: id, job });
     }
 
     fn toggle_scratchpad_tab(&mut self, ctx: &Context) {
@@ -1201,10 +1610,12 @@ impl AlacritreeApp {
         let Some(main_checkout) = main_checkout else {
             return;
         };
-        let linked = doppler::mirror_scopes(&main_checkout, &worktree);
-        if linked > 0 {
-            log::info!("linked {linked} doppler scope(s) into {}", worktree.display());
-        }
+        self.detached_jobs.push(jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
+            let linked = doppler::mirror_scopes(&main_checkout, &worktree, blocking);
+            if linked > 0 {
+                log::info!("linked {linked} doppler scope(s) into {}", worktree.display());
+            }
+        }));
     }
 
     /// Spawn a named profile into the current workspace, bypassing the
@@ -1240,10 +1651,11 @@ impl AlacritreeApp {
         self.spawn_session_with_shell(ctx, ws, shell, wsl_probe)
     }
 
-    /// Shell for a workspace; `None` means "no override" — `Session::spawn`
-    /// falls through to alacritty's config-driven shell with its
-    /// OS-guaranteed fallback.  The home tab (`None` workspace) has no
-    /// project or location, so only the default profile can apply there.
+    /// Shell for a workspace; `None` means "no override" —
+    /// `Session::pending_shell` falls through to alacritty's config-driven
+    /// shell with its OS-guaranteed fallback.  The home tab (`None`
+    /// workspace) has no project or location, so only the default profile can
+    /// apply there.
     fn resolve_shell(&self, workspace: &WorkspaceKey) -> (Option<Shell>, Option<WslProbe>) {
         let path = workspace.as_deref();
         let choice = path.and_then(|p| {
@@ -1325,7 +1737,7 @@ impl AlacritreeApp {
     /// workspace either navigated away in `close_session` or shows the
     /// "no session" placeholder.
     fn adopt_active_session(&mut self) {
-        let ws_idx = self.workspace_session_indices(&self.current_workspace);
+        let ws_idx = self.workspace_display_indices(&self.current_workspace);
         if let Some(&idx) = ws_idx.first() {
             let id = self.sessions[idx].id;
             self.active_session.insert(self.current_workspace.clone(), id);
@@ -1335,10 +1747,16 @@ impl AlacritreeApp {
     }
 
     fn close_session(&mut self, ctx: &Context, id: SessionId) {
+        self.close_session_with(ctx, id, CloseReason::User);
+    }
+
+    fn close_session_with(&mut self, ctx: &Context, id: SessionId, reason: CloseReason) {
         let Some(idx) = self.sessions.iter().position(|s| s.id == id) else {
             return;
         };
         let workspace = self.sessions[idx].working_directory.clone();
+        let policy = self.config.ui.last_session_close;
+        let ring = policy.rings().then(|| self.session_ring()).unwrap_or_default();
         self.sessions.remove(idx);
 
         let remaining: Vec<(WorkspaceKey, SessionId)> =
@@ -1358,12 +1776,24 @@ impl AlacritreeApp {
         // Closing the on-screen workspace's last session must not strand the
         // view on an empty pane. What happens instead is policy: `respawn`
         // recycles a shell in place (the last session is by design
-        // unclosable), `navigate` falls back to the project main, then home.
+        // unclosable), `navigate` falls back to the project main, then home,
+        // and the ring policies land on the nearest surviving session in the
+        // flat session ring instead.
         let main = workspace.as_deref().and_then(|p| project_main_for(&self.projects, p));
-        let verdict = close_fallback(&workspace, &self.current_workspace, &remaining, main);
-        if verdict != CloseFallback::Stay
-            && self.config.ui.last_session_close == LastSessionClose::Respawn
-        {
+        let mut verdict = close_navigation(
+            reason,
+            close_fallback(&workspace, &self.current_workspace, &remaining, main),
+        );
+        if verdict != CloseFallback::Stay && policy.rings() {
+            let prefer = policy
+                .prefers_project()
+                .then(|| sidebar_nav::project_of(&self.projects, &workspace))
+                .flatten();
+            if let Some((_, landing)) = ring_landing(&ring, &[id], prefer) {
+                verdict = CloseFallback::ActivateSession(landing);
+            }
+        }
+        if verdict != CloseFallback::Stay && policy == LastSessionClose::Respawn {
             if let Err(e) = self.spawn_session(ctx, workspace.clone()) {
                 self.report_spawn_failure(ctx, &workspace, &e);
             }
@@ -1380,8 +1810,8 @@ impl AlacritreeApp {
         self.apply_close_fallback(ctx, verdict);
     }
 
-    /// Act on a close verdict: stay put, move to the project's main checkout,
-    /// or go home.
+    /// Act on a removal verdict: stay put, move to the project's main
+    /// checkout, move to a session the ring chose, or go home.
     fn apply_close_fallback(&mut self, ctx: &Context, verdict: CloseFallback) {
         match verdict {
             CloseFallback::Stay => {},
@@ -1389,6 +1819,10 @@ impl AlacritreeApp {
                 self.activate_worktree(ctx, &main);
                 // Adopting an existing idle session produces no PTY event, so
                 // nothing else would wake the paint that shows it.
+                ctx.request_repaint();
+            },
+            CloseFallback::ActivateSession(id) => {
+                self.activate_session_by_id(id);
                 ctx.request_repaint();
             },
             CloseFallback::Home => {
@@ -1402,7 +1836,7 @@ impl AlacritreeApp {
         let Some(session) = self.sessions.iter().find(|s| s.id == id) else {
             return;
         };
-        if self.config.ui.confirm_session_close.requires_prompt(session.is_busy()) {
+        if close_needs_prompt(&self.config.ui, session.herdr_key.is_some(), session.is_busy()) {
             self.pending_session_close = Some(id);
         } else {
             self.close_session(ctx, id);
@@ -1430,26 +1864,56 @@ impl AlacritreeApp {
         // refresh should still get the prune flow, not a doomed
         // `git worktree remove`.
         let prunable = wt.prunable || worktree_liveness::is_gone(&wt.path);
+        // A missing dir has nothing to be dirty; skip the status probe. A
+        // worktree the git panel has already completed a compute for answers
+        // from that cache instead of walking the tree again — a cache entry
+        // with no compute yet (the panel's first frame for this workspace)
+        // is `GitStatus::default()`, indistinguishable from "known clean",
+        // so it is not read as an answer. A cold one waits on a job so the
+        // dialog opens at once and fills in.
+        //
+        // A resolved dirty count preloads `force` so a known-dirty tree goes
+        // straight to a forced removal, as it always has — the unforced
+        // first attempt is reserved for a genuinely unknown count, where
+        // git's own refusal decides instead.
+        let (dirty, dirty_job, force) = if prunable {
+            (Some(DirtyCounts::default()), None, false)
+        } else if let Some(counts) = self
+            .git_status
+            .get(&wt.path)
+            .filter(|cache| cache.has_status())
+            .map(|cache| DirtyCounts::from_status(cache.last()))
+        {
+            let force = counts.is_dirty();
+            (Some(counts), None, force)
+        } else {
+            let path = wt.path.clone();
+            let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
+                git_status::dirty_counts(&path, blocking)
+            });
+            (None, Some(job), false)
+        };
         self.pending_delete = Some(DeleteRequest {
             project_idx,
             worktree_path: wt.path.clone(),
             worktree_name: wt.name.clone(),
             branch: wt.branch.clone(),
-            // A missing dir has nothing to be dirty; skip the status probe.
-            dirty: if prunable {
-                DirtyCounts::default()
-            } else {
-                git_status::dirty_counts(&wt.path)
-            },
+            dirty,
+            dirty_job,
             prunable,
             delete_branch: true,
+            force,
         });
     }
 
-    /// Re-home `id` to `target`'s workspace.  A re-keying only: the PTY, its
-    /// threads, and the scrollback are untouched — the session must survive
-    /// a move the same way it survives a workspace switch.
-    fn move_session_to(&mut self, id: SessionId, target: PathBuf) -> Result<WorkspaceKey, String> {
+    /// Re-key `id` to `target`, repairing both workspaces' active-session
+    /// entries and following the move with the view when the session was the
+    /// one on screen.
+    fn move_session_to_key(
+        &mut self,
+        id: SessionId,
+        target: WorkspaceKey,
+    ) -> Result<WorkspaceKey, String> {
         let idx = self
             .sessions
             .iter()
@@ -1458,8 +1922,13 @@ impl AlacritreeApp {
         if matches!(&self.sessions[idx].kind, SessionKind::Scratchpad { .. }) {
             return Err("scratchpads belong to their backing workspace and cannot be moved".into());
         }
+        // A workspace's diff pane is found by workspace plus kind, so a pane
+        // carried elsewhere becomes the one the next git click closes while
+        // the workspace it left opens a second.
+        if matches!(&self.sessions[idx].kind, SessionKind::Diff { .. }) {
+            return Err("diff panes belong to the workspace they were opened from".into());
+        }
         let source = self.sessions[idx].working_directory.clone();
-        let target: WorkspaceKey = Some(target);
         if source == target {
             return Ok(target);
         }
@@ -1533,13 +2002,181 @@ impl AlacritreeApp {
         }
     }
 
-    fn workspace_session_indices(&self, ws: &WorkspaceKey) -> Vec<usize> {
+    /// The sessions of `ws` a reorder may move, in the order they are drawn.
+    ///
+    /// A session attached to a harness pane is not among them: its place in
+    /// the sidebar is the pane's place in the harness, which alacritree does
+    /// not own and cannot write back.  Moving one inside `self.sessions`
+    /// would change nothing on screen and quietly change the tab order, so
+    /// every reorder path reads its subject and its landing slots from here.
+    fn workspace_reorder_indices(&self, ws: &WorkspaceKey) -> Vec<usize> {
         self.sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.working_directory == *ws && s.herdr_key.is_none())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// `ws`'s sessions in the order the sidebar and the tab strip draw them:
+    /// alacritree's own first, then the harness-backed ones in the harness's
+    /// order.  Every ring the user steps through is built from here, so a
+    /// press walks the list on screen rather than the order the sessions
+    /// happened to open in — the two part company as soon as a harness pane
+    /// is attached out of the harness's own order.
+    fn workspace_display_indices(&self, ws: &WorkspaceKey) -> Vec<usize> {
+        let mut indices: Vec<usize> = self
+            .sessions
             .iter()
             .enumerate()
             .filter(|(_, s)| s.working_directory == *ws)
             .map(|(i, _)| i)
+            .collect();
+        indices.sort_by_key(|i| match self.sessions[*i].herdr_key.clone() {
+            Some(key) => (1, self.herdr_pane_index(&key).unwrap_or(usize::MAX)),
+            None => (0, 0),
+        });
+        indices
+    }
+
+    /// The workspaces a reorder may use: those the app is willing to switch
+    /// to, minus any whose delete is already running.  A session landing on a
+    /// spinner row is a session that delete is about to reap.
+    fn reorderable_workspaces(&self) -> Vec<WorkspaceKey> {
+        self.workspace_order()
+            .into_iter()
+            .filter(|ws| match ws {
+                None => true,
+                Some(path) => !self.pending_deletes.iter().any(|t| t.worktree_path == *path),
+            })
             .collect()
+    }
+
+    /// The workspace a session sits in, and the workspaces a reorder may carry
+    /// it through.  A scratchpad or diff pane belongs to its workspace, so its
+    /// range is that workspace alone whatever the scope says — the keyboard and
+    /// the mouse both read the rule from here so neither can offer a landing
+    /// the move would refuse.
+    fn reorder_range(&self, id: SessionId) -> Option<(WorkspaceKey, Vec<WorkspaceKey>)> {
+        let idx = self.sessions.iter().position(|s| s.id == id)?;
+        let origin = self.sessions[idx].working_directory.clone();
+        if matches!(
+            &self.sessions[idx].kind,
+            SessionKind::Scratchpad { .. } | SessionKind::Diff { .. }
+        ) {
+            return Some((origin.clone(), vec![origin]));
+        }
+        let range = sidebar_nav::move_range(
+            &self.projects,
+            &self.reorderable_workspaces(),
+            &origin,
+            self.config.ui.session_reorder.scope,
+        );
+        Some((origin, range))
+    }
+
+    /// Walk `id` to `position` among its own workspace's sessions.
+    fn reorder_session_within_workspace(&mut self, id: SessionId, position: usize) {
+        let Some(abs) = self.sessions.iter().position(|s| s.id == id) else { return };
+        let ws = self.sessions[abs].working_directory.clone();
+        let indices = self.workspace_reorder_indices(&ws);
+        let Some(j) = indices.iter().position(|i| *i == abs) else { return };
+        for (a, b) in walk_swaps(&indices, j, position) {
+            self.sessions.swap(a, b);
+        }
+    }
+
+    /// Apply a decided move: change the workspace first when the target is a
+    /// different one, then walk the session to its position there.  Reports the
+    /// workspace the session actually ended up in, or `None` when the move was
+    /// refused and the session stayed where it was.
+    fn apply_session_move(&mut self, id: SessionId, target: StepTarget) -> Option<WorkspaceKey> {
+        let abs = self.sessions.iter().position(|s| s.id == id)?;
+        let landed_in = if self.sessions[abs].working_directory == target.workspace {
+            target.workspace
+        } else {
+            self.move_session_to_key(id, target.workspace).ok()?
+        };
+        self.reorder_session_within_workspace(id, target.position);
+        Some(landed_in)
+    }
+
+    /// Apply a mouse drop, whose slot arithmetic `drop_position` decides.
+    fn apply_session_drop(&mut self, id: SessionId, workspace: WorkspaceKey, insert_before: usize) {
+        let Some(abs) = self.sessions.iter().position(|s| s.id == id) else { return };
+        // A harness owns this pane's place, so there is no slot to drop it
+        // into and no arithmetic to do.
+        if self.sessions[abs].herdr_key.is_some() {
+            return;
+        }
+        let same_workspace = self.sessions[abs].working_directory == workspace;
+        let indices = self.workspace_reorder_indices(&workspace);
+        let from = indices.iter().position(|i| *i == abs).unwrap_or(indices.len());
+        let Some(position) = drop_position(same_workspace, indices.len(), from, insert_before)
+        else {
+            return;
+        };
+        if same_workspace {
+            self.reorder_session_within_workspace(id, position);
+        } else {
+            let _ = self.apply_session_move(id, StepTarget { workspace, position });
+        }
+    }
+
+    /// One `MoveSessionUp` / `MoveSessionDown` press.  Every refusal is a
+    /// silent no-op: a clamped end, a boundary the scope forbids, a scratchpad
+    /// asked to leave its workspace.  None of those is a failure — each is a
+    /// move with nowhere to go.
+    fn step_session(&mut self, delta: i32) {
+        let sidebar_focused = self.focus == PaneFocus::ProjectsSidebar;
+        let Some(id) = reorder_subject(
+            sidebar_focused,
+            self.sidebar_cursor.as_ref(),
+            || self.active_session.get(&None).copied(),
+            |path| self.active_session.get(&Some(path.to_path_buf())).copied(),
+            || self.active_session_index().map(|idx| self.sessions[idx].id),
+        ) else {
+            return;
+        };
+        let Some(abs) = self.sessions.iter().position(|s| s.id == id) else { return };
+        let Some((origin, range)) = self.reorder_range(id) else { return };
+        let lens: Vec<usize> =
+            range.iter().map(|ws| self.workspace_reorder_indices(ws).len()).collect();
+        let indices = self.workspace_reorder_indices(&origin);
+        // A harness-backed session is in no reorderable list, so the step has
+        // nowhere to start — the same silent no-op as a clamped end.
+        let Some(index) = indices.iter().position(|i| *i == abs) else { return };
+        let Some(target) = sidebar_nav::step_target(&range, &lens, &origin, index, delta) else {
+            return;
+        };
+        // Follow the landing the move reports, not the one it was asked for:
+        // expanding a project is persisted, so a refusal that still ran this
+        // would leave a trace of a move that never happened.
+        let Some(landed_in) = self.apply_session_move(id, target) else { return };
+        if sidebar_focused {
+            self.follow_moved_session(id, &landed_in);
+        }
+    }
+
+    /// Keep the sidebar pointed at the session a key just moved.
+    ///
+    /// The cursor key is unchanged across a move inside one workspace, so
+    /// neither `set_sidebar_cursor` nor the focus reconciler would notice the
+    /// row moved and scroll after it — this sets the one-shot itself.  A
+    /// landing inside a collapsed project expands it, because a cursor with no
+    /// painted row is the state the reconciler treats as a row that went away.
+    fn follow_moved_session(&mut self, id: SessionId, landed_in: &WorkspaceKey) {
+        self.sidebar_cursor = Some(SidebarRow::Session(id));
+        self.sidebar_cursor_moved = true;
+        let Some(path) = landed_in.as_deref() else { return };
+        let root = self
+            .projects
+            .iter()
+            .find(|p| p.worktrees.iter().any(|w| w.path == path))
+            .map(|p| p.root.clone());
+        if let Some(root) = root {
+            self.set_project_expanded(&root, true);
+        }
     }
 
     fn scratchpad_session_index(&self, ws: &WorkspaceKey) -> Option<usize> {
@@ -1550,7 +2187,7 @@ impl AlacritreeApp {
     }
 
     fn current_session_indices(&self) -> Vec<usize> {
-        self.workspace_session_indices(&self.current_workspace)
+        self.workspace_display_indices(&self.current_workspace)
     }
 
     fn active_session_index(&self) -> Option<usize> {
@@ -1598,7 +2235,7 @@ impl AlacritreeApp {
             .into_iter()
             .flat_map(|ws| {
                 let entries: Vec<_> = self
-                    .workspace_session_indices(&ws)
+                    .workspace_display_indices(&ws)
                     .into_iter()
                     .map(|i| (ws.clone(), self.sessions[i].id))
                     .collect();
@@ -1618,6 +2255,10 @@ impl AlacritreeApp {
         }
     }
 
+    /// Every workspace the app is willing to switch to, in sidebar order.
+    /// Duplicates are kept: git lets two projects list one path, and
+    /// dropping the second would change what `cycle_workspaces` visits for
+    /// a user who configured nothing.
     fn workspace_order(&self) -> Vec<WorkspaceKey> {
         let mut order: Vec<WorkspaceKey> = vec![None];
         for project in &self.projects {
@@ -1631,6 +2272,26 @@ impl AlacritreeApp {
         order
     }
 
+    /// The flat session ring, tagged with each workspace's owning project.
+    /// Callers build it only under a ring policy: it allocates per removal.
+    fn session_ring(&self) -> Vec<RingEntry> {
+        self.workspace_order()
+            .into_iter()
+            .flat_map(|workspace| {
+                let project =
+                    sidebar_nav::project_of(&self.projects, &workspace).map(Path::to_path_buf);
+                self.workspace_display_indices(&workspace)
+                    .into_iter()
+                    .map(|i| RingEntry {
+                        project: project.clone(),
+                        workspace: workspace.clone(),
+                        id: self.sessions[i].id,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     fn add_project_via_dialog(&mut self, ctx: &Context) {
         let Some(path) = rfd::FileDialog::new().pick_folder() else {
             return;
@@ -1638,39 +2299,19 @@ impl AlacritreeApp {
         self.add_project_off_thread(ctx, wsl::normalize_root(path));
     }
 
-    /// Put a project in the sidebar without stalling the frame: `wsl.exe` takes
-    /// hundreds of milliseconds warm and seconds while the distro VM boots, so
-    /// a WSL root goes in as a placeholder and discovers on a worker.  Native
-    /// roots spawn nothing and are cheap enough to discover in place.
+    /// Put a project in the sidebar without stalling the frame: discovery
+    /// opens the repository, lists worktrees, opens each one, and detects the
+    /// default branch, none of which is free on a loaded machine (WSL roots
+    /// also pay `wsl.exe`'s startup cost on top).  Every root goes in as a
+    /// placeholder and discovers on a worker.
     fn add_project_off_thread(&mut self, ctx: &Context, path: PathBuf) {
         if self.projects.iter().any(|p| p.root == path) {
             return;
         }
-        match wsl::classify(&path) {
-            wsl::Location::Windows(_) => self
-                .projects
-                .push(Project::discover(path.clone(), self.config.ui.upstream_status).project),
-            wsl::Location::Wsl { .. } => {
-                self.projects.push(Project::placeholder(path.clone()));
-                let idx = self.projects.len() - 1;
-                self.refresh_project(ctx, idx);
-            },
-        }
+        self.projects.push(Project::placeholder(path.clone()));
+        let idx = self.projects.len() - 1;
+        self.refresh_project(ctx, idx);
         self.persist_project(&path);
-    }
-
-    /// Put a project in the sidebar, discovering its worktrees.  A project that
-    /// is already there is left alone rather than duplicated, so callers that
-    /// cannot see the sidebar (IPC) need not check first.  WSL roots discover
-    /// synchronously here (no `ctx` for a worker); callers holding one use
-    /// `add_project_off_thread`.
-    fn add_project(&mut self, path: PathBuf) -> &Project {
-        if let Some(idx) = self.projects.iter().position(|p| p.root == path) {
-            return &self.projects[idx];
-        }
-        self.projects.push(Project::discover(path.clone(), self.config.ui.upstream_status).project);
-        self.persist_project(&path);
-        self.projects.last().expect("just pushed")
     }
 
     /// Tint whichever region a drop would land on while files are hovering, so
@@ -1735,14 +2376,13 @@ impl AlacritreeApp {
                     );
                     return;
                 };
-                let session = &self.sessions[idx];
                 let text = file_drop::shell_payload(
                     &paths,
-                    session.wsl_distro(),
+                    self.sessions[idx].wsl_distro(),
                     &self.config.ui.drop.spelling,
                 );
                 if !text.is_empty() {
-                    paste::paste(session, &text, true);
+                    paste::paste(&mut self.sessions[idx], &text, true);
                 }
             },
             file_drop::Target::Scratchpad => {
@@ -1827,7 +2467,7 @@ impl AlacritreeApp {
         self.sidebar_cursor = Some(sidebar_nav::seed(
             &self.projects,
             self.current_workspace.as_deref(),
-            &self.listed_session_ids(),
+            &self.listed_workspace_rows(),
             self.active_session.get(&self.current_workspace).copied(),
         ));
         // Seeding reads the unfiltered tree, so a lingering filter from a prior
@@ -2069,9 +2709,9 @@ impl AlacritreeApp {
     /// Rows the sidebar cursor steps over this frame: the fuzzy/toggle-filtered
     /// set while a filter is active, the full visible set otherwise.
     fn current_project_rows(&mut self) -> Vec<SidebarRow> {
-        let listed_sessions = self.listed_session_ids();
+        let listed = self.listed_workspace_rows();
         if !self.project_filter.is_filtering() {
-            return sidebar_nav::visible_rows(&self.projects, &listed_sessions);
+            return sidebar_nav::visible_rows(&self.projects, &listed);
         }
 
         let apply = self.project_filter.toggles_apply(self.search_scope);
@@ -2146,15 +2786,11 @@ impl AlacritreeApp {
                 && toggles_pass(&Some(wt.path.clone()))
                 && worktree_pr_passes(any_pr, &pr_matches, &wt.path)
         };
-        sidebar_nav::filtered_rows(
-            &self.projects,
-            &listed_sessions,
-            sidebar_nav::RowPredicates {
-                home,
-                project_self: &project_self,
-                worktree: &mut worktree,
-            },
-        )
+        sidebar_nav::filtered_rows(&self.projects, &listed, sidebar_nav::RowPredicates {
+            home,
+            project_self: &project_self,
+            worktree: &mut worktree,
+        })
     }
 
     fn workspace_has_sessions(&self, key: &WorkspaceKey) -> bool {
@@ -2162,7 +2798,7 @@ impl AlacritreeApp {
     }
 
     /// Every live session as a `(workspace, id)` pair — the same shape
-    /// `close_fallback` and `sidebar_session_ids` take, and the model the
+    /// `close_fallback` takes, and the model the
     /// focus reconciler observes.
     fn session_pairs(&self) -> Vec<(WorkspaceKey, SessionId)> {
         self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect()
@@ -2196,11 +2832,14 @@ impl AlacritreeApp {
                 ),
                 active_workspace,
                 active_branch,
+                herdr_generation: self.herdr_generation(),
             },
         );
         let rows = self.current_project_rows();
         let live = self.session_pairs();
-        let snapshot = build_sidebar_snapshot(&self.projects, &live, &rows, skip_worktree, inputs);
+        let listed = self.listed_workspace_rows();
+        let snapshot =
+            build_sidebar_snapshot(&self.projects, &live, &listed, &rows, skip_worktree, inputs);
         // Paint reuses these until the next rebuild, so an unchanged filtering
         // frame runs no fuzzy matching at all.
         self.sidebar_rows_cache = Some(rows);
@@ -2246,6 +2885,7 @@ impl AlacritreeApp {
                         ),
                         active_workspace,
                         active_branch,
+                        herdr_generation: self.herdr_generation(),
                     },
                 );
                 if unchanged {
@@ -2348,7 +2988,7 @@ impl AlacritreeApp {
             },
             Key::ArrowLeft => match &cursor {
                 SidebarRow::Project(root) => self.set_project_expanded(root, false),
-                SidebarRow::Worktree(_) | SidebarRow::Session(_) => {
+                SidebarRow::Worktree(_) | SidebarRow::Session(_) | SidebarRow::HerdrAgent(..) => {
                     if let Some(target) = sidebar_nav::left_target(&rows, &cursor) {
                         self.set_sidebar_cursor(target);
                     }
@@ -2384,6 +3024,25 @@ impl AlacritreeApp {
                 let expanded =
                     self.projects.iter().find(|p| p.root == root).is_some_and(|p| p.expanded);
                 self.set_project_expanded(&root, !expanded);
+            },
+            SidebarRow::HerdrAgent(side, terminal_id) => {
+                let side = side.clone();
+                let terminal_id = terminal_id.clone();
+                let pane_id = self.find_herdr_agent(&side, &terminal_id).map(|a| a.pane_id.clone());
+                let workspace = self.herdr_row_workspace(&side, &terminal_id);
+                if let (Some(pane_id), Some(workspace)) = (pane_id, workspace) {
+                    let key = herdr::HerdrKey { side, terminal_id };
+                    // Switches first, same as the click path: a refusal is
+                    // only visible if the workspace it happened in is on
+                    // screen.
+                    let previous =
+                        std::mem::replace(&mut self.current_workspace, workspace.clone());
+                    if self.attach_herdr_agent(ctx, key, &pane_id, workspace) {
+                        self.focus_terminal();
+                    } else {
+                        self.current_workspace = previous;
+                    }
+                }
             },
         }
     }
@@ -2714,6 +3373,11 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::ToggleSessionTabs) => {
                 self.session_tabs_always = !self.session_tabs_always;
             },
+            BindingAction::Named(NamedAction::MoveSessionUp) => self.step_session(-1),
+            BindingAction::Named(NamedAction::MoveSessionDown) => self.step_session(1),
+            BindingAction::Named(NamedAction::ToggleSessionDrag) => {
+                self.session_drag = !self.session_drag;
+            },
             BindingAction::Named(NamedAction::SelectNextWorkspace) => {
                 self.cycle_workspaces(ctx, 1);
             },
@@ -2767,7 +3431,7 @@ impl AlacritreeApp {
                             });
                         }
                     },
-                    Some(SidebarRow::Home) | None => {},
+                    Some(SidebarRow::Home) | Some(SidebarRow::HerdrAgent(..)) | None => {},
                 }
             },
             BindingAction::Named(NamedAction::RenameSelected) => {
@@ -2937,13 +3601,17 @@ impl AlacritreeApp {
         if let Some(editor) = self.sessions[idx].scratchpad.as_mut() {
             editor.insert_at_cursor(ctx, id, text);
         } else {
-            paste::paste(&self.sessions[idx], text, true);
+            paste::paste(&mut self.sessions[idx], text, true);
         }
     }
 
     /// The clipboard bitmap as a file something else can open, or `None` with
     /// the reason logged.
-    fn store_clipboard_image(&self, image: &arboard::ImageData<'_>) -> Option<PathBuf> {
+    ///
+    /// The returned path is pasted into the terminal immediately, so `store`
+    /// runs inline; only the cap sweep that follows a managed directory is
+    /// backgrounded, since nothing reads its result.
+    fn store_clipboard_image(&mut self, image: &arboard::ImageData<'_>) -> Option<PathBuf> {
         let png = match clipboard_image::encode_png(image) {
             Ok(png) => png,
             Err(e) => {
@@ -2953,8 +3621,19 @@ impl AlacritreeApp {
         };
         let cfg = &self.config.ui.paste;
         let (dir, owned) = cfg.image_target();
-        match clipboard_image::store(&dir, &png, owned.then_some(cfg.image_keep)) {
-            Ok(path) => Some(path),
+        let keep = cfg.image_keep;
+        match clipboard_image::store(&dir, &png, owned) {
+            Ok(path) => {
+                if owned {
+                    let in_use = path.clone();
+                    self.detached_jobs.push(
+                        jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
+                            clipboard_image::sweep(&dir, keep, &in_use, blocking)
+                        }),
+                    );
+                }
+                Some(path)
+            },
             Err(e) => {
                 log::warn!("cannot write the clipboard image to {}: {e}", dir.display());
                 None
@@ -3032,7 +3711,7 @@ impl AlacritreeApp {
                 let seed = sidebar_nav::seed(
                     &self.projects,
                     self.current_workspace.as_deref(),
-                    &self.listed_session_ids(),
+                    &self.listed_workspace_rows(),
                     self.active_session.get(&self.current_workspace).copied(),
                 );
                 self.finish_project_search_at(Some(seed));
@@ -3237,6 +3916,8 @@ impl AlacritreeApp {
         let activate_session_request: std::cell::Cell<Option<(WorkspaceKey, SessionId)>> =
             std::cell::Cell::new(None);
         let close_session_request: std::cell::Cell<Option<SessionId>> = std::cell::Cell::new(None);
+        let attach_herdr_request: std::cell::Cell<Option<(WorkspaceKey, herdr::HerdrKey, String)>> =
+            std::cell::Cell::new(None);
         let base_picker_request: std::cell::Cell<Option<PathBuf>> = std::cell::Cell::new(None);
         // Drag-to-reorder: (dragged root, insert-before display index).
         let reorder_request: std::cell::Cell<Option<(PathBuf, usize)>> = std::cell::Cell::new(None);
@@ -3249,6 +3930,17 @@ impl AlacritreeApp {
         let theme = self.theme;
         let scrollbar = self.config.ui.scrollbar;
         let reorder_mode = self.reorder_mode;
+        let session_drag = self.session_drag;
+        // The render pass cannot borrow `self.sessions`, so the dragged
+        // session's own scope is resolved here: a row outside this range draws
+        // no indicator and never becomes a drop.
+        let drag_range: Option<(SessionId, Vec<WorkspaceKey>)> =
+            egui::DragAndDrop::payload::<DraggedSession>(ctx).and_then(|dragged| {
+                let (_, range) = self.reorder_range(dragged.0)?;
+                Some((dragged.0, range))
+            });
+        let session_drop_request: std::cell::Cell<Option<(SessionId, WorkspaceKey, usize)>> =
+            std::cell::Cell::new(None);
         let cursor_row = if self.focus == PaneFocus::ProjectsSidebar {
             self.sidebar_cursor.clone()
         } else {
@@ -3257,20 +3949,58 @@ impl AlacritreeApp {
         let cursor_moved = std::mem::take(&mut self.sidebar_cursor_moved);
         let scrolls = |is_cursor: bool| is_cursor && cursor_moved;
 
+        let filtering = self.project_filter.is_filtering();
+        let active_now = self.active_session.get(&self.current_workspace).copied();
+        // egui keeps one scroll target per frame and the last writer wins, so the
+        // two reasons to scroll are resolved here rather than by paint order.  An
+        // explicit cursor move outranks following the terminal.
+        let wants_follow = sidebar_nav::wants_follow(
+            self.config.ui.sidebar_follow_active,
+            cursor_moved,
+            &self.last_followed,
+            &self.current_workspace,
+            active_now,
+        );
+        let rows: Vec<SidebarRow> = if filtering || wants_follow {
+            match &self.sidebar_rows_cache {
+                Some(rows) => rows.clone(),
+                None => self.current_project_rows(),
+            }
+        } else {
+            Vec::new()
+        };
+        let follow_row = wants_follow
+            .then(|| {
+                let project_root = sidebar_nav::project_of(&self.projects, &self.current_workspace)
+                    .map(Path::to_path_buf);
+                sidebar_nav::follow_scroll_row(
+                    &rows,
+                    &self.current_workspace,
+                    active_now,
+                    project_root.as_deref(),
+                )
+            })
+            .flatten();
+        if follow_row.is_some() {
+            self.last_followed = (self.current_workspace.clone(), active_now);
+        }
+        // `Project`/`Worktree` rows carry a `PathBuf`; matching by reference
+        // here (mirroring the `cursor_row` matches below) keeps every scroll
+        // check on the paint path allocation-free, follow target or not.
+        let follows_home = follow_row == Some(SidebarRow::Home);
+        let follows_session = |id: SessionId| follow_row == Some(SidebarRow::Session(id));
+        let follows_project = |root: &Path| matches!(&follow_row, Some(SidebarRow::Project(r)) if r.as_path() == root);
+        let follows_worktree = |path: &Path| matches!(&follow_row, Some(SidebarRow::Worktree(p)) if p.as_path() == path);
+
         // Membership for the active filter, resolved once so paint can skip
         // non-surviving rows.  While filtering, matched projects render their
         // matched worktrees regardless of `expanded` (display-only — the flag
         // is never written).
-        let filtering = self.project_filter.is_filtering();
         let mut home_visible = true;
         let mut visible_projects: HashSet<PathBuf> = HashSet::new();
         let mut visible_worktrees: HashSet<PathBuf> = HashSet::new();
         if filtering {
             home_visible = false;
-            let rows = match &self.sidebar_rows_cache {
-                Some(rows) => rows.clone(),
-                None => self.current_project_rows(),
-            };
             for row in rows {
                 match row {
                     SidebarRow::Home => home_visible = true,
@@ -3281,7 +4011,9 @@ impl AlacritreeApp {
                         visible_worktrees.insert(path);
                     },
                     // Session rows follow their workspace row's visibility.
-                    SidebarRow::Session(_) => {},
+                    // `filtered_rows` never emits `HerdrAgent`, so this arm
+                    // never actually sees one while filtering.
+                    SidebarRow::Session(_) | SidebarRow::HerdrAgent(..) => {},
                 }
             }
         }
@@ -3293,32 +4025,45 @@ impl AlacritreeApp {
         // Snapshot attention + agent-glyph state up-front so the `iter_mut`
         // over projects below isn't blocked from calling back into `&self`
         // helpers.
-        let home_session_rows = self.workspace_session_rows(&None);
-        let worktree_session_rows: Vec<Vec<Vec<SessionRowData>>> = self
+        // `sidebar_nav::filtered_rows` never emits `SidebarRow::HerdrAgent`
+        // (it would need the agent's display name, which the row's `(Side,
+        // String)` payload doesn't carry), so a herdr row painted while
+        // filtering would have no cursor path to reach it.  Dropping them
+        // from the listing rather than rebuilding it keeps the sessions the
+        // filter does render in the positions the nav model gave them.
+        let mut listed = self.listed_workspace_rows();
+        if filtering {
+            for entries in listed.values_mut() {
+                entries.retain(|entry| entry.session().is_some());
+            }
+        }
+        let home_rows = self.workspace_rows(&None, &listed);
+        let worktree_rows: Vec<Vec<Vec<WorkspaceRowData>>> = self
             .projects
             .iter()
             .map(|p| {
                 p.worktrees
                     .iter()
-                    .map(|wt| self.workspace_session_rows(&Some(wt.path.clone())))
+                    .map(|wt| self.workspace_rows(&Some(wt.path.clone()), &listed))
                     .collect()
             })
             .collect();
 
-        let worktree_listed: Vec<Vec<bool>> = worktree_session_rows
+        let worktree_listed: Vec<Vec<bool>> = worktree_rows
             .iter()
-            .map(|v| v.iter().map(|rows| !rows.is_empty()).collect())
+            .map(|v| v.iter().map(|rows| WorkspaceRowData::any_session(rows)).collect())
             .collect();
 
         // A rendered session list carries its own per-session status; repeating
         // it on the parent row reads as noise — the same
         // rule the project row applies when expanded.  Aggregates therefore
         // apply only while the list is hidden (fewer than two sessions).
-        let home_attention = home_session_rows.is_empty() && self.workspace_needs_attention(&None);
-        let home_activity = if home_session_rows.is_empty() {
-            self.workspace_activity(&None)
+        let home_lists_sessions = WorkspaceRowData::any_session(&home_rows);
+        let home_attention = !home_lists_sessions && self.workspace_needs_attention(&None);
+        let home_activity = if home_lists_sessions {
+            SessionActivity::Shell
         } else {
-            SessionActivity::Idle
+            self.workspace_activity(&None)
         };
         let project_attention: Vec<bool> =
             self.projects.iter().map(|p| self.project_needs_attention(p)).collect();
@@ -3356,7 +4101,7 @@ impl AlacritreeApp {
                             .copied()
                             .unwrap_or(false);
                         if listed {
-                            SessionActivity::Idle
+                            SessionActivity::Shell
                         } else {
                             self.workspace_activity(&Some(wt.path.clone()))
                         }
@@ -3482,6 +4227,54 @@ impl AlacritreeApp {
                 });
                 ui.separator();
 
+                // `slot` carries a session row's display index and id; `None`
+                // is a workspace row.
+                let session_drop = |ui: &egui::Ui,
+                                    row_rect: egui::Rect,
+                                    ws: &WorkspaceKey,
+                                    slot: Option<(usize, SessionId)>| {
+                    let Some((dragged, range)) = drag_range.as_ref() else { return };
+                    // The dragged row's own edges are no-ops, so offering them
+                    // as targets would paint a drop that does nothing.
+                    if slot.is_some_and(|(_, id)| id == *dragged) {
+                        return;
+                    }
+                    if !range.contains(ws) {
+                        return;
+                    }
+                    let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) else { return };
+                    if !row_rect.contains(pointer) {
+                        return;
+                    }
+                    let position = match slot {
+                        // A session row: the half the pointer is in decides.
+                        Some((idx, _)) => {
+                            if draw_drop_indicator(ui, row_rect, pointer, &theme) {
+                                idx
+                            } else {
+                                idx + 1
+                            }
+                        },
+                        // A workspace row: its sessions start under it, so a
+                        // drop here means the front of that workspace.  This is
+                        // the only way to reach a workspace listing no session
+                        // rows — an empty one, or a single-session one below the
+                        // display threshold.
+                        None => {
+                            ui.painter().hline(
+                                row_rect.x_range(),
+                                row_rect.bottom(),
+                                drop_indicator_stroke(&theme),
+                            );
+                            0
+                        },
+                    };
+                    if ui.input(|i| i.pointer.any_released()) {
+                        session_drop_request.set(Some((*dragged, ws.clone(), position)));
+                        egui::DragAndDrop::clear_payload(ui.ctx());
+                    }
+                };
+
                 ScrollArea::vertical().show(ui, |ui| {
                     // Inter-group spacing is emitted above the group that
                     // follows, never after the last one: trailing padding
@@ -3495,7 +4288,7 @@ impl AlacritreeApp {
                             ui,
                             self.current_workspace.is_none(),
                             home_is_cursor,
-                            scrolls(home_is_cursor),
+                            scrolls(home_is_cursor) || follows_home,
                             home_attention,
                             home_activity,
                             &icons,
@@ -3507,18 +4300,61 @@ impl AlacritreeApp {
                         if home_action.spawn {
                             spawn_shell_request.set(Some(None));
                         }
-                        for row in &home_session_rows {
-                            let is_cursor = matches!(
-                                &cursor_row,
-                                Some(SidebarRow::Session(id)) if *id == row.id
-                            );
-                            let scroll = scrolls(is_cursor);
-                            let act = session_row(ui, row, is_cursor, scroll, &icons, &theme);
-                            if act.activate {
-                                activate_session_request.set(Some((None, row.id)));
-                            }
-                            if act.close {
-                                close_session_request.set(Some(row.id));
+                        session_drop(ui, home_action.rect, &None, None);
+                        // Only rows a reorder can move take a drop slot, and
+                        // the slot index counts those alone: a herdr pane's
+                        // place is herdr's to decide, so it is neither a drag
+                        // subject nor a landing.
+                        let mut slot = 0usize;
+                        for row in &home_rows {
+                            match row {
+                                WorkspaceRowData::Session(row) => {
+                                    let is_cursor = matches!(
+                                        &cursor_row,
+                                        Some(SidebarRow::Session(id)) if *id == row.id
+                                    );
+                                    let scroll = scrolls(is_cursor) || follows_session(row.id);
+                                    let movable = row.managed.is_none();
+                                    let act = session_row(
+                                        ui,
+                                        row,
+                                        is_cursor,
+                                        scroll,
+                                        session_drag && movable,
+                                        &icons,
+                                        &theme,
+                                    );
+                                    if act.activate {
+                                        activate_session_request.set(Some((None, row.id)));
+                                    }
+                                    if act.close {
+                                        close_session_request.set(Some(row.id));
+                                    }
+                                    if movable {
+                                        session_drop(ui, act.rect, &None, Some((slot, row.id)));
+                                        slot += 1;
+                                    }
+                                },
+                                WorkspaceRowData::Herdr(row) => {
+                                    let is_cursor = matches!(
+                                        &cursor_row,
+                                        Some(SidebarRow::HerdrAgent(side, id))
+                                            if *side == row.side && *id == row.terminal_id
+                                    );
+                                    let scroll = scrolls(is_cursor);
+                                    let act =
+                                        herdr_row(ui, row, is_cursor, scroll, &icons, &theme);
+                                    if act.attach {
+                                        attach_herdr_request.set(Some((
+                                            None,
+                                            herdr::HerdrKey {
+                                                side: row.side.clone(),
+                                                terminal_id: row.terminal_id.clone(),
+                                            },
+                                            row.pane_id.clone(),
+                                        )));
+                                    }
+                                },
                             }
                         }
                         group_gap = 2.0;
@@ -3669,15 +4505,15 @@ impl AlacritreeApp {
                         );
                         let header_is_cursor =
                             matches!(&cursor_row, Some(SidebarRow::Project(r)) if *r == project.root);
+                        let header_rect = egui::Rect::from_x_y_ranges(
+                            ui.max_rect().x_range(),
+                            row_rect.y_range(),
+                        );
                         if header_is_cursor {
-                            let rect = egui::Rect::from_x_y_ranges(
-                                ui.max_rect().x_range(),
-                                row_rect.y_range(),
-                            );
-                            paint_cursor_outline(ui, rect, &theme);
-                            if scrolls(header_is_cursor) {
-                                ui.scroll_to_rect(rect, None);
-                            }
+                            paint_cursor_outline(ui, header_rect, &theme);
+                        }
+                        if scrolls(header_is_cursor) || follows_project(&project.root) {
+                            ui.scroll_to_rect(header_rect, theme.scroll_align);
                         }
 
                         // Drop target for a reorder drag.  Detected against the
@@ -3691,13 +4527,7 @@ impl AlacritreeApp {
                             if let Some(pointer) = pointer
                                 .filter(|p| row_rect.contains(*p) && dragged.0 != project.root)
                             {
-                                let before = pointer.y < row_rect.center().y;
-                                let y = if before { row_rect.top() } else { row_rect.bottom() };
-                                ui.painter().hline(
-                                    row_rect.x_range(),
-                                    y,
-                                    Stroke::new(2.0 * theme.ui_scale, theme.accent),
-                                );
+                                let before = draw_drop_indicator(ui, row_rect, pointer, &theme);
                                 if ui.input(|i| i.pointer.any_released()) {
                                     let insert_before = if before { idx } else { idx + 1 };
                                     reorder_request.set(Some((dragged.0.clone(), insert_before)));
@@ -3808,7 +4638,7 @@ impl AlacritreeApp {
                                     &cursor_row,
                                     Some(SidebarRow::Worktree(p)) if *p == wt.path
                                 );
-                                let wt_scroll = scrolls(is_cursor);
+                                let wt_scroll = scrolls(is_cursor) || follows_worktree(&wt.path);
                                 let is_deleting = deleting_paths.contains(&wt.path);
                                 // A `\\wsl.localhost\` stat boots the distro's
                                 // 9P server, so probing one would restart a VM
@@ -3861,31 +4691,71 @@ impl AlacritreeApp {
                                 if let Some(name) = action.spawn_profile {
                                     spawn_profile_request.set(Some((wt.path.clone(), name)));
                                 }
-                                let session_rows = worktree_session_rows
+                                session_drop(ui, action.rect, &Some(wt.path.clone()), None);
+                                let listed_rows = worktree_rows
                                     .get(idx)
                                     .and_then(|v| v.get(wt_idx))
                                     .map(Vec::as_slice)
                                     .unwrap_or(&[]);
-                                for row in session_rows {
-                                    let is_cursor = matches!(
-                                        &cursor_row,
-                                        Some(SidebarRow::Session(id)) if *id == row.id
-                                    );
-                                    let scroll = scrolls(is_cursor);
-                                    let act = session_row(
-                                        ui,
-                                        row,
-                                        is_cursor,
-                                        scroll,
-                                        &icons,
-                                        &theme,
-                                    );
-                                    if act.activate {
-                                        activate_session_request
-                                            .set(Some((Some(wt.path.clone()), row.id)));
-                                    }
-                                    if act.close {
-                                        close_session_request.set(Some(row.id));
+                                let mut slot = 0usize;
+                                for row in listed_rows {
+                                    match row {
+                                        WorkspaceRowData::Session(row) => {
+                                            let is_cursor = matches!(
+                                                &cursor_row,
+                                                Some(SidebarRow::Session(id)) if *id == row.id
+                                            );
+                                            let scroll =
+                                                scrolls(is_cursor) || follows_session(row.id);
+                                            let movable = row.managed.is_none();
+                                            let act = session_row(
+                                                ui,
+                                                row,
+                                                is_cursor,
+                                                scroll,
+                                                session_drag && movable,
+                                                &icons,
+                                                &theme,
+                                            );
+                                            if act.activate {
+                                                activate_session_request
+                                                    .set(Some((Some(wt.path.clone()), row.id)));
+                                            }
+                                            if act.close {
+                                                close_session_request.set(Some(row.id));
+                                            }
+                                            if movable {
+                                                session_drop(
+                                                    ui,
+                                                    act.rect,
+                                                    &Some(wt.path.clone()),
+                                                    Some((slot, row.id)),
+                                                );
+                                                slot += 1;
+                                            }
+                                        },
+                                        WorkspaceRowData::Herdr(row) => {
+                                            let is_cursor = matches!(
+                                                &cursor_row,
+                                                Some(SidebarRow::HerdrAgent(side, id))
+                                                    if *side == row.side
+                                                        && *id == row.terminal_id
+                                            );
+                                            let scroll = scrolls(is_cursor);
+                                            let act = herdr_row(
+                                                ui, row, is_cursor, scroll, &icons, &theme,
+                                            );
+                                            if act.attach {
+                                                attach_herdr_request.set(Some((
+                                                    Some(wt.path.clone()),
+                                                    herdr::HerdrKey {
+                                                        side: row.side.clone(),
+                                                        terminal_id: row.terminal_id.clone(),
+                                                    },
+                                                    row.pane_id.clone(),
+                                                )));
+                                            }
+                                        },
                                     }
                                 }
                             }
@@ -3912,6 +4782,9 @@ impl AlacritreeApp {
         }
         if let Some((root, insert_before)) = reorder_request.take() {
             self.move_project(&root, insert_before);
+        }
+        if let Some((id, workspace, position)) = session_drop_request.take() {
+            self.apply_session_drop(id, workspace, position);
         }
         if let Some((root, expanded)) = expand_toggled {
             state::mutate(|s| {
@@ -3959,11 +4832,27 @@ impl AlacritreeApp {
         if let Some(id) = close_session_request.take() {
             self.request_close_session(ctx, id);
         }
+        if let Some((ws, key, pane_id)) = attach_herdr_request.take() {
+            // Switches first, same as `spawn_shell_request` below: a refusal
+            // is only visible if the workspace it happened in is on screen.
+            let previous = std::mem::replace(&mut self.current_workspace, ws.clone());
+            if self.attach_herdr_agent(ctx, key, &pane_id, ws) {
+                workspace_activated = true;
+            } else {
+                self.current_workspace = previous;
+            }
+        }
         if let Some(ws) = spawn_shell_request.take() {
             // Spawning activates the workspace and the new session, matching
-            // Ctrl+T and worktree-creation's open-on-done.  A failed spawn
-            // hands the workspace back rather than stranding the user on one
-            // with no shell — the same reasoning as `activate_worktree`.
+            // Ctrl+T and worktree-creation's open-on-done.  An `Err` here
+            // arrived before the session record did — a checkout git has
+            // forgotten, or a PTY opened inline — and hands the workspace
+            // back rather than stranding the user on one with no shell, the
+            // same reasoning as `activate_worktree`.  A PTY opened on a
+            // worker fails after the record exists, so the switch stands and
+            // `poll_pending_spawns` leaves the pane on the "no session"
+            // placeholder: every workspace it could hand back to is one
+            // `ensure_active_session` would spawn into and fail identically.
             let previous = std::mem::replace(&mut self.current_workspace, ws.clone());
             match self.spawn_session(ctx, ws.clone()) {
                 Ok(_) => workspace_activated = true,
@@ -4037,11 +4926,15 @@ impl AlacritreeApp {
 
     fn open_base_branch_picker(&mut self, worktree: PathBuf) {
         let detected = self.project_default_branch_for(&worktree);
-        let branches = crate::worktree::list_branches(&worktree);
+        let job_worktree = worktree.clone();
+        let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
+            crate::worktree::list_branches(&job_worktree, blocking)
+        });
         self.pending_base_branch = Some(BaseBranchPicker {
             worktree,
             query: String::new(),
-            branches,
+            branches: None,
+            branches_job: Some(job),
             detected,
             cursor: 0,
         });
@@ -4447,20 +5340,20 @@ impl AlacritreeApp {
             "diff: {}",
             path_style::render(&req.file, self.config.ui.path_style.diff_title, None)
         );
-        match Session::spawn_command(
+        let (size, cell_size) = self.next_spawn_geometry();
+        let (session, request) = Session::pending_command(
             ctx.clone(),
             &self.config,
             Some(workspace.clone()),
-            TermSize::new(80, 24),
-            (8.0, 16.0),
+            size,
+            cell_size,
             program,
             args,
             title,
             SessionKind::Diff { key: new_key },
-        ) {
-            Ok(session) => {
-                let id = session.id;
-                self.sessions.push(session);
+        );
+        match self.open_session(session, request) {
+            Ok(id) => {
                 self.active_session.insert(Some(workspace), id);
             },
             Err(e) => {
@@ -4476,12 +5369,16 @@ impl AlacritreeApp {
     /// is never cached, so the discovery re-runs and a mid-session install is
     /// picked up on a later open.
     fn wsl_delta_path(&mut self, distro: &str, ctx: &Context) -> Option<String> {
-        match self.pending_delta.get(distro).map(Receiver::try_recv) {
-            Some(Ok(Some(path))) => {
+        match self.pending_delta.get(distro).map(|job| (job.poll(), job.failed())) {
+            Some((Some(Some(path)), _)) => {
                 self.pending_delta.remove(distro);
                 self.wsl_delta_paths.insert(distro.to_string(), path);
             },
-            Some(Ok(None)) | Some(Err(TryRecvError::Disconnected)) => {
+            // A found-nothing landing and a panicked lookup both clear the
+            // pending entry: the former banked its answer, the latter has
+            // none to bank, and either way it must not wedge this distro out
+            // of ever being retried.
+            Some((Some(None), _)) | Some((None, true)) => {
                 self.pending_delta.remove(distro);
             },
             _ => {},
@@ -4492,15 +5389,14 @@ impl AlacritreeApp {
         }
 
         if !self.pending_delta.contains_key(distro) {
-            let (tx, rx) = mpsc::channel();
             let distro_owned = distro.to_string();
             let ctx = ctx.clone();
-            std::thread::spawn(move || {
-                let found = wsl::discover_delta(&distro_owned);
-                let _ = tx.send(found);
+            let job = jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
+                let found = wsl::discover_delta(&distro_owned, blocking);
                 ctx.request_repaint();
+                found
             });
-            self.pending_delta.insert(distro.to_string(), rx);
+            self.pending_delta.insert(distro.to_string(), job);
         }
         None
     }
@@ -4516,6 +5412,59 @@ impl AlacritreeApp {
             if let SessionKind::Diff { key } = &s.kind { Some(key.clone()) } else { None }
         })
     }
+}
+
+/// What the session on screen contributes to a spawn's geometry.
+struct ActiveGeometry {
+    size: TermSize,
+    cell_size: (f32, f32),
+    /// A scratchpad's size is fixed at construction: it takes the editor
+    /// branch, so the pane never resizes it.
+    is_scratchpad: bool,
+}
+
+/// Geometry a new PTY is born at, most exact source first: the active
+/// session's own numbers, then the terminal pane's last painted size, then
+/// the constant neither has anything to improve on.
+///
+/// A scratchpad drops out of the first tier, since its pinned size would
+/// otherwise shadow the pane geometry with a constant worse than the tier
+/// below it.
+fn spawn_geometry(
+    active: Option<ActiveGeometry>,
+    last_pane: Option<(TermSize, (f32, f32))>,
+) -> (TermSize, (f32, f32)) {
+    active
+        .filter(|active| !active.is_scratchpad)
+        .map(|active| (active.size, active.cell_size))
+        .or(last_pane)
+        .unwrap_or((TermSize::new(80, 24), (8.0, 16.0)))
+}
+
+/// What one session contributes to the GUI's own priority boost for a frame.
+struct SessionBoost {
+    /// The session's job holds a boost of its own.
+    raised: bool,
+    /// The session is the one on screen, with the window focused.
+    visible: bool,
+    /// The session's PTY is still opening.
+    pending: bool,
+}
+
+/// Whether this session is a reason for the GUI to stay boosted.  A session
+/// still opening its PTY has no job to raise yet but will have one within a
+/// frame or two, and counting it is what stops a spawn dropping the GUI to
+/// normal priority for the whole open and raising it again on attach.
+fn holds_self_boost(session: SessionBoost) -> bool {
+    session.raised || (session.visible && session.pending)
+}
+
+/// Whether a frame's sessions, taken together, are a reason for the GUI to
+/// stay boosted.  Folded rather than `any`, because the caller computes each
+/// `SessionBoost` by asking a session to raise or drop its own boost: every
+/// session has to be reached, whatever the sessions before it answered.
+fn frame_holds_self_boost(boosts: impl Iterator<Item = SessionBoost>) -> bool {
+    boosts.fold(false, |held, session| held | holds_self_boost(session))
 }
 
 /// git arguments (everything after `git`) for the requested diff — shared
@@ -4656,7 +5605,7 @@ fn profile_session_shell(profile: &crate::config::Profile) -> (Option<Shell>, Op
 
 /// `[terminal.shell] program = "wsl.exe"` gets the same shim as a wsl.exe
 /// profile; any other config shell (or none) spawns unchanged through
-/// `Session::spawn`'s own config-shell default.
+/// `Session::pending_shell`'s own config-shell default.
 fn config_session_shell(config: &crate::config::Config) -> (Option<Shell>, Option<WslProbe>) {
     match &config.shell {
         Some(s) => match shimmed_wsl_argv(&s.program, &s.args) {
@@ -4719,10 +5668,29 @@ fn profile_shell(profile: &crate::config::Profile) -> Shell {
     Shell::new(profile.program.clone(), profile.args.clone())
 }
 
-fn dirty_warning(counts: &DirtyCounts) -> Option<String> {
-    if !counts.is_dirty() {
-        return None;
-    }
+/// `git worktree remove` refuses a tree with work in it, and that refusal is
+/// the authority on whether removing would lose anything. Both fragments are
+/// real git wording: `contains modified or untracked files` is the current
+/// message, `is dirty` is what git 2.17 (the version that introduced
+/// `worktree remove`) said before the message was reworded.
+///
+/// `worktree.rs`'s failure string is `git <args>: fatal: '<path>' <reason>`,
+/// and `<path>` (attacker- or at least user-controlled) is echoed twice —
+/// once in the command args, once quoted right after `fatal:`. Matching
+/// against the raw message would let a worktree path that happens to spell
+/// out one of these fragments turn an unrelated failure (locked tree, main
+/// worktree, filesystem error) into a false "needs --force" prompt. Since
+/// git's own wording always lands after the closing quote of the path — never
+/// inside it — cutting the tail at the last `'` drops both copies of the path
+/// and leaves only text git itself authored.
+fn refused_for_unsaved_work(message: &str) -> bool {
+    let tail = message.rsplit_once("fatal:").map_or(message, |(_, tail)| tail);
+    let reason = tail.rsplit_once('\'').map_or(tail, |(_, after)| after).to_ascii_lowercase();
+    reason.contains("contains modified or untracked files, use --force")
+        || reason.contains("is dirty, use --force")
+}
+
+fn dirty_parts(counts: &DirtyCounts) -> String {
     let mut parts = Vec::new();
     if counts.staged > 0 {
         parts.push(format!("{} staged", counts.staged));
@@ -4733,10 +5701,40 @@ fn dirty_warning(counts: &DirtyCounts) -> Option<String> {
     if counts.untracked > 0 {
         parts.push(format!("{} untracked", counts.untracked));
     }
-    Some(format!(
-        "Working tree has {} file(s) — they will be discarded with --force.",
-        parts.join(", ")
-    ))
+    parts.join(", ")
+}
+
+/// The delete confirm's warning line.
+///
+/// `counts` is `None` until a count lands (`checking`) or after a probe
+/// failed and left nothing to show (`!checking`). `force` is whether this
+/// confirm would pass `--force` — a first attempt whose resolved count is
+/// already known dirty, or the retry after git refused an unforced removal.
+///
+/// `force` is checked first: a forced retry followed git's own refusal, so
+/// it is never safe to render "nothing to warn about" for it, regardless of
+/// what `counts` holds — a stale-clean read, or none at all (the request was
+/// confirmed before its probe landed, which cancelled the probe).
+fn dirty_warning(counts: Option<&DirtyCounts>, force: bool, checking: bool) -> Option<String> {
+    if force {
+        return Some(match counts.filter(|c| c.is_dirty()) {
+            Some(counts) => {
+                format!(
+                    "Working tree has {} file(s) — they will be discarded with --force.",
+                    dirty_parts(counts)
+                )
+            },
+            None => "git reported local changes; they will be discarded with --force.".to_string(),
+        });
+    }
+    match counts {
+        Some(counts) if counts.is_dirty() => {
+            Some(format!("Working tree has {} file(s) with local changes.", dirty_parts(counts)))
+        },
+        Some(_) => None,
+        None if checking => Some("Checking working tree for uncommitted changes…".to_string()),
+        None => Some("Couldn't check the working tree for local changes.".to_string()),
+    }
 }
 
 /// The modal frame's horizontal inner margin.  Any width budgeted against the
@@ -4858,10 +5856,11 @@ fn column_galley(
 ) -> std::sync::Arc<egui::Galley> {
     use egui::text::{LayoutJob, TextFormat};
     let (max_rows, break_anywhere) = wrap.limits();
-    let mut job = LayoutJob::single_section(
-        text.to_owned(),
-        TextFormat { font_id: egui::FontId::new(size, family), color, ..Default::default() },
-    );
+    let mut job = LayoutJob::single_section(text.to_owned(), TextFormat {
+        font_id: egui::FontId::new(size, family),
+        color,
+        ..Default::default()
+    });
     job.wrap.max_width = max_w.max(0.0);
     job.wrap.max_rows = max_rows;
     job.wrap.break_anywhere = break_anywhere;
@@ -5432,16 +6431,12 @@ fn path_text(
         if text.is_empty() {
             return;
         }
-        job.append(
-            &text,
-            0.0,
-            egui::TextFormat {
-                font_id: egui::FontId::new(size, emphasis_family(e, &family)),
-                color: e.color.unwrap_or(base),
-                valign,
-                ..Default::default()
-            },
-        );
+        job.append(&text, 0.0, egui::TextFormat {
+            font_id: egui::FontId::new(size, emphasis_family(e, &family)),
+            color: e.color.unwrap_or(base),
+            valign,
+            ..Default::default()
+        });
     };
     let emphases = [&theme.path_style.filename, &theme.path_style.parent];
     for (text, e) in zed_spans(&parts).into_iter().zip(emphases) {
@@ -5600,8 +6595,92 @@ fn three_square_loader(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Re
     response
 }
 
-/// Priority: attention dot > loader > generic agent > active highlight > the
-/// configured color > the built-in default.
+/// What the status slot draws for an agent's live state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentMark {
+    /// Live work animates.  A static glyph would have to blink to say as much.
+    Loader,
+    Glyph(BakedGlyph, Color32),
+}
+
+/// `quiet` is the row's own weight for an agent with nothing to report — dim
+/// on a listed herdr row, ordinary text on a live session.  Blocked takes
+/// `attention` wherever it appears, an active row's accent included: a state
+/// that wants a human cannot also be quiet.
+fn agent_mark(live: LiveState, quiet: Color32, attention: Color32) -> AgentMark {
+    match live {
+        LiveState::Idle => AgentMark::Glyph(DEFAULT_AGENT_ICON, quiet),
+        LiveState::Working => AgentMark::Loader,
+        LiveState::Blocked => AgentMark::Glyph(DEFAULT_BLOCKED_ICON, attention),
+    }
+}
+
+/// What the status slot says on hover.  A named agent is named, so a
+/// workspace running several can be told apart without opening any of them.
+fn agent_hint(live: LiveState, name: Option<&str>) -> String {
+    let doing = match live {
+        LiveState::Idle => "is running",
+        LiveState::Working => "is working",
+        LiveState::Blocked => "is waiting for you",
+    };
+    format!("{} {doing}", name.unwrap_or("agent"))
+}
+
+/// Draw a harness's own state mark into an already-allocated slot.  A harness
+/// that has stopped reporting leaves the slot empty rather than inventing a
+/// state for it.
+fn paint_harness_mark(
+    ui: &mut egui::Ui,
+    mark: Option<HarnessMark>,
+    rect: egui::Rect,
+    theme: &Theme,
+) {
+    let Some(mark) = mark else { return };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        mark.glyph,
+        egui::FontId::new(10.0 * theme.ui_scale, crate::fonts::ui_variant_family(false, false)),
+        theme.harness_state.of(mark.tone),
+    );
+}
+
+/// Draw one agent mark into an already-allocated slot.
+fn paint_agent_mark(ui: &mut egui::Ui, mark: AgentMark, rect: egui::Rect, theme: &Theme) {
+    let s = theme.ui_scale;
+    match mark {
+        AgentMark::Loader => {
+            let loader = egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(10.0 * s));
+            paint_three_square_loader(ui, loader, theme.accent);
+        },
+        AgentMark::Glyph(glyph, color) => {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                glyph.as_str(),
+                egui::FontId::proportional(10.0 * s),
+                color,
+            );
+        },
+    }
+}
+
+/// What a row knows about its own state, in the order the status slot ranks
+/// it.  Grouped rather than passed loose because the three answer one
+/// question between them, and the slot draws whichever ranks highest.
+struct RowStatus<'a> {
+    attention: bool,
+    activity: SessionActivity,
+    managed: Option<&'a Managed>,
+}
+
+/// Priority: attention dot > the harness's own state mark > the agent's live
+/// state > active highlight > the configured color > the built-in default.
+///
+/// A harness outranks the live axis because it watches the pane from outside
+/// and alacritree only reads its title, so where both have a reading the
+/// harness's is the better one — and drawing it in the harness's vocabulary is
+/// what keeps a pane looking the same listed and attached.
 ///
 /// Returns what the slot has to say on hover, for the row to register with the
 /// rest of its icons. The row icon proper reports nothing the row does not
@@ -5609,46 +6688,37 @@ fn three_square_loader(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Re
 fn paint_row_status_icon(
     ui: &mut egui::Ui,
     theme: &Theme,
-    attention: bool,
-    activity: SessionActivity,
+    status: RowStatus<'_>,
     style: &IconStyle,
     default_glyph: BakedGlyph,
     is_active: bool,
 ) -> Option<(egui::Rect, String)> {
-    if attention {
+    if status.attention {
         return Some((attention_dot(ui, theme).rect, ATTENTION_HINT.to_owned()));
     }
-    let s = theme.ui_scale;
-    if let SessionActivity::Loading(agent) = activity {
-        let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
-        let loader = egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(10.0 * s));
-        paint_three_square_loader(ui, loader, theme.accent);
-        let hint = agent.map_or_else(|| "working".to_owned(), |name| format!("{name} is working"));
-        return Some((rect, hint));
+    // Centered into the fixed slot: laying a glyph out as text would size the
+    // slot to its advance width and shift the label with it.
+    let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
+    if let Some(managed) = status.managed
+        && let Some(mark) = managed.mark
+    {
+        paint_harness_mark(ui, Some(mark), rect, theme);
+        return Some((rect, format!("{} says {}", managed.harness, mark.label)));
     }
-    let (glyph, font, color, hint) = match activity {
-        SessionActivity::Agent(agent) => (
-            DEFAULT_AGENT_ICON.as_str(),
-            egui::FontId::proportional(10.0 * s),
-            if is_active { theme.accent } else { theme.text },
-            Some(agent.map_or_else(
-                || "agent is running".to_owned(),
-                |name| format!("{name} is running"),
-            )),
-        ),
-        SessionActivity::Idle => {
+    match status.activity {
+        SessionActivity::Agent { name, live } => {
+            let quiet = if is_active { theme.accent } else { theme.text };
+            paint_agent_mark(ui, agent_mark(live, quiet, theme.attention), rect, theme);
+            Some((rect, agent_hint(live, name)))
+        },
+        SessionActivity::Shell => {
             let (glyph, font, resolved) =
                 resolve_icon(style, default_glyph, theme.text_muted, 10.0, 10.0, theme);
             let color = if is_active { theme.accent } else { resolved };
-            (glyph, font, color, None)
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, glyph, font, color);
+            None
         },
-        SessionActivity::Loading(_) => unreachable!(),
-    };
-    // Centered into the fixed slot: laying the glyph out as text would size
-    // the slot to its advance width and shift the label with it.
-    let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
-    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, glyph, font, color);
-    hint.map(|hint| (rect, hint))
+    }
 }
 
 /// Gap between adjacent action buttons. They already pad their own glyph, so
@@ -5722,6 +6792,103 @@ fn move_target(len: usize, from: usize, insert_before: usize) -> Option<usize> {
         to -= 1;
     }
     (to != from).then_some(to)
+}
+
+/// Position a session dropped before display slot `insert_before` should walk
+/// to.  Inside its own workspace the session is removed before it is inserted,
+/// so `move_target` compensates for the slots that shift down; coming from
+/// another workspace it is inserted into a list it is not in yet, where the
+/// display slot already is the position.
+fn drop_position(
+    same_workspace: bool,
+    len: usize,
+    from: usize,
+    insert_before: usize,
+) -> Option<usize> {
+    if same_workspace { move_target(len, from, insert_before) } else { Some(insert_before) }
+}
+
+/// The weight and colour every reorder drop line is drawn with, shared so the
+/// project and session drags cannot drift apart.
+fn drop_indicator_stroke(theme: &Theme) -> Stroke {
+    Stroke::new(2.0 * theme.ui_scale, theme.accent)
+}
+
+/// Paint the line a reorder drop would land on, at the row edge nearest the
+/// pointer, and report whether that edge is the top — which is what "insert
+/// before this row" means for both the project and the session drag.
+fn draw_drop_indicator(
+    ui: &egui::Ui,
+    row_rect: egui::Rect,
+    pointer: egui::Pos2,
+    theme: &Theme,
+) -> bool {
+    let before = pointer.y < row_rect.center().y;
+    let y = if before { row_rect.top() } else { row_rect.bottom() };
+    ui.painter().hline(row_rect.x_range(), y, drop_indicator_stroke(theme));
+    before
+}
+
+/// The neighbour swaps that walk the element at `indices[j]` to slot
+/// `position` of `indices`.
+///
+/// `indices` are the absolute positions one workspace occupies inside the
+/// session vector, which are not contiguous: swapping only across them keeps
+/// every other workspace's sessions at the index they were at.  Swapping is
+/// also what avoids a `Clone` bound on `Session`, which owns a PTY.
+fn walk_swaps(indices: &[usize], j: usize, position: usize) -> Vec<(usize, usize)> {
+    let mut swaps = Vec::new();
+    if indices.is_empty() || j >= indices.len() {
+        return swaps;
+    }
+    let position = position.min(indices.len() - 1);
+    let mut j = j;
+    while j > position {
+        swaps.push((indices[j - 1], indices[j]));
+        j -= 1;
+    }
+    while j < position {
+        swaps.push((indices[j], indices[j + 1]));
+        j += 1;
+    }
+    swaps
+}
+
+/// The session a reorder key acts on.
+///
+/// A cursored session wins, then the workspace the cursor is resting on lends
+/// its active session, and otherwise the session on screen moves.  The middle
+/// case is what makes a held key work across a workspace boundary: a session
+/// arriving alone in a workspace paints no row of its own, so the cursor
+/// climbs to that workspace's row, and the next press must still find it.
+///
+/// `CloseSession` has the same first-and-last shape; `DeleteSelected` reads
+/// the cursor whatever has focus, which is the wrong convention here — a key
+/// pressed at the terminal should move the terminal you are looking at.
+fn reorder_subject(
+    sidebar_focused: bool,
+    cursor: Option<&SidebarRow>,
+    home_active: impl Fn() -> Option<SessionId>,
+    worktree_active: impl Fn(&Path) -> Option<SessionId>,
+    on_screen: impl Fn() -> Option<SessionId>,
+) -> Option<SessionId> {
+    if sidebar_focused {
+        match cursor {
+            Some(SidebarRow::Session(id)) => return Some(*id),
+            Some(SidebarRow::Home) => {
+                if let Some(id) = home_active() {
+                    return Some(id);
+                }
+            },
+            Some(SidebarRow::Worktree(path)) => {
+                if let Some(id) = worktree_active(path) {
+                    return Some(id);
+                }
+            },
+            _ => {},
+        }
+    }
+    on_screen()
 }
 
 /// A grip that a project row can be dragged by to reorder it.  Drag-sensing
@@ -5817,7 +6984,7 @@ fn paint_git_row_cursor(
     let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), resp.rect.y_range());
     paint_cursor_outline(ui, rect, theme);
     if scroll_into_view {
-        ui.scroll_to_rect(rect, None);
+        ui.scroll_to_rect(rect, theme.scroll_align);
     }
 }
 
@@ -5977,6 +7144,8 @@ fn is_sidebar_nav_key(key: egui::Key) -> bool {
 struct HomeAction {
     activate: bool,
     spawn: bool,
+    /// Full-width row rect, for a drop target to test the pointer against.
+    rect: egui::Rect,
 }
 
 fn home_row(
@@ -6008,8 +7177,7 @@ fn home_row(
                     status_hint = paint_row_status_icon(
                         ui,
                         theme,
-                        attention,
-                        activity,
+                        RowStatus { attention, activity, managed: None },
                         &icons.home,
                         DEFAULT_HOME_ICON,
                         is_active,
@@ -6072,9 +7240,9 @@ fn home_row(
         paint_cursor_outline(ui, full_rect, theme);
     }
     if scroll_into_view {
-        ui.scroll_to_rect(full_rect, None);
+        ui.scroll_to_rect(full_rect, theme.scroll_align);
     }
-    HomeAction { activate: resp.clicked() && !spawn_clicked, spawn: spawn_clicked }
+    HomeAction { activate: resp.clicked() && !spawn_clicked, spawn: spawn_clicked, rect: full_rect }
 }
 
 struct WorktreeAction {
@@ -6084,13 +7252,15 @@ struct WorktreeAction {
     set_base: bool,
     /// Name of the profile picked from the row's "Open session" menu, if any.
     spawn_profile: Option<String>,
+    /// Full-width row rect, for a drop target to test the pointer against.
+    rect: egui::Rect,
 }
 
 /// Everything a sidebar session row needs, snapshotted before the panel
 /// closure so rendering doesn't borrow `self.sessions`.
 struct SessionRowData {
     id: SessionId,
-    title: String,
+    name: RowName,
     needs_attention: bool,
     activity: SessionActivity,
     /// This workspace's remembered active session (accent icon).
@@ -6098,41 +7268,240 @@ struct SessionRowData {
     /// Active *and* the workspace is current — the session on screen
     /// (row background highlight).
     is_displayed: bool,
+    /// Set while this session is attached to a harness-managed pane, so an
+    /// attached agent's row still says where it lives and how to leave.
+    managed: Option<Managed>,
+}
+
+/// One painted row under a workspace, in the order the sidebar draws them.
+/// Attaching turns a herdr row into a session row in place, so the two travel
+/// as one list rather than as two blocks that would reorder on attach.
+enum WorkspaceRowData {
+    Session(SessionRowData),
+    Herdr(HerdrRowData),
+}
+
+impl WorkspaceRowData {
+    /// Whether any of `rows` is a session of alacritree's own.  The workspace
+    /// row shows aggregate attention and activity only while none is: with a
+    /// list on screen, repeating its summary above it reads as noise.
+    fn any_session(rows: &[Self]) -> bool {
+        rows.iter().any(|row| matches!(row, Self::Session(_)))
+    }
+}
+
+/// Everything a sidebar herdr-agent row needs, snapshotted before the panel
+/// closure so rendering doesn't borrow `self.herdr_endpoints`.
+struct HerdrRowData {
+    side: herdr::Side,
+    terminal_id: String,
+    pane_id: String,
+    name: RowName,
+    managed: Managed,
+}
+
+/// The external supervisor a pane belongs to.  Named rather than flagged
+/// because a second harness would otherwise add a parallel boolean to every
+/// row, and because what a row must say — whose mark to paint, how to get
+/// out, whether the attach is exclusive — varies by harness rather than by
+/// row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Managed {
+    /// What the tooltip calls it.
+    harness: &'static str,
+    /// The harness's own detach chord, already rendered.  `None` when its
+    /// config could not be read or binds detach to nothing, both of which are
+    /// reasons to stay quiet rather than name a chord the user may not have.
+    detach: Option<String>,
+    /// The attach shares the harness's whole view rather than one pane, so
+    /// the row says so before a resize reveals it.
+    shared_view: bool,
+    /// The agent kind the harness detected, spelled the way it invokes it.
+    kind: Option<String>,
+    /// The pane's own title, when it says something the kind does not.
+    title: Option<String>,
+    /// How the harness draws the state it reports.  `None` when it is no
+    /// longer reporting one — a pane alacritree still holds open after its
+    /// harness stopped listing it.
+    mark: Option<HarnessMark>,
+}
+
+impl HerdrRowData {
+    fn from_agent(agent: &herdr::Agent, side: &herdr::Side, settings: &herdr::Settings) -> Self {
+        // A listed row has nothing better than the terminal id's tail behind
+        // the kind, so the kind takes the name rather than standing in front
+        // of six characters nobody reads.
+        let name = herdr_row_name(agent).unwrap_or_else(|| {
+            RowName::plain(agent.kind.clone().unwrap_or_else(|| {
+                let id = &agent.terminal_id;
+                let skip = id.chars().count().saturating_sub(6);
+                id.chars().skip(skip).collect()
+            }))
+        });
+        Self {
+            side: side.clone(),
+            terminal_id: agent.terminal_id.clone(),
+            pane_id: agent.pane_id.clone(),
+            name,
+            managed: Managed::herdr(side, settings, Some(agent)),
+        }
+    }
+}
+
+/// A row's name in two parts, ranked by weight rather than punctuation: the
+/// identity, and the category standing in front of it as context.  `context`
+/// is absent when the identity is already the category, so a row never spells
+/// one thing twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RowName {
+    text: String,
+    context: Option<String>,
+}
+
+impl RowName {
+    fn plain(text: String) -> Self {
+        Self { text, context: None }
+    }
+}
+
+/// The name herdr reports for a pane, and `None` when it reports none.  The
+/// kind rides along as context unless it says the same thing as the title.
+/// What a titleless agent falls back to differs by row, so each caller says
+/// so itself rather than passing its answer through here.
+fn herdr_row_name(agent: &herdr::Agent) -> Option<RowName> {
+    let title = agent.title.clone()?;
+    let context = agent.kind.clone().filter(|kind| *kind != title);
+    Some(RowName { text: title, context })
+}
+
+impl Managed {
+    /// `agent` is herdr's current word on the pane, and `None` once it stops
+    /// reporting one — a pane alacritree still holds open after its harness
+    /// let go of it, which has a harness and a way out but no state or name.
+    fn herdr(side: &herdr::Side, settings: &herdr::Settings, agent: Option<&herdr::Agent>) -> Self {
+        let kind = agent.and_then(|a| a.kind.clone());
+        let title =
+            agent.and_then(|a| a.title.clone()).filter(|t| Some(t.as_str()) != kind.as_deref());
+        Self {
+            harness: "herdr",
+            detach: settings.detach.clone(),
+            shared_view: !herdr::can_attach(side),
+            mark: agent.map(|a| herdr_mark(a.status, settings.indicators)),
+            kind,
+            title,
+        }
+    }
+
+    /// What the harness calls this pane: the agent kind backquoted as the
+    /// command it is, and the title quoted as the words it is.
+    fn pane_name(&self) -> Option<String> {
+        match (&self.kind, &self.title) {
+            (Some(kind), Some(title)) => Some(format!("`{kind}` \"{title}\"")),
+            (Some(kind), None) => Some(format!("`{kind}`")),
+            (None, Some(title)) => Some(format!("\"{title}\"")),
+            (None, None) => None,
+        }
+    }
+}
+
+/// The mark a harness paints for the state it reports, in that harness's own
+/// vocabulary.  Resolved once per row, so a pane reads the same whether it is
+/// listed or attached — the two are drawn by different painters, and attaching
+/// must not repaint a pane in a language it does not speak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HarnessMark {
+    glyph: &'static str,
+    tone: StateTone,
+    /// The harness's own word for this state, for the hover text.
+    label: &'static str,
+}
+
+/// What a harness means by a state's color.  Named rather than carried as a
+/// `Color32` so the palette stays alacritree's and a row snapshot stays free
+/// of the theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateTone {
+    Blocked,
+    Working,
+    Done,
+    Idle,
+    /// The harness reported something alacritree does not recognise.
+    Unclear,
+}
+
+/// herdr's state vocabulary, taken from its own `state_icon_symbol` and
+/// `state_label_color`.  Which of the two sets applies is herdr's `[ui]
+/// status_indicators`, so a user who picked one in herdr gets it here too.
+///
+/// `done` is `idle` on herdr's internal axis and a status of its own over its
+/// API, which is the axis alacritree reads — so the two arrive already
+/// distinguished, without the "has a human looked at it yet" bit herdr tracks
+/// to tell them apart.
+fn herdr_mark(status: herdr::Status, indicators: herdr::Indicators) -> HarnessMark {
+    use herdr::Indicators::{Dots, Symbols};
+    use herdr::Status::{Blocked, Done, Idle, Unknown, Working};
+    let (glyph, tone) = match (indicators, status) {
+        (_, Idle) => ("○", StateTone::Idle),
+        (_, Unknown) => ("·", StateTone::Unclear),
+        (Dots, Blocked) => ("●", StateTone::Blocked),
+        (Dots, Working) => ("●", StateTone::Working),
+        (Dots, Done) => ("●", StateTone::Done),
+        (Symbols, Blocked) => ("×", StateTone::Blocked),
+        (Symbols, Working) => ("◐", StateTone::Working),
+        (Symbols, Done) => ("✓", StateTone::Done),
+    };
+    HarnessMark { glyph, tone, label: status.label() }
 }
 
 /// Spawn-ordered ids of the sessions in `ws`, or empty below the list
 /// threshold.  The threshold is normally two — a single-session workspace row
 /// keeps its compact form, mirroring the tab strip — and `always` lowers it
-/// to one.  Pure over (workspace, id) pairs so the grouping rule is testable
-/// without spawning PTYs.
-fn sidebar_session_ids(
-    pairs: &[(WorkspaceKey, SessionId)],
-    ws: &WorkspaceKey,
+/// to one.
+///
+/// herdr rows are never held back by it: a pane alacritree does not own has
+/// no other surface to appear on, and hiding it would hide the workspace's
+/// only row.  They do count toward the threshold, so a lone shell session
+/// beside one is listed rather than folded into the workspace row, which
+/// would leave a hole in a list its neighbours are already in.
+///
+/// `managed` carries herdr's own position for each of its rows, and sorts by
+/// it here so an attached session and a listed agent interleave the way herdr
+/// has them rather than by which kind of row they are.  The sort is stable,
+/// so panes herdr no longer lists keep the order they were spawned in.
+fn workspace_entries(
+    shells: &[SessionId],
+    managed: Vec<(usize, sidebar_nav::WorkspaceEntry)>,
     always: bool,
-) -> Vec<SessionId> {
-    let ids: Vec<SessionId> = pairs.iter().filter(|(w, _)| w == ws).map(|(_, id)| *id).collect();
+) -> Vec<sidebar_nav::WorkspaceEntry> {
     let threshold = if always { 1 } else { 2 };
-    if ids.len() < threshold { Vec::new() } else { ids }
+    let mut managed = managed;
+    managed.sort_by_key(|(at, _)| *at);
+    let mut entries = Vec::with_capacity(shells.len() + managed.len());
+    if shells.len() + managed.len() >= threshold {
+        entries.extend(shells.iter().copied().map(sidebar_nav::WorkspaceEntry::Session));
+    }
+    entries.extend(managed.into_iter().map(|(_, entry)| entry));
+    entries
 }
 
 /// Step the lockstep index over the rows a skipped worktree owns.
 ///
 /// The projection is built before the deletion is known, so it still lists
-/// the worktree and any sessions under it.  Leaving the index parked on a row
+/// the worktree with everything under it.  Leaving the index parked on a row
 /// no node will match again would mark every later node unprojected, and the
 /// cursor repair reads an unprojected row as one that has gone away.
 fn skip_projected_rows(
     rows: &[SidebarRow],
     next_row: &mut usize,
-    live: &[(WorkspaceKey, SessionId)],
+    listed: &sidebar_nav::ListedRows,
     path: &Path,
 ) {
     if rows.get(*next_row) != Some(&SidebarRow::Worktree(path.to_path_buf())) {
         return;
     }
     *next_row += 1;
-    while let Some(SidebarRow::Session(id)) = rows.get(*next_row) {
-        if !live.iter().any(|(ws, live_id)| live_id == id && ws.as_deref() == Some(path)) {
+    for entry in listed.get(&Some(path.to_path_buf())).map_or(&[][..], Vec::as_slice) {
+        if rows.get(*next_row) != Some(&entry.row()) {
             break;
         }
         *next_row += 1;
@@ -6145,6 +7514,10 @@ fn skip_projected_rows(
 /// membership from `listed` instead would make the last session in a workspace
 /// read as deleted the moment its sibling closed.
 ///
+/// `listed` is the listing the projection was built from.  A herdr row exists
+/// only while its agent is listed, so there is no wider model to take it from,
+/// and reading a second listing here could disagree with `rows`.
+///
 /// `skip_worktree` drops a worktree whose deletion is already committed but
 /// whose git operation has not finished, so nothing lands the cursor — or a
 /// new shell — inside a directory on its way out.
@@ -6156,11 +7529,13 @@ fn skip_projected_rows(
 fn build_sidebar_snapshot(
     projects: &[Project],
     live: &[(WorkspaceKey, SessionId)],
+    listed: &sidebar_nav::ListedRows,
     rows: &[SidebarRow],
     skip_worktree: Option<&Path>,
     inputs: sidebar_focus::ObservedInputs,
 ) -> sidebar_focus::TreeSnapshot {
     use sidebar_focus::Parent;
+    use sidebar_nav::WorkspaceEntry;
 
     let mut b = sidebar_focus::SnapshotBuilder::default();
     let mut next_row = 0usize;
@@ -6178,21 +7553,40 @@ fn build_sidebar_snapshot(
         }
         b.push(row, parent, projected)
     };
+    let push_workspace = |b: &mut sidebar_focus::SnapshotBuilder,
+                          next_row: &mut usize,
+                          placed: &mut [bool],
+                          ws: &WorkspaceKey,
+                          parent: Parent| {
+        let entries = listed.get(ws).map_or(&[][..], Vec::as_slice);
+        for entry in entries {
+            push(b, next_row, entry.row(), parent);
+        }
+        // A workspace lists every shell session it has or none of them, and a
+        // session attached to a herdr pane is always listed, so a session
+        // reaching the second arm here belongs to a workspace that listed
+        // nothing at all.  It is running, so the model keeps it; it is drawn
+        // nowhere, so the projection does not.
+        for (i, (w, id)) in live.iter().enumerate() {
+            if w != ws {
+                continue;
+            }
+            placed[i] = true;
+            if !entries.contains(&WorkspaceEntry::Session(*id)) {
+                b.push(SidebarRow::Session(*id), parent, false);
+            }
+        }
+    };
 
     let home_id = push(&mut b, &mut next_row, SidebarRow::Home, Parent::Root);
-    for (i, (ws, id)) in live.iter().enumerate() {
-        if ws.is_none() {
-            push(&mut b, &mut next_row, SidebarRow::Session(*id), Parent::Node(home_id));
-            placed[i] = true;
-        }
-    }
+    push_workspace(&mut b, &mut next_row, &mut placed, &None, Parent::Node(home_id));
 
     for p in projects {
         let project_id =
             push(&mut b, &mut next_row, SidebarRow::Project(p.root.clone()), Parent::Root);
         for wt in &p.worktrees {
             if skip_worktree == Some(wt.path.as_path()) {
-                skip_projected_rows(rows, &mut next_row, live, &wt.path);
+                skip_projected_rows(rows, &mut next_row, listed, &wt.path);
                 continue;
             }
             let wt_id = push(
@@ -6201,12 +7595,8 @@ fn build_sidebar_snapshot(
                 SidebarRow::Worktree(wt.path.clone()),
                 Parent::Node(project_id),
             );
-            for (i, (ws, id)) in live.iter().enumerate() {
-                if ws.as_deref() == Some(wt.path.as_path()) {
-                    push(&mut b, &mut next_row, SidebarRow::Session(*id), Parent::Node(wt_id));
-                    placed[i] = true;
-                }
-            }
+            let ws = Some(wt.path.clone());
+            push_workspace(&mut b, &mut next_row, &mut placed, &ws, Parent::Node(wt_id));
         }
     }
 
@@ -6257,8 +7647,31 @@ enum CloseFallback {
     Stay,
     /// Switch to the project's main checkout, which still has a session.
     Activate(PathBuf),
+    /// A session in another workspace, chosen by `ring_landing`.
+    ActivateSession(SessionId),
     /// Switch to home; `activate_home` spawns a shell there if none exists.
     Home,
+}
+
+/// Why a session record is going away.  The distinction exists because
+/// neither half of a close, the respawn policy or the navigation, may apply
+/// to a session that never got a PTY.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CloseReason {
+    User,
+    SpawnFailed,
+}
+
+/// The verdict a close acts on.  A failed open stays put whatever the
+/// workspace's state says: every destination `close_fallback` can name is one
+/// `ensure_active_session` will spawn into, and that open fails the same way.
+/// Staying leaves the pane on the "no session" placeholder, which is what the
+/// workspace honestly holds.
+fn close_navigation(reason: CloseReason, verdict: CloseFallback) -> CloseFallback {
+    match reason {
+        CloseReason::User => verdict,
+        CloseReason::SpawnFailed => CloseFallback::Stay,
+    }
 }
 
 /// Which session a workspace switches to when the one at `removed_idx` is
@@ -6299,7 +7712,8 @@ fn close_landing(
 /// `remaining` is the session list after removal; `main_checkout` is the
 /// removed workspace's project main (None when the workspace *is* the main,
 /// is home, or belongs to no known project). Pure over (workspace, id)
-/// pairs for the same reason as `sidebar_session_ids`.
+/// pairs for the same reason the sidebar listing does: the rule stays
+/// testable without spawning PTYs.
 fn close_fallback(
     removed_ws: &WorkspaceKey,
     current_ws: &WorkspaceKey,
@@ -6317,6 +7731,56 @@ fn close_fallback(
     }
 }
 
+/// One session's place in the flat ring: workspaces in sidebar order, each
+/// workspace's sessions in spawn order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RingEntry {
+    /// The owning project's root, from `project_of`.  None for home.
+    project: Option<PathBuf>,
+    workspace: WorkspaceKey,
+    id: SessionId,
+}
+
+/// The session a removal lands on under the `ring_*` policies.  `ring` is the
+/// flat session ring captured before the removal and `removed` is what left
+/// it: one session for a close, a worktree's whole list for a delete.
+/// Successor first, the earliest survivor past the last removed entry, else
+/// the latest survivor before the first.
+///
+/// `prefer` is the removed workspace's owning project under `ring_project`,
+/// and None under `ring_global` and for home.  When set, the search runs over
+/// that project's entries before running over the whole ring.
+///
+/// A path two projects both list appears in the ring twice.  Both entries
+/// carry the same `project_of` tag and name the same session, so a duplicate
+/// changes no answer; indices are taken by first occurrence, the way
+/// `session_ring_target` takes them.
+fn ring_landing(
+    ring: &[RingEntry],
+    removed: &[SessionId],
+    prefer: Option<&Path>,
+) -> Option<(WorkspaceKey, SessionId)> {
+    let positions: Vec<usize> =
+        removed.iter().filter_map(|id| ring.iter().position(|e| e.id == *id)).collect();
+    let first = *positions.iter().min()?;
+    let last = *positions.iter().max()?;
+
+    let search = |group: Option<&Path>| {
+        let in_group = |e: &RingEntry| match group {
+            Some(root) => e.project.as_deref() == Some(root),
+            None => true,
+        };
+        let survives = |e: &RingEntry| !removed.contains(&e.id);
+        ring[last + 1..]
+            .iter()
+            .find(|e| in_group(e) && survives(e))
+            .or_else(|| ring[..first].iter().rev().find(|e| in_group(e) && survives(e)))
+            .map(|e| (e.workspace.clone(), e.id))
+    };
+
+    prefer.and_then(|root| search(Some(root))).or_else(|| search(None))
+}
+
 /// A close-fallback verdict the reconciler owes the terminal, and the worktree
 /// whose rows must already read as gone.  The verdict is carried rather than
 /// recomputed because only `close_fallback` knows the difference between
@@ -6326,7 +7790,8 @@ struct DeferredClose {
     verdict: CloseFallback,
     /// Set when an asynchronous worktree deletion is in flight: `projects`
     /// still lists it, so without this the reconciler would see an intact row
-    /// and could spawn a shell inside the directory being removed.
+    /// and could spawn a shell inside the directory being removed.  It pairs
+    /// with any verdict, including a ring landing in another project.
     removed_worktree: Option<PathBuf>,
 }
 
@@ -6374,7 +7839,8 @@ fn plan_move(
 /// is the main (including non-git roots, whose single pseudo-worktree is
 /// its own main) or belongs to no known project.
 fn project_main_for(projects: &[Project], ws: &Path) -> Option<PathBuf> {
-    let project = projects.iter().find(|p| p.worktrees.iter().any(|w| w.path == ws))?;
+    let root = sidebar_nav::project_of(projects, &Some(ws.to_path_buf()))?;
+    let project = projects.iter().find(|p| p.root == root)?;
     let main = project.worktrees.iter().find(|w| w.is_main)?;
     if main.path == ws { None } else { Some(main.path.clone()) }
 }
@@ -6409,6 +7875,9 @@ fn row_project_root(
         SidebarRow::Worktree(path) => path.clone(),
         SidebarRow::Session(id) => session_workspace(*id).flatten()?,
         SidebarRow::Home => return None,
+        // Carries a (Side, terminal id) pair, not a workspace or a SessionId,
+        // so unlike a session row there is nothing here to resolve against.
+        SidebarRow::HerdrAgent(..) => return None,
     };
     projects
         .iter()
@@ -6449,7 +7918,7 @@ fn base_branch_target(
 
 /// The session a SelectNextSession/SelectPreviousSession press lands on:
 /// one flat ring over every open session, workspaces in sidebar order and
-/// each workspace's sessions in spawn order.  `None` means stay put — a
+/// each workspace's sessions in the order its rows are drawn.  `None` means stay put — a
 /// ring too small to cycle, or an active session missing from the ring
 /// (its worktree turned prunable).  With no active session (an emptied
 /// workspace on screen) the first entry re-anchors the cycle.
@@ -6494,11 +7963,43 @@ fn picker_cursor(
     }
 }
 
+/// The activity a session's row paints.  A session attached to a herdr agent
+/// takes herdr's word, because herdr watches the pane from outside and sees an
+/// approval dialog no title heuristic can reach.
+///
+/// `unknown` is herdr declining to say, so the session's own reading stands.
+/// The gate closes either way: an attached pane holds an agent whether or not
+/// the process probe recognized one.
+fn herdr_backed_activity(own: SessionActivity, status: Option<herdr::Status>) -> SessionActivity {
+    let Some(status) = status else { return own };
+    let live = LiveState::from_herdr(status).unwrap_or(own.live().unwrap_or_default());
+    own.with_live(live)
+}
+
 /// Agent titles commonly lead with their own decorative mark. Once the row
 /// paints a semantic agent/loader status, retaining that mark beside it would
 /// reintroduce the vendor-specific icon set this status model replaces.
+/// What an attached session's row is called.  On Linux and WSL an attach is
+/// full passthrough, so the pane on screen is herdr's and the row names it
+/// the way herdr's own listed row would — attaching must not rename the row
+/// under the user.  A pane herdr reports no title for keeps the title its own
+/// PTY set, with the kind in front of it.
+fn session_row_name(
+    pty_title: &str,
+    activity: SessionActivity,
+    agent: Option<&herdr::Agent>,
+) -> RowName {
+    let Some(agent) = agent else {
+        return RowName::plain(session_row_title(pty_title, activity));
+    };
+    herdr_row_name(agent).unwrap_or_else(|| RowName {
+        text: session_row_title(pty_title, activity),
+        context: agent.kind.clone(),
+    })
+}
+
 fn session_row_title(title: &str, activity: SessionActivity) -> String {
-    if activity != SessionActivity::Idle {
+    if activity.is_agent() {
         let trimmed = title.trim_start();
         if let Some(first) = trimmed.chars().next() {
             let rest = &trimmed[first.len_utf8()..];
@@ -6670,8 +8171,7 @@ fn worktree_row(
                     status_hint = paint_row_status_icon(
                         ui,
                         theme,
-                        attention,
-                        activity,
+                        RowStatus { attention, activity, managed: None },
                         default_icon,
                         default_glyph,
                         is_active,
@@ -6817,7 +8317,7 @@ fn worktree_row(
         paint_cursor_outline(ui, full_rect, theme);
     }
     if scroll_into_view {
-        ui.scroll_to_rect(full_rect, None);
+        ui.scroll_to_rect(full_rect, theme.scroll_align);
     }
     WorktreeAction {
         // A prunable row is still worth clicking when shells are homed there;
@@ -6827,6 +8327,7 @@ fn worktree_row(
         spawn: spawn_clicked,
         set_base: set_base_clicked,
         spawn_profile: spawn_profile_clicked,
+        rect: full_rect,
     }
 }
 
@@ -6842,16 +8343,36 @@ fn worktree_is_switchable(wt: &Worktree, missing: Option<bool>, has_sessions: bo
     !worktree_looks_gone(wt, missing) || has_sessions
 }
 
+/// The workspaces a herdr agent may be matched against.  A checkout that
+/// looks gone offers none, which is what makes an agent working there
+/// unmatched rather than parked under a row that can only refuse it.
+/// `missing` is the liveness cache's word for a path, `None` where it has
+/// none, so the row's grey and this list agree about the same directory.
+fn herdr_workspaces(projects: &[Project], missing: impl Fn(&Path) -> Option<bool>) -> Vec<PathBuf> {
+    projects
+        .iter()
+        .flat_map(|p| p.worktrees.iter())
+        .filter(|wt| !worktree_looks_gone(wt, missing(&wt.path)))
+        .map(|wt| wt.path.clone())
+        .collect()
+}
+
 struct SessionRowAction {
     activate: bool,
     close: bool,
+    /// Full-width row rect, for a drop target to test the pointer against.
+    rect: egui::Rect,
 }
 
+/// `draggable` makes the whole row the drag handle rather than adding a grip:
+/// a session row is a tab, where a project row's own controls are what a click
+/// there is usually for.
 fn session_row(
     ui: &mut egui::Ui,
     row: &SessionRowData,
     is_cursor: bool,
     scroll_into_view: bool,
+    draggable: bool,
     icons: &Icons,
     theme: &Theme,
 ) -> SessionRowAction {
@@ -6863,9 +8384,10 @@ fn session_row(
     let mut hints = IconHints::default();
     let mut close_rect: Option<egui::Rect> = None;
     let mut title_elided = false;
-    // The leading and trailing groups run as sibling closures, so the status
-    // slot's hint travels out separately and joins the rest afterwards.
+    // The leading and trailing groups run as sibling closures, so the leading
+    // slots' hints travel out separately and join the rest afterwards.
     let mut status_hint = None;
+    let mut managed_slot = None;
     // One indent level deeper than worktree rows (16); right: 0 keeps the ×
     // at the same x as the other rows' trailing icons.
     let frame = Frame::default().inner_margin(Margin { left: 28, right: 0, top: 3, bottom: 3 });
@@ -6878,15 +8400,22 @@ fn session_row(
                     status_hint = paint_row_status_icon(
                         ui,
                         theme,
-                        row.needs_attention,
-                        row.activity,
+                        RowStatus {
+                            attention: row.needs_attention,
+                            activity: row.activity,
+                            managed: row.managed.as_ref(),
+                        },
                         &icons.session,
                         DEFAULT_SESSION_ICON,
                         row.is_active,
                     );
+                    if let Some(managed) = &row.managed {
+                        let rect = paint_managed_mark(ui, icons, theme, theme.text_muted);
+                        managed_slot = Some((rect, managed_tooltip(managed)));
+                    }
                     let (_, galley) = truncating_label(
                         ui,
-                        RichText::new(&row.title).small().color(title_color),
+                        row_name_text(ui, &row.name, title_color, theme.text_muted),
                         title_color,
                         egui::Sense::hover(),
                     );
@@ -6900,7 +8429,7 @@ fn session_row(
                         theme.text_muted,
                         theme,
                     );
-                    hints.add(btn.rect, "close session");
+                    hints.add(btn.rect, close_button_hint(row.managed.is_some()));
                     close_rect = Some(btn.rect);
                     if btn.clicked() {
                         close_clicked = true;
@@ -6909,12 +8438,23 @@ fn session_row(
             );
         })
         .response
-        .interact(egui::Sense::click());
+        .interact(if draggable {
+            egui::Sense::click_and_drag()
+        } else {
+            egui::Sense::click()
+        });
     if let Some((rect, hint)) = status_hint {
         hints.add(rect, hint);
     }
-    let resp = hints.apply(resp, theme.icon_tooltips, |resp| {
-        name_tooltip(resp, &row.title, title_elided, theme.sidebar_tooltips)
+    if let Some((rect, hint)) = managed_slot {
+        hints.add(rect, hint);
+    }
+    // A managed row answers with the harness's own sentence wherever the
+    // pointer is not on an icon: the row the user attached is the one they
+    // ask how to leave, and the name tooltip cannot say it.
+    let resp = hints.apply(resp, theme.icon_tooltips, |resp| match &row.managed {
+        Some(managed) if theme.icon_tooltips => resp.on_hover_text(managed_tooltip(managed)),
+        _ => name_tooltip(resp, &row.name.text, title_elided, theme.sidebar_tooltips),
     });
 
     // Frame allocates its space at end-of-show, so its retroactive `interact`
@@ -6944,15 +8484,229 @@ fn session_row(
         paint_cursor_outline(ui, full_rect, theme);
     }
     if scroll_into_view {
+        ui.scroll_to_rect(full_rect, theme.scroll_align);
+    }
+    if draggable {
+        resp.dnd_set_drag_payload(DraggedSession(row.id));
+    }
+    SessionRowAction {
+        activate: resp.clicked() && !close_clicked,
+        close: close_clicked,
+        rect: full_rect,
+    }
+}
+
+struct HerdrRowAction {
+    attach: bool,
+}
+
+/// A row's name as two spans: the context, then the identity.  Nothing
+/// separates them but weight — a punctuation mark here would spell out a
+/// relationship the colours already show, and the status word one used to
+/// join only repeated the mark two slots to its left.
+///
+/// One `LayoutJob` rather than two labels, for the reasons `path_text` gives:
+/// no `item_spacing` gap, no second response competing for the row's click,
+/// and elision that measures the whole stream.
+fn row_name_text(
+    ui: &egui::Ui,
+    name: &RowName,
+    text_color: Color32,
+    context_color: Color32,
+) -> egui::WidgetText {
+    let Some(context) = &name.context else {
+        return RichText::new(&name.text).small().color(text_color).into();
+    };
+    let size = egui::TextStyle::Small.resolve(ui.style()).size;
+    // A hand-built job does not inherit the ui's text valign the way RichText
+    // does, so it must be carried across or the text sits off-centre against
+    // the marks beside it.
+    let valign = ui.text_valign();
+    let mut job = egui::text::LayoutJob::default();
+    for (text, color) in [(format!("{context} "), context_color), (name.text.clone(), text_color)] {
+        job.append(&text, 0.0, egui::TextFormat {
+            font_id: egui::FontId::new(size, egui::FontFamily::Proportional),
+            color,
+            valign,
+            ..Default::default()
+        });
+    }
+    job.into()
+}
+
+/// What a harness-managed row explains on hover, one fact per comma: the
+/// state, since that is what changes; who reports it; whether the attach is
+/// the harness's whole view; and what the harness calls the pane.  The way
+/// out follows in parentheses, since it is an instruction rather than
+/// another fact about the pane.
+///
+/// The same sentence serves a listed agent and an attached one.  Attaching
+/// changes how alacritree draws a pane, not what there is to say about it,
+/// and the chord has no other surface in alacritree — it is the harness's
+/// key, not one of ours — so it has to reach the row the user is sitting in.
+fn managed_tooltip(managed: &Managed) -> String {
+    let mut parts = Vec::new();
+    if let Some(mark) = managed.mark {
+        parts.push(mark.label.to_owned());
+    }
+    parts.push(managed.harness.to_owned());
+    if managed.shared_view {
+        parts.push("shared view".to_owned());
+    }
+    parts.extend(managed.pane_name());
+    let mut hint = parts.join(", ");
+    hint.push('.');
+    if let Some(chord) = &managed.detach {
+        // Backquoted because the chord is a sequence, not one combination:
+        // unquoted, "detach with Ctrl+B q" reads as a sentence whose last
+        // word happens to be `q`.
+        hint.push_str(&format!(" (detach with `{chord}`)"));
+    }
+    hint
+}
+
+/// A shared-view attach waiting on herdr.  The gesture answers with the argv
+/// its client runs, so everything the session needs is in hand by the time it
+/// opens.
+struct PendingHerdrAttach {
+    job: jobs::Job<Result<(String, Vec<String>), String>>,
+    key: herdr::HerdrKey,
+    workspace: WorkspaceKey,
+}
+
+/// The shared view herdr is being pointed at, and the call doing the
+/// pointing.  The handle is held rather than dropped because dropping a job
+/// cancels it.
+struct HerdrViewFocus {
+    session: SessionId,
+    job: jobs::Job<Result<(), String>>,
+}
+
+/// Whether the session on screen still owes herdr a focus call.  A direct
+/// attach draws its own pane whatever herdr focuses, and an ordinary shell
+/// has no pane at all, so neither ever asks.
+fn needs_view_focus(
+    key: Option<&herdr::HerdrKey>,
+    active: SessionId,
+    focused: Option<SessionId>,
+) -> bool {
+    key.is_some_and(|key| !herdr::can_attach(&key.side)) && focused != Some(active)
+}
+
+/// What a shared-view attach asks herdr before its client can start: focus
+/// the pane, since every app client draws whatever herdr has focused, then
+/// name the session, since that is what the client attaches to.  Both are
+/// process spawns, and on native Windows both wait on herdr starting up,
+/// which is why this only ever runs on the pool.
+///
+/// `cached_name` is what the endpoint learned in the background.  A gesture
+/// that beats the first read asks herdr itself: a wait is better than a
+/// refusal.
+fn herdr_attach_gesture(
+    side: &herdr::Side,
+    pane_id: &str,
+    cached_name: Option<String>,
+) -> Result<(String, Vec<String>), String> {
+    // Two argv spawns, no shell: the only shell a `Native` command could
+    // reach on this side is cmd.exe, which does not understand `sh_quote`'s
+    // single-quoting.
+    herdr::focus_agent(side, pane_id)?;
+    let session = match cached_name {
+        Some(session) => session,
+        None => herdr::running_session_name(side)?,
+    };
+    Ok(side.command(&["session", "attach", &session]))
+}
+
+/// Whether ending a session asks first.  A harness-managed one is a detach
+/// rather than a kill, so it answers to its own switch: the attach client is
+/// always running, which would make the busy question a close asks fire every
+/// time and warn about nothing.
+fn close_needs_prompt(ui: &UiTheme, managed: bool, busy: bool) -> bool {
+    if managed { ui.confirm_session_detach } else { ui.confirm_session_close.requires_prompt(busy) }
+}
+
+/// What the × on a session row does.  Ending a harness-managed session ends
+/// the attach client and nothing else — the pane keeps running under the
+/// harness, and the row it came from comes back — so calling that a close
+/// promises a destruction that does not happen.
+fn close_button_hint(managed: bool) -> &'static str {
+    if managed { "detach session" } else { "close session" }
+}
+
+/// Paint the harness mark and return the rect it claimed, so the caller can
+/// hang the hint on it.
+fn paint_managed_mark(
+    ui: &mut egui::Ui,
+    icons: &Icons,
+    theme: &Theme,
+    color: Color32,
+) -> egui::Rect {
+    // 10.0 is what the status marks beside it use, and `◫` shares its em
+    // height with `◇` and `●`, so the same size puts them on one optical line.
+    let (glyph, font, glyph_color) =
+        resolve_icon(&icons.herdr, DEFAULT_HERDR_ICON, color, 10.0, 10.0, theme);
+    ui.label(RichText::new(glyph).color(glyph_color).font(font)).rect
+}
+
+/// A herdr agent nothing is attached to.  Drawn in `theme.text_dim` because
+/// it is listed but not live — the same weight `worktree_gone` gives a row
+/// whose checkout has been removed.  An attached agent has an ordinary
+/// session row instead, so no agent is ever drawn twice.
+///
+/// Not draggable and carries no drop-target rect: a herdr agent has no
+/// position in the session order to reorder into.
+fn herdr_row(
+    ui: &mut egui::Ui,
+    row: &HerdrRowData,
+    is_cursor: bool,
+    scroll_into_view: bool,
+    icons: &Icons,
+    theme: &Theme,
+) -> HerdrRowAction {
+    // Reserve a slot *before* the label so the hover bg paints beneath it.
+    let bg_idx = ui.painter().add(egui::Shape::Noop);
+    let panel_x = ui.max_rect().x_range();
+
+    let frame = Frame::default().inner_margin(Margin { left: 28, right: 0, top: 3, bottom: 3 });
+    let resp = frame
+        .show(ui, |ui| {
+            row_with_trailing(
+                ui,
+                |ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
+                    paint_harness_mark(ui, row.managed.mark, rect, theme);
+                    paint_managed_mark(ui, icons, theme, theme.text_dim);
+                    let text = row_name_text(ui, &row.name, theme.text_dim, theme.text_muted);
+                    let _ = truncating_label(ui, text, theme.text_dim, egui::Sense::hover());
+                },
+                |_ui| {},
+            );
+        })
+        .response
+        .interact(egui::Sense::click());
+    let resp =
+        if theme.icon_tooltips { resp.on_hover_text(managed_tooltip(&row.managed)) } else { resp };
+
+    let bg = if resp.hovered() { theme.row_hover_bg } else { Color32::TRANSPARENT };
+    let full_rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
+    if bg != Color32::TRANSPARENT {
+        ui.painter().set(bg_idx, egui::Shape::rect_filled(full_rect, 0.0, bg));
+    }
+    if is_cursor {
+        paint_cursor_outline(ui, full_rect, theme);
+    }
+    if scroll_into_view {
         ui.scroll_to_rect(full_rect, None);
     }
-    SessionRowAction { activate: resp.clicked() && !close_clicked, close: close_clicked }
+    HerdrRowAction { attach: resp.clicked() }
 }
 
 impl AlacritreeApp {
     fn reap_exited_sessions(&mut self, ctx: &Context) {
         let exited_ids: Vec<SessionId> =
-            self.sessions.iter().filter(|s| s.is_exited()).map(|s| s.id).collect();
+            self.sessions.iter().filter(|s| s.should_reap()).map(|s| s.id).collect();
         for id in exited_ids {
             self.close_session(ctx, id);
         }
@@ -6974,6 +8728,27 @@ impl AlacritreeApp {
         // `viewport().focused` is `None` on platforms that don't report focus;
         // treat unknown as "focused" so we don't pile up stale attention dots.
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+
+        // Only the session on screen, and only while the window has focus:
+        // typing somewhere else is the one moment a terminal has no claim on
+        // the machine.  Both calls are no-ops unless they change something, so
+        // a frame where focus has not moved costs nothing, and a session with
+        // no boost to give — the feature off, or a platform that has none —
+        // answers false without a call of any kind.
+        let target = visible_idx.filter(|_| focused);
+        let anything_raised =
+            frame_holds_self_boost(self.sessions.iter().enumerate().map(|(idx, session)| {
+                let wanted = Some(idx) == target;
+                SessionBoost {
+                    raised: session.set_priority_boost(wanted),
+                    visible: wanted,
+                    pending: session.is_pending(),
+                }
+            }));
+        // A boost covers every depth, so a focused tab running
+        // `cargo build -j16` raises all sixteen compilers.  The GUI left at
+        // normal would then lose to the tree it is drawing.
+        crate::focus_priority::set_self_boosted(anything_raised);
 
         let grace = self.config.ui.attention_grace;
         for idx in 0..self.sessions.len() {
@@ -7036,77 +8811,292 @@ impl AlacritreeApp {
     }
 
     /// Prefer the active session's status so parallel agents do not fight over
-    /// the parent row. If that session is idle, a loading background session
-    /// wins over a merely present agent because it communicates live work.
+    /// the parent row. If that session has nothing to report, a background
+    /// session that is working or blocked wins over a merely present agent,
+    /// because a collapsed row is the only place either state can surface.
     fn workspace_activity(&self, ws: &WorkspaceKey) -> SessionActivity {
         let active_id = self.active_session.get(ws).copied();
-        let mut other = SessionActivity::Idle;
+        let mut other = SessionActivity::Shell;
         for s in &self.sessions {
             if s.working_directory != *ws {
                 continue;
             }
-            let activity = s.activity();
-            if activity == SessionActivity::Idle {
+            let activity = herdr_backed_activity(s.activity(), self.session_herdr_status(s));
+            let Some(live) = activity.live() else {
                 continue;
-            }
+            };
             if Some(s.id) == active_id {
                 return activity;
             }
-            if matches!(activity, SessionActivity::Loading(_)) || other == SessionActivity::Idle {
+            if live > LiveState::Idle || !other.is_agent() {
                 other = activity;
             }
         }
         other
     }
 
-    /// The session rows every workspace currently lists, for the keyboard
-    /// cursor model.  Built from the same `sidebar_session_ids` rule the
-    /// paint pass uses, so cursor rows and painted rows cannot drift.
-    fn listed_session_ids(&self) -> sidebar_nav::ListedSessions {
-        let pairs: Vec<(WorkspaceKey, SessionId)> =
-            self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect();
-        let mut listed = sidebar_nav::ListedSessions::new();
-        for (ws, _) in &pairs {
-            if !listed.contains_key(ws) {
-                let ids = sidebar_session_ids(&pairs, ws, self.session_rows_always);
-                if !ids.is_empty() {
-                    listed.insert(ws.clone(), ids);
+    /// Every row each workspace lists, in the order it draws them: its own
+    /// shell sessions first, then every herdr pane the workspace holds — the
+    /// sessions attached to one and the agents nothing is attached to alike —
+    /// in herdr's own order.
+    ///
+    /// Position comes from herdr rather than from alacritree because herdr is
+    /// the only party that has an opinion surviving all three moments: attach,
+    /// detach, and a restart, which leaves every pane unattached again.  An
+    /// order built from when a session was attached agrees with itself until
+    /// the first restart and then contradicts everything the user saw.
+    ///
+    /// Agents are bucketed by the directory they work in, and an agent whose
+    /// directory matches no worktree — including one whose checkout has been
+    /// removed — lands under Home, which is the common case: an agent in a
+    /// repository alacritree does not track still belongs somewhere, and a
+    /// checkout that has gone cannot start a shell.
+    fn listed_workspace_rows(&self) -> sidebar_nav::ListedRows {
+        use sidebar_nav::WorkspaceEntry;
+
+        // `usize::MAX` parks a pane herdr has stopped listing at the tail of
+        // its own block rather than letting it fall in among the shells: the
+        // session is still herdr's, and it goes back to its slot when the
+        // listing carries it again.
+        let mut shells: HashMap<WorkspaceKey, Vec<SessionId>> = HashMap::new();
+        let mut managed: HashMap<WorkspaceKey, Vec<(usize, WorkspaceEntry)>> = HashMap::new();
+        for session in &self.sessions {
+            let ws = session.working_directory.clone();
+            match session.herdr_key.clone() {
+                Some(key) => {
+                    let at = self.herdr_pane_index(&key).unwrap_or(usize::MAX);
+                    managed.entry(ws).or_default().push((at, WorkspaceEntry::Session(session.id)));
+                },
+                None => shells.entry(ws).or_default().push(session.id),
+            }
+        }
+
+        if self.config.ui.herdr.enabled {
+            let claimed: Vec<herdr::HerdrKey> =
+                self.sessions.iter().filter_map(|s| s.herdr_key.clone()).collect();
+            let workspaces = herdr_workspaces(&self.projects, |path| self.liveness.missing(path));
+            for cache in self.herdr_endpoints.caches() {
+                let side = cache.side();
+                for agent in herdr::unattached(cache.agents(), side, &claimed) {
+                    let ws = herdr::match_workspace(agent, side, &workspaces);
+                    if ws.is_none() && !self.config.ui.herdr.show_unmatched {
+                        continue;
+                    }
+                    let key = herdr::HerdrKey {
+                        side: side.clone(),
+                        terminal_id: agent.terminal_id.clone(),
+                    };
+                    let at = self.herdr_pane_index(&key).unwrap_or(usize::MAX);
+                    let entry = WorkspaceEntry::Agent(side.clone(), agent.terminal_id.clone());
+                    managed.entry(ws).or_default().push((at, entry));
                 }
+            }
+        }
+
+        let mut listed = sidebar_nav::ListedRows::new();
+        for ws in shells.keys().chain(managed.keys()).cloned().collect::<Vec<_>>() {
+            if listed.contains_key(&ws) {
+                continue;
+            }
+            let entries = workspace_entries(
+                shells.get(&ws).map_or(&[][..], Vec::as_slice),
+                managed.remove(&ws).unwrap_or_default(),
+                self.session_rows_always,
+            );
+            if !entries.is_empty() {
+                listed.insert(ws, entries);
             }
         }
         listed
     }
 
-    /// Session rows for `ws`'s sidebar list, per `sidebar_session_ids`'s
-    /// list threshold.
-    fn workspace_session_rows(&self, ws: &WorkspaceKey) -> Vec<SessionRowData> {
-        let pairs: Vec<(WorkspaceKey, SessionId)> =
-            self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect();
-        let ids = sidebar_session_ids(&pairs, ws, self.session_rows_always);
+    /// Where a pane sits in herdr's own listing, counted across endpoints in
+    /// the order they are polled.  `None` for a pane no endpoint lists.
+    fn herdr_pane_index(&self, key: &herdr::HerdrKey) -> Option<usize> {
+        let mut before = 0;
+        for cache in self.herdr_endpoints.caches() {
+            if cache.side() == &key.side {
+                let at = cache.agents().iter().position(|a| a.terminal_id == key.terminal_id)?;
+                return Some(before + at);
+            }
+            before += cache.agents().len();
+        }
+        None
+    }
+
+    /// The workspace a herdr row is currently listed under, for the keyboard
+    /// path: `SidebarRow::HerdrAgent` itself carries no workspace, unlike a
+    /// click, which already knows which panel section it landed in.
+    fn herdr_row_workspace(&self, side: &herdr::Side, terminal_id: &str) -> Option<WorkspaceKey> {
+        let wanted = sidebar_nav::WorkspaceEntry::Agent(side.clone(), terminal_id.to_string());
+        self.listed_workspace_rows()
+            .into_iter()
+            .find(|(_, entries)| entries.contains(&wanted))
+            .map(|(ws, _)| ws)
+    }
+
+    /// The agent behind `(side, terminal_id)`, if its endpoint still has it
+    /// cached.  A stale key (the agent exited between poll and paint, or an
+    /// Enter that outraced this frame's own listing) yields no row rather
+    /// than a panic; the next poll drops it from the listing for good.
+    fn find_herdr_agent(&self, side: &herdr::Side, terminal_id: &str) -> Option<&herdr::Agent> {
+        self.herdr_endpoints
+            .caches()
+            .iter()
+            .find(|cache| cache.side() == side)
+            .and_then(|cache| cache.agents().iter().find(|a| a.terminal_id == terminal_id))
+    }
+
+    /// herdr's word on a session's agent: `Some` only while this session is
+    /// attached to one the endpoint listing still carries.
+    fn session_herdr_status(&self, session: &Session) -> Option<herdr::Status> {
+        self.session_herdr_agent(session).map(|agent| agent.status)
+    }
+
+    /// The agent this session is attached to, while the endpoint listing
+    /// still carries it.  herdr watches the pane from outside, so it is the
+    /// authority on both what the pane is called and what it is doing.
+    fn session_herdr_agent(&self, session: &Session) -> Option<&herdr::Agent> {
+        let key = session.herdr_key.as_ref()?;
+        self.find_herdr_agent(&key.side, &key.terminal_id)
+    }
+
+    /// What the endpoint learned this side's herdr session is called.
+    fn herdr_session_name(&self, side: &herdr::Side) -> Option<String> {
+        self.herdr_endpoints
+            .caches()
+            .iter()
+            .find(|cache| cache.side() == side)
+            .and_then(herdr::EndpointCache::session_name)
+    }
+
+    /// The session already attached to this agent, if one is open.
+    fn herdr_session_for(&self, key: &herdr::HerdrKey) -> Option<SessionId> {
+        self.sessions.iter().find(|s| s.herdr_key.as_ref() == Some(key)).map(|s| s.id)
+    }
+
+    /// herdr's detach chord on `side`, once that endpoint's config read has
+    /// landed.
+    fn herdr_settings(&self, side: &herdr::Side) -> herdr::Settings {
+        self.herdr_endpoints
+            .caches()
+            .iter()
+            .find(|cache| cache.side() == side)
+            .map(herdr::EndpointCache::settings)
+            .unwrap_or_default()
+    }
+
+    /// What supervises `session`, when anything does.  Derived per frame
+    /// rather than stored, so a config read that lands later, or a herdr that
+    /// stops listing the agent, reaches the row without a second source of
+    /// truth to keep in step.
+    fn session_managed(&self, session: &Session) -> Option<Managed> {
+        let key = session.herdr_key.as_ref()?;
+        let agent = self.session_herdr_agent(session);
+        Some(Managed::herdr(&key.side, &self.herdr_settings(&key.side), agent))
+    }
+
+    /// One number standing for every endpoint's rendered state, so the
+    /// sidebar's per-frame comparison stays a `u64` compare.
+    fn herdr_generation(&self) -> u64 {
+        self.herdr_endpoints.generation()
+    }
+
+    /// Refreshes the herdr endpoints on their own clock; a no-op per endpoint
+    /// until its poll interval elapses.  Disabled stops the polling, not just
+    /// the rows: the subprocesses are the whole cost of the feature, so an
+    /// opt-out that kept running them would opt out of nothing.
+    fn poll_herdr_endpoints(&mut self) {
+        if !self.config.ui.herdr.enabled {
+            return;
+        }
+        self.herdr_endpoints.poll(self.config.ui.herdr.poll_interval);
+    }
+
+    /// The rows `ws` paints, in `listed`'s order.  An entry whose session or
+    /// agent has gone since the listing was built yields no row rather than a
+    /// panic; the next rebuild drops it for good.
+    fn workspace_rows(
+        &self,
+        ws: &WorkspaceKey,
+        listed: &sidebar_nav::ListedRows,
+    ) -> Vec<WorkspaceRowData> {
+        let Some(entries) = listed.get(ws) else { return Vec::new() };
         let active = self.active_session.get(ws).copied();
         let is_current = self.current_workspace == *ws;
-        ids.iter()
-            .filter_map(|id| self.sessions.iter().find(|s| s.id == *id))
-            .map(|s| {
-                let activity = s.activity();
-                SessionRowData {
-                    id: s.id,
-                    title: session_row_title(&s.title, activity),
-                    needs_attention: s.needs_attention,
-                    activity,
-                    is_active: active == Some(s.id),
-                    is_displayed: is_current && active == Some(s.id),
-                }
+        entries
+            .iter()
+            .filter_map(|entry| match entry {
+                sidebar_nav::WorkspaceEntry::Session(id) => {
+                    let s = self.sessions.iter().find(|s| s.id == *id)?;
+                    let activity =
+                        herdr_backed_activity(s.activity(), self.session_herdr_status(s));
+                    Some(WorkspaceRowData::Session(SessionRowData {
+                        id: s.id,
+                        name: session_row_name(&s.title, activity, self.session_herdr_agent(s)),
+                        needs_attention: s.needs_attention,
+                        activity,
+                        is_active: active == Some(s.id),
+                        is_displayed: is_current && active == Some(s.id),
+                        managed: self.session_managed(s),
+                    }))
+                },
+                sidebar_nav::WorkspaceEntry::Agent(side, terminal_id) => {
+                    let agent = self.find_herdr_agent(side, terminal_id)?;
+                    let settings = self.herdr_settings(side);
+                    Some(WorkspaceRowData::Herdr(HerdrRowData::from_agent(agent, side, &settings)))
+                },
             })
             .collect()
     }
 
     fn show_delete_dialog(&mut self, ctx: &Context) {
+        if self.pending_delete.is_none() {
+            return;
+        }
+
+        // Consume Enter/Escape, and act on a confirm, before adopting a
+        // dirty count below: adoption can flip `force` from `false` to
+        // `true` this same frame, but the keypress was the user's reaction
+        // to what was already painted (a previous frame's "checking…", read
+        // as `force: false`). Executing the confirm here, against the
+        // request as it stands before this frame's adoption runs, is what
+        // keeps "the `force` a confirm executes" equal to "the `force` the
+        // user was shown" — held Enter (key repeat) would otherwise hit the
+        // race on the exact frame the probe lands.
+        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        if confirm_via_key {
+            self.run_pending_delete(ctx);
+            return;
+        }
+        if cancel_via_key {
+            self.pending_delete = None;
+            return;
+        }
+
         let theme = self.theme;
         let danger = rgb_to_color32(self.config.palette.normal[1]);
         let Some(req) = self.pending_delete.as_mut() else {
             return;
         };
+        if let Some(job) = req.dirty_job.as_ref() {
+            match job.poll() {
+                Some(counts) => {
+                    // A known-dirty count preloads `force` so confirming goes
+                    // straight to a forced removal, with the discard warning
+                    // already on screen — the same outcome a warm cache gets
+                    // at request time, just landing a frame later.
+                    req.force = counts.is_dirty();
+                    req.dirty = Some(counts);
+                    req.dirty_job = None;
+                },
+                // A panicked probe never lands a count; drop the handle so
+                // the dialog stops claiming to be checking and reads
+                // "couldn't check" instead (see `dirty_warning`).
+                None if job.failed() => req.dirty_job = None,
+                None => {},
+            }
+        }
         let (title, detail, verb) = if req.prunable {
             (
                 format!("Prune worktree `{}`?", req.worktree_name),
@@ -7124,9 +9114,7 @@ impl AlacritreeApp {
                 "Delete",
             )
         };
-        let warning = dirty_warning(&req.dirty);
-
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let warning = dirty_warning(req.dirty.as_ref(), req.force, req.dirty_job.is_some());
 
         let frame = modal_frame(&theme);
         let mut confirmed = false;
@@ -7174,11 +9162,11 @@ impl AlacritreeApp {
             },
         );
 
-        if confirm_via_key || confirmed {
+        if confirmed {
             self.run_pending_delete(ctx);
             return;
         }
-        if cancel_via_key || cancelled || modal.should_close() {
+        if cancelled || modal.should_close() {
             self.pending_delete = None;
         }
     }
@@ -7194,8 +9182,16 @@ impl AlacritreeApp {
             self.pending_session_close = None;
             return;
         };
-        let title = format!("Close session `{}`?", session.title);
-        let busy = session.is_busy();
+        // A managed session's attach client is always running, so the busy
+        // warning would fire every time and warn about nothing: what it
+        // guards against is losing work, and detaching loses none.
+        let managed = session.herdr_key.is_some();
+        let title = if managed {
+            format!("Detach from `{}`?", session.title)
+        } else {
+            format!("Close session `{}`?", session.title)
+        };
+        let busy = session.is_busy() && !managed;
 
         let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
         let frame = modal_frame(&theme);
@@ -7216,13 +9212,16 @@ impl AlacritreeApp {
                 }
                 ui.add_space(4.0 * s);
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Enter to close · Esc to cancel")
-                            .color(theme.text_muted)
-                            .small(),
-                    );
+                    let keys = if managed {
+                        "Enter to detach · Esc to cancel"
+                    } else {
+                        "Enter to close · Esc to cancel"
+                    };
+                    ui.label(RichText::new(keys).color(theme.text_muted).small());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let close_btn = modal_button(ui, &theme, "Close", danger);
+                        let (verb, tint) =
+                            if managed { ("Detach", theme.text) } else { ("Close", danger) };
+                        let close_btn = modal_button(ui, &theme, verb, tint);
                         if close_btn.clicked() {
                             confirmed = true;
                         }
@@ -7592,23 +9591,54 @@ impl AlacritreeApp {
             return;
         };
         let project_root = self.projects[req.project_idx].root.clone();
+        let policy = self.config.ui.last_session_close;
+        let ring = policy.rings().then(|| self.session_ring()).unwrap_or_default();
+        let removed: Vec<SessionId> = policy
+            .rings()
+            .then(|| {
+                self.sessions
+                    .iter()
+                    .filter(|s| s.working_directory.as_deref() == Some(&req.worktree_path))
+                    .map(|s| s.id)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Drop sessions whose cwd is the worktree before deleting it; the PTY
         // would otherwise block the directory removal on some filesystems.
         self.sessions.retain(|s| s.working_directory.as_deref() != Some(&req.worktree_path));
         self.active_session.remove(&Some(req.worktree_path.clone()));
         if self.current_workspace.as_deref() == Some(&req.worktree_path) {
+            let landing = policy
+                .rings()
+                .then(|| {
+                    let prefer = policy
+                        .prefers_project()
+                        .then(|| {
+                            sidebar_nav::project_of(
+                                &self.projects,
+                                &Some(req.worktree_path.clone()),
+                            )
+                        })
+                        .flatten();
+                    ring_landing(&ring, &removed, prefer)
+                })
+                .flatten();
+            let verdict = match landing {
+                Some((_, id)) => CloseFallback::ActivateSession(id),
+                None => CloseFallback::Home,
+            };
             if defers_close_navigation(self.config.ui.sidebar_focus) {
                 self.sidebar_deferred_close = Some(DeferredClose {
-                    verdict: CloseFallback::Home,
+                    verdict,
                     removed_worktree: Some(req.worktree_path.clone()),
                 });
                 ctx.request_repaint();
             } else {
                 // Deleting the on-screen worktree is an explicit user action,
-                // so home should greet with a live shell rather than the "no
-                // session" placeholder.
-                self.activate_home(ctx);
+                // so the view should greet with a live shell rather than the
+                // "no session" placeholder.
+                self.apply_close_fallback(ctx, verdict);
             }
         }
 
@@ -7617,47 +9647,122 @@ impl AlacritreeApp {
         // `poll_pending_deletes`; the dialog closes immediately either way and
         // the sidebar row shows a spinner meanwhile.
         let worktree_path = req.worktree_path.clone();
-        let job = if req.prunable {
+        let worktree_name = req.worktree_name.clone();
+        let branch = req.branch.clone();
+        let delete_job = if req.prunable {
             wt::DeleteJob::Prune {
                 worktree_name: req.worktree_name,
                 branch: req.branch,
                 delete_branch: req.delete_branch,
             }
         } else {
+            // `req.force` already reflects a resolved dirty count (set in
+            // `request_worktree_delete` or when its probe landed); a count
+            // that never resolved before the confirm leaves it `false`, and
+            // `poll_pending_deletes` retries with `force: true` once git
+            // itself refuses the tree as dirty.
             wt::DeleteJob::Remove {
                 worktree_path: req.worktree_path,
                 branch: req.branch,
-                force: req.dirty.is_dirty(),
+                force: req.force,
             }
         };
-        let result_rx = wt::spawn_delete(project_root, job, ctx.clone());
+        let job = wt::spawn_delete(project_root, delete_job, ctx.clone());
         self.pending_deletes.push(DeleteTask {
             project_idx: req.project_idx,
             worktree_path,
+            worktree_name,
+            branch,
+            dirty: req.dirty,
+            delete_branch: req.delete_branch,
             prunable: req.prunable,
-            result_rx,
+            job,
         });
     }
 
     /// Adopt finished background deletes: pop up any failure and refresh the
     /// affected project so the removed worktree (or its spinner) drops out of
-    /// the sidebar.
+    /// the sidebar. A refusal that names a dirty or untracked tree reopens the
+    /// confirm as a forced retry instead of surfacing a plain error — git is
+    /// the authority on whether the removal would lose work, not a count read
+    /// while the user was staring at the first dialog.
     fn poll_pending_deletes(&mut self, ctx: &Context) {
-        let mut finished: Vec<(usize, bool, Result<(), String>)> = Vec::new();
-        self.pending_deletes.retain(|task| match task.result_rx.try_recv() {
-            Ok(result) => {
-                finished.push((task.project_idx, task.prunable, result));
+        struct Finished {
+            project_idx: usize,
+            worktree_path: PathBuf,
+            worktree_name: String,
+            branch: Option<String>,
+            dirty: Option<DirtyCounts>,
+            delete_branch: bool,
+            prunable: bool,
+            result: Result<(), String>,
+        }
+        let mut finished: Vec<Finished> = Vec::new();
+        self.pending_deletes.retain(|task| match task.job.poll() {
+            Some(result) => {
+                finished.push(Finished {
+                    project_idx: task.project_idx,
+                    worktree_path: task.worktree_path.clone(),
+                    worktree_name: task.worktree_name.clone(),
+                    branch: task.branch.clone(),
+                    dirty: task.dirty,
+                    delete_branch: task.delete_branch,
+                    prunable: task.prunable,
+                    result,
+                });
                 false
             },
-            Err(mpsc::TryRecvError::Empty) => true,
-            Err(mpsc::TryRecvError::Disconnected) => false,
+            // A panicked delete job never lands a result; without this the
+            // sidebar row's spinner would spin forever instead of surfacing
+            // a failure.
+            None if task.job.failed() => {
+                finished.push(Finished {
+                    project_idx: task.project_idx,
+                    worktree_path: task.worktree_path.clone(),
+                    worktree_name: task.worktree_name.clone(),
+                    branch: task.branch.clone(),
+                    dirty: task.dirty,
+                    delete_branch: task.delete_branch,
+                    prunable: task.prunable,
+                    result: Err("the background worker panicked".to_string()),
+                });
+                false
+            },
+            None => true,
         });
-        for (project_idx, prunable, result) in finished {
-            if let Err(e) = result {
-                let action = if prunable { "Prune" } else { "Delete" };
-                self.error_dialog = Some(format!("{action} failed.\n\n{e}"));
+        for f in finished {
+            match f.result {
+                Ok(()) => {},
+                // Only opens the retry when no confirm is currently on
+                // screen — reopening unconditionally would swap the dialog
+                // contents under a user looking at an unrelated confirm
+                // (same modal id, so an in-flight Enter would force-delete
+                // the wrong worktree), and a second refusal landing in this
+                // same batch would silently overwrite the first retry
+                // instead of surfacing it.
+                Err(e) if !f.prunable && refused_for_unsaved_work(&e) => {
+                    if self.pending_delete.is_none() {
+                        self.pending_delete = Some(DeleteRequest {
+                            project_idx: f.project_idx,
+                            worktree_path: f.worktree_path,
+                            worktree_name: f.worktree_name,
+                            branch: f.branch,
+                            dirty: f.dirty,
+                            dirty_job: None,
+                            prunable: false,
+                            delete_branch: f.delete_branch,
+                            force: true,
+                        });
+                    } else {
+                        self.error_dialog = Some(format!("Delete failed.\n\n{e}"));
+                    }
+                },
+                Err(e) => {
+                    let action = if f.prunable { "Prune" } else { "Delete" };
+                    self.error_dialog = Some(format!("{action} failed.\n\n{e}"));
+                },
             }
-            self.refresh_project(ctx, project_idx);
+            self.refresh_project(ctx, f.project_idx);
         }
     }
 
@@ -7669,16 +9774,30 @@ impl AlacritreeApp {
     fn poll_pending_creates(&mut self, ctx: &Context) {
         let mut finished: Vec<(usize, Result<PathBuf, String>)> = Vec::new();
         self.pending_creates.retain_mut(|task| {
+            let mut done = None;
             loop {
                 match task.rx.try_recv() {
                     Ok(Progress::Step(_)) => {},
                     Ok(Progress::Done(result)) => {
-                        finished.push((task.project_idx, result));
-                        break false;
+                        done = Some(result);
+                        break;
                     },
-                    Err(mpsc::TryRecvError::Empty) => break true,
-                    Err(mpsc::TryRecvError::Disconnected) => break false,
+                    // Nothing more this frame either way — a worker that
+                    // unwound instead of reporting comes back through the
+                    // failure latch below, so its placeholder row is
+                    // replaced rather than left standing forever.
+                    Err(_) => break,
                 }
+            }
+            let _ = task.job.poll();
+            let done =
+                done.or_else(|| task.job.failed().then(|| Err(CREATE_WORKER_PANICKED.to_string())));
+            match done {
+                Some(result) => {
+                    finished.push((task.project_idx, result));
+                    false
+                },
+                None => true,
             }
         });
         for (project_idx, result) in finished {
@@ -7760,6 +9879,22 @@ impl AlacritreeApp {
         let Some(mut picker) = self.pending_base_branch.take() else {
             return;
         };
+        if let Some(job) = picker.branches_job.as_ref() {
+            match job.poll() {
+                Some(branches) => {
+                    picker.branches = Some(branches);
+                    picker.branches_job = None;
+                },
+                // A panicked listing never lands a result; drop the handle
+                // so the picker shows the failure row instead of "loading
+                // branches…" forever.
+                None if job.failed() => {
+                    picker.branches = Some(Err("branch listing did not complete".to_string()));
+                    picker.branches_job = None;
+                },
+                None => {},
+            }
+        }
         let theme = self.theme;
         let danger = rgb_to_color32(self.config.palette.normal[1]);
         let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
@@ -7804,13 +9939,13 @@ impl AlacritreeApp {
                 let query_changed = ui.add(edit).changed();
                 focus_default(ui.ctx(), input_id);
 
-                if let Err(e) = &picker.branches {
+                if let Some(Err(e)) = &picker.branches {
                     ui.label(RichText::new(e).color(danger).small());
                 }
 
                 filtered = match &picker.branches {
-                    Ok(branches) => filter_branches(branches, &picker.query),
-                    Err(_) => Vec::new(),
+                    Some(Ok(branches)) => filter_branches(branches, &picker.query),
+                    Some(Err(_)) | None => Vec::new(),
                 };
                 picker.cursor = picker_cursor(
                     query_changed,
@@ -7828,6 +9963,14 @@ impl AlacritreeApp {
                     let auto = ui.selectable_label(picker.cursor == 0, auto_label);
                     if auto.clicked() {
                         chosen = Some(None);
+                    }
+                    if picker.branches.is_none() {
+                        ui.add_enabled(
+                            false,
+                            egui::Label::new(
+                                RichText::new("loading branches…").color(theme.text_muted),
+                            ),
+                        );
                     }
                     for (i, branch) in filtered.iter().enumerate() {
                         let selected = current.as_deref() == Some(branch.as_str());
@@ -7853,11 +9996,12 @@ impl AlacritreeApp {
         if down {
             picker.cursor = (picker.cursor + 1).min(filtered.len());
         }
-        // A failed branch listing leaves `filtered` empty, so cursor 0 would
-        // resolve to Auto — applying it on Enter would clear an existing
-        // override on a reflexive keypress rather than the no-op a listing
-        // failure should be. Clicks can't reach this path (no rows render).
-        if confirm_via_key && picker.branches.is_ok() {
+        // While the listing is pending or failed, `filtered` is empty, so
+        // cursor 0 would resolve to Auto — applying it on Enter would clear
+        // an existing override on a reflexive keypress rather than the no-op
+        // that state should produce. Clicking Auto still works either way
+        // (see `auto.clicked()` above); only the keyboard shortcut is gated.
+        if confirm_via_key && matches!(picker.branches, Some(Ok(_))) {
             chosen = Some(if picker.cursor == 0 {
                 None
             } else {
@@ -7882,13 +10026,19 @@ impl AlacritreeApp {
             CreateState::Prompt { project_idx, branch, error } => {
                 self.show_create_prompt(ctx, project_idx, branch, error)
             },
-            CreateState::Running { project_idx, branch, mut steps, rx } => {
+            CreateState::Running { project_idx, branch, mut steps, rx, job } => {
                 let mut done: Option<Result<PathBuf, String>> = None;
                 while let Ok(p) = rx.try_recv() {
                     match p {
                         Progress::Step(s) => steps.push(s),
                         Progress::Done(r) => done = Some(r),
                     }
+                }
+                // A panicked worker sends no `Progress::Done`, so without the
+                // latch the modal would sit on its last step forever.
+                let _ = job.poll();
+                if done.is_none() && job.failed() {
+                    done = Some(Err(CREATE_WORKER_PANICKED.to_string()));
                 }
                 let minimized = self.show_create_running(ctx, project_idx, &branch, &steps);
                 match done {
@@ -7898,10 +10048,15 @@ impl AlacritreeApp {
                     // Minimized: hand the still-running create off to
                     // `poll_pending_creates` and dismiss the modal.
                     None if minimized => {
-                        self.pending_creates.push(BackgroundCreate { project_idx, branch, rx });
+                        self.pending_creates.push(BackgroundCreate {
+                            project_idx,
+                            branch,
+                            rx,
+                            job,
+                        });
                         None
                     },
-                    None => Some(CreateState::Running { project_idx, branch, steps, rx }),
+                    None => Some(CreateState::Running { project_idx, branch, steps, rx, job }),
                 }
             },
             CreateState::Done { project_idx, steps, result } => {
@@ -7993,7 +10148,8 @@ impl AlacritreeApp {
             return None;
         }
         if confirm_via_key || create_clicked {
-            // Whitespace runs become single hyphens — `some text like this` → `some-text-like-this`.
+            // Whitespace runs become single hyphens — `some text like this` →
+            // `some-text-like-this`.
             let canonical: String = branch.split_whitespace().collect::<Vec<_>>().join("-");
             if let Err(msg) = wt::validate_branch_name(&canonical) {
                 error = Some(msg);
@@ -8002,12 +10158,13 @@ impl AlacritreeApp {
             let base_dir = self.config.workspace.base_dir_for(&project_root);
             let req =
                 CreateRequest { project_root, default_branch, branch: canonical.clone(), base_dir };
-            let rx = wt::spawn_create(req, ctx.clone());
+            let (rx, job) = wt::spawn_create(req, ctx.clone());
             return Some(CreateState::Running {
                 project_idx,
                 branch: canonical,
                 steps: Vec::new(),
                 rx,
+                job,
             });
         }
         Some(CreateState::Prompt { project_idx, branch, error })
@@ -8185,12 +10342,27 @@ impl AlacritreeApp {
         for call in calls {
             let ipc::AppCall { request, reply_tx } = call;
             // Discovery is far too slow to run here, and the caller still has
-            // to be answered from the refreshed list rather than the stale
-            // one, so this request owns its reply channel until then.
-            if let ipc::IpcRequest::RefreshProject { root } = request {
-                self.defer_project_refresh(ctx, root, reply_tx);
-                continue;
-            }
+            // to be answered from the discovered list rather than the stale
+            // one (or the placeholder), so these requests own their reply
+            // channel until it lands.
+            let request = match request {
+                ipc::IpcRequest::RefreshProject { root } => {
+                    self.defer_project_refresh(ctx, root, reply_tx);
+                    continue;
+                },
+                ipc::IpcRequest::AddProject { path } => {
+                    self.defer_project_add(ctx, path, reply_tx);
+                    continue;
+                },
+                // The reply has to wait for the PTY: a client that creates a
+                // session in order to write to it would otherwise be told the
+                // id before anything can receive what it writes.
+                ipc::IpcRequest::CreateSession { workspace } => {
+                    self.defer_create_session(ctx, workspace, reply_tx);
+                    continue;
+                },
+                other => other,
+            };
             let name = request.name();
             let started = std::time::Instant::now();
             let result = self.handle_ipc_request(ctx, request);
@@ -8214,6 +10386,60 @@ impl AlacritreeApp {
         self.refresh_project(ctx, idx);
         if let Some(reply_tx) = self.project_refreshes.watch(&root, reply_tx) {
             let _ = reply_tx.send(Ok(project_json(&self.projects[idx])));
+        }
+    }
+
+    /// A project that is already in the sidebar is answered from the list as
+    /// it stands; a new one goes in as a placeholder and its discovery runs on
+    /// a worker, so the reply waits for that rather than describing worktrees
+    /// nothing has looked for yet.
+    fn defer_project_add(
+        &mut self,
+        ctx: &Context,
+        path: PathBuf,
+        reply_tx: mpsc::Sender<ipc::IpcResult>,
+    ) {
+        self.add_project_off_thread(ctx, path.clone());
+        let Some(idx) = self.projects.iter().position(|p| p.root == path) else {
+            let _ = reply_tx.send(Err(format!("{} could not be added", path.display())));
+            return;
+        };
+        if let Some(reply_tx) = self.project_refreshes.watch(&path, reply_tx) {
+            let _ = reply_tx.send(Ok(project_json(&self.projects[idx])));
+        }
+    }
+
+    fn defer_create_session(
+        &mut self,
+        ctx: &Context,
+        workspace: Option<PathBuf>,
+        reply_tx: mpsc::Sender<ipc::IpcResult>,
+    ) {
+        let workspace = match workspace {
+            None => None,
+            Some(p) => match self.known_worktree_path(&p) {
+                Some(known) => Some(known),
+                None => {
+                    let _ = reply_tx.send(Err(unknown_worktree(&p)));
+                    return;
+                },
+            },
+        };
+        let id = match self.spawn_session(ctx, workspace) {
+            Ok(id) => id,
+            // `defer_create_session` answers the client itself, so a failure
+            // the frame can still see has to be sent rather than returned.
+            Err(e) => {
+                let _ = reply_tx.send(Err(format!("failed to spawn shell: {e}")));
+                return;
+            },
+        };
+        // Nothing is opening for this id when the gate is off, since
+        // `spawn_session` attaches inline before returning: `watch` hands
+        // the channel straight back and it is answered the same way the
+        // gate-off path answers it.
+        if let Some(reply_tx) = self.pending_spawns.watch(id, reply_tx) {
+            let _ = reply_tx.send(Ok(json!({ "session_id": id })));
         }
     }
 
@@ -8247,18 +10473,10 @@ impl AlacritreeApp {
                     Ok(json!({ "workspace": known }))
                 },
             },
-            Req::CreateSession { workspace } => {
-                let workspace = match workspace {
-                    None => None,
-                    Some(p) => {
-                        Some(self.known_worktree_path(&p).ok_or_else(|| unknown_worktree(&p))?)
-                    },
-                };
-                let id = self
-                    .spawn_session(ctx, workspace)
-                    .map_err(|e| format!("failed to spawn shell: {e}"))?;
-                Ok(json!({ "session_id": id }))
-            },
+            // Claimed by `process_ipc_calls` before dispatch: the reply is
+            // held until the session's PTY is live, which needs the reply
+            // channel this method does not have.
+            Req::CreateSession { .. } => Err("create_session was not deferred".to_string()),
             Req::CloseSession { session_id } => {
                 if !self.sessions.iter().any(|s| s.id == session_id) {
                     return Err(format!("no session with id {session_id}"));
@@ -8269,7 +10487,7 @@ impl AlacritreeApp {
             Req::MoveSession { session_id, path } => {
                 let target =
                     self.workspace_for_path(&path).ok_or_else(|| unknown_worktree(&path))?;
-                let workspace = self.move_session_to(session_id, target)?;
+                let workspace = self.move_session_to_key(session_id, Some(target))?;
                 // A silent re-grouping produces no PTY events, so nothing
                 // else would wake the next paint.
                 ctx.request_repaint();
@@ -8285,7 +10503,7 @@ impl AlacritreeApp {
                 if let Some(editor) = self.sessions[idx].scratchpad.as_mut() {
                     editor.insert_at_cursor(ctx, session_id, &text);
                 } else {
-                    let session = &self.sessions[idx];
+                    let session = &mut self.sessions[idx];
                     paste::on_terminal_input_start(session);
                     session.write(text.into_bytes());
                 }
@@ -8319,8 +10537,9 @@ impl AlacritreeApp {
             // Claimed by `process_ipc_calls` before dispatch: the reply is
             // held until the background discovery lands, which needs the
             // reply channel this method does not have.
-            Req::RefreshProject { .. } => Err("refresh was not deferred".to_string()),
-            Req::AddProject { path } => Ok(project_json(self.add_project(path))),
+            Req::RefreshProject { .. } | Req::AddProject { .. } => {
+                Err("discovery was not deferred".to_string())
+            },
             Req::RemoveProject { root } => {
                 let idx =
                     self.projects.iter().position(|p| p.root == root).ok_or_else(|| {
@@ -8401,7 +10620,18 @@ fn session_json(session: &Session, is_active_tab: bool) -> Value {
 
 impl eframe::App for AlacritreeApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        let bg = self.theme.terminal_bg;
+        // This clear is the only thing painting a cell the grid leaves alone,
+        // so it has to carry the terminal's own background rather than the
+        // configured one.  eframe reads it before `update`, so a colour OSC 11
+        // moved this frame lands next frame; terminal output requests a repaint
+        // of its own, so the stale frame is replaced rather than left up.
+        let bg = self.grid_snapshot.default_bg(&self.config.palette);
+        // Deliberately not premultiplied, where alacritty's `renderer::clear`
+        // writes `(rgb * alpha, alpha)`.  `egui_glow::clear` hands these to
+        // `glClearColor` untouched and the compositor reads the framebuffer as
+        // premultiplied, so a translucent window carries its background at full
+        // strength; scaling it here would darken every `[window] opacity`
+        // already tuned against this.
         let n = |c: u8| c as f32 / 255.0;
         [n(bg.r()), n(bg.g()), n(bg.b()), self.config.window.opacity]
     }
@@ -8425,11 +10655,22 @@ impl eframe::App for AlacritreeApp {
             crash_log::record_reason(ExitReason::WindowClosed);
         }
         self.poll_project_refreshes();
+        self.poll_pending_spawns(ctx);
+        self.poll_herdr_attach(ctx);
+        self.sync_herdr_view_focus();
         // Unconditional: either sidebar can be hidden, and a drain hung off one
         // of them would strand every entry the other polled.
-        self.pr_cache.drain_completed();
+        self.pr_cache.drain_completed(ctx);
         self.poll_pending_deletes(ctx);
         self.poll_pending_creates(ctx);
+        self.poll_herdr_endpoints();
+        // Poll first, then check `failed`: a panicked job's `poll` returns
+        // `None` forever, so `failed` is what stops its handle from sitting
+        // here for the rest of the process.
+        self.detached_jobs.retain(|job| match job.poll() {
+            Some(()) => false,
+            None => !job.failed(),
+        });
         self.phases.mark("polls");
         let modal_open = self.is_modal_open();
         // Keys pressed mid-composition drive the IME's candidate window,
@@ -8463,7 +10704,10 @@ impl eframe::App for AlacritreeApp {
         // panel fill on top would compound the alpha through egui's blend.
         let translucent = self.config.window.opacity < 1.0;
         let sidebar_fill = if translucent { Color32::TRANSPARENT } else { theme.sidebar_bg };
-        let central_fill = if translucent { Color32::TRANSPARENT } else { theme.terminal_bg };
+        // Opaque, this fill is what a collapsed cell shows, so it tracks the
+        // terminal's background for the same reason the clear does.
+        let terminal_bg = self.grid_snapshot.default_bg(&self.config.palette);
+        let central_fill = if translucent { Color32::TRANSPARENT } else { terminal_bg };
 
         let panel_frame = Frame::default().fill(sidebar_fill).inner_margin(Margin::same(8));
 
@@ -8534,14 +10778,18 @@ impl eframe::App for AlacritreeApp {
                         ui,
                         session,
                         &self.config,
+                        &self.face_metrics,
                         allow_focus,
                         &mut self.builtin_glyphs,
                         &mut self.ime,
                         &mut self.color_glyphs,
                         &mut self.glyph_cache,
                         &mut self.grid_snapshot,
+                        Some(&self.gpu_grid),
+                        &mut self.detached_jobs,
                     );
                     self.grid_paint += started.elapsed();
+                    self.last_pane_geometry = Some((session.size, session.cell_size));
                     response
                 };
                 // egui fake-clicks the natively focused widget on Space/Enter,
@@ -8719,6 +10967,159 @@ mod tests {
     }
 
     #[test]
+    fn dirty_warning_under_force_never_goes_silent() {
+        // The exact regression this fixes: a forced retry with no counts at
+        // all (the request was confirmed before its probe landed, which
+        // cancelled the probe) must still tell the user `--force` discards
+        // work, not silently drop the warning.
+        let message = dirty_warning(None, true, false).expect("a forced confirm always warns");
+        assert!(message.contains("--force"));
+
+        // A stale-clean read carried into the retry must not read as "safe"
+        // either -- the retry only exists because git already refused this
+        // exact tree as dirty.
+        let clean = DirtyCounts::default();
+        let message =
+            dirty_warning(Some(&clean), true, false).expect("a forced confirm always warns");
+        assert!(message.contains("--force"));
+    }
+
+    #[test]
+    fn dirty_warning_stays_quiet_for_a_known_clean_unforced_tree() {
+        let clean = DirtyCounts::default();
+        assert_eq!(dirty_warning(Some(&clean), false, false), None);
+    }
+
+    #[test]
+    fn dirty_warning_distinguishes_checking_from_unavailable() {
+        let checking = dirty_warning(None, false, true).expect("still checking");
+        assert!(checking.to_lowercase().contains("checking"));
+        let unavailable = dirty_warning(None, false, false).expect("probe failed or was skipped");
+        assert!(!unavailable.to_lowercase().contains("checking"));
+    }
+
+    #[test]
+    fn refused_for_unsaved_work_matches_a_real_git_refusal() {
+        let message = "git worktree remove ../wt1: fatal: '../wt1' contains modified or untracked \
+                       files, use --force to delete it";
+        assert!(refused_for_unsaved_work(message));
+    }
+
+    #[test]
+    fn refused_for_unsaved_work_ignores_unrelated_failures() {
+        assert!(!refused_for_unsaved_work(
+            "git worktree remove ../wt1: fatal: '../wt1' is a main working tree"
+        ));
+    }
+
+    /// A worktree path that happens to contain the matched phrase must not
+    /// turn an unrelated failure into a false "needs --force" prompt --
+    /// `refused_for_unsaved_work` only reads the text after the closing
+    /// quote of the path, never the quoted path itself.
+    #[test]
+    fn refused_for_unsaved_work_is_not_fooled_by_a_path_spelling_out_the_phrase() {
+        let path = "../is dirty, use --force to delete it";
+        let message = format!(
+            "git worktree remove {path}: fatal: '{path}' cannot be locked: filesystem error"
+        );
+        assert!(!refused_for_unsaved_work(&message));
+    }
+
+    #[test]
+    fn spawn_geometry_prefers_the_active_session_over_the_last_painted_pane() {
+        let active = Some(ActiveGeometry {
+            size: TermSize::new(120, 40),
+            cell_size: (9.0, 18.0),
+            is_scratchpad: false,
+        });
+        let last_pane = Some((TermSize::new(80, 24), (8.0, 16.0)));
+
+        let (size, cell_size) = spawn_geometry(active, last_pane);
+
+        assert_eq!((size.columns, size.screen_lines), (120, 40));
+        assert_eq!(cell_size, (9.0, 18.0));
+    }
+
+    #[test]
+    fn an_active_scratchpad_does_not_shadow_the_last_painted_pane() {
+        // The size every scratchpad keeps for its whole life.
+        let active = Some(ActiveGeometry {
+            size: TermSize::new(80, 24),
+            cell_size: (8.0, 16.0),
+            is_scratchpad: true,
+        });
+        let last_pane = Some((TermSize::new(120, 40), (9.0, 18.0)));
+
+        let (size, cell_size) = spawn_geometry(active, last_pane);
+
+        assert_eq!((size.columns, size.screen_lines), (120, 40));
+        assert_eq!(cell_size, (9.0, 18.0));
+    }
+
+    #[test]
+    fn spawn_geometry_falls_back_to_the_last_painted_pane_without_an_active_session() {
+        let last_pane = Some((TermSize::new(120, 40), (9.0, 18.0)));
+
+        let (size, cell_size) = spawn_geometry(None, last_pane);
+
+        assert_eq!((size.columns, size.screen_lines), (120, 40));
+        assert_eq!(cell_size, (9.0, 18.0));
+    }
+
+    #[test]
+    fn spawn_geometry_falls_back_to_80x24_before_anything_has_painted() {
+        let (size, cell_size) = spawn_geometry(None, None);
+
+        assert_eq!((size.columns, size.screen_lines), (80, 24));
+        assert_eq!(cell_size, (8.0, 16.0));
+    }
+
+    #[test]
+    fn the_visible_session_holds_the_self_boost_while_its_pty_is_still_opening() {
+        // Nothing to raise yet, so `set_priority_boost` answered false.
+        let visible = SessionBoost { raised: false, visible: true, pending: true };
+
+        assert!(holds_self_boost(visible));
+    }
+
+    #[test]
+    fn a_background_session_still_opening_its_pty_holds_no_self_boost() {
+        let background = SessionBoost { raised: false, visible: false, pending: true };
+
+        assert!(!holds_self_boost(background));
+    }
+
+    #[test]
+    fn a_session_whose_job_took_the_boost_holds_it_wherever_it_sits() {
+        let background = SessionBoost { raised: true, visible: false, pending: false };
+
+        assert!(holds_self_boost(background));
+    }
+
+    #[test]
+    fn a_frame_whose_visible_session_is_still_pending_leaves_the_self_boost_where_it_was() {
+        let frame = [
+            SessionBoost { raised: false, visible: false, pending: false },
+            // On screen, its PTY still opening: no job exists to answer for
+            // it, and the boost must survive the gap until one does.
+            SessionBoost { raised: false, visible: true, pending: true },
+            SessionBoost { raised: false, visible: false, pending: true },
+        ];
+
+        assert!(frame_holds_self_boost(frame.into_iter()));
+    }
+
+    #[test]
+    fn a_frame_of_idle_background_sessions_drops_the_self_boost() {
+        let frame = [
+            SessionBoost { raised: false, visible: false, pending: false },
+            SessionBoost { raised: false, visible: false, pending: true },
+        ];
+
+        assert!(!frame_holds_self_boost(frame.into_iter()));
+    }
+
+    #[test]
     fn a_grey_worktree_only_stays_in_the_workspace_ring_while_it_holds_sessions() {
         let wt = Worktree {
             name: "gone".into(),
@@ -8754,6 +11155,16 @@ mod tests {
         if let Some(to) = move_target(v.len(), from, insert_before) {
             let it = v.remove(from);
             v.insert(to, it);
+        }
+        v
+    }
+
+    /// Apply `walk_swaps` to a concrete list, with `indices` standing in for
+    /// the absolute slots one workspace occupies inside the session vector.
+    fn walked(items: &[&str], indices: &[usize], j: usize, position: usize) -> Vec<String> {
+        let mut v: Vec<String> = items.iter().map(|s| s.to_string()).collect();
+        for (a, b) in walk_swaps(indices, j, position) {
+            v.swap(a, b);
         }
         v
     }
@@ -8856,10 +11267,9 @@ mod tests {
             false,
         );
         assert!(!retain, "a matched search action consumes the key");
-        assert!(matches!(
-            steps.as_slice(),
-            [SidebarNavStep::SearchAction(NamedAction::SidebarSearchConfirm)]
-        ));
+        assert!(matches!(steps.as_slice(), [SidebarNavStep::SearchAction(
+            NamedAction::SidebarSearchConfirm
+        )]));
         // The filter is untouched by the drain — the action does the exit.
         assert_eq!(f.mode(), panel_filter::Mode::Search);
         assert_eq!(f.query(), "foo");
@@ -8873,10 +11283,9 @@ mod tests {
             egui::Modifiers::NONE,
             false,
         );
-        assert!(matches!(
-            steps.as_slice(),
-            [SidebarNavStep::SearchAction(NamedAction::SidebarSearchCancel)]
-        ));
+        assert!(matches!(steps.as_slice(), [SidebarNavStep::SearchAction(
+            NamedAction::SidebarSearchCancel
+        )]));
 
         let mut steps = Vec::new();
         drain_search_or_nav(
@@ -8888,10 +11297,9 @@ mod tests {
             false,
         );
         assert!(
-            matches!(
-                steps.as_slice(),
-                [SidebarNavStep::SearchAction(NamedAction::SidebarSearchCancelToTerminal)]
-            ),
+            matches!(steps.as_slice(), [SidebarNavStep::SearchAction(
+                NamedAction::SidebarSearchCancelToTerminal
+            )]),
             "Shift+Esc is a distinct search action from plain Esc"
         );
     }
@@ -8910,10 +11318,9 @@ mod tests {
             egui::Modifiers::NONE,
             false,
         );
-        assert!(matches!(
-            steps.as_slice(),
-            [SidebarNavStep::Filter(panel_filter::Outcome::MoveCursor(1))]
-        ));
+        assert!(matches!(steps.as_slice(), [SidebarNavStep::Filter(
+            panel_filter::Outcome::MoveCursor(1)
+        )]));
 
         // Space stays consumed as a no-op nav even in search (fake-click guard).
         let mut steps = Vec::new();
@@ -9152,6 +11559,97 @@ mod tests {
         assert_eq!(session_ring_target(&ring, Some(9), 1), None);
     }
 
+    fn entry(project: Option<&str>, workspace: &str, id: SessionId) -> RingEntry {
+        RingEntry { project: project.map(PathBuf::from), workspace: ws(workspace), id }
+    }
+
+    /// The tree from the spec: home holds nothing, p1 owns w1 and w2, p2 owns
+    /// w3.  Ring order is sidebar order, so p1's sessions precede p2's.
+    fn spec_ring() -> Vec<RingEntry> {
+        vec![
+            entry(Some("/p1"), "/p1/w1", 1),
+            entry(Some("/p1"), "/p1/w2", 2),
+            entry(Some("/p2"), "/p2/w3", 3),
+        ]
+    }
+
+    #[test]
+    fn a_close_lands_on_the_successor() {
+        assert_eq!(ring_landing(&spec_ring(), &[1], None), Some((ws("/p1/w2"), 2)));
+    }
+
+    #[test]
+    fn a_close_at_the_tail_lands_on_the_predecessor() {
+        assert_eq!(ring_landing(&spec_ring(), &[3], None), Some((ws("/p1/w2"), 2)));
+    }
+
+    /// A worktree deletion takes every session in the workspace at once, so
+    /// the successor is measured past the last of them and the predecessor
+    /// before the first.
+    #[test]
+    fn a_deletion_steps_over_every_session_it_removed() {
+        let ring = vec![
+            entry(Some("/p1"), "/p1/w1", 1),
+            entry(Some("/p1"), "/p1/w2", 2),
+            entry(Some("/p1"), "/p1/w2", 3),
+            entry(Some("/p2"), "/p2/w3", 4),
+        ];
+        assert_eq!(ring_landing(&ring, &[2, 3], None), Some((ws("/p2/w3"), 4)));
+    }
+
+    #[test]
+    fn an_empty_ring_and_an_unknown_removal_have_no_landing() {
+        assert_eq!(ring_landing(&[], &[1], None), None);
+        assert_eq!(ring_landing(&spec_ring(), &[99], None), None);
+    }
+
+    #[test]
+    fn removing_everything_leaves_no_landing() {
+        assert_eq!(ring_landing(&spec_ring(), &[1, 2, 3], None), None);
+    }
+
+    #[test]
+    fn prefer_project_takes_its_own_project_over_a_nearer_neighbour() {
+        // p2's session sits between the two p1 sessions, so a global search
+        // from id 1 finds id 9 and a project-preferring one finds id 2.
+        let ring = vec![
+            entry(Some("/p1"), "/p1/w1", 1),
+            entry(Some("/p2"), "/p2/w3", 9),
+            entry(Some("/p1"), "/p1/w2", 2),
+        ];
+        assert_eq!(ring_landing(&ring, &[1], None), Some((ws("/p2/w3"), 9)));
+        assert_eq!(ring_landing(&ring, &[1], Some(Path::new("/p1"))), Some((ws("/p1/w2"), 2)));
+    }
+
+    /// `ring_project` is `ring_global` plus a first pass, so the two must
+    /// agree whenever that pass finds nothing.
+    #[test]
+    fn prefer_project_falls_through_to_the_whole_ring() {
+        let ring = spec_ring();
+        assert_eq!(
+            ring_landing(&ring, &[3], Some(Path::new("/p2"))),
+            ring_landing(&ring, &[3], None),
+        );
+    }
+
+    #[test]
+    fn home_has_no_project_to_prefer() {
+        let ring = vec![entry(None, "/home-placeholder", 1), entry(Some("/p1"), "/p1/w1", 2)];
+        assert_eq!(ring_landing(&ring, &[1], None), Some((ws("/p1/w1"), 2)));
+    }
+
+    /// A path two projects list is in the ring twice with one owner, so
+    /// either occurrence resolves to the same landing.
+    #[test]
+    fn a_duplicated_workspace_changes_no_landing() {
+        let ring = vec![
+            entry(Some("/p1"), "/shared", 1),
+            entry(Some("/p1"), "/shared", 1),
+            entry(Some("/p2"), "/p2/w", 2),
+        ];
+        assert_eq!(ring_landing(&ring, &[1], None), Some((ws("/p2/w"), 2)));
+    }
+
     #[test]
     fn move_target_reorders_forward_and_back() {
         // Drag "a" to the end (drop below the last row, index len).
@@ -9174,18 +11672,112 @@ mod tests {
     }
 
     #[test]
-    fn session_ids_filter_by_workspace_and_keep_spawn_order() {
-        let pairs = vec![(None, 1), (ws("/a"), 2), (None, 3), (ws("/b"), 4), (ws("/a"), 5)];
-        assert_eq!(sidebar_session_ids(&pairs, &None, false), vec![1, 3]);
-        assert_eq!(sidebar_session_ids(&pairs, &ws("/a"), false), vec![2, 5]);
-        // /b has a single session, below the two-session list threshold.
-        assert!(sidebar_session_ids(&pairs, &ws("/b"), false).is_empty());
+    fn walk_swaps_moves_within_a_contiguous_workspace() {
+        assert_eq!(walked(&["a", "b", "c"], &[0, 1, 2], 0, 2), vec!["b", "c", "a"]);
+        assert_eq!(walked(&["a", "b", "c"], &[0, 1, 2], 2, 0), vec!["c", "a", "b"]);
     }
 
     #[test]
-    fn session_ids_empty_for_unknown_workspace() {
-        let pairs = vec![(None, 1)];
-        assert!(sidebar_session_ids(&pairs, &ws("/missing"), false).is_empty());
+    fn walk_swaps_leaves_interleaved_workspaces_in_place() {
+        // Slots 0 and 2 belong to one workspace, slot 1 to another; moving the
+        // first workspace's second session to the front must not disturb it.
+        assert_eq!(walked(&["a", "x", "b"], &[0, 2], 1, 0), vec!["b", "x", "a"]);
+    }
+
+    #[test]
+    fn walk_swaps_is_empty_when_nothing_moves() {
+        assert!(walk_swaps(&[0, 1, 2], 1, 1).is_empty());
+        // A position past the end clamps to the last slot, which is a no-op
+        // for the element already there.
+        assert!(walk_swaps(&[0, 1, 2], 2, 9).is_empty());
+    }
+
+    #[test]
+    fn a_same_workspace_drop_uses_the_move_target_arithmetic() {
+        // Dropping below your own row is a no-op, the same as for projects.
+        assert_eq!(drop_position(true, 3, 1, 2), None);
+        // Dropping onto the row below moves you past it.
+        assert_eq!(drop_position(true, 3, 1, 3), Some(2));
+        assert_eq!(moved(&["a", "b", "c"], 1, 3), vec!["a", "c", "b"]);
+    }
+
+    #[test]
+    fn a_cross_workspace_drop_takes_the_display_slot_as_the_position() {
+        // The session is not in that workspace's list yet, so nothing shifts
+        // down and every slot passes through — including the two the same
+        // workspace answers differently, which is what tells the branches
+        // apart.
+        assert_eq!(drop_position(false, 3, 1, 2), Some(2));
+        assert_eq!(drop_position(false, 3, 1, 3), Some(3));
+        // A drop onto the front of a workspace whose rows are all below it.
+        assert_eq!(drop_position(false, 0, 0, 0), Some(0));
+    }
+
+    #[test]
+    fn walk_swaps_places_an_arrival_at_the_stated_position() {
+        // Arriving from another workspace, the display slot is the position:
+        // nothing was removed from this list first, so there is no off-by-one.
+        assert_eq!(walk_swaps(&[0, 1, 2], 2, 0), vec![(1, 2), (0, 1)]);
+    }
+
+    #[test]
+    fn reorder_subject_prefers_the_cursored_session() {
+        assert_eq!(
+            reorder_subject(true, Some(&SidebarRow::Session(7)), || None, |_| None, || Some(3)),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn reorder_subject_takes_a_workspace_rows_active_session() {
+        // The landing after a cross-workspace step: the session paints no row
+        // yet, so the cursor sits on the worktree it arrived in.
+        let row = SidebarRow::Worktree(PathBuf::from("/b"));
+        assert_eq!(
+            reorder_subject(true, Some(&row), || None, |p| (p == Path::new("/b")).then_some(9), || Some(3)),
+            Some(9)
+        );
+        assert_eq!(
+            reorder_subject(true, Some(&SidebarRow::Home), || Some(4), |_| None, || Some(3)),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn reorder_subject_falls_back_to_the_session_on_screen() {
+        // Terminal focused: the cursor is ignored entirely.
+        assert_eq!(
+            reorder_subject(false, Some(&SidebarRow::Session(7)), || None, |_| None, || Some(3)),
+            Some(3)
+        );
+        // Sidebar focused on a project header, which owns no session.
+        let row = SidebarRow::Project(PathBuf::from("/a"));
+        assert_eq!(reorder_subject(true, Some(&row), || None, |_| None, || Some(3)), Some(3));
+        // And an empty workspace row falls through rather than refusing.
+        let row = SidebarRow::Worktree(PathBuf::from("/b"));
+        assert_eq!(reorder_subject(true, Some(&row), || None, |_| None, || Some(3)), Some(3));
+    }
+
+    fn entries(ids: &[SessionId]) -> Vec<sidebar_nav::WorkspaceEntry> {
+        ids.iter().copied().map(sidebar_nav::WorkspaceEntry::Session).collect()
+    }
+
+    /// herdr's index, paired with the row it belongs to, is what
+    /// `workspace_entries` sorts on.
+    fn at(
+        index: usize,
+        entry: sidebar_nav::WorkspaceEntry,
+    ) -> (usize, sidebar_nav::WorkspaceEntry) {
+        (index, entry)
+    }
+
+    fn agent_entry(terminal_id: &str) -> sidebar_nav::WorkspaceEntry {
+        sidebar_nav::WorkspaceEntry::Agent(herdr::Side::Native, terminal_id.to_string())
+    }
+
+    #[test]
+    fn workspace_entries_keep_shell_sessions_in_spawn_order() {
+        assert_eq!(workspace_entries(&[1, 3], Vec::new(), false), entries(&[1, 3]));
     }
 
     #[test]
@@ -9229,16 +11821,383 @@ mod tests {
 
     #[test]
     fn session_row_title_drops_an_agents_decorative_prefix() {
-        let agent = SessionActivity::Agent(Some("claude"));
+        let agent = SessionActivity::agent(Some("claude"), LiveState::Idle);
         assert_eq!(session_row_title("✳ claude", agent), "claude");
-        assert_eq!(session_row_title("⠋ Thinking…", SessionActivity::Loading(None)), "Thinking…");
+        assert_eq!(
+            session_row_title("⠋ Thinking…", SessionActivity::agent(None, LiveState::Working)),
+            "Thinking…"
+        );
         // An ordinary session title owns its decoration because the status
         // slot is not replacing it with an agent mark.
-        assert_eq!(session_row_title("✳ favorite", SessionActivity::Idle), "✳ favorite");
+        assert_eq!(session_row_title("✳ favorite", SessionActivity::Shell), "✳ favorite");
         // A recognized agent with a plain title strips nothing.
         assert_eq!(session_row_title("node build", agent), "node build");
         // Never strip down to an empty label.
         assert_eq!(session_row_title("✳ ", agent), "✳ ");
+    }
+
+    /// The status slot is the only place a blocked agent announces itself, so
+    /// the three live states must not collapse into the same mark.
+    #[test]
+    fn each_live_state_draws_its_own_mark() {
+        let quiet = Color32::from_rgb(1, 1, 1);
+        let attention = Color32::from_rgb(2, 2, 2);
+        assert_eq!(
+            agent_mark(LiveState::Idle, quiet, attention),
+            AgentMark::Glyph(DEFAULT_AGENT_ICON, quiet)
+        );
+        assert_eq!(agent_mark(LiveState::Working, quiet, attention), AgentMark::Loader);
+        assert_eq!(
+            agent_mark(LiveState::Blocked, quiet, attention),
+            AgentMark::Glyph(DEFAULT_BLOCKED_ICON, attention)
+        );
+    }
+
+    /// A blocked agent stays amber on the row the user is looking at, where
+    /// the accent would otherwise claim the slot.
+    #[test]
+    fn blocked_keeps_its_color_over_the_active_rows_accent() {
+        let accent = Color32::from_rgb(3, 3, 3);
+        let attention = Color32::from_rgb(4, 4, 4);
+        assert_eq!(
+            agent_mark(LiveState::Blocked, accent, attention),
+            AgentMark::Glyph(DEFAULT_BLOCKED_ICON, attention)
+        );
+    }
+
+    #[test]
+    fn the_status_hint_names_the_agent_and_what_it_is_doing() {
+        assert_eq!(agent_hint(LiveState::Idle, Some("claude")), "claude is running");
+        assert_eq!(agent_hint(LiveState::Working, Some("codex")), "codex is working");
+        assert_eq!(agent_hint(LiveState::Blocked, Some("claude")), "claude is waiting for you");
+        assert_eq!(agent_hint(LiveState::Blocked, None), "agent is waiting for you");
+    }
+
+    #[test]
+    fn an_attached_herdr_session_takes_herdrs_live_state() {
+        let claude = SessionActivity::agent(Some("claude"), LiveState::Idle);
+
+        // Not attached to herdr: nothing overrides the session's own reading.
+        assert_eq!(herdr_backed_activity(claude, None), claude);
+
+        // herdr sees the approval dialog no title heuristic can.
+        assert_eq!(
+            herdr_backed_activity(claude, Some(herdr::Status::Blocked)),
+            SessionActivity::agent(Some("claude"), LiveState::Blocked)
+        );
+
+        // An attached pane holds an agent even when the process probe missed
+        // one, so the gate closes on herdr's word alone.
+        assert_eq!(
+            herdr_backed_activity(SessionActivity::Shell, Some(herdr::Status::Working)),
+            SessionActivity::agent(None, LiveState::Working)
+        );
+
+        // `unknown` is herdr declining to say, not a claim of idleness: the
+        // session keeps whatever it already knew.
+        let working = SessionActivity::agent(Some("claude"), LiveState::Working);
+        assert_eq!(herdr_backed_activity(working, Some(herdr::Status::Unknown)), working);
+    }
+
+    fn herdr_agent(kind: Option<&str>) -> herdr::Agent {
+        herdr::Agent {
+            terminal_id: "term_65abfc8e300361".into(),
+            pane_id: "w5:p1".into(),
+            kind: kind.map(String::from),
+            title: None,
+            status: herdr::Status::Idle,
+            focused: false,
+            cwd: None,
+            foreground_cwd: None,
+        }
+    }
+
+    /// herdr distinguishes four live states and says so on its own panes.
+    /// Collapsing any pair onto one mark would make the sidebar say less
+    /// about a pane than the window it came from.
+    #[test]
+    fn herdr_marks_keep_its_four_states_apart() {
+        for set in [herdr::Indicators::Dots, herdr::Indicators::Symbols] {
+            let marks: Vec<HarnessMark> = [
+                herdr::Status::Blocked,
+                herdr::Status::Working,
+                herdr::Status::Done,
+                herdr::Status::Idle,
+            ]
+            .into_iter()
+            .map(|status| herdr_mark(status, set))
+            .collect();
+            for (i, a) in marks.iter().enumerate() {
+                for b in &marks[i + 1..] {
+                    assert_ne!(a, b, "{set:?} draws two states the same");
+                }
+            }
+        }
+    }
+
+    /// Taken from herdr's own `state_icon_symbol`, so a pane carries one mark
+    /// whether it is read in herdr or in the sidebar.
+    #[test]
+    fn herdr_marks_are_the_ones_herdr_paints() {
+        let dots = |status| herdr_mark(status, herdr::Indicators::Dots).glyph;
+        assert_eq!(dots(herdr::Status::Blocked), "●");
+        assert_eq!(dots(herdr::Status::Working), "●");
+        assert_eq!(dots(herdr::Status::Done), "●");
+        assert_eq!(dots(herdr::Status::Idle), "○");
+
+        let symbols = |status| herdr_mark(status, herdr::Indicators::Symbols).glyph;
+        assert_eq!(symbols(herdr::Status::Blocked), "×");
+        assert_eq!(symbols(herdr::Status::Working), "◐");
+        assert_eq!(symbols(herdr::Status::Done), "✓");
+        assert_eq!(symbols(herdr::Status::Idle), "○");
+    }
+
+    /// A status alacritree does not recognise is herdr declining to say, and
+    /// the row says that rather than claiming the agent is idle.
+    #[test]
+    fn an_unknown_herdr_status_is_drawn_as_no_reading() {
+        for set in [herdr::Indicators::Dots, herdr::Indicators::Symbols] {
+            let mark = herdr_mark(herdr::Status::Unknown, set);
+            assert_eq!(mark.glyph, "·");
+            assert_eq!(mark.tone, StateTone::Unclear);
+        }
+    }
+
+    #[test]
+    fn herdr_row_name_prefers_the_reported_kind() {
+        let row = HerdrRowData::from_agent(
+            &herdr_agent(Some("claude")),
+            &herdr::Side::Native,
+            &herdr::Settings::default(),
+        );
+        assert_eq!(row.name, RowName::plain("claude".into()));
+    }
+
+    #[test]
+    fn herdr_row_name_falls_back_to_the_terminal_id_tail() {
+        let row = HerdrRowData::from_agent(
+            &herdr_agent(None),
+            &herdr::Side::Native,
+            &herdr::Settings::default(),
+        );
+        assert_eq!(row.name, RowName::plain("300361".into()));
+    }
+
+    /// A shared view shows whatever pane herdr has focused, so the one on
+    /// screen has to keep asking for its own.
+    #[test]
+    fn a_shared_view_asks_herdr_for_its_pane() {
+        let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
+        let asks = needs_view_focus(Some(&key), 1, None);
+        assert_eq!(asks, cfg!(windows));
+    }
+
+    /// A direct attach is wired to one pane, so herdr's focus decides nothing
+    /// about what it draws.
+    #[test]
+    fn a_direct_attach_never_asks_herdr_for_its_pane() {
+        let key = herdr::HerdrKey { side: herdr::Side::Wsl("d".into()), terminal_id: "t1".into() };
+        assert!(!needs_view_focus(Some(&key), 1, None));
+        assert!(!needs_view_focus(None, 1, None));
+    }
+
+    /// The pane herdr was last pointed at is where it still is, and asking
+    /// again every frame would spawn a herdr per frame.
+    #[test]
+    fn a_shared_view_asks_once_per_switch() {
+        let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
+        assert!(!needs_view_focus(Some(&key), 1, Some(1)));
+        let asks = needs_view_focus(Some(&key), 2, Some(1));
+        assert_eq!(asks, cfg!(windows));
+    }
+
+    #[test]
+    fn herdr_row_shared_view_follows_can_attach() {
+        let native = HerdrRowData::from_agent(
+            &herdr_agent(None),
+            &herdr::Side::Native,
+            &herdr::Settings::default(),
+        );
+        assert_eq!(native.managed.shared_view, cfg!(windows));
+
+        let wsl = HerdrRowData::from_agent(
+            &herdr_agent(None),
+            &herdr::Side::Wsl("d".into()),
+            &herdr::Settings::default(),
+        );
+        assert!(!wsl.managed.shared_view);
+    }
+
+    #[test]
+    fn herdr_row_name_keeps_a_short_terminal_id_whole() {
+        // `saturating_sub(6)` exists precisely for ids shorter than the tail
+        // it takes; a plain `- 6` would panic on this one.
+        let agent = herdr::Agent {
+            terminal_id: "t1".into(),
+            pane_id: "w1:p1".into(),
+            kind: None,
+            title: None,
+            status: herdr::Status::Idle,
+            focused: false,
+            cwd: None,
+            foreground_cwd: None,
+        };
+        let row =
+            HerdrRowData::from_agent(&agent, &herdr::Side::Native, &herdr::Settings::default());
+        assert_eq!(row.name, RowName::plain("t1".into()));
+    }
+
+    /// On Linux and WSL an attach is full passthrough, so the pane the user
+    /// ends up looking at is herdr's.  The row says so by naming it the way
+    /// herdr's own listed row does, rather than by whatever the attach
+    /// process titled its PTY.
+    #[test]
+    fn an_attached_session_takes_herdrs_name() {
+        let agent = titled(Some("claude"), Some("primary"));
+        let name = session_row_name("bash", SessionActivity::Shell, Some(&agent));
+        assert_eq!((name.context.as_deref(), name.text.as_str()), (Some("claude"), "primary"));
+    }
+
+    /// herdr reporting no title is not a reason to lose the name the session
+    /// already had, so the PTY's title stands in.
+    #[test]
+    fn an_attached_session_without_a_herdr_title_keeps_its_own() {
+        let agent = titled(Some("claude"), None);
+        let name = session_row_name("✳ building", SessionActivity::Shell, Some(&agent));
+        assert_eq!((name.context.as_deref(), name.text.as_str()), (Some("claude"), "✳ building"));
+    }
+
+    /// A session no harness owns is untouched by any of this.
+    #[test]
+    fn an_ordinary_session_keeps_its_pty_title() {
+        let agent = SessionActivity::agent(Some("claude"), LiveState::Idle);
+        let name = session_row_name("✳ claude", agent, None);
+        assert_eq!((name.context, name.text.as_str()), (None, "claude"));
+    }
+
+    fn titled(kind: Option<&str>, title: Option<&str>) -> herdr::Agent {
+        herdr::Agent { title: title.map(String::from), ..herdr_agent(kind) }
+    }
+
+    fn row_of(kind: Option<&str>, title: Option<&str>) -> HerdrRowData {
+        HerdrRowData::from_agent(
+            &titled(kind, title),
+            &herdr::Side::Wsl("d".into()),
+            &herdr::Settings::default(),
+        )
+    }
+
+    /// The kind is a category and the title is an identity, so the title takes
+    /// the bright slot and the kind stands in front of it as context.
+    #[test]
+    fn a_titled_agent_reads_kind_then_title() {
+        let row = row_of(Some("claude"), Some("primary"));
+        assert_eq!(
+            (row.name.context.as_deref(), row.name.text.as_str()),
+            (Some("claude"), "primary")
+        );
+    }
+
+    /// Nothing is repeated: a title that only echoes the kind leaves the row
+    /// with one word, not the same word twice.
+    #[test]
+    fn a_title_equal_to_the_kind_is_not_repeated() {
+        let row = row_of(Some("codex"), Some("codex"));
+        assert_eq!((row.name.context.as_deref(), row.name.text.as_str()), (None, "codex"));
+    }
+
+    #[test]
+    fn an_untitled_agent_keeps_the_kind_as_its_name() {
+        let row = row_of(Some("claude"), None);
+        assert_eq!((row.name.context.as_deref(), row.name.text.as_str()), (None, "claude"));
+    }
+
+    /// An agent herdr has not identified still has a pane title, and that is a
+    /// better name than six characters of a terminal id.
+    #[test]
+    fn a_kindless_agent_is_named_by_its_title() {
+        let row = row_of(None, Some("scratch"));
+        assert_eq!((row.name.context.as_deref(), row.name.text.as_str()), (None, "scratch"));
+    }
+
+    #[test]
+    fn an_agent_with_neither_falls_back_to_the_terminal_id_tail() {
+        let row = row_of(None, None);
+        assert_eq!((row.name.context.as_deref(), row.name.text.as_str()), (None, "300361"));
+    }
+
+    /// Everything the row's marks cannot say goes here, one fact per comma,
+    /// with the way out in parentheses after them: a mark can carry a state
+    /// but not the word for it, and nothing on the row can carry a chord.
+    #[test]
+    fn the_tooltip_spells_out_what_the_marks_cannot() {
+        let agent = herdr::Agent {
+            status: herdr::Status::Working,
+            ..titled(Some("claude"), Some("Claude Code"))
+        };
+        let mut row = HerdrRowData::from_agent(
+            &agent,
+            &herdr::Side::Wsl("d".into()),
+            &herdr::Settings::default(),
+        );
+        assert_eq!(managed_tooltip(&row.managed), r#"working, herdr, `claude` "Claude Code"."#);
+
+        row.managed.detach = Some("Ctrl+B q".to_string());
+        assert_eq!(
+            managed_tooltip(&row.managed),
+            r#"working, herdr, `claude` "Claude Code". (detach with `Ctrl+B q`)"#
+        );
+
+        row.managed.shared_view = true;
+        assert_eq!(
+            managed_tooltip(&row.managed),
+            r#"working, herdr, shared view, `claude` "Claude Code". (detach with `Ctrl+B q`)"#
+        );
+    }
+
+    /// A pane whose title says no more than its kind is named once.
+    #[test]
+    fn the_tooltip_does_not_say_the_kind_twice() {
+        let row = row_of(Some("codex"), Some("codex"));
+        assert_eq!(managed_tooltip(&row.managed), "idle, herdr, `codex`.");
+    }
+
+    /// A session alacritree still holds open after herdr stopped listing its
+    /// pane has no state and no name left to report, but it is still herdr's
+    /// and the user still has to know how to leave it.
+    #[test]
+    fn an_unlisted_pane_still_says_how_to_leave() {
+        let settings =
+            herdr::Settings { detach: Some("Ctrl+B q".into()), ..herdr::Settings::default() };
+        let managed = Managed::herdr(&herdr::Side::Wsl("d".into()), &settings, None);
+        assert_eq!(managed_tooltip(&managed), "herdr. (detach with `Ctrl+B q`)");
+    }
+
+    /// Losing a view costs a click to get back and losing a shell costs the
+    /// shell, so the two prompts answer to separate switches — and the busy
+    /// question a close asks never reaches a detach, whose attach client is
+    /// running by definition.
+    #[test]
+    fn a_detach_asks_on_its_own_switch() {
+        use crate::config::ConfirmSessionClose;
+
+        let mut ui = UiTheme::default();
+        assert_eq!(ui.confirm_session_close, ConfirmSessionClose::Never);
+        assert!(close_needs_prompt(&ui, true, false));
+        assert!(!close_needs_prompt(&ui, false, true));
+
+        ui.confirm_session_close = ConfirmSessionClose::Always;
+        ui.confirm_session_detach = false;
+        assert!(!close_needs_prompt(&ui, true, true));
+        assert!(close_needs_prompt(&ui, false, false));
+    }
+
+    /// Ending a herdr-managed session ends the attach and leaves the pane
+    /// running, so the control cannot call itself a close.
+    #[test]
+    fn the_close_control_is_a_detach_on_a_managed_row() {
+        assert_eq!(close_button_hint(true), "detach session");
+        assert_eq!(close_button_hint(false), "close session");
     }
 
     #[test]
@@ -9264,25 +12223,58 @@ mod tests {
     }
 
     #[test]
-    fn session_ids_apply_two_session_threshold() {
-        let no_match: Vec<(WorkspaceKey, SessionId)> = vec![(ws("/other"), 1)];
-        assert!(sidebar_session_ids(&no_match, &ws("/a"), false).is_empty());
-
-        let one_match = vec![(ws("/a"), 1), (ws("/other"), 2)];
-        assert!(sidebar_session_ids(&one_match, &ws("/a"), false).is_empty());
-
-        let two_match = vec![(ws("/a"), 1), (ws("/other"), 2), (ws("/a"), 3)];
-        assert_eq!(sidebar_session_ids(&two_match, &ws("/a"), false), vec![1, 3]);
+    fn workspace_entries_apply_the_two_row_threshold() {
+        assert!(workspace_entries(&[], Vec::new(), false).is_empty());
+        assert!(workspace_entries(&[1], Vec::new(), false).is_empty());
+        assert_eq!(workspace_entries(&[1, 3], Vec::new(), false), entries(&[1, 3]));
     }
 
     #[test]
-    fn session_ids_always_flag_lists_single_sessions() {
-        let one_match = vec![(ws("/a"), 1), (ws("/other"), 2)];
-        assert_eq!(sidebar_session_ids(&one_match, &ws("/a"), true), vec![1]);
+    fn workspace_entries_always_flag_lists_single_sessions() {
+        assert_eq!(workspace_entries(&[1], Vec::new(), true), entries(&[1]));
+        assert!(workspace_entries(&[], Vec::new(), true).is_empty());
+    }
 
-        // Zero sessions stays empty even with the flag on.
-        let no_match: Vec<(WorkspaceKey, SessionId)> = vec![(ws("/other"), 2)];
-        assert!(sidebar_session_ids(&no_match, &ws("/a"), true).is_empty());
+    /// A herdr pane has no other surface to appear on, so the threshold can
+    /// never hide one — and a lone shell session beside one is listed rather
+    /// than folded into the workspace row, which would leave a hole in a list
+    /// its neighbour is already in.
+    #[test]
+    fn a_herdr_row_is_listed_whatever_the_threshold_says() {
+        let lone = workspace_entries(&[], vec![at(0, agent_entry("t1"))], false);
+        assert_eq!(lone, vec![agent_entry("t1")]);
+
+        let beside = workspace_entries(&[1], vec![at(0, agent_entry("t1"))], false);
+        assert_eq!(beside, vec![sidebar_nav::WorkspaceEntry::Session(1), agent_entry("t1")]);
+    }
+
+    /// The whole point of the merged list: a pane keeps herdr's position
+    /// whether alacritree is attached to it or not, so attaching changes how
+    /// a row is drawn and never where it sits.
+    #[test]
+    fn herdr_rows_take_their_order_from_herdr_not_from_the_attach() {
+        // herdr lists t1 then t2; alacritree attached to t2 first, so the
+        // session vec has them the other way round.
+        let managed =
+            vec![at(1, sidebar_nav::WorkspaceEntry::Session(9)), at(0, agent_entry("t1"))];
+        assert_eq!(workspace_entries(&[], managed, false), vec![
+            agent_entry("t1"),
+            sidebar_nav::WorkspaceEntry::Session(9)
+        ]);
+    }
+
+    /// A pane herdr has stopped listing keeps its block rather than falling
+    /// in among the shells: the session is still herdr's, and it goes back to
+    /// its slot when the listing carries it again.
+    #[test]
+    fn an_unlisted_pane_waits_at_the_tail_of_its_own_block() {
+        let managed =
+            vec![at(usize::MAX, sidebar_nav::WorkspaceEntry::Session(9)), at(0, agent_entry("t1"))];
+        assert_eq!(workspace_entries(&[1], managed, false), vec![
+            sidebar_nav::WorkspaceEntry::Session(1),
+            agent_entry("t1"),
+            sidebar_nav::WorkspaceEntry::Session(9),
+        ]);
     }
 
     use crate::projects::{Project, Worktree};
@@ -9457,6 +12449,19 @@ mod tests {
             deferred.verdict,
             CloseFallback::Activate(main),
             "the verdict is carried, not recomputed from whatever state remains"
+        );
+    }
+
+    /// A user's close navigates: away from an emptied workspace, or into a
+    /// replacement shell.  A failed open must do neither.  Wherever it
+    /// navigates to, `ensure_active_session` spawns into it, and that open
+    /// fails the same way.
+    #[test]
+    fn a_failed_spawn_neither_navigates_nor_respawns() {
+        assert_eq!(close_navigation(CloseReason::User, CloseFallback::Home), CloseFallback::Home);
+        assert_eq!(
+            close_navigation(CloseReason::SpawnFailed, CloseFallback::Home),
+            CloseFallback::Stay
         );
     }
 
@@ -9723,19 +12728,16 @@ mod tests {
             "/home/lev/.cargo/bin/delta",
         );
         assert_eq!(program, "wsl.exe");
-        assert_eq!(
-            args[..8],
-            [
-                "-d",
-                "kali-linux",
-                "--cd",
-                r"\\wsl.localhost\kali-linux\home\lev\proj",
-                "--exec",
-                "sh",
-                "-c",
-                r#"export LESS="${LESS-R}"; exec git -c "core.pager=/home/lev/.cargo/bin/delta --paging=always" "$@""#,
-            ]
-        );
+        assert_eq!(args[..8], [
+            "-d",
+            "kali-linux",
+            "--cd",
+            r"\\wsl.localhost\kali-linux\home\lev\proj",
+            "--exec",
+            "sh",
+            "-c",
+            r#"export LESS="${LESS-R}"; exec git -c "core.pager=/home/lev/.cargo/bin/delta --paging=always" "$@""#,
+        ]);
         assert_eq!(args[8], "sh");
         assert_eq!(&args[9..], diff_args(&req("a.rs", DiffSource::Staged)).as_slice());
     }
@@ -9748,18 +12750,15 @@ mod tests {
             &req("a.rs", DiffSource::Staged),
         );
         assert_eq!(program, "wsl.exe");
-        assert_eq!(
-            args[..7],
-            [
-                "-d",
-                "kali-linux",
-                "--cd",
-                r"\\wsl.localhost\kali-linux\home\lev\proj",
-                "--exec",
-                "sh",
-                "-c"
-            ]
-        );
+        assert_eq!(args[..7], [
+            "-d",
+            "kali-linux",
+            "--cd",
+            r"\\wsl.localhost\kali-linux\home\lev\proj",
+            "--exec",
+            "sh",
+            "-c"
+        ]);
         let script = &args[7];
         assert!(script.contains("getent passwd"), "resolves login shell: {script}");
         // The LESS export lives inside the login shell's script so a LESS
@@ -10389,7 +13388,7 @@ mod tests {
                 false,
                 false,
                 false,
-                SessionActivity::Idle,
+                SessionActivity::Shell,
                 false,
                 &[],
                 &icons,
@@ -10562,7 +13561,7 @@ mod tests {
                     false,
                     false,
                     false,
-                    SessionActivity::Idle,
+                    SessionActivity::Shell,
                     false,
                     &[],
                     &icons,
@@ -10657,8 +13656,8 @@ mod tests {
         let expected_size = egui::vec2(16.0 * s, 16.0 * s);
         assert!(
             (painted_size - expected_size).length() < 0.01,
-            "styled_icon_button must paint into a 16x16 slot: got {painted_size:?}, \
-             expected {expected_size:?}"
+            "styled_icon_button must paint into a 16x16 slot: got {painted_size:?}, expected \
+             {expected_size:?}"
         );
         let (family, size, color) =
             painted_glyph_style(&output.shapes, "▶").expect("the configured glyph painted");
@@ -10696,7 +13695,7 @@ mod tests {
                 false,
                 false,
                 false,
-                SessionActivity::Idle,
+                SessionActivity::Shell,
                 false,
                 &[],
                 &icons,
@@ -10768,14 +13767,15 @@ mod tests {
 
             let row = SessionRowData {
                 id: 1,
-                title: "zsh".to_owned(),
+                name: RowName::plain("zsh".to_owned()),
                 needs_attention: false,
-                activity: SessionActivity::Idle,
+                activity: SessionActivity::Shell,
                 is_active: true,
                 is_displayed: true,
+                managed: None,
             };
             let mut session = |ui: &mut egui::Ui| {
-                session_row(ui, &row, false, false, &icons, &theme);
+                session_row(ui, &row, false, false, false, &icons, &theme);
             };
             assert_eq!(
                 hint_painted_over(&mut session, "×", "close session"),
@@ -10784,7 +13784,7 @@ mod tests {
             );
 
             let mut home = |ui: &mut egui::Ui| {
-                home_row(ui, true, false, false, false, SessionActivity::Idle, &icons, &theme);
+                home_row(ui, true, false, false, false, SessionActivity::Shell, &icons, &theme);
             };
             assert_eq!(
                 hint_painted_over(&mut home, "+", "new shell"),
@@ -10855,11 +13855,12 @@ mod tests {
         let icons = crate::config::Icons::default();
         let session = |attention, activity| SessionRowData {
             id: 1,
-            title: "zsh".to_owned(),
+            name: RowName::plain("zsh".to_owned()),
             needs_attention: attention,
             activity,
             is_active: true,
             is_displayed: true,
+            managed: None,
         };
 
         for (icon_tooltips, want) in [(true, true), (false, false)] {
@@ -10868,9 +13869,9 @@ mod tests {
             config.ui.sidebar_tooltips = SidebarTooltips::Off;
             let theme = Theme::from_config(&config);
 
-            let agent = session(false, SessionActivity::Agent(Some("claude")));
+            let agent = session(false, SessionActivity::agent(Some("claude"), LiveState::Idle));
             let mut agent_row = |ui: &mut egui::Ui| {
-                session_row(ui, &agent, false, false, &icons, &theme);
+                session_row(ui, &agent, false, false, false, &icons, &theme);
             };
             assert_eq!(
                 hint_painted_over(&mut agent_row, DEFAULT_AGENT_ICON.as_str(), "claude is running",),
@@ -10883,9 +13884,10 @@ mod tests {
             let slot = painted_glyph_positions(probe.last().expect("the row painted"))
                 [DEFAULT_AGENT_ICON.as_str()];
 
-            let loading = session(false, SessionActivity::Loading(Some("claude")));
+            let loading =
+                session(false, SessionActivity::agent(Some("claude"), LiveState::Working));
             let texts = texts_while_hovering_at(slot, WIDTH, |ui| {
-                session_row(ui, &loading, false, false, &icons, &theme);
+                session_row(ui, &loading, false, false, false, &icons, &theme);
             });
             assert_eq!(
                 texts.iter().flatten().any(|(text, _)| text == "claude is working"),
@@ -10893,9 +13895,9 @@ mod tests {
                 "loading status, icon_tooltips = {icon_tooltips}"
             );
 
-            let waiting = session(true, SessionActivity::Idle);
+            let waiting = session(true, SessionActivity::Shell);
             let texts = texts_while_hovering_at(slot, WIDTH, |ui| {
-                session_row(ui, &waiting, false, false, &icons, &theme);
+                session_row(ui, &waiting, false, false, false, &icons, &theme);
             });
             assert_eq!(
                 texts.iter().flatten().any(|(text, _)| text == "needs attention"),
@@ -11019,7 +14021,7 @@ mod tests {
                     false,
                     false,
                     false,
-                    SessionActivity::Idle,
+                    SessionActivity::Shell,
                     false,
                     &[],
                     &icons,
@@ -11085,7 +14087,7 @@ mod tests {
                     false,
                     false,
                     false,
-                    SessionActivity::Idle,
+                    SessionActivity::Shell,
                     false,
                     &[],
                     &icons,
@@ -11106,11 +14108,11 @@ mod tests {
     fn the_upstream_tooltip_names_the_upstream_ref() {
         let icons = crate::config::Icons::default();
         let theme = Theme::from_config(&Config::default());
-        let (_, _, _, tip) = upstream_badge(
-            &icons,
-            &theme,
-            &UpstreamState::Diverged { upstream: "origin/x".into(), ahead: 2, behind: 1 },
-        );
+        let (_, _, _, tip) = upstream_badge(&icons, &theme, &UpstreamState::Diverged {
+            upstream: "origin/x".into(),
+            ahead: 2,
+            behind: 1,
+        });
         assert_eq!(tip, "tracks origin/x — 2 ahead, 1 behind");
 
         let (_, _, _, tip) = upstream_badge(&icons, &theme, &UpstreamState::Untracked);
@@ -11158,7 +14160,7 @@ mod tests {
                     false,
                     false,
                     false,
-                    SessionActivity::Idle,
+                    SessionActivity::Shell,
                     false,
                     &[],
                     &icons,
@@ -11189,23 +14191,24 @@ mod tests {
         let icons = crate::config::Icons::default();
         let row = SessionRowData {
             id: 1,
-            title: "cargo test --workspace --all-features -- --nocapture".to_owned(),
+            name: RowName::plain("cargo test --workspace --all-features -- --nocapture".to_owned()),
             needs_attention: false,
-            activity: SessionActivity::Idle,
+            activity: SessionActivity::Shell,
             is_active: true,
             is_displayed: true,
+            managed: None,
         };
 
         let texts = texts_while_hovering(140.0, |ui| {
-            session_row(ui, &row, false, false, &icons, &theme);
+            session_row(ui, &row, false, false, false, &icons, &theme);
         });
 
         assert!(
-            row_elided(&texts, &row.title),
+            row_elided(&texts, &row.name.text),
             "the row must be too narrow for the title, or the test proves nothing: {texts:?}"
         );
         assert!(
-            tooltip_shown(&texts, &row.title),
+            tooltip_shown(&texts, &row.name.text),
             "hovering the elided row painted no tooltip with the full title: {texts:?}"
         );
     }
@@ -11250,8 +14253,8 @@ mod tests {
                 assert_eq!(
                     row_elided(&texts, path),
                     path == long,
-                    "{mode:?} on {kind} {path:?}: the harness must elide exactly the long \
-                     path: {texts:?}"
+                    "{mode:?} on {kind} {path:?}: the harness must elide exactly the long path: \
+                     {texts:?}"
                 );
                 assert_eq!(
                     tooltip_shown(&texts, path),
@@ -11274,12 +14277,13 @@ mod tests {
         ];
         let live =
             vec![(None, 1), (Some(PathBuf::from("/a/wt1")), 2), (Some(PathBuf::from("/a/wt1")), 3)];
-        let listed = sidebar_nav::ListedSessions::from([
+        let listed = sidebar_nav::tests::sessions_only(HashMap::from([
             (None, vec![1]),
             (Some(PathBuf::from("/a/wt1")), vec![2, 3]),
-        ]);
+        ]));
         let rows = sidebar_nav::visible_rows(&projects, &listed);
-        let snapshot = build_sidebar_snapshot(&projects, &live, &rows, None, Default::default());
+        let snapshot =
+            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
 
         for row in &rows {
             let id = snapshot.find(row).expect("every projected row is in the model");
@@ -11302,6 +14306,61 @@ mod tests {
         assert!(!snapshot.is_projected(hidden));
     }
 
+    /// Herdr rows are navigable rows, so the arena has to carry them in the
+    /// order the projection lists them.  Missing them parks the lockstep index
+    /// on the first agent row, which marks every row below it unprojected and
+    /// leaves the cursor with no node to sit on.
+    #[test]
+    fn herdr_rows_are_projected_under_the_workspace_they_are_listed_in() {
+        use crate::sidebar_focus::Parent;
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2"])];
+        let live: Vec<(WorkspaceKey, SessionId)> = vec![(Some(PathBuf::from("/a/wt1")), 1)];
+        let home_agent = SidebarRow::HerdrAgent(herdr::Side::Native, "term_home".into());
+        let worktree_agent = SidebarRow::HerdrAgent(herdr::Side::Wsl("d".into()), "term_wt".into());
+        let listed = sidebar_nav::ListedRows::from([
+            (None, vec![sidebar_nav::WorkspaceEntry::Agent(
+                herdr::Side::Native,
+                "term_home".to_string(),
+            )]),
+            (Some(PathBuf::from("/a/wt1")), vec![
+                sidebar_nav::WorkspaceEntry::Session(1),
+                sidebar_nav::WorkspaceEntry::Agent(
+                    herdr::Side::Wsl("d".into()),
+                    "term_wt".to_string(),
+                ),
+            ]),
+        ]);
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let snapshot =
+            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
+
+        for row in &rows {
+            let id = snapshot.find(row).expect("every projected row is in the model");
+            assert!(snapshot.is_projected(id), "{row:?} must stay navigable");
+            let arena_parent = match snapshot.parent(id) {
+                Parent::Root => None,
+                Parent::Node(p) => Some(snapshot.row(p).clone()),
+                Parent::Detached => panic!("a projected row is never detached: {row:?}"),
+            };
+            assert_eq!(
+                arena_parent,
+                sidebar_nav::left_target(&rows, row),
+                "arena parent must agree with the row model for {row:?}"
+            );
+        }
+
+        assert_eq!(
+            snapshot.parent(snapshot.find(&home_agent).unwrap()),
+            Parent::Node(snapshot.find(&SidebarRow::Home).unwrap()),
+        );
+        assert_eq!(
+            snapshot.parent(snapshot.find(&worktree_agent).unwrap()),
+            Parent::Node(snapshot.find(&SidebarRow::Worktree(PathBuf::from("/a/wt1"))).unwrap()),
+        );
+    }
+
     #[test]
     fn a_session_below_the_listing_threshold_is_still_in_the_model() {
         use crate::sidebar_nav::{self, SidebarRow};
@@ -11311,16 +14370,17 @@ mod tests {
         // lists any, so this one is live but unprojected.
         let live = vec![(Some(PathBuf::from("/a/wt1")), 7)];
         let listed = {
-            let mut l = sidebar_nav::ListedSessions::new();
-            let ids = sidebar_session_ids(&live, &Some(PathBuf::from("/a/wt1")), false);
-            assert!(ids.is_empty(), "the threshold rule must actually drop this session");
-            if !ids.is_empty() {
-                l.insert(Some(PathBuf::from("/a/wt1")), ids);
+            let mut l = sidebar_nav::ListedRows::new();
+            let entries = workspace_entries(&[7], Vec::new(), false);
+            assert!(entries.is_empty(), "the threshold rule must actually drop this session");
+            if !entries.is_empty() {
+                l.insert(Some(PathBuf::from("/a/wt1")), entries);
             }
             l
         };
         let rows = sidebar_nav::visible_rows(&projects, &listed);
-        let snapshot = build_sidebar_snapshot(&projects, &live, &rows, None, Default::default());
+        let snapshot =
+            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
 
         let id = snapshot
             .find(&SidebarRow::Session(7))
@@ -11336,9 +14396,10 @@ mod tests {
         // `remove_project` drops the project but keeps its sessions running.
         let projects: Vec<crate::projects::Project> = vec![];
         let live = vec![(Some(PathBuf::from("/orphan/wt1")), 5)];
-        let listed = sidebar_nav::ListedSessions::new();
+        let listed = sidebar_nav::ListedRows::new();
         let rows = sidebar_nav::visible_rows(&projects, &listed);
-        let snapshot = build_sidebar_snapshot(&projects, &live, &rows, None, Default::default());
+        let snapshot =
+            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
 
         let id = snapshot.find(&SidebarRow::Session(5)).expect("the session is still running");
         assert_eq!(
@@ -11353,12 +14414,13 @@ mod tests {
         use crate::sidebar_nav::{self, SidebarRow};
 
         let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2"])];
-        let listed = sidebar_nav::ListedSessions::new();
+        let listed = sidebar_nav::ListedRows::new();
         let rows = sidebar_nav::visible_rows(&projects, &listed);
         let doomed = PathBuf::from("/a/wt2");
         let snapshot = build_sidebar_snapshot(
             &projects,
             &[],
+            &listed,
             &rows,
             Some(doomed.as_path()),
             Default::default(),
@@ -11386,12 +14448,13 @@ mod tests {
 
         let projects =
             vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2", "/a/wt3"])];
-        let listed = sidebar_nav::ListedSessions::new();
+        let listed = sidebar_nav::ListedRows::new();
         let rows = sidebar_nav::visible_rows(&projects, &listed);
         let doomed = PathBuf::from("/a/wt2");
         let snapshot = build_sidebar_snapshot(
             &projects,
             &[],
+            &listed,
             &rows,
             Some(doomed.as_path()),
             Default::default(),
@@ -11404,6 +14467,98 @@ mod tests {
             snapshot.is_projected(below),
             "a row below the one being deleted must still be navigable"
         );
+    }
+
+    /// A checkout the liveness cache calls gone offers no workspace, so the
+    /// agent working in it matches nothing and lists under Home.  Matched to
+    /// the removed worktree instead, its row's Enter could only refuse.
+    #[test]
+    fn a_gone_worktree_offers_no_workspace_to_an_agent() {
+        use crate::sidebar_nav;
+
+        let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2"])];
+        let gone = PathBuf::from("/a/wt2");
+        let workspaces = herdr_workspaces(&projects, |path| Some(path == gone));
+        assert_eq!(workspaces, vec![PathBuf::from("/a/wt1")]);
+
+        let agent = herdr::Agent {
+            terminal_id: "t1".into(),
+            pane_id: "w1:p1".into(),
+            kind: None,
+            title: None,
+            status: herdr::Status::Idle,
+            focused: false,
+            cwd: Some(gone.to_string_lossy().into_owned()),
+            foreground_cwd: None,
+        };
+        assert_eq!(
+            herdr::match_workspace(&agent, &herdr::Side::Native, &workspaces),
+            None,
+            "an agent under a removed checkout falls back to Home"
+        );
+    }
+
+    /// The lockstep walk follows the listing, not the session vector.
+    ///
+    /// Attaching to the second pane first leaves the two sessions in the
+    /// opposite order to herdr's, and a walk that trusted the vector would
+    /// push them the wrong way round, match neither against the projection
+    /// and trip its own assert.
+    #[test]
+    fn the_snapshot_walk_follows_the_listing_not_the_session_vector() {
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        let projects = vec![sidebar_nav::tests::project("/a", true, &["/a/wt1"])];
+        let wt = Some(PathBuf::from("/a/wt1"));
+        // Attached in the order 9 then 4; herdr lists the panes 4 then 9.
+        let live = vec![(wt.clone(), 9), (wt.clone(), 4)];
+        let listed = sidebar_nav::ListedRows::from([(wt.clone(), vec![
+            sidebar_nav::WorkspaceEntry::Session(4),
+            sidebar_nav::WorkspaceEntry::Session(9),
+        ])]);
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let snapshot =
+            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
+
+        assert_eq!(rows, vec![
+            SidebarRow::Home,
+            SidebarRow::Project(PathBuf::from("/a")),
+            SidebarRow::Worktree(PathBuf::from("/a/wt1")),
+            SidebarRow::Session(4),
+            SidebarRow::Session(9),
+        ]);
+        for row in &rows {
+            let id = snapshot.find(row).expect("every projected row is in the model");
+            assert!(snapshot.is_projected(id), "{row:?} must stay navigable");
+        }
+    }
+
+    /// Same lockstep hazard, with the doomed worktree carrying a herdr row:
+    /// the agent rows it owns have to be stepped over as well.
+    #[test]
+    fn rows_below_a_deleted_worktree_with_a_herdr_row_stay_navigable() {
+        use crate::sidebar_nav::{self, SidebarRow};
+
+        let projects =
+            vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2", "/a/wt3"])];
+        let doomed = PathBuf::from("/a/wt2");
+        let listed = sidebar_nav::ListedRows::from([(Some(doomed.clone()), vec![
+            sidebar_nav::WorkspaceEntry::Agent(herdr::Side::Native, "term_doomed".to_string()),
+        ])]);
+        let rows = sidebar_nav::visible_rows(&projects, &listed);
+        let snapshot = build_sidebar_snapshot(
+            &projects,
+            &[],
+            &listed,
+            &rows,
+            Some(doomed.as_path()),
+            Default::default(),
+        );
+
+        let below = snapshot
+            .find(&SidebarRow::Worktree(PathBuf::from("/a/wt3")))
+            .expect("the worktree below the deleted one is still in the tree");
+        assert!(snapshot.is_projected(below));
     }
 
     /// Dispatch cannot catch a wrong pairing: `toggle` drops an identity the

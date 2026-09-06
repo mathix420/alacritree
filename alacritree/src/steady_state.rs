@@ -119,6 +119,7 @@ mod tests {
             pr_generation: 0,
             active_workspace: None,
             active_branch: None,
+            herdr_generation: 0,
         };
         let base = ObservedInputs::capture(&projects, inputs(&live), ui);
 
@@ -145,6 +146,7 @@ mod tests {
             pr_generation: 0,
             active_workspace: None,
             active_branch: None,
+            herdr_generation: 0,
         };
         let base = ObservedInputs::capture(&projects, inputs(&live), ui);
 
@@ -152,6 +154,22 @@ mod tests {
 
         assert!(same);
         assert_eq!(counts.allocs, 0, "a filter must not put an allocation back in the frame path");
+    }
+
+    /// The poll runs every frame with no setting that disables it, so the
+    /// common case — nothing opening — has to be free.
+    #[test]
+    fn polling_no_pending_spawns_allocates_nothing() {
+        let mut spawns = crate::pending_spawn::PendingSpawns::default();
+
+        let (finished, counts) = measure(|| spawns.take_finished());
+
+        assert!(finished.is_empty(), "nothing was started, so nothing can have finished");
+        assert_eq!(
+            counts.allocs, 0,
+            "a frame with no PTY opening allocated {} times ({} bytes) polling for one",
+            counts.allocs, counts.bytes
+        );
     }
 
     #[test]
@@ -166,6 +184,7 @@ mod tests {
             pr_generation: 0,
             active_workspace: None,
             active_branch: None,
+            herdr_generation: 0,
         };
 
         let base_small = ObservedInputs::capture(&small, std::iter::empty(), ui);
@@ -204,6 +223,7 @@ mod tests {
                 pr_generation: 0,
                 active_workspace: None,
                 active_branch: None,
+                herdr_generation: 0,
             };
             let base = ObservedInputs::capture(&projects, inputs(&live), ui);
 

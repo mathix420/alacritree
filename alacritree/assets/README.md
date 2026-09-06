@@ -23,7 +23,7 @@ names the missing codepoint.
 Requires `fonttools` and DejaVu 2.37.
 
     D=/usr/share/fonts/truetype/dejavu
-    U=U+002B,U+00B7,U+00D7,U+2014,U+2022,U+2026,U+2191,U+2193,U+21BB,U+21C5,U+2302,U+232B,U+258C,U+25AA,U+25B8,U+25BE,U+25C7,U+25CB,U+25CF,U+25EF,U+2713,U+283F,U+2B24
+    U=U+002B,U+00B7,U+00D7,U+2014,U+2022,U+2026,U+2191,U+2193,U+21BB,U+21C5,U+2302,U+232B,U+258C,U+25AA,U+25B8,U+25BE,U+25C7,U+25CB,U+25CF,U+25D0,U+25EB,U+25EF,U+2713,U+283F,U+2B24
     python3 -m fontTools.subset $D/DejaVuSans.ttf     --unicodes="$U"     --output-file=sans.ttf --no-hinting --notdef-outline --drop-tables+=MATH
     python3 -m fontTools.subset $D/DejaVuSansMono.ttf --unicodes="U+2315" --output-file=mono.ttf --no-hinting --notdef-outline
 

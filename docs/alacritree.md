@@ -74,6 +74,16 @@ project, its Git worktrees.
   `$XDG_CONFIG_HOME/alacritree/state.toml`. Failures are logged and ignored —
   a missing or corrupt state file never crashes the app.
 
+### herdr agents
+
+herdr is a terminal workspace manager for coding agents. When a herdr server is running, the agents it manages appear in the sidebar under the worktree each agent's working directory matches, dimmed and carrying the `◫` mark that says the pane belongs to herdr rather than to alacritree. A row names the agent's pane title where herdr reports one, with the agent kind in front of it as context, so two agents of one kind in one checkout can be told apart; an agent with no title is named by its kind alone. An agent whose directory matches no worktree — including one whose checkout has been removed — is listed under Home.
+
+- **Attaching.** Enter or a click opens a session attached to that agent, and the row is replaced by the session's own row, which keeps the herdr mark so an attached agent still says where it lives. Hovering either row spells out the same sentence — the state, the harness, and what herdr calls the pane, with the way out after them. Detaching is herdr's own chord, not one of alacritree's, read from herdr's `config.toml` so a rebound `keys.prefix` or `keys.detach` is what you are told. The row's `×` ends the attach and leaves the pane running under herdr, so it offers to detach rather than to close, and the agent's own row comes back. Whether it asks first is `[ui] confirm_session_detach`, a switch of its own: a detach destroys nothing, so the busy question `confirm_session_close` asks has no answer here, and turning one off says nothing about the other.
+- **Order.** A workspace draws its own shell sessions first, then every herdr pane it holds — the sessions attached to one and the agents nothing is attached to alike — in herdr's own order. Attaching therefore changes how a pane is drawn and never where it sits, and neither does detaching or a restart. Reordering is for alacritree's own sessions: a herdr pane's place belongs to herdr, so drag and `MoveSessionUp` / `MoveSessionDown` pass over one. Sort the panes in herdr and the sidebar follows within a poll.
+- **Status.** The row's mark is herdr's own, so a pane carries one symbol whether you read it in herdr or in the sidebar. herdr distinguishes blocked, working, done and idle, and offers two indicator sets; alacritree follows whichever its `[ui] status_indicators` selects, drawing `● ● ● ○` for the dotted set and `× ◐ ✓ ○` for the symbol one, coloured red, yellow, teal and green out of your own palette. A status alacritree does not recognise is drawn as `·` rather than as idle. An attached agent's session row takes herdr's word too, so a dialog the pane title never mentions still reaches the sidebar, and attaching never repaints a pane in a different vocabulary.
+- **Native Windows.** herdr cannot attach a single agent there, so attaching focuses the pane in your own herdr window and shares the whole herdr session — the view resizes with the alacritree pane, and the tooltip says `shared view`. Each row still gets its own session, so every attached agent keeps its `×` and its place in the tab cycle. Every one of herdr's clients draws the same focused pane, though, so alacritree points herdr at the pane of whichever shared view you are looking at: switching to a session moves herdr's focus, in your own herdr window too. Moving that focus inside herdr rather than from the sidebar leaves the session showing a pane its row does not name, until you pick a row again. Both the focus and the session-name lookup are herdr processes, so they always run off the UI thread and the window keeps painting while herdr answers.
+- **Discovery.** Alacritree asks the native `herdr` on your `PATH` and each running WSL distro. Nothing is installed or started. A side with no herdr on it is asked once and then left alone, so a machine without herdr pays a single failed spawn; a side whose herdr answered — even to say its server is down — is retried on a slow clock, so starting herdr after alacritree brings its agents in without a restart. See `[ui.herdr]` under [Configuration](#configuration) for the poll interval and the opt-out.
+
 ### Creating a worktree
 
 The create modal validates the proposed branch name against `git
@@ -379,10 +389,53 @@ sidebar_focus      = "preserve"  # how far the projects sidebar goes when the
                                   # landing that has a live session, and lands a
                                   # closed session on its neighbour instead of on
                                   # the workspace's first session
+sidebar_follow_active = false  # scroll the projects sidebar to the session on
+                                # screen whenever it changes — a cycling key, a
+                                # click, the palette, an IPC request (default
+                                # false); the cursor is left where it was
+sidebar_scroll_align = "minimal"  # where a row a sidebar scrolled to is
+                                   # parked. "minimal" (default) rests it
+                                   # against whichever edge it entered from.
+                                   # "center" re-centres the list on every
+                                   # cursor step, and scrolls a clicked row
+                                   # out from under the pointer — not a
+                                   # scrolloff, the row always lands mid-panel
 vsync              = true   # restart required — wait for the display's refresh
                             # before showing a finished frame (default true).
                             # false presents each frame as soon as it is drawn,
                             # trading tearing for lower keystroke-to-screen delay
+focus_priority_boost = false  # Windows only, restart required — put the
+                              # session on screen one scheduling class above
+                              # normal (default false).
+                              # A program that redraws its line as you type
+                              # needs CPU for every keystroke, and at normal
+                              # priority a build saturating every core starves
+                              # it: nushell echoed in 10 ms boosted, against up
+                              # to 1.9 s unboosted. Covers the shell and
+                              # everything it starts, at any depth, including
+                              # commands that live only a moment. Follows
+                              # focus, and raises nothing while the window is
+                              # in the background
+async_session_spawn = false   # open a session's PTY on a worker rather than
+                              # in the frame that asked for it, so spawning
+                              # does not stutter (default false).
+                              # Creating a console process costs milliseconds
+                              # when the machine is idle and hundreds when it is
+                              # busy, and the frame pays all of it. The tab
+                              # appears at once and starts painting when its PTY
+                              # attaches; anything typed in between is replayed
+reap_descendants_on_close = false  # Windows only, restart required — when a
+                              # session closes, end everything it started at
+                              # any depth (default false).
+                              # The console reaps only the programs attached to
+                              # it, so a helper that left the console — an
+                              # editor's background search, anything started
+                              # detached — outlives the terminal and keeps
+                              # piling up. This also covers alacritree being
+                              # killed or crashing, since the kernel does the
+                              # reaping when the last handle closes. A process
+                              # that means to outlive the terminal must ask
+                              # with CREATE_BREAKAWAY_FROM_JOB
 search_scope       = "filtered"  # whether a sidebar search is confined by the
                                  # active toggle filters
                                  # "filtered" (default): a query narrows what
@@ -411,9 +464,18 @@ icon_tooltips      = true        # whether a sidebar icon explains itself on
                                  # icon's hint never depends on panel width
 confirm_session_close = "never"  # when the sidebar × asks before killing a PTY:
                                  # "never" (default) | "busy" | "always"
-last_session_close = "respawn"   # closing the on-screen workspace's last
-                                 # session: "respawn" (default) starts a fresh
-                                 # one, "navigate" moves to another workspace
+confirm_session_detach = true    # whether the × on a harness-managed row asks
+                                 # before detaching. Its own switch, since a
+                                 # detach leaves the pane running under its
+                                 # harness and lists its row again
+last_session_close = "respawn"   # what happens when the on-screen workspace
+                                 # stops having sessions, whether the last one
+                                 # closed or the worktree was deleted:
+                                 # "respawn" (default) starts a fresh one,
+                                 # "navigate" moves to another workspace,
+                                 # "ring_global" and "ring_project" move to the
+                                 # nearest surviving session in the ring, else
+                                 # home
 pr_status          = false  # poll `gh` for each branch's open PR, which drives
                             # the PR row icons, the PR-state filters, and $pr
                             # below (default false)
@@ -450,6 +512,11 @@ bold_italic_family = "Inter Display"  # unset falls back to family
 [ui.session_display]        # startup defaults; key bindings toggle both at runtime
 sidebar_always = false      # keep a sidebar session row even with one session
 tabs_always    = false      # keep a tab-strip segment even with one session
+
+[ui.session_reorder]        # startup default; ToggleSessionDrag flips drag at runtime
+drag  = false               # drag a session row with the mouse to reorder it
+scope = "workspace"         # how far a reorder may carry a session:
+                            # "workspace" | "project" | "anywhere"
 
 [ui.focus_outline]          # off by default, which keeps the current look
 sidebar   = false           # outline the projects sidebar when it has focus
@@ -527,6 +594,19 @@ image_dir   = "~/shots"     # where those PNGs go (default: the per-user cache
 image_keep  = 20            # how many PNGs the default directory keeps.
                             # Minimum 1 — the image a paste just handed to the
                             # shell always survives the sweep
+
+[ui.herdr]                  # agents running under a herdr server, listed in
+                            # the sidebar under the worktree each agent's
+                            # working directory matches
+enabled          = true     # false does no herdr work at all: no polling,
+                            # no rows
+poll_interval_ms = 2000     # how often a reachable server is asked for its
+                            # agents. A side with no herdr on it is given up on
+                            # after one attempt, so a machine without herdr
+                            # pays a single failed spawn; a side that has one
+                            # is retried even while its server is down
+show_unmatched   = true     # list an agent whose directory matches no
+                            # worktree under Home; false hides it instead
 
 [workspace]
 worktree_dir = "~/dev/worktrees"   # base dir for new worktrees (default ~/.alacritree/worktrees)
@@ -617,12 +697,7 @@ Two things worth knowing about what the schema does and does not do:
   `alacritty.toml` legitimately carries keys only the real alacritty acts on —
   `[hints]`, `[bell]`, `[mouse]`, `[general] import`. Those get no completion,
   but they are not flagged.
-- **Closed-value keys are completed.** `confirm_session_close`, `scrollbar`,
-  `sidebar_focus`, `search_scope`, `sidebar_tooltips`, `last_session_close`,
-  `path_style.*` and `drop.quote` offer their accepted spellings. Keys where
-  Alacritty accepts more than one spelling for the same value — cursor `shape`
-  and `blinking`, binding `action` — are deliberately left unconstrained, so a
-  working config is never marked wrong.
+- **Closed-value keys are completed.** `confirm_session_close`, `scrollbar`, `sidebar_focus`, `sidebar_scroll_align`, `search_scope`, `sidebar_tooltips`, `last_session_close`, `path_style.*` and `drop.quote` offer their accepted spellings. A binding's `action` completes from every action alacritree implements but rejects nothing, so an alacritty-only action still validates. Cursor `shape` and `blinking`, where Alacritty accepts more than one spelling for the same value, are deliberately left unconstrained, so a working config is never marked wrong.
 
 [taplo]: https://taplo.tamasfe.dev/
 [ebt]: https://marketplace.visualstudio.com/items?itemName=tamasfe.even-better-toml
