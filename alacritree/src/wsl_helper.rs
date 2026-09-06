@@ -132,16 +132,25 @@ use std::path::Path;
 /// The distro-side helper, passed verbatim as the single argument of
 /// `wsl.exe --exec sh -c`.  POSIX sh only — dash and busybox ash both run
 /// it.  Shape: capability hello, dead-pidfile GC, a background writer that
-/// owns stdout, then the request dispatcher on stdin.  Responses all leave
-/// through the writer, whose FIFO completion lines are far under PIPE_BUF,
-/// so concurrent jobs never interleave frames.  Commentary lives here, not
-/// in the script, so every byte shipped into the distro earns its keep.
+/// owns stdout, then the request dispatcher on stdin, whose `PING` answers
+/// with an unrouted frame so a caller can tell a stalled dispatcher from a
+/// slow one.  Responses all leave through the writer, whose FIFO completion
+/// lines are far under PIPE_BUF, so concurrent jobs never interleave frames.
+/// Commentary lives here, not in the script, so every byte shipped into the
+/// distro earns its keep.
 ///
 /// Empty request fields arrive as `-` (see `encode_field`); decoded args
 /// lose trailing newlines to command substitution, which no current caller
 /// passes.  Stdin EOF ends the dispatcher; the EXIT trap removes the temp
 /// dir and `kill 0` takes the writer and any in-flight jobs down with the
-/// process group, so a job can never deadlock on the deleted FIFO.
+/// process group, so a job can never deadlock on the deleted FIFO.  Relay
+/// death normally arrives as SIGHUP (every `--exec` session gets a
+/// controlling pty the shell owns, and losing it signals the foreground
+/// group), which the HUP trap below routes through the same EXIT trap —
+/// but a dispatcher that is already dead under a still-live relay, or one
+/// killed outright before the signal lands, reaches no trap at all.  A
+/// start sweeps those predecessors' directories the way the pidfile GC
+/// already sweeps stale session pids.
 pub(crate) const HELPER_SCRIPT: &str = r##"
 set -u
 b64() { printf %s "$1" | base64 | tr -d '\n'; }
@@ -154,16 +163,31 @@ printf 'hello\t1\t%s\t%s\t%s\t%s\n' \
   "$(b64 "$(printf %s "$caps" | sed -n 2p)")" \
   "$(b64 "$(printf %s "$caps" | sed -n 3p)")" \
   "$(b64 "$rt")"
-mkdir -p "$rt" 2>/dev/null
+mkdir -m 700 -p "$rt"
 for f in "$rt"/session-*.pid; do
   [ -e "$f" ] || continue
   p=$(cat "$f" 2>/dev/null)
   case $p in ''|*[!0-9]*) rm -f "$f"; continue;; esac
   [ -d "/proc/$p" ] || rm -f "$f"
 done
-t=$(mktemp -d) || exit 1
+for d in "$rt"/helper-*; do
+  [ -d "$d" ] || continue
+  p=${d##*helper-}
+  case $p in ''|*[!0-9]*) continue;; esac
+  [ -d "/proc/$p" ] && continue
+  [ -p "$d/done" ] && ( exec 3<>"$d/done" ) 2>/dev/null
+  rm -rf "$d"
+done
+t=$rt/helper-$$
+[ -p "$t/done" ] && ( exec 3<>"$t/done" ) 2>/dev/null
+rm -rf "$t"
+mkdir -m 700 "$t" || exit 1
 mkfifo "$t/done" || exit 1
 trap 'rm -rf "$t"; kill 0 2>/dev/null' EXIT
+# Losing the pty (every --exec session gets one) delivers SIGHUP to the
+# foreground group; without this, dash and busybox ash both terminate on an
+# untrapped HUP without running the EXIT trap above.
+trap 'exit' HUP
 (
   exec 3<>"$t/done"
   while read -r id code <&3; do
@@ -228,6 +252,7 @@ while IFS=$TAB read -r id kind rest; do
     printf %s "$comm" > "$t/$id.out"
     printf '%s 0\n' "$id" >> "$t/done"
     ;;
+  PING) printf '0 0\n' >> "$t/done" & ;;
   esac
 done
 "##;
@@ -327,6 +352,38 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// A broken distro must not cause a spawn storm.
 const RESPAWN_COOLDOWN: Duration = Duration::from_secs(30);
 
+/// The two periods the liveness decision reads.  A struct rather than
+/// constants so a test can drive the wait loop in milliseconds; production
+/// only ever uses `DEFAULT`.
+struct Timing {
+    /// How often a waiter pings and re-examines the transport.  Matches the
+    /// period zed's remote client uses for the same job.
+    slice: Duration,
+    /// Six slices.  VS Code's equivalent tolerates four and AMQP two, both
+    /// against peers that are not sharing vCPUs with the judge.
+    silence_limit: Duration,
+}
+
+impl Timing {
+    const DEFAULT: Self =
+        Self { slice: Duration::from_secs(5), silence_limit: Duration::from_secs(30) };
+}
+
+/// A slice whose own sleep ran well past what it asked for was descheduled,
+/// so the silence it measured says nothing about the far end.
+fn starved(asked: Duration, slept: Duration) -> bool {
+    slept > asked.saturating_mul(2)
+}
+
+/// Whether an expired slice is evidence the transport is dead.
+///
+/// `silence` is how long the caller has *observed* no bytes, which is not
+/// the same as how old the last byte is: after a resume the last byte is
+/// legitimately hours old with nobody watching.
+fn wedged(timing: &Timing, asked: Duration, slept: Duration, silence: Duration) -> bool {
+    !starved(asked, slept) && silence > timing.silence_limit
+}
+
 static ENABLED: AtomicBool = AtomicBool::new(true);
 
 pub fn set_enabled(enabled: bool) {
@@ -350,11 +407,25 @@ pub enum TransportError {
 
 pub struct HelperClient {
     distro: String,
-    stdin: Mutex<Option<std::process::ChildStdin>>,
+    /// Boxed rather than a `ChildStdin` so a test can stand a fake helper
+    /// behind the same client the app uses.
+    stdin: Mutex<Option<Box<dyn Write + Send>>>,
     pending: Mutex<HashMap<u64, mpsc::Sender<Frame>>>,
     next_id: AtomicU64,
     capabilities: OnceLock<Capabilities>,
     down: AtomicBool,
+    /// Kept so a teardown can end a `wsl.exe` that stopped draining its
+    /// pipes.  Dropping stdin only reaches a helper still listening for the
+    /// EOF.
+    child: Mutex<Option<std::process::Child>>,
+    /// Monotonic base for `last_bytes_at`, which is stored as elapsed
+    /// milliseconds so the read path stays lock-free.
+    started: Instant,
+    /// Milliseconds since `started` at the last successful read off the
+    /// helper's stdout.  Bytes, not frames: a partially delivered frame is
+    /// still proof the far end is producing output.
+    last_bytes_at: AtomicU64,
+    timing: Timing,
 }
 
 fn lock<'a, T>(mutex: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
@@ -366,6 +437,9 @@ impl HelperClient {
     /// attempted; readiness (the hello line) arrives asynchronously on the
     /// reader thread.  Failures leave the client marked down so the
     /// registry's cooldown sees them like any other death.
+    // Launching the resident helper is this function's job; the child is
+    // long-lived and never waited on here.
+    #[allow(clippy::disallowed_methods)]
     fn spawn(distro: &str) -> Arc<Self> {
         let client = Arc::new(Self {
             distro: distro.to_string(),
@@ -374,6 +448,10 @@ impl HelperClient {
             next_id: AtomicU64::new(1),
             capabilities: OnceLock::new(),
             down: AtomicBool::new(false),
+            child: Mutex::new(None),
+            started: Instant::now(),
+            last_bytes_at: AtomicU64::new(0),
+            timing: Timing::DEFAULT,
         });
         let mut child = match wsl::command(distro, None)
             .arg("sh")
@@ -391,15 +469,21 @@ impl HelperClient {
                 return client;
             },
         };
-        *lock(&client.stdin) = child.stdin.take();
-        let stdout = child.stdout.take().expect("stdout piped above");
+        *lock(&client.stdin) = child.stdin.take().map(|w| Box::new(w) as Box<dyn Write + Send>);
+        let stdout =
+            Box::new(child.stdout.take().expect("stdout piped above")) as Box<dyn Read + Send>;
+        *lock(&client.child) = Some(child);
         let reader = client.clone();
         let spawned =
             std::thread::Builder::new().name(format!("wsl-helper-{distro}")).spawn(move || {
                 reader.read_loop(stdout);
-                // Stdin is closed by mark_down; reap so a dead helper never
-                // lingers as a zombie in the process table.
-                let _ = child.wait();
+                // Reap so a dead helper never lingers as a zombie in the
+                // process table.  Taking it also releases the handle a
+                // teardown would otherwise still be able to kill.
+                let finished = lock(&reader.child).take();
+                if let Some(mut child) = finished {
+                    let _ = child.wait();
+                }
             });
         if let Err(e) = spawned {
             client.mark_down(&format!("failed to start reader thread: {e}"));
@@ -407,7 +491,7 @@ impl HelperClient {
         client
     }
 
-    fn read_loop(&self, stdout: std::process::ChildStdout) {
+    fn read_loop(&self, stdout: Box<dyn Read + Send>) {
         let mut reader = std::io::BufReader::new(stdout);
         let mut hello = String::new();
         match reader.read_line(&mut hello) {
@@ -424,15 +508,18 @@ impl HelperClient {
             match reader.read(&mut chunk) {
                 Ok(0) => return self.mark_down("closed its pipe"),
                 Err(e) => return self.mark_down(&format!("read failed: {e}")),
-                Ok(n) => match frames.push(&chunk[..n]) {
-                    Ok(done) => {
-                        for frame in done {
-                            if let Some(tx) = lock(&self.pending).remove(&frame.id) {
-                                let _ = tx.send(frame);
+                Ok(n) => {
+                    self.stamp_bytes();
+                    match frames.push(&chunk[..n]) {
+                        Ok(done) => {
+                            for frame in done {
+                                if let Some(tx) = lock(&self.pending).remove(&frame.id) {
+                                    let _ = tx.send(frame);
+                                }
                             }
-                        }
-                    },
-                    Err(e) => return self.mark_down(&e),
+                        },
+                        Err(e) => return self.mark_down(&e),
+                    }
                 },
             }
         }
@@ -442,7 +529,14 @@ impl HelperClient {
         if !self.down.swap(true, Ordering::AcqRel) {
             log::warn!("wsl helper for {}: {why}; falling back to one-shot spawns", self.distro);
         }
-        // Closing stdin EOFs the helper, which cleans up and exits.
+        // Closing stdin cannot be the teardown: a writer parked inside
+        // `write_all` holds the stdin lock until its write fails, and a relay
+        // whose Linux side is already gone forwards no EOF at all.  Killing
+        // first bounds both.  The close below lands microseconds later, so no
+        // ordering here gives the helper's EXIT trap a real chance to run.
+        if let Some(child) = lock(&self.child).as_mut() {
+            let _ = child.kill();
+        }
         *lock(&self.stdin) = None;
         // Waiters whose request was already written see the hangup as a
         // dropped sender — NoReply, never a retry.
@@ -455,6 +549,57 @@ impl HelperClient {
 
     fn is_ready(&self) -> bool {
         !self.is_down() && self.capabilities.get().is_some()
+    }
+
+    fn stamp_bytes(&self) {
+        self.last_bytes_at.store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// How long the helper has produced nothing at all.  `Relaxed` is
+    /// enough because no other memory is published under the stamp, and a
+    /// waiter that observes a stale value only defers judgment by one slice.
+    fn silent_for(&self) -> Duration {
+        let now = self.started.elapsed().as_millis() as u64;
+        Duration::from_millis(now.saturating_sub(self.last_bytes_at.load(Ordering::Relaxed)))
+    }
+
+    /// Ask the dispatcher to prove it is still reading.  The reply is a
+    /// frame nothing routes; its only effect is refreshing `last_bytes_at`.
+    fn ping(&self) {
+        // A held stdin lock is a reason to skip, never to wait: blocking
+        // here would park the waiter inside the failure it came to detect,
+        // and the thread holding the lock is itself proof of a live write.
+        let Ok(mut guard) = self.stdin.try_lock() else { return };
+        if let Some(stdin) = guard.as_mut() {
+            let _ = stdin.write_all(b"0\tPING\n").and_then(|()| stdin.flush());
+        }
+    }
+
+    /// A client over arbitrary pipes, so a test can be the helper.  Starts
+    /// the reader thread the same way `spawn` does; there is no child to
+    /// reap, so teardown finds `None` and skips the kill.
+    #[cfg(test)]
+    fn over(
+        distro: &str,
+        reader: Box<dyn Read + Send>,
+        writer: Box<dyn Write + Send>,
+        timing: Timing,
+    ) -> Arc<Self> {
+        let client = Arc::new(Self {
+            distro: distro.to_string(),
+            stdin: Mutex::new(Some(writer)),
+            pending: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+            capabilities: OnceLock::new(),
+            down: AtomicBool::new(false),
+            child: Mutex::new(None),
+            started: Instant::now(),
+            last_bytes_at: AtomicU64::new(0),
+            timing,
+        });
+        let owner = client.clone();
+        std::thread::spawn(move || owner.read_loop(reader));
+        client
     }
 
     pub fn capabilities(&self) -> Option<&Capabilities> {
@@ -484,12 +629,65 @@ impl HelperClient {
             self.mark_down(&format!("write failed: {e}"));
             return Err(TransportError::NotWritten(e));
         }
-        match rx.recv_timeout(timeout) {
-            Ok(frame) => Ok(frame),
-            Err(_) => {
+        // Liveness is asked as "has anything arrived recently", not "was
+        // this reply on time": a loaded host delivers late, a wedged helper
+        // never delivers, and only the second is worth a teardown.
+        let sent_at = Instant::now();
+        let deadline = sent_at + timeout;
+        // Silence only counts while somebody was awake to observe it.  A
+        // slice that overran means the host was starved, and the quiet
+        // underneath it says nothing about the far end, so the window
+        // restarts rather than carrying that stretch forward.
+        let mut watching_since = sent_at;
+        loop {
+            let slice_start = Instant::now();
+            let remaining = deadline.saturating_duration_since(slice_start);
+            if remaining.is_zero() {
                 lock(&self.pending).remove(&id);
-                Err(TransportError::NoReply(format!("no reply from the {} helper", self.distro)))
-            },
+                return Err(TransportError::NoReply(format!(
+                    "no reply from the {} helper",
+                    self.distro
+                )));
+            }
+            let asked = remaining.min(self.timing.slice);
+            match rx.recv_timeout(asked) {
+                Ok(frame) => return Ok(frame),
+                // The sender is dropped by `mark_down`'s `pending.clear()`,
+                // so a disconnect means someone already tore this down.
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(TransportError::NoReply(format!(
+                        "the {} helper went down while waiting",
+                        self.distro
+                    )));
+                },
+                Err(mpsc::RecvTimeoutError::Timeout) => {},
+            }
+            let slept = slice_start.elapsed();
+            let silence = self.silent_for().min(watching_since.elapsed());
+            if starved(asked, slept) {
+                watching_since = Instant::now();
+            }
+            if wedged(&self.timing, asked, slept, silence) {
+                // The count is taken into a local first: passing
+                // `lock(...).len()` as an argument keeps the guard alive
+                // across the call, and `mark_down` takes the same mutex.
+                let outstanding = {
+                    let mut pending = lock(&self.pending);
+                    pending.remove(&id);
+                    pending.len()
+                };
+                self.mark_down(&format!(
+                    "silent for {:.0}s with {outstanding} outstanding",
+                    silence.as_secs_f64()
+                ));
+                return Err(TransportError::NoReply(format!(
+                    "no reply from the {} helper",
+                    self.distro
+                )));
+            }
+            // After the judgment, so the next slice reads the answer to this
+            // slice's question rather than to one sent moments ago.
+            self.ping();
         }
     }
 
@@ -660,8 +858,83 @@ fn ensure_poller() {
 }
 
 #[cfg(test)]
+// Fixtures drive real processes and wait on them; no frame is pending.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+
+    /// A hello `parse_hello` accepts: protocol 1, all four capability
+    /// fields empty.
+    const HELLO_LINE: &str = "hello\t1\t\t\t\t\n";
+
+    /// One end of a pipe pair standing in for the helper's stdio.
+    struct FakePipe {
+        rx: mpsc::Receiver<Vec<u8>>,
+        buf: std::collections::VecDeque<u8>,
+    }
+
+    impl Read for FakePipe {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            while self.buf.is_empty() {
+                // A disconnected sender is the far end closing its pipe,
+                // which `read_loop` reads as EOF exactly as it would from a
+                // real one.
+                let Ok(chunk) = self.rx.recv() else { return Ok(0) };
+                self.buf.extend(chunk);
+            }
+            let n = out.len().min(self.buf.len());
+            for slot in out.iter_mut().take(n) {
+                *slot = self.buf.pop_front().expect("checked above");
+            }
+            Ok(n)
+        }
+    }
+
+    struct FakeSink(mpsc::Sender<Vec<u8>>);
+
+    impl Write for FakeSink {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            let _ = self.0.send(data.to_vec());
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A client wired to a fake helper, plus the two ends the test drives it
+    /// from: `to_client` writes what the helper says, `from_client` reads
+    /// what the client sent.
+    struct FakeHelper {
+        to_client: mpsc::Sender<Vec<u8>>,
+        from_client: mpsc::Receiver<Vec<u8>>,
+    }
+
+    impl FakeHelper {
+        /// A helper that says hello and then never speaks again.
+        fn silent() -> (Arc<HelperClient>, FakeHelper) {
+            Self::with_timing(Timing::DEFAULT)
+        }
+
+        fn with_timing(timing: Timing) -> (Arc<HelperClient>, FakeHelper) {
+            let (to_client, client_reads) = mpsc::channel();
+            let (client_writes, from_client) = mpsc::channel();
+            to_client.send(HELLO_LINE.as_bytes().to_vec()).expect("client not started yet");
+            let client = HelperClient::over(
+                "fake",
+                Box::new(FakePipe { rx: client_reads, buf: Default::default() }),
+                Box::new(FakeSink(client_writes)),
+                timing,
+            );
+            let ready_by = Instant::now() + Duration::from_secs(5);
+            while !client.is_ready() {
+                assert!(Instant::now() < ready_by, "fake hello was never parsed");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            (client, FakeHelper { to_client, from_client })
+        }
+    }
 
     #[test]
     fn run_request_encodes_base64_fields() {
@@ -725,6 +998,44 @@ mod tests {
                 Frame { id: 9, exit: 1, payload: Vec::new() },
             ]
         );
+    }
+
+    #[test]
+    fn the_helper_script_reclaims_a_dead_predecessors_directory() {
+        // The temp dir has to be named by dispatcher pid, or a start cannot tell
+        // a dead predecessor's directory from a live sibling's.
+        assert!(HELPER_SCRIPT.contains("t=$rt/helper-$$"));
+        assert!(!HELPER_SCRIPT.contains("mktemp -d"));
+
+        // Liveness comes from /proc, checked before anything is removed, and the
+        // stale FIFO is opened before the directory goes, so a job subshell
+        // parked in open(O_WRONLY) is released rather than orphaned.
+        let sweep =
+            HELPER_SCRIPT.split_once("for d in \"$rt\"/helper-*").expect("the startup sweep").1;
+        let body = sweep.split_once("done\n").expect("the sweep body").0;
+        let live = body.find("[ -d \"/proc/$p\" ] && continue").expect("the liveness check");
+        let fifo = body.find("exec 3<>").expect("the fifo release");
+        let remove = body.find("rm -rf \"$d\"").expect("the directory removal");
+        assert!(live < remove, "liveness must be checked before the directory is removed");
+        assert!(fifo < remove, "the FIFO must be opened before the directory is removed");
+    }
+
+    #[test]
+    fn the_hup_trap_runs_the_exit_trap_on_a_dead_relay() {
+        // Measured under load (30 relay kills per configuration): closing
+        // stdin before killing left 19/30 temp dirs behind, killing first
+        // brought that to 16/30, and this trap is what took it to 0/30 — the
+        // startup sweep is only the backstop for what this line prevents.
+        assert!(HELPER_SCRIPT.contains("trap 'exit' HUP"));
+    }
+
+    #[test]
+    fn the_dispatcher_answers_a_ping_on_the_reserved_id() {
+        // Without this arm a wedged dispatcher and a merely quiet one look
+        // identical from the client's side, and the wait loop would tear
+        // down every long-running job the moment it outlasted the silence
+        // limit.
+        assert!(HELPER_SCRIPT.contains("PING) printf '0 0\\n'"));
     }
 
     #[test]
@@ -842,6 +1153,254 @@ mod tests {
         assert!(a.starts_with(&prefix), "{a} should start with {prefix}");
     }
 
+    #[test]
+    fn a_starved_slice_never_condemns_the_helper() {
+        // The waiter asked for five seconds and the host handed it back twenty,
+        // so the silence it measured under that is not evidence of anything.
+        assert!(!wedged(
+            &Timing::DEFAULT,
+            Duration::from_secs(5),
+            Duration::from_secs(20),
+            Duration::from_secs(300),
+        ));
+    }
+
+    #[test]
+    fn silence_past_the_limit_in_a_punctual_slice_condemns_the_helper() {
+        assert!(wedged(
+            &Timing::DEFAULT,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(31),
+        ));
+    }
+
+    #[test]
+    fn silence_inside_the_limit_is_not_evidence() {
+        assert!(!wedged(
+            &Timing::DEFAULT,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(29),
+        ));
+    }
+
+    #[test]
+    fn a_test_timing_scales_the_whole_decision_down() {
+        // The loop under test has to run in milliseconds, so the limit the
+        // predicate reads has to come from the struct rather than a constant.
+        let fast =
+            Timing { slice: Duration::from_millis(50), silence_limit: Duration::from_millis(300) };
+        assert!(wedged(
+            &fast,
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            Duration::from_millis(301)
+        ));
+        assert!(!wedged(
+            &fast,
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            Duration::from_millis(299)
+        ));
+    }
+
+    #[test]
+    fn a_punctual_slice_is_not_starved() {
+        assert!(!starved(Duration::from_secs(5), Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_slice_at_exactly_twice_its_ask_is_not_starved() {
+        assert!(!starved(Duration::from_secs(5), Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn a_slice_past_twice_its_ask_is_starved() {
+        assert!(starved(
+            Duration::from_secs(5),
+            Duration::from_secs(10) + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn starved_saturates_rather_than_overflows_on_a_huge_ask() {
+        assert!(!starved(Duration::MAX, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_client_that_has_never_read_reports_its_whole_life_as_silence() {
+        // The helper end is bound rather than dropped: dropping it closes the
+        // pipe, which the reader would correctly read as EOF and tear down.
+        let (client, _helper) = FakeHelper::silent();
+        std::thread::sleep(Duration::from_millis(20));
+        // Never stamped past the hello, so the silence covers the sleep.  The
+        // clock only moves forward, so this bound cannot invert under load.
+        assert!(client.silent_for() >= Duration::from_millis(20));
+
+        client.stamp_bytes();
+        // A stamp at any point after construction leaves less silence behind it
+        // than the client has been alive, whatever the scheduler does next.
+        assert!(client.silent_for() < client.started.elapsed());
+    }
+
+    #[test]
+    fn a_ping_reaches_the_far_end_as_a_reserved_id_zero_line() {
+        let (client, helper) = FakeHelper::silent();
+        client.ping();
+        let sent =
+            helper.from_client.recv_timeout(Duration::from_secs(5)).expect("a ping was sent");
+        assert_eq!(sent, b"0\tPING\n");
+    }
+
+    #[test]
+    fn a_ping_with_nowhere_to_write_is_silently_skipped() {
+        let (client, _helper) = FakeHelper::silent();
+        // A torn-down client has no stdin.  A ping that cannot be sent is one
+        // more slice of silence, which the wait loop already handles; it must
+        // not panic and must not report anything new.
+        client.mark_down("test");
+        client.ping();
+        assert!(client.is_down());
+    }
+
+    #[test]
+    fn a_helper_that_stops_answering_is_torn_down_rather_than_waited_out() {
+        // Scaled down by two orders of magnitude: the decision is the same one
+        // production makes, taken in a third of a second.
+        let timing =
+            Timing { slice: Duration::from_millis(50), silence_limit: Duration::from_millis(300) };
+        let (client, helper) = FakeHelper::with_timing(timing);
+
+        let started = Instant::now();
+        let result = client.run("printf hi", &[]);
+
+        assert!(
+            matches!(result, Err(TransportError::NoReply(_))),
+            "a silent helper answers nothing"
+        );
+        assert!(client.is_down(), "a silent helper must be torn down, not merely reported");
+        assert!(lock(&client.pending).is_empty(), "the waiter left its channel behind");
+        assert!(
+            started.elapsed() < RUN_TIMEOUT,
+            "gave up on the run budget rather than on silence, after {:?}",
+            started.elapsed()
+        );
+
+        // The waiter asked the dispatcher to prove it was reading, which is the
+        // signal the old code had no way to send.
+        let mut pings = 0;
+        while let Ok(sent) = helper.from_client.try_recv() {
+            if sent == b"0\tPING\n" {
+                pings += 1;
+            }
+        }
+        assert!(pings > 0, "no ping was ever sent");
+    }
+
+    #[test]
+    fn a_slow_job_over_a_healthy_pipe_is_never_torn_down() {
+        // A silence limit far longer than the test's own runtime: a false
+        // teardown here would need the reader thread starved for five seconds
+        // inside a test that finishes in a fraction of one.
+        let timing =
+            Timing { slice: Duration::from_millis(50), silence_limit: Duration::from_secs(5) };
+        let (client, helper) = FakeHelper::with_timing(timing);
+
+        let answering = std::thread::spawn(move || {
+            let mut slices = 0;
+            while let Ok(sent) = helper.from_client.recv_timeout(Duration::from_secs(10)) {
+                if sent != b"0\tPING\n" {
+                    continue;
+                }
+                slices += 1;
+                let _ = helper.to_client.send(b"0\t0\t0\n".to_vec());
+                if slices < 4 {
+                    continue;
+                }
+                // The job finishes after four answered pings: slow, but the
+                // pipe was never quiet.
+                let _ = helper.to_client.send(b"1\t0\t2\nhi".to_vec());
+                return helper;
+            }
+            helper
+        });
+
+        let (exit, payload) = client.run("printf hi", &[]).expect("a slow job still answers");
+        assert_eq!(exit, 0);
+        assert_eq!(payload, b"hi");
+        assert!(!client.is_down(), "a healthy pipe was torn down");
+        assert!(lock(&client.pending).is_empty());
+        let _ = answering.join();
+    }
+
+    #[test]
+    fn silence_older_than_the_wait_is_not_the_waiter_s_to_judge() {
+        // Wide margin on purpose: this runs alongside other `wsl_helper`
+        // tests under nextest's parallel execution, and a scheduling delay
+        // here must never read the same as a genuine clamp regression.
+        let timing =
+            Timing { slice: Duration::from_millis(50), silence_limit: Duration::from_secs(1) };
+        let (client, helper) = FakeHelper::with_timing(timing);
+        // The client has been quiet longer than the limit before the request is
+        // even sent; only silence observed after it counts.
+        std::thread::sleep(Duration::from_millis(1200));
+        let answering = std::thread::spawn(move || {
+            while let Ok(sent) = helper.from_client.recv_timeout(Duration::from_secs(10)) {
+                if sent == b"0\tPING\n" {
+                    let _ = helper.to_client.send(b"1\t0\t2\nhi".to_vec());
+                    return helper;
+                }
+            }
+            helper
+        });
+        assert_eq!(client.run("printf hi", &[]).expect("answered"), (0, b"hi".to_vec()));
+        assert!(!client.is_down());
+        let _ = answering.join();
+    }
+
+    /// A wedged helper is torn down rather than making every later caller pay
+    /// the full run budget.  Requires WSL, and it deliberately kills the shared
+    /// helper for the default distro, so run it on its own:
+    /// `cargo nextest run -p alacritree wsl_helper::tests::a_wedged_helper --run-ignored all`
+    #[test]
+    #[ignore]
+    fn a_wedged_helper_is_torn_down_once_it_stops_answering() {
+        let distro =
+            crate::wsl::distros().into_iter().find(|d| d.is_default).expect("a default distro");
+        let ready_by = Instant::now() + Duration::from_secs(120);
+        let client = loop {
+            if let Some(c) = client(&distro.name) {
+                break c;
+            }
+            assert!(Instant::now() < ready_by, "helper never became ready");
+            std::thread::sleep(Duration::from_millis(200));
+        };
+
+        // A job's stdout is `$t/<id>.out`, so its own fd 1 names the directory
+        // holding the completion fifo.  `$$` rather than `self`, because inside
+        // a command substitution `/proc/self` is the substitution's own pipe.
+        // Removing the fifo leaves the writer blocked on a deleted inode while
+        // later completions land in a regular file nobody reads, which is the
+        // wedge this test needs.  The removal is delayed so this request still
+        // gets its own answer back.
+        let (exit, _) = client
+            .run(
+                r#"d=$(readlink /proc/$$/fd/1); d=${d%/*}
+[ -p "$d/done" ] || exit 1
+( sleep 1; rm -f "$d/done" ) >/dev/null 2>&1 &"#,
+                &[],
+            )
+            .expect("the wedge request is answered before the fifo goes");
+        assert_eq!(exit, 0, "the job did not find the completion fifo");
+
+        let down_by = Instant::now() + Duration::from_secs(90);
+        while !client.is_down() {
+            assert!(Instant::now() < down_by, "a wedged helper was never marked down");
+            let _ = client.run("printf x", &[]);
+        }
+    }
+
     /// Live round trip against the default distro.  Requires WSL; run
     /// manually: `cargo test -p alacritree wsl_helper:: -- --ignored`
     #[test]
@@ -888,19 +1447,18 @@ mod tests {
         // An unregistered probe key resolves to "no foreground comm".
         assert_eq!(client.probe("999999-999999").expect("probe"), None);
 
-        use std::process::{Command, Stdio};
+        use std::process::Stdio;
 
-        use crate::command_ext::CommandExt;
+        use crate::command_ext;
 
         // The shim publishes its pid, then execs the login shell; piped stdin
         // (held open) keeps that shell alive for the duration of the test.
-        // Without hide_console the spawn pops a visible terminal window when
-        // the test runs from a hidden console.
+        // Without command_ext::hidden the spawn pops a visible terminal window
+        // when the test runs from a hidden console.
         let key = new_probe_key();
         let (program, args) = shim_invocation(&distro.name, Path::new(r"C:\"), &key);
-        let mut child = Command::new(program)
+        let mut child = command_ext::hidden(program)
             .args(&args)
-            .hide_console()
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -926,5 +1484,93 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// Killing the child is what frees a writer parked inside `write_all` on a
+    /// pipe nobody is draining.  Requires WSL and kills the shared helper for
+    /// the default distro, so run it on its own:
+    /// `cargo nextest run -p alacritree wsl_helper::tests::killing_a_helper --run-ignored all`
+    #[test]
+    #[ignore]
+    fn killing_a_helper_frees_a_writer_blocked_on_its_pipe() {
+        let distro =
+            crate::wsl::distros().into_iter().find(|d| d.is_default).expect("a default distro");
+        let ready_by = Instant::now() + Duration::from_secs(120);
+        let client = loop {
+            if let Some(c) = client(&distro.name) {
+                break c;
+            }
+            assert!(Instant::now() < ready_by, "helper never became ready");
+            std::thread::sleep(Duration::from_millis(200));
+        };
+
+        // A job's parent is the backgrounded subshell and *its* parent is the
+        // dispatcher, which is the process that has to stop reading stdin for a
+        // write to block.  Field 4 of /proc/<pid>/stat is the ppid.  The pid is
+        // handed back so a panic anywhere below can still resume it.
+        let (exit, pid_out) = client
+            .run(r#"p=$(awk '{print $4}' /proc/$PPID/stat); kill -STOP "$p"; printf '%s' "$p""#, &[
+            ])
+            .expect("the stop request is answered before the dispatcher freezes");
+        assert_eq!(exit, 0, "the dispatcher was never stopped");
+        let dispatcher_pid = String::from_utf8_lossy(&pid_out).trim().to_string();
+        assert!(
+            !dispatcher_pid.is_empty() && dispatcher_pid.chars().all(|c| c.is_ascii_digit()),
+            "dispatcher pid: {dispatcher_pid:?}"
+        );
+
+        // The client is deliberately unusable by the time teardown or a panic
+        // runs, so resuming goes through a fresh one-shot command straight to
+        // the distro instead.  Drop covers every exit, panics included, so the
+        // dispatcher is never left frozen for the next test to trip over.
+        struct ResumeStoppedDispatcher {
+            distro: String,
+            pid: String,
+        }
+        impl Drop for ResumeStoppedDispatcher {
+            fn drop(&mut self) {
+                let _ = crate::wsl::command(&self.distro, None)
+                    .arg("sh")
+                    .arg("-c")
+                    .arg("kill -CONT \"$1\" 2>/dev/null")
+                    .arg("sh")
+                    .arg(&self.pid)
+                    .output();
+            }
+        }
+        let _resume_dispatcher =
+            ResumeStoppedDispatcher { distro: distro.name.clone(), pid: dispatcher_pid };
+
+        // Measured empirically: a few hundred KiB fits inside the combined
+        // buffering of the Windows pipe, wsl.exe's relay, the hvsocket, and
+        // the Linux pipe without ever pushing back, so `write_all` returns
+        // long before the stopped dispatcher would matter.  1 MiB is the
+        // smallest size found to exceed all of that and genuinely park the
+        // writer; anything smaller passes without exercising the kill at all.
+        let writer = client.clone();
+        let blocked = std::thread::spawn(move || {
+            let big = "x".repeat(1024 * 1024);
+            // A `NoReply` here means the write never blocked at all — it
+            // reached the helper and `mark_down` cleared the pending map out
+            // from under it, which proves nothing about killing the child.
+            let err =
+                writer.run("printf ''", &[&big]).expect_err("the killed helper cannot answer");
+            assert!(
+                matches!(err, TransportError::NotWritten(_)),
+                "the write never blocked: {err:?}"
+            );
+        });
+
+        std::thread::sleep(Duration::from_secs(1));
+        let tore_down = std::thread::spawn(move || client.mark_down("blocked-write test"));
+
+        assert!(!blocked.is_finished(), "the write completed instead of blocking");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !(blocked.is_finished() && tore_down.is_finished()) {
+            assert!(Instant::now() < deadline, "kill did not free the blocked writer");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        blocked.join().expect("writer thread");
+        tore_down.join().expect("teardown thread");
     }
 }
