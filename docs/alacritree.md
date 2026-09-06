@@ -76,9 +76,9 @@ project, its Git worktrees.
 
 ### herdr agents
 
-herdr is a terminal workspace manager for coding agents. When a herdr server is running, the agents it manages appear in the sidebar under the worktree each agent's working directory matches, dimmed and marked `herdr`. An agent whose directory matches no worktree — including one whose checkout has been removed — is listed under Home.
+herdr is a terminal workspace manager for coding agents. When a herdr server is running, the agents it manages appear in the sidebar under the worktree each agent's working directory matches, dimmed and carrying the `◫` mark that says the pane belongs to herdr rather than to alacritree. An agent whose directory matches no worktree — including one whose checkout has been removed — is listed under Home.
 
-- **Attaching.** Enter or a click opens a session attached to that agent, and the row is replaced by the session's own row until you detach. Detach with herdr's own chord, `Ctrl+B q`.
+- **Attaching.** Enter or a click opens a session attached to that agent, and the row is replaced by the session's own row, which keeps the herdr mark so an attached agent still says where it lives. Detaching is herdr's own chord, not one of alacritree's: the mark's tooltip names it, read from herdr's `config.toml` so a rebound `keys.prefix` or `keys.detach` is what you are told.
 - **Status.** The row's mark follows what herdr reports: a working agent animates, an agent held at an approval dialog turns the attention color, and an idle one stays quiet. An attached agent's session row takes herdr's word too, so a dialog the pane title never mentions still reaches the sidebar.
 - **Native Windows.** herdr cannot attach a single agent there, so attaching focuses the pane in your own herdr window and shares the whole herdr session — the view resizes with the alacritree pane. Such rows are marked `shared view`.
 - **Discovery.** Alacritree asks the native `herdr` on your `PATH` and each running WSL distro. Nothing is installed or started; a machine without herdr sees no rows and stops asking after one failed attempt per server. See `[ui.herdr]` under [Configuration](#configuration) for the poll interval and the opt-out.

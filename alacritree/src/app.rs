@@ -16,14 +16,14 @@ use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
 use crate::config::{
     BakedGlyph, Config, DEFAULT_ADD_ICON, DEFAULT_AGENT_ICON, DEFAULT_BLOCKED_ICON,
-    DEFAULT_CLOSE_ICON, DEFAULT_HOME_ICON, DEFAULT_PR_CLOSED_ICON, DEFAULT_PR_DRAFT_ICON,
-    DEFAULT_PR_MERGED_ICON, DEFAULT_PR_OPEN_ICON, DEFAULT_PROJECT_COLLAPSED_ICON,
-    DEFAULT_PROJECT_EXPANDED_ICON, DEFAULT_REFRESH_ICON, DEFAULT_REORDER_ICON, DEFAULT_SEARCH_ICON,
-    DEFAULT_SESSION_ICON, DEFAULT_UPSTREAM_DIVERGED_ICON, DEFAULT_UPSTREAM_GONE_ICON,
-    DEFAULT_UPSTREAM_LEVEL_ICON, DEFAULT_UPSTREAM_UNTRACKED_ICON, DEFAULT_WORKTREE_ICON,
-    DEFAULT_WORKTREE_MAIN_ICON, FontConfig, IconStyle, Icons, LastSessionClose, PathStyleConfig,
-    ScrollbarStyle, SearchScope, SidebarFocus, SidebarTooltips, TextEmphasis, UiFont,
-    profile_command,
+    DEFAULT_CLOSE_ICON, DEFAULT_HERDR_ICON, DEFAULT_HOME_ICON, DEFAULT_PR_CLOSED_ICON,
+    DEFAULT_PR_DRAFT_ICON, DEFAULT_PR_MERGED_ICON, DEFAULT_PR_OPEN_ICON,
+    DEFAULT_PROJECT_COLLAPSED_ICON, DEFAULT_PROJECT_EXPANDED_ICON, DEFAULT_REFRESH_ICON,
+    DEFAULT_REORDER_ICON, DEFAULT_SEARCH_ICON, DEFAULT_SESSION_ICON,
+    DEFAULT_UPSTREAM_DIVERGED_ICON, DEFAULT_UPSTREAM_GONE_ICON, DEFAULT_UPSTREAM_LEVEL_ICON,
+    DEFAULT_UPSTREAM_UNTRACKED_ICON, DEFAULT_WORKTREE_ICON, DEFAULT_WORKTREE_MAIN_ICON, FontConfig,
+    IconStyle, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SearchScope, SidebarFocus,
+    SidebarTooltips, TextEmphasis, UiFont, profile_command,
 };
 use crate::crash_log::{self, ExitReason};
 use crate::git_nav::{self, GitSection, SectionCount};
@@ -4174,7 +4174,7 @@ impl AlacritreeApp {
                                     if *side == row.side && *id == row.terminal_id
                             );
                             let scroll = scrolls(is_cursor);
-                            let act = herdr_row(ui, row, is_cursor, scroll, &theme);
+                            let act = herdr_row(ui, row, is_cursor, scroll, &icons, &theme);
                             if act.attach {
                                 attach_herdr_request.set(Some((
                                     None,
@@ -4567,7 +4567,7 @@ impl AlacritreeApp {
                                             if *side == row.side && *id == row.terminal_id
                                     );
                                     let scroll = scrolls(is_cursor);
-                                    let act = herdr_row(ui, row, is_cursor, scroll, &theme);
+                                    let act = herdr_row(ui, row, is_cursor, scroll, &icons, &theme);
                                     if act.attach {
                                         attach_herdr_request.set(Some((
                                             Some(wt.path.clone()),
@@ -7044,6 +7044,9 @@ struct SessionRowData {
     /// Active *and* the workspace is current — the session on screen
     /// (row background highlight).
     is_displayed: bool,
+    /// Set while this session is attached to a harness-managed pane, so an
+    /// attached agent's row still says where it lives and how to leave.
+    managed: Option<Managed>,
 }
 
 /// Everything a sidebar herdr-agent row needs, snapshotted before the panel
@@ -7056,13 +7059,29 @@ struct HerdrRowData {
     /// id when herdr hasn't identified it yet.
     name: String,
     status: herdr::Status,
-    /// Set when herdr can't attach this agent directly on `side`, so
-    /// attaching instead focuses the pane and shares the whole herdr window.
+    managed: Managed,
+}
+
+/// The external supervisor a pane belongs to.  Named rather than flagged
+/// because a second harness would otherwise add a parallel boolean to every
+/// row, and because what a row must say — whose mark to paint, how to get
+/// out, whether the attach is exclusive — varies by harness rather than by
+/// row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Managed {
+    /// What the tooltip calls it.
+    harness: &'static str,
+    /// The harness's own detach chord, already rendered.  `None` when its
+    /// config could not be read or binds detach to nothing, both of which are
+    /// reasons to stay quiet rather than name a chord the user may not have.
+    detach: Option<String>,
+    /// The attach shares the harness's whole view rather than one pane, so
+    /// the row says so before a resize reveals it.
     shared_view: bool,
 }
 
 impl HerdrRowData {
-    fn from_agent(agent: &herdr::Agent, side: &herdr::Side) -> Self {
+    fn from_agent(agent: &herdr::Agent, side: &herdr::Side, detach: Option<&str>) -> Self {
         let name = agent.kind.clone().unwrap_or_else(|| {
             let id = &agent.terminal_id;
             let skip = id.chars().count().saturating_sub(6);
@@ -7074,6 +7093,16 @@ impl HerdrRowData {
             pane_id: agent.pane_id.clone(),
             name,
             status: agent.status,
+            managed: Managed::herdr(side, detach),
+        }
+    }
+}
+
+impl Managed {
+    fn herdr(side: &herdr::Side, detach: Option<&str>) -> Self {
+        Self {
+            harness: "herdr",
+            detach: detach.map(str::to_string),
             shared_view: !herdr::can_attach(side),
         }
     }
@@ -7979,9 +8008,10 @@ fn session_row(
     let mut hints = IconHints::default();
     let mut close_rect: Option<egui::Rect> = None;
     let mut title_elided = false;
-    // The leading and trailing groups run as sibling closures, so the status
-    // slot's hint travels out separately and joins the rest afterwards.
+    // The leading and trailing groups run as sibling closures, so the leading
+    // slots' hints travel out separately and join the rest afterwards.
     let mut status_hint = None;
+    let mut managed_slot = None;
     // One indent level deeper than worktree rows (16); right: 0 keeps the ×
     // at the same x as the other rows' trailing icons.
     let frame = Frame::default().inner_margin(Margin { left: 28, right: 0, top: 3, bottom: 3 });
@@ -8000,6 +8030,10 @@ fn session_row(
                         DEFAULT_SESSION_ICON,
                         row.is_active,
                     );
+                    if let Some(managed) = &row.managed {
+                        let rect = paint_managed_mark(ui, icons, theme, theme.text_muted);
+                        managed_slot = Some((rect, managed_hint(managed)));
+                    }
                     let (_, galley) = truncating_label(
                         ui,
                         RichText::new(&row.title).small().color(title_color),
@@ -8031,6 +8065,9 @@ fn session_row(
             egui::Sense::click()
         });
     if let Some((rect, hint)) = status_hint {
+        hints.add(rect, hint);
+    }
+    if let Some((rect, hint)) = managed_slot {
         hints.add(rect, hint);
     }
     let resp = hints.apply(resp, theme.icon_tooltips, |resp| {
@@ -8084,15 +8121,40 @@ struct HerdrRowAction {
 /// distinguishes it from an ordinary session, then `shared view` when the
 /// agent can only be reached through a shared herdr window.
 fn herdr_row_label(row: &HerdrRowData) -> String {
-    let shared = if row.shared_view { " · shared view" } else { "" };
-    format!("{} — {} · herdr{shared}", row.name, row.status.label())
+    let shared = if row.managed.shared_view { " · shared view" } else { "" };
+    format!("{} — {}{shared}", row.name, row.status.label())
 }
 
 /// What hovering the row explains — herdr's detach chord has no other
 /// surface in alacritree, so it goes on every herdr row rather than only the
 /// ones with something else to say.
 fn herdr_row_tooltip(row: &HerdrRowData) -> String {
-    format!("{}. Detach with Ctrl+B q.", herdr_row_label(row))
+    format!("{} · {}", herdr_row_label(row), managed_hint(&row.managed))
+}
+
+/// What a harness mark explains on hover.  The detach chord has no other
+/// surface in alacritree — it is the harness's key, not one of ours — so it
+/// travels with the mark wherever the mark goes.
+fn managed_hint(managed: &Managed) -> String {
+    match &managed.detach {
+        Some(chord) => format!("{}, detach with {chord}", managed.harness),
+        None => managed.harness.to_string(),
+    }
+}
+
+/// Paint the harness mark and return the rect it claimed, so the caller can
+/// hang the hint on it.
+fn paint_managed_mark(
+    ui: &mut egui::Ui,
+    icons: &Icons,
+    theme: &Theme,
+    color: Color32,
+) -> egui::Rect {
+    // 10.0 is what the status marks beside it use, and `◫` shares its em
+    // height with `◇` and `●`, so the same size puts them on one optical line.
+    let (glyph, font, glyph_color) =
+        resolve_icon(&icons.herdr, DEFAULT_HERDR_ICON, color, 10.0, 10.0, theme);
+    ui.label(RichText::new(glyph).color(glyph_color).font(font)).rect
 }
 
 /// A herdr agent nothing is attached to.  Drawn in `theme.text_dim` because
@@ -8107,6 +8169,7 @@ fn herdr_row(
     row: &HerdrRowData,
     is_cursor: bool,
     scroll_into_view: bool,
+    icons: &Icons,
     theme: &Theme,
 ) -> HerdrRowAction {
     // Reserve a slot *before* the label so the hover bg paints beneath it.
@@ -8127,6 +8190,7 @@ fn herdr_row(
                     let live = LiveState::from_herdr(row.status).unwrap_or_default();
                     let mark = agent_mark(live, theme.text_dim, theme.attention);
                     paint_agent_mark(ui, mark, rect, theme);
+                    paint_managed_mark(ui, icons, theme, theme.text_dim);
                     let _ = truncating_label(
                         ui,
                         RichText::new(herdr_row_label(row)).small().color(theme.text_dim),
@@ -8378,10 +8442,30 @@ impl AlacritreeApp {
         let Some(keys) = listed.get(ws) else { return Vec::new() };
         keys.iter()
             .filter_map(|(side, terminal_id)| {
-                self.find_herdr_agent(side, terminal_id)
-                    .map(|agent| HerdrRowData::from_agent(agent, side))
+                self.find_herdr_agent(side, terminal_id).map(|agent| {
+                    HerdrRowData::from_agent(agent, side, self.herdr_detach_chord(side))
+                })
             })
             .collect()
+    }
+
+    /// herdr's detach chord on `side`, once that endpoint's config read has
+    /// landed.
+    fn herdr_detach_chord(&self, side: &herdr::Side) -> Option<&str> {
+        self.herdr_endpoints
+            .caches()
+            .iter()
+            .find(|cache| cache.side() == side)
+            .and_then(|cache| cache.detach())
+    }
+
+    /// What supervises `session`, when anything does.  Derived per frame
+    /// rather than stored, so a config read that lands later, or a herdr that
+    /// stops listing the agent, reaches the row without a second source of
+    /// truth to keep in step.
+    fn session_managed(&self, session: &Session) -> Option<Managed> {
+        let key = session.herdr_key.as_ref()?;
+        Some(Managed::herdr(&key.side, self.herdr_detach_chord(&key.side)))
     }
 
     /// One number standing for every endpoint's rendered state, so the
@@ -8420,6 +8504,7 @@ impl AlacritreeApp {
                     activity,
                     is_active: active == Some(s.id),
                     is_displayed: is_current && active == Some(s.id),
+                    managed: self.session_managed(s),
                 }
             })
             .collect()
@@ -11267,23 +11352,24 @@ mod tests {
 
     #[test]
     fn herdr_row_name_prefers_the_reported_kind() {
-        let row = HerdrRowData::from_agent(&herdr_agent(Some("claude")), &herdr::Side::Native);
+        let row =
+            HerdrRowData::from_agent(&herdr_agent(Some("claude")), &herdr::Side::Native, None);
         assert_eq!(row.name, "claude");
     }
 
     #[test]
     fn herdr_row_name_falls_back_to_the_terminal_id_tail() {
-        let row = HerdrRowData::from_agent(&herdr_agent(None), &herdr::Side::Native);
+        let row = HerdrRowData::from_agent(&herdr_agent(None), &herdr::Side::Native, None);
         assert_eq!(row.name, "300361");
     }
 
     #[test]
     fn herdr_row_shared_view_follows_can_attach() {
-        let native = HerdrRowData::from_agent(&herdr_agent(None), &herdr::Side::Native);
-        assert_eq!(native.shared_view, cfg!(windows));
+        let native = HerdrRowData::from_agent(&herdr_agent(None), &herdr::Side::Native, None);
+        assert_eq!(native.managed.shared_view, cfg!(windows));
 
-        let wsl = HerdrRowData::from_agent(&herdr_agent(None), &herdr::Side::Wsl("d".into()));
-        assert!(!wsl.shared_view);
+        let wsl = HerdrRowData::from_agent(&herdr_agent(None), &herdr::Side::Wsl("d".into()), None);
+        assert!(!wsl.managed.shared_view);
     }
 
     #[test]
@@ -11298,19 +11384,33 @@ mod tests {
             cwd: None,
             foreground_cwd: None,
         };
-        let row = HerdrRowData::from_agent(&agent, &herdr::Side::Native);
+        let row = HerdrRowData::from_agent(&agent, &herdr::Side::Native, None);
         assert_eq!(row.name, "t1");
     }
 
+    /// The harness mark carries the word the label used to spend space on,
+    /// so the label says only what the mark cannot.
     #[test]
     fn herdr_row_label_names_the_status_and_marks_a_shared_view() {
         let side = herdr::Side::Wsl("d".into());
-        let mut row = HerdrRowData::from_agent(&herdr_agent(Some("claude")), &side);
+        let mut row = HerdrRowData::from_agent(&herdr_agent(Some("claude")), &side, None);
         row.status = herdr::Status::Working;
-        assert_eq!(herdr_row_label(&row), "claude — working · herdr");
+        assert_eq!(herdr_row_label(&row), "claude — working");
 
-        row.shared_view = true;
-        assert_eq!(herdr_row_label(&row), "claude — working · herdr · shared view");
+        row.managed.shared_view = true;
+        assert_eq!(herdr_row_label(&row), "claude — working · shared view");
+    }
+
+    /// A chord alacritree could not read is one it must not invent, so the
+    /// hint names the harness and stops there.
+    #[test]
+    fn the_managed_hint_names_the_chord_only_when_one_is_known() {
+        let side = herdr::Side::Wsl("d".into());
+        let row = HerdrRowData::from_agent(&herdr_agent(Some("claude")), &side, None);
+        assert_eq!(herdr_row_tooltip(&row), "claude — idle · herdr");
+
+        let row = HerdrRowData::from_agent(&herdr_agent(Some("claude")), &side, Some("Ctrl+B q"));
+        assert_eq!(herdr_row_tooltip(&row), "claude — idle · herdr, detach with Ctrl+B q");
     }
 
     #[test]
@@ -12837,6 +12937,7 @@ mod tests {
                 activity: SessionActivity::Shell,
                 is_active: true,
                 is_displayed: true,
+                managed: None,
             };
             let mut session = |ui: &mut egui::Ui| {
                 session_row(ui, &row, false, false, false, &icons, &theme);
@@ -12924,6 +13025,7 @@ mod tests {
             activity,
             is_active: true,
             is_displayed: true,
+            managed: None,
         };
 
         for (icon_tooltips, want) in [(true, true), (false, false)] {
@@ -13259,6 +13361,7 @@ mod tests {
             activity: SessionActivity::Shell,
             is_active: true,
             is_displayed: true,
+            managed: None,
         };
 
         let texts = texts_while_hovering(140.0, |ui| {

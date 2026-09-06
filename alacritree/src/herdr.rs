@@ -387,6 +387,7 @@ pub struct EndpointCache {
     reach: Reach,
     last_attempt: Option<Instant>,
     pending: Option<jobs::Job<Result<Vec<Agent>, String>>>,
+    chord: Chord,
 }
 
 impl EndpointCache {
@@ -398,6 +399,7 @@ impl EndpointCache {
             reach: Reach::default(),
             last_attempt: None,
             pending: None,
+            chord: Chord::Unread,
         }
     }
 
@@ -415,12 +417,51 @@ impl EndpointCache {
         &self.agents
     }
 
+    /// herdr's detach chord here, once the config read has landed.  `None`
+    /// until then, and afterwards when herdr binds detach to nothing or the
+    /// side could not be read — all three are reasons to say nothing rather
+    /// than to name a chord the user may not have.
+    pub fn detach(&self) -> Option<&str> {
+        match &self.chord {
+            Chord::Read(chord) => chord.as_deref(),
+            Chord::Unread | Chord::Pending(_) => None,
+        }
+    }
+
+    /// Adopt a landed config read.  The chord is part of what a row renders,
+    /// so arriving late still has to invalidate the sidebar's comparison.
+    fn advance_chord(&mut self) {
+        let Chord::Pending(job) = &self.chord else { return };
+        if let Some(chord) = job.poll() {
+            self.chord = Chord::Read(chord);
+            self.generation = self.generation.wrapping_add(1);
+        } else if job.failed() {
+            self.chord = Chord::Read(None);
+        }
+    }
+
+    /// Read the config once this endpoint has proved a herdr lives here.
+    /// Starting at construction would run a shell inside every installed
+    /// distro to learn a chord no row will ever show.
+    fn start_chord_read(&mut self) {
+        if !matches!(self.chord, Chord::Unread) {
+            return;
+        }
+        let side = self.side.clone();
+        self.chord = Chord::Pending(
+            jobs::pool()
+                .spawn(jobs::Priority::Background, move |blocking| detach_chord(&side, blocking)),
+        );
+    }
+
     /// Adopts a landed result and starts a new poll when due.  Never blocks.
     pub fn poll(&mut self, interval: Duration) {
+        self.advance_chord();
         if let Some(job) = &self.pending {
             match job.poll() {
                 Some(Ok(agents)) => {
                     self.reach.record_success();
+                    self.start_chord_read();
                     if rendered_differs(&self.agents, &agents) {
                         self.generation = self.generation.wrapping_add(1);
                     }
@@ -647,9 +688,245 @@ fn list_agents(side: &Side, _blocking: &jobs::Blocking) -> Result<Vec<Agent>, St
     Ok(parse_agent_list(&String::from_utf8_lossy(&output.stdout)))
 }
 
+/// herdr's own defaults.  A config that binds neither still detaches on
+/// these, so an untouched installation has a chord to name rather than an
+/// unknown one.
+const DEFAULT_PREFIX: &str = "ctrl+b";
+const DEFAULT_DETACH: &str = "prefix+q";
+
+#[derive(Deserialize, Default)]
+struct RawHerdrConfig {
+    #[serde(default)]
+    keys: RawKeys,
+}
+
+#[derive(Deserialize, Default)]
+struct RawKeys {
+    prefix: Option<String>,
+    detach: Option<RawBinding>,
+}
+
+/// herdr binds an action to one key or to several.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawBinding {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl RawBinding {
+    /// The binding a hint names.  herdr's own help surface leads with the
+    /// first, and a row has space for one.  An empty string is herdr's
+    /// spelling for unbound.
+    fn first(&self) -> Option<&str> {
+        match self {
+            Self::One(value) => Some(value.as_str()),
+            Self::Many(values) => values.first().map(String::as_str),
+        }
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    }
+}
+
+/// Render one `+`-joined combo the way alacritree spells chords elsewhere:
+/// `ctrl+b` reads as `Ctrl+B`.
+fn render_combo(raw: &str) -> String {
+    raw.split('+').map(render_key).collect::<Vec<_>>().join("+")
+}
+
+fn render_key(key: &str) -> String {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else { return String::new() };
+    if key.len() == 1 {
+        return first.to_ascii_uppercase().to_string();
+    }
+    first.to_uppercase().chain(chars).collect()
+}
+
+/// The half of a prefix binding that follows the prefix.  A bare key keeps
+/// herdr's own lowercase spelling, so the hint matches herdr's documentation
+/// (`ctrl+b q`); a modified one is a combo and reads like one.
+fn render_prefixed(rest: &str) -> String {
+    if rest.contains('+') { render_combo(rest) } else { rest.to_string() }
+}
+
+/// The detach chord `config` binds, spelled as herdr documents it.
+///
+/// A config herdr itself would reject falls back to the defaults herdr would
+/// then run with, so a typo anywhere in the file does not silence the hint.
+/// `None` means detach is bound to nothing — the one case where there is no
+/// chord to advertise.
+fn detach_chord_from(config: &str) -> Option<String> {
+    let parsed: RawHerdrConfig = toml::from_str(config).unwrap_or_default();
+    let prefix = parsed
+        .keys
+        .prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|prefix| !prefix.is_empty())
+        .unwrap_or(DEFAULT_PREFIX);
+    let detach = match &parsed.keys.detach {
+        Some(binding) => binding.first()?,
+        None => DEFAULT_DETACH,
+    };
+    Some(match detach.strip_prefix("prefix+") {
+        Some(rest) => format!("{} {}", render_combo(prefix), render_prefixed(rest)),
+        None => render_combo(detach),
+    })
+}
+
+/// Where herdr looks for its config, mirroring its own resolution so both
+/// programs read the same file.  `HERDR_CONFIG_PATH` wins everywhere, then
+/// `XDG_CONFIG_HOME` — herdr consults it on Windows too, before the platform
+/// directory, so a Windows user with it set keeps one config under `~`.
+fn native_config_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("HERDR_CONFIG_PATH") {
+        return Some(PathBuf::from(path));
+    }
+    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(dir).join("herdr").join("config.toml"));
+    }
+    #[cfg(windows)]
+    if let Ok(dir) = std::env::var("APPDATA") {
+        return Some(PathBuf::from(dir).join("herdr").join("config.toml"));
+    }
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok()?;
+    Some(PathBuf::from(home).join(".config").join("herdr").join("config.toml"))
+}
+
+/// The shell that prints a distro's herdr config.  Resolution happens inside
+/// the distro because that is where the environment it depends on lives; a
+/// missing file prints nothing and still exits zero, which reads as herdr's
+/// defaults rather than as a distro we could not reach.
+const CONFIG_SCRIPT: &str = concat!(
+    r#"p=${HERDR_CONFIG_PATH:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr/config.toml}; "#,
+    r#"[ -f "$p" ] && cat "$p" || true"#,
+);
+
+/// herdr's config text for this side, or `None` when the side could not be
+/// read at all.  An absent file is `Some("")`: herdr runs on its defaults
+/// there, and so should the hint.
+fn read_config(side: &Side, _blocking: &jobs::Blocking) -> Option<String> {
+    match side {
+        Side::Native => match std::fs::read_to_string(native_config_path()?) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(String::new()),
+            Err(_) => None,
+        },
+        Side::Wsl(distro) => {
+            let (program, args) = wsl::exec_invocation(distro, &["sh", "-lc", CONFIG_SCRIPT]);
+            #[allow(clippy::disallowed_methods)] // Reading the distro's config is this arm's job.
+            let output = command_ext::hidden(program)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output()
+                .ok()?;
+            output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+        },
+    }
+}
+
+/// herdr's detach chord on this side, spelled as herdr documents it.  Both
+/// halves are user-settable, so a hint naming a chord the user has rebound
+/// would be worse than no hint at all.
+pub fn detach_chord(side: &Side, blocking: &jobs::Blocking) -> Option<String> {
+    detach_chord_from(&read_config(side, blocking)?)
+}
+
+/// A config read runs once per endpoint: herdr rereads its own config only on
+/// request, and re-running a shell inside every distro on the listing cadence
+/// would cost a process per distro per tick to learn a string that does not
+/// move.
+enum Chord {
+    Unread,
+    Pending(jobs::Job<Option<String>>),
+    Read(Option<String>),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// herdr ships `ctrl+b` / `prefix+q`, so an untouched config is not an
+    /// unknown chord — it is the documented one.
+    #[test]
+    fn an_untouched_config_yields_herdrs_documented_chord() {
+        assert_eq!(detach_chord_from(""), Some("Ctrl+B q".to_string()));
+        assert_eq!(
+            detach_chord_from(
+                "onboarding = false
+"
+            ),
+            Some("Ctrl+B q".to_string())
+        );
+    }
+
+    #[test]
+    fn a_rebound_prefix_moves_the_first_half() {
+        let cfg = "[keys]
+prefix = \"f12\"
+";
+        assert_eq!(detach_chord_from(cfg), Some("F12 q".to_string()));
+    }
+
+    #[test]
+    fn a_rebound_detach_moves_the_second_half() {
+        let cfg = "[keys]
+detach = \"prefix+shift+d\"
+";
+        assert_eq!(detach_chord_from(cfg), Some("Ctrl+B Shift+D".to_string()));
+    }
+
+    /// A detach bound off the prefix is one chord, not two, so it renders
+    /// without the leading prefix it never goes through.
+    #[test]
+    fn a_direct_detach_binding_drops_the_prefix() {
+        let cfg = "[keys]
+detach = \"ctrl+alt+q\"
+";
+        assert_eq!(detach_chord_from(cfg), Some("Ctrl+Alt+Q".to_string()));
+    }
+
+    /// herdr accepts a list of bindings for one action.  The row has space
+    /// for one, and the first is the one its own help surface leads with.
+    #[test]
+    fn a_list_of_bindings_renders_the_first() {
+        let cfg = "[keys]
+detach = [\"prefix+q\", \"prefix+d\"]
+";
+        assert_eq!(detach_chord_from(cfg), Some("Ctrl+B q".to_string()));
+    }
+
+    /// An empty binding is herdr's spelling for "unbound", and a chord that
+    /// does not exist must not be advertised.
+    #[test]
+    fn an_unbound_detach_has_no_chord() {
+        assert_eq!(
+            detach_chord_from(
+                "[keys]
+detach = \"\"
+"
+            ),
+            None
+        );
+        assert_eq!(
+            detach_chord_from(
+                "[keys]
+detach = []
+"
+            ),
+            None
+        );
+    }
+
+    /// A config herdr itself would reject falls back to the defaults it
+    /// would then run with, rather than leaving the row silent.
+    #[test]
+    fn an_unparseable_config_falls_back_to_the_defaults() {
+        assert_eq!(detach_chord_from("[keys"), Some("Ctrl+B q".to_string()));
+    }
 
     /// Captured from a native Windows server.  `skip_serializing_if` drops
     /// `foreground_cwd`, `name`, `display_agent` and `agent_session` rather

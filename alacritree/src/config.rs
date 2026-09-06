@@ -665,6 +665,11 @@ baked_glyphs! {
     DEFAULT_WORKTREE_MAIN_ICON = "●";
     DEFAULT_WORKTREE_ICON = "○";
     DEFAULT_SESSION_ICON = "▪";
+    /// A pane a terminal workspace manager owns rather than alacritree.  A
+    /// split square says "multiplexed elsewhere" at row size, where a
+    /// vendor's logo would only say "smudge" — and it stays neutral as more
+    /// than one such manager becomes supportable.
+    DEFAULT_HERDR_ICON = "◫";
     DEFAULT_HOME_ICON = "⌂";
     DEFAULT_PROJECT_EXPANDED_ICON = "▾";
     DEFAULT_PROJECT_COLLAPSED_ICON = "▸";
@@ -983,6 +988,7 @@ pub struct Icons {
     pub worktree_main: IconStyle,
     pub worktree: IconStyle,
     pub session: IconStyle,
+    pub herdr: IconStyle,
     pub home: IconStyle,
     pub project_expanded: IconStyle,
     pub project_collapsed: IconStyle,
@@ -1037,6 +1043,7 @@ impl Default for Icons {
             worktree_main: glyph(DEFAULT_WORKTREE_MAIN_ICON),
             worktree: glyph(DEFAULT_WORKTREE_ICON),
             session: glyph(DEFAULT_SESSION_ICON),
+            herdr: glyph(DEFAULT_HERDR_ICON),
             home: glyph(DEFAULT_HOME_ICON),
             project_expanded: glyph(DEFAULT_PROJECT_EXPANDED_ICON),
             project_collapsed: glyph(DEFAULT_PROJECT_COLLAPSED_ICON),
@@ -2162,6 +2169,8 @@ struct RawIcons {
     worktree: Option<RawIconStyle>,
     /// A terminal session row.
     session: Option<RawIconStyle>,
+    /// A pane owned by a terminal workspace manager such as herdr.
+    herdr: Option<RawIconStyle>,
     /// The home tab, whose sessions inherit the launch directory.
     home: Option<RawIconStyle>,
     /// An expanded project.
@@ -2215,6 +2224,7 @@ fn build_icons(raw: RawIcons) -> Icons {
         worktree_main: style_or(raw.worktree_main, &d.worktree_main),
         worktree: style_or(raw.worktree, &d.worktree),
         session: style_or(raw.session, &d.session),
+        herdr: style_or(raw.herdr, &d.herdr),
         home: style_or(raw.home, &d.home),
         project_expanded: style_or(raw.project_expanded, &d.project_expanded),
         project_collapsed: style_or(raw.project_collapsed, &d.project_collapsed),
@@ -4420,7 +4430,7 @@ program = "second"
         let mut icons: Vec<&str> = DEFAULT_ICON_GLYPHS.iter().map(|g| g.as_str()).collect();
         icons.sort_unstable();
         let mut expected =
-            ["⌕", "●", "○", "▪", "⌂", "▾", "▸", "⬤", "◯", "⬤", "⬤", "✓", "⇅", "⌫", "↑"];
+            ["⌕", "●", "○", "▪", "◫", "⌂", "▾", "▸", "⬤", "◯", "⬤", "⬤", "✓", "⇅", "⌫", "↑"];
         expected.sort_unstable();
         assert_eq!(icons, expected);
     }

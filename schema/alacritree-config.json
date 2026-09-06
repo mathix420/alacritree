@@ -537,6 +537,14 @@
           ],
           "description": "The \"delete worktree\" button."
         },
+        "herdr": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "A pane owned by a terminal workspace manager such as herdr."
+        },
         "home": {
           "anyOf": [
             {
