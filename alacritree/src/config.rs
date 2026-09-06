@@ -56,8 +56,7 @@ pub struct Config {
     /// shared config works on every platform.
     pub working_directory: Option<PathBuf>,
     /// Where `state.toml` and the scratchpad notes live, from `[general]
-    /// state_dir`.  `None` keeps the per-user config base they have always
-    /// used.
+    /// state_dir`.  `None` means the per-user config base.
     pub state_dir: Option<PathBuf>,
     pub wsl_automount_root: String,
     pub wsl_resident_helper: bool,
@@ -153,14 +152,11 @@ pub struct DebugConfig {
     /// Keeps this session's log file for as long as it is on, since the
     /// report has nowhere else to go.
     pub gpu_timing: bool,
-    /// alacritree-only, set in `alacritree.toml`.  Off by default.
-    /// `ALACRITREE_FRAME_LOG` outranks it, being the only switch that exists
-    /// before this file is read.  Like `gpu_timing`, keeps the session log
-    /// open, since the report has nowhere else to go.
+    /// alacritree-only, set in `alacritree.toml`.  Off by default;
+    /// `ALACRITREE_FRAME_LOG` overrides it.
     pub frame_log: bool,
-    /// alacritree-only, set in `alacritree.toml`.  Where crash artifacts and
-    /// session logs are written.  `None` keeps the machine-local state
-    /// directory `logdir::log_dir` resolves.
+    /// alacritree-only, set in `alacritree.toml`.  Crash artifacts and session
+    /// logs go here.  `None` means whatever `logdir::log_dir` resolves.
     pub log_dir: Option<PathBuf>,
 }
 
@@ -1791,18 +1787,16 @@ struct RawGeneral {
     /// it belongs in `alacritree.toml`.  A leading `~` expands to the home
     /// directory; a relative path is ignored.
     ///
-    /// Unset keeps the per-user config base: `%APPDATA%\alacritree` on
-    /// Windows, `$XDG_CONFIG_HOME/alacritree` or `~/.config/alacritree`
-    /// elsewhere.  That is where these files have always lived, so leaving
-    /// this unset changes nothing.
+    /// Unset keeps the per-user config base, where these files have always
+    /// lived: `%APPDATA%\alacritree` on Windows, `$XDG_CONFIG_HOME/alacritree`
+    /// or `~/.config/alacritree` elsewhere.
     ///
-    /// Setting it moves nothing.  Existing state and notes stay at the old
-    /// path, and alacritree starts again from an empty sidebar and empty
-    /// scratchpads at the new one; move the files yourself if you want them to
-    /// follow.  Point every alacritree on the machine at the same directory:
-    /// the CLI resolves this key the same way the window does, so a command
-    /// run against a different config reads a different state file than the
-    /// window is writing.
+    /// Setting this moves nothing.  The old state and notes stay where they
+    /// are and the new directory starts empty, so move the files across
+    /// yourself if you want them.  Every alacritree on the machine needs the
+    /// same value: the CLI resolves this key the way the window does, so a
+    /// command run against a different config reads a state file the window is
+    /// not writing.
     state_dir: Option<String>,
 }
 
@@ -1829,14 +1823,12 @@ struct RawDebug {
     /// keystroke echo every few seconds.  alacritree-only, so it belongs in
     /// `alacritree.toml`.  Default `false`.
     ///
-    /// `ALACRITREE_FRAME_LOG` overrides this in both directions: setting it to
-    /// `0` or the empty string turns measurements off however this key is set.
-    /// The variable is the only switch that exists before the config is read,
-    /// so a run that exported it means it.
+    /// `ALACRITREE_FRAME_LOG` wins over this key both ways: `1` turns
+    /// measurements on, `0` and the empty string turn them off.  The variable
+    /// is the only switch available before the config is read.
     ///
-    /// Keeps this session's log file for as long as it is on, since the report
-    /// goes to the log stream and a GUI-subsystem binary has no console for it
-    /// to reach otherwise.
+    /// Keeps this session's log file for as long as it is on.  The report goes
+    /// to the log stream, and a GUI-subsystem binary has no console.
     frame_log: Option<bool>,
     /// Where crash artifacts and session logs are written.  alacritree-only,
     /// so it belongs in `alacritree.toml`.  A leading `~` expands to the home
@@ -1844,12 +1836,12 @@ struct RawDebug {
     ///
     /// Unset writes to the machine-local state directory: `%LOCALAPPDATA%\
     /// alacritree` on Windows, `$XDG_STATE_HOME/alacritree` or
-    /// `~/.local/state/alacritree` elsewhere.  Logs are deliberately not kept
-    /// beside the config, which on Windows roams between machines.
+    /// `~/.local/state/alacritree` elsewhere.  Logs stay out of the config
+    /// directory, which on Windows roams between machines.
     ///
-    /// A panic raised before this file is parsed still lands in the default
-    /// directory, since nothing knows about this key yet when the crash hook
-    /// is armed.  Setting it does not move logs already written.
+    /// Setting this moves no log already written, and a panic during config
+    /// parsing still lands in the default directory: the crash hook is armed
+    /// before this key can be read.
     log_dir: Option<String>,
 }
 

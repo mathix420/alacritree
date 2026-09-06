@@ -24,22 +24,20 @@ use std::time::{Duration, Instant};
 /// How often the accumulated frames are summarized.
 const REPORT_EVERY: Duration = Duration::from_secs(5);
 
-/// Whether measurements were asked for.  Read by the PTY threads, which have no
-/// handle on the `FrameLog` the UI thread owns, so the answer lives beside them
-/// rather than on it.
+/// Whether measurements were asked for.  Process-wide because the PTY threads
+/// read it and have no handle on the `FrameLog` the UI thread owns.
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// What `ALACRITREE_FRAME_LOG` says, when it says anything.  It outranks
-/// `[debug] frame_log`: the variable is the only switch that exists before the
-/// config parses, so a run that exported it is asking for measurements whatever
-/// the file says.
+/// What `ALACRITREE_FRAME_LOG` says, or `None` when it is unset.  It wins over
+/// `[debug] frame_log`: the variable is the only switch available before the
+/// config parses.
 fn env_override(raw: Option<&OsStr>) -> Option<bool> {
     raw.map(|v| !matches!(v.to_str(), Some("0") | Some("")))
 }
 
-/// Settle the flag from the loaded config.  Has to run before the first session
-/// spawns: the PTY threads read it without synchronizing against startup, and a
-/// value published after they start is silently ignored rather than refused.
+/// Publish the config's answer.  Run this before the first session spawns: the
+/// PTY threads read the flag without synchronizing against startup, so a value
+/// stored after they start is ignored rather than refused.
 pub fn set_enabled(from_config: bool) {
     let asked = env_override(std::env::var_os("ALACRITREE_FRAME_LOG").as_deref());
     ENABLED.store(asked.unwrap_or(from_config), Ordering::Relaxed);
@@ -262,9 +260,9 @@ pub struct FrameLog {
 }
 
 impl FrameLog {
-    /// A log if measurements were asked for, otherwise nothing — the caller
-    /// keeps an `Option` so a normal run pays nothing.  Reads the flag
-    /// `set_enabled` settled, so constructing before that call measures nothing.
+    /// A log if measurements were asked for, otherwise nothing, so a normal run
+    /// pays one `Option` check per frame.  Reads the flag `set_enabled` stores,
+    /// so a `FrameLog` built before that call measures nothing.
     pub fn start() -> Option<Self> {
         enabled().then(|| Self {
             samples: Samples::default(),

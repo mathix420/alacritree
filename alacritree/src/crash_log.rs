@@ -89,15 +89,13 @@ pub fn install(dir: &Path, version: &'static str) {
     }));
 }
 
-/// Point the recorder at the directory `[debug] log_dir` names, which is only
-/// known once the config has been read.  Not a second `install`: `install`
-/// wraps the previous panic hook, so calling it twice chains two hooks and
-/// records every panic twice.
+/// Point the recorder at `[debug] log_dir`, which is only known once the config
+/// has been read.  Not a second `install`: `install` wraps the previous panic
+/// hook, so a second call chains two hooks and records every panic twice.
 ///
-/// Refused once an artifact exists, since a directory that moves after
-/// something was written orphans that record instead of relocating it.  A
-/// directory that cannot be secured is also refused, leaving the recorder on
-/// the default one rather than with nowhere to write.
+/// Declines a directory it cannot secure, leaving the recorder on the one it
+/// has.  Declines once an artifact exists, so one process cannot end up with
+/// its records split across two directories.
 pub fn set_dir(dir: &Path) {
     if let Err(e) = logdir::prepare_log_dir(dir) {
         let _ = writeln!(std::io::stderr(), "alacritree: cannot secure {}: {e}", dir.display());

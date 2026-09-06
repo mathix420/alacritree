@@ -67,18 +67,18 @@ pub fn config_path() -> Option<PathBuf> {
     Some(config_dir()?.join("state.toml"))
 }
 
-/// What `[general] state_dir` named, once someone has read it.
+/// What `[general] state_dir` named, empty until an entry point reads it.
 static CONFIGURED: OnceLock<PathBuf> = OnceLock::new();
 
-/// Publish `[general] state_dir`.  Both entry points call it, the window and
-/// the CLI answering with no window, because a command reading a different
-/// `state.toml` than the window writes would answer from a file nobody updates.
+/// Publish `[general] state_dir`.  The window and the CLI both call it: a
+/// command that resolved the key differently would answer from a `state.toml`
+/// nothing is writing.
 pub fn set_dir(dir: PathBuf) {
     let _ = CONFIGURED.set(dir);
 }
 
 /// Where `state.toml` and the scratchpad notes live: `[general] state_dir` when
-/// it is set, otherwise the per-user config base they have always used.
+/// set, otherwise the per-user config base.
 pub(crate) fn config_dir() -> Option<PathBuf> {
     if let Some(dir) = CONFIGURED.get() {
         return Some(dir.clone());
@@ -227,9 +227,9 @@ mod tests {
     /// the scratchpad notes have to move together rather than split across the
     /// configured directory and the default one.
     ///
-    /// Sets the process-wide directory, which is a `OnceLock`: no other test
-    /// may assert the unconfigured resolution, or the two race for which runs
-    /// first inside one test binary.
+    /// Sets a `OnceLock`, so no other test may assert the unconfigured
+    /// resolution: inside one test binary the two would race for which runs
+    /// first.
     #[test]
     fn a_configured_directory_takes_the_state_file_and_the_notes() {
         let dir = TempDir::new().expect("a temp dir");

@@ -166,7 +166,7 @@ fn main() -> eframe::Result<()> {
     }
     let log_dir = config.debug.log_dir.clone().or(default_log_dir);
 
-    // Before any session exists: the PTY threads read this flag without
+    // Before the first session: the PTY threads read this without
     // synchronizing against startup.
     frame_log::set_enabled(config.debug.frame_log);
 

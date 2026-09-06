@@ -304,8 +304,8 @@ pub fn run(cli: Cli) -> Option<i32> {
     Some(execute(&request, cli.socket.as_deref(), cli.json, config))
 }
 
-/// Where to read config from, carried as far as the offline path in case the
-/// request reaches it.  A request a running instance answers never needs it.
+/// Where the offline path reads config from, carried down from the CLI args.
+/// A request a running instance answers never reads config at all.
 #[derive(Clone, Copy)]
 struct ConfigSource<'a> {
     dir: Option<&'a Path>,
@@ -367,11 +367,10 @@ fn dispatch(
 ) -> Result<serde_json::Value, SendError> {
     match ipc::send_request(socket, request, timeout_for(request)) {
         Err(SendError::NoInstance) => {
-            // Reading `state.toml` ourselves means resolving `[general]
+            // Serving the request ourselves means resolving `[general]
             // state_dir` the way the window does, or we answer from a file
-            // nothing is writing.  Only here: a request an instance answered
-            // never touched the config, and parsing it there would be latency
-            // on the common path.
+            // nothing is writing.  Resolved here rather than in `run` because
+            // a request a running instance answers never needs the config.
             if let Some(dir) = crate::config::load(config.dir, config.overrides).0.state_dir {
                 crate::state::set_dir(dir);
             }

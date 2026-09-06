@@ -274,7 +274,7 @@
           "type": "boolean"
         },
         "frame_log": {
-          "description": "Measure whole frames and report the period, CPU time, grid share and\nkeystroke echo every few seconds.  alacritree-only, so it belongs in\n`alacritree.toml`.  Default `false`.\n\n`ALACRITREE_FRAME_LOG` overrides this in both directions: setting it to\n`0` or the empty string turns measurements off however this key is set.\nThe variable is the only switch that exists before the config is read,\nso a run that exported it means it.\n\nKeeps this session's log file for as long as it is on, since the report\ngoes to the log stream and a GUI-subsystem binary has no console for it\nto reach otherwise.",
+          "description": "Measure whole frames and report the period, CPU time, grid share and\nkeystroke echo every few seconds.  alacritree-only, so it belongs in\n`alacritree.toml`.  Default `false`.\n\n`ALACRITREE_FRAME_LOG` wins over this key both ways: `1` turns\nmeasurements on, `0` and the empty string turn them off.  The variable\nis the only switch available before the config is read.\n\nKeeps this session's log file for as long as it is on.  The report goes\nto the log stream, and a GUI-subsystem binary has no console.",
           "type": "boolean"
         },
         "gpu_timing": {
@@ -282,7 +282,7 @@
           "type": "boolean"
         },
         "log_dir": {
-          "description": "Where crash artifacts and session logs are written.  alacritree-only,\nso it belongs in `alacritree.toml`.  A leading `~` expands to the home\ndirectory; a relative path is ignored.\n\nUnset writes to the machine-local state directory: `%LOCALAPPDATA%\\\nalacritree` on Windows, `$XDG_STATE_HOME/alacritree` or\n`~/.local/state/alacritree` elsewhere.  Logs are deliberately not kept\nbeside the config, which on Windows roams between machines.\n\nA panic raised before this file is parsed still lands in the default\ndirectory, since nothing knows about this key yet when the crash hook\nis armed.  Setting it does not move logs already written.",
+          "description": "Where crash artifacts and session logs are written.  alacritree-only,\nso it belongs in `alacritree.toml`.  A leading `~` expands to the home\ndirectory; a relative path is ignored.\n\nUnset writes to the machine-local state directory: `%LOCALAPPDATA%\\\nalacritree` on Windows, `$XDG_STATE_HOME/alacritree` or\n`~/.local/state/alacritree` elsewhere.  Logs stay out of the config\ndirectory, which on Windows roams between machines.\n\nSetting this moves no log already written, and a panic during config\nparsing still lands in the default directory: the crash hook is armed\nbefore this key can be read.",
           "type": "string"
         },
         "persistent_logging": {
@@ -439,7 +439,7 @@
           "type": "boolean"
         },
         "state_dir": {
-          "description": "Where alacritree keeps what it remembers between runs: `state.toml`\n(project roots, expanded rows, sidebar visibility, per-worktree base\nbranches) and the per-workspace scratchpad notes.  alacritree-only, so\nit belongs in `alacritree.toml`.  A leading `~` expands to the home\ndirectory; a relative path is ignored.\n\nUnset keeps the per-user config base: `%APPDATA%\\alacritree` on\nWindows, `$XDG_CONFIG_HOME/alacritree` or `~/.config/alacritree`\nelsewhere.  That is where these files have always lived, so leaving\nthis unset changes nothing.\n\nSetting it moves nothing.  Existing state and notes stay at the old\npath, and alacritree starts again from an empty sidebar and empty\nscratchpads at the new one; move the files yourself if you want them to\nfollow.  Point every alacritree on the machine at the same directory:\nthe CLI resolves this key the same way the window does, so a command\nrun against a different config reads a different state file than the\nwindow is writing.",
+          "description": "Where alacritree keeps what it remembers between runs: `state.toml`\n(project roots, expanded rows, sidebar visibility, per-worktree base\nbranches) and the per-workspace scratchpad notes.  alacritree-only, so\nit belongs in `alacritree.toml`.  A leading `~` expands to the home\ndirectory; a relative path is ignored.\n\nUnset keeps the per-user config base, where these files have always\nlived: `%APPDATA%\\alacritree` on Windows, `$XDG_CONFIG_HOME/alacritree`\nor `~/.config/alacritree` elsewhere.\n\nSetting this moves nothing.  The old state and notes stay where they\nare and the new directory starts empty, so move the files across\nyourself if you want them.  Every alacritree on the machine needs the\nsame value: the CLI resolves this key the way the window does, so a\ncommand run against a different config reads a state file the window is\nnot writing.",
           "type": "string"
         },
         "working_directory": {
