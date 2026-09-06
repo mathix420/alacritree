@@ -7036,7 +7036,7 @@ struct WorktreeAction {
 /// closure so rendering doesn't borrow `self.sessions`.
 struct SessionRowData {
     id: SessionId,
-    title: String,
+    name: RowName,
     needs_attention: bool,
     activity: SessionActivity,
     /// This workspace's remembered active session (accent icon).
@@ -7055,12 +7055,7 @@ struct HerdrRowData {
     side: herdr::Side,
     terminal_id: String,
     pane_id: String,
-    /// The identifying half: the pane's title where herdr reports one, else
-    /// the agent kind, else the last six characters of the terminal id.
-    name: String,
-    /// The agent kind standing in front of `name` as context, and `None` when
-    /// `name` is already the kind — a row never spells one thing twice.
-    kind: Option<String>,
+    name: RowName,
     status: herdr::Status,
     managed: Managed,
 }
@@ -7085,27 +7080,51 @@ struct Managed {
 
 impl HerdrRowData {
     fn from_agent(agent: &herdr::Agent, side: &herdr::Side, detach: Option<&str>) -> Self {
-        let id_tail = || {
-            let id = &agent.terminal_id;
-            let skip = id.chars().count().saturating_sub(6);
-            id.chars().skip(skip).collect::<String>()
-        };
-        let (name, kind) = match (agent.title.clone(), agent.kind.clone()) {
-            (Some(title), Some(kind)) if title != kind => (title, Some(kind)),
-            (Some(title), _) => (title, None),
-            (None, Some(kind)) => (kind, None),
-            (None, None) => (id_tail(), None),
-        };
+        // A listed row has nothing better than the terminal id's tail behind
+        // the kind, so the kind takes the name rather than standing in front
+        // of six characters nobody reads.
+        let name = herdr_row_name(agent).unwrap_or_else(|| {
+            RowName::plain(agent.kind.clone().unwrap_or_else(|| {
+                let id = &agent.terminal_id;
+                let skip = id.chars().count().saturating_sub(6);
+                id.chars().skip(skip).collect()
+            }))
+        });
         Self {
             side: side.clone(),
             terminal_id: agent.terminal_id.clone(),
             pane_id: agent.pane_id.clone(),
             name,
-            kind,
             status: agent.status,
             managed: Managed::herdr(side, detach),
         }
     }
+}
+
+/// A row's name in two parts, ranked by weight rather than punctuation: the
+/// identity, and the category standing in front of it as context.  `context`
+/// is absent when the identity is already the category, so a row never spells
+/// one thing twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RowName {
+    text: String,
+    context: Option<String>,
+}
+
+impl RowName {
+    fn plain(text: String) -> Self {
+        Self { text, context: None }
+    }
+}
+
+/// The name herdr reports for a pane, and `None` when it reports none.  The
+/// kind rides along as context unless it says the same thing as the title.
+/// What a titleless agent falls back to differs by row, so each caller says
+/// so itself rather than passing its answer through here.
+fn herdr_row_name(agent: &herdr::Agent) -> Option<RowName> {
+    let title = agent.title.clone()?;
+    let context = agent.kind.clone().filter(|kind| *kind != title);
+    Some(RowName { text: title, context })
 }
 
 impl Managed {
@@ -7631,6 +7650,25 @@ fn herdr_backed_activity(own: SessionActivity, status: Option<herdr::Status>) ->
 /// Agent titles commonly lead with their own decorative mark. Once the row
 /// paints a semantic agent/loader status, retaining that mark beside it would
 /// reintroduce the vendor-specific icon set this status model replaces.
+/// What an attached session's row is called.  On Linux and WSL an attach is
+/// full passthrough, so the pane on screen is herdr's and the row names it
+/// the way herdr's own listed row would — attaching must not rename the row
+/// under the user.  A pane herdr reports no title for keeps the title its own
+/// PTY set, with the kind in front of it.
+fn session_row_name(
+    pty_title: &str,
+    activity: SessionActivity,
+    agent: Option<&herdr::Agent>,
+) -> RowName {
+    let Some(agent) = agent else {
+        return RowName::plain(session_row_title(pty_title, activity));
+    };
+    herdr_row_name(agent).unwrap_or_else(|| RowName {
+        text: session_row_title(pty_title, activity),
+        context: agent.kind.clone(),
+    })
+}
+
 fn session_row_title(title: &str, activity: SessionActivity) -> String {
     if activity.is_agent() {
         let trimmed = title.trim_start();
@@ -8046,7 +8084,7 @@ fn session_row(
                     }
                     let (_, galley) = truncating_label(
                         ui,
-                        RichText::new(&row.title).small().color(title_color),
+                        row_name_text(ui, &row.name, title_color, theme.text_muted),
                         title_color,
                         egui::Sense::hover(),
                     );
@@ -8081,7 +8119,7 @@ fn session_row(
         hints.add(rect, hint);
     }
     let resp = hints.apply(resp, theme.icon_tooltips, |resp| {
-        name_tooltip(resp, &row.title, title_elided, theme.sidebar_tooltips)
+        name_tooltip(resp, &row.name.text, title_elided, theme.sidebar_tooltips)
     });
 
     // Frame allocates its space at end-of-show, so its retroactive `interact`
@@ -8127,16 +8165,22 @@ struct HerdrRowAction {
     attach: bool,
 }
 
-/// The row's label: name first, then status, then the `herdr` marker that
-/// distinguishes it from an ordinary session, then `shared view` when the
-/// agent can only be reached through a shared herdr window.
-/// The row's two spans: the dim kind, then the identifying name.  Nothing
-/// separates them but weight — a punctuation mark here would be spelling out
-/// a relationship the colours already show, and the status word it used to
+/// A row's name as two spans: the context, then the identity.  Nothing
+/// separates them but weight — a punctuation mark here would spell out a
+/// relationship the colours already show, and the status word one used to
 /// join only repeated the mark two slots to its left.
-fn herdr_row_text(ui: &egui::Ui, row: &HerdrRowData, theme: &Theme) -> egui::WidgetText {
-    let Some(kind) = &row.kind else {
-        return RichText::new(&row.name).small().color(theme.text_dim).into();
+///
+/// One `LayoutJob` rather than two labels, for the reasons `path_text` gives:
+/// no `item_spacing` gap, no second response competing for the row's click,
+/// and elision that measures the whole stream.
+fn row_name_text(
+    ui: &egui::Ui,
+    name: &RowName,
+    text_color: Color32,
+    context_color: Color32,
+) -> egui::WidgetText {
+    let Some(context) = &name.context else {
+        return RichText::new(&name.text).small().color(text_color).into();
     };
     let size = egui::TextStyle::Small.resolve(ui.style()).size;
     // A hand-built job does not inherit the ui's text valign the way RichText
@@ -8144,9 +8188,7 @@ fn herdr_row_text(ui: &egui::Ui, row: &HerdrRowData, theme: &Theme) -> egui::Wid
     // the marks beside it.
     let valign = ui.text_valign();
     let mut job = egui::text::LayoutJob::default();
-    for (text, color) in
-        [(format!("{kind} "), theme.text_muted), (row.name.clone(), theme.text_dim)]
-    {
+    for (text, color) in [(format!("{context} "), context_color), (name.text.clone(), text_color)] {
         job.append(&text, 0.0, egui::TextFormat {
             font_id: egui::FontId::new(size, egui::FontFamily::Proportional),
             color,
@@ -8161,9 +8203,9 @@ fn herdr_row_text(ui: &egui::Ui, row: &HerdrRowData, theme: &Theme) -> egui::Wid
 /// surface in alacritree, so it goes on every herdr row rather than only the
 /// ones with something else to say.
 fn herdr_row_tooltip(row: &HerdrRowData) -> String {
-    let who = match &row.kind {
-        Some(kind) => format!("{kind} {}", row.name),
-        None => row.name.clone(),
+    let who = match &row.name.context {
+        Some(context) => format!("{context} {}", row.name.text),
+        None => row.name.text.clone(),
     };
     format!("{who}, {}. {}.", row.status.label(), managed_hint(&row.managed))
 }
@@ -8232,7 +8274,7 @@ fn herdr_row(
                     let mark = agent_mark(live, theme.text_dim, theme.attention);
                     paint_agent_mark(ui, mark, rect, theme);
                     paint_managed_mark(ui, icons, theme, theme.text_dim);
-                    let text = herdr_row_text(ui, row, theme);
+                    let text = row_name_text(ui, &row.name, theme.text_dim, theme.text_muted);
                     let _ = truncating_label(ui, text, theme.text_dim, egui::Sense::hover());
                 },
                 |_ui| {},
@@ -8456,8 +8498,15 @@ impl AlacritreeApp {
     /// herdr's word on a session's agent: `Some` only while this session is
     /// attached to one the endpoint listing still carries.
     fn session_herdr_status(&self, session: &Session) -> Option<herdr::Status> {
+        self.session_herdr_agent(session).map(|agent| agent.status)
+    }
+
+    /// The agent this session is attached to, while the endpoint listing
+    /// still carries it.  herdr watches the pane from outside, so it is the
+    /// authority on both what the pane is called and what it is doing.
+    fn session_herdr_agent(&self, session: &Session) -> Option<&herdr::Agent> {
         let key = session.herdr_key.as_ref()?;
-        self.find_herdr_agent(&key.side, &key.terminal_id).map(|agent| agent.status)
+        self.find_herdr_agent(&key.side, &key.terminal_id)
     }
 
     /// The workspace a herdr row is currently listed under, for the keyboard
@@ -8536,7 +8585,7 @@ impl AlacritreeApp {
                 let activity = herdr_backed_activity(s.activity(), self.session_herdr_status(s));
                 SessionRowData {
                     id: s.id,
-                    title: session_row_title(&s.title, activity),
+                    name: session_row_name(&s.title, activity, self.session_herdr_agent(s)),
                     needs_attention: s.needs_attention,
                     activity,
                     is_active: active == Some(s.id),
@@ -11392,13 +11441,13 @@ mod tests {
     fn herdr_row_name_prefers_the_reported_kind() {
         let row =
             HerdrRowData::from_agent(&herdr_agent(Some("claude")), &herdr::Side::Native, None);
-        assert_eq!(row.name, "claude");
+        assert_eq!(row.name, RowName::plain("claude".into()));
     }
 
     #[test]
     fn herdr_row_name_falls_back_to_the_terminal_id_tail() {
         let row = HerdrRowData::from_agent(&herdr_agent(None), &herdr::Side::Native, None);
-        assert_eq!(row.name, "300361");
+        assert_eq!(row.name, RowName::plain("300361".into()));
     }
 
     #[test]
@@ -11424,7 +11473,35 @@ mod tests {
             foreground_cwd: None,
         };
         let row = HerdrRowData::from_agent(&agent, &herdr::Side::Native, None);
-        assert_eq!(row.name, "t1");
+        assert_eq!(row.name, RowName::plain("t1".into()));
+    }
+
+    /// On Linux and WSL an attach is full passthrough, so the pane the user
+    /// ends up looking at is herdr's.  The row says so by naming it the way
+    /// herdr's own listed row does, rather than by whatever the attach
+    /// process titled its PTY.
+    #[test]
+    fn an_attached_session_takes_herdrs_name() {
+        let agent = titled(Some("claude"), Some("primary"));
+        let name = session_row_name("bash", SessionActivity::Shell, Some(&agent));
+        assert_eq!((name.context.as_deref(), name.text.as_str()), (Some("claude"), "primary"));
+    }
+
+    /// herdr reporting no title is not a reason to lose the name the session
+    /// already had, so the PTY's title stands in.
+    #[test]
+    fn an_attached_session_without_a_herdr_title_keeps_its_own() {
+        let agent = titled(Some("claude"), None);
+        let name = session_row_name("✳ building", SessionActivity::Shell, Some(&agent));
+        assert_eq!((name.context.as_deref(), name.text.as_str()), (Some("claude"), "✳ building"));
+    }
+
+    /// A session no harness owns is untouched by any of this.
+    #[test]
+    fn an_ordinary_session_keeps_its_pty_title() {
+        let agent = SessionActivity::agent(Some("claude"), LiveState::Idle);
+        let name = session_row_name("✳ claude", agent, None);
+        assert_eq!((name.context, name.text.as_str()), (None, "claude"));
     }
 
     fn titled(kind: Option<&str>, title: Option<&str>) -> herdr::Agent {
@@ -11440,7 +11517,10 @@ mod tests {
     #[test]
     fn a_titled_agent_reads_kind_then_title() {
         let row = row_of(Some("claude"), Some("primary"));
-        assert_eq!((row.kind.as_deref(), row.name.as_str()), (Some("claude"), "primary"));
+        assert_eq!(
+            (row.name.context.as_deref(), row.name.text.as_str()),
+            (Some("claude"), "primary")
+        );
     }
 
     /// Nothing is repeated: a title that only echoes the kind leaves the row
@@ -11448,13 +11528,13 @@ mod tests {
     #[test]
     fn a_title_equal_to_the_kind_is_not_repeated() {
         let row = row_of(Some("codex"), Some("codex"));
-        assert_eq!((row.kind.as_deref(), row.name.as_str()), (None, "codex"));
+        assert_eq!((row.name.context.as_deref(), row.name.text.as_str()), (None, "codex"));
     }
 
     #[test]
     fn an_untitled_agent_keeps_the_kind_as_its_name() {
         let row = row_of(Some("claude"), None);
-        assert_eq!((row.kind.as_deref(), row.name.as_str()), (None, "claude"));
+        assert_eq!((row.name.context.as_deref(), row.name.text.as_str()), (None, "claude"));
     }
 
     /// An agent herdr has not identified still has a pane title, and that is a
@@ -11462,13 +11542,13 @@ mod tests {
     #[test]
     fn a_kindless_agent_is_named_by_its_title() {
         let row = row_of(None, Some("scratch"));
-        assert_eq!((row.kind.as_deref(), row.name.as_str()), (None, "scratch"));
+        assert_eq!((row.name.context.as_deref(), row.name.text.as_str()), (None, "scratch"));
     }
 
     #[test]
     fn an_agent_with_neither_falls_back_to_the_terminal_id_tail() {
         let row = row_of(None, None);
-        assert_eq!((row.kind.as_deref(), row.name.as_str()), (None, "300361"));
+        assert_eq!((row.name.context.as_deref(), row.name.text.as_str()), (None, "300361"));
     }
 
     /// Everything the row's marks cannot say goes here, in sentences — the
@@ -13011,7 +13091,7 @@ mod tests {
 
             let row = SessionRowData {
                 id: 1,
-                title: "zsh".to_owned(),
+                name: RowName::plain("zsh".to_owned()),
                 needs_attention: false,
                 activity: SessionActivity::Shell,
                 is_active: true,
@@ -13099,7 +13179,7 @@ mod tests {
         let icons = crate::config::Icons::default();
         let session = |attention, activity| SessionRowData {
             id: 1,
-            title: "zsh".to_owned(),
+            name: RowName::plain("zsh".to_owned()),
             needs_attention: attention,
             activity,
             is_active: true,
@@ -13435,7 +13515,7 @@ mod tests {
         let icons = crate::config::Icons::default();
         let row = SessionRowData {
             id: 1,
-            title: "cargo test --workspace --all-features -- --nocapture".to_owned(),
+            name: RowName::plain("cargo test --workspace --all-features -- --nocapture".to_owned()),
             needs_attention: false,
             activity: SessionActivity::Shell,
             is_active: true,
@@ -13448,11 +13528,11 @@ mod tests {
         });
 
         assert!(
-            row_elided(&texts, &row.title),
+            row_elided(&texts, &row.name.text),
             "the row must be too narrow for the title, or the test proves nothing: {texts:?}"
         );
         assert!(
-            tooltip_shown(&texts, &row.title),
+            tooltip_shown(&texts, &row.name.text),
             "hovering the elided row painted no tooltip with the full title: {texts:?}"
         );
     }
