@@ -5,15 +5,15 @@
 //! terminal view can underline them on hover and open them on click.
 
 use std::cell::RefCell;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use alacritty_terminal::grid::BidirectionalIterator;
 use alacritty_terminal::index::{Direction, Point};
 use alacritty_terminal::term::Term;
 use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 
-use crate::command_ext::CommandExt;
 use crate::session::EventProxy;
+use crate::{command_ext, jobs};
 
 // Identical to alacritty's built-in URL hint regex so the set of recognised
 // schemes (and the trailing-character rules) stay in sync with what users
@@ -150,19 +150,24 @@ fn post_process(term: &Term<EventProxy>, regex_match: Match, point: Point) -> Op
     trimmed.contains(&point).then_some(trimmed)
 }
 
-/// Hand the URI to the OS handler — `xdg-open` on Linux/BSDs, `open` on macOS,
-/// `cmd /c start` on Windows — matching alacritty's default URL hint action.
-pub fn open(uri: &str) {
-    let result = spawn(uri);
-    if let Err(err) = result {
-        log::warn!("failed to open link {uri:?}: {err}");
-    }
+/// Hand the URI to the OS handler — `xdg-open` on Linux/BSDs, `open` on
+/// macOS, `cmd /c start` on Windows — matching alacritty's default URL hint
+/// action.  Submitted rather than spawned inline: `CreateProcess` is not free
+/// on a loaded machine, and this runs from the grid's click handler.
+#[must_use = "dropping the handle cancels the open"]
+pub fn open(uri: &str) -> jobs::Job<()> {
+    let uri = uri.to_owned();
+    jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
+        if let Err(err) = spawn(&uri, blocking) {
+            log::warn!("failed to open link {uri:?}: {err}");
+        }
+    })
 }
 
 #[cfg(target_os = "macos")]
-fn spawn(uri: &str) -> std::io::Result<()> {
-    Command::new("open")
-        .hide_console()
+#[allow(clippy::disallowed_methods)] // Running the process is this function's job.
+fn spawn(uri: &str, _blocking: &jobs::Blocking) -> std::io::Result<()> {
+    command_ext::hidden("open")
         .arg(uri)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -172,11 +177,11 @@ fn spawn(uri: &str) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-fn spawn(uri: &str) -> std::io::Result<()> {
+#[allow(clippy::disallowed_methods)] // Running the process is this function's job.
+fn spawn(uri: &str, _blocking: &jobs::Blocking) -> std::io::Result<()> {
     // `start` treats its first quoted argument as a window title, so pass an
     // empty title before the URL to keep `cmd` from eating it.
-    Command::new("cmd")
-        .hide_console()
+    command_ext::hidden("cmd")
         .args(["/c", "start", ""])
         .arg(uri)
         .stdin(Stdio::null())
@@ -187,9 +192,9 @@ fn spawn(uri: &str) -> std::io::Result<()> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn spawn(uri: &str) -> std::io::Result<()> {
-    Command::new("xdg-open")
-        .hide_console()
+#[allow(clippy::disallowed_methods)] // Running the process is this function's job.
+fn spawn(uri: &str, _blocking: &jobs::Blocking) -> std::io::Result<()> {
+    command_ext::hidden("xdg-open")
         .arg(uri)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

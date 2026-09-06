@@ -11,6 +11,11 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn generated() -> String {
+    // The child here is alacritree itself, a GUI-subsystem binary that
+    // allocates no console at all, so there is no window to hide. This crate
+    // has no lib target, so an integration test cannot reach
+    // `command_ext::hidden` to build it the sanctioned way.
+    #[allow(clippy::disallowed_methods)]
     let out = Command::new(env!("CARGO_BIN_EXE_alacritree")).arg("schema").output().unwrap();
     assert!(out.status.success(), "`alacritree schema` failed");
     String::from_utf8(out.stdout).unwrap()
