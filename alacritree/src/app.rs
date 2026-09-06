@@ -7055,9 +7055,12 @@ struct HerdrRowData {
     side: herdr::Side,
     terminal_id: String,
     pane_id: String,
-    /// The agent's reported kind, or the last six characters of its terminal
-    /// id when herdr hasn't identified it yet.
+    /// The identifying half: the pane's title where herdr reports one, else
+    /// the agent kind, else the last six characters of the terminal id.
     name: String,
+    /// The agent kind standing in front of `name` as context, and `None` when
+    /// `name` is already the kind — a row never spells one thing twice.
+    kind: Option<String>,
     status: herdr::Status,
     managed: Managed,
 }
@@ -7082,16 +7085,23 @@ struct Managed {
 
 impl HerdrRowData {
     fn from_agent(agent: &herdr::Agent, side: &herdr::Side, detach: Option<&str>) -> Self {
-        let name = agent.kind.clone().unwrap_or_else(|| {
+        let id_tail = || {
             let id = &agent.terminal_id;
             let skip = id.chars().count().saturating_sub(6);
-            id.chars().skip(skip).collect()
-        });
+            id.chars().skip(skip).collect::<String>()
+        };
+        let (name, kind) = match (agent.title.clone(), agent.kind.clone()) {
+            (Some(title), Some(kind)) if title != kind => (title, Some(kind)),
+            (Some(title), _) => (title, None),
+            (None, Some(kind)) => (kind, None),
+            (None, None) => (id_tail(), None),
+        };
         Self {
             side: side.clone(),
             terminal_id: agent.terminal_id.clone(),
             pane_id: agent.pane_id.clone(),
             name,
+            kind,
             status: agent.status,
             managed: Managed::herdr(side, detach),
         }
@@ -8120,26 +8130,57 @@ struct HerdrRowAction {
 /// The row's label: name first, then status, then the `herdr` marker that
 /// distinguishes it from an ordinary session, then `shared view` when the
 /// agent can only be reached through a shared herdr window.
-fn herdr_row_label(row: &HerdrRowData) -> String {
-    let shared = if row.managed.shared_view { " · shared view" } else { "" };
-    format!("{} — {}{shared}", row.name, row.status.label())
+/// The row's two spans: the dim kind, then the identifying name.  Nothing
+/// separates them but weight — a punctuation mark here would be spelling out
+/// a relationship the colours already show, and the status word it used to
+/// join only repeated the mark two slots to its left.
+fn herdr_row_text(ui: &egui::Ui, row: &HerdrRowData, theme: &Theme) -> egui::WidgetText {
+    let Some(kind) = &row.kind else {
+        return RichText::new(&row.name).small().color(theme.text_dim).into();
+    };
+    let size = egui::TextStyle::Small.resolve(ui.style()).size;
+    // A hand-built job does not inherit the ui's text valign the way RichText
+    // does, so it must be carried across or the text sits off-centre against
+    // the marks beside it.
+    let valign = ui.text_valign();
+    let mut job = egui::text::LayoutJob::default();
+    for (text, color) in
+        [(format!("{kind} "), theme.text_muted), (row.name.clone(), theme.text_dim)]
+    {
+        job.append(&text, 0.0, egui::TextFormat {
+            font_id: egui::FontId::new(size, egui::FontFamily::Proportional),
+            color,
+            valign,
+            ..Default::default()
+        });
+    }
+    job.into()
 }
 
 /// What hovering the row explains — herdr's detach chord has no other
 /// surface in alacritree, so it goes on every herdr row rather than only the
 /// ones with something else to say.
 fn herdr_row_tooltip(row: &HerdrRowData) -> String {
-    format!("{} · {}", herdr_row_label(row), managed_hint(&row.managed))
+    let who = match &row.kind {
+        Some(kind) => format!("{kind} {}", row.name),
+        None => row.name.clone(),
+    };
+    format!("{who}, {}. {}.", row.status.label(), managed_hint(&row.managed))
 }
 
 /// What a harness mark explains on hover.  The detach chord has no other
 /// surface in alacritree — it is the harness's key, not one of ours — so it
 /// travels with the mark wherever the mark goes.
 fn managed_hint(managed: &Managed) -> String {
-    match &managed.detach {
-        Some(chord) => format!("{}, detach with {chord}", managed.harness),
-        None => managed.harness.to_string(),
+    let mut hint = managed.harness.to_string();
+    if managed.shared_view {
+        hint.push_str(", shared view");
     }
+    if let Some(chord) = &managed.detach {
+        hint.push_str(", detach with ");
+        hint.push_str(chord);
+    }
+    hint
 }
 
 /// Paint the harness mark and return the rect it claimed, so the caller can
@@ -8191,12 +8232,8 @@ fn herdr_row(
                     let mark = agent_mark(live, theme.text_dim, theme.attention);
                     paint_agent_mark(ui, mark, rect, theme);
                     paint_managed_mark(ui, icons, theme, theme.text_dim);
-                    let _ = truncating_label(
-                        ui,
-                        RichText::new(herdr_row_label(row)).small().color(theme.text_dim),
-                        theme.text_dim,
-                        egui::Sense::hover(),
-                    );
+                    let text = herdr_row_text(ui, row, theme);
+                    let _ = truncating_label(ui, text, theme.text_dim, egui::Sense::hover());
                 },
                 |_ui| {},
             );
@@ -11344,6 +11381,7 @@ mod tests {
             terminal_id: "term_65abfc8e300361".into(),
             pane_id: "w5:p1".into(),
             kind: kind.map(String::from),
+            title: None,
             status: herdr::Status::Idle,
             cwd: None,
             foreground_cwd: None,
@@ -11380,6 +11418,7 @@ mod tests {
             terminal_id: "t1".into(),
             pane_id: "w1:p1".into(),
             kind: None,
+            title: None,
             status: herdr::Status::Idle,
             cwd: None,
             foreground_cwd: None,
@@ -11388,29 +11427,69 @@ mod tests {
         assert_eq!(row.name, "t1");
     }
 
-    /// The harness mark carries the word the label used to spend space on,
-    /// so the label says only what the mark cannot.
-    #[test]
-    fn herdr_row_label_names_the_status_and_marks_a_shared_view() {
-        let side = herdr::Side::Wsl("d".into());
-        let mut row = HerdrRowData::from_agent(&herdr_agent(Some("claude")), &side, None);
-        row.status = herdr::Status::Working;
-        assert_eq!(herdr_row_label(&row), "claude — working");
-
-        row.managed.shared_view = true;
-        assert_eq!(herdr_row_label(&row), "claude — working · shared view");
+    fn titled(kind: Option<&str>, title: Option<&str>) -> herdr::Agent {
+        herdr::Agent { title: title.map(String::from), ..herdr_agent(kind) }
     }
 
-    /// A chord alacritree could not read is one it must not invent, so the
-    /// hint names the harness and stops there.
-    #[test]
-    fn the_managed_hint_names_the_chord_only_when_one_is_known() {
-        let side = herdr::Side::Wsl("d".into());
-        let row = HerdrRowData::from_agent(&herdr_agent(Some("claude")), &side, None);
-        assert_eq!(herdr_row_tooltip(&row), "claude — idle · herdr");
+    fn row_of(kind: Option<&str>, title: Option<&str>) -> HerdrRowData {
+        HerdrRowData::from_agent(&titled(kind, title), &herdr::Side::Wsl("d".into()), None)
+    }
 
-        let row = HerdrRowData::from_agent(&herdr_agent(Some("claude")), &side, Some("Ctrl+B q"));
-        assert_eq!(herdr_row_tooltip(&row), "claude — idle · herdr, detach with Ctrl+B q");
+    /// The kind is a category and the title is an identity, so the title takes
+    /// the bright slot and the kind stands in front of it as context.
+    #[test]
+    fn a_titled_agent_reads_kind_then_title() {
+        let row = row_of(Some("claude"), Some("primary"));
+        assert_eq!((row.kind.as_deref(), row.name.as_str()), (Some("claude"), "primary"));
+    }
+
+    /// Nothing is repeated: a title that only echoes the kind leaves the row
+    /// with one word, not the same word twice.
+    #[test]
+    fn a_title_equal_to_the_kind_is_not_repeated() {
+        let row = row_of(Some("codex"), Some("codex"));
+        assert_eq!((row.kind.as_deref(), row.name.as_str()), (None, "codex"));
+    }
+
+    #[test]
+    fn an_untitled_agent_keeps_the_kind_as_its_name() {
+        let row = row_of(Some("claude"), None);
+        assert_eq!((row.kind.as_deref(), row.name.as_str()), (None, "claude"));
+    }
+
+    /// An agent herdr has not identified still has a pane title, and that is a
+    /// better name than six characters of a terminal id.
+    #[test]
+    fn a_kindless_agent_is_named_by_its_title() {
+        let row = row_of(None, Some("scratch"));
+        assert_eq!((row.kind.as_deref(), row.name.as_str()), (None, "scratch"));
+    }
+
+    #[test]
+    fn an_agent_with_neither_falls_back_to_the_terminal_id_tail() {
+        let row = row_of(None, None);
+        assert_eq!((row.kind.as_deref(), row.name.as_str()), (None, "300361"));
+    }
+
+    /// Everything the row's marks cannot say goes here, in sentences — the
+    /// status word, the shared view, the harness and the way out.
+    #[test]
+    fn the_tooltip_carries_what_the_marks_cannot() {
+        let mut row = row_of(Some("claude"), Some("primary"));
+        row.status = herdr::Status::Working;
+        assert_eq!(herdr_row_tooltip(&row), "claude primary, working. herdr.");
+
+        row.managed.detach = Some("Ctrl+B q".to_string());
+        assert_eq!(
+            herdr_row_tooltip(&row),
+            "claude primary, working. herdr, detach with Ctrl+B q."
+        );
+
+        row.managed.shared_view = true;
+        assert_eq!(
+            herdr_row_tooltip(&row),
+            "claude primary, working. herdr, shared view, detach with Ctrl+B q."
+        );
     }
 
     #[test]
@@ -13663,6 +13742,7 @@ mod tests {
             terminal_id: "t1".into(),
             pane_id: "w1:p1".into(),
             kind: None,
+            title: None,
             status: herdr::Status::Idle,
             cwd: Some(gone.to_string_lossy().into_owned()),
             foreground_cwd: None,

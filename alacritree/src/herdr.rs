@@ -66,6 +66,10 @@ pub struct Agent {
     pub terminal_id: String,
     pub pane_id: String,
     pub kind: Option<String>,
+    /// The pane's title, with the decorative agent prefix already removed by
+    /// herdr.  Two agents of one kind in one checkout are told apart by this
+    /// and nothing else.
+    pub title: Option<String>,
     pub status: Status,
     pub cwd: Option<String>,
     pub foreground_cwd: Option<String>,
@@ -91,6 +95,7 @@ struct RawAgent {
     agent_status: Option<String>,
     agent: Option<String>,
     display_agent: Option<String>,
+    terminal_title_stripped: Option<String>,
     cwd: Option<String>,
     foreground_cwd: Option<String>,
 }
@@ -112,6 +117,10 @@ pub fn parse_agent_list(stdout: &str) -> Vec<Agent> {
                 pane_id: raw.pane_id?,
                 status: Status::parse(&raw.agent_status?),
                 kind: raw.display_agent.or(raw.agent),
+                title: raw
+                    .terminal_title_stripped
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty()),
                 cwd: raw.cwd,
                 foreground_cwd: raw.foreground_cwd,
             })
@@ -849,6 +858,35 @@ enum Chord {
 mod tests {
     use super::*;
 
+    /// herdr strips its own decorative title prefix already, and that stripped
+    /// form is what distinguishes two agents of the same kind in one checkout.
+    #[test]
+    fn an_agents_pane_title_is_parsed() {
+        let stdout = r#"{"result":{"agents":[
+            {"terminal_id":"t1","pane_id":"w5:p1","agent_status":"idle","agent":"claude",
+             "terminal_title":"✫ primary","terminal_title_stripped":"primary"}]}}"#;
+        let agents = parse_agent_list(stdout);
+        assert_eq!(agents[0].title.as_deref(), Some("primary"));
+    }
+
+    /// An agent herdr reports no title for is the common case, not an error.
+    #[test]
+    fn a_titleless_agent_parses_with_no_title() {
+        let stdout = r#"{"result":{"agents":[
+            {"terminal_id":"t1","pane_id":"w5:p1","agent_status":"idle","agent":"claude"}]}}"#;
+        assert_eq!(parse_agent_list(stdout)[0].title, None);
+    }
+
+    /// A title of nothing but spaces says as little as an absent one, and must
+    /// not claim the row's identifying slot.
+    #[test]
+    fn a_blank_title_is_no_title() {
+        let stdout = r#"{"result":{"agents":[
+            {"terminal_id":"t1","pane_id":"w5:p1","agent_status":"idle","agent":"claude",
+             "terminal_title_stripped":"   "}]}}"#;
+        assert_eq!(parse_agent_list(stdout)[0].title, None);
+    }
+
     /// herdr ships `ctrl+b` / `prefix+q`, so an untouched config is not an
     /// unknown chord — it is the documented one.
     #[test]
@@ -1158,6 +1196,7 @@ detach = []
             terminal_id: id.into(),
             pane_id: "w1:p1".into(),
             kind: Some("claude".into()),
+            title: None,
             status,
             cwd: Some("/repo".into()),
             foreground_cwd: None,
@@ -1182,6 +1221,7 @@ detach = []
             terminal_id: "t1".into(),
             pane_id: "w1:p1".into(),
             kind: None,
+            title: None,
             status: Status::Idle,
             cwd: Some(cwd.into()),
             foreground_cwd: foreground.map(str::to_string),
