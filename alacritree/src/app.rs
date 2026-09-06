@@ -1444,23 +1444,17 @@ impl AlacritreeApp {
         if self.pending_herdr_attach.iter().any(|pending| pending.key == key) {
             return true;
         }
+        // The gesture is two herdr processes whatever `async_session_spawn`
+        // says, and running them from the click would hold the frame for as
+        // long as herdr takes to answer.
         let name = self.herdr_session_name(&key.side);
-        if self.config.ui.async_session_spawn {
-            let side = key.side.clone();
-            let pane = pane_id.to_string();
-            let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
-                herdr_attach_gesture(&side, &pane, name)
-            });
-            self.pending_herdr_attach.push(PendingHerdrAttach { job, key, workspace });
-            return true;
-        }
-        match herdr_attach_gesture(&key.side, pane_id, name) {
-            Ok((program, argv)) => self.open_herdr_session(ctx, key, workspace, program, argv),
-            Err(e) => {
-                self.error_dialog = Some(e);
-                false
-            },
-        }
+        let side = key.side.clone();
+        let pane = pane_id.to_string();
+        let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
+            herdr_attach_gesture(&side, &pane, name)
+        });
+        self.pending_herdr_attach.push(PendingHerdrAttach { job, key, workspace });
+        true
     }
 
     /// Adopt the shared-view attaches whose herdr calls have landed.  Each
@@ -8592,11 +8586,10 @@ fn needs_view_focus(
 }
 
 /// What a shared-view attach asks herdr before its client can start: focus
-/// the pane, since the client reads the focused one when it starts, then name
-/// the session, since that is what it attaches to.  Both are process spawns,
-/// and on native Windows both are herdr starting behind whatever the machine
-/// charges for it, which is why this runs on the pool wherever the spawn gate
-/// allows.
+/// the pane, since every app client draws whatever herdr has focused, then
+/// name the session, since that is what the client attaches to.  Both are
+/// process spawns, and on native Windows both wait on herdr starting up,
+/// which is why this only ever runs on the pool.
 ///
 /// `cached_name` is what the endpoint learned in the background.  A gesture
 /// that beats the first read asks herdr itself: a wait is better than a
