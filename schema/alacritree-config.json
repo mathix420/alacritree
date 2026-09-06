@@ -1106,6 +1106,10 @@
           ],
           "type": "string"
         },
+        "confirm_session_detach": {
+          "description": "Whether the sidebar × on a harness-managed row asks before detaching.\nSeparate from `confirm_session_close` because a detach leaves the\npane running and its row listed again. Default true.",
+          "type": "boolean"
+        },
         "decorations": {
           "$ref": "#/$defs/RawDecorations",
           "description": "Corrections to the underline and strikeout the font placed\n([`RawDecorations`])."

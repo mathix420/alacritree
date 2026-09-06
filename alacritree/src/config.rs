@@ -1213,6 +1213,13 @@ pub struct UiTheme {
     pub attention_grace: Duration,
     /// Ask before the sidebar's per-session `×` kills the PTY.
     pub confirm_session_close: ConfirmSessionClose,
+    /// Ask before the sidebar's `×` detaches from a harness-managed pane.
+    /// Its own switch rather than a mode of [`Self::confirm_session_close`]:
+    /// a detach destroys nothing — the pane keeps running under its harness
+    /// and its row comes back — so the busy question a close asks has no
+    /// answer here, and a user who wants no close prompt may still want to
+    /// be asked before losing the view.
+    pub confirm_session_detach: bool,
     /// What closing the last session in the on-screen workspace does.
     pub last_session_close: LastSessionClose,
     /// How the projects sidebar repairs a cursor whose row stopped rendering.
@@ -1336,6 +1343,7 @@ impl Default for UiTheme {
             notifications: true,
             attention_grace: Duration::ZERO,
             confirm_session_close: ConfirmSessionClose::Never,
+            confirm_session_detach: true,
             last_session_close: LastSessionClose::Respawn,
             sidebar_focus: SidebarFocus::default(),
             sidebar_follow_active: false,
@@ -2462,6 +2470,10 @@ struct RawUi {
     /// "never" (default) | "busy" | "always".
     #[schemars(extend("enum" = ["never", "busy", "always"]))]
     confirm_session_close: Option<String>,
+    /// Whether the sidebar × on a harness-managed row asks before detaching.
+    /// Separate from `confirm_session_close` because a detach leaves the
+    /// pane running and its row listed again. Default true.
+    confirm_session_detach: Option<bool>,
     /// What happens when the on-screen workspace stops having sessions,
     /// whether a close or a worktree deletion took the last one:
     /// "respawn" (default) | "navigate" | "ring_global" | "ring_project".
@@ -2757,6 +2769,7 @@ impl RawConfig {
             confirm_session_close: parse_confirm_session_close(
                 self.ui.confirm_session_close.as_deref(),
             ),
+            confirm_session_detach: self.ui.confirm_session_detach.unwrap_or(true),
             last_session_close: parse_last_session_close(self.ui.last_session_close.as_deref()),
             sidebar_focus: parse_sidebar_focus(self.ui.sidebar_focus.as_deref()),
             sidebar_follow_active: self.ui.sidebar_follow_active.unwrap_or(false),
@@ -3427,6 +3440,19 @@ mod tests {
             let ui = ui_from_toml(&format!("[ui]\nconfirm_session_close = \"{raw}\""));
             assert_eq!(ui.confirm_session_close, expected, "value {raw:?}");
         }
+    }
+
+    /// Losing the view costs a click to get back, so the ask is on by
+    /// default even though the close prompt is not.
+    #[test]
+    fn confirm_session_detach_defaults_to_asking() {
+        assert!(ui_from_toml("").confirm_session_detach);
+    }
+
+    #[test]
+    fn confirm_session_detach_can_be_turned_off() {
+        let ui = ui_from_toml("[ui]\nconfirm_session_detach = false");
+        assert!(!ui.confirm_session_detach);
     }
 
     #[test]

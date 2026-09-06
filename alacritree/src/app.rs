@@ -23,7 +23,7 @@ use crate::config::{
     DEFAULT_UPSTREAM_DIVERGED_ICON, DEFAULT_UPSTREAM_GONE_ICON, DEFAULT_UPSTREAM_LEVEL_ICON,
     DEFAULT_UPSTREAM_UNTRACKED_ICON, DEFAULT_WORKTREE_ICON, DEFAULT_WORKTREE_MAIN_ICON, FontConfig,
     IconStyle, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SearchScope, SidebarFocus,
-    SidebarTooltips, TextEmphasis, UiFont, profile_command,
+    SidebarTooltips, TextEmphasis, UiFont, UiTheme, profile_command,
 };
 use crate::crash_log::{self, ExitReason};
 use crate::git_nav::{self, GitSection, SectionCount};
@@ -1736,7 +1736,7 @@ impl AlacritreeApp {
         let Some(session) = self.sessions.iter().find(|s| s.id == id) else {
             return;
         };
-        if self.config.ui.confirm_session_close.requires_prompt(session.is_busy()) {
+        if close_needs_prompt(&self.config.ui, session.herdr_key.is_some(), session.is_busy()) {
             self.pending_session_close = Some(id);
         } else {
             self.close_session(ctx, id);
@@ -8457,6 +8457,14 @@ fn managed_tooltip(managed: &Managed) -> String {
     hint
 }
 
+/// Whether ending a session asks first.  A harness-managed one is a detach
+/// rather than a kill, so it answers to its own switch: the attach client is
+/// always running, which would make the busy question a close asks fire every
+/// time and warn about nothing.
+fn close_needs_prompt(ui: &UiTheme, managed: bool, busy: bool) -> bool {
+    if managed { ui.confirm_session_detach } else { ui.confirm_session_close.requires_prompt(busy) }
+}
+
 /// What the × on a session row does.  Ending a harness-managed session ends
 /// the attach client and nothing else — the pane keeps running under the
 /// harness, and the row it came from comes back — so calling that a close
@@ -11975,6 +11983,25 @@ mod tests {
             herdr::Settings { detach: Some("Ctrl+B q".into()), ..herdr::Settings::default() };
         let managed = Managed::herdr(&herdr::Side::Wsl("d".into()), &settings, None);
         assert_eq!(managed_tooltip(&managed), "herdr. (detach with `Ctrl+B q`)");
+    }
+
+    /// Losing a view costs a click to get back and losing a shell costs the
+    /// shell, so the two prompts answer to separate switches — and the busy
+    /// question a close asks never reaches a detach, whose attach client is
+    /// running by definition.
+    #[test]
+    fn a_detach_asks_on_its_own_switch() {
+        use crate::config::ConfirmSessionClose;
+
+        let mut ui = UiTheme::default();
+        assert_eq!(ui.confirm_session_close, ConfirmSessionClose::Never);
+        assert!(close_needs_prompt(&ui, true, false));
+        assert!(!close_needs_prompt(&ui, false, true));
+
+        ui.confirm_session_close = ConfirmSessionClose::Always;
+        ui.confirm_session_detach = false;
+        assert!(!close_needs_prompt(&ui, true, true));
+        assert!(close_needs_prompt(&ui, false, false));
     }
 
     /// Ending a herdr-managed session ends the attach and leaves the pane
