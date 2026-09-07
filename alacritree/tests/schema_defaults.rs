@@ -98,8 +98,14 @@ fn every_leaf_without_a_default_is_allowlisted() {
         leaves(&schema).into_iter().filter(|(_, has)| !has).map(|(key, _)| key).collect();
 
     if std::env::var("ALACRITREE_UPDATE_ALLOWLIST").as_deref() == Ok("1") {
+        let existing = std::fs::read_to_string(allowlist_path()).unwrap_or_default();
+        let header: String = existing
+            .lines()
+            .take_while(|l| l.trim().is_empty() || l.trim_start().starts_with('#'))
+            .map(|l| format!("{l}\n"))
+            .collect();
         let body: String = found.iter().map(|k| format!("{k}\n")).collect();
-        std::fs::write(allowlist_path(), body).unwrap();
+        std::fs::write(allowlist_path(), header + &body).unwrap();
         return;
     }
 
