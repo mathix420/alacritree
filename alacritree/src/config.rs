@@ -3646,6 +3646,20 @@ mod tests {
         assert_eq!(HerdrConfig::default(), RawHerdr::default().resolve());
     }
 
+    /// A raw struct that gained a `Default` but lost its `serde(default)`
+    /// resolves an install with no config file correctly and silently
+    /// discards what a real config file wrote, which the stock-config
+    /// snapshot cannot see.
+    #[test]
+    fn a_written_key_still_beats_its_default() {
+        let config =
+            config_from("[integrations.herdr]\npoll_interval_ms = 500\nshow_unmatched = false\n");
+        assert_eq!(config.integrations.herdr.poll_interval, Duration::from_millis(500));
+        assert!(!config.integrations.herdr.show_unmatched);
+        // A key the file did not mention keeps the default it now owns.
+        assert!(config.integrations.herdr.enabled);
+    }
+
     #[test]
     fn the_primary_colours_default_to_the_stock_palette() {
         let raw = RawPrimary::default();

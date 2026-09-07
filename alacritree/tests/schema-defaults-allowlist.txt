@@ -1,3 +1,11 @@
+# Config keys with no schema default, and why that is correct.
+#
+# Regenerate: devkit run task test --env ALACRITREE_UPDATE_ALLOWLIST=1
+#
+# A key belongs here when it resolves to no fixed value: the resolved field is
+# itself optional, the value is derived at runtime, the field is required (an
+# absent one is a parse error), or a fixed default would strand a deprecated
+# alias location.
 BindingCommand.program
 RawBinding.action
 RawBinding.chars
