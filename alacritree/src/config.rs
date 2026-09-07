@@ -1181,8 +1181,8 @@ impl Default for Decorations {
     }
 }
 
-/// A knob that will not parse logs and behaves as `"0"`, the way the rest of
-/// this file treats a value it does not recognize.
+/// A knob that will not parse logs and behaves as `"0px"`, the way the rest
+/// of this file treats a value it does not recognize.
 fn parse_adjust(field: &str, raw: &str) -> Adjust {
     Adjust::parse(raw).unwrap_or_else(|| {
         log::warn!("unusable ui.decorations.{field} value {raw:?}, using \"0px\"");
@@ -1436,6 +1436,8 @@ impl Default for FontConfig {
     }
 }
 
+/// The resolution baseline for an absent `[cursor]` section; `into_config`
+/// overlays whatever the config file set on top of these values.
 impl Default for CursorConfig {
     fn default() -> Self {
         Self { shape: CursorShape::Block, blinking: false, unfocused_hollow: true }

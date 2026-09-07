@@ -4,8 +4,10 @@
 #
 # A key belongs here when it resolves to no fixed value: the resolved field is
 # itself optional, the value is derived at runtime, the field is required (an
-# absent one is a parse error), or a fixed default would strand a deprecated
-# alias location.
+# absent one is a parse error), a fixed default would strand a deprecated
+# alias location, or the field is a collection whose element type implements
+# no `Serialize`, so schemars can emit nothing for it regardless of what the
+# field itself resolves to.
 BindingCommand.program
 RawBinding.action
 RawBinding.chars
