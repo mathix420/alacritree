@@ -1925,7 +1925,7 @@ struct RawFont {
     /// chain.  Recommended home is `alacritree.toml`: upstream alacritty
     /// warns about unknown keys, so putting it in the shared `alacritty.toml`
     /// would make the real alacritty noisy.
-    fallback: Option<Vec<String>>,
+    fallback: Vec<String>,
     /// Draw emoji from their font's colour tables.  Turning this off falls
     /// through to the first fallback face with ordinary outlines, so emoji
     /// render monochrome.  Also alacritree-only, so it belongs in
@@ -1950,7 +1950,7 @@ impl Default for RawFont {
             offset: RawFontDelta::default(),
             glyph_offset: RawFontDelta::default(),
             builtin_box_drawing: true,
-            fallback: None,
+            fallback: Vec::new(),
             color_glyphs: true,
             color_glyph_cache_mb: 10,
         }
@@ -1968,7 +1968,7 @@ impl RawFont {
             offset: self.offset.resolve(),
             glyph_offset: self.glyph_offset.resolve(),
             builtin_box_drawing: self.builtin_box_drawing,
-            fallback: self.fallback.unwrap_or_default(),
+            fallback: self.fallback,
             color_glyphs: self.color_glyphs,
             color_glyph_cache_mb: self.color_glyph_cache_mb,
         }

@@ -428,6 +428,7 @@
           "type": "boolean"
         },
         "fallback": {
+          "default": [],
           "description": "Ordered list of fallback font families or font file paths, tried in\norder after the four primary faces and before the automatic system\nchain.  Recommended home is `alacritree.toml`: upstream alacritty\nwarns about unknown keys, so putting it in the shared `alacritty.toml`\nwould make the real alacritty noisy.",
           "items": {
             "type": "string"

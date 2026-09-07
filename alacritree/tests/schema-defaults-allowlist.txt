@@ -22,7 +22,6 @@ RawCursorStyle.blinking
 RawCursorStyle.shape
 RawDebug.log_dir
 RawFocusOutline.color
-RawFont.fallback
 RawFontFace.family
 RawFontFace.style
 RawGeneral.state_dir
