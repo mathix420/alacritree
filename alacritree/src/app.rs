@@ -4024,6 +4024,7 @@ impl AlacritreeApp {
         let mut home_visible = true;
         let mut visible_projects: HashSet<PathBuf> = HashSet::new();
         let mut visible_worktrees: HashSet<PathBuf> = HashSet::new();
+        let mut visible_children: HashSet<SidebarRow> = HashSet::new();
         if filtering {
             home_visible = false;
             for row in rows {
@@ -4035,10 +4036,9 @@ impl AlacritreeApp {
                     SidebarRow::Worktree(path) => {
                         visible_worktrees.insert(path);
                     },
-                    // Session rows follow their workspace row's visibility.
-                    // `filtered_rows` never emits `HerdrAgent`, so this arm
-                    // never actually sees one while filtering.
-                    SidebarRow::Session(_) | SidebarRow::HerdrAgent(..) => {},
+                    SidebarRow::Session(_) | SidebarRow::HerdrAgent(..) => {
+                        visible_children.insert(row.clone());
+                    },
                 }
             }
         }
@@ -4050,16 +4050,10 @@ impl AlacritreeApp {
         // Snapshot attention + agent-glyph state up-front so the `iter_mut`
         // over projects below isn't blocked from calling back into `&self`
         // helpers.
-        // `sidebar_nav::filtered_rows` never emits `SidebarRow::HerdrAgent`
-        // (it would need the agent's display name, which the row's `(Side,
-        // String)` payload doesn't carry), so a herdr row painted while
-        // filtering would have no cursor path to reach it.  Dropping them
-        // from the listing rather than rebuilding it keeps the sessions the
-        // filter does render in the positions the nav model gave them.
         let mut listed = self.listed_workspace_rows();
         if filtering {
             for entries in listed.values_mut() {
-                entries.retain(|entry| entry.session().is_some());
+                entries.retain(|entry| visible_children.contains(&entry.row()));
             }
         }
         let home_rows = self.workspace_rows(&None, &listed);

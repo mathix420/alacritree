@@ -14,7 +14,7 @@ use crate::projects::{Project, Worktree};
 use crate::session::SessionId;
 
 /// A row the sidebar cursor can rest on, in render order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SidebarRow {
     Home,
     /// Project header, keyed by the project root.
