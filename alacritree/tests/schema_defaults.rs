@@ -139,3 +139,36 @@ fn the_walk_sees_the_defaults_that_already_exist() {
         assert!(with_defaults.contains(key), "the walk missed {key}: {with_defaults:#?}");
     }
 }
+
+/// A `default` that is not one of the spellings beside it is a typo the
+/// parser hides: an unknown string falls back to the resolved default, so
+/// the config still comes out right and only the schema is wrong.
+#[test]
+fn every_default_is_one_of_the_spellings_offered_beside_it() {
+    fn walk(node: &Value, path: &str, bad: &mut Vec<String>) {
+        match node {
+            Value::Object(map) => {
+                if let (Some(default), Some(Value::Array(spellings))) =
+                    (map.get("default"), map.get("enum"))
+                {
+                    if !spellings.contains(default) {
+                        bad.push(format!("{path}: default {default} is not one of {spellings:?}"));
+                    }
+                }
+                for (key, child) in map {
+                    walk(child, &format!("{path}.{key}"), bad);
+                }
+            },
+            Value::Array(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    walk(child, &format!("{path}[{i}]"), bad);
+                }
+            },
+            _ => {},
+        }
+    }
+
+    let mut bad = Vec::new();
+    walk(&generated(), "", &mut bad);
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}

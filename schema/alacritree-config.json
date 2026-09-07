@@ -300,21 +300,25 @@
       "description": "Corrections applied to what the font reports for its underline and\nstrikeout.  Each value is `\"2px\"` (physical pixels, added), `\"2pt\"` or a\nbare `\"2\"` (points, added), or `\"150%\"` (a multiplier).  Positive moves a\nline down, matching kitty and ghostty.  A percentage takes no sign.\nDefault `\"0\"`, which draws what the font asked for.",
       "properties": {
         "strikeout_position": {
+          "default": "0px",
           "description": "Shift or scale of how far the strikeout sits from the top of the cell.",
           "pattern": "^(-?[0-9]*\\.?[0-9]+(px|pt)?|[0-9]*\\.?[0-9]+%)$",
           "type": "string"
         },
         "strikeout_thickness": {
+          "default": "0px",
           "description": "Shift or scale of the strikeout bar's weight.",
           "pattern": "^(-?[0-9]*\\.?[0-9]+(px|pt)?|[0-9]*\\.?[0-9]+%)$",
           "type": "string"
         },
         "underline_position": {
+          "default": "0px",
           "description": "Shift or scale of how far the underline sits from the top of the\ncell, for the straight, dotted and dashed styles.  The double and\ncurly styles are placed from the font's descent instead, so this\nknob does not reach them.",
           "pattern": "^(-?[0-9]*\\.?[0-9]+(px|pt)?|[0-9]*\\.?[0-9]+%)$",
           "type": "string"
         },
         "underline_thickness": {
+          "default": "0px",
           "description": "Shift or scale of the underline's stroke weight.  Every style draws\nwith this value, including double and curly.",
           "pattern": "^(-?[0-9]*\\.?[0-9]+(px|pt)?|[0-9]*\\.?[0-9]+%)$",
           "type": "string"
@@ -832,6 +836,7 @@
     "RawPathStyle": {
       "properties": {
         "diff_title": {
+          "default": "full",
           "description": "\"full\" (default) | \"fish\" | \"zed\", per site.\n\nThe diff pane's title.",
           "enum": [
             "full",
@@ -845,6 +850,7 @@
           "description": "How the last path segment is emphasized."
         },
         "git_header": {
+          "default": "full",
           "description": "The path in the git panel's header.",
           "enum": [
             "full",
@@ -854,6 +860,7 @@
           "type": "string"
         },
         "git_rows": {
+          "default": "full",
           "description": "Paths in the git panel's file rows.",
           "enum": [
             "full",
@@ -986,6 +993,7 @@
           "type": "boolean"
         },
         "scope": {
+          "default": "workspace",
           "description": "How far a reorder may carry a session: \"workspace\" (default) |\n\"project\" | \"anywhere\".",
           "enum": [
             "workspace",
@@ -1146,6 +1154,7 @@
           "type": "integer"
         },
         "confirm_session_close": {
+          "default": "never",
           "description": "When the sidebar × on a session row asks before killing the PTY:\n\"never\" (default) | \"busy\" | \"always\".",
           "enum": [
             "never",
@@ -1203,6 +1212,7 @@
           "description": "Sidebar glyph overrides."
         },
         "last_session_close": {
+          "default": "respawn",
           "description": "What happens when the on-screen workspace stops having sessions,\nwhether a close or a worktree deletion took the last one:\n\"respawn\" (default) | \"navigate\" | \"ring_global\" | \"ring_project\".",
           "enum": [
             "respawn",
@@ -1253,6 +1263,7 @@
           "type": "boolean"
         },
         "scrollbar": {
+          "default": "floating",
           "description": "Sidebar scrollbar style: \"floating\" (default) | \"solid\".",
           "enum": [
             "floating",
@@ -1261,6 +1272,7 @@
           "type": "string"
         },
         "search_scope": {
+          "default": "filtered",
           "description": "Whether a fuzzy query is confined by the panel's active toggle filters:\n\"filtered\" (default) | \"all\".",
           "enum": [
             "filtered",
@@ -1314,6 +1326,7 @@
           "type": "boolean"
         },
         "sidebar_focus": {
+          "default": "preserve",
           "description": "How far the projects sidebar goes when the cursor's row stops being\nrendered: \"preserve\" (default) | \"follow\".",
           "enum": [
             "preserve",
@@ -1335,6 +1348,7 @@
           "description": "Sidebar text color.  Unset derives it from the terminal palette."
         },
         "sidebar_scroll_align": {
+          "default": "minimal",
           "description": "Where a row the sidebar scrolled to is parked:\n\"minimal\" (default) | \"center\".  Under \"center\" every cursor step\nre-centres the list, and clicking a row near the panel edge scrolls it\nout from under the pointer.",
           "enum": [
             "minimal",
@@ -1343,6 +1357,7 @@
           "type": "string"
         },
         "sidebar_tooltips": {
+          "default": "elided",
           "description": "When a sidebar row spells its full name out on hover:\n\"elided\" (default) | \"always\" | \"off\".",
           "enum": [
             "elided",
@@ -1390,6 +1405,7 @@
           "type": "boolean"
         },
         "quote": {
+          "default": "auto",
           "description": "How a path is quoted for the shell that receives it.  The five concrete\nmodes are wezterm's `quote_dropped_files` values.",
           "enum": [
             "auto",

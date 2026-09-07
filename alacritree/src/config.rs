@@ -374,13 +374,12 @@ impl ConfirmSessionClose {
     }
 }
 
-fn parse_confirm_session_close(raw: Option<&str>) -> ConfirmSessionClose {
+fn parse_confirm_session_close(raw: &str) -> ConfirmSessionClose {
     match raw {
-        None => ConfirmSessionClose::default(),
-        Some("never") => ConfirmSessionClose::Never,
-        Some("busy") => ConfirmSessionClose::Busy,
-        Some("always") => ConfirmSessionClose::Always,
-        Some(other) => {
+        "never" => ConfirmSessionClose::Never,
+        "busy" => ConfirmSessionClose::Busy,
+        "always" => ConfirmSessionClose::Always,
+        other => {
             log::warn!("unknown ui.confirm_session_close value {other:?}, using \"never\"");
             ConfirmSessionClose::default()
         },
@@ -450,16 +449,15 @@ impl ShellQuoting {
     }
 }
 
-fn parse_quoting(raw: Option<&str>) -> Quoting {
+fn parse_quoting(raw: &str) -> Quoting {
     match raw {
-        None => Quoting::default(),
-        Some("auto") => Quoting::Auto,
-        Some("none") => Quoting::None,
-        Some("spaces_only") => Quoting::SpacesOnly,
-        Some("posix") => Quoting::Posix,
-        Some("windows") => Quoting::Windows,
-        Some("windows_always_quoted") => Quoting::WindowsAlwaysQuoted,
-        Some(other) => {
+        "auto" => Quoting::Auto,
+        "none" => Quoting::None,
+        "spaces_only" => Quoting::SpacesOnly,
+        "posix" => Quoting::Posix,
+        "windows" => Quoting::Windows,
+        "windows_always_quoted" => Quoting::WindowsAlwaysQuoted,
+        other => {
             log::warn!("unknown ui.drop.quote value {other:?}, using \"auto\"");
             Quoting::default()
         },
@@ -631,25 +629,23 @@ pub enum ScrollbarStyle {
     Solid,
 }
 
-fn parse_scrollbar(raw: Option<&str>) -> ScrollbarStyle {
+fn parse_scrollbar(raw: &str) -> ScrollbarStyle {
     match raw {
-        None => ScrollbarStyle::default(),
-        Some("floating") => ScrollbarStyle::Floating,
-        Some("solid") => ScrollbarStyle::Solid,
-        Some(other) => {
+        "floating" => ScrollbarStyle::Floating,
+        "solid" => ScrollbarStyle::Solid,
+        other => {
             log::warn!("unknown ui.scrollbar value {other:?}, using \"floating\"");
             ScrollbarStyle::default()
         },
     }
 }
 
-fn parse_path_style(raw: Option<&str>) -> PathStyle {
+fn parse_path_style(raw: &str) -> PathStyle {
     match raw {
-        None => PathStyle::default(),
-        Some("full") => PathStyle::Full,
-        Some("fish") => PathStyle::Fish,
-        Some("zed") => PathStyle::Zed,
-        Some(other) => {
+        "full" => PathStyle::Full,
+        "fish" => PathStyle::Fish,
+        "zed" => PathStyle::Zed,
+        other => {
             log::warn!("unknown ui.path_style value {other:?}, using \"full\"");
             PathStyle::default()
         },
@@ -796,14 +792,13 @@ impl LastSessionClose {
     }
 }
 
-fn parse_last_session_close(raw: Option<&str>) -> LastSessionClose {
+fn parse_last_session_close(raw: &str) -> LastSessionClose {
     match raw {
-        None => LastSessionClose::default(),
-        Some("respawn") => LastSessionClose::Respawn,
-        Some("navigate") => LastSessionClose::Navigate,
-        Some("ring_global") => LastSessionClose::RingGlobal,
-        Some("ring_project") => LastSessionClose::RingProject,
-        Some(other) => {
+        "respawn" => LastSessionClose::Respawn,
+        "navigate" => LastSessionClose::Navigate,
+        "ring_global" => LastSessionClose::RingGlobal,
+        "ring_project" => LastSessionClose::RingProject,
+        other => {
             log::warn!("unknown ui.last_session_close value {other:?}, using \"respawn\"");
             LastSessionClose::default()
         },
@@ -831,12 +826,11 @@ impl SidebarFocus {
     }
 }
 
-fn parse_sidebar_focus(raw: Option<&str>) -> SidebarFocus {
+fn parse_sidebar_focus(raw: &str) -> SidebarFocus {
     match raw {
-        None => SidebarFocus::default(),
-        Some("preserve") => SidebarFocus::Preserve,
-        Some("follow") => SidebarFocus::Follow,
-        Some(other) => {
+        "preserve" => SidebarFocus::Preserve,
+        "follow" => SidebarFocus::Follow,
+        other => {
             log::warn!("unknown ui.sidebar_focus value {other:?}, using \"preserve\"");
             SidebarFocus::default()
         },
@@ -866,12 +860,11 @@ impl ScrollAlign {
     }
 }
 
-fn parse_scroll_align(raw: Option<&str>) -> ScrollAlign {
+fn parse_scroll_align(raw: &str) -> ScrollAlign {
     match raw {
-        None => ScrollAlign::default(),
-        Some("minimal") => ScrollAlign::Minimal,
-        Some("center") => ScrollAlign::Center,
-        Some(other) => {
+        "minimal" => ScrollAlign::Minimal,
+        "center" => ScrollAlign::Center,
+        other => {
             log::warn!("unknown ui.sidebar_scroll_align value {other:?}, using \"minimal\"");
             ScrollAlign::default()
         },
@@ -890,12 +883,11 @@ pub enum SearchScope {
     All,
 }
 
-fn parse_search_scope(raw: Option<&str>) -> SearchScope {
+fn parse_search_scope(raw: &str) -> SearchScope {
     match raw {
-        None => SearchScope::default(),
-        Some("filtered") => SearchScope::Filtered,
-        Some("all") => SearchScope::All,
-        Some(other) => {
+        "filtered" => SearchScope::Filtered,
+        "all" => SearchScope::All,
+        other => {
             log::warn!("unknown ui.search_scope value {other:?}, using \"filtered\"");
             SearchScope::default()
         },
@@ -918,13 +910,12 @@ pub enum ReorderScope {
     Anywhere,
 }
 
-fn parse_reorder_scope(raw: Option<&str>) -> ReorderScope {
+fn parse_reorder_scope(raw: &str) -> ReorderScope {
     match raw {
-        None => ReorderScope::default(),
-        Some("workspace") => ReorderScope::Workspace,
-        Some("project") => ReorderScope::Project,
-        Some("anywhere") => ReorderScope::Anywhere,
-        Some(other) => {
+        "workspace" => ReorderScope::Workspace,
+        "project" => ReorderScope::Project,
+        "anywhere" => ReorderScope::Anywhere,
+        other => {
             log::warn!("unknown ui.session_reorder.scope value {other:?}, using \"workspace\"");
             ReorderScope::default()
         },
@@ -957,13 +948,12 @@ pub enum SidebarTooltips {
     Always,
 }
 
-fn parse_sidebar_tooltips(raw: Option<&str>) -> SidebarTooltips {
+fn parse_sidebar_tooltips(raw: &str) -> SidebarTooltips {
     match raw {
-        None => SidebarTooltips::default(),
-        Some("off") => SidebarTooltips::Off,
-        Some("elided") => SidebarTooltips::Elided,
-        Some("always") => SidebarTooltips::Always,
-        Some(other) => {
+        "off" => SidebarTooltips::Off,
+        "elided" => SidebarTooltips::Elided,
+        "always" => SidebarTooltips::Always,
+        other => {
             log::warn!("unknown ui.sidebar_tooltips value {other:?}, using \"elided\"");
             SidebarTooltips::default()
         },
@@ -1223,12 +1213,9 @@ impl Default for Decorations {
 
 /// A knob that will not parse logs and behaves as `"0"`, the way the rest of
 /// this file treats a value it does not recognize.
-fn parse_adjust(field: &str, raw: Option<&str>) -> Adjust {
-    let Some(text) = raw else {
-        return Adjust::NONE;
-    };
-    Adjust::parse(text).unwrap_or_else(|| {
-        log::warn!("unusable ui.decorations.{field} value {text:?}, using \"0\"");
+fn parse_adjust(field: &str, raw: &str) -> Adjust {
+    Adjust::parse(raw).unwrap_or_else(|| {
+        log::warn!("unusable ui.decorations.{field} value {raw:?}, using \"0\"");
         Adjust::NONE
     })
 }
@@ -2460,7 +2447,7 @@ struct RawSessionDisplay {
     tabs_always: bool,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawSessionReorder {
     /// Let a session row be dragged with the mouse to reorder it.
@@ -2468,7 +2455,13 @@ struct RawSessionReorder {
     /// How far a reorder may carry a session: "workspace" (default) |
     /// "project" | "anywhere".
     #[schemars(extend("enum" = ["workspace", "project", "anywhere"]))]
-    scope: Option<String>,
+    scope: String,
+}
+
+impl Default for RawSessionReorder {
+    fn default() -> Self {
+        Self { drag: false, scope: "workspace".to_string() }
+    }
 }
 
 /// Corrections applied to what the font reports for its underline and
@@ -2476,7 +2469,7 @@ struct RawSessionReorder {
 /// bare `"2"` (points, added), or `"150%"` (a multiplier).  Positive moves a
 /// line down, matching kitty and ghostty.  A percentage takes no sign.
 /// Default `"0"`, which draws what the font asked for.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawDecorations {
     /// Shift or scale of how far the underline sits from the top of the
@@ -2484,17 +2477,28 @@ struct RawDecorations {
     /// curly styles are placed from the font's descent instead, so this
     /// knob does not reach them.
     #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
-    underline_position: Option<String>,
+    underline_position: String,
     /// Shift or scale of the underline's stroke weight.  Every style draws
     /// with this value, including double and curly.
     #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
-    underline_thickness: Option<String>,
+    underline_thickness: String,
     /// Shift or scale of how far the strikeout sits from the top of the cell.
     #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
-    strikeout_position: Option<String>,
+    strikeout_position: String,
     /// Shift or scale of the strikeout bar's weight.
     #[schemars(extend("pattern" = r"^(-?[0-9]*\.?[0-9]+(px|pt)?|[0-9]*\.?[0-9]+%)$"))]
-    strikeout_thickness: Option<String>,
+    strikeout_thickness: String,
+}
+
+impl Default for RawDecorations {
+    fn default() -> Self {
+        Self {
+            underline_position: "0px".to_string(),
+            underline_thickness: "0px".to_string(),
+            strikeout_position: "0px".to_string(),
+            strikeout_thickness: "0px".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2568,7 +2572,7 @@ struct RawUiDrop {
         "windows",
         "windows_always_quoted"
     ]))]
-    quote: Option<String>,
+    quote: String,
     /// Rewrite a Windows path to its distro spelling when the session runs
     /// inside WSL.
     wsl_translate: bool,
@@ -2583,7 +2587,7 @@ impl Default for RawUiDrop {
             terminal: true,
             sidebar: true,
             scratchpad: true,
-            quote: None,
+            quote: "auto".to_string(),
             wsl_translate: true,
             highlight: true,
         }
@@ -2687,7 +2691,7 @@ struct RawUi {
     /// When the sidebar × on a session row asks before killing the PTY:
     /// "never" (default) | "busy" | "always".
     #[schemars(extend("enum" = ["never", "busy", "always"]))]
-    confirm_session_close: Option<String>,
+    confirm_session_close: String,
     /// Whether the sidebar × on a harness-managed row asks before detaching.
     /// Separate from `confirm_session_close` because a detach leaves the
     /// pane running and its row listed again. Default true.
@@ -2696,11 +2700,11 @@ struct RawUi {
     /// whether a close or a worktree deletion took the last one:
     /// "respawn" (default) | "navigate" | "ring_global" | "ring_project".
     #[schemars(extend("enum" = ["respawn", "navigate", "ring_global", "ring_project"]))]
-    last_session_close: Option<String>,
+    last_session_close: String,
     /// How far the projects sidebar goes when the cursor's row stops being
     /// rendered: "preserve" (default) | "follow".
     #[schemars(extend("enum" = ["preserve", "follow"]))]
-    sidebar_focus: Option<String>,
+    sidebar_focus: String,
     /// Whether the projects sidebar scrolls to the session on screen whenever
     /// it changes — a cycling key, a click, the palette, an IPC request.
     /// The sidebar cursor is left where it was: `false` (default).
@@ -2710,15 +2714,15 @@ struct RawUi {
     /// re-centres the list, and clicking a row near the panel edge scrolls it
     /// out from under the pointer.
     #[schemars(extend("enum" = ["minimal", "center"]))]
-    sidebar_scroll_align: Option<String>,
+    sidebar_scroll_align: String,
     /// Whether a fuzzy query is confined by the panel's active toggle filters:
     /// "filtered" (default) | "all".
     #[schemars(extend("enum" = ["filtered", "all"]))]
-    search_scope: Option<String>,
+    search_scope: String,
     /// When a sidebar row spells its full name out on hover:
     /// "elided" (default) | "always" | "off".
     #[schemars(extend("enum" = ["elided", "always", "off"]))]
-    sidebar_tooltips: Option<String>,
+    sidebar_tooltips: String,
     /// Whether a sidebar icon explains itself on hover: `true` (default).
     icon_tooltips: bool,
     /// Whether per-session rows and tabs appear before a workspace has two
@@ -2735,7 +2739,7 @@ struct RawUi {
     icons: RawIcons,
     /// Sidebar scrollbar style: "floating" (default) | "solid".
     #[schemars(extend("enum" = ["floating", "solid"]))]
-    scrollbar: Option<String>,
+    scrollbar: String,
     /// Draw the terminal grid through an OpenGL paint callback instead of
     /// handing epaint a mesh.  Default `false`: it needs a GL 3 context and
     /// bypasses the renderer every other panel goes through, so an
@@ -2814,20 +2818,20 @@ impl Default for RawUi {
             sidebar_attention: None,
             notifications: true,
             attention_grace_ms: 0,
-            confirm_session_close: None,
+            confirm_session_close: "never".to_string(),
             confirm_session_detach: true,
-            last_session_close: None,
-            sidebar_focus: None,
+            last_session_close: "respawn".to_string(),
+            sidebar_focus: "preserve".to_string(),
             sidebar_follow_active: false,
-            sidebar_scroll_align: None,
-            search_scope: None,
-            sidebar_tooltips: None,
+            sidebar_scroll_align: "minimal".to_string(),
+            search_scope: "filtered".to_string(),
+            sidebar_tooltips: "elided".to_string(),
             icon_tooltips: true,
             session_display: RawSessionDisplay::default(),
             session_reorder: RawSessionReorder::default(),
             delta_path: None,
             icons: RawIcons::default(),
-            scrollbar: None,
+            scrollbar: "floating".to_string(),
             gpu_grid: false,
             decorations: RawDecorations::default(),
             pr_status: false,
@@ -2853,24 +2857,36 @@ impl Default for RawUi {
     }
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawPathStyle {
     /// "full" (default) | "fish" | "zed", per site.
     ///
     /// The diff pane's title.
     #[schemars(extend("enum" = ["full", "fish", "zed"]))]
-    diff_title: Option<String>,
+    diff_title: String,
     /// Paths in the git panel's file rows.
     #[schemars(extend("enum" = ["full", "fish", "zed"]))]
-    git_rows: Option<String>,
+    git_rows: String,
     /// The path in the git panel's header.
     #[schemars(extend("enum" = ["full", "fish", "zed"]))]
-    git_header: Option<String>,
+    git_header: String,
     /// How the last path segment is emphasized.
     filename: RawTextEmphasis,
     /// How the leading path segments are emphasized.
     parent: RawTextEmphasis,
+}
+
+impl Default for RawPathStyle {
+    fn default() -> Self {
+        Self {
+            diff_title: "full".to_string(),
+            git_rows: "full".to_string(),
+            git_header: "full".to_string(),
+            filename: RawTextEmphasis::default(),
+            parent: RawTextEmphasis::default(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -3041,16 +3057,14 @@ impl RawConfig {
             sidebar_attention: self.ui.sidebar_attention.map(|v| rgb_to_color32(v.0)),
             notifications: self.ui.notifications,
             attention_grace: Duration::from_millis(self.ui.attention_grace_ms),
-            confirm_session_close: parse_confirm_session_close(
-                self.ui.confirm_session_close.as_deref(),
-            ),
+            confirm_session_close: parse_confirm_session_close(&self.ui.confirm_session_close),
             confirm_session_detach: self.ui.confirm_session_detach,
-            last_session_close: parse_last_session_close(self.ui.last_session_close.as_deref()),
-            sidebar_focus: parse_sidebar_focus(self.ui.sidebar_focus.as_deref()),
+            last_session_close: parse_last_session_close(&self.ui.last_session_close),
+            sidebar_focus: parse_sidebar_focus(&self.ui.sidebar_focus),
             sidebar_follow_active: self.ui.sidebar_follow_active,
-            sidebar_scroll_align: parse_scroll_align(self.ui.sidebar_scroll_align.as_deref()),
-            search_scope: parse_search_scope(self.ui.search_scope.as_deref()),
-            sidebar_tooltips: parse_sidebar_tooltips(self.ui.sidebar_tooltips.as_deref()),
+            sidebar_scroll_align: parse_scroll_align(&self.ui.sidebar_scroll_align),
+            search_scope: parse_search_scope(&self.ui.search_scope),
+            sidebar_tooltips: parse_sidebar_tooltips(&self.ui.sidebar_tooltips),
             icon_tooltips: self.ui.icon_tooltips,
             session_display: SessionDisplay {
                 sidebar_always: self.ui.session_display.sidebar_always,
@@ -3058,25 +3072,25 @@ impl RawConfig {
             },
             session_reorder: SessionReorder {
                 drag: self.ui.session_reorder.drag,
-                scope: parse_reorder_scope(self.ui.session_reorder.scope.as_deref()),
+                scope: parse_reorder_scope(&self.ui.session_reorder.scope),
             },
             gpu_grid: self.ui.gpu_grid,
             decorations: Decorations {
                 underline_position: parse_adjust(
                     "underline_position",
-                    self.ui.decorations.underline_position.as_deref(),
+                    &self.ui.decorations.underline_position,
                 ),
                 underline_thickness: parse_adjust(
                     "underline_thickness",
-                    self.ui.decorations.underline_thickness.as_deref(),
+                    &self.ui.decorations.underline_thickness,
                 ),
                 strikeout_position: parse_adjust(
                     "strikeout_position",
-                    self.ui.decorations.strikeout_position.as_deref(),
+                    &self.ui.decorations.strikeout_position,
                 ),
                 strikeout_thickness: parse_adjust(
                     "strikeout_thickness",
-                    self.ui.decorations.strikeout_thickness.as_deref(),
+                    &self.ui.decorations.strikeout_thickness,
                 ),
             },
             pr_status: self.ui.pr_status,
@@ -3090,7 +3104,7 @@ impl RawConfig {
                 color: self.ui.focus_outline.color.map(|v| rgb_to_color32(v.0)),
                 thickness: self.ui.focus_outline.thickness.max(0.5),
             },
-            scrollbar: parse_scrollbar(self.ui.scrollbar.as_deref()),
+            scrollbar: parse_scrollbar(&self.ui.scrollbar),
             sidebar_click_focus: self.ui.sidebar_click_focus,
             focus_priority_boost: self.ui.focus_priority_boost,
             async_session_spawn: self.ui.async_session_spawn,
@@ -3099,9 +3113,9 @@ impl RawConfig {
             worktree_name: self.ui.worktree_name.clone().filter(|t| !t.trim().is_empty()),
             project_name: self.ui.project_name.clone().filter(|t| !t.trim().is_empty()),
             path_style: PathStyleConfig {
-                diff_title: parse_path_style(self.ui.path_style.diff_title.as_deref()),
-                git_rows: parse_path_style(self.ui.path_style.git_rows.as_deref()),
-                git_header: parse_path_style(self.ui.path_style.git_header.as_deref()),
+                diff_title: parse_path_style(&self.ui.path_style.diff_title),
+                git_rows: parse_path_style(&self.ui.path_style.git_rows),
+                git_header: parse_path_style(&self.ui.path_style.git_header),
                 filename: text_emphasis(&self.ui.path_style.filename),
                 parent: text_emphasis(&self.ui.path_style.parent),
             },
@@ -3111,7 +3125,7 @@ impl RawConfig {
                 sidebar: self.ui.drop.sidebar,
                 scratchpad: self.ui.drop.scratchpad,
                 spelling: PathSpelling {
-                    quote: parse_quoting(self.ui.drop.quote.as_deref()),
+                    quote: parse_quoting(&self.ui.drop.quote),
                     wsl_translate: self.ui.drop.wsl_translate,
                 },
                 highlight: self.ui.drop.highlight,
@@ -4845,8 +4859,8 @@ program = "second"
     /// the line somewhere the user cannot predict.
     #[test]
     fn a_malformed_adjustment_behaves_as_zero() {
-        assert_eq!(parse_adjust("underline_position", Some("2 px")), Adjust::NONE);
-        assert_eq!(parse_adjust("underline_position", None), Adjust::NONE);
+        assert_eq!(parse_adjust("underline_position", "2 px"), Adjust::NONE);
+        assert_eq!(parse_adjust("underline_position", "0px"), Adjust::NONE);
     }
 
     #[test]
