@@ -1422,6 +1422,7 @@ impl AlacritreeApp {
         key: herdr::HerdrKey,
         pane_id: &str,
         workspace: WorkspaceKey,
+        previous: WorkspaceKey,
     ) -> bool {
         if let Some(id) = self.herdr_session_for(&key) {
             self.activate_session_by_id(id);
@@ -1453,7 +1454,7 @@ impl AlacritreeApp {
         let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
             herdr_attach_gesture(&side, &pane, name)
         });
-        self.pending_herdr_attach.push(PendingHerdrAttach { job, key, workspace });
+        self.pending_herdr_attach.push(PendingHerdrAttach { job, key, workspace, previous });
         true
     }
 
@@ -1465,16 +1466,34 @@ impl AlacritreeApp {
         for pending in std::mem::take(&mut self.pending_herdr_attach) {
             match pending.job.poll() {
                 Some(Ok((program, argv))) => {
-                    self.open_herdr_session(ctx, pending.key, pending.workspace, program, argv);
+                    let still_here = self.current_workspace == pending.workspace;
+                    if !self.open_herdr_session(ctx, pending.key, pending.workspace, program, argv)
+                        && still_here
+                    {
+                        self.current_workspace = pending.previous;
+                    }
                 },
-                Some(Err(e)) => self.error_dialog = Some(e),
+                Some(Err(e)) => {
+                    self.restore_after_failed_attach(&pending);
+                    self.error_dialog = Some(e);
+                },
                 None if pending.job.failed() => {
+                    self.restore_after_failed_attach(&pending);
                     self.error_dialog = Some("the herdr attach did not finish".to_string());
                 },
                 None => running.push(pending),
             }
         }
         self.pending_herdr_attach = running;
+    }
+
+    /// Hand the user back only if they are still sitting on the workspace this
+    /// attach switched them to.  The job answers frames later, so a switch
+    /// made in between is theirs and outranks the restore.
+    fn restore_after_failed_attach(&mut self, pending: &PendingHerdrAttach) {
+        if self.current_workspace == pending.workspace {
+            self.current_workspace = pending.previous.clone();
+        }
     }
 
     /// Open the session that runs an attach client.  A shared view starts on
@@ -3043,7 +3062,7 @@ impl AlacritreeApp {
                     // screen.
                     let previous =
                         std::mem::replace(&mut self.current_workspace, workspace.clone());
-                    if self.attach_herdr_agent(ctx, key, &pane_id, workspace) {
+                    if self.attach_herdr_agent(ctx, key, &pane_id, workspace, previous.clone()) {
                         self.focus_terminal();
                     } else {
                         self.current_workspace = previous;
@@ -4842,7 +4861,7 @@ impl AlacritreeApp {
             // Switches first, same as `spawn_shell_request` below: a refusal
             // is only visible if the workspace it happened in is on screen.
             let previous = std::mem::replace(&mut self.current_workspace, ws.clone());
-            if self.attach_herdr_agent(ctx, key, &pane_id, ws) {
+            if self.attach_herdr_agent(ctx, key, &pane_id, ws, previous.clone()) {
                 workspace_activated = true;
             } else {
                 self.current_workspace = previous;
@@ -8599,6 +8618,10 @@ struct PendingHerdrAttach {
     job: jobs::Job<Result<(String, Vec<String>), String>>,
     key: herdr::HerdrKey,
     workspace: WorkspaceKey,
+    /// Where to hand the user back when herdr refuses.  A shared-view
+    /// attach answers frames after the switch, so the caller cannot restore
+    /// the workspace itself the way a direct attach lets it.
+    previous: WorkspaceKey,
 }
 
 /// The shared view herdr is being pointed at, and the call doing the
@@ -9682,7 +9705,7 @@ impl AlacritreeApp {
                 // Switches first, same as both sidebar paths: a refusal is only
                 // visible if the workspace it happened in is on screen.
                 let previous = std::mem::replace(&mut self.current_workspace, a.workspace.clone());
-                if self.attach_herdr_agent(ctx, a.key, &a.pane_id, a.workspace) {
+                if self.attach_herdr_agent(ctx, a.key, &a.pane_id, a.workspace, previous.clone()) {
                     self.focus_terminal();
                 } else {
                     self.current_workspace = previous;
