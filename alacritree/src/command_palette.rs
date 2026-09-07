@@ -20,6 +20,17 @@ use crate::app::WorkspaceKey;
 use crate::bindings::{BindingAction, KeyBinding, NamedAction, bindable_actions};
 use crate::session::SessionId;
 
+/// A herdr agent no session holds, and where attaching to it lands.  The
+/// workspace rides along because the listing already resolved it: looking it
+/// up again would go through `herdr_row_workspace`, whose outer `None` means
+/// "listed nowhere" — a state the palette can reach and the sidebar cannot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HerdrAttach {
+    pub key: crate::herdr::HerdrKey,
+    pub pane_id: String,
+    pub workspace: WorkspaceKey,
+}
+
 /// What activating a palette row does. Each arm is resolved by
 /// `run_palette_action` in `app.rs`, which already owns the machinery it needs.
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +45,9 @@ pub enum PaletteAction {
     CreateWorktree(PathBuf),
     /// Spawn a `[[ui.profiles]]` entry by name into the current workspace.
     SpawnProfile(String),
+    /// Attach to a herdr agent no session holds, in the workspace its working
+    /// directory matched.
+    AttachHerdrAgent(HerdrAttach),
 }
 
 /// The heading a row files under. Grouping keeps the list readable now that a
@@ -49,6 +63,7 @@ pub enum PaletteSection {
     Window,
     Profiles,
     OpenSessions,
+    HerdrAgents,
     SwitchWorkspace,
     NewWorktree,
 }
@@ -65,6 +80,7 @@ impl PaletteSection {
             Self::Window => "Window & application",
             Self::Profiles => "Shell profiles",
             Self::OpenSessions => "Open sessions",
+            Self::HerdrAgents => "Herdr agents",
             Self::SwitchWorkspace => "Switch workspace",
             Self::NewWorktree => "New worktree",
         }
@@ -177,6 +193,22 @@ impl PaletteItem {
             item.search.push(' ');
             item.search.push_str(config_name);
         }
+        item
+    }
+
+    /// A herdr agent nothing is attached to.  `herdr` is folded into the
+    /// search haystack without being painted, so the integration's own name
+    /// finds these rows as well as the attached ones, whose secondary column
+    /// already carries it.
+    pub fn herdr_agent(attach: HerdrAttach, primary: String, secondary: String) -> Self {
+        let mut item = Self::new(
+            PaletteAction::AttachHerdrAgent(attach),
+            PaletteSection::HerdrAgents,
+            String::new(),
+            primary,
+            secondary,
+        );
+        item.search.push_str(" herdr");
         item
     }
 }
@@ -631,5 +663,57 @@ mod tests {
         let mut palette = CommandPalette::new();
         palette.query_mut().push_str("SpawnProfile2");
         assert_eq!(palette.rank(&items), vec![0]);
+    }
+
+    fn attach(id: &str) -> HerdrAttach {
+        HerdrAttach {
+            key: crate::herdr::HerdrKey {
+                side: crate::herdr::Side::Native,
+                terminal_id: id.into(),
+            },
+            pane_id: "w5:p1".into(),
+            workspace: None,
+        }
+    }
+
+    /// One heading is enough only if the integration's own name reaches both
+    /// kinds of row, so `herdr` is folded into the haystack of the unattached
+    /// ones and already sits in the attached ones' secondary column.
+    #[test]
+    fn typing_herdr_ranks_attached_and_unattached_rows() {
+        let items = vec![
+            PaletteItem::session(
+                1,
+                "fix the wrap bug".into(),
+                "herdr · claude · working · Home".into(),
+            ),
+            PaletteItem::herdr_agent(
+                attach("t1"),
+                "review the schema".into(),
+                "claude · idle · Home".into(),
+            ),
+            PaletteItem::session(2, "nvim config".into(), "session · Home".into()),
+        ];
+        let mut palette = CommandPalette::new();
+        palette.query_mut().push_str("herdr");
+        let ranked = palette.rank(&items);
+        assert!(ranked.contains(&0), "the attached row is missing");
+        assert!(ranked.contains(&1), "the unattached row is missing");
+        assert!(!ranked.contains(&2), "a plain session row should not match");
+    }
+
+    /// Grouping is by first appearance, so building the agent block right after
+    /// the session block is what puts the heading under Open sessions.
+    #[test]
+    fn herdr_agents_group_after_open_sessions() {
+        let items = vec![
+            PaletteItem::session(1, "nvim".into(), "session · Home".into()),
+            PaletteItem::herdr_agent(attach("t1"), "review".into(), "claude · idle · Home".into()),
+        ];
+        let mut palette = CommandPalette::new();
+        let ranked = palette.rank(&items);
+        let sections: Vec<PaletteSection> =
+            group(&items, &ranked).into_iter().map(|(s, _)| s).collect();
+        assert_eq!(sections, vec![PaletteSection::OpenSessions, PaletteSection::HerdrAgents]);
     }
 }

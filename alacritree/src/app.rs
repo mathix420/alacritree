@@ -9558,6 +9558,32 @@ impl AlacritreeApp {
             };
             items.push(PaletteItem::session(session.id, name.text, secondary));
         }
+        for (ws, side, agent) in self.herdr_agent_listing() {
+            // A listed row has nothing better than the terminal id's tail behind
+            // the kind, so the kind takes the name rather than standing in front
+            // of six characters nobody reads.
+            let name = herdr_row_name(agent).unwrap_or_else(|| {
+                RowName::plain(agent.kind.clone().unwrap_or_else(|| {
+                    let id = &agent.terminal_id;
+                    let skip = id.chars().count().saturating_sub(6);
+                    id.chars().skip(skip).collect()
+                }))
+            });
+            let secondary =
+                self.herdr_palette_secondary(side, agent.status, name.context.as_deref(), &ws);
+            items.push(PaletteItem::herdr_agent(
+                command_palette::HerdrAttach {
+                    key: herdr::HerdrKey {
+                        side: side.clone(),
+                        terminal_id: agent.terminal_id.clone(),
+                    },
+                    pane_id: agent.pane_id.clone(),
+                    workspace: ws.clone(),
+                },
+                name.text,
+                secondary,
+            ));
+        }
         for ws in self.workspace_order() {
             let (primary, secondary) = self.workspace_entry_label(&ws);
             items.push(PaletteItem::workspace(ws, primary, secondary));
@@ -9592,8 +9618,9 @@ impl AlacritreeApp {
 
     /// The secondary column a herdr row shows: the integration, then whatever
     /// context the name did not already carry, then herdr's own status word,
-    /// then where the row lives.  Shared by the attached and unattached rows so
-    /// one heading's worth of vocabulary reads the same across both.
+    /// then the side it runs on, then where the row lives.  Shared by the
+    /// attached and unattached rows so one heading's worth of vocabulary reads
+    /// the same across both.
     fn herdr_palette_secondary(
         &self,
         side: &herdr::Side,
@@ -9650,6 +9677,16 @@ impl AlacritreeApp {
             PaletteAction::SpawnProfile(name) => {
                 self.spawn_profile_session(ctx, &name);
                 self.focus_terminal();
+            },
+            PaletteAction::AttachHerdrAgent(a) => {
+                // Switches first, same as both sidebar paths: a refusal is only
+                // visible if the workspace it happened in is on screen.
+                let previous = std::mem::replace(&mut self.current_workspace, a.workspace.clone());
+                if self.attach_herdr_agent(ctx, a.key, &a.pane_id, a.workspace) {
+                    self.focus_terminal();
+                } else {
+                    self.current_workspace = previous;
+                }
             },
         }
     }
