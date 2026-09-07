@@ -223,13 +223,14 @@ mod tests {
     }
 
     #[test]
-    fn an_optional_key_is_not_described_as_nullable() {
-        // TOML cannot write null, so a `["string", "null"]` union offers a
-        // value no config file can hold.
+    fn a_defaulted_key_publishes_its_value_and_not_null() {
+        // TOML cannot write null, so a `"default": null` offers a value no
+        // config file can hold.  A key that resolves to a fixed value
+        // publishes that value instead.
         let schema = parsed();
         let pr_status = &schema["$defs"]["RawUi"]["properties"]["pr_status"];
         assert_eq!(pr_status["type"], "boolean");
-        assert!(pr_status.get("default").is_none(), "null is not this key's default");
+        assert_eq!(pr_status["default"], serde_json::json!(false));
     }
 
     #[test]

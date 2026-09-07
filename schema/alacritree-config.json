@@ -270,14 +270,17 @@
       "description": "alacritty's `[debug]` section, plus one alacritree-only key.",
       "properties": {
         "crash_log": {
+          "default": true,
           "description": "Write an artifact when the process panics.  alacritree-only, so it\nbelongs in `alacritree.toml`.  Default `true`: a crash that leaves no\nrecord is the failure this exists to prevent.",
           "type": "boolean"
         },
         "frame_log": {
+          "default": false,
           "description": "Measure whole frames and report the period, CPU time, grid share and\nkeystroke echo every few seconds.  alacritree-only, so it belongs in\n`alacritree.toml`.  Default `false`.\n\n`ALACRITREE_FRAME_LOG` wins over this key both ways: `1` turns\nmeasurements on, `0` and the empty string turn them off.  The variable\nis the only switch available before the config is read.\n\nKeeps this session's log file for as long as it is on.  The report goes\nto the log stream, and a GUI-subsystem binary has no console.",
           "type": "boolean"
         },
         "gpu_timing": {
+          "default": false,
           "description": "Log what the GPU grid's paint callback costs: the wall time of\nissuing a frame, and the GPU's own time for the upload and each of\nthe three draws.  alacritree-only, so it belongs in\n`alacritree.toml`.  Default `false`; timer queries are cheap but not\nfree, and the line is only meaningful to someone reading it.  Needs\n`[ui] gpu_grid` and a GL 3.3 context.  Keeps this session's log file\nfor as long as it is on, since the report has nowhere else to go.",
           "type": "boolean"
         },
@@ -286,6 +289,7 @@
           "type": "string"
         },
         "persistent_logging": {
+          "default": false,
           "description": "Keep the log file after quitting.  Upstream's name and upstream's\ndefault (`false`).",
           "type": "boolean"
         }
@@ -329,14 +333,17 @@
           "description": "Outline color.  Unset uses the sidebar accent."
         },
         "sidebar": {
+          "default": false,
           "description": "Outline the sidebar when it holds keyboard focus.",
           "type": "boolean"
         },
         "terminal": {
+          "default": false,
           "description": "Outline the terminal when it holds keyboard focus.",
           "type": "boolean"
         },
         "thickness": {
+          "default": 1.0,
           "description": "Outline thickness in pixels.",
           "format": "float",
           "type": "number"
@@ -355,16 +362,19 @@
           "description": "The bold-italic face.  An unset family falls back to `normal`'s."
         },
         "builtin_box_drawing": {
+          "default": true,
           "description": "Draw box-drawing (U+2500–U+259F), legacy computing (U+1FB00–U+1FB3B)\nand Powerline (U+E0B0–U+E0BF) characters with the built-in renderer\ninstead of the font.  Default `true`.",
           "type": "boolean"
         },
         "color_glyph_cache_mb": {
+          "default": 10,
           "description": "Budget in megabytes for the rasterized colour-glyph cache.  The cache\nis already bounded by how many codepoints the colour fonts cover, but\nthat ceiling moves with cell size and with the fallback list.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
         },
         "color_glyphs": {
+          "default": true,
           "description": "Draw emoji from their font's colour tables.  Turning this off falls\nthrough to the first fallback face with ordinary outlines, so emoji\nrender monochrome.  Also alacritree-only, so it belongs in\n`alacritree.toml` alongside `fallback`.  Default `true`.",
           "type": "boolean"
         },
@@ -392,6 +402,7 @@
           "description": "Extra space around each cell in pixels: `y` is line spacing, `x` is\nletter spacing.  Default `{ x = 0, y = 0 }`."
         },
         "size": {
+          "default": 11.25,
           "description": "Font size in points.  Default `11.25`.",
           "format": "float",
           "type": "number"
@@ -402,6 +413,7 @@
     "RawFontDelta": {
       "properties": {
         "x": {
+          "default": 0,
           "description": "Horizontal offset in pixels.",
           "format": "int8",
           "maximum": 127,
@@ -409,6 +421,7 @@
           "type": "integer"
         },
         "y": {
+          "default": 0,
           "description": "Vertical offset in pixels.",
           "format": "int8",
           "maximum": 127,
@@ -435,6 +448,7 @@
       "description": "Subset of alacritty's `[general]` section that alacritree honors.  It\nlives in the shared `alacritty.toml`, so disabling alacritty's socket\ndisables ours too — the two sockets are separate files, but the intent\n(\"no IPC\") is the same.",
       "properties": {
         "ipc_socket": {
+          "default": true,
           "description": "Offer the local socket that `alacritree <command>` and the MCP bridge\nconnect to.  Default `true`.",
           "type": "boolean"
         },
@@ -801,11 +815,13 @@
     "RawPadding": {
       "properties": {
         "x": {
+          "default": 0.0,
           "description": "Horizontal padding in pixels.",
           "format": "float",
           "type": "number"
         },
         "y": {
+          "default": 0.0,
           "description": "Vertical padding in pixels.",
           "format": "float",
           "type": "number"
@@ -915,12 +931,14 @@
     "RawScrolling": {
       "properties": {
         "history": {
+          "default": 10000,
           "description": "Maximum number of lines kept in the scrollback buffer.\nDefault `10000`.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
         },
         "multiplier": {
+          "default": 3,
           "description": "Lines scrolled per mouse-wheel increment.  Default `3`.",
           "format": "uint8",
           "maximum": 255,
@@ -933,10 +951,12 @@
     "RawSelection": {
       "properties": {
         "save_to_clipboard": {
+          "default": false,
           "description": "Copy selected text to the system clipboard as soon as it is selected.\nDefault `false`.",
           "type": "boolean"
         },
         "semantic_escape_chars": {
+          "default": ",│`|:\"' ()[]{}<>\t",
           "description": "Characters that separate \"semantic words\" for double-click selection.",
           "type": "string"
         }
@@ -946,10 +966,12 @@
     "RawSessionDisplay": {
       "properties": {
         "sidebar_always": {
+          "default": false,
           "description": "Show a workspace's sidebar session row even with a single session.",
           "type": "boolean"
         },
         "tabs_always": {
+          "default": false,
           "description": "Draw a tab-strip segment even with a single session.",
           "type": "boolean"
         }
@@ -959,6 +981,7 @@
     "RawSessionReorder": {
       "properties": {
         "drag": {
+          "default": false,
           "description": "Let a session row be dragged with the mouse to reorder it.",
           "type": "boolean"
         },
@@ -1088,6 +1111,7 @@
     "RawTextEmphasis": {
       "properties": {
         "bold": {
+          "default": false,
           "description": "Draw bold.",
           "type": "boolean"
         },
@@ -1100,6 +1124,7 @@
           "description": "Text color.  Unset inherits the row's foreground."
         },
         "italic": {
+          "default": false,
           "description": "Draw italic.",
           "type": "boolean"
         }
@@ -1109,10 +1134,12 @@
     "RawUi": {
       "properties": {
         "async_session_spawn": {
+          "default": false,
           "description": "Open a session's PTY on a worker rather than in the frame that asked\nfor it, so spawning does not stutter.  Default false.",
           "type": "boolean"
         },
         "attention_grace_ms": {
+          "default": 0,
           "description": "Grace window in milliseconds before an attention trigger pings; a\nsession that resumes work inside it swallows the ping.  Default 0.",
           "format": "uint64",
           "minimum": 0,
@@ -1128,6 +1155,7 @@
           "type": "string"
         },
         "confirm_session_detach": {
+          "default": true,
           "description": "Whether the sidebar × on a harness-managed row asks before detaching.\nSeparate from `confirm_session_close` because a detach leaves the\npane running and its row listed again. Default true.",
           "type": "boolean"
         },
@@ -1152,6 +1180,7 @@
           "description": "Outline drawn around whichever pane holds keyboard focus."
         },
         "focus_priority_boost": {
+          "default": false,
           "description": "Put the session on screen one scheduling class above normal — its\nshell and every process that shell starts — so a busy machine cannot\nstarve what the user is typing into.  Follows focus.  Windows only.\nDefault false.",
           "type": "boolean"
         },
@@ -1160,10 +1189,12 @@
           "description": "The font sidebars, tabs and dialogs are drawn with."
         },
         "gpu_grid": {
+          "default": false,
           "description": "Draw the terminal grid through an OpenGL paint callback instead of\nhanding epaint a mesh.  Default `false`: it needs a GL 3 context and\nbypasses the renderer every other panel goes through, so an\nunmodified config keeps the path that has always drawn the grid.  A\ncontext too old for instanced arrays logs once and paints the mesh\nfrom the next frame on.",
           "type": "boolean"
         },
         "icon_tooltips": {
+          "default": true,
           "description": "Whether a sidebar icon explains itself on hover: `true` (default).",
           "type": "boolean"
         },
@@ -1182,6 +1213,7 @@
           "type": "string"
         },
         "notifications": {
+          "default": true,
           "description": "Post a desktop notification when a hidden session rings the bell;\nclicking it focuses that session.",
           "type": "boolean"
         },
@@ -1194,6 +1226,7 @@
           "description": "How paths are abbreviated where the UI writes them."
         },
         "pr_status": {
+          "default": false,
           "description": "Poll `gh` for each branch's open pull request, which drives the PR row\nicons, the PR-state filters, and `$pr` in row templates.",
           "type": "boolean"
         },
@@ -1215,6 +1248,7 @@
           "type": "string"
         },
         "reap_descendants_on_close": {
+          "default": false,
           "description": "End everything a session started when that session closes, at any\ndepth, except processes that ask to break away.  Windows only.\nDefault false.",
           "type": "boolean"
         },
@@ -1275,6 +1309,7 @@
           "description": "Color of the line between a sidebar and the terminal."
         },
         "sidebar_click_focus": {
+          "default": false,
           "description": "Clicking a sidebar moves keyboard focus to it.  Default false.",
           "type": "boolean"
         },
@@ -1287,6 +1322,7 @@
           "type": "string"
         },
         "sidebar_follow_active": {
+          "default": false,
           "description": "Whether the projects sidebar scrolls to the session on screen whenever\nit changes — a cycling key, a click, the palette, an IPC request.\nThe sidebar cursor is left where it was: `false` (default).",
           "type": "boolean"
         },
@@ -1316,14 +1352,17 @@
           "type": "string"
         },
         "upstream_status": {
+          "default": false,
           "description": "Paint a badge on each worktree row for its branch's upstream state.\nLocal refs only: nothing fetches, so a branch deleted on the remote\nreads as tracked until something prunes locally.",
           "type": "boolean"
         },
         "vsync": {
+          "default": true,
           "description": "Wait for the display's refresh before showing a finished frame.\nDefault true.",
           "type": "boolean"
         },
         "worktree_liveness": {
+          "default": true,
           "description": "Re-check on a 1.5 s tick whether each listed worktree's checkout is\nstill on disk, so a `git worktree remove` typed into one of our own\nsessions greys the row without waiting for a manual refresh.  Default\n`true`; the probe is one `stat` per listed row, which an exotic\nfilesystem could make expensive.",
           "type": "boolean"
         },
@@ -1341,10 +1380,12 @@
     "RawUiDrop": {
       "properties": {
         "enabled": {
+          "default": true,
           "description": "Accept dropped files at all.  `false` turns every target off.",
           "type": "boolean"
         },
         "highlight": {
+          "default": true,
           "description": "Highlight the target a drag is over.",
           "type": "boolean"
         },
@@ -1361,18 +1402,22 @@
           "type": "string"
         },
         "scratchpad": {
+          "default": true,
           "description": "Write a dropped file's path into the workspace scratchpad.",
           "type": "boolean"
         },
         "sidebar": {
+          "default": true,
           "description": "Let a file dropped on the projects sidebar add its repository.",
           "type": "boolean"
         },
         "terminal": {
+          "default": true,
           "description": "Write a dropped file's path into the terminal.",
           "type": "boolean"
         },
         "wsl_translate": {
+          "default": true,
           "description": "Rewrite a Windows path to its distro spelling when the session runs\ninside WSL.",
           "type": "boolean"
         }
@@ -1390,6 +1435,7 @@
           "type": "string"
         },
         "builtin_symbols": {
+          "default": true,
           "description": "Draw the sidebar's own symbols from the bundled subset rather than from\nthe configured family, so a font missing them still renders.",
           "type": "boolean"
         },
@@ -1412,10 +1458,12 @@
     "RawUiPaste": {
       "properties": {
         "files": {
+          "default": true,
           "description": "Paste files held on the clipboard as their paths.",
           "type": "boolean"
         },
         "image": {
+          "default": true,
           "description": "Paste an image held on the clipboard by writing it to a file and\npasting that path.",
           "type": "boolean"
         },
@@ -1424,6 +1472,7 @@
           "type": "string"
         },
         "image_keep": {
+          "default": 20,
           "description": "How many pasted images to keep before the oldest are removed.",
           "format": "uint",
           "minimum": 0,
@@ -1444,6 +1493,7 @@
     "RawWindow": {
       "properties": {
         "opacity": {
+          "default": 1.0,
           "description": "Background opacity from `0.0` (transparent) to `1.0` (opaque).\nChanging it requires a restart: transparency is a window flag set\nbefore the window exists.  Default `1.0`.",
           "format": "float",
           "type": "number"
@@ -1500,6 +1550,7 @@
           "type": "string"
         },
         "resident_helper": {
+          "default": true,
           "description": "Keep a resident helper process per distro for foreground probes,\nbatched git queries, and tool discovery.  `false` restores one-shot\nwsl.exe spawns everywhere; WSL sessions then always report \"no\nTUI\", so FocusLeft/FocusRight always move panel focus.",
           "type": "boolean"
         }

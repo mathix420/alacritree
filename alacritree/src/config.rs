@@ -659,8 +659,8 @@ fn parse_path_style(raw: Option<&str>) -> PathStyle {
 fn text_emphasis(raw: &RawTextEmphasis) -> TextEmphasis {
     TextEmphasis {
         color: raw.color.map(|v| rgb_to_color32(v.0)),
-        bold: raw.bold.unwrap_or(false),
-        italic: raw.italic.unwrap_or(false),
+        bold: raw.bold,
+        italic: raw.italic,
     }
 }
 
@@ -1475,21 +1475,7 @@ impl Default for Config {
 
 impl Default for FontConfig {
     fn default() -> Self {
-        // Match alacritty's default of 11.25pt.  See `FontConfig::egui_size`
-        // for the pt-to-logical-pixel conversion applied at use sites.
-        Self {
-            size: 11.25,
-            normal: FontFace::default(),
-            bold: FontFace::default(),
-            italic: FontFace::default(),
-            bold_italic: FontFace::default(),
-            offset: FontDelta::default(),
-            glyph_offset: FontDelta::default(),
-            builtin_box_drawing: true,
-            fallback: Vec::new(),
-            color_glyphs: true,
-            color_glyph_cache_mb: 10,
-        }
+        RawFont::default().resolve()
     }
 }
 
@@ -1501,23 +1487,19 @@ impl Default for CursorConfig {
 
 impl Default for ScrollingConfig {
     fn default() -> Self {
-        Self { history: 10_000, multiplier: 3 }
+        RawScrolling::default().resolve()
     }
 }
 
 impl Default for WindowConfig {
     fn default() -> Self {
-        Self { padding_x: 0.0, padding_y: 0.0, opacity: 1.0 }
+        RawWindow::default().resolve()
     }
 }
 
 impl Default for SelectionConfig {
     fn default() -> Self {
-        // Mirrors alacritty_terminal::term::SEMANTIC_ESCAPE_CHARS.
-        Self {
-            semantic_escape_chars: String::from(",│`|:\"' ()[]{}<>\t"),
-            save_to_clipboard: false,
-        }
+        RawSelection::default().resolve()
     }
 }
 
@@ -1857,12 +1839,12 @@ struct RawConfig {
 /// lives in the shared `alacritty.toml`, so disabling alacritty's socket
 /// disables ours too — the two sockets are separate files, but the intent
 /// ("no IPC") is the same.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawGeneral {
     /// Offer the local socket that `alacritree <command>` and the MCP bridge
     /// connect to.  Default `true`.
-    ipc_socket: Option<bool>,
+    ipc_socket: bool,
     /// Directory sessions on the home tab start in; worktree tabs always start
     /// in their checkout.  A leading `~` expands to the home directory.  Unset
     /// inherits the launching process's directory.
@@ -1886,17 +1868,23 @@ struct RawGeneral {
     state_dir: Option<String>,
 }
 
+impl Default for RawGeneral {
+    fn default() -> Self {
+        Self { ipc_socket: true, working_directory: None, state_dir: None }
+    }
+}
+
 /// alacritty's `[debug]` section, plus one alacritree-only key.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawDebug {
     /// Write an artifact when the process panics.  alacritree-only, so it
     /// belongs in `alacritree.toml`.  Default `true`: a crash that leaves no
     /// record is the failure this exists to prevent.
-    crash_log: Option<bool>,
+    crash_log: bool,
     /// Keep the log file after quitting.  Upstream's name and upstream's
     /// default (`false`).
-    persistent_logging: Option<bool>,
+    persistent_logging: bool,
     /// Log what the GPU grid's paint callback costs: the wall time of
     /// issuing a frame, and the GPU's own time for the upload and each of
     /// the three draws.  alacritree-only, so it belongs in
@@ -1904,7 +1892,7 @@ struct RawDebug {
     /// free, and the line is only meaningful to someone reading it.  Needs
     /// `[ui] gpu_grid` and a GL 3.3 context.  Keeps this session's log file
     /// for as long as it is on, since the report has nowhere else to go.
-    gpu_timing: Option<bool>,
+    gpu_timing: bool,
     /// Measure whole frames and report the period, CPU time, grid share and
     /// keystroke echo every few seconds.  alacritree-only, so it belongs in
     /// `alacritree.toml`.  Default `false`.
@@ -1915,7 +1903,7 @@ struct RawDebug {
     ///
     /// Keeps this session's log file for as long as it is on.  The report goes
     /// to the log stream, and a GUI-subsystem binary has no console.
-    frame_log: Option<bool>,
+    frame_log: bool,
     /// Where crash artifacts and session logs are written.  alacritree-only,
     /// so it belongs in `alacritree.toml`.  A leading `~` expands to the home
     /// directory; a relative path is ignored.
@@ -1931,6 +1919,18 @@ struct RawDebug {
     log_dir: Option<String>,
 }
 
+impl Default for RawDebug {
+    fn default() -> Self {
+        Self {
+            crash_log: true,
+            persistent_logging: false,
+            gpu_timing: false,
+            frame_log: false,
+            log_dir: None,
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawKeyboard {
@@ -1939,11 +1939,11 @@ struct RawKeyboard {
     bindings: Vec<bindings::RawBinding>,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawFont {
     /// Font size in points.  Default `11.25`.
-    size: Option<f32>,
+    size: f32,
     /// The face ordinary text is drawn with.
     normal: RawFontFace,
     /// The bold face.  An unset family falls back to `normal`'s.
@@ -1962,7 +1962,7 @@ struct RawFont {
     /// Draw box-drawing (U+2500–U+259F), legacy computing (U+1FB00–U+1FB3B)
     /// and Powerline (U+E0B0–U+E0BF) characters with the built-in renderer
     /// instead of the font.  Default `true`.
-    builtin_box_drawing: Option<bool>,
+    builtin_box_drawing: bool,
     /// Ordered list of fallback font families or font file paths, tried in
     /// order after the four primary faces and before the automatic system
     /// chain.  Recommended home is `alacritree.toml`: upstream alacritty
@@ -1973,11 +1973,49 @@ struct RawFont {
     /// through to the first fallback face with ordinary outlines, so emoji
     /// render monochrome.  Also alacritree-only, so it belongs in
     /// `alacritree.toml` alongside `fallback`.  Default `true`.
-    color_glyphs: Option<bool>,
+    color_glyphs: bool,
     /// Budget in megabytes for the rasterized colour-glyph cache.  The cache
     /// is already bounded by how many codepoints the colour fonts cover, but
     /// that ceiling moves with cell size and with the fallback list.
-    color_glyph_cache_mb: Option<usize>,
+    color_glyph_cache_mb: usize,
+}
+
+impl Default for RawFont {
+    fn default() -> Self {
+        // Match alacritty's default of 11.25pt.  See `FontConfig::egui_size`
+        // for the pt-to-logical-pixel conversion applied at use sites.
+        Self {
+            size: 11.25,
+            normal: RawFontFace::default(),
+            bold: RawFontFace::default(),
+            italic: RawFontFace::default(),
+            bold_italic: RawFontFace::default(),
+            offset: RawFontDelta::default(),
+            glyph_offset: RawFontDelta::default(),
+            builtin_box_drawing: true,
+            fallback: None,
+            color_glyphs: true,
+            color_glyph_cache_mb: 10,
+        }
+    }
+}
+
+impl RawFont {
+    fn resolve(self) -> FontConfig {
+        FontConfig {
+            size: self.size.max(1.0),
+            normal: self.normal.resolve(),
+            bold: self.bold.resolve(),
+            italic: self.italic.resolve(),
+            bold_italic: self.bold_italic.resolve(),
+            offset: self.offset.resolve(),
+            glyph_offset: self.glyph_offset.resolve(),
+            builtin_box_drawing: self.builtin_box_drawing,
+            fallback: self.fallback.unwrap_or_default(),
+            color_glyphs: self.color_glyphs,
+            color_glyph_cache_mb: self.color_glyph_cache_mb,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1990,13 +2028,25 @@ struct RawFontFace {
     style: Option<String>,
 }
 
+impl RawFontFace {
+    fn resolve(self) -> FontFace {
+        FontFace { family: self.family, style: self.style }
+    }
+}
+
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawFontDelta {
     /// Horizontal offset in pixels.
-    x: Option<i8>,
+    x: i8,
     /// Vertical offset in pixels.
-    y: Option<i8>,
+    y: i8,
+}
+
+impl RawFontDelta {
+    fn resolve(self) -> FontDelta {
+        FontDelta { x: self.x, y: self.y }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -2033,17 +2083,29 @@ enum RawCursorStyle {
     },
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawScrolling {
     /// Maximum number of lines kept in the scrollback buffer.
     /// Default `10000`.
-    history: Option<u32>,
+    history: u32,
     /// Lines scrolled per mouse-wheel increment.  Default `3`.
-    multiplier: Option<u8>,
+    multiplier: u8,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+impl Default for RawScrolling {
+    fn default() -> Self {
+        Self { history: 10_000, multiplier: 3 }
+    }
+}
+
+impl RawScrolling {
+    fn resolve(self) -> ScrollingConfig {
+        ScrollingConfig { history: self.history as usize, multiplier: self.multiplier }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawWindow {
     /// Blank space around the terminal grid, in pixels, added at both
@@ -2052,16 +2114,33 @@ struct RawWindow {
     /// Background opacity from `0.0` (transparent) to `1.0` (opaque).
     /// Changing it requires a restart: transparency is a window flag set
     /// before the window exists.  Default `1.0`.
-    opacity: Option<f32>,
+    opacity: f32,
+}
+
+impl Default for RawWindow {
+    fn default() -> Self {
+        Self { padding: None, opacity: 1.0 }
+    }
+}
+
+impl RawWindow {
+    fn resolve(self) -> WindowConfig {
+        let padding = self.padding.unwrap_or_default();
+        WindowConfig {
+            padding_x: padding.x,
+            padding_y: padding.y,
+            opacity: self.opacity.clamp(0.0, 1.0),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawPadding {
     /// Horizontal padding in pixels.
-    x: Option<f32>,
+    x: f32,
     /// Vertical padding in pixels.
-    y: Option<f32>,
+    y: f32,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -2088,14 +2167,33 @@ enum RawShell {
     },
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawSelection {
     /// Characters that separate "semantic words" for double-click selection.
-    semantic_escape_chars: Option<String>,
+    semantic_escape_chars: String,
     /// Copy selected text to the system clipboard as soon as it is selected.
     /// Default `false`.
-    save_to_clipboard: Option<bool>,
+    save_to_clipboard: bool,
+}
+
+impl Default for RawSelection {
+    fn default() -> Self {
+        // Mirrors alacritty_terminal::term::SEMANTIC_ESCAPE_CHARS.
+        Self {
+            semantic_escape_chars: String::from(",│`|:\"' ()[]{}<>\t"),
+            save_to_clipboard: false,
+        }
+    }
+}
+
+impl RawSelection {
+    fn resolve(self) -> SelectionConfig {
+        SelectionConfig {
+            semantic_escape_chars: self.semantic_escape_chars,
+            save_to_clipboard: self.save_to_clipboard,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -2189,19 +2287,25 @@ struct RawIndexed {
 /// Top-level `[wsl]`: platform-integration options.  Lives outside `[ui]`
 /// because nothing here is presentation — it governs how the app talks to
 /// distros.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawWsl {
     /// Keep a resident helper process per distro for foreground probes,
     /// batched git queries, and tool discovery.  `false` restores one-shot
     /// wsl.exe spawns everywhere; WSL sessions then always report "no
     /// TUI", so FocusLeft/FocusRight always move panel focus.
-    resident_helper: Option<bool>,
+    resident_helper: bool,
     /// Distro-side mount point for Windows drives, mirroring wsl.conf's
     /// `[automount] root`.  Only used for paths *we* translate (git output
     /// from inside a distro); `wsl.exe --cd` translates with the distro's
     /// real mount table regardless of this value.
     automount_root: Option<String>,
+}
+
+impl Default for RawWsl {
+    fn default() -> Self {
+        Self { resident_helper: true, automount_root: None }
+    }
 }
 
 /// `[ui.icons]`: sidebar glyph overrides.  A bare string sets the glyph
@@ -2351,16 +2455,16 @@ struct RawUiWsl {
 #[serde(default)]
 struct RawSessionDisplay {
     /// Show a workspace's sidebar session row even with a single session.
-    sidebar_always: Option<bool>,
+    sidebar_always: bool,
     /// Draw a tab-strip segment even with a single session.
-    tabs_always: Option<bool>,
+    tabs_always: bool,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawSessionReorder {
     /// Let a session row be dragged with the mouse to reorder it.
-    drag: Option<bool>,
+    drag: bool,
     /// How far a reorder may carry a session: "workspace" (default) |
     /// "project" | "anywhere".
     #[schemars(extend("enum" = ["workspace", "project", "anywhere"]))]
@@ -2393,7 +2497,7 @@ struct RawDecorations {
     strikeout_thickness: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawUiFont {
     /// Family for sidebars, tabs and dialogs.  Unset uses the terminal font.
@@ -2408,33 +2512,52 @@ struct RawUiFont {
     bold_italic_family: Option<String>,
     /// Draw the sidebar's own symbols from the bundled subset rather than from
     /// the configured family, so a font missing them still renders.
-    builtin_symbols: Option<bool>,
+    builtin_symbols: bool,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+impl Default for RawUiFont {
+    fn default() -> Self {
+        Self {
+            family: None,
+            size: None,
+            bold_family: None,
+            italic_family: None,
+            bold_italic_family: None,
+            builtin_symbols: true,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawFocusOutline {
     /// Outline the sidebar when it holds keyboard focus.
-    sidebar: Option<bool>,
+    sidebar: bool,
     /// Outline the terminal when it holds keyboard focus.
-    terminal: Option<bool>,
+    terminal: bool,
     /// Outline color.  Unset uses the sidebar accent.
     color: Option<RgbStr>,
     /// Outline thickness in pixels.
-    thickness: Option<f32>,
+    thickness: f32,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+impl Default for RawFocusOutline {
+    fn default() -> Self {
+        Self { sidebar: false, terminal: false, color: None, thickness: 1.0 }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawUiDrop {
     /// Accept dropped files at all.  `false` turns every target off.
-    enabled: Option<bool>,
+    enabled: bool,
     /// Write a dropped file's path into the terminal.
-    terminal: Option<bool>,
+    terminal: bool,
     /// Let a file dropped on the projects sidebar add its repository.
-    sidebar: Option<bool>,
+    sidebar: bool,
     /// Write a dropped file's path into the workspace scratchpad.
-    scratchpad: Option<bool>,
+    scratchpad: bool,
     /// How a path is quoted for the shell that receives it.  The five concrete
     /// modes are wezterm's `quote_dropped_files` values.
     #[schemars(extend("enum" = [
@@ -2448,23 +2571,43 @@ struct RawUiDrop {
     quote: Option<String>,
     /// Rewrite a Windows path to its distro spelling when the session runs
     /// inside WSL.
-    wsl_translate: Option<bool>,
+    wsl_translate: bool,
     /// Highlight the target a drag is over.
-    highlight: Option<bool>,
+    highlight: bool,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+impl Default for RawUiDrop {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            terminal: true,
+            sidebar: true,
+            scratchpad: true,
+            quote: None,
+            wsl_translate: true,
+            highlight: true,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawUiPaste {
     /// Paste files held on the clipboard as their paths.
-    files: Option<bool>,
+    files: bool,
     /// Paste an image held on the clipboard by writing it to a file and
     /// pasting that path.
-    image: Option<bool>,
+    image: bool,
     /// Where pasted images are written.  Unset uses a cache directory.
     image_dir: Option<String>,
     /// How many pasted images to keep before the oldest are removed.
-    image_keep: Option<usize>,
+    image_keep: usize,
+}
+
+impl Default for RawUiPaste {
+    fn default() -> Self {
+        Self { files: true, image: true, image_dir: None, image_keep: 20 }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -2520,7 +2663,7 @@ impl RawHerdr {
     }
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawUi {
     /// Sidebar background.  Unset derives it from the terminal palette.
@@ -2537,10 +2680,10 @@ struct RawUi {
     sidebar_attention: Option<RgbStr>,
     /// Post a desktop notification when a hidden session rings the bell;
     /// clicking it focuses that session.
-    notifications: Option<bool>,
+    notifications: bool,
     /// Grace window in milliseconds before an attention trigger pings; a
     /// session that resumes work inside it swallows the ping.  Default 0.
-    attention_grace_ms: Option<u64>,
+    attention_grace_ms: u64,
     /// When the sidebar × on a session row asks before killing the PTY:
     /// "never" (default) | "busy" | "always".
     #[schemars(extend("enum" = ["never", "busy", "always"]))]
@@ -2548,7 +2691,7 @@ struct RawUi {
     /// Whether the sidebar × on a harness-managed row asks before detaching.
     /// Separate from `confirm_session_close` because a detach leaves the
     /// pane running and its row listed again. Default true.
-    confirm_session_detach: Option<bool>,
+    confirm_session_detach: bool,
     /// What happens when the on-screen workspace stops having sessions,
     /// whether a close or a worktree deletion took the last one:
     /// "respawn" (default) | "navigate" | "ring_global" | "ring_project".
@@ -2561,7 +2704,7 @@ struct RawUi {
     /// Whether the projects sidebar scrolls to the session on screen whenever
     /// it changes — a cycling key, a click, the palette, an IPC request.
     /// The sidebar cursor is left where it was: `false` (default).
-    sidebar_follow_active: Option<bool>,
+    sidebar_follow_active: bool,
     /// Where a row the sidebar scrolled to is parked:
     /// "minimal" (default) | "center".  Under "center" every cursor step
     /// re-centres the list, and clicking a row near the panel edge scrolls it
@@ -2577,7 +2720,7 @@ struct RawUi {
     #[schemars(extend("enum" = ["elided", "always", "off"]))]
     sidebar_tooltips: Option<String>,
     /// Whether a sidebar icon explains itself on hover: `true` (default).
-    icon_tooltips: Option<bool>,
+    icon_tooltips: bool,
     /// Whether per-session rows and tabs appear before a workspace has two
     /// sessions.
     session_display: RawSessionDisplay,
@@ -2599,23 +2742,23 @@ struct RawUi {
     /// unmodified config keeps the path that has always drawn the grid.  A
     /// context too old for instanced arrays logs once and paints the mesh
     /// from the next frame on.
-    gpu_grid: Option<bool>,
+    gpu_grid: bool,
     /// Corrections to the underline and strikeout the font placed
     /// ([`RawDecorations`]).
     decorations: RawDecorations,
     /// Poll `gh` for each branch's open pull request, which drives the PR row
     /// icons, the PR-state filters, and `$pr` in row templates.
-    pr_status: Option<bool>,
+    pr_status: bool,
     /// Paint a badge on each worktree row for its branch's upstream state.
     /// Local refs only: nothing fetches, so a branch deleted on the remote
     /// reads as tracked until something prunes locally.
-    upstream_status: Option<bool>,
+    upstream_status: bool,
     /// Re-check on a 1.5 s tick whether each listed worktree's checkout is
     /// still on disk, so a `git worktree remove` typed into one of our own
     /// sessions greys the row without waiting for a manual refresh.  Default
     /// `true`; the probe is one `stat` per listed row, which an exotic
     /// filesystem could make expensive.
-    worktree_liveness: Option<bool>,
+    worktree_liveness: bool,
     /// Max `gh` lookups in flight at once.  Unset lets the pool decide, which
     /// is one below its own background ceiling so a lookup can never take
     /// the last slot local work needs.  A value lowers that; nothing raises
@@ -2637,28 +2780,77 @@ struct RawUi {
     /// Outline drawn around whichever pane holds keyboard focus.
     focus_outline: RawFocusOutline,
     /// Clicking a sidebar moves keyboard focus to it.  Default false.
-    sidebar_click_focus: Option<bool>,
+    sidebar_click_focus: bool,
     /// Put the session on screen one scheduling class above normal — its
     /// shell and every process that shell starts — so a busy machine cannot
     /// starve what the user is typing into.  Follows focus.  Windows only.
     /// Default false.
-    focus_priority_boost: Option<bool>,
+    focus_priority_boost: bool,
     /// Open a session's PTY on a worker rather than in the frame that asked
     /// for it, so spawning does not stutter.  Default false.
-    async_session_spawn: Option<bool>,
+    async_session_spawn: bool,
     /// End everything a session started when that session closes, at any
     /// depth, except processes that ask to break away.  Windows only.
     /// Default false.
-    reap_descendants_on_close: Option<bool>,
+    reap_descendants_on_close: bool,
     /// Wait for the display's refresh before showing a finished frame.
     /// Default true.
-    vsync: Option<bool>,
+    vsync: bool,
     /// How paths are abbreviated where the UI writes them.
     path_style: RawPathStyle,
     /// What a file dragged onto the window does.  Default: every target on.
     drop: RawUiDrop,
     /// What the clipboard's non-text contents paste as.
     paste: RawUiPaste,
+}
+
+impl Default for RawUi {
+    fn default() -> Self {
+        Self {
+            sidebar_background: None,
+            sidebar_foreground: None,
+            sidebar_border: None,
+            sidebar_accent: None,
+            sidebar_attention: None,
+            notifications: true,
+            attention_grace_ms: 0,
+            confirm_session_close: None,
+            confirm_session_detach: true,
+            last_session_close: None,
+            sidebar_focus: None,
+            sidebar_follow_active: false,
+            sidebar_scroll_align: None,
+            search_scope: None,
+            sidebar_tooltips: None,
+            icon_tooltips: true,
+            session_display: RawSessionDisplay::default(),
+            session_reorder: RawSessionReorder::default(),
+            delta_path: None,
+            icons: RawIcons::default(),
+            scrollbar: None,
+            gpu_grid: false,
+            decorations: RawDecorations::default(),
+            pr_status: false,
+            upstream_status: false,
+            worktree_liveness: true,
+            pr_status_concurrency: None,
+            font: RawUiFont::default(),
+            worktree_name: None,
+            project_name: None,
+            wsl: RawUiWsl::default(),
+            profiles: Vec::new(),
+            default_profile: None,
+            focus_outline: RawFocusOutline::default(),
+            sidebar_click_focus: false,
+            focus_priority_boost: false,
+            async_session_spawn: false,
+            reap_descendants_on_close: false,
+            vsync: true,
+            path_style: RawPathStyle::default(),
+            drop: RawUiDrop::default(),
+            paste: RawUiPaste::default(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -2687,9 +2879,9 @@ struct RawTextEmphasis {
     /// Text color.  Unset inherits the row's foreground.
     color: Option<RgbStr>,
     /// Draw bold.
-    bold: Option<bool>,
+    bold: bool,
     /// Draw italic.
-    italic: Option<bool>,
+    italic: bool,
 }
 
 /// One `[[ui.profiles]]` entry.  Fields are optional so a malformed entry
@@ -2847,28 +3039,28 @@ impl RawConfig {
             sidebar_border: self.ui.sidebar_border.map(|v| rgb_to_color32(v.0)),
             sidebar_accent: self.ui.sidebar_accent.map(|v| rgb_to_color32(v.0)),
             sidebar_attention: self.ui.sidebar_attention.map(|v| rgb_to_color32(v.0)),
-            notifications: self.ui.notifications.unwrap_or(true),
-            attention_grace: Duration::from_millis(self.ui.attention_grace_ms.unwrap_or(0)),
+            notifications: self.ui.notifications,
+            attention_grace: Duration::from_millis(self.ui.attention_grace_ms),
             confirm_session_close: parse_confirm_session_close(
                 self.ui.confirm_session_close.as_deref(),
             ),
-            confirm_session_detach: self.ui.confirm_session_detach.unwrap_or(true),
+            confirm_session_detach: self.ui.confirm_session_detach,
             last_session_close: parse_last_session_close(self.ui.last_session_close.as_deref()),
             sidebar_focus: parse_sidebar_focus(self.ui.sidebar_focus.as_deref()),
-            sidebar_follow_active: self.ui.sidebar_follow_active.unwrap_or(false),
+            sidebar_follow_active: self.ui.sidebar_follow_active,
             sidebar_scroll_align: parse_scroll_align(self.ui.sidebar_scroll_align.as_deref()),
             search_scope: parse_search_scope(self.ui.search_scope.as_deref()),
             sidebar_tooltips: parse_sidebar_tooltips(self.ui.sidebar_tooltips.as_deref()),
-            icon_tooltips: self.ui.icon_tooltips.unwrap_or(true),
+            icon_tooltips: self.ui.icon_tooltips,
             session_display: SessionDisplay {
-                sidebar_always: self.ui.session_display.sidebar_always.unwrap_or(false),
-                tabs_always: self.ui.session_display.tabs_always.unwrap_or(false),
+                sidebar_always: self.ui.session_display.sidebar_always,
+                tabs_always: self.ui.session_display.tabs_always,
             },
             session_reorder: SessionReorder {
-                drag: self.ui.session_reorder.drag.unwrap_or(false),
+                drag: self.ui.session_reorder.drag,
                 scope: parse_reorder_scope(self.ui.session_reorder.scope.as_deref()),
             },
-            gpu_grid: self.ui.gpu_grid.unwrap_or(false),
+            gpu_grid: self.ui.gpu_grid,
             decorations: Decorations {
                 underline_position: parse_adjust(
                     "underline_position",
@@ -2887,23 +3079,23 @@ impl RawConfig {
                     self.ui.decorations.strikeout_thickness.as_deref(),
                 ),
             },
-            pr_status: self.ui.pr_status.unwrap_or(false),
-            upstream_status: self.ui.upstream_status.unwrap_or(false),
-            worktree_liveness: self.ui.worktree_liveness.unwrap_or(true),
+            pr_status: self.ui.pr_status,
+            upstream_status: self.ui.upstream_status,
+            worktree_liveness: self.ui.worktree_liveness,
             pr_status_concurrency: self.ui.pr_status_concurrency,
             icons: build_icons(self.ui.icons),
             focus_outline: FocusOutline {
-                sidebar: self.ui.focus_outline.sidebar.unwrap_or(false),
-                terminal: self.ui.focus_outline.terminal.unwrap_or(false),
+                sidebar: self.ui.focus_outline.sidebar,
+                terminal: self.ui.focus_outline.terminal,
                 color: self.ui.focus_outline.color.map(|v| rgb_to_color32(v.0)),
-                thickness: self.ui.focus_outline.thickness.map_or(1.0, |t| t.max(0.5)),
+                thickness: self.ui.focus_outline.thickness.max(0.5),
             },
             scrollbar: parse_scrollbar(self.ui.scrollbar.as_deref()),
-            sidebar_click_focus: self.ui.sidebar_click_focus.unwrap_or(false),
-            focus_priority_boost: self.ui.focus_priority_boost.unwrap_or(false),
-            async_session_spawn: self.ui.async_session_spawn.unwrap_or(false),
-            reap_descendants_on_close: self.ui.reap_descendants_on_close.unwrap_or(false),
-            vsync: self.ui.vsync.unwrap_or(true),
+            sidebar_click_focus: self.ui.sidebar_click_focus,
+            focus_priority_boost: self.ui.focus_priority_boost,
+            async_session_spawn: self.ui.async_session_spawn,
+            reap_descendants_on_close: self.ui.reap_descendants_on_close,
+            vsync: self.ui.vsync,
             worktree_name: self.ui.worktree_name.clone().filter(|t| !t.trim().is_empty()),
             project_name: self.ui.project_name.clone().filter(|t| !t.trim().is_empty()),
             path_style: PathStyleConfig {
@@ -2914,66 +3106,31 @@ impl RawConfig {
                 parent: text_emphasis(&self.ui.path_style.parent),
             },
             drop: DropConfig {
-                enabled: self.ui.drop.enabled.unwrap_or(true),
-                terminal: self.ui.drop.terminal.unwrap_or(true),
-                sidebar: self.ui.drop.sidebar.unwrap_or(true),
-                scratchpad: self.ui.drop.scratchpad.unwrap_or(true),
+                enabled: self.ui.drop.enabled,
+                terminal: self.ui.drop.terminal,
+                sidebar: self.ui.drop.sidebar,
+                scratchpad: self.ui.drop.scratchpad,
                 spelling: PathSpelling {
                     quote: parse_quoting(self.ui.drop.quote.as_deref()),
-                    wsl_translate: self.ui.drop.wsl_translate.unwrap_or(true),
+                    wsl_translate: self.ui.drop.wsl_translate,
                 },
-                highlight: self.ui.drop.highlight.unwrap_or(true),
+                highlight: self.ui.drop.highlight,
             },
             paste: PasteConfig {
-                files: self.ui.paste.files.unwrap_or(true),
-                image: self.ui.paste.image.unwrap_or(true),
+                files: self.ui.paste.files,
+                image: self.ui.paste.image,
                 image_dir: self
                     .ui
                     .paste
                     .image_dir
                     .as_deref()
                     .and_then(|raw| parse_config_path(raw, "ui.paste.image_dir")),
-                image_keep: self.ui.paste.image_keep.unwrap_or(20).max(1),
+                image_keep: self.ui.paste.image_keep.max(1),
             },
         };
 
         // ---- Font ----
-        let mut font = config.font.clone();
-        if let Some(s) = self.font.size {
-            font.size = s.max(1.0);
-        }
-        font.normal = FontFace {
-            family: self.font.normal.family.clone(),
-            style: self.font.normal.style.clone(),
-        };
-        font.bold =
-            FontFace { family: self.font.bold.family.clone(), style: self.font.bold.style.clone() };
-        font.italic = FontFace {
-            family: self.font.italic.family.clone(),
-            style: self.font.italic.style.clone(),
-        };
-        font.bold_italic = FontFace {
-            family: self.font.bold_italic.family.clone(),
-            style: self.font.bold_italic.style.clone(),
-        };
-        font.offset = FontDelta {
-            x: self.font.offset.x.unwrap_or(font.offset.x),
-            y: self.font.offset.y.unwrap_or(font.offset.y),
-        };
-        font.glyph_offset = FontDelta {
-            x: self.font.glyph_offset.x.unwrap_or(font.glyph_offset.x),
-            y: self.font.glyph_offset.y.unwrap_or(font.glyph_offset.y),
-        };
-        if let Some(b) = self.font.builtin_box_drawing {
-            font.builtin_box_drawing = b;
-        }
-        font.fallback = self.font.fallback.clone().unwrap_or_default();
-        if let Some(c) = self.font.color_glyphs {
-            font.color_glyphs = c;
-        }
-        if let Some(mb) = self.font.color_glyph_cache_mb {
-            font.color_glyph_cache_mb = mb;
-        }
+        let font = self.font.resolve();
 
         // ---- Cursor ----
         let mut cursor = config.cursor;
@@ -2985,36 +3142,13 @@ impl RawConfig {
         }
 
         // ---- Scrolling ----
-        let mut scrolling = config.scrolling;
-        if let Some(h) = self.scrolling.history {
-            scrolling.history = h as usize;
-        }
-        if let Some(m) = self.scrolling.multiplier {
-            scrolling.multiplier = m;
-        }
+        let scrolling = self.scrolling.resolve();
 
-        // ---- Window padding ----
-        let mut window = config.window;
-        if let Some(p) = self.window.padding {
-            if let Some(x) = p.x {
-                window.padding_x = x;
-            }
-            if let Some(y) = p.y {
-                window.padding_y = y;
-            }
-        }
-        if let Some(o) = self.window.opacity {
-            window.opacity = o.clamp(0.0, 1.0);
-        }
+        // ---- Window ----
+        let window = self.window.resolve();
 
         // ---- Selection ----
-        let mut selection = config.selection.clone();
-        if let Some(s) = self.selection.semantic_escape_chars {
-            selection.semantic_escape_chars = s;
-        }
-        if let Some(v) = self.selection.save_to_clipboard {
-            selection.save_to_clipboard = v;
-        }
+        let selection = self.selection.resolve();
 
         // ---- Shell ----
         let shell = self.terminal.shell.map(|s| match s {
@@ -3053,7 +3187,7 @@ impl RawConfig {
             .map(|r| r.trim_end_matches('/').to_string())
             .filter(|r| r.starts_with('/') && r.len() > 1)
             .unwrap_or_else(|| "/mnt".to_string());
-        let wsl_resident_helper = self.wsl.resident_helper.unwrap_or(true);
+        let wsl_resident_helper = self.wsl.resident_helper;
 
         // ---- UI Font ----
         let ui_font = UiFont {
@@ -3067,7 +3201,7 @@ impl RawConfig {
                 .bold_italic_family
                 .clone()
                 .filter(|f| !f.trim().is_empty()),
-            builtin_symbols: self.ui.font.builtin_symbols.unwrap_or(true),
+            builtin_symbols: self.ui.font.builtin_symbols,
         };
 
         // ---- Profiles ----
@@ -3093,12 +3227,12 @@ impl RawConfig {
             shell,
             selection,
             bindings,
-            ipc_socket: self.general.ipc_socket.unwrap_or(true),
+            ipc_socket: self.general.ipc_socket,
             debug: DebugConfig {
-                crash_log: self.debug.crash_log.unwrap_or(true),
-                persistent_logging: self.debug.persistent_logging.unwrap_or(false),
-                gpu_timing: self.debug.gpu_timing.unwrap_or(false),
-                frame_log: self.debug.frame_log.unwrap_or(false),
+                crash_log: self.debug.crash_log,
+                persistent_logging: self.debug.persistent_logging,
+                gpu_timing: self.debug.gpu_timing,
+                frame_log: self.debug.frame_log,
                 log_dir: self
                     .debug
                     .log_dir
