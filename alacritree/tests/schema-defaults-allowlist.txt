@@ -53,10 +53,8 @@ RawInverted.cursor
 RawInverted.foreground
 RawInverted.text
 RawKeyboard.bindings
-RawPrimary.background
 RawPrimary.bright_foreground
 RawPrimary.dim_foreground
-RawPrimary.foreground
 RawProfile.name
 RawProfile.program
 RawSet.black

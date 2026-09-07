@@ -2214,19 +2214,31 @@ struct RawColors {
     draw_bold_text_with_bright_colors: bool,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawPrimary {
     /// Default text color.
-    foreground: Option<RgbStr>,
+    foreground: RgbStr,
     /// Default background color.
-    background: Option<RgbStr>,
+    background: RgbStr,
     /// Foreground for bold text, used only when
     /// `draw_bold_text_with_bright_colors` is `true`.  Unset uses
     /// `foreground`.
     bright_foreground: Option<RgbStr>,
     /// Foreground for dimmed text.  Unset derives it from `foreground`.
     dim_foreground: Option<RgbStr>,
+}
+
+impl Default for RawPrimary {
+    fn default() -> Self {
+        let stock = Palette::default();
+        Self {
+            foreground: RgbStr(stock.fg),
+            background: RgbStr(stock.bg),
+            bright_foreground: None,
+            dim_foreground: None,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -3013,12 +3025,8 @@ impl RawConfig {
         let mut palette = config.palette;
         let c = self.colors;
 
-        if let Some(v) = c.primary.foreground {
-            palette.fg = v.0;
-        }
-        if let Some(v) = c.primary.background {
-            palette.bg = v.0;
-        }
+        palette.fg = c.primary.foreground.0;
+        palette.bg = c.primary.background.0;
         palette.bright_fg = c.primary.bright_foreground.map(|v| v.0);
         palette.dim_fg = c.primary.dim_foreground.map(|v| v.0);
 
@@ -3572,6 +3580,13 @@ mod tests {
     #[test]
     fn the_herdr_defaults_live_in_the_raw_layer() {
         assert_eq!(HerdrConfig::default(), RawHerdr::default().resolve());
+    }
+
+    #[test]
+    fn the_primary_colours_default_to_the_stock_palette() {
+        let raw = RawPrimary::default();
+        assert_eq!(raw.foreground, RgbStr(Palette::default().fg));
+        assert_eq!(raw.background, RgbStr(Palette::default().bg));
     }
     fn ui_from_toml(input: &str) -> UiTheme {
         let value: toml::Value = toml::from_str(input).expect("valid toml");

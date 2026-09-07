@@ -879,11 +879,8 @@
     "RawPrimary": {
       "properties": {
         "background": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Color"
-            }
-          ],
+          "$ref": "#/$defs/Color",
+          "default": "#181818",
           "description": "Default background color."
         },
         "bright_foreground": {
@@ -903,11 +900,8 @@
           "description": "Foreground for dimmed text.  Unset derives it from `foreground`."
         },
         "foreground": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Color"
-            }
-          ],
+          "$ref": "#/$defs/Color",
+          "default": "#d8d8d8",
           "description": "Default text color."
         }
       },
