@@ -4713,4 +4713,44 @@ program = "second"
         let back: RgbStr = serde_json::from_value(json).unwrap();
         assert_eq!(original, back);
     }
+
+    /// What an install with no config file resolves to.  Every literal this plan
+    /// moves out of an `unwrap_or` and into a `Default` has to land on the same
+    /// value it had before, and a moved literal is invisible to every other test
+    /// here: the schema would publish the wrong default and agree with itself.
+    ///
+    /// `ALACRITREE_UPDATE_STOCK=1` rewrites the fixture.  Doing that is only ever
+    /// correct when a default genuinely changed on purpose.
+    #[test]
+    fn the_stock_config_is_unchanged() {
+        let path = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/stock-config.json"
+        ));
+        // `default_bindings` adds Cmd chords under `#[cfg(target_os = "macos")]`,
+        // so a fixture holding them fails on a Mac for a reason that has nothing
+        // to do with a default moving.  No binding literal moves in this change.
+        let mut resolved = serde_json::to_value(super::stock_config()).unwrap();
+        resolved.as_object_mut().unwrap().remove("bindings");
+        let now = serde_json::to_string_pretty(&resolved).unwrap() + "\n";
+        let committed = std::fs::read_to_string(&path).unwrap_or_default();
+        if committed == now {
+            return;
+        }
+        if std::env::var("ALACRITREE_UPDATE_STOCK").as_deref() == Ok("1") {
+            std::fs::write(&path, &now).unwrap();
+            return;
+        }
+        let (line, was, is) = committed
+            .lines()
+            .zip(now.lines())
+            .enumerate()
+            .find(|(_, (a, b))| a != b)
+            .map_or((0, "", ""), |(i, (a, b))| (i + 1, a, b));
+        panic!(
+            "a config default moved — regenerate with `devkit run task test --env \
+             ALACRITREE_UPDATE_STOCK=1` only if you meant to change it\n\nfirst difference at \
+             line {line}:\n  was: {was}\n  is:  {is}"
+        );
+    }
 }

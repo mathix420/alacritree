@@ -1,0 +1,460 @@
+{
+  "cursor": {
+    "blinking": false,
+    "shape": "Block",
+    "unfocused_hollow": true
+  },
+  "debug": {
+    "crash_log": true,
+    "frame_log": false,
+    "gpu_timing": false,
+    "log_dir": null,
+    "persistent_logging": false
+  },
+  "default_profile": null,
+  "delta_path": null,
+  "env": {},
+  "font": {
+    "bold": {
+      "family": null,
+      "style": null
+    },
+    "bold_italic": {
+      "family": null,
+      "style": null
+    },
+    "builtin_box_drawing": true,
+    "color_glyph_cache_mb": 10,
+    "color_glyphs": true,
+    "fallback": [],
+    "glyph_offset": {
+      "x": 0,
+      "y": 0
+    },
+    "italic": {
+      "family": null,
+      "style": null
+    },
+    "normal": {
+      "family": null,
+      "style": null
+    },
+    "offset": {
+      "x": 0,
+      "y": 0
+    },
+    "size": 11.25
+  },
+  "integrations": {
+    "herdr": {
+      "attach": "Agent",
+      "enabled": true,
+      "poll_interval": {
+        "nanos": 0,
+        "secs": 2
+      },
+      "show_unmatched": true
+    }
+  },
+  "ipc_socket": true,
+  "palette": {
+    "bg": {
+      "b": 24,
+      "g": 24,
+      "r": 24
+    },
+    "bright": [
+      {
+        "b": 107,
+        "g": 107,
+        "r": 107
+      },
+      {
+        "b": 85,
+        "g": 85,
+        "r": 197
+      },
+      {
+        "b": 116,
+        "g": 196,
+        "r": 170
+      },
+      {
+        "b": 136,
+        "g": 202,
+        "r": 254
+      },
+      {
+        "b": 200,
+        "g": 184,
+        "r": 130
+      },
+      {
+        "b": 184,
+        "g": 140,
+        "r": 194
+      },
+      {
+        "b": 195,
+        "g": 211,
+        "r": 147
+      },
+      {
+        "b": 248,
+        "g": 248,
+        "r": 248
+      }
+    ],
+    "bright_fg": null,
+    "cursor_bg": null,
+    "cursor_fg": null,
+    "dim": null,
+    "dim_fg": null,
+    "draw_bold_with_bright": false,
+    "fg": {
+      "b": 216,
+      "g": 216,
+      "r": 216
+    },
+    "indexed": [],
+    "normal": [
+      {
+        "b": 24,
+        "g": 24,
+        "r": 24
+      },
+      {
+        "b": 66,
+        "g": 66,
+        "r": 172
+      },
+      {
+        "b": 89,
+        "g": 169,
+        "r": 144
+      },
+      {
+        "b": 117,
+        "g": 191,
+        "r": 244
+      },
+      {
+        "b": 181,
+        "g": 159,
+        "r": 106
+      },
+      {
+        "b": 159,
+        "g": 117,
+        "r": 170
+      },
+      {
+        "b": 170,
+        "g": 181,
+        "r": 117
+      },
+      {
+        "b": 216,
+        "g": 216,
+        "r": 216
+      }
+    ],
+    "selection_bg": null,
+    "selection_fg": null
+  },
+  "profiles": [],
+  "scrolling": {
+    "history": 10000,
+    "multiplier": 3
+  },
+  "selection": {
+    "save_to_clipboard": false,
+    "semantic_escape_chars": ",│`|:\"' ()[]{}<>\t"
+  },
+  "shell": null,
+  "state_dir": null,
+  "ui": {
+    "async_session_spawn": false,
+    "attention_grace": {
+      "nanos": 0,
+      "secs": 0
+    },
+    "confirm_session_close": "Never",
+    "confirm_session_detach": true,
+    "decorations": {
+      "strikeout_position": {
+        "Pixels": 0.0
+      },
+      "strikeout_thickness": {
+        "Pixels": 0.0
+      },
+      "underline_position": {
+        "Pixels": 0.0
+      },
+      "underline_thickness": {
+        "Pixels": 0.0
+      }
+    },
+    "drop": {
+      "enabled": true,
+      "highlight": true,
+      "scratchpad": true,
+      "sidebar": true,
+      "spelling": {
+        "quote": "Auto",
+        "wsl_translate": true
+      },
+      "terminal": true
+    },
+    "focus_outline": {
+      "color": null,
+      "sidebar": false,
+      "terminal": false,
+      "thickness": 1.0
+    },
+    "focus_priority_boost": false,
+    "gpu_grid": false,
+    "icon_tooltips": true,
+    "icons": {
+      "add_project": {
+        "bold": false,
+        "color": null,
+        "glyph": "+",
+        "italic": false,
+        "size": null
+      },
+      "close_session": {
+        "bold": false,
+        "color": null,
+        "glyph": "×",
+        "italic": false,
+        "size": null
+      },
+      "delete_worktree": {
+        "bold": false,
+        "color": null,
+        "glyph": "×",
+        "italic": false,
+        "size": null
+      },
+      "herdr": {
+        "bold": false,
+        "color": null,
+        "glyph": "◫",
+        "italic": false,
+        "size": null
+      },
+      "home": {
+        "bold": false,
+        "color": null,
+        "glyph": "⌂",
+        "italic": false,
+        "size": null
+      },
+      "new_session": {
+        "bold": false,
+        "color": null,
+        "glyph": "+",
+        "italic": false,
+        "size": null
+      },
+      "new_worktree": {
+        "bold": false,
+        "color": null,
+        "glyph": "+",
+        "italic": false,
+        "size": null
+      },
+      "pr_closed": {
+        "bold": false,
+        "color": null,
+        "glyph": "⬤",
+        "italic": false,
+        "size": null
+      },
+      "pr_draft": {
+        "bold": false,
+        "color": null,
+        "glyph": "◯",
+        "italic": false,
+        "size": null
+      },
+      "pr_merged": {
+        "bold": false,
+        "color": null,
+        "glyph": "⬤",
+        "italic": false,
+        "size": null
+      },
+      "pr_open": {
+        "bold": false,
+        "color": null,
+        "glyph": "⬤",
+        "italic": false,
+        "size": null
+      },
+      "project_collapsed": {
+        "bold": false,
+        "color": null,
+        "glyph": "▸",
+        "italic": false,
+        "size": null
+      },
+      "project_expanded": {
+        "bold": false,
+        "color": null,
+        "glyph": "▾",
+        "italic": false,
+        "size": null
+      },
+      "refresh": {
+        "bold": false,
+        "color": null,
+        "glyph": "↻",
+        "italic": false,
+        "size": null
+      },
+      "remove_project": {
+        "bold": false,
+        "color": null,
+        "glyph": "×",
+        "italic": false,
+        "size": null
+      },
+      "reorder": {
+        "bold": false,
+        "color": null,
+        "glyph": "⇅",
+        "italic": false,
+        "size": null
+      },
+      "search": {
+        "bold": false,
+        "color": null,
+        "glyph": "⌕",
+        "italic": false,
+        "size": null
+      },
+      "session": {
+        "bold": false,
+        "color": null,
+        "glyph": "▪",
+        "italic": false,
+        "size": null
+      },
+      "upstream_diverged": {
+        "bold": false,
+        "color": null,
+        "glyph": "⇅",
+        "italic": false,
+        "size": null
+      },
+      "upstream_gone": {
+        "bold": false,
+        "color": null,
+        "glyph": "⌫",
+        "italic": false,
+        "size": null
+      },
+      "upstream_level": {
+        "bold": false,
+        "color": null,
+        "glyph": "✓",
+        "italic": false,
+        "size": null
+      },
+      "upstream_untracked": {
+        "bold": false,
+        "color": null,
+        "glyph": "↑",
+        "italic": false,
+        "size": null
+      },
+      "worktree": {
+        "bold": false,
+        "color": null,
+        "glyph": "○",
+        "italic": false,
+        "size": null
+      },
+      "worktree_main": {
+        "bold": false,
+        "color": null,
+        "glyph": "●",
+        "italic": false,
+        "size": null
+      }
+    },
+    "last_session_close": "Respawn",
+    "notifications": true,
+    "paste": {
+      "files": true,
+      "image": true,
+      "image_dir": null,
+      "image_keep": 20
+    },
+    "path_style": {
+      "diff_title": "Full",
+      "filename": {
+        "bold": false,
+        "color": null,
+        "italic": false
+      },
+      "git_header": "Full",
+      "git_rows": "Full",
+      "parent": {
+        "bold": false,
+        "color": null,
+        "italic": false
+      }
+    },
+    "pr_status": false,
+    "pr_status_concurrency": null,
+    "project_name": null,
+    "reap_descendants_on_close": false,
+    "scrollbar": "Floating",
+    "search_scope": "Filtered",
+    "session_display": {
+      "sidebar_always": false,
+      "tabs_always": false
+    },
+    "session_reorder": {
+      "drag": false,
+      "scope": "Workspace"
+    },
+    "sidebar_accent": null,
+    "sidebar_attention": null,
+    "sidebar_background": null,
+    "sidebar_border": null,
+    "sidebar_click_focus": false,
+    "sidebar_focus": "Preserve",
+    "sidebar_follow_active": false,
+    "sidebar_foreground": null,
+    "sidebar_scroll_align": "Minimal",
+    "sidebar_tooltips": "Elided",
+    "upstream_status": false,
+    "vsync": true,
+    "worktree_liveness": true,
+    "worktree_name": null
+  },
+  "ui_font": {
+    "bold_family": null,
+    "bold_italic_family": null,
+    "builtin_symbols": true,
+    "family": null,
+    "italic_family": null,
+    "size": null
+  },
+  "window": {
+    "opacity": 1.0,
+    "padding_x": 0.0,
+    "padding_y": 0.0
+  },
+  "working_directory": null,
+  "workspace": {
+    "overrides": [],
+    "worktree_dir": null
+  },
+  "wsl_automount_root": "/mnt",
+  "wsl_resident_helper": true
+}
