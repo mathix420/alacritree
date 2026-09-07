@@ -68,6 +68,7 @@ pub struct Config {
     pub profiles: Vec<Profile>,
     /// Validated at load: always names an entry in `profiles` when `Some`.
     pub default_profile: Option<String>,
+    pub integrations: IntegrationsConfig,
 }
 
 /// Environment values never serialise.  Enforced on the field rather than by
@@ -546,9 +547,40 @@ impl PasteConfig {
     }
 }
 
-/// `[ui.herdr]`: whether alacritree lists agents running under a herdr server
-/// in the sidebar. On by default; a probe with no herdr binary or server
-/// present costs nothing, so an unmodified config pays no price for it.
+/// `[integrations]`: how alacritree talks to the other tools it can see.  How
+/// what those tools contribute is *drawn* stays under `[ui]` — a herdr row's
+/// glyph is `ui.icons.herdr`, not a setting here.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct IntegrationsConfig {
+    pub herdr: HerdrConfig,
+}
+
+/// What opening a herdr agent row attaches to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub enum AttachMode {
+    /// The agent's own pane.
+    #[default]
+    Agent,
+    /// The herdr session that pane belongs to, with the pane focused.
+    Session,
+}
+
+fn parse_attach_mode(raw: Option<&str>) -> AttachMode {
+    match raw {
+        None => AttachMode::default(),
+        Some("agent") => AttachMode::Agent,
+        Some("session") => AttachMode::Session,
+        Some(other) => {
+            log::warn!("unknown integrations.herdr.attach value {other:?}, using \"agent\"");
+            AttachMode::default()
+        },
+    }
+}
+
+/// `[integrations.herdr]`: whether alacritree lists agents running under a
+/// herdr server in the sidebar, and what opening one attaches to.  On by
+/// default; a probe with no herdr binary or server present costs nothing, so
+/// an unmodified config pays no price for it.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HerdrConfig {
     /// Discover herdr servers and list their agents in the sidebar.
@@ -557,11 +589,19 @@ pub struct HerdrConfig {
     pub poll_interval: Duration,
     /// List agents whose working directory matches no worktree, under Home.
     pub show_unmatched: bool,
+    /// What a row opens.  Honoured per side; the native side of a Windows
+    /// host attaches to the session whatever this says.
+    pub attach: AttachMode,
 }
 
 impl Default for HerdrConfig {
     fn default() -> Self {
-        Self { enabled: true, poll_interval: Duration::from_millis(2000), show_unmatched: true }
+        Self {
+            enabled: true,
+            poll_interval: Duration::from_millis(2000),
+            show_unmatched: true,
+            attach: AttachMode::default(),
+        }
     }
 }
 
@@ -1327,9 +1367,6 @@ pub struct UiTheme {
     pub drop: DropConfig,
     /// `[ui.paste]`: what Paste does with a clipboard that holds no text.
     pub paste: PasteConfig,
-    /// `[ui.herdr]`: whether agents running under a herdr server appear in
-    /// the sidebar, and how often their state is re-polled.
-    pub herdr: HerdrConfig,
 }
 
 impl Default for UiTheme {
@@ -1372,7 +1409,6 @@ impl Default for UiTheme {
             path_style: PathStyleConfig::default(),
             drop: DropConfig::default(),
             paste: PasteConfig::default(),
-            herdr: HerdrConfig::default(),
         }
     }
 }
@@ -1438,6 +1474,7 @@ impl Default for Config {
             delta_path: None,
             profiles: Vec::new(),
             default_profile: None,
+            integrations: IntegrationsConfig::default(),
         }
     }
 }
@@ -1817,6 +1854,9 @@ struct RawConfig {
     debug: RawDebug,
     /// How alacritree talks to WSL distros.  `alacritree.toml` only.
     wsl: RawWsl,
+    /// The other tools alacritree can notice and cooperate with.
+    /// `alacritree.toml` only.
+    integrations: RawIntegrations,
 }
 
 /// Subset of alacritty's `[general]` section that alacritree honors.  It
@@ -2435,6 +2475,13 @@ struct RawUiPaste {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
+struct RawIntegrations {
+    /// Agents running under a herdr server.
+    herdr: RawHerdr,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default)]
 struct RawHerdr {
     /// Discover herdr servers and list their agents in the sidebar.  Inert
     /// when no herdr binary or server is present.
@@ -2443,6 +2490,18 @@ struct RawHerdr {
     poll_interval_ms: Option<u64>,
     /// List agents whose working directory matches no worktree, under Home.
     show_unmatched: Option<bool>,
+    /// Whether opening a row attaches to that agent's pane directly
+    /// ("agent", default) or to the herdr session around it with the pane
+    /// focused ("session").
+    ///
+    /// "session" hands the mouse to herdr's own client, where a selection
+    /// joins soft-wrapped rows and copy mode works; a direct attach is
+    /// repainted row by row, so the host terminal sees every wrap as a line
+    /// break.  Honoured per side: the native side of a Windows host always
+    /// attaches to the session, because herdr implements no direct attach
+    /// there.
+    #[schemars(extend("enum" = ["agent", "session"]))]
+    attach: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -2584,8 +2643,6 @@ struct RawUi {
     drop: RawUiDrop,
     /// What the clipboard's non-text contents paste as.
     paste: RawUiPaste,
-    /// Whether agents running under a herdr server appear in the sidebar.
-    herdr: RawHerdr,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -2852,13 +2909,6 @@ impl RawConfig {
                     .and_then(|raw| parse_config_path(raw, "ui.paste.image_dir")),
                 image_keep: self.ui.paste.image_keep.unwrap_or(20).max(1),
             },
-            herdr: HerdrConfig {
-                enabled: self.ui.herdr.enabled.unwrap_or(true),
-                poll_interval: Duration::from_millis(
-                    self.ui.herdr.poll_interval_ms.unwrap_or(2000),
-                ),
-                show_unmatched: self.ui.herdr.show_unmatched.unwrap_or(true),
-            },
         };
 
         // ---- Font ----
@@ -3044,6 +3094,16 @@ impl RawConfig {
             delta_path: self.ui.delta_path.filter(|s| !s.trim().is_empty()),
             profiles,
             default_profile,
+            integrations: IntegrationsConfig {
+                herdr: HerdrConfig {
+                    enabled: self.integrations.herdr.enabled.unwrap_or(true),
+                    poll_interval: Duration::from_millis(
+                        self.integrations.herdr.poll_interval_ms.unwrap_or(2000),
+                    ),
+                    show_unmatched: self.integrations.herdr.show_unmatched.unwrap_or(true),
+                    attach: parse_attach_mode(self.integrations.herdr.attach.as_deref()),
+                },
+            },
         }
     }
 }
@@ -3314,17 +3374,27 @@ mod tests {
     #[test]
     fn herdr_defaults_to_enabled_with_a_two_second_poll() {
         let config = Config::default();
-        assert!(config.ui.herdr.enabled);
-        assert_eq!(config.ui.herdr.poll_interval, Duration::from_millis(2000));
-        assert!(config.ui.herdr.show_unmatched);
+        assert!(config.integrations.herdr.enabled);
+        assert_eq!(config.integrations.herdr.poll_interval, Duration::from_millis(2000));
+        assert!(config.integrations.herdr.show_unmatched);
+        assert_eq!(config.integrations.herdr.attach, AttachMode::Agent);
     }
 
     #[test]
     fn herdr_can_be_turned_off() {
-        let toml = "[ui.herdr]\nenabled = false\npoll_interval_ms = 5000\n";
+        let toml = "[integrations.herdr]\nenabled = false\npoll_interval_ms = 5000\n";
         let config = config_from(toml);
-        assert!(!config.ui.herdr.enabled);
-        assert_eq!(config.ui.herdr.poll_interval, Duration::from_millis(5000));
+        assert!(!config.integrations.herdr.enabled);
+        assert_eq!(config.integrations.herdr.poll_interval, Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn herdr_attach_mode_parses_and_falls_back_to_agent() {
+        let session = config_from("[integrations.herdr]\nattach = \"session\"\n");
+        assert_eq!(session.integrations.herdr.attach, AttachMode::Session);
+
+        let nonsense = config_from("[integrations.herdr]\nattach = \"pane\"\n");
+        assert_eq!(nonsense.integrations.herdr.attach, AttachMode::Agent);
     }
     fn ui_from_toml(input: &str) -> UiTheme {
         let value: toml::Value = toml::from_str(input).expect("valid toml");

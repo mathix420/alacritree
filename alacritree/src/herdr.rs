@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use crate::config::AttachMode;
 use crate::{command_ext, jobs, wsl};
 use serde::Deserialize;
 
@@ -196,6 +197,14 @@ pub fn can_attach(side: &Side) -> bool {
         Side::Native => !cfg!(windows),
         Side::Wsl(_) => true,
     }
+}
+
+/// Whether a row on `side` opens the agent's own pane.  Capability and
+/// preference are separate questions and only disagree in one direction: a
+/// user who asks for a direct attach on a side that has none gets the
+/// session, and no user can be given a direct attach they did not ask for.
+pub fn attaches_directly(side: &Side, mode: AttachMode) -> bool {
+    mode == AttachMode::Agent && can_attach(side)
 }
 
 /// How long the attach gesture waits for herdr before calling it a refusal.
@@ -1229,6 +1238,17 @@ status_indicators = \"symbols\"
     #[test]
     fn wsl_can_always_attach() {
         assert!(can_attach(&Side::Wsl("d".into())));
+    }
+
+    /// The preference can only ever give up a direct attach, never conjure
+    /// one on a side that has none.
+    #[test]
+    fn asking_for_the_session_gives_up_a_direct_attach() {
+        let wsl = Side::Wsl("d".into());
+        assert!(attaches_directly(&wsl, AttachMode::Agent));
+        assert!(!attaches_directly(&wsl, AttachMode::Session));
+        assert!(!attaches_directly(&Side::Native, AttachMode::Session));
+        assert_eq!(attaches_directly(&Side::Native, AttachMode::Agent), !cfg!(windows));
     }
 
     #[test]

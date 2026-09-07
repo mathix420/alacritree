@@ -451,6 +451,14 @@
     },
     "RawHerdr": {
       "properties": {
+        "attach": {
+          "description": "Whether opening a row attaches to that agent's pane directly\n(\"agent\", default) or to the herdr session around it with the pane\nfocused (\"session\").\n\n\"session\" hands the mouse to herdr's own client, where a selection\njoins soft-wrapped rows and copy mode works; a direct attach is\nrepainted row by row, so the host terminal sees every wrap as a line\nbreak.  Honoured per side: the native side of a Windows host always\nattaches to the session, because herdr implements no direct attach\nthere.",
+          "enum": [
+            "agent",
+            "session"
+          ],
+          "type": "string"
+        },
         "enabled": {
           "description": "Discover herdr servers and list their agents in the sidebar.  Inert\nwhen no herdr binary or server is present.",
           "type": "boolean"
@@ -726,6 +734,15 @@
         "index",
         "color"
       ],
+      "type": "object"
+    },
+    "RawIntegrations": {
+      "properties": {
+        "herdr": {
+          "$ref": "#/$defs/RawHerdr",
+          "description": "Agents running under a herdr server."
+        }
+      },
       "type": "object"
     },
     "RawInverted": {
@@ -1142,10 +1159,6 @@
           "description": "Draw the terminal grid through an OpenGL paint callback instead of\nhanding epaint a mesh.  Default `false`: it needs a GL 3 context and\nbypasses the renderer every other panel goes through, so an\nunmodified config keeps the path that has always drawn the grid.  A\ncontext too old for instanced arrays logs once and paints the mesh\nfrom the next frame on.",
           "type": "boolean"
         },
-        "herdr": {
-          "$ref": "#/$defs/RawHerdr",
-          "description": "Whether agents running under a herdr server appear in the sidebar."
-        },
         "icon_tooltips": {
           "description": "Whether a sidebar icon explains itself on hover: `true` (default).",
           "type": "boolean"
@@ -1521,6 +1534,10 @@
     "general": {
       "$ref": "#/$defs/RawGeneral",
       "description": "Options that fit no other table."
+    },
+    "integrations": {
+      "$ref": "#/$defs/RawIntegrations",
+      "description": "The other tools alacritree can notice and cooperate with.\n`alacritree.toml` only."
     },
     "keyboard": {
       "$ref": "#/$defs/RawKeyboard",
