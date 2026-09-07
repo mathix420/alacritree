@@ -312,46 +312,89 @@ pub fn seed(
     SidebarRow::Home
 }
 
-/// The three predicates that decide whether a row survives an active filter.
-/// `worktree` is `FnMut` because the fuzzy matcher it wraps needs `&mut self`.
+/// What decides whether a row survives an active filter.  The gate (toggle
+/// and PR dimensions) is separate from the name test because a child match
+/// surfaces a workspace through the gate and never around it.  `name` and
+/// `child` are `FnMut` because the fuzzy matcher they wrap needs `&mut self`.
 pub struct RowPredicates<'a> {
-    pub home: bool,
+    pub home_gate: bool,
+    pub home_name: bool,
     pub project_self: &'a dyn Fn(&Project) -> bool,
-    pub worktree: &'a mut dyn FnMut(&Project, &Worktree) -> bool,
+    pub gate: &'a dyn Fn(&WorkspaceKey) -> bool,
+    pub name: &'a mut dyn FnMut(&Project, &Worktree) -> bool,
+    /// `None` while the query is empty, which is what keeps a bare toggle
+    /// from surfacing every workspace that holds any child at all.
+    pub child: Option<&'a mut dyn FnMut(&WorkspaceKey, &WorkspaceEntry) -> bool>,
 }
 
 /// Render-order rows under an active filter. Projects are force-expanded (a
 /// filter that hides its own results is useless); a header survives when it
-/// matches itself or keeps at least one visible worktree.  Surviving
-/// workspace rows keep their listed session rows — the filter matches
-/// workspaces, not sessions.
+/// matches itself or keeps at least one visible worktree.  A workspace that
+/// matched by name keeps all its children; one surfaced only because a child
+/// matched keeps just the matching ones.
 pub fn filtered_rows(
     projects: &[Project],
     listed: &ListedRows,
-    preds: RowPredicates<'_>,
+    mut preds: RowPredicates<'_>,
 ) -> Vec<SidebarRow> {
-    // Only session rows survive: a `HerdrAgent` row is keyed by `(Side,
-    // String)` and carries no display name, so the filter has nothing to
-    // match it on and a painted one would have no cursor path to reach it.
-    fn push_session_rows(rows: &mut Vec<SidebarRow>, listed: &ListedRows, ws: &WorkspaceKey) {
-        if let Some(entries) = listed.get(ws) {
-            rows.extend(
-                entries.iter().filter_map(WorkspaceEntry::session).map(SidebarRow::Session),
+    /// The rows a surviving workspace contributes, and whether any child
+    /// matched.  A name match takes every child; otherwise only the matches
+    /// survive, so searching for a child does not hand back its siblings.
+    fn children(
+        preds: &mut RowPredicates<'_>,
+        listed: &ListedRows,
+        ws: &WorkspaceKey,
+        name_matched: bool,
+    ) -> (Vec<SidebarRow>, bool) {
+        let Some(entries) = listed.get(ws) else {
+            return (Vec::new(), false);
+        };
+        let Some(child) = preds.child.as_mut() else {
+            return (
+                if name_matched {
+                    entries.iter().map(WorkspaceEntry::row).collect()
+                } else {
+                    Vec::new()
+                },
+                false,
             );
+        };
+        // `filter` hands the closure `&&WorkspaceEntry`, so the pattern
+        // destructures one layer off before the predicate sees it.
+        let matching: Vec<SidebarRow> =
+            entries.iter().filter(|&e| child(ws, e)).map(WorkspaceEntry::row).collect();
+        let any = !matching.is_empty();
+        if name_matched {
+            (entries.iter().map(WorkspaceEntry::row).collect(), any)
+        } else {
+            (matching, any)
         }
     }
 
     let mut rows = Vec::new();
-    if preds.home {
+    // Read before the `&mut preds` borrow: an argument list evaluates left to
+    // right, so a field read after it would be a use of a borrowed value.
+    let (home_gate, home_name) = (preds.home_gate, preds.home_name);
+    let (home_children, home_child_matched) = children(&mut preds, listed, &None, home_name);
+    if home_gate && (home_name || home_child_matched) {
         rows.push(SidebarRow::Home);
-        push_session_rows(&mut rows, listed, &None);
+        rows.extend(home_children);
     }
     for p in projects {
         let self_matches = (preds.project_self)(p);
         let mut visible_worktrees: Vec<SidebarRow> = Vec::new();
-        for wt in p.worktrees.iter().filter(|wt| (preds.worktree)(p, wt)) {
+        for wt in &p.worktrees {
+            let ws = Some(wt.path.clone());
+            if !(preds.gate)(&ws) {
+                continue;
+            }
+            let name_matched = (preds.name)(p, wt);
+            let (child_rows, child_matched) = children(&mut preds, listed, &ws, name_matched);
+            if !name_matched && !child_matched {
+                continue;
+            }
             visible_worktrees.push(SidebarRow::Worktree(wt.path.clone()));
-            push_session_rows(&mut visible_worktrees, listed, &Some(wt.path.clone()));
+            visible_worktrees.extend(child_rows);
         }
         if self_matches || !visible_worktrees.is_empty() {
             rows.push(SidebarRow::Project(p.root.clone()));
@@ -670,9 +713,12 @@ pub(crate) mod tests {
     fn filtered_rows_keeps_projects_with_matching_worktrees_and_forces_expansion() {
         let projects = vec![project("/a", false, &["/a/wt1", "/a/wt2"])];
         let preds = RowPredicates {
-            home: true,
+            home_gate: true,
+            home_name: true,
             project_self: &|_p| false,
-            worktree: &mut |_p, wt| wt.path == PathBuf::from("/a/wt1"),
+            gate: &|_ws| true,
+            name: &mut |_p, wt| wt.path == PathBuf::from("/a/wt1"),
+            child: None,
         };
         assert_eq!(filtered_rows(&projects, &no_sessions(), preds), vec![
             SidebarRow::Home,
@@ -685,9 +731,12 @@ pub(crate) mod tests {
     fn filtered_rows_keeps_a_self_matching_header_without_its_worktrees() {
         let projects = vec![project("/a", true, &["/a/wt1"])];
         let preds = RowPredicates {
-            home: true,
+            home_gate: true,
+            home_name: true,
             project_self: &|p| p.root == PathBuf::from("/a"),
-            worktree: &mut |_p, _wt| false,
+            gate: &|_ws| true,
+            name: &mut |_p, _wt| false,
+            child: None,
         };
         assert_eq!(filtered_rows(&projects, &no_sessions(), preds), vec![
             SidebarRow::Home,
@@ -696,12 +745,34 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn filtered_rows_drops_home_when_it_fails_the_predicate() {
+    fn filtered_rows_drops_home_when_its_name_does_not_match() {
         let projects = vec![project("/a", true, &["/a/wt1"])];
         let preds = RowPredicates {
-            home: false,
+            home_gate: true,
+            home_name: false,
             project_self: &|p| p.root == PathBuf::from("/a"),
-            worktree: &mut |_p, _wt| true,
+            gate: &|_ws| true,
+            name: &mut |_p, _wt| true,
+            child: None,
+        };
+        assert_eq!(filtered_rows(&projects, &no_sessions(), preds), vec![
+            SidebarRow::Project(PathBuf::from("/a")),
+            SidebarRow::Worktree(PathBuf::from("/a/wt1"))
+        ]);
+    }
+
+    /// A toggle narrows the tree whether or not anything matches by name, so
+    /// the gate drops Home on its own.
+    #[test]
+    fn filtered_rows_drops_home_when_it_fails_the_gate() {
+        let projects = vec![project("/a", true, &["/a/wt1"])];
+        let preds = RowPredicates {
+            home_gate: false,
+            home_name: true,
+            project_self: &|p| p.root == PathBuf::from("/a"),
+            gate: &|_ws| true,
+            name: &mut |_p, _wt| true,
+            child: None,
         };
         assert_eq!(filtered_rows(&projects, &no_sessions(), preds), vec![
             SidebarRow::Project(PathBuf::from("/a")),
@@ -713,9 +784,12 @@ pub(crate) mod tests {
     fn filtered_rows_drops_projects_matching_neither_self_nor_worktrees() {
         let projects = vec![project("/a", true, &["/a/wt1"]), project("/b", true, &["/b/wt1"])];
         let preds = RowPredicates {
-            home: true,
+            home_gate: true,
+            home_name: true,
             project_self: &|p| p.root == PathBuf::from("/a"),
-            worktree: &mut |p, _wt| p.root == PathBuf::from("/a"),
+            gate: &|_ws| true,
+            name: &mut |p, _wt| p.root == PathBuf::from("/a"),
+            child: None,
         };
         assert_eq!(filtered_rows(&projects, &no_sessions(), preds), vec![
             SidebarRow::Home,
@@ -830,9 +904,12 @@ pub(crate) mod tests {
             (Some(PathBuf::from("/a/wt2")), vec![9]),
         ]);
         let preds = RowPredicates {
-            home: true,
+            home_gate: true,
+            home_name: true,
             project_self: &|_p| false,
-            worktree: &mut |_p, wt| wt.path == PathBuf::from("/a/wt1"),
+            gate: &|_ws| true,
+            name: &mut |_p, wt| wt.path == PathBuf::from("/a/wt1"),
+            child: None,
         };
         assert_eq!(filtered_rows(&projects, &sessions_only(sessions), preds), vec![
             SidebarRow::Home,
@@ -847,10 +924,81 @@ pub(crate) mod tests {
     fn filtered_rows_hides_home_session_rows_with_home() {
         let projects = vec![project("/a", true, &["/a/wt1"])];
         let sessions = HashMap::from([(None, vec![1])]);
-        let preds =
-            RowPredicates { home: false, project_self: &|_| true, worktree: &mut |_, _| true };
+        let preds = RowPredicates {
+            home_gate: true,
+            home_name: false,
+            project_self: &|_| true,
+            gate: &|_ws| true,
+            name: &mut |_, _| true,
+            child: None,
+        };
         let rows = filtered_rows(&projects, &sessions_only(sessions), preds);
         assert!(!rows.contains(&SidebarRow::Session(1)));
+    }
+
+    fn agent_listing() -> ListedRows {
+        ListedRows::from([(ws("/a/wt1"), vec![
+            WorkspaceEntry::Session(1),
+            WorkspaceEntry::Agent(Side::Native, "term_a".into()),
+        ])])
+    }
+
+    /// Searching for a child hands back that child, not its workspace plus
+    /// every sibling, which would be the opposite of searching.
+    #[test]
+    fn filtered_rows_surfaces_a_workspace_for_a_matching_child_alone() {
+        let projects = vec![project("/a", false, &["/a/wt1"])];
+        let preds = RowPredicates {
+            home_gate: true,
+            home_name: false,
+            project_self: &|_p| false,
+            gate: &|_ws| true,
+            name: &mut |_p, _wt| false,
+            child: Some(&mut |_ws, e| *e == WorkspaceEntry::Agent(Side::Native, "term_a".into())),
+        };
+        assert_eq!(filtered_rows(&projects, &agent_listing(), preds), vec![
+            SidebarRow::Project(PathBuf::from("/a")),
+            SidebarRow::Worktree(PathBuf::from("/a/wt1")),
+            SidebarRow::HerdrAgent(Side::Native, "term_a".into()),
+        ]);
+    }
+
+    /// A workspace matching by its own name keeps every child, agents
+    /// included. The child rule narrows which workspaces surface, never
+    /// which children a surfaced workspace shows.
+    #[test]
+    fn filtered_rows_keeps_every_child_of_a_name_matched_workspace() {
+        let projects = vec![project("/a", false, &["/a/wt1"])];
+        let preds = RowPredicates {
+            home_gate: true,
+            home_name: false,
+            project_self: &|_p| false,
+            gate: &|_ws| true,
+            name: &mut |_p, _wt| true,
+            child: Some(&mut |_ws, _e| false),
+        };
+        assert_eq!(filtered_rows(&projects, &agent_listing(), preds), vec![
+            SidebarRow::Project(PathBuf::from("/a")),
+            SidebarRow::Worktree(PathBuf::from("/a/wt1")),
+            SidebarRow::Session(1),
+            SidebarRow::HerdrAgent(Side::Native, "term_a".into()),
+        ]);
+    }
+
+    /// The gate is the only way in, so a toggle keeps narrowing the tree even
+    /// when a child would otherwise surface its workspace.
+    #[test]
+    fn filtered_rows_does_not_let_a_child_match_bypass_the_gate() {
+        let projects = vec![project("/a", false, &["/a/wt1"])];
+        let preds = RowPredicates {
+            home_gate: false,
+            home_name: false,
+            project_self: &|_p| false,
+            gate: &|_ws| false,
+            name: &mut |_p, _wt| false,
+            child: Some(&mut |_ws, _e| true),
+        };
+        assert!(filtered_rows(&projects, &agent_listing(), preds).is_empty());
     }
 
     #[test]

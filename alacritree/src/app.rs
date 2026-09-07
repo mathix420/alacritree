@@ -2794,27 +2794,26 @@ impl AlacritreeApp {
             HashMap::new()
         };
 
-        let toggles_pass = |key: &WorkspaceKey| {
+        let gate = |key: &WorkspaceKey| {
             project_toggles_pass(
                 apply,
                 toggle_sessions,
                 self.workspace_has_sessions(key),
                 toggle_attention,
                 self.workspace_needs_attention(key),
-            )
+            ) && key.as_deref().is_none_or(|path| worktree_pr_passes(any_pr, &pr_matches, path))
         };
-        let home = home_matches && toggles_pass(&None);
         let project_self =
             |p: &Project| !any_toggle && project_matches.get(&p.root).copied().unwrap_or(false);
-        let mut worktree = |_p: &Project, wt: &Worktree| {
-            worktree_matches.get(&wt.path).copied().unwrap_or(false)
-                && toggles_pass(&Some(wt.path.clone()))
-                && worktree_pr_passes(any_pr, &pr_matches, &wt.path)
-        };
+        let mut name =
+            |_p: &Project, wt: &Worktree| worktree_matches.get(&wt.path).copied().unwrap_or(false);
         sidebar_nav::filtered_rows(&self.projects, &listed, sidebar_nav::RowPredicates {
-            home,
+            home_gate: gate(&None),
+            home_name: home_matches,
             project_self: &project_self,
-            worktree: &mut worktree,
+            gate: &gate,
+            name: &mut name,
+            child: None,
         })
     }
 
