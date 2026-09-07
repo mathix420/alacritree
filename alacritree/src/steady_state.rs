@@ -104,7 +104,12 @@ mod tests {
     fn inputs<'a>(
         s: &'a [(Option<std::path::PathBuf>, u64)],
     ) -> impl Iterator<Item = SessionInput<'a>> {
-        s.iter().map(|(ws, id)| SessionInput { workspace: ws, id: *id, attention: false })
+        s.iter().map(|(ws, id)| SessionInput {
+            workspace: ws,
+            id: *id,
+            attention: false,
+            title: "",
+        })
     }
 
     #[test]

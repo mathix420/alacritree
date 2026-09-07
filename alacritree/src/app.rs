@@ -2829,12 +2829,18 @@ impl AlacritreeApp {
     }
 
     /// Live sessions borrowed for the unchanged-inputs check, which runs on
-    /// every frame and must not allocate.
-    fn session_inputs(&self) -> impl Iterator<Item = sidebar_focus::SessionInput<'_>> {
-        self.sessions.iter().map(|s| sidebar_focus::SessionInput {
+    /// every frame and must not allocate.  `titles` is off unless a query is
+    /// live, so a shell repainting its prompt does not invalidate a projection
+    /// no title can change.
+    fn session_inputs(
+        &self,
+        titles: bool,
+    ) -> impl Iterator<Item = sidebar_focus::SessionInput<'_>> {
+        self.sessions.iter().map(move |s| sidebar_focus::SessionInput {
             workspace: &s.working_directory,
             id: s.id,
             attention: s.needs_attention,
+            title: if titles { &s.title } else { "" },
         })
     }
 
@@ -2844,7 +2850,7 @@ impl AlacritreeApp {
             active_workspace.and_then(|p| self.git_status.get(p)).and_then(|c| c.current_branch());
         let inputs = sidebar_focus::ObservedInputs::capture(
             &self.projects,
-            self.session_inputs(),
+            self.session_inputs(!self.project_filter.query().is_empty()),
             sidebar_focus::UiInputs {
                 session_rows_always: self.session_rows_always,
                 query: self.project_filter.query(),
@@ -2897,7 +2903,7 @@ impl AlacritreeApp {
             if let Some(prev) = &self.sidebar_focus_prev {
                 let unchanged = prev.inputs.matches(
                     &self.projects,
-                    self.session_inputs(),
+                    self.session_inputs(!self.project_filter.query().is_empty()),
                     sidebar_focus::UiInputs {
                         session_rows_always: self.session_rows_always,
                         query: self.project_filter.query(),
