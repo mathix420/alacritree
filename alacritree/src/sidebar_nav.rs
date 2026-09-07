@@ -359,14 +359,15 @@ pub fn filtered_rows(
                 false,
             );
         };
-        // `filter` hands the closure `&&WorkspaceEntry`, so the pattern
-        // destructures one layer off before the predicate sees it.
-        let matching: Vec<SidebarRow> =
-            entries.iter().filter(|&e| child(ws, e)).map(WorkspaceEntry::row).collect();
-        let any = !matching.is_empty();
         if name_matched {
+            let any = entries.iter().any(|e| child(ws, e));
             (entries.iter().map(WorkspaceEntry::row).collect(), any)
         } else {
+            // `filter` hands the closure `&&WorkspaceEntry`, so the pattern
+            // destructures one layer off before the predicate sees it.
+            let matching: Vec<SidebarRow> =
+                entries.iter().filter(|&e| child(ws, e)).map(WorkspaceEntry::row).collect();
+            let any = !matching.is_empty();
             (matching, any)
         }
     }
@@ -999,6 +1000,25 @@ pub(crate) mod tests {
             child: Some(&mut |_ws, _e| true),
         };
         assert!(filtered_rows(&projects, &agent_listing(), preds).is_empty());
+    }
+
+    /// Pins that the `&&` in the Home branch is load-bearing: keying the
+    /// listing under Home itself, rather than a worktree, is what would catch
+    /// a regression to `||` that let a child match open Home past a closed
+    /// gate.
+    #[test]
+    fn filtered_rows_does_not_let_a_home_child_match_bypass_the_home_gate() {
+        let listed =
+            ListedRows::from([(None, vec![WorkspaceEntry::Agent(Side::Native, "term_a".into())])]);
+        let preds = RowPredicates {
+            home_gate: false,
+            home_name: false,
+            project_self: &|_p| false,
+            gate: &|_ws| true,
+            name: &mut |_p, _wt| false,
+            child: Some(&mut |_ws, _e| true),
+        };
+        assert!(filtered_rows(&[], &listed, preds).is_empty());
     }
 
     #[test]

@@ -2794,6 +2794,62 @@ impl AlacritreeApp {
             HashMap::new()
         };
 
+        // Child names are resolved before the matcher borrows the filter: the
+        // names come off `&self` helpers and the matcher wants `&mut
+        // self.project_filter`, so the two cannot be live at once.  Skipped
+        // outright with an empty query, where `matches` answers true for
+        // everything and every workspace holding any child would surface.
+        let child_matches: HashMap<SidebarRow, bool> = if self.project_filter.query().is_empty() {
+            HashMap::new()
+        } else {
+            let names: Vec<(SidebarRow, String)> = listed
+                .values()
+                .flatten()
+                .map(|entry| {
+                    let name = match entry {
+                        sidebar_nav::WorkspaceEntry::Session(id) => self
+                            .sessions
+                            .iter()
+                            .find(|s| s.id == *id)
+                            .map(|s| {
+                                let activity = herdr_backed_activity(
+                                    s.activity(),
+                                    self.session_herdr_status(s),
+                                );
+                                session_row_name(&s.title, activity, self.session_herdr_agent(s))
+                            })
+                            .map(|n| match n.context {
+                                Some(context) => format!("{} {}", n.text, context),
+                                None => n.text,
+                            })
+                            .unwrap_or_default(),
+                        sidebar_nav::WorkspaceEntry::Agent(side, terminal_id) => self
+                            .find_herdr_agent(side, terminal_id)
+                            .map(|a| {
+                                // Mirrors `HerdrRowData::from_agent`'s fallback:
+                                // title, then kind, then the terminal id's tail.
+                                let name = herdr_row_name(a)
+                                    .map(|n| n.text)
+                                    .or_else(|| a.kind.clone())
+                                    .unwrap_or_else(|| {
+                                        let id = &a.terminal_id;
+                                        let skip = id.chars().count().saturating_sub(6);
+                                        id.chars().skip(skip).collect()
+                                    });
+                                match &a.kind {
+                                    Some(kind) if *kind != name => format!("{name} {kind}"),
+                                    _ => name,
+                                }
+                            })
+                            .unwrap_or_default(),
+                    };
+                    (entry.row(), name)
+                })
+                .collect();
+            let filter = &mut self.project_filter;
+            names.into_iter().map(|(row, name)| (row, filter.matches(&name))).collect()
+        };
+
         let gate = |key: &WorkspaceKey| {
             project_toggles_pass(
                 apply,
@@ -2807,13 +2863,19 @@ impl AlacritreeApp {
             |p: &Project| !any_toggle && project_matches.get(&p.root).copied().unwrap_or(false);
         let mut name =
             |_p: &Project, wt: &Worktree| worktree_matches.get(&wt.path).copied().unwrap_or(false);
+        let matched_children = !child_matches.is_empty();
+        let mut child = |_ws: &WorkspaceKey, entry: &sidebar_nav::WorkspaceEntry| {
+            child_matches.get(&entry.row()).copied().unwrap_or(false)
+        };
+        let child: Option<&mut dyn FnMut(&WorkspaceKey, &sidebar_nav::WorkspaceEntry) -> bool> =
+            if matched_children { Some(&mut child) } else { None };
         sidebar_nav::filtered_rows(&self.projects, &listed, sidebar_nav::RowPredicates {
             home_gate: gate(&None),
             home_name: home_matches,
             project_self: &project_self,
             gate: &gate,
             name: &mut name,
-            child: None,
+            child,
         })
     }
 
@@ -4056,6 +4118,9 @@ impl AlacritreeApp {
         // over projects below isn't blocked from calling back into `&self`
         // helpers.
         let mut listed = self.listed_workspace_rows();
+        // The cursor can only reach a row the nav model listed, so paint keeps
+        // exactly that set: a session the filter dropped would strand just
+        // like an unlisted agent, so both are pruned by row membership here.
         if filtering {
             for entries in listed.values_mut() {
                 entries.retain(|entry| visible_children.contains(&entry.row()));
