@@ -2708,7 +2708,7 @@ struct RawWorktreeOverride {
 }
 
 /// Wrapper that parses `"0xrrggbb"`, `"#rrggbb"`, or `"rrggbb"` into an `Rgb`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct RgbStr(Rgb);
 
 /// Hand-written because `RgbStr` deserializes from a string it parses itself,
@@ -2734,6 +2734,16 @@ impl<'de> Deserialize<'de> for RgbStr {
         parse_hex_rgb(&s)
             .map(RgbStr)
             .ok_or_else(|| serde::de::Error::custom(format!("invalid color string: {s:?}")))
+    }
+}
+
+/// Hand-written for the same reason `Deserialize` is: the accepted spellings
+/// live in `parse_hex_rgb`, and a derive on the inner `Rgb` would emit an
+/// object against a schema that says `"type": "string"`.
+impl serde::Serialize for RgbStr {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Rgb { r, g, b } = self.0;
+        serializer.serialize_str(&format!("#{r:02x}{g:02x}{b:02x}"))
     }
 }
 
@@ -4684,5 +4694,23 @@ program = "second"
     fn a_malformed_adjustment_behaves_as_zero() {
         assert_eq!(parse_adjust("underline_position", Some("2 px")), Adjust::NONE);
         assert_eq!(parse_adjust("underline_position", None), Adjust::NONE);
+    }
+
+    #[test]
+    fn a_color_serializes_to_the_spelling_it_parses() {
+        let parsed: RgbStr = toml::from_str::<toml::Value>("c = \"#6a9fb5\"").unwrap()["c"]
+            .clone()
+            .try_into()
+            .unwrap();
+        let json = serde_json::to_value(parsed).unwrap();
+        assert_eq!(json, serde_json::json!("#6a9fb5"));
+    }
+
+    #[test]
+    fn a_color_round_trips_through_json() {
+        let original = RgbStr(rgb(0x18, 0x18, 0x18));
+        let json = serde_json::to_value(original).unwrap();
+        let back: RgbStr = serde_json::from_value(json).unwrap();
+        assert_eq!(original, back);
     }
 }
