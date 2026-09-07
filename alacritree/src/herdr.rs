@@ -181,6 +181,15 @@ impl Side {
             },
         }
     }
+
+    /// How a row names this side.  `None` on the native one, whose name would
+    /// be the same word on every row of a machine that has only it.
+    pub fn label(&self) -> Option<String> {
+        match self {
+            Self::Native => None,
+            Self::Wsl(distro) => Some(format!("wsl:{distro}")),
+        }
+    }
 }
 
 /// Direct attach to one agent.  Unsupported on native Windows, where

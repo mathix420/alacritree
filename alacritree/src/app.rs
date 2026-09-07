@@ -9543,12 +9543,20 @@ impl AlacritreeApp {
             items.push(PaletteItem::profile(profile.name.clone(), command, keys, &config_name));
         }
         for session in &self.sessions {
-            let ws = self.workspace_label(&session.working_directory);
-            items.push(PaletteItem::session(
-                session.id,
-                session.title.clone(),
-                format!("session · {ws}"),
-            ));
+            let agent = self.session_herdr_agent(session);
+            let activity =
+                herdr_backed_activity(session.activity(), self.session_herdr_status(session));
+            let name = session_row_name(&session.title, activity, agent);
+            let secondary = match agent {
+                Some(a) => self.herdr_palette_secondary(
+                    &session.herdr_key.as_ref().expect("an agent implies a key").side,
+                    a.status,
+                    name.context.as_deref(),
+                    &session.working_directory,
+                ),
+                None => format!("session · {}", self.workspace_label(&session.working_directory)),
+            };
+            items.push(PaletteItem::session(session.id, name.text, secondary));
         }
         for ws in self.workspace_order() {
             let (primary, secondary) = self.workspace_entry_label(&ws);
@@ -9580,6 +9588,25 @@ impl AlacritreeApp {
         path.file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| wsl::display_path(path))
+    }
+
+    /// The secondary column a herdr row shows: the integration, then whatever
+    /// context the name did not already carry, then herdr's own status word,
+    /// then where the row lives.  Shared by the attached and unattached rows so
+    /// one heading's worth of vocabulary reads the same across both.
+    fn herdr_palette_secondary(
+        &self,
+        side: &herdr::Side,
+        status: herdr::Status,
+        context: Option<&str>,
+        workspace: &WorkspaceKey,
+    ) -> String {
+        let mut parts = vec!["herdr".to_string()];
+        parts.extend(context.map(str::to_string));
+        parts.push(status.label().to_string());
+        parts.extend(side.label());
+        parts.push(self.workspace_label(workspace));
+        parts.join(" · ")
     }
 
     /// The (primary, secondary) a workspace palette row shows.
@@ -12001,6 +12028,14 @@ mod tests {
         let listed = listed_herdr_agents(&caches, &[], &workspaces, true);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].0, Some(PathBuf::from(dir)));
+    }
+
+    /// The native side would name itself the same word on every row of a machine
+    /// that has only it, so only a WSL endpoint is worth spelling out.
+    #[test]
+    fn only_a_wsl_side_is_labelled() {
+        assert_eq!(herdr::Side::Native.label(), None);
+        assert_eq!(herdr::Side::Wsl("Ubuntu".into()).label(), Some("wsl:Ubuntu".into()));
     }
 
     /// herdr distinguishes four live states and says so on its own panes.
