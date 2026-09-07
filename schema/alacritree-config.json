@@ -170,10 +170,55 @@
       ],
       "type": "object"
     },
+    "RawBrightSet": {
+      "properties": {
+        "black": {
+          "$ref": "#/$defs/Color",
+          "default": "#6b6b6b",
+          "description": "ANSI color 0."
+        },
+        "blue": {
+          "$ref": "#/$defs/Color",
+          "default": "#82b8c8",
+          "description": "ANSI color 4."
+        },
+        "cyan": {
+          "$ref": "#/$defs/Color",
+          "default": "#93d3c3",
+          "description": "ANSI color 6."
+        },
+        "green": {
+          "$ref": "#/$defs/Color",
+          "default": "#aac474",
+          "description": "ANSI color 2."
+        },
+        "magenta": {
+          "$ref": "#/$defs/Color",
+          "default": "#c28cb8",
+          "description": "ANSI color 5."
+        },
+        "red": {
+          "$ref": "#/$defs/Color",
+          "default": "#c55555",
+          "description": "ANSI color 1."
+        },
+        "white": {
+          "$ref": "#/$defs/Color",
+          "default": "#f8f8f8",
+          "description": "ANSI color 7."
+        },
+        "yellow": {
+          "$ref": "#/$defs/Color",
+          "default": "#feca88",
+          "description": "ANSI color 3."
+        }
+      },
+      "type": "object"
+    },
     "RawColors": {
       "properties": {
         "bright": {
-          "$ref": "#/$defs/RawSet",
+          "$ref": "#/$defs/RawBrightSet",
           "description": "The eight bright ANSI colors (8–15)."
         },
         "cursor": {
@@ -201,7 +246,7 @@
           "type": "array"
         },
         "normal": {
-          "$ref": "#/$defs/RawSet",
+          "$ref": "#/$defs/RawNormalSet",
           "description": "The eight normal ANSI colors (0–7)."
         },
         "primary": {
@@ -812,6 +857,51 @@
             "$ref": "#/$defs/RawBinding"
           },
           "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "RawNormalSet": {
+      "properties": {
+        "black": {
+          "$ref": "#/$defs/Color",
+          "default": "#181818",
+          "description": "ANSI color 0."
+        },
+        "blue": {
+          "$ref": "#/$defs/Color",
+          "default": "#6a9fb5",
+          "description": "ANSI color 4."
+        },
+        "cyan": {
+          "$ref": "#/$defs/Color",
+          "default": "#75b5aa",
+          "description": "ANSI color 6."
+        },
+        "green": {
+          "$ref": "#/$defs/Color",
+          "default": "#90a959",
+          "description": "ANSI color 2."
+        },
+        "magenta": {
+          "$ref": "#/$defs/Color",
+          "default": "#aa759f",
+          "description": "ANSI color 5."
+        },
+        "red": {
+          "$ref": "#/$defs/Color",
+          "default": "#ac4242",
+          "description": "ANSI color 1."
+        },
+        "white": {
+          "$ref": "#/$defs/Color",
+          "default": "#d8d8d8",
+          "description": "ANSI color 7."
+        },
+        "yellow": {
+          "$ref": "#/$defs/Color",
+          "default": "#f4bf75",
+          "description": "ANSI color 3."
         }
       },
       "type": "object"

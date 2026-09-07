@@ -2198,10 +2198,10 @@ struct RawColors {
     selection: RawInverted,
     /// The eight normal ANSI colors (0–7).
     #[serde(default)]
-    normal: RawSet,
+    normal: RawNormalSet,
     /// The eight bright ANSI colors (8–15).
     #[serde(default)]
-    bright: RawSet,
+    bright: RawBrightSet,
     /// The eight dim ANSI colors.  Unset derives them from `normal`.
     #[serde(default)]
     dim: Option<RawSet>,
@@ -2274,6 +2274,71 @@ struct RawSet {
     /// ANSI color 7.
     white: Option<RgbStr>,
 }
+
+/// Two palette sections with the same eight slots and different defaults.
+/// schemars reads a field's default off the struct that declares it, so
+/// `normal` and `bright` cannot share one type without sharing one palette.
+macro_rules! raw_palette_set {
+    ($name:ident, $slots:expr) => {
+        #[derive(Debug, Deserialize, JsonSchema)]
+        #[serde(default)]
+        struct $name {
+            /// ANSI color 0.
+            black: RgbStr,
+            /// ANSI color 1.
+            red: RgbStr,
+            /// ANSI color 2.
+            green: RgbStr,
+            /// ANSI color 3.
+            yellow: RgbStr,
+            /// ANSI color 4.
+            blue: RgbStr,
+            /// ANSI color 5.
+            magenta: RgbStr,
+            /// ANSI color 6.
+            cyan: RgbStr,
+            /// ANSI color 7.
+            white: RgbStr,
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                let s: [Rgb; 8] = $slots;
+                Self {
+                    black: RgbStr(s[0]),
+                    red: RgbStr(s[1]),
+                    green: RgbStr(s[2]),
+                    yellow: RgbStr(s[3]),
+                    blue: RgbStr(s[4]),
+                    magenta: RgbStr(s[5]),
+                    cyan: RgbStr(s[6]),
+                    white: RgbStr(s[7]),
+                }
+            }
+        }
+
+        impl $name {
+            /// `apply_set` writes per slot off an `Option`, and every slot here
+            /// is present, so an absent section writes the stock value over the
+            /// stock value.
+            fn into_optional(self) -> RawSet {
+                RawSet {
+                    black: Some(self.black),
+                    red: Some(self.red),
+                    green: Some(self.green),
+                    yellow: Some(self.yellow),
+                    blue: Some(self.blue),
+                    magenta: Some(self.magenta),
+                    cyan: Some(self.cyan),
+                    white: Some(self.white),
+                }
+            }
+        }
+    };
+}
+
+raw_palette_set!(RawNormalSet, Palette::default().normal);
+raw_palette_set!(RawBrightSet, Palette::default().bright);
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct RawIndexed {
@@ -3040,8 +3105,8 @@ impl RawConfig {
             c.selection.text.map(|v| v.0).or_else(|| c.selection.foreground.map(|v| v.0));
         palette.selection_bg = c.selection.background.map(|v| v.0);
 
-        apply_set(&mut palette.normal, c.normal);
-        apply_set(&mut palette.bright, c.bright);
+        apply_set(&mut palette.normal, c.normal.into_optional());
+        apply_set(&mut palette.bright, c.bright.into_optional());
         if let Some(d) = c.dim {
             let mut dim = palette.normal;
             apply_set(&mut dim, d);
@@ -3588,6 +3653,24 @@ mod tests {
         assert_eq!(raw.foreground, RgbStr(Palette::default().fg));
         assert_eq!(raw.background, RgbStr(Palette::default().bg));
     }
+
+    #[test]
+    fn each_palette_section_defaults_to_its_own_colours() {
+        let stock = Palette::default();
+        let normal = RawNormalSet::default().into_optional();
+        let bright = RawBrightSet::default().into_optional();
+        assert_eq!(normal.black.unwrap().0, stock.normal[0]);
+        assert_eq!(bright.black.unwrap().0, stock.bright[0]);
+        assert_ne!(normal.black.unwrap().0, bright.black.unwrap().0);
+    }
+
+    #[test]
+    fn an_absent_bright_section_keeps_the_bright_palette() {
+        let resolved = toml::from_str::<RawConfig>("").unwrap().into_config();
+        assert_eq!(resolved.palette.bright, Palette::default().bright);
+        assert_eq!(resolved.palette.normal, Palette::default().normal);
+    }
+
     fn ui_from_toml(input: &str) -> UiTheme {
         let value: toml::Value = toml::from_str(input).expect("valid toml");
         let raw: RawConfig = value.try_into().expect("valid config");
