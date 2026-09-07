@@ -565,12 +565,11 @@ pub enum AttachMode {
     Session,
 }
 
-fn parse_attach_mode(raw: Option<&str>) -> AttachMode {
+fn parse_attach_mode(raw: &str) -> AttachMode {
     match raw {
-        None => AttachMode::default(),
-        Some("agent") => AttachMode::Agent,
-        Some("session") => AttachMode::Session,
-        Some(other) => {
+        "agent" => AttachMode::Agent,
+        "session" => AttachMode::Session,
+        other => {
             log::warn!("unknown integrations.herdr.attach value {other:?}, using \"agent\"");
             AttachMode::default()
         },
@@ -581,7 +580,7 @@ fn parse_attach_mode(raw: Option<&str>) -> AttachMode {
 /// herdr server in the sidebar, and what opening one attaches to.  On by
 /// default; a probe with no herdr binary or server present costs nothing, so
 /// an unmodified config pays no price for it.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct HerdrConfig {
     /// Discover herdr servers and list their agents in the sidebar.
     pub enabled: bool,
@@ -596,12 +595,7 @@ pub struct HerdrConfig {
 
 impl Default for HerdrConfig {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            poll_interval: Duration::from_millis(2000),
-            show_unmatched: true,
-            attach: AttachMode::default(),
-        }
+        RawHerdr::default().resolve()
     }
 }
 
@@ -2480,19 +2474,19 @@ struct RawIntegrations {
     herdr: RawHerdr,
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawHerdr {
     /// Discover herdr servers and list their agents in the sidebar.  Inert
     /// when no herdr binary or server is present.
-    enabled: Option<bool>,
+    enabled: bool,
     /// How often a reachable herdr server is re-polled for agent state.
-    poll_interval_ms: Option<u64>,
+    poll_interval_ms: u64,
     /// List agents whose working directory matches no worktree, under Home.
-    show_unmatched: Option<bool>,
+    show_unmatched: bool,
     /// Whether opening a row attaches to that agent's pane directly
-    /// ("agent", default) or to the herdr session around it with the pane
-    /// focused ("session").
+    /// ("agent") or to the herdr session around it with the pane focused
+    /// ("session").
     ///
     /// "session" hands the mouse to herdr's own client, where a selection
     /// joins soft-wrapped rows and copy mode works; a direct attach is
@@ -2501,7 +2495,29 @@ struct RawHerdr {
     /// attaches to the session, because herdr implements no direct attach
     /// there.
     #[schemars(extend("enum" = ["agent", "session"]))]
-    attach: Option<String>,
+    attach: String,
+}
+
+impl Default for RawHerdr {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval_ms: 2000,
+            show_unmatched: true,
+            attach: "agent".to_string(),
+        }
+    }
+}
+
+impl RawHerdr {
+    fn resolve(self) -> HerdrConfig {
+        HerdrConfig {
+            enabled: self.enabled,
+            poll_interval: Duration::from_millis(self.poll_interval_ms),
+            show_unmatched: self.show_unmatched,
+            attach: parse_attach_mode(&self.attach),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -3104,16 +3120,7 @@ impl RawConfig {
             delta_path: self.ui.delta_path.filter(|s| !s.trim().is_empty()),
             profiles,
             default_profile,
-            integrations: IntegrationsConfig {
-                herdr: HerdrConfig {
-                    enabled: self.integrations.herdr.enabled.unwrap_or(true),
-                    poll_interval: Duration::from_millis(
-                        self.integrations.herdr.poll_interval_ms.unwrap_or(2000),
-                    ),
-                    show_unmatched: self.integrations.herdr.show_unmatched.unwrap_or(true),
-                    attach: parse_attach_mode(self.integrations.herdr.attach.as_deref()),
-                },
-            },
+            integrations: IntegrationsConfig { herdr: self.integrations.herdr.resolve() },
         }
     }
 }
@@ -3405,6 +3412,18 @@ mod tests {
 
         let nonsense = config_from("[integrations.herdr]\nattach = \"pane\"\n");
         assert_eq!(nonsense.integrations.herdr.attach, AttachMode::Agent);
+    }
+
+    #[test]
+    fn an_absent_herdr_section_resolves_to_the_raw_defaults() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        let resolved = raw.into_config();
+        assert_eq!(resolved.integrations.herdr, HerdrConfig::default());
+    }
+
+    #[test]
+    fn the_herdr_defaults_live_in_the_raw_layer() {
+        assert_eq!(HerdrConfig::default(), RawHerdr::default().resolve());
     }
     fn ui_from_toml(input: &str) -> UiTheme {
         let value: toml::Value = toml::from_str(input).expect("valid toml");

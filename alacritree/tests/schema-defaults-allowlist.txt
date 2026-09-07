@@ -37,10 +37,6 @@ RawFontFace.style
 RawGeneral.ipc_socket
 RawGeneral.state_dir
 RawGeneral.working_directory
-RawHerdr.attach
-RawHerdr.enabled
-RawHerdr.poll_interval_ms
-RawHerdr.show_unmatched
 RawIconStyle.color
 RawIconStyle.glyph
 RawIconStyle.size

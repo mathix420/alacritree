@@ -452,7 +452,8 @@
     "RawHerdr": {
       "properties": {
         "attach": {
-          "description": "Whether opening a row attaches to that agent's pane directly\n(\"agent\", default) or to the herdr session around it with the pane\nfocused (\"session\").\n\n\"session\" hands the mouse to herdr's own client, where a selection\njoins soft-wrapped rows and copy mode works; a direct attach is\nrepainted row by row, so the host terminal sees every wrap as a line\nbreak.  Honoured per side: the native side of a Windows host always\nattaches to the session, because herdr implements no direct attach\nthere.",
+          "default": "agent",
+          "description": "Whether opening a row attaches to that agent's pane directly\n(\"agent\") or to the herdr session around it with the pane focused\n(\"session\").\n\n\"session\" hands the mouse to herdr's own client, where a selection\njoins soft-wrapped rows and copy mode works; a direct attach is\nrepainted row by row, so the host terminal sees every wrap as a line\nbreak.  Honoured per side: the native side of a Windows host always\nattaches to the session, because herdr implements no direct attach\nthere.",
           "enum": [
             "agent",
             "session"
@@ -460,16 +461,19 @@
           "type": "string"
         },
         "enabled": {
+          "default": true,
           "description": "Discover herdr servers and list their agents in the sidebar.  Inert\nwhen no herdr binary or server is present.",
           "type": "boolean"
         },
         "poll_interval_ms": {
+          "default": 2000,
           "description": "How often a reachable herdr server is re-polled for agent state.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "show_unmatched": {
+          "default": true,
           "description": "List agents whose working directory matches no worktree, under Home.",
           "type": "boolean"
         }
