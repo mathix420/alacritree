@@ -589,195 +589,123 @@
       "description": "`[ui.icons]`: sidebar glyph overrides.  A bare string sets the glyph\nalone; a table also styles color/weight/slant/size.  Any glyph works, so\nNerd Font users can substitute their own icons.",
       "properties": {
         "add_project": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "+",
           "description": "The \"add project\" button."
         },
         "close_session": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "×",
           "description": "The \"close session\" button."
         },
         "delete_worktree": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "×",
           "description": "The \"delete worktree\" button."
         },
         "herdr": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "◫",
           "description": "A pane owned by a terminal workspace manager such as herdr."
         },
         "home": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "⌂",
           "description": "The home tab, whose sessions inherit the launch directory."
         },
         "new_session": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "+",
           "description": "The \"new session\" button."
         },
         "new_worktree": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "+",
           "description": "The \"new worktree\" button."
         },
         "pr_closed": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "⬤",
           "description": "A branch whose pull request was closed unmerged."
         },
         "pr_draft": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "◯",
           "description": "A branch whose pull request is a draft."
         },
         "pr_merged": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "⬤",
           "description": "A branch whose pull request was merged."
         },
         "pr_open": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "⬤",
           "description": "A branch with an open pull request."
         },
         "project_collapsed": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "▸",
           "description": "A collapsed project."
         },
         "project_expanded": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "▾",
           "description": "An expanded project."
         },
         "refresh": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "↻",
           "description": "The \"refresh\" button."
         },
         "remove_project": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "×",
           "description": "The \"remove project\" button."
         },
         "reorder": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "⇅",
           "description": "The drag handle a row is reordered by."
         },
         "search": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "⌕",
           "description": "The panel search box."
         },
         "session": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "▪",
           "description": "A terminal session row."
         },
         "upstream_diverged": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "⇅",
           "description": "A branch that has both moved ahead of and fallen behind its upstream."
         },
         "upstream_gone": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "⌫",
           "description": "A branch whose upstream no longer exists locally."
         },
         "upstream_level": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "✓",
           "description": "A branch level with its upstream."
         },
         "upstream_untracked": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "↑",
           "description": "A branch that tracks nothing."
         },
         "worktree": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "○",
           "description": "A linked worktree."
         },
         "worktree_main": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/RawIconStyle"
-            }
-          ],
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "●",
           "description": "A project's main checkout."
         }
       },
@@ -1293,6 +1221,32 @@
         },
         "icons": {
           "$ref": "#/$defs/RawIcons",
+          "default": {
+            "add_project": "+",
+            "close_session": "×",
+            "delete_worktree": "×",
+            "herdr": "◫",
+            "home": "⌂",
+            "new_session": "+",
+            "new_worktree": "+",
+            "pr_closed": "⬤",
+            "pr_draft": "◯",
+            "pr_merged": "⬤",
+            "pr_open": "⬤",
+            "project_collapsed": "▸",
+            "project_expanded": "▾",
+            "refresh": "↻",
+            "remove_project": "×",
+            "reorder": "⇅",
+            "search": "⌕",
+            "session": "▪",
+            "upstream_diverged": "⇅",
+            "upstream_gone": "⌫",
+            "upstream_level": "✓",
+            "upstream_untracked": "↑",
+            "worktree": "○",
+            "worktree_main": "●"
+          },
           "description": "Sidebar glyph overrides."
         },
         "last_session_close": {

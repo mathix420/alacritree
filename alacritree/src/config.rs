@@ -1062,39 +1062,9 @@ impl Default for FocusOutline {
     }
 }
 
-/// A default icon: just the glyph, no styling.
-fn glyph(g: BakedGlyph) -> IconStyle {
-    IconStyle { glyph: Some(g.as_str().to_string()), ..Default::default() }
-}
-
 impl Default for Icons {
     fn default() -> Self {
-        Self {
-            search: glyph(DEFAULT_SEARCH_ICON),
-            worktree_main: glyph(DEFAULT_WORKTREE_MAIN_ICON),
-            worktree: glyph(DEFAULT_WORKTREE_ICON),
-            session: glyph(DEFAULT_SESSION_ICON),
-            herdr: glyph(DEFAULT_HERDR_ICON),
-            home: glyph(DEFAULT_HOME_ICON),
-            project_expanded: glyph(DEFAULT_PROJECT_EXPANDED_ICON),
-            project_collapsed: glyph(DEFAULT_PROJECT_COLLAPSED_ICON),
-            pr_open: glyph(DEFAULT_PR_OPEN_ICON),
-            pr_draft: glyph(DEFAULT_PR_DRAFT_ICON),
-            pr_merged: glyph(DEFAULT_PR_MERGED_ICON),
-            pr_closed: glyph(DEFAULT_PR_CLOSED_ICON),
-            upstream_level: glyph(DEFAULT_UPSTREAM_LEVEL_ICON),
-            upstream_diverged: glyph(DEFAULT_UPSTREAM_DIVERGED_ICON),
-            upstream_gone: glyph(DEFAULT_UPSTREAM_GONE_ICON),
-            upstream_untracked: glyph(DEFAULT_UPSTREAM_UNTRACKED_ICON),
-            add_project: glyph(DEFAULT_ADD_ICON),
-            new_worktree: glyph(DEFAULT_ADD_ICON),
-            new_session: glyph(DEFAULT_ADD_ICON),
-            remove_project: glyph(DEFAULT_CLOSE_ICON),
-            delete_worktree: glyph(DEFAULT_CLOSE_ICON),
-            close_session: glyph(DEFAULT_CLOSE_ICON),
-            refresh: glyph(DEFAULT_REFRESH_ICON),
-            reorder: glyph(DEFAULT_REORDER_ICON),
-        }
+        build_icons(RawIcons::default())
     }
 }
 
@@ -2375,92 +2345,121 @@ impl Default for RawWsl {
 /// `[ui.icons]`: sidebar glyph overrides.  A bare string sets the glyph
 /// alone; a table also styles color/weight/slant/size.  Any glyph works, so
 /// Nerd Font users can substitute their own icons.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
 #[serde(default)]
 struct RawIcons {
     /// The panel search box.
-    search: Option<RawIconStyle>,
+    search: RawIconStyle,
     /// A project's main checkout.
-    worktree_main: Option<RawIconStyle>,
+    worktree_main: RawIconStyle,
     /// A linked worktree.
-    worktree: Option<RawIconStyle>,
+    worktree: RawIconStyle,
     /// A terminal session row.
-    session: Option<RawIconStyle>,
+    session: RawIconStyle,
     /// A pane owned by a terminal workspace manager such as herdr.
-    herdr: Option<RawIconStyle>,
+    herdr: RawIconStyle,
     /// The home tab, whose sessions inherit the launch directory.
-    home: Option<RawIconStyle>,
+    home: RawIconStyle,
     /// An expanded project.
-    project_expanded: Option<RawIconStyle>,
+    project_expanded: RawIconStyle,
     /// A collapsed project.
-    project_collapsed: Option<RawIconStyle>,
+    project_collapsed: RawIconStyle,
     /// A branch with an open pull request.
-    pr_open: Option<RawIconStyle>,
+    pr_open: RawIconStyle,
     /// A branch whose pull request is a draft.
-    pr_draft: Option<RawIconStyle>,
+    pr_draft: RawIconStyle,
     /// A branch whose pull request was merged.
-    pr_merged: Option<RawIconStyle>,
+    pr_merged: RawIconStyle,
     /// A branch whose pull request was closed unmerged.
-    pr_closed: Option<RawIconStyle>,
+    pr_closed: RawIconStyle,
     /// A branch level with its upstream.
-    upstream_level: Option<RawIconStyle>,
+    upstream_level: RawIconStyle,
     /// A branch that has both moved ahead of and fallen behind its upstream.
-    upstream_diverged: Option<RawIconStyle>,
+    upstream_diverged: RawIconStyle,
     /// A branch whose upstream no longer exists locally.
-    upstream_gone: Option<RawIconStyle>,
+    upstream_gone: RawIconStyle,
     /// A branch that tracks nothing.
-    upstream_untracked: Option<RawIconStyle>,
+    upstream_untracked: RawIconStyle,
     /// The "add project" button.
-    add_project: Option<RawIconStyle>,
+    add_project: RawIconStyle,
     /// The "new worktree" button.
-    new_worktree: Option<RawIconStyle>,
+    new_worktree: RawIconStyle,
     /// The "new session" button.
-    new_session: Option<RawIconStyle>,
+    new_session: RawIconStyle,
     /// The "remove project" button.
-    remove_project: Option<RawIconStyle>,
+    remove_project: RawIconStyle,
     /// The "delete worktree" button.
-    delete_worktree: Option<RawIconStyle>,
+    delete_worktree: RawIconStyle,
     /// The "close session" button.
-    close_session: Option<RawIconStyle>,
+    close_session: RawIconStyle,
     /// The "refresh" button.
-    refresh: Option<RawIconStyle>,
+    refresh: RawIconStyle,
     /// The drag handle a row is reordered by.
-    reorder: Option<RawIconStyle>,
+    reorder: RawIconStyle,
 }
 
-/// An absent key falls back to the key's default style (glyph included); a
-/// present one always wins, even if it styles without setting `glyph`.
-fn style_or(raw: Option<RawIconStyle>, default: &IconStyle) -> IconStyle {
-    raw.map(IconStyle::from).unwrap_or_else(|| default.clone())
+/// A default icon is the glyph alone — no colour, no weight, no size.
+fn raw_glyph(g: BakedGlyph) -> RawIconStyle {
+    RawIconStyle::Glyph(g.as_str().to_string())
+}
+
+impl Default for RawIcons {
+    fn default() -> Self {
+        Self {
+            search: raw_glyph(DEFAULT_SEARCH_ICON),
+            worktree_main: raw_glyph(DEFAULT_WORKTREE_MAIN_ICON),
+            worktree: raw_glyph(DEFAULT_WORKTREE_ICON),
+            session: raw_glyph(DEFAULT_SESSION_ICON),
+            herdr: raw_glyph(DEFAULT_HERDR_ICON),
+            home: raw_glyph(DEFAULT_HOME_ICON),
+            project_expanded: raw_glyph(DEFAULT_PROJECT_EXPANDED_ICON),
+            project_collapsed: raw_glyph(DEFAULT_PROJECT_COLLAPSED_ICON),
+            pr_open: raw_glyph(DEFAULT_PR_OPEN_ICON),
+            pr_draft: raw_glyph(DEFAULT_PR_DRAFT_ICON),
+            pr_merged: raw_glyph(DEFAULT_PR_MERGED_ICON),
+            pr_closed: raw_glyph(DEFAULT_PR_CLOSED_ICON),
+            upstream_level: raw_glyph(DEFAULT_UPSTREAM_LEVEL_ICON),
+            upstream_diverged: raw_glyph(DEFAULT_UPSTREAM_DIVERGED_ICON),
+            upstream_gone: raw_glyph(DEFAULT_UPSTREAM_GONE_ICON),
+            upstream_untracked: raw_glyph(DEFAULT_UPSTREAM_UNTRACKED_ICON),
+            add_project: raw_glyph(DEFAULT_ADD_ICON),
+            new_worktree: raw_glyph(DEFAULT_ADD_ICON),
+            new_session: raw_glyph(DEFAULT_ADD_ICON),
+            remove_project: raw_glyph(DEFAULT_CLOSE_ICON),
+            delete_worktree: raw_glyph(DEFAULT_CLOSE_ICON),
+            close_session: raw_glyph(DEFAULT_CLOSE_ICON),
+            refresh: raw_glyph(DEFAULT_REFRESH_ICON),
+            reorder: raw_glyph(DEFAULT_REORDER_ICON),
+        }
+    }
 }
 
 fn build_icons(raw: RawIcons) -> Icons {
-    let d = Icons::default();
     Icons {
-        search: style_or(raw.search, &d.search),
-        worktree_main: style_or(raw.worktree_main, &d.worktree_main),
-        worktree: style_or(raw.worktree, &d.worktree),
-        session: style_or(raw.session, &d.session),
-        herdr: style_or(raw.herdr, &d.herdr),
-        home: style_or(raw.home, &d.home),
-        project_expanded: style_or(raw.project_expanded, &d.project_expanded),
-        project_collapsed: style_or(raw.project_collapsed, &d.project_collapsed),
-        pr_open: style_or(raw.pr_open, &d.pr_open),
-        pr_draft: style_or(raw.pr_draft, &d.pr_draft),
-        pr_merged: style_or(raw.pr_merged, &d.pr_merged),
-        pr_closed: style_or(raw.pr_closed, &d.pr_closed),
-        upstream_level: style_or(raw.upstream_level, &d.upstream_level),
-        upstream_diverged: style_or(raw.upstream_diverged, &d.upstream_diverged),
-        upstream_gone: style_or(raw.upstream_gone, &d.upstream_gone),
-        upstream_untracked: style_or(raw.upstream_untracked, &d.upstream_untracked),
-        add_project: style_or(raw.add_project, &d.add_project),
-        new_worktree: style_or(raw.new_worktree, &d.new_worktree),
-        new_session: style_or(raw.new_session, &d.new_session),
-        remove_project: style_or(raw.remove_project, &d.remove_project),
-        delete_worktree: style_or(raw.delete_worktree, &d.delete_worktree),
-        close_session: style_or(raw.close_session, &d.close_session),
-        refresh: style_or(raw.refresh, &d.refresh),
-        reorder: style_or(raw.reorder, &d.reorder),
+        search: raw.search.into(),
+        worktree_main: raw.worktree_main.into(),
+        worktree: raw.worktree.into(),
+        session: raw.session.into(),
+        herdr: raw.herdr.into(),
+        home: raw.home.into(),
+        project_expanded: raw.project_expanded.into(),
+        project_collapsed: raw.project_collapsed.into(),
+        pr_open: raw.pr_open.into(),
+        pr_draft: raw.pr_draft.into(),
+        pr_merged: raw.pr_merged.into(),
+        pr_closed: raw.pr_closed.into(),
+        upstream_level: raw.upstream_level.into(),
+        upstream_diverged: raw.upstream_diverged.into(),
+        upstream_gone: raw.upstream_gone.into(),
+        upstream_untracked: raw.upstream_untracked.into(),
+        add_project: raw.add_project.into(),
+        new_worktree: raw.new_worktree.into(),
+        new_session: raw.new_session.into(),
+        remove_project: raw.remove_project.into(),
+        delete_worktree: raw.delete_worktree.into(),
+        close_session: raw.close_session.into(),
+        refresh: raw.refresh.into(),
+        reorder: raw.reorder.into(),
     }
 }
 
@@ -2468,7 +2467,7 @@ fn build_icons(raw: RawIcons) -> Icons {
 // arm.
 /// A styled icon override: either a bare glyph string (`worktree = "◆"`) or a
 /// table (`worktree = { glyph = "◆", color = "#ff5555", bold = true }`).
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
 #[serde(untagged)]
 enum RawIconStyle {
     /// The glyph alone.
@@ -5017,5 +5016,33 @@ program = "second"
              ALACRITREE_UPDATE_STOCK=1` only if you meant to change it\n\nfirst difference at \
              line {line}:\n  was: {was}\n  is:  {is}"
         );
+    }
+
+    /// An untagged enum can serialize to a shape its own Deserialize rejects,
+    /// which would publish a default no config file may legally write.
+    #[test]
+    fn every_icon_default_round_trips() {
+        let raw = RawIcons::default();
+        let json = serde_json::to_value(&raw).unwrap();
+        let back: RawIcons = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(
+            build_icons(back),
+            build_icons(raw),
+            "an icon default does not survive its own schema"
+        );
+        // The Glyph variant must publish as a bare string: it is the branch
+        // Deserialize tries first, and the one an editor offers.
+        assert!(json["search"].is_string(), "search published as {}", json["search"]);
+    }
+
+    /// A key the file styles without naming a glyph keeps the built-in one,
+    /// which or_glyph supplies at paint rather than at resolution.
+    #[test]
+    fn an_absent_icon_key_keeps_its_glyph() {
+        let raw: RawConfig = toml::from_str("[ui.icons]\nworktree = { bold = true }\n").unwrap();
+        let icons = raw.into_config().ui.icons;
+        assert!(icons.worktree.bold);
+        assert!(icons.worktree.glyph.is_none(), "a styled key resolves with no glyph of its own");
+        assert_eq!(icons.session, Icons::default().session, "an untouched key is untouched");
     }
 }
