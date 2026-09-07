@@ -487,6 +487,11 @@ impl EndpointCache {
         &self.agents
     }
 
+    #[cfg(test)]
+    pub fn set_agents_for_test(&mut self, agents: Vec<Agent>) {
+        self.agents = agents;
+    }
+
     /// What herdr's config here says, once the read has landed.  Before that
     /// it is herdr's own defaults, which is what herdr would be running on if
     /// its config said nothing — except for the chord, which stays `None`

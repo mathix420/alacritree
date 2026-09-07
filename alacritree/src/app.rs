@@ -8365,6 +8365,29 @@ fn herdr_workspaces(projects: &[Project], missing: impl Fn(&Path) -> Option<bool
         .collect()
 }
 
+/// Every herdr agent no session holds, with the workspace it belongs under.
+/// The sidebar and the palette both read this, so an agent hidden from one is
+/// hidden from the other by construction rather than by two filters agreeing.
+fn listed_herdr_agents<'a>(
+    caches: &'a [herdr::EndpointCache],
+    claimed: &[herdr::HerdrKey],
+    workspaces: &[PathBuf],
+    show_unmatched: bool,
+) -> Vec<(WorkspaceKey, &'a herdr::Side, &'a herdr::Agent)> {
+    let mut listed = Vec::new();
+    for cache in caches {
+        let side = cache.side();
+        for agent in herdr::unattached(cache.agents(), side, claimed) {
+            let ws = herdr::match_workspace(agent, side, workspaces);
+            if ws.is_none() && !show_unmatched {
+                continue;
+            }
+            listed.push((ws, side, agent));
+        }
+    }
+    listed
+}
+
 struct SessionRowAction {
     activate: bool,
     close: bool,
@@ -8840,6 +8863,23 @@ impl AlacritreeApp {
         other
     }
 
+    /// `listed_herdr_agents` against this frame's own state.  Empty while herdr
+    /// is disabled, so a caller never has to ask twice.
+    fn herdr_agent_listing(&self) -> Vec<(WorkspaceKey, &herdr::Side, &herdr::Agent)> {
+        if !self.config.integrations.herdr.enabled {
+            return Vec::new();
+        }
+        let claimed: Vec<herdr::HerdrKey> =
+            self.sessions.iter().filter_map(|s| s.herdr_key.clone()).collect();
+        let workspaces = herdr_workspaces(&self.projects, |path| self.liveness.missing(path));
+        listed_herdr_agents(
+            self.herdr_endpoints.caches(),
+            &claimed,
+            &workspaces,
+            self.config.integrations.herdr.show_unmatched,
+        )
+    }
+
     /// Every row each workspace lists, in the order it draws them: its own
     /// shell sessions first, then every herdr pane the workspace holds — the
     /// sessions attached to one and the agents nothing is attached to alike —
@@ -8876,26 +8916,12 @@ impl AlacritreeApp {
             }
         }
 
-        if self.config.integrations.herdr.enabled {
-            let claimed: Vec<herdr::HerdrKey> =
-                self.sessions.iter().filter_map(|s| s.herdr_key.clone()).collect();
-            let workspaces = herdr_workspaces(&self.projects, |path| self.liveness.missing(path));
-            for cache in self.herdr_endpoints.caches() {
-                let side = cache.side();
-                for agent in herdr::unattached(cache.agents(), side, &claimed) {
-                    let ws = herdr::match_workspace(agent, side, &workspaces);
-                    if ws.is_none() && !self.config.integrations.herdr.show_unmatched {
-                        continue;
-                    }
-                    let key = herdr::HerdrKey {
-                        side: side.clone(),
-                        terminal_id: agent.terminal_id.clone(),
-                    };
-                    let at = self.herdr_pane_index(&key).unwrap_or(usize::MAX);
-                    let entry = WorkspaceEntry::Agent(side.clone(), agent.terminal_id.clone());
-                    managed.entry(ws).or_default().push((at, entry));
-                }
-            }
+        for (ws, side, agent) in self.herdr_agent_listing() {
+            let key =
+                herdr::HerdrKey { side: side.clone(), terminal_id: agent.terminal_id.clone() };
+            let at = self.herdr_pane_index(&key).unwrap_or(usize::MAX);
+            let entry = WorkspaceEntry::Agent(side.clone(), agent.terminal_id.clone());
+            managed.entry(ws).or_default().push((at, entry));
         }
 
         let mut listed = sidebar_nav::ListedRows::new();
@@ -11933,6 +11959,48 @@ mod tests {
             cwd: None,
             foreground_cwd: None,
         }
+    }
+
+    /// An agent with a working directory, for the bucketing cases.
+    fn agent_in(dir: &str) -> herdr::Agent {
+        herdr::Agent { cwd: Some(dir.into()), ..herdr_agent(Some("claude")) }
+    }
+
+    fn cache_with(agents: Vec<herdr::Agent>) -> herdr::EndpointCache {
+        let mut cache = herdr::EndpointCache::new(herdr::Side::Native);
+        cache.set_agents_for_test(agents);
+        cache
+    }
+
+    /// `show_unmatched` is the sidebar's setting, and the palette reads the same
+    /// listing, so an agent it hides is hidden from both by construction.
+    #[test]
+    fn an_unmatched_agent_is_absent_when_show_unmatched_is_off() {
+        let caches = [cache_with(vec![herdr_agent(Some("claude"))])];
+        assert!(listed_herdr_agents(&caches, &[], &[], false).is_empty());
+        assert_eq!(listed_herdr_agents(&caches, &[], &[], true).len(), 1);
+    }
+
+    /// An agent an open session holds is not listed: its row is that session's.
+    #[test]
+    fn a_claimed_agent_is_absent_from_the_listing() {
+        let agent = herdr_agent(Some("claude"));
+        let claimed =
+            [herdr::HerdrKey { side: herdr::Side::Native, terminal_id: agent.terminal_id.clone() }];
+        let caches = [cache_with(vec![agent])];
+        assert!(listed_herdr_agents(&caches, &claimed, &[], true).is_empty());
+    }
+
+    /// The workspace an agent is bucketed under is the longest matching worktree
+    /// path, which is what the palette carries in its attach payload.
+    #[test]
+    fn a_matched_agent_carries_its_workspace() {
+        let dir = if cfg!(windows) { r"C:\p\wt" } else { "/p/wt" };
+        let caches = [cache_with(vec![agent_in(dir)])];
+        let workspaces = vec![PathBuf::from(dir)];
+        let listed = listed_herdr_agents(&caches, &[], &workspaces, true);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, Some(PathBuf::from(dir)));
     }
 
     /// herdr distinguishes four live states and says so on its own panes.
