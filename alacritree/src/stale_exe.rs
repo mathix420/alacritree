@@ -9,9 +9,8 @@
 // must not open with a `//!` inner doc comment — included mid-crate, an inner
 // attribute fails to parse.
 
-use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
+use std::{fs, io};
 
 /// Marks a renamed-aside file.  Changing the extension also keeps leftovers
 /// out of PATH lookups and cargo's uplift.

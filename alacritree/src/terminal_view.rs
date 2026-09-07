@@ -1,10 +1,9 @@
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
-use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::search::Match;
-use alacritty_terminal::term::{Term, TermDamage};
+use alacritty_terminal::term::{Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape};
 use egui::{
     Color32, CursorIcon, Event, FontFamily, FontId, ImeEvent, Modifiers, MouseWheelUnit,
@@ -16,17 +15,14 @@ use crate::clipboard::{self, Target};
 use crate::color_glyph::{CachedColorGlyph, ColorGlyphCache};
 use crate::colors::{background, default_background, foreground, resolve, rgb_to_color32};
 use crate::config::{Config, Palette};
-use crate::decoration_sprites;
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
 use crate::glyph_cache::{Face, GlyphCache, MAX_EXTRA_CELLS, growth_offset, may_grow};
 use crate::grid_gl::{Frame as GridFrame, GpuGrid};
 use crate::grid_instances::RunView;
 use crate::input::{associated_text, event_to_bytes};
-use crate::jobs;
 use crate::links::{self, Link};
-use crate::mouse;
-use crate::paste;
 use crate::session::{EventProxy, Session, SessionId, SessionKind, TermSize};
+use crate::{decoration_sprites, jobs, mouse, paste};
 
 #[allow(clippy::too_many_arguments)]
 pub fn show(
@@ -1541,7 +1537,8 @@ fn paint_run_glyphs(
     let (x, y) = (cells.min.x, cells.min.y);
 
     if !style.flags.contains(Flags::HIDDEN) {
-        // Per-glyph paint: egui's run layout drifts off the cursor's `col * cell_w` grid (worse with zoom).
+        // Per-glyph paint: egui's run layout drifts off the cursor's `col * cell_w` grid (worse
+        // with zoom).
         let face =
             Face::new(style.flags.contains(Flags::BOLD), style.flags.contains(Flags::ITALIC));
         let glyph_dx = config.font.glyph_offset.x as f32;
@@ -2596,14 +2593,10 @@ mod tests {
             painted_text(&ctx, &mut session, &config, &mut caches, screen, Vec::new());
         assert!(!scrolled_back.contains(&last), "the grid is not scrolled back to begin with");
 
-        let typed = painted_text(
-            &ctx,
-            &mut session,
-            &config,
-            &mut caches,
-            screen,
-            vec![Event::Text("a".to_owned())],
-        );
+        let typed =
+            painted_text(&ctx, &mut session, &config, &mut caches, screen, vec![Event::Text(
+                "a".to_owned(),
+            )]);
 
         assert!(
             typed.contains(&last),
@@ -2789,7 +2782,8 @@ mod tests {
     }
 
     /// Not a gate — run it by hand:
-    /// `cargo test -p alacritree --release -- --ignored --nocapture --test-threads=1 report_echo_latency`
+    /// `cargo test -p alacritree --release -- --ignored --nocapture --test-threads=1
+    /// report_echo_latency`
     ///
     /// What the user actually waits for: output reaching the terminal, and
     /// that output reaching the screen.  The frame loop is modelled the way
@@ -2946,7 +2940,8 @@ mod tests {
     }
 
     /// Not a gate — run it by hand:
-    /// `cargo test -p alacritree --release -- --ignored --nocapture --test-threads=1 report_cost_by_rows`
+    /// `cargo test -p alacritree --release -- --ignored --nocapture --test-threads=1
+    /// report_cost_by_rows`
     ///
     /// A full-screen app repaints in place, so its damage is a handful of rows
     /// rather than the whole grid — the one workload where skipping unchanged
@@ -2993,7 +2988,8 @@ mod tests {
             }
 
             println!(
-                "{filled:>3} of {rows} rows with content: build {:?} + tessellate {:?}, {} vertices",
+                "{filled:>3} of {rows} rows with content: build {:?} + tessellate {:?}, {} \
+                 vertices",
                 build / iterations,
                 tessellate / iterations,
                 cost.vertices,

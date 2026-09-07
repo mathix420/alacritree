@@ -202,8 +202,8 @@ mod tests {
         // timing threshold would notice.
         assert!(
             big_visits < small_visits * 20,
-            "comparing a 10× larger tree examined {big_visits} records against {small_visits} \
-             — that is superlinear, so something is scanning inside a per-node loop"
+            "comparing a 10× larger tree examined {big_visits} records against {small_visits} — \
+             that is superlinear, so something is scanning inside a per-node loop"
         );
     }
 

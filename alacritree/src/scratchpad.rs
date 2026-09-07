@@ -136,7 +136,8 @@ pub fn show_editor(
                         .text_color(text_color)
                         .hint_text(
                             RichText::new(
-                                "Start typing.\n\nEverything is automatically saved to this workspace.",
+                                "Start typing.\n\nEverything is automatically saved to this \
+                                 workspace.",
                             )
                             .color(hint_color)
                             .monospace()

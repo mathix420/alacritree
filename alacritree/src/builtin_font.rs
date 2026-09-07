@@ -67,16 +67,13 @@ impl BuiltinGlyphCache {
             let image = Arc::try_unwrap(glyph.image).unwrap_or_else(|arc| (*arc).clone());
             let texture =
                 ctx.load_texture(format!("builtin_{:x}", c as u32), image, TextureOptions::NEAREST);
-            self.entries.insert(
-                c,
-                CachedGlyph {
-                    texture,
-                    top: glyph.top,
-                    left: glyph.left,
-                    width: glyph.width,
-                    height: glyph.height,
-                },
-            );
+            self.entries.insert(c, CachedGlyph {
+                texture,
+                top: glyph.top,
+                left: glyph.left,
+                width: glyph.width,
+                height: glyph.height,
+            });
         }
         self.entries.get(&c)
     }

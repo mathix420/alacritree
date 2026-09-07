@@ -2,9 +2,8 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener, Notify, WindowSize};
@@ -18,11 +17,9 @@ use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
 use alacritty_terminal::vte::ansi::Rgb;
 
 use crate::clipboard::Target;
-use crate::colors;
 use crate::config::{Config, Palette};
-use crate::herdr;
-use crate::scratchpad;
 use crate::wsl_helper::{self, WslProbe};
+use crate::{colors, herdr, scratchpad};
 
 #[derive(Clone)]
 pub struct EventProxy {
@@ -2144,8 +2141,7 @@ mod tests {
     fn pty_less_probe(kind: SessionKind, title: &str) -> Session {
         let size = TermSize::new(80, 24);
         let (proxy, events) = EventProxy::new(egui::Context::default());
-        let term =
-            Arc::new(FairMutex::new(Term::new(TermConfig::default(), &size, proxy.clone())));
+        let term = Arc::new(FairMutex::new(Term::new(TermConfig::default(), &size, proxy.clone())));
 
         Session {
             id: 0,
@@ -2424,15 +2420,11 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "$out = [Console]::OpenStandardOutput()\n\
-                 $block = [Text.Encoding]::ASCII.GetBytes([string]::new('x', 262144))\n\
-                 for ($i = 0; $i -lt 32; $i++) {{\n\
-                 $out.Write($block, 0, $block.Length)\n\
-                 }}\n\
-                 $tail = [Text.Encoding]::ASCII.GetBytes(\"`n{MARKER}`n\")\n\
-                 $out.Write($tail, 0, $tail.Length)\n\
-                 $out.Flush()\n\
-                 Start-Sleep -Seconds 600\n"
+                "$out = [Console]::OpenStandardOutput()\n$block = \
+                 [Text.Encoding]::ASCII.GetBytes([string]::new('x', 262144))\nfor ($i = 0; $i -lt \
+                 32; $i++) {{\n$out.Write($block, 0, $block.Length)\n}}\n$tail = \
+                 [Text.Encoding]::ASCII.GetBytes(\"`n{MARKER}`n\")\n$out.Write($tail, 0, \
+                 $tail.Length)\n$out.Flush()\nStart-Sleep -Seconds 600\n"
             ),
         )
         .unwrap();
@@ -2545,14 +2537,14 @@ mod tests {
         assert_eq!(
             probe(false),
             ERROR_BAD_EXE_FORMAT,
-            "the planted conpty.dll was not reached through PATH, so the hardened arm \
-             below would pass whatever the search order does"
+            "the planted conpty.dll was not reached through PATH, so the hardened arm below would \
+             pass whatever the search order does"
         );
         assert_eq!(
             probe(true),
             ERROR_MOD_NOT_FOUND,
-            "`conpty.dll` still resolves out of PATH, so another terminal's console host \
-             would end up hosting every pane"
+            "`conpty.dll` still resolves out of PATH, so another terminal's console host would \
+             end up hosting every pane"
         );
     }
 

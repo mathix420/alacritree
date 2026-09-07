@@ -105,8 +105,8 @@ fn handle_response(response: &UNNotificationResponse) {
 pub fn init(ctx: egui::Context) {
     if NSBundle::mainBundle().bundleIdentifier().is_none() {
         log::warn!(
-            "desktop notifications disabled: not running from an app bundle \
-             (assemble one with alacritree/extra/osx/make-app.sh)"
+            "desktop notifications disabled: not running from an app bundle (assemble one with \
+             alacritree/extra/osx/make-app.sh)"
         );
         let _ = STATE.set(None);
         return;

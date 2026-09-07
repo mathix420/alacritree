@@ -148,14 +148,11 @@ mod tests {
 
         let result = visible_rows(&staged, &unstaged, &branch, ALL, &mut query_pass);
 
-        assert_eq!(
-            result.rows,
-            vec![
-                row(GitSection::Staged, "a.rs", Some(ChangeKind::Added)),
-                row(GitSection::Unstaged, "b.rs", Some(ChangeKind::Modified)),
-                row(GitSection::Branch, "c.rs", None),
-            ]
-        );
+        assert_eq!(result.rows, vec![
+            row(GitSection::Staged, "a.rs", Some(ChangeKind::Added)),
+            row(GitSection::Unstaged, "b.rs", Some(ChangeKind::Modified)),
+            row(GitSection::Branch, "c.rs", None),
+        ]);
         assert_eq!((result.staged.visible, result.staged.total), (1, 1));
         assert_eq!((result.unstaged.visible, result.unstaged.total), (1, 1));
         assert_eq!((result.branch.visible, result.branch.total), (1, 1));
@@ -185,10 +182,11 @@ mod tests {
 
         let result = visible_rows(&staged, &unstaged, &branch, NONE, &mut query_pass);
 
-        assert_eq!(
-            result.rows,
-            vec![row(GitSection::Staged, "conflict.rs", Some(ChangeKind::Conflicted))]
-        );
+        assert_eq!(result.rows, vec![row(
+            GitSection::Staged,
+            "conflict.rs",
+            Some(ChangeKind::Conflicted)
+        )]);
         assert_eq!((result.staged.visible, result.staged.total), (1, 1));
     }
 
@@ -203,14 +201,11 @@ mod tests {
 
         let result = visible_rows(&staged, &unstaged, &branch, ALL, &mut query_pass);
 
-        assert_eq!(
-            result.rows,
-            vec![
-                row(GitSection::Staged, "keep.rs", Some(ChangeKind::Added)),
-                row(GitSection::Unstaged, "keep.rs", Some(ChangeKind::Modified)),
-                row(GitSection::Branch, "keep.rs", None),
-            ]
-        );
+        assert_eq!(result.rows, vec![
+            row(GitSection::Staged, "keep.rs", Some(ChangeKind::Added)),
+            row(GitSection::Unstaged, "keep.rs", Some(ChangeKind::Modified)),
+            row(GitSection::Branch, "keep.rs", None),
+        ]);
         assert_eq!((result.staged.visible, result.staged.total), (1, 2));
         assert_eq!((result.unstaged.visible, result.unstaged.total), (1, 2));
         assert_eq!((result.branch.visible, result.branch.total), (1, 2));

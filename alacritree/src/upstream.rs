@@ -22,11 +22,11 @@ pub enum UpstreamState {
 }
 
 /// Parse the tab-delimited output of
-/// `git for-each-ref --format='%(refname:short)%09%(upstream:short)%09%(upstream:track,nobracket)'`.
-/// The track field is empty for a level branch, absent-upstream branches
-/// carry an empty upstream, and `gone` marks a configured upstream whose ref
-/// no longer resolves. Callers must run git under `LC_ALL=C`: the track
-/// vocabulary is localized.
+/// `git for-each-ref
+/// --format='%(refname:short)%09%(upstream:short)%09%(upstream:track,nobracket)'`. The track field
+/// is empty for a level branch, absent-upstream branches carry an empty upstream, and `gone` marks
+/// a configured upstream whose ref no longer resolves. Callers must run git under `LC_ALL=C`: the
+/// track vocabulary is localized.
 pub fn parse_for_each_ref(bytes: &[u8]) -> HashMap<String, UpstreamState> {
     let text = String::from_utf8_lossy(bytes);
     let mut map = HashMap::new();
@@ -177,18 +177,21 @@ mod tests {
                     solo\t\t\n";
         let map = parse_for_each_ref(out);
         assert_eq!(map["level"], UpstreamState::Level { upstream: "origin/level".into() });
-        assert_eq!(
-            map["ahead"],
-            UpstreamState::Diverged { upstream: "origin/ahead".into(), ahead: 2, behind: 0 }
-        );
-        assert_eq!(
-            map["behind"],
-            UpstreamState::Diverged { upstream: "origin/behind".into(), ahead: 0, behind: 3 }
-        );
-        assert_eq!(
-            map["both"],
-            UpstreamState::Diverged { upstream: "origin/both".into(), ahead: 2, behind: 3 }
-        );
+        assert_eq!(map["ahead"], UpstreamState::Diverged {
+            upstream: "origin/ahead".into(),
+            ahead: 2,
+            behind: 0
+        });
+        assert_eq!(map["behind"], UpstreamState::Diverged {
+            upstream: "origin/behind".into(),
+            ahead: 0,
+            behind: 3
+        });
+        assert_eq!(map["both"], UpstreamState::Diverged {
+            upstream: "origin/both".into(),
+            ahead: 2,
+            behind: 3
+        });
         assert_eq!(map["dead"], UpstreamState::Gone { upstream: "origin/dead".into() });
         assert_eq!(map["solo"], UpstreamState::Untracked);
     }
@@ -318,18 +321,21 @@ mod git2_tests {
 
         let map = map_from_repo(&repo);
         assert_eq!(map["level"], UpstreamState::Level { upstream: "main".into() });
-        assert_eq!(
-            map["ahead"],
-            UpstreamState::Diverged { upstream: "main".into(), ahead: 2, behind: 0 }
-        );
-        assert_eq!(
-            map["behind"],
-            UpstreamState::Diverged { upstream: "upstream-behind".into(), ahead: 0, behind: 3 }
-        );
-        assert_eq!(
-            map["diverged"],
-            UpstreamState::Diverged { upstream: "upstream-diverged".into(), ahead: 2, behind: 4 }
-        );
+        assert_eq!(map["ahead"], UpstreamState::Diverged {
+            upstream: "main".into(),
+            ahead: 2,
+            behind: 0
+        });
+        assert_eq!(map["behind"], UpstreamState::Diverged {
+            upstream: "upstream-behind".into(),
+            ahead: 0,
+            behind: 3
+        });
+        assert_eq!(map["diverged"], UpstreamState::Diverged {
+            upstream: "upstream-diverged".into(),
+            ahead: 2,
+            behind: 4
+        });
     }
 
     fn commit_empty(repo: &Repository) -> git2::Oid {

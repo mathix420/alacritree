@@ -400,8 +400,8 @@ mod tests {
                 .is_none_or(|face| crate::fonts::face_outlines_char(&face, c));
             assert!(
                 drawn_in_color || drawn_by_egui,
-                "U+{:04X} {c} is claimed by a face that can draw neither an outline nor \
-                 colour artwork for it, so the cell renders blank",
+                "U+{:04X} {c} is claimed by a face that can draw neither an outline nor colour \
+                 artwork for it, so the cell renders blank",
                 c as u32
             );
         }
@@ -418,7 +418,7 @@ mod tests {
         };
         let mut cache = ColorGlyphCache::new(chain.clone(), 10);
         let face = cache.resolve_claiming_face('😀').expect("no face claims U+1F600");
-        let (image, _, _) = cache.render('😀', &face, (9, 20), 2).expect("emoji did not rasterize");
+        let (image, ..) = cache.render('😀', &face, (9, 20), 2).expect("emoji did not rasterize");
 
         let hues: std::collections::HashSet<(u8, u8, u8)> = image
             .pixels

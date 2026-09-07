@@ -760,8 +760,8 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
         assert!(sections[6].contains("LC_ALL=C"), "the track vocabulary is localized");
         assert!(
             sections[6].contains(r#"if [ "$2" = "1" ]; then"#),
-            "the for-each-ref call must stay gated by the upstream flag, or the feature runs \
-             even when disabled"
+            "the for-each-ref call must stay gated by the upstream flag, or the feature runs even \
+             when disabled"
         );
     }
 

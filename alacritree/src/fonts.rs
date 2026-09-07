@@ -227,7 +227,7 @@ fn scan_coverage_with_workers(
     // Stat once per distinct file, before the fan-out, so the parallel
     // phase reads a finished map instead of contending on one.
     let mut stat_memo: HashMap<PathBuf, Option<(u64, u64)>> = HashMap::new();
-    for (path, _, _) in &faces {
+    for (path, ..) in &faces {
         stat_memo.entry(path.clone()).or_insert_with(|| disk_cache::stat_file(path));
     }
 
@@ -532,9 +532,13 @@ pub(crate) fn face_outlines_char(face: &ChainFace, c: char) -> bool {
 struct DiscardOutline;
 impl ttf_parser::OutlineBuilder for DiscardOutline {
     fn move_to(&mut self, _: f32, _: f32) {}
+
     fn line_to(&mut self, _: f32, _: f32) {}
+
     fn quad_to(&mut self, _: f32, _: f32, _: f32, _: f32) {}
+
     fn curve_to(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32) {}
+
     fn close(&mut self) {}
 }
 
@@ -3096,16 +3100,13 @@ mod coverage {
             order_candidates(&mut candidates, "seed family", 700, false);
             let order: Vec<_> =
                 candidates.iter().map(|(c, _)| (c.family.as_str(), c.weight)).collect();
-            assert_eq!(
-                order,
-                [
-                    ("Seed Family", 400), // same family wins even without a style match
-                    ("Beta", 700),        // style match + monospace
-                    ("Beta", 400),        // monospace
-                    ("Alpha", 700),       // italic mismatches the variant; name order
-                    ("Zeta", 400),
-                ]
-            );
+            assert_eq!(order, [
+                ("Seed Family", 400), // same family wins even without a style match
+                ("Beta", 700),        // style match + monospace
+                ("Beta", 400),        // monospace
+                ("Alpha", 700),       // italic mismatches the variant; name order
+                ("Zeta", 400),
+            ]);
         }
 
         #[test]

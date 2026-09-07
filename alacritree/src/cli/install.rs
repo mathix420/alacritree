@@ -7,9 +7,8 @@
 //! from the renamed file, and a later install sweeps it once the process has
 //! exited.
 
-use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
+use std::{fs, io};
 
 use crate::stale_exe;
 

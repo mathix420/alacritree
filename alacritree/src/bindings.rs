@@ -348,11 +348,9 @@ impl NamedAction {
                 "Jump the sidebar cursor to the previous project".into()
             },
             Self::RefreshProjects => "Rescan every project's worktrees".into(),
-            Self::DeleteSelected => {
-                "Close the selected session, delete the selected worktree, or remove the selected \
-                 project"
-                    .into()
-            },
+            Self::DeleteSelected => "Close the selected session, delete the selected worktree, or \
+                                     remove the selected project"
+                .into(),
             Self::RenameSelected => "Rename the selected project".into(),
             Self::ToggleProjectExpanded => "Expand or collapse the selected project".into(),
             Self::FocusProjectsSidebar => "Focus the projects sidebar".into(),
@@ -1415,10 +1413,9 @@ mod tests {
             vec![NamedAction::SelectNextTab],
             "Ctrl+Tab default must survive a Ctrl+Shift+Tab user binding"
         );
-        assert_eq!(
-            named_matches(&b, Key::Tab, Modifiers::CTRL | Modifiers::SHIFT),
-            vec![NamedAction::SelectLastTab]
-        );
+        assert_eq!(named_matches(&b, Key::Tab, Modifiers::CTRL | Modifiers::SHIFT), vec![
+            NamedAction::SelectLastTab
+        ]);
     }
 
     #[test]
@@ -1504,18 +1501,15 @@ mod tests {
     #[test]
     fn search_actions_have_default_bindings() {
         let b = parse_bindings(vec![]);
-        assert_eq!(
-            named_matches(&b, Key::Enter, Modifiers::NONE),
-            vec![NamedAction::SidebarSearchConfirm]
-        );
-        assert_eq!(
-            named_matches(&b, Key::Escape, Modifiers::NONE),
-            vec![NamedAction::SidebarSearchCancel]
-        );
-        assert_eq!(
-            named_matches(&b, Key::Escape, Modifiers::SHIFT),
-            vec![NamedAction::SidebarSearchCancelToTerminal]
-        );
+        assert_eq!(named_matches(&b, Key::Enter, Modifiers::NONE), vec![
+            NamedAction::SidebarSearchConfirm
+        ]);
+        assert_eq!(named_matches(&b, Key::Escape, Modifiers::NONE), vec![
+            NamedAction::SidebarSearchCancel
+        ]);
+        assert_eq!(named_matches(&b, Key::Escape, Modifiers::SHIFT), vec![
+            NamedAction::SidebarSearchCancelToTerminal
+        ]);
         // Plain Esc and Shift+Esc are distinct triggers, not aliases.
         assert!(named_matches(&b, Key::Enter, Modifiers::SHIFT).is_empty());
     }
@@ -1529,10 +1523,9 @@ mod tests {
     #[test]
     fn user_binding_replaces_sidebar_focus_default() {
         let b = parse_bindings(vec![raw_action("B", Some("Control|Shift"), "ReceiveChar")]);
-        assert_eq!(
-            named_matches(&b, Key::B, Modifiers::CTRL | Modifiers::SHIFT),
-            vec![NamedAction::ReceiveChar]
-        );
+        assert_eq!(named_matches(&b, Key::B, Modifiers::CTRL | Modifiers::SHIFT), vec![
+            NamedAction::ReceiveChar
+        ]);
     }
 
     #[test]
@@ -1559,10 +1552,9 @@ mod tests {
         let mut r = raw_action("B", Some("Control"), "ToggleViMode");
         r.mode = Some("Vi".into());
         let b = parse_bindings(vec![r]);
-        assert_eq!(
-            named_matches(&b, Key::B, Modifiers::CTRL),
-            vec![NamedAction::ToggleLeftSidebar]
-        );
+        assert_eq!(named_matches(&b, Key::B, Modifiers::CTRL), vec![
+            NamedAction::ToggleLeftSidebar
+        ]);
     }
 
     #[test]
@@ -1604,10 +1596,9 @@ mod tests {
     #[test]
     fn close_session_is_a_default_ctrl_shift_w_binding() {
         let b = parse_bindings(vec![]);
-        assert_eq!(
-            named_matches(&b, Key::W, Modifiers::CTRL | Modifiers::SHIFT),
-            vec![NamedAction::CloseSession]
-        );
+        assert_eq!(named_matches(&b, Key::W, Modifiers::CTRL | Modifiers::SHIFT), vec![
+            NamedAction::CloseSession
+        ]);
     }
 
     #[test]
@@ -1760,10 +1751,9 @@ mod tests {
     #[test]
     fn delete_selected_has_an_unmodified_delete_default_and_parses() {
         let b = parse_bindings(vec![]);
-        assert_eq!(
-            named_matches(&b, Key::Delete, Modifiers::NONE),
-            vec![NamedAction::DeleteSelected]
-        );
+        assert_eq!(named_matches(&b, Key::Delete, Modifiers::NONE), vec![
+            NamedAction::DeleteSelected
+        ]);
         assert!(matches!(
             parse_action("DeleteSelected"),
             BindingAction::Named(NamedAction::DeleteSelected)
@@ -1798,10 +1788,9 @@ mod tests {
     #[test]
     fn toggle_project_expanded_has_an_unmodified_o_default_and_parses() {
         let b = parse_bindings(vec![]);
-        assert_eq!(
-            named_matches(&b, Key::O, Modifiers::NONE),
-            vec![NamedAction::ToggleProjectExpanded]
-        );
+        assert_eq!(named_matches(&b, Key::O, Modifiers::NONE), vec![
+            NamedAction::ToggleProjectExpanded
+        ]);
         assert!(matches!(
             parse_action("ToggleProjectExpanded"),
             BindingAction::Named(NamedAction::ToggleProjectExpanded)
@@ -1824,10 +1813,9 @@ mod tests {
     #[test]
     fn scratchpad_tab_is_a_default_ctrl_backtick_binding_and_parses() {
         let b = parse_bindings(vec![]);
-        assert_eq!(
-            named_matches(&b, Key::Backtick, Modifiers::CTRL),
-            vec![NamedAction::OpenScratchpad]
-        );
+        assert_eq!(named_matches(&b, Key::Backtick, Modifiers::CTRL), vec![
+            NamedAction::OpenScratchpad
+        ]);
         assert!(matches!(
             parse_action("OpenScratchpad"),
             BindingAction::Named(NamedAction::OpenScratchpad)

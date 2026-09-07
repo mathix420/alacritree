@@ -32,9 +32,9 @@ pub fn document() -> String {
     obj.insert("title".into(), "alacritree configuration".into());
     obj.insert(
         "description".into(),
-        "Everything alacritree reads out of alacritty.toml and alacritree.toml. \
-         Unknown keys are allowed: the two files are layers, and alacritty.toml \
-         legitimately carries keys only the real alacritty acts on."
+        "Everything alacritree reads out of alacritty.toml and alacritree.toml. Unknown keys are \
+         allowed: the two files are layers, and alacritty.toml legitimately carries keys only the \
+         real alacritty acts on."
             .into(),
     );
 

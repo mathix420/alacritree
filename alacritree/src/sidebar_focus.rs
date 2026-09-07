@@ -646,10 +646,10 @@ mod tests {
         let s = snapshot();
         let wt1 = s.find(&row_worktree("/a/wt1")).unwrap();
         let kids = s.children(Parent::Node(wt1));
-        assert_eq!(
-            kids.iter().map(|&id| s.row(id).clone()).collect::<Vec<_>>(),
-            vec![SidebarRow::Session(1), SidebarRow::Session(2)]
-        );
+        assert_eq!(kids.iter().map(|&id| s.row(id).clone()).collect::<Vec<_>>(), vec![
+            SidebarRow::Session(1),
+            SidebarRow::Session(2)
+        ]);
     }
 
     #[test]
@@ -675,20 +675,16 @@ mod tests {
         // Each UI input on its own.
         assert!(!base.matches(&[], [session(&HOME, 1, false)].into_iter(), ui("x", 0)));
         assert!(!base.matches(&[], [session(&HOME, 1, false)].into_iter(), ui("", 0b01)));
-        assert!(!base.matches(
-            &[],
-            [session(&HOME, 1, false)].into_iter(),
-            UiInputs {
-                session_rows_always: true,
-                query: "",
-                toggles: 0,
-                toggles_apply: true,
-                pr_generation: 0,
-                active_workspace: None,
-                active_branch: None,
-                herdr_generation: 0,
-            },
-        ));
+        assert!(!base.matches(&[], [session(&HOME, 1, false)].into_iter(), UiInputs {
+            session_rows_always: true,
+            query: "",
+            toggles: 0,
+            toggles_apply: true,
+            pr_generation: 0,
+            active_workspace: None,
+            active_branch: None,
+            herdr_generation: 0,
+        },));
 
         // Each session input on its own: attention, id, count.
         assert!(!base.matches(&[], [session(&HOME, 1, true)].into_iter(), ui("", 0)));

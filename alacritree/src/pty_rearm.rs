@@ -90,8 +90,8 @@ const DRAIN_AHEAD: usize = 2 * PIPE_CAPACITY;
 
 const _: () = assert!(
     DRAIN_AHEAD > PIPE_CAPACITY,
-    "a refill that cannot outrun the ring never reaches the read that hands \
-     the waker back, so the announcements never stop",
+    "a refill that cannot outrun the ring never reaches the read that hands the waker back, so \
+     the announcements never stop",
 );
 
 /// Bytes taken out of the console pipe ahead of the read loop, and how far the

@@ -461,22 +461,16 @@ mod tests {
         use crate::config::{Adjust, Decorations};
         let metrics = crate::fonts::FaceMetrics::default();
         let plain = Geometry::resolve([10, 24], 16.0, 2.0, &metrics, &Decorations::default());
-        let shifted = Geometry::resolve(
-            [10, 24],
-            16.0,
-            2.0,
-            &metrics,
-            &Decorations { underline_position: Adjust::Pixels(2.0), ..Decorations::default() },
-        );
+        let shifted = Geometry::resolve([10, 24], 16.0, 2.0, &metrics, &Decorations {
+            underline_position: Adjust::Pixels(2.0),
+            ..Decorations::default()
+        });
         assert_eq!(shifted.underline_y - plain.underline_y, 2.0);
 
-        let in_points = Geometry::resolve(
-            [10, 24],
-            16.0,
-            2.0,
-            &metrics,
-            &Decorations { underline_position: Adjust::Points(2.0), ..Decorations::default() },
-        );
+        let in_points = Geometry::resolve([10, 24], 16.0, 2.0, &metrics, &Decorations {
+            underline_position: Adjust::Points(2.0),
+            ..Decorations::default()
+        });
         assert_eq!(in_points.underline_y - plain.underline_y, 4.0);
     }
 
@@ -490,13 +484,10 @@ mod tests {
         // resolves to a fractional 1.4: rounding first would answer 2.0 where
         // scaling first answers 3.0.  A whole-pixel stroke leaves the two
         // orderings agreeing and the assertion proving nothing.
-        let doubled = Geometry::resolve(
-            [10, 24],
-            22.4,
-            1.0,
-            &metrics,
-            &Decorations { underline_thickness: Adjust::Scale(2.0), ..Decorations::default() },
-        );
+        let doubled = Geometry::resolve([10, 24], 22.4, 1.0, &metrics, &Decorations {
+            underline_thickness: Adjust::Scale(2.0),
+            ..Decorations::default()
+        });
         assert_eq!(doubled.underline_thickness, 3.0);
     }
 
@@ -508,23 +499,17 @@ mod tests {
         use crate::config::{Adjust, Decorations};
         let metrics = crate::fonts::FaceMetrics::default();
         let plain = Geometry::resolve([10, 24], 16.0, 2.0, &metrics, &Decorations::default());
-        let shifted = Geometry::resolve(
-            [10, 24],
-            16.0,
-            2.0,
-            &metrics,
-            &Decorations { strikeout_position: Adjust::Pixels(2.0), ..Decorations::default() },
-        );
+        let shifted = Geometry::resolve([10, 24], 16.0, 2.0, &metrics, &Decorations {
+            strikeout_position: Adjust::Pixels(2.0),
+            ..Decorations::default()
+        });
         assert_eq!(shifted.strikeout_y - plain.strikeout_y, 2.0);
         assert_eq!(shifted.underline_y, plain.underline_y, "moved the wrong line");
 
-        let in_points = Geometry::resolve(
-            [10, 24],
-            16.0,
-            2.0,
-            &metrics,
-            &Decorations { strikeout_position: Adjust::Points(2.0), ..Decorations::default() },
-        );
+        let in_points = Geometry::resolve([10, 24], 16.0, 2.0, &metrics, &Decorations {
+            strikeout_position: Adjust::Points(2.0),
+            ..Decorations::default()
+        });
         assert_eq!(in_points.strikeout_y - plain.strikeout_y, 4.0);
     }
 
@@ -536,13 +521,10 @@ mod tests {
         use crate::config::{Adjust, Decorations};
         let metrics = crate::fonts::FaceMetrics::default();
         let plain = Geometry::resolve([10, 24], 22.4, 1.0, &metrics, &Decorations::default());
-        let doubled = Geometry::resolve(
-            [10, 24],
-            22.4,
-            1.0,
-            &metrics,
-            &Decorations { strikeout_thickness: Adjust::Scale(2.0), ..Decorations::default() },
-        );
+        let doubled = Geometry::resolve([10, 24], 22.4, 1.0, &metrics, &Decorations {
+            strikeout_thickness: Adjust::Scale(2.0),
+            ..Decorations::default()
+        });
         assert_eq!(doubled.strikeout_thickness, 3.0);
         assert_eq!(doubled.underline_thickness, plain.underline_thickness, "scaled the wrong bar");
     }

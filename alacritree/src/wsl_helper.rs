@@ -269,21 +269,18 @@ pub(crate) const SHIM_SCRIPT: &str = r##"d=${XDG_RUNTIME_DIR:-/tmp}/alacritree; 
 /// argv for a session alacritree constructs itself (`ShellChoice::Wsl`,
 /// auto-by-location): the shim with the probe key as `$1`.
 pub fn shim_invocation(distro: &str, workdir: &Path, probe_key: &str) -> (String, Vec<String>) {
-    (
-        "wsl.exe".to_string(),
-        vec![
-            "-d".to_string(),
-            distro.to_string(),
-            "--cd".to_string(),
-            workdir.to_string_lossy().into_owned(),
-            "--exec".to_string(),
-            "sh".to_string(),
-            "-c".to_string(),
-            SHIM_SCRIPT.to_string(),
-            "sh".to_string(),
-            probe_key.to_string(),
-        ],
-    )
+    ("wsl.exe".to_string(), vec![
+        "-d".to_string(),
+        distro.to_string(),
+        "--cd".to_string(),
+        workdir.to_string_lossy().into_owned(),
+        "--exec".to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        SHIM_SCRIPT.to_string(),
+        "sh".to_string(),
+        probe_key.to_string(),
+    ])
 }
 
 /// Probe-key shim for a `[[ui.profiles]]` entry that launches wsl.exe.
@@ -991,13 +988,11 @@ mod tests {
         for byte in stream {
             frames.extend(reader.push(&[byte]).unwrap());
         }
-        assert_eq!(
-            frames,
-            vec![
-                Frame { id: 4, exit: 0, payload: b"hello".to_vec() },
-                Frame { id: 9, exit: 1, payload: Vec::new() },
-            ]
-        );
+        assert_eq!(frames, vec![Frame { id: 4, exit: 0, payload: b"hello".to_vec() }, Frame {
+            id: 9,
+            exit: 1,
+            payload: Vec::new()
+        },]);
     }
 
     #[test]
@@ -1067,21 +1062,18 @@ mod tests {
     fn shim_invocation_builds_expected_argv() {
         let (program, args) = shim_invocation("kali-linux", Path::new(r"C:\proj"), "1234-1");
         assert_eq!(program, "wsl.exe");
-        assert_eq!(
-            args,
-            vec![
-                "-d",
-                "kali-linux",
-                "--cd",
-                r"C:\proj",
-                "--exec",
-                "sh",
-                "-c",
-                SHIM_SCRIPT,
-                "sh",
-                "1234-1",
-            ]
-        );
+        assert_eq!(args, vec![
+            "-d",
+            "kali-linux",
+            "--cd",
+            r"C:\proj",
+            "--exec",
+            "sh",
+            "-c",
+            SHIM_SCRIPT,
+            "sh",
+            "1234-1",
+        ]);
     }
 
     #[test]
@@ -1098,21 +1090,18 @@ mod tests {
         let (args, distro) =
             wrap_profile_argv(r"C:\Windows\System32\wsl.exe", &profile_args, "9-9").unwrap();
         assert_eq!(distro.as_deref(), Some("kali-linux"));
-        assert_eq!(
-            args,
-            vec![
-                "-d",
-                "kali-linux",
-                "--cd",
-                "/home",
-                "--exec",
-                "sh",
-                "-c",
-                SHIM_SCRIPT,
-                "sh",
-                "9-9"
-            ]
-        );
+        assert_eq!(args, vec![
+            "-d",
+            "kali-linux",
+            "--cd",
+            "/home",
+            "--exec",
+            "sh",
+            "-c",
+            SHIM_SCRIPT,
+            "sh",
+            "9-9"
+        ]);
     }
 
     #[test]

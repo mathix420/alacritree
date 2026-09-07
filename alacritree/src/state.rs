@@ -264,10 +264,10 @@ mod tests {
         let path = state_file(&dir);
 
         // The other window adds a project while this one is running.
-        save_to(
-            &path,
-            &PersistedState { projects: vec![project("/repo/theirs")], ..Default::default() },
-        );
+        save_to(&path, &PersistedState {
+            projects: vec![project("/repo/theirs")],
+            ..Default::default()
+        });
 
         // This window, whose startup snapshot predates that project, hides a
         // sidebar.
@@ -288,17 +288,17 @@ mod tests {
     fn adding_a_project_keeps_the_ones_already_on_disk() {
         let dir = TempDir::new().unwrap();
         let path = state_file(&dir);
-        save_to(
-            &path,
-            &PersistedState { projects: vec![project("/repo/theirs")], ..Default::default() },
-        );
+        save_to(&path, &PersistedState {
+            projects: vec![project("/repo/theirs")],
+            ..Default::default()
+        });
 
         mutate_at(&path, |s| s.projects.push(project("/repo/ours")));
 
-        assert_eq!(
-            roots(&load_from(&path)),
-            vec![PathBuf::from("/repo/theirs"), PathBuf::from("/repo/ours"),]
-        );
+        assert_eq!(roots(&load_from(&path)), vec![
+            PathBuf::from("/repo/theirs"),
+            PathBuf::from("/repo/ours"),
+        ]);
     }
 
     /// Re-reading the file must not resurrect a project the user deleted — the
@@ -307,13 +307,10 @@ mod tests {
     fn removing_a_project_deletes_it() {
         let dir = TempDir::new().unwrap();
         let path = state_file(&dir);
-        save_to(
-            &path,
-            &PersistedState {
-                projects: vec![project("/repo/keep"), project("/repo/drop")],
-                ..Default::default()
-            },
-        );
+        save_to(&path, &PersistedState {
+            projects: vec![project("/repo/keep"), project("/repo/drop")],
+            ..Default::default()
+        });
 
         mutate_at(&path, |s| s.projects.retain(|p| p.root != PathBuf::from("/repo/drop")));
 
@@ -368,10 +365,11 @@ mod tests {
         };
         let order = vec![PathBuf::from("/c"), PathBuf::from("/a"), PathBuf::from("/b")];
         reorder_projects(&mut state, &order);
-        assert_eq!(
-            roots(&state),
-            vec![PathBuf::from("/c"), PathBuf::from("/a"), PathBuf::from("/b")]
-        );
+        assert_eq!(roots(&state), vec![
+            PathBuf::from("/c"),
+            PathBuf::from("/a"),
+            PathBuf::from("/b")
+        ]);
     }
 
     /// A project another window added but this one never loaded is not in the

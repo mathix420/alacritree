@@ -594,10 +594,11 @@ mod tests {
         assert_eq!(grid.glyphs[6].slot, BLANK_SLOT, "the overlay drew a glyph as well");
         assert_eq!(grid.glyphs[7].slot, 7);
         let overlays: Vec<_> = grid.overlays().collect();
-        assert_eq!(
-            overlays,
-            [(1, Overlay { col: 2, ch: '\u{1f600}', fg: Color32::WHITE.to_array() })]
-        );
+        assert_eq!(overlays, [(1, Overlay {
+            col: 2,
+            ch: '\u{1f600}',
+            fg: Color32::WHITE.to_array()
+        })]);
     }
 
     /// Overlays live as long as the records they stand in for, so a row that is

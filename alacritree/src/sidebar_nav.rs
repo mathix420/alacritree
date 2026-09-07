@@ -117,15 +117,17 @@ pub fn move_range(
 ) -> Vec<WorkspaceKey> {
     let range: Vec<WorkspaceKey> = match scope {
         ReorderScope::Workspace => Vec::new(),
-        ReorderScope::Project => match origin.as_deref().and_then(|p| owning_project(projects, p)) {
-            Some(project) => order
-                .iter()
-                .filter(|ws| {
-                    ws.as_deref().is_some_and(|p| project.worktrees.iter().any(|w| w.path == p))
-                })
-                .cloned()
-                .collect(),
-            None => Vec::new(),
+        ReorderScope::Project => {
+            match origin.as_deref().and_then(|p| owning_project(projects, p)) {
+                Some(project) => order
+                    .iter()
+                    .filter(|ws| {
+                        ws.as_deref().is_some_and(|p| project.worktrees.iter().any(|w| w.path == p))
+                    })
+                    .cloned()
+                    .collect(),
+                None => Vec::new(),
+            }
         },
         ReorderScope::Anywhere => order.to_vec(),
     };
@@ -423,12 +425,8 @@ pub(crate) mod tests {
 
     #[test]
     fn move_range_workspace_scope_is_the_origin_alone() {
-        let range = move_range(
-            &two_projects(),
-            &full_order(),
-            &ws("/a/wt1"),
-            ReorderScope::Workspace,
-        );
+        let range =
+            move_range(&two_projects(), &full_order(), &ws("/a/wt1"), ReorderScope::Workspace);
         assert_eq!(range, vec![ws("/a/wt1")]);
     }
 
@@ -455,8 +453,7 @@ pub(crate) mod tests {
     fn move_range_ignores_project_expansion() {
         let collapsed =
             vec![project("/a", false, &["/a/wt1", "/a/wt2"]), project("/b", false, &["/b/wt1"])];
-        let range =
-            move_range(&collapsed, &full_order(), &ws("/a/wt1"), ReorderScope::Anywhere);
+        let range = move_range(&collapsed, &full_order(), &ws("/a/wt1"), ReorderScope::Anywhere);
         assert_eq!(range, full_order());
     }
 
@@ -585,26 +582,23 @@ pub(crate) mod tests {
     fn visible_rows_lists_home_then_projects_in_render_order() {
         let projects =
             vec![project("/a", true, &["/a/wt1", "/a/wt2"]), project("/b", true, &["/b/wt1"])];
-        assert_eq!(
-            visible_rows(&projects, &no_sessions()),
-            vec![
-                SidebarRow::Home,
-                SidebarRow::Project(PathBuf::from("/a")),
-                SidebarRow::Worktree(PathBuf::from("/a/wt1")),
-                SidebarRow::Worktree(PathBuf::from("/a/wt2")),
-                SidebarRow::Project(PathBuf::from("/b")),
-                SidebarRow::Worktree(PathBuf::from("/b/wt1")),
-            ]
-        );
+        assert_eq!(visible_rows(&projects, &no_sessions()), vec![
+            SidebarRow::Home,
+            SidebarRow::Project(PathBuf::from("/a")),
+            SidebarRow::Worktree(PathBuf::from("/a/wt1")),
+            SidebarRow::Worktree(PathBuf::from("/a/wt2")),
+            SidebarRow::Project(PathBuf::from("/b")),
+            SidebarRow::Worktree(PathBuf::from("/b/wt1")),
+        ]);
     }
 
     #[test]
     fn visible_rows_hides_worktrees_of_collapsed_projects() {
         let projects = vec![project("/a", false, &["/a/wt1"])];
-        assert_eq!(
-            visible_rows(&projects, &no_sessions()),
-            vec![SidebarRow::Home, SidebarRow::Project(PathBuf::from("/a")),]
-        );
+        assert_eq!(visible_rows(&projects, &no_sessions()), vec![
+            SidebarRow::Home,
+            SidebarRow::Project(PathBuf::from("/a")),
+        ]);
     }
 
     #[test]
@@ -680,14 +674,11 @@ pub(crate) mod tests {
             project_self: &|_p| false,
             worktree: &mut |_p, wt| wt.path == PathBuf::from("/a/wt1"),
         };
-        assert_eq!(
-            filtered_rows(&projects, &no_sessions(), preds),
-            vec![
-                SidebarRow::Home,
-                SidebarRow::Project(PathBuf::from("/a")),
-                SidebarRow::Worktree(PathBuf::from("/a/wt1")),
-            ]
-        );
+        assert_eq!(filtered_rows(&projects, &no_sessions(), preds), vec![
+            SidebarRow::Home,
+            SidebarRow::Project(PathBuf::from("/a")),
+            SidebarRow::Worktree(PathBuf::from("/a/wt1")),
+        ]);
     }
 
     #[test]
@@ -698,10 +689,10 @@ pub(crate) mod tests {
             project_self: &|p| p.root == PathBuf::from("/a"),
             worktree: &mut |_p, _wt| false,
         };
-        assert_eq!(
-            filtered_rows(&projects, &no_sessions(), preds),
-            vec![SidebarRow::Home, SidebarRow::Project(PathBuf::from("/a"))]
-        );
+        assert_eq!(filtered_rows(&projects, &no_sessions(), preds), vec![
+            SidebarRow::Home,
+            SidebarRow::Project(PathBuf::from("/a"))
+        ]);
     }
 
     #[test]
@@ -712,13 +703,10 @@ pub(crate) mod tests {
             project_self: &|p| p.root == PathBuf::from("/a"),
             worktree: &mut |_p, _wt| true,
         };
-        assert_eq!(
-            filtered_rows(&projects, &no_sessions(), preds),
-            vec![
-                SidebarRow::Project(PathBuf::from("/a")),
-                SidebarRow::Worktree(PathBuf::from("/a/wt1"))
-            ]
-        );
+        assert_eq!(filtered_rows(&projects, &no_sessions(), preds), vec![
+            SidebarRow::Project(PathBuf::from("/a")),
+            SidebarRow::Worktree(PathBuf::from("/a/wt1"))
+        ]);
     }
 
     #[test]
@@ -729,14 +717,11 @@ pub(crate) mod tests {
             project_self: &|p| p.root == PathBuf::from("/a"),
             worktree: &mut |p, _wt| p.root == PathBuf::from("/a"),
         };
-        assert_eq!(
-            filtered_rows(&projects, &no_sessions(), preds),
-            vec![
-                SidebarRow::Home,
-                SidebarRow::Project(PathBuf::from("/a")),
-                SidebarRow::Worktree(PathBuf::from("/a/wt1")),
-            ]
-        );
+        assert_eq!(filtered_rows(&projects, &no_sessions(), preds), vec![
+            SidebarRow::Home,
+            SidebarRow::Project(PathBuf::from("/a")),
+            SidebarRow::Worktree(PathBuf::from("/a/wt1")),
+        ]);
     }
 
     #[test]
@@ -744,28 +729,25 @@ pub(crate) mod tests {
         let projects = vec![project("/a", true, &["/a/wt1"])];
         let sessions =
             HashMap::from([(None, vec![1, 2]), (Some(PathBuf::from("/a/wt1")), vec![3, 4])]);
-        assert_eq!(
-            visible_rows(&projects, &sessions_only(sessions)),
-            vec![
-                SidebarRow::Home,
-                SidebarRow::Session(1),
-                SidebarRow::Session(2),
-                SidebarRow::Project(PathBuf::from("/a")),
-                SidebarRow::Worktree(PathBuf::from("/a/wt1")),
-                SidebarRow::Session(3),
-                SidebarRow::Session(4),
-            ]
-        );
+        assert_eq!(visible_rows(&projects, &sessions_only(sessions)), vec![
+            SidebarRow::Home,
+            SidebarRow::Session(1),
+            SidebarRow::Session(2),
+            SidebarRow::Project(PathBuf::from("/a")),
+            SidebarRow::Worktree(PathBuf::from("/a/wt1")),
+            SidebarRow::Session(3),
+            SidebarRow::Session(4),
+        ]);
     }
 
     #[test]
     fn visible_rows_hides_session_rows_of_collapsed_projects() {
         let projects = vec![project("/a", false, &["/a/wt1"])];
         let sessions = HashMap::from([(Some(PathBuf::from("/a/wt1")), vec![3, 4])]);
-        assert_eq!(
-            visible_rows(&projects, &sessions_only(sessions)),
-            vec![SidebarRow::Home, SidebarRow::Project(PathBuf::from("/a"))]
-        );
+        assert_eq!(visible_rows(&projects, &sessions_only(sessions)), vec![
+            SidebarRow::Home,
+            SidebarRow::Project(PathBuf::from("/a"))
+        ]);
     }
 
     #[test]
@@ -852,16 +834,13 @@ pub(crate) mod tests {
             project_self: &|_p| false,
             worktree: &mut |_p, wt| wt.path == PathBuf::from("/a/wt1"),
         };
-        assert_eq!(
-            filtered_rows(&projects, &sessions_only(sessions), preds),
-            vec![
-                SidebarRow::Home,
-                SidebarRow::Session(1),
-                SidebarRow::Project(PathBuf::from("/a")),
-                SidebarRow::Worktree(PathBuf::from("/a/wt1")),
-                SidebarRow::Session(3),
-            ]
-        );
+        assert_eq!(filtered_rows(&projects, &sessions_only(sessions), preds), vec![
+            SidebarRow::Home,
+            SidebarRow::Session(1),
+            SidebarRow::Project(PathBuf::from("/a")),
+            SidebarRow::Worktree(PathBuf::from("/a/wt1")),
+            SidebarRow::Session(3),
+        ]);
     }
 
     #[test]

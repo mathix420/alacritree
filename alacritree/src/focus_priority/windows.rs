@@ -213,8 +213,8 @@ mod tests {
         GetPriorityClass, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
-    use crate::command_ext::CommandExt as _;
     use super::*;
+    use crate::command_ext::CommandExt as _;
 
     #[test]
     fn a_priority_job_can_move_to_the_thread_that_opens_the_pty() {

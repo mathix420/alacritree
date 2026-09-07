@@ -50,10 +50,10 @@ fn the_committed_schema_matches_the_config_types() {
         .find(|(_, (a, b))| a != b)
         .map_or((0, "", ""), |(i, (a, b))| (i + 1, a, b));
     panic!(
-        "schema/alacritree-config.json is stale — regenerate with \
-         `ALACRITREE_UPDATE_SCHEMA=1 cargo test -p alacritree --test config_schema` \
-         (or `cargo run -p alacritree -- schema > schema/alacritree-config.json`)\n\n\
-         first difference at line {line}:\n  committed: {was}\n  generated: {now}"
+        "schema/alacritree-config.json is stale — regenerate with `ALACRITREE_UPDATE_SCHEMA=1 \
+         cargo test -p alacritree --test config_schema` (or `cargo run -p alacritree -- schema > \
+         schema/alacritree-config.json`)\n\nfirst difference at line {line}:\n  committed: \
+         {was}\n  generated: {now}"
     );
 }
 
