@@ -235,7 +235,7 @@
         },
         "draw_bold_text_with_bright_colors": {
           "default": false,
-          "description": "Draw bold text with the bright color variants.  Default `false`.",
+          "description": "Draw bold text with the bright color variants.",
           "type": "boolean"
         },
         "indexed_colors": {
@@ -263,13 +263,13 @@
     "RawCursor": {
       "properties": {
         "blink_interval": {
-          "description": "Blink interval in milliseconds.  Default `750`.",
+          "description": "Blink interval in milliseconds.  Accepted for alacritty\ncompatibility: alacritree does not blink the cursor, so the real\nalacritty acts on this and nothing here does.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "blink_timeout": {
-          "description": "Seconds after which the cursor stops blinking; `0` never stops.\nDefault `5`.",
+          "description": "Seconds after which the cursor stops blinking; `0` never stops.\nAccepted for alacritty compatibility: alacritree does not blink the\ncursor, so the real alacritty acts on this and nothing here does.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -283,7 +283,7 @@
           "description": "Cursor shape and blinking.  Older alacritty configs write just\n`style = \"Block\"` rather than `style.shape = \"Block\"`; both are\naccepted."
         },
         "unfocused_hollow": {
-          "description": "Render the cursor as a hollow box when the window is not focused.\nDefault `true`.",
+          "description": "Render the cursor as a hollow box when the window is not focused.\nAccepted for alacritty compatibility: alacritree paints the same\ncursor whether or not the window has focus, so the real alacritty\nacts on this and nothing here does.",
           "type": "boolean"
         }
       },
@@ -316,17 +316,17 @@
       "properties": {
         "crash_log": {
           "default": true,
-          "description": "Write an artifact when the process panics.  alacritree-only, so it\nbelongs in `alacritree.toml`.  Default `true`: a crash that leaves no\nrecord is the failure this exists to prevent.",
+          "description": "Write an artifact when the process panics.  alacritree-only, so it\nbelongs in `alacritree.toml`.  A crash that leaves no record is the\nfailure this exists to prevent.",
           "type": "boolean"
         },
         "frame_log": {
           "default": false,
-          "description": "Measure whole frames and report the period, CPU time, grid share and\nkeystroke echo every few seconds.  alacritree-only, so it belongs in\n`alacritree.toml`.  Default `false`.\n\n`ALACRITREE_FRAME_LOG` wins over this key both ways: `1` turns\nmeasurements on, `0` and the empty string turn them off.  The variable\nis the only switch available before the config is read.\n\nKeeps this session's log file for as long as it is on.  The report goes\nto the log stream, and a GUI-subsystem binary has no console.",
+          "description": "Measure whole frames and report the period, CPU time, grid share and\nkeystroke echo every few seconds.  alacritree-only, so it belongs in\n`alacritree.toml`.\n\n`ALACRITREE_FRAME_LOG` wins over this key both ways: `1` turns\nmeasurements on, `0` and the empty string turn them off.  The variable\nis the only switch available before the config is read.\n\nKeeps this session's log file for as long as it is on.  The report goes\nto the log stream, and a GUI-subsystem binary has no console.",
           "type": "boolean"
         },
         "gpu_timing": {
           "default": false,
-          "description": "Log what the GPU grid's paint callback costs: the wall time of\nissuing a frame, and the GPU's own time for the upload and each of\nthe three draws.  alacritree-only, so it belongs in\n`alacritree.toml`.  Default `false`; timer queries are cheap but not\nfree, and the line is only meaningful to someone reading it.  Needs\n`[ui] gpu_grid` and a GL 3.3 context.  Keeps this session's log file\nfor as long as it is on, since the report has nowhere else to go.",
+          "description": "Log what the GPU grid's paint callback costs: the wall time of\nissuing a frame, and the GPU's own time for the upload and each of\nthe three draws.  alacritree-only, so it belongs in\n`alacritree.toml`.  Timer queries are cheap but not free, and the\nline is only meaningful to someone reading it.  Needs `[ui] gpu_grid`\nand a GL 3.3 context.  Keeps this session's log file for as long as\nit is on, since the report has nowhere else to go.",
           "type": "boolean"
         },
         "log_dir": {
@@ -335,14 +335,14 @@
         },
         "persistent_logging": {
           "default": false,
-          "description": "Keep the log file after quitting.  Upstream's name and upstream's\ndefault (`false`).",
+          "description": "Keep the log file after quitting.  Upstream's name and upstream's\ndefault.",
           "type": "boolean"
         }
       },
       "type": "object"
     },
     "RawDecorations": {
-      "description": "Corrections applied to what the font reports for its underline and\nstrikeout.  Each value is `\"2px\"` (physical pixels, added), `\"2pt\"` or a\nbare `\"2\"` (points, added), or `\"150%\"` (a multiplier).  Positive moves a\nline down, matching kitty and ghostty.  A percentage takes no sign.\nDefault `\"0\"`, which draws what the font asked for.",
+      "description": "Corrections applied to what the font reports for its underline and\nstrikeout.  Each value is `\"2px\"` (physical pixels, added), `\"2pt\"` or a\nbare `\"2\"` (points, added), or `\"150%\"` (a multiplier).  Positive moves a\nline down, matching kitty and ghostty.  A percentage takes no sign.  A\nzero offset draws what the font asked for.",
       "properties": {
         "strikeout_position": {
           "default": "0px",
@@ -412,7 +412,7 @@
         },
         "builtin_box_drawing": {
           "default": true,
-          "description": "Draw box-drawing (U+2500–U+259F), legacy computing (U+1FB00–U+1FB3B)\nand Powerline (U+E0B0–U+E0BF) characters with the built-in renderer\ninstead of the font.  Default `true`.",
+          "description": "Draw box-drawing (U+2500–U+259F), legacy computing (U+1FB00–U+1FB3B)\nand Powerline (U+E0B0–U+E0BF) characters with the built-in renderer\ninstead of the font.",
           "type": "boolean"
         },
         "color_glyph_cache_mb": {
@@ -424,7 +424,7 @@
         },
         "color_glyphs": {
           "default": true,
-          "description": "Draw emoji from their font's colour tables.  Turning this off falls\nthrough to the first fallback face with ordinary outlines, so emoji\nrender monochrome.  Also alacritree-only, so it belongs in\n`alacritree.toml` alongside `fallback`.  Default `true`.",
+          "description": "Draw emoji from their font's colour tables.  Turning this off falls\nthrough to the first fallback face with ordinary outlines, so emoji\nrender monochrome.  Also alacritree-only, so it belongs in\n`alacritree.toml` alongside `fallback`.",
           "type": "boolean"
         },
         "fallback": {
@@ -448,11 +448,11 @@
         },
         "offset": {
           "$ref": "#/$defs/RawFontDelta",
-          "description": "Extra space around each cell in pixels: `y` is line spacing, `x` is\nletter spacing.  Default `{ x = 0, y = 0 }`."
+          "description": "Extra space around each cell in pixels: `y` is line spacing, `x` is\nletter spacing."
         },
         "size": {
           "default": 11.25,
-          "description": "Font size in points.  Default `11.25`.",
+          "description": "Font size in points.",
           "format": "float",
           "type": "number"
         }
@@ -498,7 +498,7 @@
       "properties": {
         "ipc_socket": {
           "default": true,
-          "description": "Offer the local socket that `alacritree <command>` and the MCP bridge\nconnect to.  Default `true`.",
+          "description": "Offer the local socket that `alacritree <command>` and the MCP bridge\nconnect to.",
           "type": "boolean"
         },
         "state_dir": {
@@ -855,7 +855,7 @@
       "properties": {
         "diff_title": {
           "default": "full",
-          "description": "\"full\" (default) | \"fish\" | \"zed\", per site.\n\nThe diff pane's title.",
+          "description": "\"full\" | \"fish\" | \"zed\", per site.\n\nThe diff pane's title.",
           "enum": [
             "full",
             "fish",
@@ -951,14 +951,14 @@
       "properties": {
         "history": {
           "default": 10000,
-          "description": "Maximum number of lines kept in the scrollback buffer.\nDefault `10000`.",
+          "description": "Maximum number of lines kept in the scrollback buffer.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
         },
         "multiplier": {
           "default": 3,
-          "description": "Lines scrolled per mouse-wheel increment.  Default `3`.",
+          "description": "Lines scrolled per mouse-wheel increment.",
           "format": "uint8",
           "maximum": 255,
           "minimum": 0,
@@ -971,7 +971,7 @@
       "properties": {
         "save_to_clipboard": {
           "default": false,
-          "description": "Copy selected text to the system clipboard as soon as it is selected.\nDefault `false`.",
+          "description": "Copy selected text to the system clipboard as soon as it is selected.",
           "type": "boolean"
         },
         "semantic_escape_chars": {
@@ -1006,7 +1006,7 @@
         },
         "scope": {
           "default": "workspace",
-          "description": "How far a reorder may carry a session: \"workspace\" (default) |\n\"project\" | \"anywhere\".",
+          "description": "How far a reorder may carry a session: \"workspace\" | \"project\" |\n\"anywhere\".",
           "enum": [
             "workspace",
             "project",
@@ -1155,19 +1155,19 @@
       "properties": {
         "async_session_spawn": {
           "default": false,
-          "description": "Open a session's PTY on a worker rather than in the frame that asked\nfor it, so spawning does not stutter.  Default false.",
+          "description": "Open a session's PTY on a worker rather than in the frame that asked\nfor it, so spawning does not stutter.",
           "type": "boolean"
         },
         "attention_grace_ms": {
           "default": 0,
-          "description": "Grace window in milliseconds before an attention trigger pings; a\nsession that resumes work inside it swallows the ping.  Default 0.",
+          "description": "Grace window in milliseconds before an attention trigger pings; a\nsession that resumes work inside it swallows the ping.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "confirm_session_close": {
           "default": "never",
-          "description": "When the sidebar × on a session row asks before killing the PTY:\n\"never\" (default) | \"busy\" | \"always\".",
+          "description": "When the sidebar × on a session row asks before killing the PTY:\n\"never\" | \"busy\" | \"always\".",
           "enum": [
             "never",
             "busy",
@@ -1177,7 +1177,7 @@
         },
         "confirm_session_detach": {
           "default": true,
-          "description": "Whether the sidebar × on a harness-managed row asks before detaching.\nSeparate from `confirm_session_close` because a detach leaves the\npane running and its row listed again. Default true.",
+          "description": "Whether the sidebar × on a harness-managed row asks before detaching.\nSeparate from `confirm_session_close` because a detach leaves the\npane running and its row listed again.",
           "type": "boolean"
         },
         "decorations": {
@@ -1194,7 +1194,7 @@
         },
         "drop": {
           "$ref": "#/$defs/RawUiDrop",
-          "description": "What a file dragged onto the window does.  Default: every target on."
+          "description": "What a file dragged onto the window does."
         },
         "focus_outline": {
           "$ref": "#/$defs/RawFocusOutline",
@@ -1202,7 +1202,7 @@
         },
         "focus_priority_boost": {
           "default": false,
-          "description": "Put the session on screen one scheduling class above normal — its\nshell and every process that shell starts — so a busy machine cannot\nstarve what the user is typing into.  Follows focus.  Windows only.\nDefault false.",
+          "description": "Put the session on screen one scheduling class above normal — its\nshell and every process that shell starts — so a busy machine cannot\nstarve what the user is typing into.  Follows focus.  Windows only.",
           "type": "boolean"
         },
         "font": {
@@ -1211,12 +1211,12 @@
         },
         "gpu_grid": {
           "default": false,
-          "description": "Draw the terminal grid through an OpenGL paint callback instead of\nhanding epaint a mesh.  Default `false`: it needs a GL 3 context and\nbypasses the renderer every other panel goes through, so an\nunmodified config keeps the path that has always drawn the grid.  A\ncontext too old for instanced arrays logs once and paints the mesh\nfrom the next frame on.",
+          "description": "Draw the terminal grid through an OpenGL paint callback instead of\nhanding epaint a mesh.  It needs a GL 3 context and bypasses the\nrenderer every other panel goes through, so an unmodified config keeps\nthe path that has always drawn the grid.  A context too old for\ninstanced arrays logs once and paints the mesh from the next frame on.",
           "type": "boolean"
         },
         "icon_tooltips": {
           "default": true,
-          "description": "Whether a sidebar icon explains itself on hover: `true` (default).",
+          "description": "Whether a sidebar icon explains itself on hover.",
           "type": "boolean"
         },
         "icons": {
@@ -1251,7 +1251,7 @@
         },
         "last_session_close": {
           "default": "respawn",
-          "description": "What happens when the on-screen workspace stops having sessions,\nwhether a close or a worktree deletion took the last one:\n\"respawn\" (default) | \"navigate\" | \"ring_global\" | \"ring_project\".",
+          "description": "What happens when the on-screen workspace stops having sessions,\nwhether a close or a worktree deletion took the last one:\n\"respawn\" | \"navigate\" | \"ring_global\" | \"ring_project\".",
           "enum": [
             "respawn",
             "navigate",
@@ -1297,12 +1297,12 @@
         },
         "reap_descendants_on_close": {
           "default": false,
-          "description": "End everything a session started when that session closes, at any\ndepth, except processes that ask to break away.  Windows only.\nDefault false.",
+          "description": "End everything a session started when that session closes, at any\ndepth, except processes that ask to break away.  Windows only.",
           "type": "boolean"
         },
         "scrollbar": {
           "default": "floating",
-          "description": "Sidebar scrollbar style: \"floating\" (default) | \"solid\".",
+          "description": "Sidebar scrollbar style: \"floating\" | \"solid\".",
           "enum": [
             "floating",
             "solid"
@@ -1311,7 +1311,7 @@
         },
         "search_scope": {
           "default": "filtered",
-          "description": "Whether a fuzzy query is confined by the panel's active toggle filters:\n\"filtered\" (default) | \"all\".",
+          "description": "Whether a fuzzy query is confined by the panel's active toggle filters:\n\"filtered\" | \"all\".",
           "enum": [
             "filtered",
             "all"
@@ -1360,12 +1360,12 @@
         },
         "sidebar_click_focus": {
           "default": false,
-          "description": "Clicking a sidebar moves keyboard focus to it.  Default false.",
+          "description": "Clicking a sidebar moves keyboard focus to it.",
           "type": "boolean"
         },
         "sidebar_focus": {
           "default": "preserve",
-          "description": "How far the projects sidebar goes when the cursor's row stops being\nrendered: \"preserve\" (default) | \"follow\".",
+          "description": "How far the projects sidebar goes when the cursor's row stops being\nrendered: \"preserve\" | \"follow\".",
           "enum": [
             "preserve",
             "follow"
@@ -1374,7 +1374,7 @@
         },
         "sidebar_follow_active": {
           "default": false,
-          "description": "Whether the projects sidebar scrolls to the session on screen whenever\nit changes — a cycling key, a click, the palette, an IPC request.\nThe sidebar cursor is left where it was: `false` (default).",
+          "description": "Whether the projects sidebar scrolls to the session on screen whenever\nit changes — a cycling key, a click, the palette, an IPC request.\nThe sidebar cursor is left where it was.",
           "type": "boolean"
         },
         "sidebar_foreground": {
@@ -1387,7 +1387,7 @@
         },
         "sidebar_scroll_align": {
           "default": "minimal",
-          "description": "Where a row the sidebar scrolled to is parked:\n\"minimal\" (default) | \"center\".  Under \"center\" every cursor step\nre-centres the list, and clicking a row near the panel edge scrolls it\nout from under the pointer.",
+          "description": "Where a row the sidebar scrolled to is parked: \"minimal\" | \"center\".\nUnder \"center\" every cursor step re-centres the list, and clicking a\nrow near the panel edge scrolls it out from under the pointer.",
           "enum": [
             "minimal",
             "center"
@@ -1396,7 +1396,7 @@
         },
         "sidebar_tooltips": {
           "default": "elided",
-          "description": "When a sidebar row spells its full name out on hover:\n\"elided\" (default) | \"always\" | \"off\".",
+          "description": "When a sidebar row spells its full name out on hover:\n\"elided\" | \"always\" | \"off\".",
           "enum": [
             "elided",
             "always",
@@ -1411,12 +1411,12 @@
         },
         "vsync": {
           "default": true,
-          "description": "Wait for the display's refresh before showing a finished frame.\nDefault true.",
+          "description": "Wait for the display's refresh before showing a finished frame.",
           "type": "boolean"
         },
         "worktree_liveness": {
           "default": true,
-          "description": "Re-check on a 1.5 s tick whether each listed worktree's checkout is\nstill on disk, so a `git worktree remove` typed into one of our own\nsessions greys the row without waiting for a manual refresh.  Default\n`true`; the probe is one `stat` per listed row, which an exotic\nfilesystem could make expensive.",
+          "description": "Re-check on a 1.5 s tick whether each listed worktree's checkout is\nstill on disk, so a `git worktree remove` typed into one of our own\nsessions greys the row without waiting for a manual refresh.  The\nprobe is one `stat` per listed row, which an exotic filesystem could\nmake expensive.",
           "type": "boolean"
         },
         "worktree_name": {
@@ -1548,7 +1548,7 @@
       "properties": {
         "opacity": {
           "default": 1.0,
-          "description": "Background opacity from `0.0` (transparent) to `1.0` (opaque).\nChanging it requires a restart: transparency is a window flag set\nbefore the window exists.  Default `1.0`.",
+          "description": "Background opacity from `0.0` (transparent) to `1.0` (opaque).\nChanging it requires a restart: transparency is a window flag set\nbefore the window exists.",
           "format": "float",
           "type": "number"
         },
@@ -1600,7 +1600,7 @@
       "description": "Top-level `[wsl]`: platform-integration options.  Lives outside `[ui]`\nbecause nothing here is presentation — it governs how the app talks to\ndistros.",
       "properties": {
         "automount_root": {
-          "description": "Distro-side mount point for Windows drives, mirroring wsl.conf's\n`[automount] root`.  Only used for paths *we* translate (git output\nfrom inside a distro); `wsl.exe --cd` translates with the distro's\nreal mount table regardless of this value.",
+          "description": "Distro-side mount point for Windows drives, mirroring wsl.conf's\n`[automount] root`.  Only used for paths *we* translate (git output\nfrom inside a distro); `wsl.exe --cd` translates with the distro's\nreal mount table regardless of this value.  Unset means `/mnt`; the\nkey stays optional so the deprecated `[ui.wsl]` spelling can still win\nwhen this one is absent.",
           "type": "string"
         },
         "resident_helper": {

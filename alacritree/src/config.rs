@@ -1185,7 +1185,7 @@ impl Default for Decorations {
 /// this file treats a value it does not recognize.
 fn parse_adjust(field: &str, raw: &str) -> Adjust {
     Adjust::parse(raw).unwrap_or_else(|| {
-        log::warn!("unusable ui.decorations.{field} value {raw:?}, using \"0\"");
+        log::warn!("unusable ui.decorations.{field} value {raw:?}, using \"0px\"");
         Adjust::NONE
     })
 }
@@ -1800,7 +1800,7 @@ struct RawConfig {
 #[serde(default)]
 struct RawGeneral {
     /// Offer the local socket that `alacritree <command>` and the MCP bridge
-    /// connect to.  Default `true`.
+    /// connect to.
     ipc_socket: bool,
     /// Directory sessions on the home tab start in; worktree tabs always start
     /// in their checkout.  A leading `~` expands to the home directory.  Unset
@@ -1836,23 +1836,23 @@ impl Default for RawGeneral {
 #[serde(default)]
 struct RawDebug {
     /// Write an artifact when the process panics.  alacritree-only, so it
-    /// belongs in `alacritree.toml`.  Default `true`: a crash that leaves no
-    /// record is the failure this exists to prevent.
+    /// belongs in `alacritree.toml`.  A crash that leaves no record is the
+    /// failure this exists to prevent.
     crash_log: bool,
     /// Keep the log file after quitting.  Upstream's name and upstream's
-    /// default (`false`).
+    /// default.
     persistent_logging: bool,
     /// Log what the GPU grid's paint callback costs: the wall time of
     /// issuing a frame, and the GPU's own time for the upload and each of
     /// the three draws.  alacritree-only, so it belongs in
-    /// `alacritree.toml`.  Default `false`; timer queries are cheap but not
-    /// free, and the line is only meaningful to someone reading it.  Needs
-    /// `[ui] gpu_grid` and a GL 3.3 context.  Keeps this session's log file
-    /// for as long as it is on, since the report has nowhere else to go.
+    /// `alacritree.toml`.  Timer queries are cheap but not free, and the
+    /// line is only meaningful to someone reading it.  Needs `[ui] gpu_grid`
+    /// and a GL 3.3 context.  Keeps this session's log file for as long as
+    /// it is on, since the report has nowhere else to go.
     gpu_timing: bool,
     /// Measure whole frames and report the period, CPU time, grid share and
     /// keystroke echo every few seconds.  alacritree-only, so it belongs in
-    /// `alacritree.toml`.  Default `false`.
+    /// `alacritree.toml`.
     ///
     /// `ALACRITREE_FRAME_LOG` wins over this key both ways: `1` turns
     /// measurements on, `0` and the empty string turn them off.  The variable
@@ -1899,7 +1899,7 @@ struct RawKeyboard {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawFont {
-    /// Font size in points.  Default `11.25`.
+    /// Font size in points.
     size: f32,
     /// The face ordinary text is drawn with.
     normal: RawFontFace,
@@ -1910,7 +1910,7 @@ struct RawFont {
     /// The bold-italic face.  An unset family falls back to `normal`'s.
     bold_italic: RawFontFace,
     /// Extra space around each cell in pixels: `y` is line spacing, `x` is
-    /// letter spacing.  Default `{ x = 0, y = 0 }`.
+    /// letter spacing.
     offset: RawFontDelta,
     /// Where the glyph sits inside its cell, in pixels.  Increasing `x` moves
     /// it right, increasing `y` moves it up.  Built-in glyphs ignore this,
@@ -1918,7 +1918,7 @@ struct RawFont {
     glyph_offset: RawFontDelta,
     /// Draw box-drawing (U+2500–U+259F), legacy computing (U+1FB00–U+1FB3B)
     /// and Powerline (U+E0B0–U+E0BF) characters with the built-in renderer
-    /// instead of the font.  Default `true`.
+    /// instead of the font.
     builtin_box_drawing: bool,
     /// Ordered list of fallback font families or font file paths, tried in
     /// order after the four primary faces and before the automatic system
@@ -1929,7 +1929,7 @@ struct RawFont {
     /// Draw emoji from their font's colour tables.  Turning this off falls
     /// through to the first fallback face with ordinary outlines, so emoji
     /// render monochrome.  Also alacritree-only, so it belongs in
-    /// `alacritree.toml` alongside `fallback`.  Default `true`.
+    /// `alacritree.toml` alongside `fallback`.
     color_glyphs: bool,
     /// Budget in megabytes for the rasterized colour-glyph cache.  The cache
     /// is already bounded by how many codepoints the colour fonts cover, but
@@ -2014,12 +2014,17 @@ struct RawCursor {
     /// accepted.
     style: Option<RawCursorStyle>,
     /// Render the cursor as a hollow box when the window is not focused.
-    /// Default `true`.
+    /// Accepted for alacritty compatibility: alacritree paints the same
+    /// cursor whether or not the window has focus, so the real alacritty
+    /// acts on this and nothing here does.
     unfocused_hollow: Option<bool>,
-    /// Blink interval in milliseconds.  Default `750`.
+    /// Blink interval in milliseconds.  Accepted for alacritty
+    /// compatibility: alacritree does not blink the cursor, so the real
+    /// alacritty acts on this and nothing here does.
     blink_interval: Option<u64>,
     /// Seconds after which the cursor stops blinking; `0` never stops.
-    /// Default `5`.
+    /// Accepted for alacritty compatibility: alacritree does not blink the
+    /// cursor, so the real alacritty acts on this and nothing here does.
     blink_timeout: Option<u64>,
 }
 
@@ -2044,9 +2049,8 @@ enum RawCursorStyle {
 #[serde(default)]
 struct RawScrolling {
     /// Maximum number of lines kept in the scrollback buffer.
-    /// Default `10000`.
     history: u32,
-    /// Lines scrolled per mouse-wheel increment.  Default `3`.
+    /// Lines scrolled per mouse-wheel increment.
     multiplier: u8,
 }
 
@@ -2070,7 +2074,7 @@ struct RawWindow {
     padding: Option<RawPadding>,
     /// Background opacity from `0.0` (transparent) to `1.0` (opaque).
     /// Changing it requires a restart: transparency is a window flag set
-    /// before the window exists.  Default `1.0`.
+    /// before the window exists.
     opacity: f32,
 }
 
@@ -2130,7 +2134,6 @@ struct RawSelection {
     /// Characters that separate "semantic words" for double-click selection.
     semantic_escape_chars: String,
     /// Copy selected text to the system clipboard as soon as it is selected.
-    /// Default `false`.
     save_to_clipboard: bool,
 }
 
@@ -2179,7 +2182,7 @@ struct RawColors {
     /// indices keep their standard values.
     #[serde(default)]
     indexed_colors: Vec<RawIndexed>,
-    /// Draw bold text with the bright color variants.  Default `false`.
+    /// Draw bold text with the bright color variants.
     #[serde(default)]
     draw_bold_text_with_bright_colors: bool,
 }
@@ -2332,7 +2335,9 @@ struct RawWsl {
     /// Distro-side mount point for Windows drives, mirroring wsl.conf's
     /// `[automount] root`.  Only used for paths *we* translate (git output
     /// from inside a distro); `wsl.exe --cd` translates with the distro's
-    /// real mount table regardless of this value.
+    /// real mount table regardless of this value.  Unset means `/mnt`; the
+    /// key stays optional so the deprecated `[ui.wsl]` spelling can still win
+    /// when this one is absent.
     automount_root: Option<String>,
 }
 
@@ -2528,8 +2533,8 @@ struct RawSessionDisplay {
 struct RawSessionReorder {
     /// Let a session row be dragged with the mouse to reorder it.
     drag: bool,
-    /// How far a reorder may carry a session: "workspace" (default) |
-    /// "project" | "anywhere".
+    /// How far a reorder may carry a session: "workspace" | "project" |
+    /// "anywhere".
     #[schemars(extend("enum" = ["workspace", "project", "anywhere"]))]
     scope: String,
 }
@@ -2543,8 +2548,8 @@ impl Default for RawSessionReorder {
 /// Corrections applied to what the font reports for its underline and
 /// strikeout.  Each value is `"2px"` (physical pixels, added), `"2pt"` or a
 /// bare `"2"` (points, added), or `"150%"` (a multiplier).  Positive moves a
-/// line down, matching kitty and ghostty.  A percentage takes no sign.
-/// Default `"0"`, which draws what the font asked for.
+/// line down, matching kitty and ghostty.  A percentage takes no sign.  A
+/// zero offset draws what the font asked for.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawDecorations {
@@ -2762,44 +2767,43 @@ struct RawUi {
     /// clicking it focuses that session.
     notifications: bool,
     /// Grace window in milliseconds before an attention trigger pings; a
-    /// session that resumes work inside it swallows the ping.  Default 0.
+    /// session that resumes work inside it swallows the ping.
     attention_grace_ms: u64,
     /// When the sidebar × on a session row asks before killing the PTY:
-    /// "never" (default) | "busy" | "always".
+    /// "never" | "busy" | "always".
     #[schemars(extend("enum" = ["never", "busy", "always"]))]
     confirm_session_close: String,
     /// Whether the sidebar × on a harness-managed row asks before detaching.
     /// Separate from `confirm_session_close` because a detach leaves the
-    /// pane running and its row listed again. Default true.
+    /// pane running and its row listed again.
     confirm_session_detach: bool,
     /// What happens when the on-screen workspace stops having sessions,
     /// whether a close or a worktree deletion took the last one:
-    /// "respawn" (default) | "navigate" | "ring_global" | "ring_project".
+    /// "respawn" | "navigate" | "ring_global" | "ring_project".
     #[schemars(extend("enum" = ["respawn", "navigate", "ring_global", "ring_project"]))]
     last_session_close: String,
     /// How far the projects sidebar goes when the cursor's row stops being
-    /// rendered: "preserve" (default) | "follow".
+    /// rendered: "preserve" | "follow".
     #[schemars(extend("enum" = ["preserve", "follow"]))]
     sidebar_focus: String,
     /// Whether the projects sidebar scrolls to the session on screen whenever
     /// it changes — a cycling key, a click, the palette, an IPC request.
-    /// The sidebar cursor is left where it was: `false` (default).
+    /// The sidebar cursor is left where it was.
     sidebar_follow_active: bool,
-    /// Where a row the sidebar scrolled to is parked:
-    /// "minimal" (default) | "center".  Under "center" every cursor step
-    /// re-centres the list, and clicking a row near the panel edge scrolls it
-    /// out from under the pointer.
+    /// Where a row the sidebar scrolled to is parked: "minimal" | "center".
+    /// Under "center" every cursor step re-centres the list, and clicking a
+    /// row near the panel edge scrolls it out from under the pointer.
     #[schemars(extend("enum" = ["minimal", "center"]))]
     sidebar_scroll_align: String,
     /// Whether a fuzzy query is confined by the panel's active toggle filters:
-    /// "filtered" (default) | "all".
+    /// "filtered" | "all".
     #[schemars(extend("enum" = ["filtered", "all"]))]
     search_scope: String,
     /// When a sidebar row spells its full name out on hover:
-    /// "elided" (default) | "always" | "off".
+    /// "elided" | "always" | "off".
     #[schemars(extend("enum" = ["elided", "always", "off"]))]
     sidebar_tooltips: String,
-    /// Whether a sidebar icon explains itself on hover: `true` (default).
+    /// Whether a sidebar icon explains itself on hover.
     icon_tooltips: bool,
     /// Whether per-session rows and tabs appear before a workspace has two
     /// sessions.
@@ -2813,15 +2817,14 @@ struct RawUi {
     delta_path: Option<String>,
     /// Sidebar glyph overrides.
     icons: RawIcons,
-    /// Sidebar scrollbar style: "floating" (default) | "solid".
+    /// Sidebar scrollbar style: "floating" | "solid".
     #[schemars(extend("enum" = ["floating", "solid"]))]
     scrollbar: String,
     /// Draw the terminal grid through an OpenGL paint callback instead of
-    /// handing epaint a mesh.  Default `false`: it needs a GL 3 context and
-    /// bypasses the renderer every other panel goes through, so an
-    /// unmodified config keeps the path that has always drawn the grid.  A
-    /// context too old for instanced arrays logs once and paints the mesh
-    /// from the next frame on.
+    /// handing epaint a mesh.  It needs a GL 3 context and bypasses the
+    /// renderer every other panel goes through, so an unmodified config keeps
+    /// the path that has always drawn the grid.  A context too old for
+    /// instanced arrays logs once and paints the mesh from the next frame on.
     gpu_grid: bool,
     /// Corrections to the underline and strikeout the font placed
     /// ([`RawDecorations`]).
@@ -2835,9 +2838,9 @@ struct RawUi {
     upstream_status: bool,
     /// Re-check on a 1.5 s tick whether each listed worktree's checkout is
     /// still on disk, so a `git worktree remove` typed into one of our own
-    /// sessions greys the row without waiting for a manual refresh.  Default
-    /// `true`; the probe is one `stat` per listed row, which an exotic
-    /// filesystem could make expensive.
+    /// sessions greys the row without waiting for a manual refresh.  The
+    /// probe is one `stat` per listed row, which an exotic filesystem could
+    /// make expensive.
     worktree_liveness: bool,
     /// Max `gh` lookups in flight at once.  Unset lets the pool decide, which
     /// is one below its own background ceiling so a lookup can never take
@@ -2859,26 +2862,23 @@ struct RawUi {
     default_profile: Option<String>,
     /// Outline drawn around whichever pane holds keyboard focus.
     focus_outline: RawFocusOutline,
-    /// Clicking a sidebar moves keyboard focus to it.  Default false.
+    /// Clicking a sidebar moves keyboard focus to it.
     sidebar_click_focus: bool,
     /// Put the session on screen one scheduling class above normal — its
     /// shell and every process that shell starts — so a busy machine cannot
     /// starve what the user is typing into.  Follows focus.  Windows only.
-    /// Default false.
     focus_priority_boost: bool,
     /// Open a session's PTY on a worker rather than in the frame that asked
-    /// for it, so spawning does not stutter.  Default false.
+    /// for it, so spawning does not stutter.
     async_session_spawn: bool,
     /// End everything a session started when that session closes, at any
     /// depth, except processes that ask to break away.  Windows only.
-    /// Default false.
     reap_descendants_on_close: bool,
     /// Wait for the display's refresh before showing a finished frame.
-    /// Default true.
     vsync: bool,
     /// How paths are abbreviated where the UI writes them.
     path_style: RawPathStyle,
-    /// What a file dragged onto the window does.  Default: every target on.
+    /// What a file dragged onto the window does.
     drop: RawUiDrop,
     /// What the clipboard's non-text contents paste as.
     paste: RawUiPaste,
@@ -2936,7 +2936,7 @@ impl Default for RawUi {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawPathStyle {
-    /// "full" (default) | "fish" | "zed", per site.
+    /// "full" | "fish" | "zed", per site.
     ///
     /// The diff pane's title.
     #[schemars(extend("enum" = ["full", "fish", "zed"]))]
@@ -4941,6 +4941,16 @@ program = "second"
         assert_eq!(Adjust::parse("0").unwrap().apply(7.0, 2.0), 7.0);
         assert_eq!(Adjust::parse("100%").unwrap().apply(7.0, 2.0), 7.0);
         assert_eq!(Adjust::NONE.apply(7.0, 2.0), 7.0);
+    }
+
+    /// `"0"` parses to `Points(0.0)` where `NONE` is `Pixels(0.0)`: the same
+    /// line through `apply`, but unequal under the `PartialEq` that
+    /// `changed_from_defaults` compares with, so a `"0"` default would report
+    /// an untouched config as modified.  That is why the default is `"0px"`.
+    #[test]
+    fn the_decoration_default_parses_to_no_adjustment() {
+        assert_eq!(Adjust::parse("0px"), Some(Adjust::NONE));
+        assert_ne!(Adjust::parse("0"), Some(Adjust::NONE));
     }
 
     /// Pixels are physical and points are not, which is the whole reason both
