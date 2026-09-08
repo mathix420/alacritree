@@ -474,6 +474,10 @@ confirm_session_detach = true    # whether the × on a harness-managed row asks
                                  # before detaching. Its own switch, since a
                                  # detach leaves the pane running under its
                                  # harness and lists its row again
+sessions_filter_counts_detached = false  # whether the sidebar's sessions
+                                          # toggle also counts a listed detached
+                                          # herdr agent as occupying a workspace
+                                          # (default false)
 last_session_close = "respawn"   # what happens when the on-screen workspace
                                  # stops having sessions, whether the last one
                                  # closed or the worktree was deleted:

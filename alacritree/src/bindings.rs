@@ -163,6 +163,11 @@ pub enum NamedAction {
     SidebarSearchCancelToTerminal,
     /// Narrow the projects sidebar to workspaces with a live session.
     ToggleSessionsFilter,
+    /// Flip whether `ToggleSessionsFilter` also counts a listed detached
+    /// herdr agent as occupying a workspace.  Runtime-only, like
+    /// `ToggleSessionRows`: it flips a preference rather than a panel toggle,
+    /// so it is not scoped to the sidebar owning focus.
+    ToggleDetachedSessionsFilter,
     /// Narrow the projects sidebar to workspaces whose session wants attention.
     ToggleAttentionFilter,
     /// PR-state filters.  One dimension: the active states union, and the
@@ -379,6 +384,9 @@ impl NamedAction {
                 "Cancel the sidebar search and focus the terminal".into()
             },
             Self::ToggleSessionsFilter => "Filter the sidebar to workspaces with a session".into(),
+            Self::ToggleDetachedSessionsFilter => {
+                "Toggle whether the sessions filter counts detached herdr agents".into()
+            },
             Self::ToggleAttentionFilter => {
                 "Filter the sidebar to workspaces wanting attention".into()
             },
@@ -972,7 +980,7 @@ fn parse_mods(s: &str) -> Option<Modifiers> {
 /// Every simple (non-parametrized) `NamedAction`, kept in sync with the enum by
 /// hand. Mirrors the old shortcuts window's bindable list; `SelectTab`/
 /// `SpawnProfile` are excluded here because they carry an index.
-pub fn bindable_actions() -> [NamedAction; 66] {
+pub fn bindable_actions() -> [NamedAction; 67] {
     use NamedAction::*;
     [
         Paste,
@@ -1029,6 +1037,7 @@ pub fn bindable_actions() -> [NamedAction; 66] {
         Quit,
         TogglePalette,
         ToggleSessionsFilter,
+        ToggleDetachedSessionsFilter,
         ToggleAttentionFilter,
         TogglePrOpenFilter,
         TogglePrDraftFilter,
@@ -1156,6 +1165,7 @@ pub fn parse_action(name: &str) -> BindingAction {
         "SidebarSearchCancel" => BindingAction::Named(SidebarSearchCancel),
         "SidebarSearchCancelToTerminal" => BindingAction::Named(SidebarSearchCancelToTerminal),
         "ToggleSessionsFilter" => BindingAction::Named(ToggleSessionsFilter),
+        "ToggleDetachedSessionsFilter" => BindingAction::Named(ToggleDetachedSessionsFilter),
         "ToggleAttentionFilter" => BindingAction::Named(ToggleAttentionFilter),
         "TogglePrOpenFilter" => BindingAction::Named(TogglePrOpenFilter),
         "TogglePrDraftFilter" => BindingAction::Named(TogglePrDraftFilter),
@@ -1443,6 +1453,7 @@ mod tests {
             ("FocusTerminal", NamedAction::FocusTerminal),
             ("FocusGitSidebar", NamedAction::FocusGitSidebar),
             ("ToggleSessionRows", NamedAction::ToggleSessionRows),
+            ("ToggleDetachedSessionsFilter", NamedAction::ToggleDetachedSessionsFilter),
             ("ToggleSessionTabs", NamedAction::ToggleSessionTabs),
             ("ToggleSessionDrag", NamedAction::ToggleSessionDrag),
             ("MoveSessionUp", NamedAction::MoveSessionUp),
@@ -1916,6 +1927,7 @@ mod tests {
             NamedAction::TogglePrClosedFilter,
             NamedAction::RefreshPrStatus,
             NamedAction::ToggleSearchScope,
+            NamedAction::ToggleDetachedSessionsFilter,
         ] {
             assert!(bound(a).is_none(), "{a:?} must ship without a default key");
         }

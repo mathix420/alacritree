@@ -295,7 +295,10 @@ satisfy the session/attention conjunction and match one active PR state to
 survive:
 
 - `ToggleSessionsFilter` (default `S`) — narrow to workspaces with a live
-  session.
+  session, widened to a listed detached herdr agent when
+  `[ui] sessions_filter_counts_detached` is on.
+- `ToggleDetachedSessionsFilter` — flip the runtime
+  `sessions_filter_counts_detached` value. No default key.
 - `ToggleAttentionFilter` (default `A`) — narrow to workspaces whose session
   wants attention.
 - `TogglePrOpenFilter` / `TogglePrDraftFilter` / `TogglePrMergedFilter` /

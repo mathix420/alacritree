@@ -110,7 +110,8 @@ fn section_of(a: NamedAction) -> PaletteSection {
         FocusProjectsSidebar | FocusGitSidebar | FocusTerminal => Sidebar,
         FocusLeft | FocusRight => Sidebar,
         SidebarSearchConfirm | SidebarSearchCancel | SidebarSearchCancelToTerminal => Sidebar,
-        ToggleSessionsFilter | ToggleAttentionFilter | ClearProjectFilters => Filters,
+        ToggleSessionsFilter | ToggleDetachedSessionsFilter => Filters,
+        ToggleAttentionFilter | ClearProjectFilters => Filters,
         TogglePrOpenFilter | TogglePrDraftFilter => Filters,
         TogglePrMergedFilter | TogglePrClosedFilter => Filters,
         ToggleModifiedFilter | ToggleDeletedFilter => Filters,
@@ -582,6 +583,7 @@ mod tests {
         let items = action_items(&parse_bindings(vec![]));
         for name in [
             "ToggleSessionsFilter",
+            "ToggleDetachedSessionsFilter",
             "ToggleAttentionFilter",
             "TogglePrOpenFilter",
             "TogglePrDraftFilter",

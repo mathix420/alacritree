@@ -380,6 +380,24 @@ fn project_toggles_pass(
     (!toggle_sessions || has_sessions) && (!toggle_attention || needs_attention)
 }
 
+/// Whether a workspace counts as occupied for the sessions toggle: it holds a
+/// live session, or — when `counts_detached` is set — a listed herdr agent
+/// nothing is attached to.  `session_workspaces` is the workspace of every
+/// live session; a folded lone shell (absent from `listed` below the row
+/// threshold, but still in `session_workspaces`) passes either way.
+fn sessions_filter_passes(
+    session_workspaces: &[WorkspaceKey],
+    listed: &sidebar_nav::ListedRows,
+    key: &WorkspaceKey,
+    counts_detached: bool,
+) -> bool {
+    session_workspaces.contains(key)
+        || (counts_detached
+            && listed.get(key).is_some_and(|entries| {
+                entries.iter().any(|e| matches!(e, sidebar_nav::WorkspaceEntry::Agent(..)))
+            }))
+}
+
 /// The toggle identities the projects panel accepts.  The PR identities exist
 /// only when polling does, or every PR state would read as unknown and the
 /// filters could only ever empty the panel.
@@ -512,6 +530,10 @@ pub struct AlacritreeApp {
     /// Runtime copy of `[ui.session_reorder] drag`.  Like the display toggles
     /// above, the config is only the startup default and nothing is persisted.
     session_drag: bool,
+    /// Runtime copy of `[ui] sessions_filter_counts_detached`.  Like the
+    /// display toggles above, the config is only the startup default and
+    /// nothing is persisted.
+    sessions_filter_counts_detached: bool,
     sidebar_cursor: Option<SidebarRow>,
     /// Reveals the project rows' drag grips.  A transient mode, not persisted:
     /// reordering is a rare, deliberate act, and a grip on every row the rest
@@ -988,6 +1010,7 @@ impl AlacritreeApp {
             session_rows_always: config.ui.session_display.sidebar_always,
             session_tabs_always: config.ui.session_display.tabs_always,
             session_drag: config.ui.session_reorder.drag,
+            sessions_filter_counts_detached: config.ui.sessions_filter_counts_detached,
             sidebar_cursor: None,
             reorder_mode: false,
             sidebar_auto_shown: false,
@@ -1742,7 +1765,8 @@ impl AlacritreeApp {
         // with a failed spawn — stay put and let the sidebar re-mark the row.
         // Shells already running there are the exception: they outlive the
         // directory, and this row is the only way back to them.
-        if self.worktree_gone(path) && !self.workspace_has_sessions(&Some(path.to_path_buf())) {
+        if self.worktree_gone(path) && !self.workspace_has_sessions_only(&Some(path.to_path_buf()))
+        {
             self.error_dialog =
                 Some("worktree directory is missing — prune it from the sidebar".to_string());
             if let Some(idx) =
@@ -2309,7 +2333,7 @@ impl AlacritreeApp {
         let mut order: Vec<WorkspaceKey> = vec![None];
         for project in &self.projects {
             for wt in &project.worktrees {
-                let has_sessions = self.workspace_has_sessions(&Some(wt.path.clone()));
+                let has_sessions = self.workspace_has_sessions_only(&Some(wt.path.clone()));
                 if worktree_is_switchable(wt, self.liveness.missing(&wt.path), has_sessions) {
                     order.push(Some(wt.path.clone()));
                 }
@@ -2860,11 +2884,18 @@ impl AlacritreeApp {
                 HashMap::new()
             };
 
+        let session_workspaces: Vec<WorkspaceKey> =
+            self.sessions.iter().map(|s| s.working_directory.clone()).collect();
         let gate = |key: &WorkspaceKey| {
             project_toggles_pass(
                 apply,
                 toggle_sessions,
-                self.workspace_has_sessions(key),
+                sessions_filter_passes(
+                    &session_workspaces,
+                    &listed,
+                    key,
+                    self.sessions_filter_counts_detached,
+                ),
                 toggle_attention,
                 self.workspace_needs_attention(key),
             ) && key.as_deref().is_none_or(|path| worktree_pr_passes(any_pr, &pr_matches, path))
@@ -2889,7 +2920,7 @@ impl AlacritreeApp {
         })
     }
 
-    fn workspace_has_sessions(&self, key: &WorkspaceKey) -> bool {
+    fn workspace_has_sessions_only(&self, key: &WorkspaceKey) -> bool {
         self.sessions.iter().any(|s| s.working_directory == *key)
     }
 
@@ -3488,6 +3519,9 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::MoveSessionDown) => self.step_session(1),
             BindingAction::Named(NamedAction::ToggleSessionDrag) => {
                 self.session_drag = !self.session_drag;
+            },
+            BindingAction::Named(NamedAction::ToggleDetachedSessionsFilter) => {
+                self.sessions_filter_counts_detached = !self.sessions_filter_counts_detached;
             },
             BindingAction::Named(NamedAction::SelectNextWorkspace) => {
                 self.cycle_workspaces(ctx, 1);
@@ -13105,6 +13139,45 @@ mod tests {
     }
 
     #[test]
+    fn sessions_filter_counts_a_listed_agent_only_when_the_flag_is_on() {
+        let wt = ws("/a/wt1");
+        let listed = sidebar_nav::ListedRows::from([(wt.clone(), vec![
+            sidebar_nav::WorkspaceEntry::Agent(herdr::Side::Native, "term_a".to_string()),
+        ])]);
+        assert!(!sessions_filter_passes(&[], &listed, &wt, false));
+        assert!(sessions_filter_passes(&[], &listed, &wt, true));
+    }
+
+    #[test]
+    fn sessions_filter_fails_a_workspace_with_neither_session_nor_agent() {
+        let wt = ws("/a/wt1");
+        let listed = sidebar_nav::ListedRows::new();
+        assert!(!sessions_filter_passes(&[], &listed, &wt, false));
+        assert!(!sessions_filter_passes(&[], &listed, &wt, true));
+    }
+
+    #[test]
+    fn sessions_filter_passes_a_folded_lone_shell_either_way() {
+        // Below the row threshold `workspace_entries` folds the lone shell out
+        // of `listed`, but the session itself is still live.
+        let wt = ws("/a/wt1");
+        let listed = sidebar_nav::ListedRows::new();
+        let session_workspaces = [wt.clone()];
+        assert!(sessions_filter_passes(&session_workspaces, &listed, &wt, false));
+        assert!(sessions_filter_passes(&session_workspaces, &listed, &wt, true));
+    }
+
+    #[test]
+    fn sessions_filter_counts_a_detached_agent_bucketed_under_home() {
+        let listed =
+            sidebar_nav::ListedRows::from([(None, vec![sidebar_nav::WorkspaceEntry::Agent(
+                herdr::Side::Native,
+                "term_home".to_string(),
+            )])]);
+        assert!(sessions_filter_passes(&[], &listed, &None, true));
+    }
+
+    #[test]
     fn a_wide_search_stands_down_the_git_toggles() {
         // Toggled on for "modified" only, an untracked row fails while the
         // toggle applies and passes once a wide search stands it down.
@@ -15036,6 +15109,7 @@ mod tests {
     fn the_projects_filter_actions_map_to_their_identities() {
         for (action, identity) in [
             (NamedAction::ToggleSessionsFilter, Some('s')),
+            (NamedAction::ToggleDetachedSessionsFilter, None),
             (NamedAction::ToggleAttentionFilter, Some('a')),
             (NamedAction::TogglePrOpenFilter, Some('o')),
             (NamedAction::TogglePrDraftFilter, Some('d')),
