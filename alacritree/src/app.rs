@@ -6103,6 +6103,12 @@ const PALETTE_ACTION_W: f32 = 200.0;
 const PALETTE_KEYS_W: f32 = 180.0;
 const PALETTE_DESC_MIN: f32 = 160.0;
 
+/// Clear space between a row's status mark and the description after it.
+const PALETTE_MARK_GAP: f32 = 6.0;
+
+/// The accent bar a selected row paints along its left edge.
+const PALETTE_SELECTION_BAR_W: f32 = 2.5;
+
 /// Geometry for the palette's `description | action | keys` grid.  Every row and
 /// the header lay out against the same widths, so the columns line up down the
 /// list instead of each row packing its own way.  A grid with room for the fixed
@@ -6111,6 +6117,10 @@ const PALETTE_DESC_MIN: f32 = 160.0;
 struct PaletteColumns {
     width: f32,
     pad: f32,
+    /// The leading status-mark gutter: the mark's own footprint plus the space
+    /// after it.  Every row claims it, marked or not, so the descriptions line
+    /// up whether or not a row has a mark to show.
+    mark: f32,
     desc: f32,
     action: f32,
     keys: f32,
@@ -6124,18 +6134,20 @@ impl PaletteColumns {
     fn new(scale: f32, width: f32) -> Self {
         let pad = 10.0 * scale;
         let gap = 14.0 * scale;
-        let content = (width - 2.0 * pad - 2.0 * gap).max(0.0);
+        let mark = (ROW_STATUS_ICON_W + PALETTE_MARK_GAP) * scale;
+        let content = (width - 2.0 * pad - mark - 2.0 * gap).max(0.0);
         let action = PALETTE_ACTION_W * scale;
         let keys = PALETTE_KEYS_W * scale;
         let comfortable = PALETTE_DESC_MIN * scale + action + keys;
         if content >= comfortable {
             let desc = content - action - keys;
-            return Self { width, pad, desc, action, keys, gap, narrow: false };
+            return Self { width, pad, mark, desc, action, keys, gap, narrow: false };
         }
         let shrink = content / comfortable;
         Self {
             width,
             pad,
+            mark,
             desc: PALETTE_DESC_MIN * scale * shrink,
             action: action * shrink,
             keys: keys * shrink,
@@ -6151,8 +6163,14 @@ impl PaletteColumns {
         if self.narrow { ColumnWrap::Anywhere } else { ColumnWrap::Clip }
     }
 
-    fn desc_x(&self, left: f32) -> f32 {
+    /// Where a row's status mark sits.  Clear of the selected row's accent
+    /// bar, which is painted hard against the row's left edge.
+    fn mark_x(&self, left: f32) -> f32 {
         left + self.pad
+    }
+
+    fn desc_x(&self, left: f32) -> f32 {
+        self.mark_x(left) + self.mark
     }
 
     fn action_x(&self, left: f32) -> f32 {
@@ -6207,7 +6225,7 @@ fn paint_palette_section(ui: &mut egui::Ui, theme: &Theme, cols: &PaletteColumns
         egui::FontFamily::Proportional,
         size,
         theme.accent,
-        cols.width - 2.0 * cols.pad,
+        cols.width - 2.0 * cols.pad - cols.mark,
         ColumnWrap::Clip,
     );
     ui.painter().galley(
@@ -6288,7 +6306,10 @@ fn paint_palette_row(
             46,
         );
         painter.rect_filled(rect, 5.0 * s, wash);
-        let bar = egui::Rect::from_min_size(rect.left_top(), egui::vec2(2.5 * s, rect.height()));
+        let bar = egui::Rect::from_min_size(
+            rect.left_top(),
+            egui::vec2(PALETTE_SELECTION_BAR_W * s, rect.height()),
+        );
         painter.rect_filled(bar, 0.0, theme.accent);
     } else if resp.hovered() {
         painter.rect_filled(rect, 5.0 * s, theme.row_hover_bg);
@@ -6298,8 +6319,10 @@ fn paint_palette_row(
     // the single-line columns beside it.
     let (left, top) = (rect.left(), rect.top() + v_pad);
     if let Some((mark, hint)) = mark {
-        let mark_rect =
-            egui::Rect::from_min_size(egui::pos2(left, top), row_status_icon_size(theme));
+        let mark_rect = egui::Rect::from_min_size(
+            egui::pos2(cols.mark_x(left), top),
+            row_status_icon_size(theme),
+        );
         match *mark {
             SessionMark::Attention => paint_attention_dot(ui, mark_rect, theme),
             SessionMark::Harness(harness_mark) => {
@@ -6757,8 +6780,10 @@ fn paint_row_bg(
 /// Footprint every leading row marker claims, whichever glyph it ends up
 /// drawing. Markers vary wildly in intrinsic width (`·` vs `✳`), so sizing the
 /// slot to the glyph would start each row's label at a different x.
+const ROW_STATUS_ICON_W: f32 = 10.0;
+
 fn row_status_icon_size(theme: &Theme) -> egui::Vec2 {
-    egui::vec2(10.0, 14.0) * theme.ui_scale
+    egui::vec2(ROW_STATUS_ICON_W, 14.0) * theme.ui_scale
 }
 
 const ATTENTION_HINT: &str = "needs attention";
@@ -12501,16 +12526,27 @@ mod tests {
         assert_eq!(hint, agent_hint(LiveState::Working, Some("claude")));
     }
 
-    /// The mark the palette paints sits in the column grid's own left
-    /// padding rather than a slot of its own, so a row with no mark leaves
-    /// nothing for the desc/action/keys arithmetic to notice.  If the two
-    /// ever drift apart, the mark either overruns the description or leaves
-    /// a visible gap before it.
+    /// The mark has a gutter of its own ahead of the description.  A gutter
+    /// only as wide as the glyph leaves the label butted against the mark.
     #[test]
-    fn the_palette_mark_slot_fits_the_columns_own_padding() {
+    fn the_palette_mark_gutter_clears_the_description() {
         let theme = Theme::from_config(&Config::default());
         let cols = PaletteColumns::new(theme.ui_scale, PALETTE_WIDTH);
-        assert_eq!(cols.pad, row_status_icon_size(&theme).x);
+        let mark_right = cols.mark_x(0.0) + row_status_icon_size(&theme).x;
+        let desc_left = cols.desc_x(0.0);
+        assert!(
+            desc_left > mark_right,
+            "the description starts at {desc_left}, inside a mark ending at {mark_right}"
+        );
+    }
+
+    /// The mark starts past the accent bar a selected row paints along its left
+    /// edge, so selecting a row does not clip its mark.
+    #[test]
+    fn the_palette_mark_clears_the_selected_rows_accent_bar() {
+        let theme = Theme::from_config(&Config::default());
+        let cols = PaletteColumns::new(theme.ui_scale, PALETTE_WIDTH);
+        assert!(cols.mark_x(0.0) > PALETTE_SELECTION_BAR_W * theme.ui_scale);
     }
 
     #[test]
@@ -15750,7 +15786,8 @@ mod tests {
         let cols = PaletteColumns::new(1.0, 760.0);
         assert_eq!(cols.action, 200.0);
         assert_eq!(cols.keys, 180.0);
-        assert_eq!(cols.desc, 760.0 - 2.0 * 10.0 - 2.0 * 14.0 - 380.0);
+        let mark = ROW_STATUS_ICON_W + PALETTE_MARK_GAP;
+        assert_eq!(cols.desc, 760.0 - 2.0 * 10.0 - mark - 2.0 * 14.0 - 380.0);
         assert!(!cols.narrow, "a wide palette ellipsizes its columns rather than wrapping them");
     }
 
@@ -15775,8 +15812,12 @@ mod tests {
     /// The grid does not jump as it crosses from fixed to proportional.
     #[test]
     fn the_columns_are_continuous_across_the_narrow_threshold() {
-        let fixed = PaletteColumns::new(1.0, 588.0);
-        let narrow = PaletteColumns::new(1.0, 587.0);
+        let threshold = (1..2000)
+            .map(|w| w as f32)
+            .find(|&w| !PaletteColumns::new(1.0, w).narrow)
+            .expect("the grid reaches its fixed widths at some width");
+        let fixed = PaletteColumns::new(1.0, threshold);
+        let narrow = PaletteColumns::new(1.0, threshold - 1.0);
         assert!(!fixed.narrow && narrow.narrow);
         assert!((fixed.desc - narrow.desc).abs() < 1.0);
         assert!((fixed.action - narrow.action).abs() < 1.0);
