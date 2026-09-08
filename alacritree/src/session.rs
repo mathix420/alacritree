@@ -1233,7 +1233,7 @@ pub fn open(request: OpenRequest) -> std::io::Result<Attachment> {
     #[cfg(windows)]
     let pty = crate::pty_rearm::RearmingPty::new(pty);
 
-    let event_loop = EventLoop::new(term, proxy, pty, false, false)?;
+    let event_loop = EventLoop::new(term, proxy, pty, pty_options.drain_on_exit, false)?;
     let sender = event_loop.channel();
     event_loop.spawn();
     crate::frame_log::spawn_phase(Some(id), "open", started.elapsed());
@@ -1406,7 +1406,11 @@ impl Session {
         let pty_options = PtyOptions {
             shell,
             working_directory: pty_cwd,
-            drain_on_exit: false,
+            // Without this the loop drops whatever the child wrote and it had
+            // not yet read: the last output a held session exists to show.
+            // Unconditional because any session can be held — a refused herdr
+            // attach is, under every `hold_exited_sessions` value.
+            drain_on_exit: true,
             env,
             // Windows has no argv: alacritty_terminal joins these args into a
             // single CreateProcess command line, quoting them only when this
