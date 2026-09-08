@@ -18,6 +18,7 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use crate::app::WorkspaceKey;
 use crate::bindings::{BindingAction, KeyBinding, NamedAction, bindable_actions};
+use crate::herdr::HerdrKey;
 use crate::session::SessionId;
 
 /// A herdr agent no session holds, and where attaching to it lands.  The
@@ -26,7 +27,7 @@ use crate::session::SessionId;
 /// "listed nowhere" — a state the palette can reach and the sidebar cannot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HerdrAttach {
-    pub key: crate::herdr::HerdrKey,
+    pub key: HerdrKey,
     pub pane_id: String,
     pub workspace: WorkspaceKey,
 }

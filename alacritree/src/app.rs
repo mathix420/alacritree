@@ -2854,12 +2854,12 @@ impl AlacritreeApp {
             |p: &Project| !any_toggle && project_matches.get(&p.root).copied().unwrap_or(false);
         let mut name =
             |_p: &Project, wt: &Worktree| worktree_matches.get(&wt.path).copied().unwrap_or(false);
-        let matched_children = !child_matches.is_empty();
-        let mut child = |_ws: &WorkspaceKey, entry: &sidebar_nav::WorkspaceEntry| {
+        let children_tested = !child_matches.is_empty();
+        let mut child = |entry: &sidebar_nav::WorkspaceEntry| {
             child_matches.get(&entry.row()).copied().unwrap_or(false)
         };
-        let child: Option<&mut dyn FnMut(&WorkspaceKey, &sidebar_nav::WorkspaceEntry) -> bool> =
-            if matched_children { Some(&mut child) } else { None };
+        let child: Option<&mut dyn FnMut(&sidebar_nav::WorkspaceEntry) -> bool> =
+            if children_tested { Some(&mut child) } else { None };
         sidebar_nav::filtered_rows(&self.projects, &listed, sidebar_nav::RowPredicates {
             home_gate: gate(&None),
             home_name: home_matches,
@@ -4104,7 +4104,7 @@ impl AlacritreeApp {
                         visible_worktrees.insert(path);
                     },
                     SidebarRow::Session(_) | SidebarRow::HerdrAgent(..) => {
-                        visible_children.insert(row.clone());
+                        visible_children.insert(row);
                     },
                 }
             }
@@ -12307,29 +12307,6 @@ mod tests {
         assert!(row.managed.shared_view);
     }
 
-    #[test]
-    fn herdr_row_name_keeps_a_short_terminal_id_whole() {
-        // `saturating_sub(6)` exists precisely for ids shorter than the tail
-        // it takes; a plain `- 6` would panic on this one.
-        let agent = herdr::Agent {
-            terminal_id: "t1".into(),
-            pane_id: "w1:p1".into(),
-            kind: None,
-            title: None,
-            status: herdr::Status::Idle,
-            focused: false,
-            cwd: None,
-            foreground_cwd: None,
-        };
-        let row = HerdrRowData::from_agent(
-            &agent,
-            &herdr::Side::Native,
-            &herdr::Settings::default(),
-            AttachMode::Agent,
-        );
-        assert_eq!(row.name, RowName::plain("t1".into()));
-    }
-
     /// The sidebar, the palette and the filter all call `herdr_display_name`
     /// rather than resolving a title themselves, so pinning its output here
     /// pins what all three show.
@@ -12357,6 +12334,8 @@ mod tests {
 
     #[test]
     fn herdr_display_name_keeps_a_short_terminal_id_whole() {
+        // `saturating_sub(6)` exists precisely for ids shorter than the tail
+        // it takes; a plain `- 6` would panic on this one.
         let agent = herdr::Agent {
             terminal_id: "t1".into(),
             pane_id: "w1:p1".into(),

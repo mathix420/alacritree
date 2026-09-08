@@ -315,7 +315,8 @@ pub fn seed(
 /// What decides whether a row survives an active filter.  The gate (toggle
 /// and PR dimensions) is separate from the name test because a child match
 /// surfaces a workspace through the gate and never around it.  `name` and
-/// `child` are `FnMut` because the fuzzy matcher they wrap needs `&mut self`.
+/// `child` take `&mut` so a caller may answer from state it carries between
+/// rows; both of today's callers answer from a map resolved before the call.
 pub struct RowPredicates<'a> {
     pub home_gate: bool,
     pub home_name: bool,
@@ -324,7 +325,7 @@ pub struct RowPredicates<'a> {
     pub name: &'a mut dyn FnMut(&Project, &Worktree) -> bool,
     /// `None` while the query is empty, which is what keeps a bare toggle
     /// from surfacing every workspace that holds any child at all.
-    pub child: Option<&'a mut dyn FnMut(&WorkspaceKey, &WorkspaceEntry) -> bool>,
+    pub child: Option<&'a mut dyn FnMut(&WorkspaceEntry) -> bool>,
 }
 
 /// Render-order rows under an active filter. Projects are force-expanded (a
@@ -337,9 +338,11 @@ pub fn filtered_rows(
     listed: &ListedRows,
     mut preds: RowPredicates<'_>,
 ) -> Vec<SidebarRow> {
-    /// The rows a surviving workspace contributes, and whether any child
-    /// matched.  A name match takes every child; otherwise only the matches
-    /// survive, so searching for a child does not hand back its siblings.
+    /// The rows a surviving workspace contributes, and whether a child match
+    /// is what surfaced it.  A name match takes every child and leaves that
+    /// flag false, since the workspace is already kept; otherwise only the
+    /// matches survive, so searching for a child does not hand back its
+    /// siblings.
     fn children(
         preds: &mut RowPredicates<'_>,
         listed: &ListedRows,
@@ -349,27 +352,16 @@ pub fn filtered_rows(
         let Some(entries) = listed.get(ws) else {
             return (Vec::new(), false);
         };
-        let Some(child) = preds.child.as_mut() else {
-            return (
-                if name_matched {
-                    entries.iter().map(WorkspaceEntry::row).collect()
-                } else {
-                    Vec::new()
-                },
-                false,
-            );
-        };
         if name_matched {
-            let any = entries.iter().any(|e| child(ws, e));
-            (entries.iter().map(WorkspaceEntry::row).collect(), any)
-        } else {
-            // `filter` hands the closure `&&WorkspaceEntry`, so the pattern
-            // destructures one layer off before the predicate sees it.
-            let matching: Vec<SidebarRow> =
-                entries.iter().filter(|&e| child(ws, e)).map(WorkspaceEntry::row).collect();
-            let any = !matching.is_empty();
-            (matching, any)
+            return (entries.iter().map(WorkspaceEntry::row).collect(), false);
         }
+        let Some(child) = preds.child.as_mut() else {
+            return (Vec::new(), false);
+        };
+        let matching: Vec<SidebarRow> =
+            entries.iter().filter(|&e| child(e)).map(WorkspaceEntry::row).collect();
+        let any = !matching.is_empty();
+        (matching, any)
     }
 
     let mut rows = Vec::new();
@@ -955,7 +947,7 @@ pub(crate) mod tests {
             project_self: &|_p| false,
             gate: &|_ws| true,
             name: &mut |_p, _wt| false,
-            child: Some(&mut |_ws, e| *e == WorkspaceEntry::Agent(Side::Native, "term_a".into())),
+            child: Some(&mut |e| *e == WorkspaceEntry::Agent(Side::Native, "term_a".into())),
         };
         assert_eq!(filtered_rows(&projects, &agent_listing(), preds), vec![
             SidebarRow::Project(PathBuf::from("/a")),
@@ -976,7 +968,7 @@ pub(crate) mod tests {
             project_self: &|_p| false,
             gate: &|_ws| true,
             name: &mut |_p, _wt| true,
-            child: Some(&mut |_ws, _e| false),
+            child: Some(&mut |_e| false),
         };
         assert_eq!(filtered_rows(&projects, &agent_listing(), preds), vec![
             SidebarRow::Project(PathBuf::from("/a")),
@@ -997,7 +989,7 @@ pub(crate) mod tests {
             project_self: &|_p| false,
             gate: &|_ws| false,
             name: &mut |_p, _wt| false,
-            child: Some(&mut |_ws, _e| true),
+            child: Some(&mut |_e| true),
         };
         assert!(filtered_rows(&projects, &agent_listing(), preds).is_empty());
     }
@@ -1016,7 +1008,7 @@ pub(crate) mod tests {
             project_self: &|_p| false,
             gate: &|_ws| true,
             name: &mut |_p, _wt| false,
-            child: Some(&mut |_ws, _e| true),
+            child: Some(&mut |_e| true),
         };
         assert!(filtered_rows(&[], &listed, preds).is_empty());
     }
