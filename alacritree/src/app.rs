@@ -6096,18 +6096,19 @@ fn focus_default(ctx: &Context, id: egui::Id) {
 enum ColumnWrap {
     /// One line, ellipsized at the column edge — the scannable default.
     Clip,
-    /// Wrap at word boundaries, over as many lines as it takes.
-    Words,
-    /// Wrap mid-token if that is the only way to stay inside the column.
-    Anywhere,
+    /// Wrap at word boundaries, stopping after `max_rows`.
+    Words { max_rows: usize },
+    /// Wrap mid-token if that is the only way to stay inside the column,
+    /// stopping after `max_rows`.
+    Anywhere { max_rows: usize },
 }
 
 impl ColumnWrap {
     fn limits(self) -> (usize, bool) {
         match self {
             Self::Clip => (1, true),
-            Self::Words => (usize::MAX, false),
-            Self::Anywhere => (usize::MAX, true),
+            Self::Words { max_rows } => (max_rows, false),
+            Self::Anywhere { max_rows } => (max_rows, true),
         }
     }
 }
@@ -6148,12 +6149,15 @@ fn prose_galley(
     size: f32,
     color: Color32,
     max_w: f32,
+    max_rows: usize,
 ) -> std::sync::Arc<egui::Galley> {
-    let wrapped = column_galley(ctx, text, family.clone(), size, color, max_w, ColumnWrap::Words);
+    let wrapped = column_galley(ctx, text, family.clone(), size, color, max_w, ColumnWrap::Words {
+        max_rows,
+    });
     if wrapped.size().x <= max_w {
         return wrapped;
     }
-    column_galley(ctx, text, family, size, color, max_w, ColumnWrap::Anywhere)
+    column_galley(ctx, text, family, size, color, max_w, ColumnWrap::Anywhere { max_rows })
 }
 
 /// The hover text for a row: the full text of whatever its columns had to cut,
@@ -6240,7 +6244,7 @@ impl PaletteColumns {
     /// token, so a narrow grid has to split it mid-word; a comfortable one
     /// keeps every row one line tall and ellipsizes the overflow.
     fn token_wrap(&self) -> ColumnWrap {
-        if self.narrow { ColumnWrap::Anywhere } else { ColumnWrap::Clip }
+        if self.narrow { ColumnWrap::Anywhere { max_rows: usize::MAX } } else { ColumnWrap::Clip }
     }
 
     /// Where a row's status mark sits.  Clear of the selected row's accent
@@ -6315,19 +6319,10 @@ fn paint_palette_section(ui: &mut egui::Ui, theme: &Theme, cols: &PaletteColumns
     );
 }
 
-/// Paint one command-palette row across the three columns: the description
-/// (bright, wrapped over as many lines as it needs), the action's config name
-/// (dim), and every key bound to it (accent).  On a narrow grid the other two
-/// columns wrap as well; whatever is still cut short offers its full text on
-/// hover.  A selected row gets a soft accent wash and a crisp accent bar; a
-/// hovered one a faint fill.
-///
-/// `mark` is the row's status mark, chosen the same way the sidebar chooses
-/// one for the same session or herdr agent.  It paints into the column grid's
-/// own left padding, ahead of the description, which is already exactly its
-/// width — a row with no mark leaves that padding empty, so the grid's own
-/// arithmetic never has to change to make room for one.  Its hover is a
-/// second one, kept separate from the row's elided-text hover above.
+/// Paint one command-palette row on the shared column grid. Session rows bound
+/// their title and middle cell, reserve a location line, and use their detail
+/// tooltip across the entire hit target. Action rows retain their existing
+/// layout and elided-text tooltip.
 fn paint_palette_row(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -6341,7 +6336,7 @@ fn paint_palette_row(
     let v_pad = 6.0 * s;
     let ctx = ui.ctx();
 
-    let token = cols.token_wrap();
+    let is_session = item.subtitle.is_some();
     let desc = prose_galley(
         ctx,
         &item.primary,
@@ -6349,16 +6344,41 @@ fn paint_palette_row(
         theme.font_normal,
         theme.text,
         cols.desc,
+        if is_session { 2 } else { usize::MAX },
     );
-    let action = column_galley(
-        ctx,
-        &item.secondary,
-        egui::FontFamily::Proportional,
-        theme.font_normal,
-        theme.text_dim,
-        cols.action,
-        token,
-    );
+    let subtitle_size = (theme.font_normal - 2.0).max(8.0);
+    let subtitle = item.subtitle.as_deref().map(|text| {
+        column_galley(
+            ctx,
+            text,
+            egui::FontFamily::Proportional,
+            subtitle_size,
+            theme.text_muted,
+            cols.desc,
+            ColumnWrap::Clip,
+        )
+    });
+    let action = if is_session {
+        prose_galley(
+            ctx,
+            &item.secondary,
+            egui::FontFamily::Proportional,
+            theme.font_normal,
+            theme.text_dim,
+            cols.action,
+            3,
+        )
+    } else {
+        column_galley(
+            ctx,
+            &item.secondary,
+            egui::FontFamily::Proportional,
+            theme.font_normal,
+            theme.text_dim,
+            cols.action,
+            cols.token_wrap(),
+        )
+    };
     let keys = column_galley(
         ctx,
         &item.keys,
@@ -6366,15 +6386,23 @@ fn paint_palette_row(
         theme.font_normal,
         theme.accent,
         cols.keys,
-        token,
+        cols.token_wrap(),
     );
-    let hover = elided_hover(&[
+    let elided_hover = elided_hover(&[
         (desc.elided, item.primary.as_str()),
+        (
+            subtitle.as_ref().is_some_and(|subtitle| subtitle.elided),
+            item.subtitle.as_deref().unwrap_or_default(),
+        ),
         (action.elided, item.secondary.as_str()),
         (keys.elided, item.keys.as_str()),
     ]);
-
-    let row_h = (desc.size().y.max(action.size().y).max(keys.size().y) + 2.0 * v_pad).round();
+    let subtitle_h = subtitle.as_ref().map_or(0.0, |subtitle| {
+        let font = egui::FontId::new(subtitle_size, egui::FontFamily::Proportional);
+        subtitle.size().y.max(ctx.fonts(|fonts| fonts.row_height(&font)))
+    });
+    let description_h = desc.size().y + subtitle_h;
+    let row_h = (description_h.max(action.size().y).max(keys.size().y) + 2.0 * v_pad).round();
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(cols.width, row_h), egui::Sense::click());
     let painter = ui.painter().clone();
 
@@ -6413,16 +6441,25 @@ fn paint_palette_row(
                 paint_agent_mark(ui, agent_mark(live, quiet, theme.attention), mark_rect, theme);
             },
         }
-        let mark_id = ui.id().with(("palette_status_mark", item_index));
-        ui.interact(mark_rect, mark_id, egui::Sense::hover()).on_hover_text(hint.clone());
+        if item.hover.is_none() {
+            let mark_id = ui.id().with(("palette_status_mark", item_index));
+            ui.interact(mark_rect, mark_id, egui::Sense::hover()).on_hover_text(hint.clone());
+        }
     }
+    let subtitle_y = top + desc.size().y;
     painter.galley(egui::pos2(cols.desc_x(left), top), desc, theme.text);
+    if let Some(subtitle) = subtitle {
+        painter.galley(egui::pos2(cols.desc_x(left), subtitle_y), subtitle, theme.text_muted);
+    }
     painter.galley(egui::pos2(cols.action_x(left), top), action, theme.text_dim);
     painter.galley(egui::pos2(cols.keys_x(left), top), keys, theme.accent);
 
-    match hover {
+    match &item.hover {
         Some(text) => resp.on_hover_text(text),
-        None => resp,
+        None => match elided_hover {
+            Some(text) => resp.on_hover_text(text),
+            None => resp,
+        },
     }
 }
 
@@ -16557,6 +16594,182 @@ mod tests {
         assert!((fixed.desc - narrow.desc).abs() < 1.0);
         assert!((fixed.action - narrow.action).abs() < 1.0);
         assert!((fixed.keys - narrow.keys).abs() < 1.0);
+    }
+
+    struct PaintedPaletteText {
+        rows: usize,
+        elided: bool,
+        pos: egui::Pos2,
+        size: egui::Vec2,
+        font_size: f32,
+        color: Color32,
+    }
+
+    fn painted_palette_row(
+        width: f32,
+        item: &PaletteItem,
+    ) -> (HashMap<String, PaintedPaletteText>, egui::Rect) {
+        let ctx = egui::Context::default();
+        let theme = Theme::from_config(&Config::default());
+        let mut row_rect = None;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(900.0, 400.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, 300.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        let cols = PaletteColumns::new(theme.ui_scale, width);
+                        row_rect =
+                            Some(paint_palette_row(ui, &theme, &cols, item, None, 0, false).rect);
+                    },
+                );
+            });
+        });
+
+        let mut text = HashMap::new();
+        fn collect(shape: &egui::Shape, text: &mut HashMap<String, PaintedPaletteText>) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    let format = &t.galley.job.sections[0].format;
+                    text.insert(t.galley.text().to_owned(), PaintedPaletteText {
+                        rows: t.galley.rows.len(),
+                        elided: t.galley.elided,
+                        pos: t.pos,
+                        size: t.galley.size(),
+                        font_size: format.font_id.size,
+                        color: format.color,
+                    });
+                },
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| collect(shape, text)),
+                _ => {},
+            }
+        }
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut text);
+        }
+        (text, row_rect.expect("the palette row painted"))
+    }
+
+    fn palette_session(primary: &str, subtitle: &str, secondary: &str, hover: &str) -> PaletteItem {
+        PaletteItem::session(
+            1,
+            primary.to_owned(),
+            subtitle.to_owned(),
+            secondary.to_owned(),
+            hover.to_owned(),
+            Some("codex"),
+            true,
+        )
+    }
+
+    #[test]
+    fn palette_session_rows_bound_title_subtitle_and_middle() {
+        let title = "A deliberately long session title that wraps past two rows in the \
+                     description column and must stop there instead of continuing through every \
+                     remaining word in this sentence";
+        let subtitle = "◆ alacritree / feature/herdr-palette";
+        let middle = "codex · working on a deliberately long status message that needs more than \
+                      three lines in the middle column before it is cut";
+        let item = palette_session(title, subtitle, middle, "full session details");
+        let (text, rect) = painted_palette_row(760.0, &item);
+        let theme = Theme::from_config(&Config::default());
+        let title_paint = &text[title];
+        let subtitle_paint = &text[subtitle];
+        let middle_paint = &text[middle];
+
+        assert_eq!(title_paint.rows, 2);
+        assert!(title_paint.elided);
+        assert_eq!(title_paint.font_size, theme.font_normal);
+        assert_eq!(title_paint.color, theme.text);
+        assert_eq!(subtitle_paint.rows, 1);
+        assert_eq!(subtitle_paint.font_size, (theme.font_normal - 2.0).max(8.0));
+        assert_eq!(subtitle_paint.color, theme.text_muted);
+        assert!(subtitle_paint.pos.y >= title_paint.pos.y + title_paint.size.y - 0.5);
+        assert_eq!(middle_paint.rows, 3);
+        assert!(middle_paint.elided);
+        assert_eq!(middle_paint.font_size, theme.font_normal);
+        assert_eq!(middle_paint.color, theme.text_dim);
+
+        let content_height = (title_paint.size.y + subtitle_paint.size.y).max(middle_paint.size.y);
+        assert!((rect.height() - (content_height + 12.0)).abs() <= 1.0);
+    }
+
+    #[test]
+    fn narrow_palette_session_rows_bound_long_tokens() {
+        let title =
+            "title-with-one-unbroken-token-that-is-much-too-wide-for-the-description-column";
+        let subtitle = "/repo/worktrees/feature/one-unbroken-branch-name-that-is-too-wide";
+        let middle = "one-unbroken-middle-cell-token-that-needs-to-stop-after-three-lines";
+        let item = palette_session(title, subtitle, middle, "full narrow session details");
+        let (text, rect) = painted_palette_row(240.0, &item);
+
+        assert_eq!(text[title].rows, 2);
+        assert!(text[title].elided);
+        assert_eq!(text[subtitle].rows, 1);
+        assert!(text[subtitle].elided);
+        assert_eq!(text[middle].rows, 3);
+        assert!(text[middle].elided);
+        assert_eq!(rect.width(), 240.0);
+    }
+
+    #[test]
+    fn palette_session_rows_reserve_an_empty_subtitle_line() {
+        let empty = palette_session("shell", "", "shell", "empty subtitle details");
+        let filled = palette_session("shell", "◆", "shell", "filled subtitle details");
+        let action = PaletteItem::profile("shell".into(), "shell".into(), String::new(), "");
+
+        let (_, empty_rect) = painted_palette_row(760.0, &empty);
+        let (_, filled_rect) = painted_palette_row(760.0, &filled);
+        let (_, action_rect) = painted_palette_row(760.0, &action);
+
+        assert_eq!(empty_rect.height(), filled_rect.height());
+        assert!(empty_rect.height() > action_rect.height());
+    }
+
+    #[test]
+    fn palette_session_hover_owns_the_whole_row_including_the_status_mark() {
+        let item = palette_session("shell", "◆ home", "shell", "persistent session details");
+        let mark = (SessionMark::Attention, "competing status hint".to_owned());
+        let theme = Theme::from_config(&Config::default());
+        let texts = texts_while_hovering_at(egui::pos2(23.0, 20.0), 760.0, |ui| {
+            let cols = PaletteColumns::new(theme.ui_scale, 760.0);
+            paint_palette_row(ui, &theme, &cols, &item, Some(&mark), 0, false);
+        });
+
+        assert!(texts.iter().flatten().any(|(text, _)| text == "persistent session details"));
+        assert!(!texts.iter().flatten().any(|(text, _)| text == "competing status hint"));
+    }
+
+    #[test]
+    fn action_palette_rows_keep_elided_only_hover() {
+        let theme = Theme::from_config(&Config::default());
+        let short =
+            PaletteItem::profile("Open config".into(), "Config".into(), "Ctrl+C".into(), "");
+        let short_frames = texts_while_hovering(760.0, |ui| {
+            let cols = PaletteColumns::new(theme.ui_scale, 760.0);
+            paint_palette_row(ui, &theme, &cols, &short, None, 0, false);
+        });
+        assert!(!tooltip_shown(&short_frames, &short.primary));
+
+        let long = PaletteItem::profile(
+            "Open config".into(),
+            "AnActionNameFarTooLongForTheComfortablePaletteActionColumnToPaintInFull".into(),
+            "Ctrl+Shift+Something".into(),
+            "",
+        );
+        let long_frames = texts_while_hovering(760.0, |ui| {
+            let cols = PaletteColumns::new(theme.ui_scale, 760.0);
+            paint_palette_row(ui, &theme, &cols, &long, None, 0, false);
+        });
+        assert!(row_elided(&long_frames, &long.secondary));
+        assert!(tooltip_shown(&long_frames, &long.secondary));
     }
 
     #[test]
