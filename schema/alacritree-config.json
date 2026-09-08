@@ -537,9 +537,14 @@
           "minimum": 0,
           "type": "integer"
         },
+        "show_panes": {
+          "default": false,
+          "description": "List every pane a herdr server owns, not only the ones it detected an\nagent in.  A pane running a plain shell gets a row named by its own\ntitle, carrying no status, and opening it shares herdr's view of the\ntab that holds it rather than attaching to the pane.\n\nNeeds a herdr that knows `pane list` (0.8.2 does).  An older one\nanswers with a usage error, which reads as no herdr on that side and\nstops the polling there until this is turned off and alacritree\nrestarted.",
+          "type": "boolean"
+        },
         "show_unmatched": {
           "default": true,
-          "description": "List agents whose working directory matches no worktree, under Home.",
+          "description": "List panes whose working directory matches no worktree, under Home.",
           "type": "boolean"
         }
       },
@@ -1312,7 +1317,8 @@
           "type": "string"
         },
         "search_depth": {
-          "description": "How far a sidebar query reaches: \"workspaces\" (default) matches project\nand worktree names only; \"sessions\" also matches session titles and\nherdr agent names.",
+          "default": "workspaces",
+          "description": "How far a sidebar query reaches: \"workspaces\" matches project and\nworktree names only; \"sessions\" also matches session titles and herdr\nagent names.",
           "enum": [
             "workspaces",
             "sessions"

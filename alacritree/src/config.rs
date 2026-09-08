@@ -584,8 +584,11 @@ pub struct HerdrConfig {
     pub enabled: bool,
     /// How often a reachable herdr server is re-polled for agent state.
     pub poll_interval: Duration,
-    /// List agents whose working directory matches no worktree, under Home.
+    /// List panes whose working directory matches no worktree, under Home.
     pub show_unmatched: bool,
+    /// List every pane a herdr server owns, not only the ones it detected an
+    /// agent in.
+    pub show_panes: bool,
     /// What a row opens.  Honoured per side; the native side of a Windows
     /// host attaches to the session whatever this says.
     pub attach: AttachMode,
@@ -2743,8 +2746,18 @@ struct RawHerdr {
     enabled: bool,
     /// How often a reachable herdr server is re-polled for agent state.
     poll_interval_ms: u64,
-    /// List agents whose working directory matches no worktree, under Home.
+    /// List panes whose working directory matches no worktree, under Home.
     show_unmatched: bool,
+    /// List every pane a herdr server owns, not only the ones it detected an
+    /// agent in.  A pane running a plain shell gets a row named by its own
+    /// title, carrying no status, and opening it shares herdr's view of the
+    /// tab that holds it rather than attaching to the pane.
+    ///
+    /// Needs a herdr that knows `pane list` (0.8.2 does).  An older one
+    /// answers with a usage error, which reads as no herdr on that side and
+    /// stops the polling there until this is turned off and alacritree
+    /// restarted.
+    show_panes: bool,
     /// Whether opening a row attaches to that agent's pane directly
     /// ("agent") or to the herdr session around it with the pane focused
     /// ("session").
@@ -2765,6 +2778,7 @@ impl Default for RawHerdr {
             enabled: true,
             poll_interval_ms: 2000,
             show_unmatched: true,
+            show_panes: false,
             attach: "agent".to_string(),
         }
     }
@@ -2776,6 +2790,7 @@ impl RawHerdr {
             enabled: self.enabled,
             poll_interval: Duration::from_millis(self.poll_interval_ms),
             show_unmatched: self.show_unmatched,
+            show_panes: self.show_panes,
             attach: parse_attach_mode(&self.attach),
         }
     }
@@ -3660,6 +3675,7 @@ mod tests {
         assert!(config.integrations.herdr.enabled);
         assert_eq!(config.integrations.herdr.poll_interval, Duration::from_millis(2000));
         assert!(config.integrations.herdr.show_unmatched);
+        assert!(!config.integrations.herdr.show_panes);
         assert_eq!(config.integrations.herdr.attach, AttachMode::Agent);
     }
 
@@ -3669,6 +3685,19 @@ mod tests {
         let config = config_from(toml);
         assert!(!config.integrations.herdr.enabled);
         assert_eq!(config.integrations.herdr.poll_interval, Duration::from_millis(5000));
+    }
+
+    /// Panes with no agent in them are opt-in: the key needs a herdr that
+    /// knows `pane list`, so a config that never names it keeps the listing it
+    /// has always had.
+    #[test]
+    fn herdr_pane_listing_is_opt_in() {
+        let config = config_from(
+            "[integrations.herdr]
+show_panes = true
+",
+        );
+        assert!(config.integrations.herdr.show_panes);
     }
 
     #[test]

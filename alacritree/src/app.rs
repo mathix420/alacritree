@@ -1475,7 +1475,7 @@ impl AlacritreeApp {
             self.activate_session_by_id(id);
             return true;
         }
-        if herdr::attaches_directly(&key.side, self.config.integrations.herdr.attach) {
+        if self.herdr_attaches_directly(&key) {
             // Nothing to ask herdr first: the pane id is the whole target,
             // and the client attaches to it directly.
             let args = herdr::attach_args(pane_id);
@@ -1497,9 +1497,11 @@ impl AlacritreeApp {
         // long as herdr takes to answer.
         let name = self.herdr_session_name(&key.side);
         let side = key.side.clone();
-        let pane = pane_id.to_string();
+        let focus = self
+            .find_herdr_agent(&key.side, &key.terminal_id)
+            .map_or_else(|| herdr::focus_pane_args(pane_id), herdr::focus_args);
         let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
-            herdr_attach_gesture(&side, &pane, name)
+            herdr_attach_gesture(&side, &focus, name)
         });
         self.pending_herdr_attach.push(PendingHerdrAttach { job, key, workspace, previous });
         true
@@ -1551,8 +1553,7 @@ impl AlacritreeApp {
         program: String,
         argv: Vec<String>,
     ) -> bool {
-        let shared_view =
-            !herdr::attaches_directly(&key.side, self.config.integrations.herdr.attach);
+        let shared_view = !self.herdr_attaches_directly(&key);
         // `alacritty_terminal::tty::Shell`'s fields are crate-private, so
         // this goes through the constructor rather than a struct literal.
         let shell = Shell::new(program, argv);
@@ -1606,19 +1607,19 @@ impl AlacritreeApp {
         if !needs_view_focus(
             key.as_ref(),
             self.config.integrations.herdr.attach,
+            self.herdr_pane_has_agent(key.as_ref()),
             id,
             self.herdr_focused_view,
         ) {
             return;
         }
         let Some(key) = key else { return };
-        let Some(pane_id) =
-            self.find_herdr_agent(&key.side, &key.terminal_id).map(|agent| agent.pane_id.clone())
+        let Some(focus) = self.find_herdr_agent(&key.side, &key.terminal_id).map(herdr::focus_args)
         else {
             return;
         };
         let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
-            herdr::focus_agent(&key.side, &pane_id)
+            herdr::focus_pane(&key.side, &focus)
         });
         self.herdr_view_focus = Some(HerdrViewFocus { session: id, job });
     }
@@ -7510,15 +7511,19 @@ impl RowName {
 /// unattached rows so one heading's worth of vocabulary reads the same across
 /// both.  The native side contributes nothing, since a row that says nothing
 /// about a side is on the one the app itself runs on.
+///
+/// A pane with no agent in it carries no status word: `unknown` is what herdr
+/// calls an agent it cannot classify, and spending it on a shell would say
+/// the pane holds one.
 fn herdr_palette_secondary(
     side: &herdr::Side,
-    status: herdr::Status,
+    status: Option<herdr::Status>,
     context: Option<&str>,
     workspace: String,
 ) -> String {
     let mut parts = vec!["herdr".to_string()];
     parts.extend(context.map(str::to_string));
-    parts.push(status.label().to_string());
+    parts.extend(status.map(|s| s.label().to_string()));
     parts.extend(side.label());
     parts.push(workspace);
     parts.join(" · ")
@@ -7584,8 +7589,14 @@ impl Managed {
         Self {
             harness: "herdr",
             detach: settings.detach.clone(),
-            shared_view: !herdr::attaches_directly(side, attach),
-            mark: agent.map(|a| herdr_mark(a.status, settings.indicators)),
+            shared_view: !herdr::attaches_directly(
+                side,
+                attach,
+                agent.is_none_or(|a| a.status.is_some()),
+            ),
+            mark: agent
+                .and_then(|a| a.status)
+                .map(|status| herdr_mark(status, settings.indicators)),
             kind,
             title,
         }
@@ -8810,10 +8821,12 @@ struct HerdrViewFocus {
 fn needs_view_focus(
     key: Option<&herdr::HerdrKey>,
     attach: AttachMode,
+    has_agent: bool,
     active: SessionId,
     focused: Option<SessionId>,
 ) -> bool {
-    key.is_some_and(|key| !herdr::attaches_directly(&key.side, attach)) && focused != Some(active)
+    key.is_some_and(|key| !herdr::attaches_directly(&key.side, attach, has_agent))
+        && focused != Some(active)
 }
 
 /// What a shared-view attach asks herdr before its client can start: focus
@@ -8827,13 +8840,13 @@ fn needs_view_focus(
 /// refusal.
 fn herdr_attach_gesture(
     side: &herdr::Side,
-    pane_id: &str,
+    focus: &[String],
     cached_name: Option<String>,
 ) -> Result<(String, Vec<String>), String> {
     // Two argv spawns, no shell: the only shell a `Native` command could
     // reach on this side is cmd.exe, which does not understand `sh_quote`'s
     // single-quoting.
-    herdr::focus_agent(side, pane_id)?;
+    herdr::focus_pane(side, focus)?;
     let session = match cached_name {
         Some(session) => session,
         None => herdr::running_session_name(side)?,
@@ -9176,7 +9189,7 @@ impl AlacritreeApp {
     /// herdr's word on a session's agent: `Some` only while this session is
     /// attached to one the endpoint listing still carries.
     fn session_herdr_status(&self, session: &Session) -> Option<herdr::Status> {
-        self.session_herdr_agent(session).map(|agent| agent.status)
+        self.session_herdr_agent(session).and_then(|agent| agent.status)
     }
 
     /// The agent this session is attached to, while the endpoint listing
@@ -9185,6 +9198,24 @@ impl AlacritreeApp {
     fn session_herdr_agent(&self, session: &Session) -> Option<&herdr::Agent> {
         let key = session.herdr_key.as_ref()?;
         self.find_herdr_agent(&key.side, &key.terminal_id)
+    }
+
+    /// Whether herdr reports an agent in the pane `key` names.  A pane herdr
+    /// has stopped listing keeps the answer it had, so a session does not
+    /// start calling itself a shared view the moment herdr lets go of its
+    /// pane; a session that is not herdr's at all answers the same way.
+    fn herdr_pane_has_agent(&self, key: Option<&herdr::HerdrKey>) -> bool {
+        key.and_then(|key| self.find_herdr_agent(&key.side, &key.terminal_id))
+            .is_none_or(|agent| agent.status.is_some())
+    }
+
+    /// Whether opening this pane's row attaches to the pane on its own.
+    fn herdr_attaches_directly(&self, key: &herdr::HerdrKey) -> bool {
+        herdr::attaches_directly(
+            &key.side,
+            self.config.integrations.herdr.attach,
+            self.herdr_pane_has_agent(Some(key)),
+        )
     }
 
     /// What the endpoint learned this side's herdr session is called.
@@ -9241,7 +9272,10 @@ impl AlacritreeApp {
         if !self.config.integrations.herdr.enabled {
             return;
         }
-        self.herdr_endpoints.poll(self.config.integrations.herdr.poll_interval);
+        self.herdr_endpoints.poll(
+            self.config.integrations.herdr.poll_interval,
+            herdr::Listing::wanted(self.config.integrations.herdr.show_panes),
+        );
     }
 
     /// The rows `ws` paints, in `listed`'s order.  An entry whose session or
@@ -12213,9 +12247,10 @@ mod tests {
         herdr::Agent {
             terminal_id: "term_65abfc8e300361".into(),
             pane_id: "w5:p1".into(),
+            tab_id: Some("w5:t1".into()),
             kind: kind.map(String::from),
             title: None,
-            status: herdr::Status::Idle,
+            status: Some(herdr::Status::Idle),
             focused: false,
             cwd: None,
             foreground_cwd: None,
@@ -12350,7 +12385,7 @@ mod tests {
     #[test]
     fn a_shared_view_asks_herdr_for_its_pane() {
         let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
-        let asks = needs_view_focus(Some(&key), AttachMode::Agent, 1, None);
+        let asks = needs_view_focus(Some(&key), AttachMode::Agent, true, 1, None);
         assert_eq!(asks, cfg!(windows));
     }
 
@@ -12359,8 +12394,16 @@ mod tests {
     #[test]
     fn a_direct_attach_never_asks_herdr_for_its_pane() {
         let key = herdr::HerdrKey { side: herdr::Side::Wsl("d".into()), terminal_id: "t1".into() };
-        assert!(!needs_view_focus(Some(&key), AttachMode::Agent, 1, None));
-        assert!(!needs_view_focus(None, AttachMode::Agent, 1, None));
+        assert!(!needs_view_focus(Some(&key), AttachMode::Agent, true, 1, None));
+        assert!(!needs_view_focus(None, AttachMode::Agent, true, 1, None));
+    }
+
+    /// A pane with no agent in it has no direct attach on any side, so its
+    /// session is a shared view and keeps asking for its own pane.
+    #[test]
+    fn an_agentless_pane_asks_herdr_for_its_pane_on_every_side() {
+        let key = herdr::HerdrKey { side: herdr::Side::Wsl("d".into()), terminal_id: "t1".into() };
+        assert!(needs_view_focus(Some(&key), AttachMode::Agent, false, 1, None));
     }
 
     /// The pane herdr was last pointed at is where it still is, and asking
@@ -12368,8 +12411,8 @@ mod tests {
     #[test]
     fn a_shared_view_asks_once_per_switch() {
         let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
-        assert!(!needs_view_focus(Some(&key), AttachMode::Agent, 1, Some(1)));
-        let asks = needs_view_focus(Some(&key), AttachMode::Agent, 2, Some(1));
+        assert!(!needs_view_focus(Some(&key), AttachMode::Agent, true, 1, Some(1)));
+        let asks = needs_view_focus(Some(&key), AttachMode::Agent, true, 2, Some(1));
         assert_eq!(asks, cfg!(windows));
     }
 
@@ -12405,6 +12448,46 @@ mod tests {
         assert!(row.managed.shared_view);
     }
 
+    /// A herdr pane running a plain shell.  herdr names no agent in it, so
+    /// the only thing it can be called is the title it set itself.
+    fn shell_pane() -> herdr::Agent {
+        herdr::Agent { status: None, ..titled(None, Some("~/G/g/alacritree")) }
+    }
+
+    /// A shell pane has no kind to fall back to, and six characters of a
+    /// terminal id name nothing a user would recognise.
+    #[test]
+    fn an_agentless_pane_is_named_by_its_title() {
+        assert_eq!(herdr_display_name(&shell_pane()), RowName::plain("~/G/g/alacritree".into()));
+    }
+
+    /// `unknown` is herdr's word for an agent it cannot classify, so a shell
+    /// wearing it would claim an agent is there.
+    #[test]
+    fn an_agentless_pane_claims_no_status() {
+        assert_eq!(
+            herdr_palette_secondary(&herdr::Side::Native, None, None, "Home".into()),
+            "herdr \u{b7} Home"
+        );
+    }
+
+    /// The pane is still herdr's, which is what the row's mark says; the
+    /// state is the part there is nothing to report.  Every `herdr agent`
+    /// subcommand resolves its target through the agent registry, so the
+    /// attach shares herdr's view even on a side that attaches directly.
+    #[test]
+    fn an_agentless_pane_paints_no_state_and_shares_the_view() {
+        let row = HerdrRowData::from_agent(
+            &shell_pane(),
+            &herdr::Side::Wsl("d".into()),
+            &herdr::Settings::default(),
+            AttachMode::Agent,
+        );
+        assert_eq!(row.managed.mark, None);
+        assert!(row.managed.shared_view);
+        assert_eq!(managed_tooltip(&row.managed), r#"herdr, shared view, "~/G/g/alacritree"."#);
+    }
+
     /// The sidebar, the palette and the filter all call `herdr_display_name`
     /// rather than resolving a title themselves, so pinning its output here
     /// pins what all three show.
@@ -12437,9 +12520,10 @@ mod tests {
         let agent = herdr::Agent {
             terminal_id: "t1".into(),
             pane_id: "w1:p1".into(),
+            tab_id: Some("w1:t1".into()),
             kind: None,
             title: None,
-            status: herdr::Status::Idle,
+            status: Some(herdr::Status::Idle),
             focused: false,
             cwd: None,
             foreground_cwd: None,
@@ -12467,7 +12551,7 @@ mod tests {
         assert_eq!(
             herdr_palette_secondary(
                 &herdr::Side::Wsl("ubuntu".into()),
-                herdr::Status::Working,
+                Some(herdr::Status::Working),
                 Some("claude"),
                 "alacritree / master".into(),
             ),
@@ -12482,7 +12566,7 @@ mod tests {
         assert_eq!(
             herdr_palette_secondary(
                 &herdr::Side::Wsl("ubuntu".into()),
-                herdr::Status::Idle,
+                Some(herdr::Status::Idle),
                 None,
                 "Home".into(),
             ),
@@ -12495,7 +12579,12 @@ mod tests {
     #[test]
     fn palette_secondary_leaves_the_native_side_unsaid() {
         assert_eq!(
-            herdr_palette_secondary(&herdr::Side::Native, herdr::Status::Done, None, "Home".into()),
+            herdr_palette_secondary(
+                &herdr::Side::Native,
+                Some(herdr::Status::Done),
+                None,
+                "Home".into(),
+            ),
             "herdr \u{b7} done \u{b7} Home"
         );
     }
@@ -12647,7 +12736,7 @@ mod tests {
     #[test]
     fn the_tooltip_spells_out_what_the_marks_cannot() {
         let agent = herdr::Agent {
-            status: herdr::Status::Working,
+            status: Some(herdr::Status::Working),
             ..titled(Some("claude"), Some("Claude Code"))
         };
         let mut row = HerdrRowData::from_agent(
@@ -15025,9 +15114,10 @@ mod tests {
         let agent = herdr::Agent {
             terminal_id: "t1".into(),
             pane_id: "w1:p1".into(),
+            tab_id: Some("w1:t1".into()),
             kind: None,
             title: None,
-            status: herdr::Status::Idle,
+            status: Some(herdr::Status::Idle),
             focused: false,
             cwd: Some(gone.to_string_lossy().into_owned()),
             foreground_cwd: None,

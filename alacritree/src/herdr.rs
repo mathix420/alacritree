@@ -77,19 +77,26 @@ impl Status {
     }
 }
 
-/// One agent as herdr reports it.  `terminal_id` is the identity because
+/// One pane as herdr reports it.  `terminal_id` is the identity because
 /// `pane_id` is positional: a pane moved between workspaces gets a new one,
 /// and ids restart at `w1` after `session delete`.
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub terminal_id: String,
     pub pane_id: String,
+    /// The tab holding this pane.  `herdr agent focus` resolves its target
+    /// through the agent registry, so a pane with no agent in it is reached
+    /// through its tab instead.
+    pub tab_id: Option<String>,
     pub kind: Option<String>,
     /// The pane's title, with the decorative agent prefix already removed by
     /// herdr.  Two agents of one kind in one checkout are told apart by this
     /// and nothing else.
     pub title: Option<String>,
-    pub status: Status,
+    /// herdr's word on the agent in this pane, and `None` when herdr found no
+    /// agent in it at all.  `Some(Unknown)` is the other half of that
+    /// distinction: an agent is there and herdr cannot classify it.
+    pub status: Option<Status>,
     /// The pane herdr's own window is showing.  A shared-view attach borrows
     /// that window rather than one pane, so this is what such a session has
     /// on screen.
@@ -98,23 +105,72 @@ pub struct Agent {
     pub foreground_cwd: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct Envelope {
-    result: Option<AgentList>,
+/// Which herdr listing a poll asks for.  `agent list` answers with the panes
+/// herdr detected an agent in; `pane list` answers with every pane it owns,
+/// a superset carrying the same fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listing {
+    Agents,
+    Panes,
+}
+
+impl Listing {
+    /// The listing `[integrations.herdr] show_panes` asks for.
+    pub fn wanted(show_panes: bool) -> Self {
+        if show_panes { Self::Panes } else { Self::Agents }
+    }
+
+    /// The `herdr` subcommand that produces this listing.  A herdr too old
+    /// for `pane list` answers with a usage error rather than an envelope,
+    /// which `list_panes` cannot tell from no herdr on that side at all.
+    pub fn args(self) -> [&'static str; 2] {
+        match self {
+            Self::Agents => ["agent", "list"],
+            Self::Panes => ["pane", "list"],
+        }
+    }
+
+    /// Panes from one reply.  An entry missing an identity — or, where the
+    /// entry is an agent, a status — is dropped on its own; its siblings
+    /// still parse.
+    pub fn parse(self, stdout: &str) -> Vec<Agent> {
+        let Ok(envelope) = serde_json::from_str::<Envelope>(stdout) else {
+            return Vec::new();
+        };
+        let Some(listed) = envelope.result else {
+            return Vec::new();
+        };
+        let raw = match self {
+            Self::Agents => listed.agents,
+            Self::Panes => listed.panes,
+        };
+        raw.into_iter().filter_map(|raw| raw.into_agent(self)).collect()
+    }
 }
 
 #[derive(Deserialize)]
-struct AgentList {
+struct Envelope {
+    result: Option<Listed>,
+}
+
+/// The one key the two listings differ in.  Both are absent-tolerant, so a
+/// reply is read under the listing that was asked for rather than under
+/// whichever key happens to be present.
+#[derive(Deserialize)]
+struct Listed {
     #[serde(default)]
-    agents: Vec<RawAgent>,
+    agents: Vec<RawPane>,
+    #[serde(default)]
+    panes: Vec<RawPane>,
 }
 
 /// Only the fields the sidebar renders.  Everything else herdr sends is
 /// ignored, so an additive protocol change costs nothing.
 #[derive(Deserialize)]
-struct RawAgent {
+struct RawPane {
     terminal_id: Option<String>,
     pane_id: Option<String>,
+    tab_id: Option<String>,
     agent_status: Option<String>,
     agent: Option<String>,
     display_agent: Option<String>,
@@ -124,33 +180,27 @@ struct RawAgent {
     foreground_cwd: Option<String>,
 }
 
-/// Agents from one `herdr agent list` reply.  An agent missing an identity
-/// or a status is dropped on its own; its siblings still parse.
-pub fn parse_agent_list(stdout: &str) -> Vec<Agent> {
-    let Ok(envelope) = serde_json::from_str::<Envelope>(stdout) else {
-        return Vec::new();
-    };
-    let Some(list) = envelope.result else {
-        return Vec::new();
-    };
-    list.agents
-        .into_iter()
-        .filter_map(|raw| {
-            Some(Agent {
-                terminal_id: raw.terminal_id?,
-                pane_id: raw.pane_id?,
-                status: Status::parse(&raw.agent_status?),
-                kind: raw.display_agent.or(raw.agent),
-                title: raw
-                    .terminal_title_stripped
-                    .map(|t| t.trim().to_string())
-                    .filter(|t| !t.is_empty()),
-                focused: raw.focused.unwrap_or(false),
-                cwd: raw.cwd,
-                foreground_cwd: raw.foreground_cwd,
-            })
+impl RawPane {
+    fn into_agent(self, listing: Listing) -> Option<Agent> {
+        // Everything `agent list` returns is an agent, whatever it says about
+        // the agent's kind; in a pane listing the `agent` key is what says so.
+        let has_agent = listing == Listing::Agents || self.agent.is_some();
+        let status = if has_agent { Some(Status::parse(&self.agent_status?)) } else { None };
+        Some(Agent {
+            terminal_id: self.terminal_id?,
+            pane_id: self.pane_id?,
+            tab_id: self.tab_id,
+            status,
+            kind: self.display_agent.or(self.agent),
+            title: self
+                .terminal_title_stripped
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty()),
+            focused: self.focused.unwrap_or(false),
+            cwd: self.cwd,
+            foreground_cwd: self.foreground_cwd,
         })
-        .collect()
+    }
 }
 
 /// Single-quote a POSIX argument, since WSL invocations are one `sh -lc`
@@ -212,8 +262,13 @@ pub fn can_attach(side: &Side) -> bool {
 /// preference are separate questions and only disagree in one direction: a
 /// user who asks for a direct attach on a side that has none gets the
 /// session, and no user can be given a direct attach they did not ask for.
-pub fn attaches_directly(side: &Side, mode: AttachMode) -> bool {
-    mode == AttachMode::Agent && can_attach(side)
+///
+/// `has_agent` is false for a pane herdr found no agent in.  Every `herdr
+/// agent` subcommand resolves its target through the agent registry, which
+/// holds nothing for such a pane, so it is only ever reachable through the
+/// session.
+pub fn attaches_directly(side: &Side, mode: AttachMode, has_agent: bool) -> bool {
+    has_agent && mode == AttachMode::Agent && can_attach(side)
 }
 
 /// How long the attach gesture waits for herdr before calling it a refusal.
@@ -239,14 +294,31 @@ fn bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<
     rx.recv_timeout(GESTURE_TIMEOUT).ok()
 }
 
+/// The `herdr` subcommand that brings `agent`'s pane to the front of the
+/// user's own herdr window.  `agent focus` resolves its target through the
+/// agent registry and answers `agent_not_found` for a pane with no agent in
+/// it, so such a pane is reached by focusing the tab that holds it.
+pub fn focus_args(agent: &Agent) -> Vec<String> {
+    match (agent.status, &agent.tab_id) {
+        (None, Some(tab_id)) => vec!["tab".into(), "focus".into(), tab_id.clone()],
+        _ => focus_pane_args(&agent.pane_id),
+    }
+}
+
+/// The `herdr` subcommand that focuses one pane by id.
+pub fn focus_pane_args(pane_id: &str) -> Vec<String> {
+    vec!["agent".into(), "focus".into(), pane_id.into()]
+}
+
 /// Focuses one pane in the user's own herdr window, the first half of the
 /// native-Windows attach fallback.  A non-zero exit carries herdr's stderr
 /// verbatim rather than `error_code`'s parsed code, since a user-facing
 /// message wants herdr's human-readable text, not its machine code, and a
 /// server that does not answer inside [`GESTURE_TIMEOUT`] refuses the same
 /// way.
-pub fn focus_agent(side: &Side, pane_id: &str) -> Result<(), String> {
-    let (program, args) = side.command(&["agent", "focus", pane_id]);
+pub fn focus_pane(side: &Side, focus: &[String]) -> Result<(), String> {
+    let borrowed: Vec<&str> = focus.iter().map(String::as_str).collect();
+    let (program, args) = side.command(&borrowed);
     #[allow(clippy::disallowed_methods)] // Running herdr is this function's job.
     let run = move || {
         command_ext::hidden(program)
@@ -580,7 +652,7 @@ impl EndpointCache {
     }
 
     /// Adopts a landed result and starts a new poll when due.  Never blocks.
-    pub fn poll(&mut self, interval: Duration) {
+    pub fn poll(&mut self, interval: Duration, listing: Listing) {
         self.advance_settings();
         self.advance_session_name();
         if let Some(job) = &self.pending {
@@ -623,10 +695,9 @@ impl EndpointCache {
         }
         self.last_attempt = Some(Instant::now());
         let side = self.side.clone();
-        self.pending = Some(
-            jobs::pool()
-                .spawn(jobs::Priority::Background, move |blocking| list_agents(&side, blocking)),
-        );
+        self.pending = Some(jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
+            list_panes(&side, listing, blocking)
+        }));
     }
 
     /// Records one poll that produced no agents, and says so once.  A novel
@@ -702,10 +773,10 @@ impl Endpoints {
     }
 
     /// Refreshes the endpoint set and each endpoint's agents.  Never blocks.
-    pub fn poll(&mut self, interval: Duration) {
+    pub fn poll(&mut self, interval: Duration, listing: Listing) {
         self.refresh_running();
         for cache in &mut self.caches {
-            cache.poll(interval);
+            cache.poll(interval, listing);
         }
     }
 
@@ -795,8 +866,8 @@ fn rendered_differs(was: &[Agent], now: &[Agent]) -> bool {
         })
 }
 
-/// Runs `herdr agent list` on one side.  Success is on stdout, errors are on
-/// stderr, so both are captured; the exit status decides which to read.
+/// Runs one of herdr's listings on one side.  Success is on stdout, errors
+/// are on stderr, so both are captured; the exit status decides which to read.
 ///
 /// wsl.exe's own failure messages (a missing distro, for instance) come back
 /// UTF-16LE unless WSL_UTF8 is set, and `from_utf8_lossy` mangles them without
@@ -804,8 +875,12 @@ fn rendered_differs(was: &[Agent], now: &[Agent]) -> bool {
 /// herdr's own output is a relayed Linux byte stream and is unaffected either
 /// way.
 #[allow(clippy::disallowed_methods)] // Running herdr is this function's job.
-fn list_agents(side: &Side, _blocking: &jobs::Blocking) -> Result<Vec<Agent>, PollError> {
-    let (program, args) = side.command(&["agent", "list"]);
+fn list_panes(
+    side: &Side,
+    listing: Listing,
+    _blocking: &jobs::Blocking,
+) -> Result<Vec<Agent>, PollError> {
+    let (program, args) = side.command(&listing.args());
     let output = command_ext::hidden(program)
         .args(args)
         .env("WSL_UTF8", "1")
@@ -821,7 +896,7 @@ fn list_agents(side: &Side, _blocking: &jobs::Blocking) -> Result<Vec<Agent>, Po
             None => PollError::Absent("herdr_unavailable"),
         });
     }
-    Ok(parse_agent_list(&String::from_utf8_lossy(&output.stdout)))
+    Ok(listing.parse(&String::from_utf8_lossy(&output.stdout)))
 }
 
 /// herdr's own defaults.  A config that binds neither still detaches on
@@ -1010,7 +1085,7 @@ mod tests {
         let stdout = r#"{"result":{"agents":[
             {"terminal_id":"t1","pane_id":"w5:p1","agent_status":"idle","agent":"claude",
              "terminal_title":"✫ primary","terminal_title_stripped":"primary"}]}}"#;
-        let agents = parse_agent_list(stdout);
+        let agents = Listing::Agents.parse(stdout);
         assert_eq!(agents[0].title.as_deref(), Some("primary"));
     }
 
@@ -1019,7 +1094,7 @@ mod tests {
     fn a_titleless_agent_parses_with_no_title() {
         let stdout = r#"{"result":{"agents":[
             {"terminal_id":"t1","pane_id":"w5:p1","agent_status":"idle","agent":"claude"}]}}"#;
-        assert_eq!(parse_agent_list(stdout)[0].title, None);
+        assert_eq!(Listing::Agents.parse(stdout)[0].title, None);
     }
 
     /// A title of nothing but spaces says as little as an absent one, and must
@@ -1029,7 +1104,7 @@ mod tests {
         let stdout = r#"{"result":{"agents":[
             {"terminal_id":"t1","pane_id":"w5:p1","agent_status":"idle","agent":"claude",
              "terminal_title_stripped":"   "}]}}"#;
-        assert_eq!(parse_agent_list(stdout)[0].title, None);
+        assert_eq!(Listing::Agents.parse(stdout)[0].title, None);
     }
 
     /// herdr ships `ctrl+b` / `prefix+q`, so an untouched config is not an
@@ -1168,12 +1243,12 @@ status_indicators = \"symbols\"
 
     #[test]
     fn parses_a_windows_agent_with_absent_optional_fields() {
-        let agents = parse_agent_list(WINDOWS);
+        let agents = Listing::Agents.parse(WINDOWS);
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].terminal_id, "term_65abfc8e300361");
         assert_eq!(agents[0].pane_id, "w5:p1");
         assert_eq!(agents[0].kind.as_deref(), Some("claude"));
-        assert_eq!(agents[0].status, Status::Idle);
+        assert_eq!(agents[0].status, Some(Status::Idle));
         assert_eq!(agents[0].foreground_cwd, None);
     }
 
@@ -1186,7 +1261,7 @@ status_indicators = \"symbols\"
 
     #[test]
     fn parses_a_wsl_agent_with_foreground_cwd() {
-        let agents = parse_agent_list(WSL);
+        let agents = Listing::Agents.parse(WSL);
         assert_eq!(agents[0].foreground_cwd.as_deref(), Some("/home/dev/Git/devkit"));
         assert_eq!(agents[0].kind.as_deref(), Some("codex"));
     }
@@ -1194,7 +1269,7 @@ status_indicators = \"symbols\"
     #[test]
     fn empty_agent_list_is_not_an_error() {
         let reply = r#"{"id":"cli:agent:list","result":{"agents":[],"type":"agent_list"}}"#;
-        assert!(parse_agent_list(reply).is_empty());
+        assert!(Listing::Agents.parse(reply).is_empty());
     }
 
     #[test]
@@ -1202,9 +1277,9 @@ status_indicators = \"symbols\"
         let reply = r#"{"id":"x","surprise":1,"result":{"agents":[
             {"terminal_id":"t1","pane_id":"w1:p1","agent_status":"meditating",
              "future_field":true}],"type":"agent_list"}}"#;
-        let agents = parse_agent_list(reply);
+        let agents = Listing::Agents.parse(reply);
         assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].status, Status::Unknown);
+        assert_eq!(agents[0].status, Some(Status::Unknown));
     }
 
     #[test]
@@ -1212,7 +1287,7 @@ status_indicators = \"symbols\"
         let reply = r#"{"id":"x","result":{"agents":[
             {"pane_id":"w1:p1","agent_status":"idle"},
             {"terminal_id":"t2","pane_id":"w1:p2","agent_status":"idle"}],"type":"agent_list"}}"#;
-        let agents = parse_agent_list(reply);
+        let agents = Listing::Agents.parse(reply);
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].terminal_id, "t2");
     }
@@ -1222,7 +1297,57 @@ status_indicators = \"symbols\"
         let reply = r#"{"id":"x","result":{"agents":[
             {"terminal_id":"t1","pane_id":"w1:p1","agent_status":"idle",
              "agent":"claude","display_agent":"Claude Code"}],"type":"agent_list"}}"#;
-        assert_eq!(parse_agent_list(reply)[0].kind.as_deref(), Some("Claude Code"));
+        assert_eq!(Listing::Agents.parse(reply)[0].kind.as_deref(), Some("Claude Code"));
+    }
+
+    /// Captured from a native Windows server.  The second pane runs a plain
+    /// shell: herdr carries no `agent` key for it and calls its status
+    /// `unknown`, which is the state word of an agent it cannot classify and
+    /// not a claim that one is there.
+    const PANES: &str = r#"{"id":"cli:pane:list","result":{"panes":[
+        {"agent":"claude","agent_status":"idle","pane_id":"w1:p1","tab_id":"w1:t1",
+         "terminal_id":"term_a","cwd":"C:\\projects\\alacritree","focused":true,
+         "terminal_title":"✫ Claude Code","terminal_title_stripped":"Claude Code",
+         "scroll":{"offset_from_bottom":0},"workspace_id":"w1"},
+        {"agent_status":"unknown","pane_id":"w1:p4","tab_id":"w1:t4",
+         "terminal_id":"term_b","cwd":"C:\\projects\\alacritree","focused":false,
+         "terminal_title":"~/p/alacritree","terminal_title_stripped":"~/p/alacritree",
+         "scroll":{"offset_from_bottom":0},"workspace_id":"w1"}],"type":"pane_list"}}"#;
+
+    #[test]
+    fn a_pane_listing_keeps_the_shell_beside_the_agent() {
+        let panes = Listing::Panes.parse(PANES);
+        assert_eq!(panes.len(), 2);
+        assert_eq!(panes[0].status, Some(Status::Idle));
+        assert_eq!(panes[0].kind.as_deref(), Some("claude"));
+        assert_eq!(panes[1].status, None);
+        assert_eq!(panes[1].kind, None);
+        assert_eq!(panes[1].title.as_deref(), Some("~/p/alacritree"));
+        assert_eq!(panes[1].tab_id.as_deref(), Some("w1:t4"));
+    }
+
+    /// One call either way: each poll is a process spawn per side, and the
+    /// pane listing already carries everything the agent listing does.
+    #[test]
+    fn showing_panes_swaps_the_listing_rather_than_adding_one() {
+        assert_eq!(Listing::wanted(false).args(), ["agent", "list"]);
+        assert_eq!(Listing::wanted(true).args(), ["pane", "list"]);
+    }
+
+    /// `herdr agent focus` answers `agent_not_found` for a pane with no agent
+    /// in it, so the tab is the only handle such a pane has.
+    #[test]
+    fn a_pane_with_no_agent_is_focused_through_its_tab() {
+        let panes = Listing::Panes.parse(PANES);
+        assert_eq!(focus_args(&panes[0]), vec!["agent", "focus", "w1:p1"]);
+        assert_eq!(focus_args(&panes[1]), vec!["tab", "focus", "w1:t4"]);
+    }
+
+    /// A pane herdr detected no agent in has nothing `herdr agent attach`
+    /// could resolve, whatever the side and the configured mode allow.
+    #[test]
+    fn a_pane_with_no_agent_never_attaches_directly() {
+        assert!(!attaches_directly(&Side::Wsl("d".into()), AttachMode::Agent, false));
     }
 
     /// The reply that arrives on stderr with stdout empty when no server is
@@ -1231,7 +1356,7 @@ status_indicators = \"symbols\"
     fn reads_the_error_code_off_stderr() {
         let stderr = r#"{"error":{"code":"server_not_running","message":"no herdr server"},"id":"cli:agent:list"}"#;
         assert_eq!(error_code(stderr).as_deref(), Some("server_not_running"));
-        assert!(parse_agent_list("").is_empty());
+        assert!(Listing::Agents.parse("").is_empty());
     }
 
     #[test]
@@ -1259,10 +1384,10 @@ status_indicators = \"symbols\"
     #[test]
     fn asking_for_the_session_gives_up_a_direct_attach() {
         let wsl = Side::Wsl("d".into());
-        assert!(attaches_directly(&wsl, AttachMode::Agent));
-        assert!(!attaches_directly(&wsl, AttachMode::Session));
-        assert!(!attaches_directly(&Side::Native, AttachMode::Session));
-        assert_eq!(attaches_directly(&Side::Native, AttachMode::Agent), !cfg!(windows));
+        assert!(attaches_directly(&wsl, AttachMode::Agent, true));
+        assert!(!attaches_directly(&wsl, AttachMode::Session, true));
+        assert!(!attaches_directly(&Side::Native, AttachMode::Session, true));
+        assert_eq!(attaches_directly(&Side::Native, AttachMode::Agent, true), !cfg!(windows));
     }
 
     #[test]
@@ -1420,9 +1545,10 @@ status_indicators = \"symbols\"
         Agent {
             terminal_id: id.into(),
             pane_id: "w1:p1".into(),
+            tab_id: Some("w1:t1".into()),
             kind: Some("claude".into()),
             title: None,
-            status,
+            status: Some(status),
             focused: false,
             cwd: Some("/repo".into()),
             foreground_cwd: None,
@@ -1446,9 +1572,10 @@ status_indicators = \"symbols\"
         Agent {
             terminal_id: "t1".into(),
             pane_id: "w1:p1".into(),
+            tab_id: Some("w1:t1".into()),
             kind: None,
             title: None,
-            status: Status::Idle,
+            status: Some(Status::Idle),
             focused: false,
             cwd: Some(cwd.into()),
             foreground_cwd: foreground.map(str::to_string),
