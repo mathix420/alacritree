@@ -12151,6 +12151,73 @@ mod tests {
     }
 
     #[test]
+    fn attached_herdr_palette_retains_details_across_a_pre_attachment_agent_reply() {
+        let mut app = herdr_lifecycle_app();
+        app.config.ui.path_style.git_rows = PathStyle::Fish;
+        app.config.integrations.herdr.show_panes = false;
+        app.config.ui.icons.herdr.glyph = Some("✦".into());
+        app.herdr_endpoints.caches_mut_for_test()[0].complete_listing_for_test(
+            Ok(r#"{"result":{"agents":[{"terminal_id":"term-kept","pane_id":"w1:p1","agent":"claude","agent_status":"working","terminal_title_stripped":"review work","cwd":"/private/project","focused":true}]}}"#),
+            herdr::Listing::Agents,
+            herdr::Listing::Agents,
+            Instant::now(),
+        );
+        let request_started = Instant::now();
+        let id = bind_herdr_fixture(&mut app, herdr::Side::Native, "term-kept");
+        app.herdr_endpoints.caches_mut_for_test()[0].complete_listing_for_test(
+            Ok(r#"{"result":{"agents":[]}}"#),
+            herdr::Listing::Agents,
+            herdr::Listing::Agents,
+            request_started,
+        );
+
+        for after_failure in [false, true] {
+            if after_failure {
+                app.herdr_endpoints.caches_mut_for_test()[0].complete_listing_for_test(
+                    Err(herdr::PollError::Absent("spawn_failed")),
+                    herdr::Listing::Panes,
+                    herdr::Listing::Agents,
+                    Instant::now(),
+                );
+            }
+            app.reconcile_herdr_sessions(&Context::default());
+            assert_eq!(app.sessions[0].id, id);
+            assert!(app.herdr_endpoints.caches()[0].inventory().is_none());
+            let items = app.palette_items();
+            let row = items
+                .iter()
+                .position(|item| item.action == PaletteAction::ActivateSession(id))
+                .unwrap();
+            let item = &items[row];
+            assert_eq!(item.primary, "review work", "after failure: {after_failure}");
+            assert_eq!(item.secondary, "claude");
+            assert!(item.subtitle.as_deref().unwrap().starts_with("✦ "));
+            let hover = item.hover.as_deref().unwrap();
+            for detail in [
+                "Pane: w1:p1",
+                "Terminal: term-kept",
+                "Cwd: /private/project",
+                "herdr",
+                "Activate: switch to this session",
+            ] {
+                assert!(hover.contains(detail), "{detail}: {hover}");
+            }
+            assert!(!hover.contains("Status: working"));
+            let pane = app.herdr_endpoints.caches()[0].attachment_pane("term-kept").unwrap();
+            assert!(!pane.current);
+            assert!(pane.agent.status.is_none());
+            assert!(!pane.agent.focused);
+            let mut palette = CommandPalette::new();
+            *palette.query_mut() = "herdr".into();
+            assert!(palette.rank(&items).contains(&row));
+            for hidden in ["term-kept", "/private/project"] {
+                *palette.query_mut() = hidden.into();
+                assert!(!palette.rank(&items).contains(&row));
+            }
+        }
+    }
+
+    #[test]
     fn attached_herdr_palette_without_metadata_uses_the_binding() {
         let mut app = herdr_lifecycle_app();
         app.config.ui.icons.herdr.glyph = Some("✦".into());

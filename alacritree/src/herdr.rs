@@ -712,7 +712,15 @@ impl EndpointCache {
         } else {
             self.reach.record_success();
             self.inventory = None;
-            self.attachment_panes.clear();
+            if attached {
+                for pane in &mut self.attachment_panes {
+                    pane.current = false;
+                    pane.agent.status = None;
+                    pane.agent.focused = false;
+                }
+            } else {
+                self.attachment_panes.clear();
+            }
         }
         if display == Listing::Agents && reply.listing == Listing::Panes {
             agents.retain(|agent| agent.status.is_some());
