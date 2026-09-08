@@ -173,6 +173,17 @@ impl LiveState {
             herdr::Status::Unknown => None,
         }
     }
+
+    /// Word a row paints for this state, mirroring `herdr::Status::label` so
+    /// an agent alacritree reads on its own speaks the same vocabulary herdr
+    /// does.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Blocked => "blocked",
+        }
+    }
 }
 
 /// What the sidebar needs to communicate about a live session.  Presence is a
@@ -2749,6 +2760,13 @@ mod tests {
     fn the_live_axis_ranks_by_how_much_a_state_wants_a_human() {
         assert!(LiveState::Idle < LiveState::Working);
         assert!(LiveState::Working < LiveState::Blocked);
+    }
+
+    #[test]
+    fn live_state_labels_mirror_herdrs_own_words() {
+        assert_eq!(LiveState::Idle.label(), "idle");
+        assert_eq!(LiveState::Working.label(), "working");
+        assert_eq!(LiveState::Blocked.label(), "blocked");
     }
 
     #[test]

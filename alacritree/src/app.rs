@@ -7471,6 +7471,24 @@ fn herdr_palette_secondary(
     parts.join(" · ")
 }
 
+/// The secondary column for a session whose activity is an agent with no
+/// herdr agent behind it: the local reading of the same axes herdr's shape
+/// would report if herdr were watching.  Elides the name the same way
+/// `herdr_row_name` elides its context — when the row's primary already
+/// spells it out, the secondary does not repeat it.
+fn agent_palette_secondary(
+    name: Option<&str>,
+    primary: &str,
+    live: LiveState,
+    workspace: String,
+) -> String {
+    let mut parts = vec!["agent".to_string()];
+    parts.extend(name.filter(|n| *n != primary).map(str::to_string));
+    parts.push(live.label().to_string());
+    parts.push(workspace);
+    parts.join(" · ")
+}
+
 /// The name herdr reports for a pane, and `None` when it reports none.  The
 /// kind rides along as context unless it says the same thing as the title.
 /// What a titleless agent falls back to differs by row, so each caller says
@@ -9671,13 +9689,21 @@ impl AlacritreeApp {
             let activity =
                 herdr_backed_activity(session.activity(), self.session_herdr_status(session));
             let name = session_row_name(&session.title, activity, agent);
-            let secondary = match (agent, session.herdr_key.as_ref()) {
-                (Some(a), Some(key)) => herdr_palette_secondary(
+            let secondary = match (agent, session.herdr_key.as_ref(), activity) {
+                (Some(a), Some(key), _) => herdr_palette_secondary(
                     &key.side,
                     a.status,
                     name.context.as_deref(),
                     self.workspace_label(&session.working_directory),
                 ),
+                (_, _, SessionActivity::Agent { name: agent_name, live }) => {
+                    agent_palette_secondary(
+                        agent_name,
+                        &name.text,
+                        live,
+                        self.workspace_label(&session.working_directory),
+                    )
+                },
                 _ => format!("session · {}", self.workspace_label(&session.working_directory)),
             };
             items.push(PaletteItem::session(session.id, name.text, secondary));
@@ -12399,6 +12425,37 @@ mod tests {
         assert_eq!(
             herdr_palette_secondary(&herdr::Side::Native, herdr::Status::Done, None, "Home".into()),
             "herdr \u{b7} done \u{b7} Home"
+        );
+    }
+
+    /// A local agent's name is worth a column when the primary painted
+    /// something else, the same way herdr's own context is.
+    #[test]
+    fn agent_palette_secondary_spells_out_a_name_the_primary_did_not_carry() {
+        assert_eq!(
+            agent_palette_secondary(Some("claude"), "zsh", LiveState::Working, "myrepo".into()),
+            "agent \u{b7} claude \u{b7} working \u{b7} myrepo"
+        );
+    }
+
+    /// Stripping the decorative mark leaves the primary saying "claude"
+    /// already, so the secondary does not spell it out a second time.
+    #[test]
+    fn agent_palette_secondary_omits_a_name_the_primary_already_carried() {
+        assert_eq!(
+            agent_palette_secondary(Some("claude"), "claude", LiveState::Working, "myrepo".into()),
+            "agent \u{b7} working \u{b7} myrepo"
+        );
+    }
+
+    /// An agent recognized only by its decorative prefix has no name to
+    /// spell out at all, so the secondary is exactly as bare as the elided
+    /// case above.
+    #[test]
+    fn agent_palette_secondary_has_nothing_to_elide_without_a_recognized_name() {
+        assert_eq!(
+            agent_palette_secondary(None, "claude", LiveState::Idle, "Home".into()),
+            "agent \u{b7} idle \u{b7} Home"
         );
     }
 
