@@ -535,6 +535,7 @@ pub struct EndpointCache {
     generation: u64,
     reach: Reach,
     last_attempt: Option<Instant>,
+    sampled_at: Option<Instant>,
     pending: Option<jobs::Job<Result<Vec<Agent>, PollError>>>,
     settings: Read<Settings>,
     session_name: Read<String>,
@@ -548,6 +549,7 @@ impl EndpointCache {
             generation: 0,
             reach: Reach::default(),
             last_attempt: None,
+            sampled_at: None,
             pending: None,
             settings: Read::Unread,
             session_name: Read::Unread,
@@ -566,6 +568,12 @@ impl EndpointCache {
 
     pub fn agents(&self) -> &[Agent] {
         &self.agents
+    }
+
+    /// When the successful listing began, so a focus change can reject a
+    /// reply that was already in flight before it landed.
+    pub fn sampled_at(&self) -> Option<Instant> {
+        self.sampled_at
     }
 
     #[cfg(test)]
@@ -658,6 +666,7 @@ impl EndpointCache {
         if let Some(job) = &self.pending {
             match job.poll() {
                 Some(Ok(agents)) => {
+                    self.sampled_at = self.last_attempt;
                     self.reach.record_success();
                     self.start_settings_read();
                     self.start_session_name_read();
@@ -668,6 +677,7 @@ impl EndpointCache {
                     self.pending = None;
                 },
                 Some(Err(error)) => {
+                    self.sampled_at = None;
                     self.note_failure(&error);
                     // herdr restarting may name its session differently, and
                     // attaching to the old name reaches nothing.
@@ -1077,6 +1087,40 @@ enum Read<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchanged_listings_advance_freshness_without_rebuilding_rows() {
+        let mut cache = EndpointCache::new(Side::Native);
+        cache.settings = Read::Done(Settings::default());
+        cache.session_name = Read::Done("fixture".into());
+        let first = Instant::now() - Duration::from_secs(2);
+        let second = first + Duration::from_secs(1);
+        let mut first_generation = None;
+        for started in [first, second] {
+            cache.last_attempt = Some(started);
+            cache.pending = Some(jobs::pool().spawn(jobs::Priority::Background, |_| {
+                Ok(Listing::Panes.parse(
+                    r#"{"result":{"panes":[
+                        {"terminal_id":"t2","pane_id":"w2:p1","tab_id":"w2:t1","focused":true}
+                    ]}}"#,
+                ))
+            }));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while cache.pending.is_some() {
+                cache.poll(Duration::from_secs(60), Listing::Panes);
+                assert!(Instant::now() < deadline, "listing job did not settle");
+                std::thread::yield_now();
+            }
+            assert_eq!(cache.sampled_at(), Some(started));
+            assert_eq!(cache.agents()[0].terminal_id, "t2");
+            assert!(cache.agents()[0].focused);
+            if let Some(generation) = first_generation {
+                assert_eq!(cache.generation(), generation);
+            } else {
+                first_generation = Some(cache.generation());
+            }
+        }
+    }
 
     /// herdr strips its own decorative title prefix already, and that stripped
     /// form is what distinguishes two agents of the same kind in one checkout.

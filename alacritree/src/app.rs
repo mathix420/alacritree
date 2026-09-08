@@ -721,7 +721,7 @@ pub struct AlacritreeApp {
     pending_herdr_attach: Vec<PendingHerdrAttach>,
     /// The shared view herdr was last focused for, and the call still on its
     /// way, both owned by `sync_herdr_view_focus`.
-    herdr_focused_view: Option<SessionId>,
+    herdr_focused_view: HerdrViewSync,
     herdr_view_focus: Option<HerdrViewFocus>,
     /// Resolved absolute path of `delta` inside each WSL distro, so diff panes
     /// stop re-sourcing a login profile on every open.  Successes only: a miss
@@ -1128,7 +1128,7 @@ impl AlacritreeApp {
             project_refresh_jobs: HashMap::new(),
             pending_spawns: Default::default(),
             pending_herdr_attach: Vec::new(),
-            herdr_focused_view: None,
+            herdr_focused_view: HerdrViewSync::default(),
             herdr_view_focus: None,
             wsl_delta_paths: HashMap::new(),
             pending_delta: HashMap::new(),
@@ -1550,15 +1550,17 @@ impl AlacritreeApp {
         // The gesture is two herdr processes whatever `async_session_spawn`
         // says, and running them from the click would hold the frame for as
         // long as herdr takes to answer.
-        let name = self.herdr_session_name(&key.side);
-        let side = key.side.clone();
         let focus = self
             .find_herdr_agent(&key.side, &key.terminal_id)
             .map_or_else(|| herdr::focus_pane_args(pane_id), herdr::focus_args);
-        let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
-            herdr_attach_gesture(&side, &focus, name)
+        self.pending_herdr_attach.push(PendingHerdrAttach {
+            job: None,
+            focus,
+            key,
+            workspace,
+            previous,
         });
-        self.pending_herdr_attach.push(PendingHerdrAttach { job, key, workspace, previous });
+        ctx.request_repaint();
         true
     }
 
@@ -1566,9 +1568,14 @@ impl AlacritreeApp {
     /// session opens in the workspace its own click came from, which that
     /// click switched to before handing the gesture over.
     fn poll_herdr_attach(&mut self, ctx: &Context) {
-        let mut running = Vec::new();
-        for pending in std::mem::take(&mut self.pending_herdr_attach) {
-            match pending.job.poll() {
+        if self.herdr_view_focus.is_some() || self.pending_herdr_attach.is_empty() {
+            return;
+        }
+        // Attach gestures and session switches both change herdr's global
+        // focus, so only one may be in flight.
+        let mut pending = self.pending_herdr_attach.remove(0);
+        if let Some(job) = &pending.job {
+            match job.poll() {
                 Some(Ok((program, argv))) => {
                     // The open takes the workspace by value, so the arm keeps
                     // its own copy to judge the restore against afterwards.
@@ -1582,14 +1589,26 @@ impl AlacritreeApp {
                     self.restore_after_failed_attach(&pending.workspace, pending.previous);
                     self.error_dialog = Some(e);
                 },
-                None if pending.job.failed() => {
+                None if job.failed() => {
                     self.restore_after_failed_attach(&pending.workspace, pending.previous);
                     self.error_dialog = Some("the herdr attach did not finish".to_string());
                 },
-                None => running.push(pending),
+                None => self.pending_herdr_attach.insert(0, pending),
             }
+        } else {
+            let name = self.herdr_session_name(&pending.key.side);
+            let side = pending.key.side.clone();
+            let focus = self
+                .find_herdr_agent(&side, &pending.key.terminal_id)
+                .map_or_else(|| pending.focus.clone(), herdr::focus_args);
+            pending.job = Some(jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
+                herdr_attach_gesture(&side, &focus, name)
+            }));
+            self.pending_herdr_attach.insert(0, pending);
         }
-        self.pending_herdr_attach = running;
+        if self.pending_herdr_attach.first().is_some_and(|pending| pending.job.is_none()) {
+            ctx.request_repaint();
+        }
     }
 
     fn restore_after_failed_attach(&mut self, switched_to: &WorkspaceKey, previous: WorkspaceKey) {
@@ -1618,7 +1637,7 @@ impl AlacritreeApp {
                     session.herdr_key = Some(key);
                 }
                 if shared_view {
-                    self.herdr_focused_view = Some(id);
+                    self.herdr_focused_view.attached(id, Instant::now());
                 }
                 true
             },
@@ -1629,54 +1648,99 @@ impl AlacritreeApp {
         }
     }
 
-    /// Keep herdr focused on the pane the visible shared view stands for.
-    ///
-    /// herdr's app clients all render one shared state, so several shared
-    /// views on a side draw the same pane at any moment.  Asking herdr to
-    /// focus the pane of whichever one the user is looking at is what makes
-    /// them behave as one session per agent: the visible one is right, and
-    /// the rest are off screen.
-    ///
-    /// One call at a time, and the tracker moves only once herdr has answered
-    /// — two focuses in flight would land in whatever order herdr finished
-    /// them in.  A refusal still moves it, so a herdr that keeps saying no
-    /// costs one call rather than one per frame.
-    fn sync_herdr_view_focus(&mut self) {
+    /// Local session switches focus herdr; a settled view follows later
+    /// focus changes made inside herdr. Listings started before our focus
+    /// landed cannot reverse the user's session selection.
+    fn sync_herdr_view_focus(&mut self, ctx: &Context) {
+        let active = self.active_session_index().map(|index| &self.sessions[index]);
+        let key = active.and_then(|session| session.herdr_key.clone());
+        let selection = active
+            .zip(key.as_ref())
+            .map(|(session, key)| (session.id, key, self.herdr_pane_has_agent(Some(key))));
+        let snapshot = key
+            .as_ref()
+            .and_then(|key| {
+                self.herdr_endpoints.caches().iter().find(|cache| cache.side() == &key.side)
+            })
+            .and_then(|cache| cache.sampled_at().map(|at| (at, cache.side(), cache.agents())))
+            .filter(|_| {
+                self.focus == PaneFocus::Terminal
+                    && !self.is_modal_open()
+                    && !self.palette.is_open()
+                    && ctx.input(|input| input.viewport().focused).unwrap_or(true)
+            });
+        let action = self.herdr_focused_view.next(
+            selection,
+            self.config.integrations.herdr.attach,
+            snapshot,
+            self.herdr_view_focus.is_some() || !self.pending_herdr_attach.is_empty(),
+        );
         if let Some(pending) = self.herdr_view_focus.take() {
             match pending.job.poll() {
                 Some(result) => {
+                    let succeeded = result.is_ok();
                     if let Err(e) = result {
                         log::warn!("{e}");
                     }
-                    self.herdr_focused_view = Some(pending.session);
+                    self.herdr_focused_view.settled(pending.session, succeeded, Instant::now());
                 },
-                None if pending.job.failed() => self.herdr_focused_view = Some(pending.session),
+                None if pending.job.failed() => {
+                    self.herdr_focused_view.settled(pending.session, false, Instant::now());
+                },
                 None => self.herdr_view_focus = Some(pending),
+            }
+            if self.herdr_view_focus.is_none() {
+                ctx.request_repaint();
             }
             return;
         }
-        let Some(id) = self.active_session.get(&self.current_workspace).copied() else {
-            return;
-        };
-        let key = self.sessions.iter().find(|s| s.id == id).and_then(|s| s.herdr_key.clone());
-        if !needs_view_focus(
-            key.as_ref(),
-            self.config.integrations.herdr.attach,
-            self.herdr_pane_has_agent(key.as_ref()),
-            id,
-            self.herdr_focused_view,
-        ) {
-            return;
+        match action {
+            Some(HerdrViewAction::Focus(id)) => {
+                let Some(key) = key else { return };
+                let Some(focus) =
+                    self.find_herdr_agent(&key.side, &key.terminal_id).map(herdr::focus_args)
+                else {
+                    return;
+                };
+                let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
+                    herdr::focus_pane(&key.side, &focus)
+                });
+                self.herdr_view_focus = Some(HerdrViewFocus { session: id, job });
+            },
+            Some(HerdrViewAction::Follow(key)) => self.follow_herdr_view(ctx, key),
+            None => {},
         }
-        let Some(key) = key else { return };
-        let Some(focus) = self.find_herdr_agent(&key.side, &key.terminal_id).map(herdr::focus_args)
-        else {
-            return;
+    }
+
+    fn follow_herdr_view(&mut self, ctx: &Context, key: herdr::HerdrKey) {
+        let id = if let Some(id) = self.herdr_session_for(&key) {
+            id
+        } else {
+            let Some(workspace) = self.herdr_row_workspace(&key.side, &key.terminal_id) else {
+                return;
+            };
+            let (program, argv) = if self.herdr_attaches_directly(&key) {
+                let Some(agent) = self.find_herdr_agent(&key.side, &key.terminal_id) else {
+                    return;
+                };
+                let args = herdr::attach_args(&agent.pane_id);
+                let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+                key.side.command(&borrowed)
+            } else {
+                let Some(name) = self.herdr_session_name(&key.side) else { return };
+                key.side.command(&["session", "attach", &name])
+            };
+            if !self.open_herdr_session(ctx, key.clone(), workspace, program, argv) {
+                return;
+            }
+            let Some(id) = self.herdr_session_for(&key) else { return };
+            id
         };
-        let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
-            herdr::focus_pane(&key.side, &focus)
-        });
-        self.herdr_view_focus = Some(HerdrViewFocus { session: id, job });
+        self.activate_session_by_id(id);
+        self.reveal_search_row(&SidebarRow::Session(id));
+        self.set_sidebar_cursor(SidebarRow::Session(id));
+        self.focus_terminal();
+        self.herdr_focused_view.attached(id, Instant::now());
     }
 
     fn toggle_scratchpad_tab(&mut self, ctx: &Context) {
@@ -8927,11 +8991,14 @@ fn managed_tooltip(managed: &Managed) -> String {
     hint
 }
 
+type HerdrAttachResult = Result<(String, Vec<String>), String>;
+
 /// A shared-view attach waiting on herdr.  The gesture answers with the argv
 /// its client runs, so everything the session needs is in hand by the time it
 /// opens.
 struct PendingHerdrAttach {
-    job: jobs::Job<Result<(String, Vec<String>), String>>,
+    job: Option<jobs::Job<HerdrAttachResult>>,
+    focus: Vec<String>,
     key: herdr::HerdrKey,
     workspace: WorkspaceKey,
     /// Where to hand the user back when herdr refuses.  A shared-view
@@ -8946,6 +9013,69 @@ struct PendingHerdrAttach {
 struct HerdrViewFocus {
     session: SessionId,
     job: jobs::Job<Result<(), String>>,
+}
+
+#[derive(Default)]
+struct HerdrViewSync {
+    visible: Option<SessionId>,
+    focused: Option<SessionId>,
+    follow_after: Option<Instant>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HerdrViewAction {
+    Focus(SessionId),
+    Follow(herdr::HerdrKey),
+}
+
+impl HerdrViewSync {
+    fn attached(&mut self, id: SessionId, at: Instant) {
+        self.visible = Some(id);
+        self.settled(id, true, at);
+    }
+
+    fn settled(&mut self, id: SessionId, succeeded: bool, at: Instant) {
+        if self.visible == Some(id) {
+            self.focused = Some(id);
+            self.follow_after = succeeded.then_some(at);
+        }
+    }
+
+    fn next(
+        &mut self,
+        active: Option<(SessionId, &herdr::HerdrKey, bool)>,
+        attach: AttachMode,
+        snapshot: Option<(Instant, &herdr::Side, &[herdr::Agent])>,
+        busy: bool,
+    ) -> Option<HerdrViewAction> {
+        let active = active
+            .filter(|(_, key, has_agent)| !herdr::attaches_directly(&key.side, attach, *has_agent));
+        let visible = active.map(|(id, ..)| id);
+        if self.visible != visible {
+            self.visible = visible;
+            self.focused = None;
+            self.follow_after = None;
+        }
+        if busy {
+            return None;
+        }
+        let (id, key, has_agent) = active?;
+        if needs_view_focus(Some(key), attach, has_agent, id, self.focused) {
+            return Some(HerdrViewAction::Focus(id));
+        }
+        let (sampled_at, side, agents) = snapshot?;
+        if side != &key.side || sampled_at <= self.follow_after? {
+            return None;
+        }
+        let focused = agents.iter().find(|agent| agent.focused)?;
+        self.follow_after = Some(sampled_at);
+        (focused.terminal_id != key.terminal_id).then(|| {
+            HerdrViewAction::Follow(herdr::HerdrKey {
+                side: side.clone(),
+                terminal_id: focused.terminal_id.clone(),
+            })
+        })
+    }
 }
 
 /// Whether the session on screen still owes herdr a focus call.  A direct
@@ -8975,7 +9105,7 @@ fn herdr_attach_gesture(
     side: &herdr::Side,
     focus: &[String],
     cached_name: Option<String>,
-) -> Result<(String, Vec<String>), String> {
+) -> HerdrAttachResult {
     // Two argv spawns, no shell: the only shell a `Native` command could
     // reach on this side is cmd.exe, which does not understand `sh_quote`'s
     // single-quoting.
@@ -11175,13 +11305,13 @@ impl eframe::App for AlacritreeApp {
         self.poll_project_refreshes();
         self.poll_pending_spawns(ctx);
         self.poll_herdr_attach(ctx);
-        self.sync_herdr_view_focus();
         // Unconditional: either sidebar can be hidden, and a drain hung off one
         // of them would strand every entry the other polled.
         self.pr_cache.drain_completed(ctx);
         self.poll_pending_deletes(ctx);
         self.poll_pending_creates(ctx);
         self.poll_herdr_endpoints();
+        self.sync_herdr_view_focus(ctx);
         // Poll first, then check `failed`: a panicked job's `poll` returns
         // `None` forever, so `failed` is what stops its handle from sitting
         // here for the rest of the process.
@@ -11479,6 +11609,144 @@ fn notify_worker(body: String, id: SessionId, _ctx: egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn herdr_shared_view_follows_new_tabs_and_refocuses_on_return() {
+        let side = herdr::Side::Native;
+        let t1 = herdr::HerdrKey { side: side.clone(), terminal_id: "t1".into() };
+        let t2 = herdr::HerdrKey { side: side.clone(), terminal_id: "t2".into() };
+        let panes = herdr::Listing::Panes.parse(
+            r#"{"result":{"panes":[
+                {"terminal_id":"t1","pane_id":"w1:p1","tab_id":"w1:t1","focused":false},
+                {"terminal_id":"t2","pane_id":"w2:p1","tab_id":"w2:t1","focused":true}
+            ]}}"#,
+        );
+        let mut sync = HerdrViewSync::default();
+        let active = Some((1, &t1, false));
+        assert_eq!(
+            sync.next(active, AttachMode::Session, None, false),
+            Some(HerdrViewAction::Focus(1))
+        );
+        let focused_at = Instant::now();
+        sync.settled(1, true, focused_at);
+        let snapshot = Some((focused_at + Duration::from_millis(1), &side, panes.as_slice()));
+        assert_eq!(
+            sync.next(active, AttachMode::Session, snapshot, false),
+            Some(HerdrViewAction::Follow(t2.clone()))
+        );
+        sync.attached(2, focused_at + Duration::from_millis(2));
+        assert_eq!(sync.next(Some((2, &t2, false)), AttachMode::Session, snapshot, false), None);
+        assert_eq!(sync.next(None, AttachMode::Session, snapshot, false), None);
+        assert_eq!(
+            sync.next(active, AttachMode::Session, snapshot, false),
+            Some(HerdrViewAction::Focus(1))
+        );
+    }
+
+    #[test]
+    fn herdr_shared_view_refocuses_after_an_ordinary_session() {
+        let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
+        let mut sync = HerdrViewSync::default();
+        sync.attached(1, Instant::now());
+        assert_eq!(sync.next(None, AttachMode::Session, None, false), None);
+        assert_eq!(
+            sync.next(Some((1, &key, false)), AttachMode::Session, None, false),
+            Some(HerdrViewAction::Focus(1))
+        );
+    }
+
+    #[test]
+    fn herdr_follow_attempts_wait_for_a_new_snapshot() {
+        let side = herdr::Side::Native;
+        let key = herdr::HerdrKey { side: side.clone(), terminal_id: "t1".into() };
+        let panes = herdr::Listing::Panes.parse(
+            r#"{"result":{"panes":[
+                {"terminal_id":"t2","pane_id":"w2:p1","tab_id":"w2:t1","focused":true}
+            ]}}"#,
+        );
+        let mut sync = HerdrViewSync::default();
+        let focused_at = Instant::now();
+        sync.attached(1, focused_at);
+        let active = Some((1, &key, false));
+        let snapshot = Some((focused_at + Duration::from_millis(1), &side, panes.as_slice()));
+        assert!(matches!(
+            sync.next(active, AttachMode::Session, snapshot, false),
+            Some(HerdrViewAction::Follow(_))
+        ));
+        assert_eq!(sync.next(active, AttachMode::Session, snapshot, false), None);
+        let snapshot = Some((focused_at + Duration::from_millis(2), &side, panes.as_slice()));
+        assert!(matches!(
+            sync.next(active, AttachMode::Session, snapshot, false),
+            Some(HerdrViewAction::Follow(_))
+        ));
+        sync.settled(1, false, focused_at + Duration::from_millis(3));
+        let snapshot = Some((focused_at + Duration::from_millis(4), &side, panes.as_slice()));
+        assert_eq!(sync.next(active, AttachMode::Session, snapshot, false), None);
+    }
+
+    #[test]
+    fn herdr_shared_view_rejects_stale_and_foreign_focus_snapshots() {
+        let side = herdr::Side::Wsl("ubuntu".into());
+        let other_side = herdr::Side::Wsl("debian".into());
+        let key = herdr::HerdrKey { side: side.clone(), terminal_id: "t1".into() };
+        let panes = herdr::Listing::Panes.parse(
+            r#"{"result":{"panes":[
+                {"terminal_id":"t2","pane_id":"w2:p1","tab_id":"w2:t1","focused":true}
+            ]}}"#,
+        );
+        let mut sync = HerdrViewSync::default();
+        let active = Some((1, &key, false));
+        let started = Instant::now();
+        assert_eq!(
+            sync.next(active, AttachMode::Agent, None, false),
+            Some(HerdrViewAction::Focus(1))
+        );
+        assert_eq!(sync.next(active, AttachMode::Agent, None, true), None);
+        let settled = started + Duration::from_millis(1);
+        sync.settled(1, true, settled);
+        assert_eq!(
+            sync.next(active, AttachMode::Agent, Some((started, &side, &panes)), false),
+            None
+        );
+        let fresh = settled + Duration::from_millis(1);
+        assert_eq!(
+            sync.next(active, AttachMode::Agent, Some((fresh, &other_side, &panes)), false),
+            None
+        );
+        assert_eq!(sync.next(active, AttachMode::Agent, Some((fresh, &side, &panes)), true), None);
+        assert_eq!(
+            sync.next(
+                Some((1, &key, true)),
+                AttachMode::Agent,
+                Some((fresh, &side, &panes)),
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            sync.next(active, AttachMode::Agent, Some((fresh, &side, &panes)), false),
+            Some(HerdrViewAction::Focus(1))
+        );
+    }
+
+    #[test]
+    fn herdr_focus_completion_cannot_restore_a_view_left_while_pending() {
+        let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
+        let active = Some((1, &key, false));
+        let mut sync = HerdrViewSync::default();
+        assert_eq!(
+            sync.next(active, AttachMode::Session, None, false),
+            Some(HerdrViewAction::Focus(1))
+        );
+        assert_eq!(sync.next(None, AttachMode::Session, None, true), None);
+        sync.settled(1, true, Instant::now());
+        assert_eq!(
+            sync.next(active, AttachMode::Session, None, false),
+            Some(HerdrViewAction::Focus(1))
+        );
+        sync.settled(1, false, Instant::now());
+        assert_eq!(sync.next(active, AttachMode::Session, None, false), None);
+    }
 
     fn ws(p: &str) -> WorkspaceKey {
         Some(PathBuf::from(p))
