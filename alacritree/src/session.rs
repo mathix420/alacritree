@@ -983,6 +983,27 @@ mod windows_process_probe {
     /// the agent it found there.
     pub(super) type ScannedTrees = BTreeMap<u32, (Vec<u32>, Option<&'static str>)>;
 
+    pub(super) fn name_signals_for_tree<F>(
+        tree: &[u32],
+        mut name_for_pid: F,
+    ) -> (Vec<String>, Option<&'static str>, bool)
+    where
+        F: FnMut(u32) -> Option<String>,
+    {
+        let names: Vec<String> = tree.iter().filter_map(|&pid| name_for_pid(pid)).collect();
+        let nav_tui = names.iter().any(|n| is_nav_tui_name(n));
+        let agent = agent_name_by_name(&names);
+        (names, agent, nav_tui)
+    }
+
+    pub(super) fn cache_tree(tree: &[u32]) -> Vec<u32> {
+        let mut cache_tree = tree.to_vec();
+        // The table comes out of a hash map, so cache comparisons need an
+        // order independent of its iteration order.
+        cache_tree.sort_unstable();
+        cache_tree
+    }
+
     #[derive(Default)]
     struct Shared {
         /// Shells asked about since the last pass.  Taken rather than kept, so
@@ -1080,23 +1101,18 @@ mod windows_process_probe {
         shell_pid: u32,
         scanned: &mut ScannedTrees,
     ) -> Signals {
-        let mut tree = process_tree_pids(table, shell_pid);
+        let tree = process_tree_pids(table, shell_pid);
         let has_children = tree.len() > 1;
-        // The table comes out of a hash map, so the tree has to be ordered
-        // before it can be compared against the one the last scan ran on.
-        tree.sort_unstable();
+        let (_names, agent, nav_tui) = name_signals_for_tree(&tree, |pid| {
+            sys.process(Pid::from_u32(pid))
+                .map(|process| process.name().to_string_lossy().into_owned())
+        });
         let pids: Vec<Pid> = tree.iter().copied().map(Pid::from_u32).collect();
-
-        let names: Vec<String> = pids
-            .iter()
-            .filter_map(|pid| sys.process(*pid))
-            .map(|p| p.name().to_string_lossy().into_owned())
-            .collect();
-        let nav_tui = names.iter().any(|n| is_nav_tui_name(n));
-        if let Some(name) = agent_name_by_name(&names) {
+        let cache_tree = cache_tree(&tree);
+        if let Some(name) = agent {
             return (Some(name), has_children, nav_tui);
         }
-        if let Some(name) = remembered_agent(scanned, shell_pid, &tree) {
+        if let Some(name) = remembered_agent(scanned, shell_pid, &cache_tree) {
             return (name, has_children, nav_tui);
         }
 
@@ -1112,7 +1128,7 @@ mod windows_process_probe {
             .filter_map(|pid| sys.process(*pid))
             .map(|p| p.cmd().iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "));
         let name = agent_name_by_cmdline(cmds);
-        scanned.insert(shell_pid, (tree, name));
+        scanned.insert(shell_pid, (cache_tree, name));
         (name, has_children, nav_tui)
     }
 
@@ -2033,6 +2049,55 @@ mod tests {
         assert_eq!(remembered_agent(&cache, 42, &[42, 100]), Some(None));
         assert_eq!(remembered_agent(&cache, 42, &[42, 100, 101]), None);
         assert_eq!(remembered_agent(&cache, 43, &[42, 100]), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_parent_agent_wins_over_a_lower_pid_child_agent() {
+        use super::windows_process_probe::name_signals_for_tree;
+
+        let processes = [
+            (15256, None, "powershell.exe"),
+            (34352, Some(15256), "claude.exe"),
+            (32372, Some(34352), "codex.exe"),
+        ];
+        let parent_links: Vec<_> =
+            processes.iter().map(|&(pid, parent, _)| (pid, parent)).collect();
+        let tree = process_tree_pids(&parent_links, 15256);
+
+        let (_, agent, _) = name_signals_for_tree(&tree, |pid| {
+            processes
+                .iter()
+                .find(|&&(candidate, ..)| candidate == pid)
+                .map(|&(_, _, name)| name.to_owned())
+        });
+
+        assert_eq!(agent, Some("claude"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_root_agent_is_selected_without_descendants() {
+        use super::windows_process_probe::name_signals_for_tree;
+
+        let tree = process_tree_pids(&[(15256, None)], 15256);
+        let (_, agent, _) = name_signals_for_tree(&tree, |_| Some("claude.exe".to_owned()));
+
+        assert_eq!(agent, Some("claude"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cache_tree_ignores_process_snapshot_sibling_order() {
+        use super::windows_process_probe::cache_tree;
+
+        let first =
+            process_tree_pids(&[(15256, None), (34352, Some(15256)), (32372, Some(15256))], 15256);
+        let second =
+            process_tree_pids(&[(15256, None), (32372, Some(15256)), (34352, Some(15256))], 15256);
+
+        assert_ne!(first, second);
+        assert_eq!(cache_tree(&first), cache_tree(&second));
     }
 
     /// Not a gate — run it by hand:
