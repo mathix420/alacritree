@@ -999,7 +999,7 @@ fn parse_mods(s: &str) -> Option<Modifiers> {
 /// Every simple (non-parametrized) `NamedAction`, kept in sync with the enum by
 /// hand. Mirrors the old shortcuts window's bindable list; `SelectTab`/
 /// `SpawnProfile` are excluded here because they carry an index.
-pub fn bindable_actions() -> [NamedAction; 67] {
+pub fn bindable_actions() -> [NamedAction; 68] {
     use NamedAction::*;
     [
         Paste,
