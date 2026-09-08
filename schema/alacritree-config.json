@@ -79,6 +79,7 @@
                 "AddProject",
                 "ToggleSidebarFocus",
                 "CloseSession",
+                "CloseExitedSession",
                 "SidebarTop",
                 "SidebarBottom",
                 "SidebarNextProject",

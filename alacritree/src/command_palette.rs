@@ -97,7 +97,7 @@ fn section_of(a: NamedAction) -> PaletteSection {
         ScrollPageUp | ScrollPageDown | ScrollHalfPageUp | ScrollHalfPageDown => Scrollback,
         ScrollLineUp | ScrollLineDown | ScrollToTop | ScrollToBottom => Scrollback,
         ClearHistory => Scrollback,
-        SpawnNewInstance | SpawnProfile(_) | CloseSession => Sessions,
+        SpawnNewInstance | SpawnProfile(_) | CloseSession | CloseExitedSession => Sessions,
         SelectNextTab | SelectPreviousTab | SelectTab(_) | SelectLastTab => Sessions,
         SelectNextSession | SelectPreviousSession => Sessions,
         ToggleSessionRows | ToggleSessionTabs | ToggleSessionDrag => Sessions,

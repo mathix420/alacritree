@@ -62,6 +62,7 @@ below is hard-coded.
 | `Ctrl+Shift+B`       | Toggle keyboard focus between terminal and sidebar    |
 | `Ctrl+Shift+G`       | Move focus to the git status sidebar                  |
 | `Ctrl+Shift+W`       | Close the cursored session (sidebar) or the current shell |
+| `Enter`              | Exited session on screen: close it                    |
 | `Home` / `End`       | Sidebar focused: cursor to the first / last row       |
 | `PageUp` / `PageDown`| Sidebar focused: jump to the previous / next project  |
 | `R`                  | Sidebar focused: rescan every project's worktrees     |
@@ -153,6 +154,7 @@ entry. Names match alacritty's own action names, so existing configs port over.
   workspace. Out-of-range indices are ignored.
 - `SelectLastTab` — select the last session in the current workspace.
 - `CloseSession` — close the session under the sidebar cursor when the sidebar is focused on one, otherwise the active session in the current workspace. Honors the `confirm_session_close` policy (may open a confirmation dialog; `"busy"` prompts only while a process is running). When the on-screen workspace stops having sessions, whether this close or a worktree deletion took the last one, `ui.last_session_close` decides what follows: `"respawn"` (default) recycles a shell in place, `"navigate"` moves to the project's main checkout or home, and `"ring_global"` / `"ring_project"` move along the flat session ring instead.
+- `CloseExitedSession` — close the session on screen once its child has exited. Default: unmodified `Enter`, which is only affordable because the action is scoped to an exited session: in a live one the key goes to the PTY like any other. Nothing to confirm and no sidebar cursor involved — the child is already gone. Which exits leave a session on screen to be closed this way is `[ui] hold_exited_sessions`; a session held that way writes one line into its own grid naming this key, or the command palette when nothing is bound to it.
 - `SidebarTop` / `SidebarBottom` — move the sidebar cursor to the first / last
   visible row.
 - `SidebarPreviousProject` / `SidebarNextProject` — jump the sidebar cursor to

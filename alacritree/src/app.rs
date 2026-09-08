@@ -340,22 +340,31 @@ fn focus_move(
     }
 }
 
-/// Whether a matched binding's key press should reach `action`, given which
-/// pane currently owns keyboard focus. Filter actions are scoped to the
+/// What the binding pass knows about the frame when it decides whether a
+/// matched action may consume a key press.  Each field names a scope some
+/// action is gated on; outside it the action stands aside.
+#[derive(Clone, Copy, Default)]
+struct BindingScope {
+    sidebar_focused: bool,
+    git_focused: bool,
+    scratchpad_focused: bool,
+    /// The terminal owns focus and the session on screen has exited, so no
+    /// child is left to read the keys its bindings would otherwise consume.
+    exited_session_focused: bool,
+}
+
+/// Whether a matched binding's key press should reach `action`, given what
+/// currently owns keyboard focus. Filter actions are scoped to the
 /// sidebar that owns them so a bare letter like `d` doesn't fire a git-panel
 /// filter while the projects sidebar (or the terminal) has focus, and vice
 /// versa. `terminal_only` actions additionally step aside for the scratchpad
 /// editor, which wants those same keys for native text editing.
-fn valid_for_focus(
-    action: &BindingAction,
-    sidebar_focused: bool,
-    git_focused: bool,
-    scratchpad_focused: bool,
-) -> bool {
+fn valid_for_focus(action: &BindingAction, scope: BindingScope) -> bool {
     let focus_ok = match action {
-        BindingAction::Named(n) if n.is_projects_filter_scoped() => sidebar_focused,
-        BindingAction::Named(n) if n.is_git_filter_scoped() => git_focused,
-        BindingAction::Named(n) if n.is_sidebar_scoped() => sidebar_focused,
+        BindingAction::Named(n) if n.is_exited_session_scoped() => scope.exited_session_focused,
+        BindingAction::Named(n) if n.is_projects_filter_scoped() => scope.sidebar_focused,
+        BindingAction::Named(n) if n.is_git_filter_scoped() => scope.git_focused,
+        BindingAction::Named(n) if n.is_sidebar_scoped() => scope.sidebar_focused,
         _ => true,
     };
     let terminal_only = match action {
@@ -363,7 +372,27 @@ fn valid_for_focus(
         BindingAction::Named(n) => n.is_terminal_only(),
         BindingAction::Unsupported(_) => false,
     };
-    focus_ok && !(scratchpad_focused && terminal_only)
+    focus_ok && !(scope.scratchpad_focused && terminal_only)
+}
+
+/// The actions one key press dispatches. Stacked user bindings can mix a
+/// scoped action with a global one on a single trigger, so each is judged on
+/// its own; an empty result leaves the press in the event queue, which is what
+/// keeps a bare-key binding — `Enter`, `Delete`, a plain letter — out of the
+/// PTY's way while its scope is inactive.
+fn dispatched_actions(matched: Vec<&BindingAction>, scope: BindingScope) -> Vec<&BindingAction> {
+    matched
+        .into_iter()
+        .filter(|a| valid_for_focus(a, scope))
+        // Search actions are owned by the sidebar nav pass; here their default
+        // Enter/Esc/Shift+Esc must fall through to the PTY when the terminal
+        // (or a non-searching panel) has focus.
+        .filter(|a| !matches!(a, BindingAction::Named(n) if n.is_search_scoped()))
+        // Palette cursor moves are owned by the palette modal, which suppresses
+        // this pass entirely while it is up. Reaching here means it is closed,
+        // so their keys belong to the sidebar or the PTY.
+        .filter(|a| !matches!(a, BindingAction::Named(n) if n.is_palette_scoped()))
+        .collect()
 }
 
 /// Whether a workspace survives the projects panel's toggle dimension.
@@ -2621,37 +2650,24 @@ impl AlacritreeApp {
     fn handle_shortcuts(&mut self, ctx: &Context) {
         let sidebar_focused = self.focus == PaneFocus::ProjectsSidebar && !self.palette.is_open();
         let git_focused = self.focus == PaneFocus::GitSidebar && !self.palette.is_open();
-        let scratchpad_focused = self.focus == PaneFocus::Terminal
-            && self
-                .active_session_index()
-                .is_some_and(|idx| self.sessions[idx].scratchpad.is_some());
+        let active_session = self
+            .active_session_index()
+            .filter(|_| self.focus == PaneFocus::Terminal)
+            .map(|idx| &self.sessions[idx]);
+        let scope = BindingScope {
+            sidebar_focused,
+            git_focused,
+            scratchpad_focused: active_session.is_some_and(|s| s.scratchpad.is_some()),
+            exited_session_focused: active_session.is_some_and(Session::is_exited),
+        };
         let actions: Vec<BindingAction> = ctx.input_mut(|i| {
             let mut actions = Vec::new();
             i.events.retain(|ev| {
                 if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
-                    let matched =
-                        crate::bindings::all_matches(&self.config.bindings, *key, *modifiers);
-                    // Sidebar-cursor actions only exist while the sidebar owns focus;
-                    // anywhere else their keys (unmodified Home/End/PageUp/PageDown) are
-                    // terminal input.  Stacked user bindings can mix a sidebar action with
-                    // a global one on a single trigger, so filter per action — and if
-                    // nothing else matched, let the event through untouched.
-                    let matched: Vec<_> = matched
-                        .into_iter()
-                        .filter(|a| {
-                            valid_for_focus(a, sidebar_focused, git_focused, scratchpad_focused)
-                        })
-                        // Search actions are owned by the sidebar nav pass; here
-                        // their default Enter/Esc/Shift+Esc must fall through to
-                        // the PTY when the terminal (or a non-searching panel)
-                        // has focus.
-                        .filter(|a| !matches!(a, BindingAction::Named(n) if n.is_search_scoped()))
-                        // Palette cursor moves are owned by the palette modal,
-                        // which suppresses this pass entirely while it is up.
-                        // Reaching here means it is closed, so their keys belong
-                        // to the sidebar or the PTY.
-                        .filter(|a| !matches!(a, BindingAction::Named(n) if n.is_palette_scoped()))
-                        .collect();
+                    let matched = dispatched_actions(
+                        crate::bindings::all_matches(&self.config.bindings, *key, *modifiers),
+                        scope,
+                    );
                     if !matched.is_empty() {
                         let suppress_chars = matched
                             .iter()
@@ -3554,6 +3570,16 @@ impl AlacritreeApp {
                     .or_else(|| self.active_session_index().map(|idx| self.sessions[idx].id));
                 if let Some(id) = target {
                     self.request_close_session(ctx, id);
+                }
+            },
+            // No confirmation and no cursor: the child is already gone, so
+            // there is nothing left to interrupt and nothing to ask about.
+            BindingAction::Named(NamedAction::CloseExitedSession) => {
+                if let Some(idx) = self.active_session_index()
+                    && self.sessions[idx].is_exited()
+                {
+                    let id = self.sessions[idx].id;
+                    self.close_session(ctx, id);
                 }
             },
             BindingAction::Named(NamedAction::SidebarTop) => self.sidebar_cursor_to_edge(true),
@@ -13417,36 +13443,42 @@ mod tests {
         );
     }
 
+    /// The terminal owning focus over a live session, which is what every
+    /// scope test that does not say otherwise means.
+    fn scope() -> BindingScope {
+        BindingScope::default()
+    }
+
     #[test]
     fn projects_filter_action_valid_when_projects_sidebar_focused() {
         let action = BindingAction::Named(NamedAction::ToggleSessionsFilter);
-        assert!(valid_for_focus(&action, true, false, false));
+        assert!(valid_for_focus(&action, BindingScope { sidebar_focused: true, ..scope() }));
     }
 
     #[test]
     fn projects_filter_action_rejected_when_git_sidebar_focused() {
         let action = BindingAction::Named(NamedAction::ToggleSessionsFilter);
-        assert!(!valid_for_focus(&action, false, true, false));
+        assert!(!valid_for_focus(&action, BindingScope { git_focused: true, ..scope() }));
     }
 
     #[test]
     fn git_filter_action_valid_when_git_sidebar_focused() {
         let action = BindingAction::Named(NamedAction::ToggleModifiedFilter);
-        assert!(valid_for_focus(&action, false, true, false));
+        assert!(valid_for_focus(&action, BindingScope { git_focused: true, ..scope() }));
     }
 
     #[test]
     fn git_filter_action_rejected_when_projects_sidebar_focused() {
         let action = BindingAction::Named(NamedAction::ToggleModifiedFilter);
-        assert!(!valid_for_focus(&action, true, false, false));
+        assert!(!valid_for_focus(&action, BindingScope { sidebar_focused: true, ..scope() }));
     }
 
     #[test]
     fn both_sidebar_filters_rejected_when_terminal_focused() {
         let projects_action = BindingAction::Named(NamedAction::ToggleSessionsFilter);
         let git_action = BindingAction::Named(NamedAction::ToggleModifiedFilter);
-        assert!(!valid_for_focus(&projects_action, false, false, false));
-        assert!(!valid_for_focus(&git_action, false, false, false));
+        assert!(!valid_for_focus(&projects_action, scope()));
+        assert!(!valid_for_focus(&git_action, scope()));
     }
 
     /// `ScrollPageUp` is unscoped by pane focus, so only the scratchpad
@@ -13454,8 +13486,44 @@ mod tests {
     #[test]
     fn terminal_only_action_yields_to_the_scratchpad_editor() {
         let action = BindingAction::Named(NamedAction::ScrollPageUp);
-        assert!(!valid_for_focus(&action, false, false, true));
-        assert!(valid_for_focus(&action, false, false, false));
+        assert!(!valid_for_focus(&action, BindingScope { scratchpad_focused: true, ..scope() }));
+        assert!(valid_for_focus(&action, scope()));
+    }
+
+    /// The one that decides whether the terminal stays usable: `Enter` is the
+    /// default trigger for `CloseExitedSession`, and bindings are consumed
+    /// ahead of `event_to_bytes`, so dispatching anything here would take the
+    /// key away from every shell prompt in the app.
+    #[test]
+    fn a_live_session_keeps_its_enter() {
+        let bindings = crate::bindings::parse_bindings(Vec::new());
+        let matched =
+            crate::bindings::all_matches(&bindings, egui::Key::Enter, egui::Modifiers::NONE);
+        assert!(
+            matched
+                .iter()
+                .any(|a| matches!(a, BindingAction::Named(NamedAction::CloseExitedSession))),
+            "Enter must still reach the exited-session binding"
+        );
+        assert!(
+            dispatched_actions(matched, scope()).is_empty(),
+            "a live session's Enter must fall through to the PTY"
+        );
+    }
+
+    /// Once the child is gone the same press closes the session instead.
+    #[test]
+    fn an_exited_session_dispatches_enter_to_the_close_action() {
+        let bindings = crate::bindings::parse_bindings(Vec::new());
+        let matched =
+            crate::bindings::all_matches(&bindings, egui::Key::Enter, egui::Modifiers::NONE);
+        let scope = BindingScope { exited_session_focused: true, ..scope() };
+        let dispatched = dispatched_actions(matched, scope);
+        assert_eq!(dispatched.len(), 1, "{dispatched:?}");
+        assert!(
+            matches!(dispatched[0], BindingAction::Named(NamedAction::CloseExitedSession)),
+            "{dispatched:?}"
+        );
     }
 
     #[test]

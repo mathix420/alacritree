@@ -96,6 +96,9 @@ pub enum NamedAction {
     AddProject,
     ToggleSidebarFocus,
     CloseSession,
+    /// Close the session on screen once its child has exited.  Its default
+    /// trigger is a bare `Enter`, which only a scope this narrow can afford.
+    CloseExitedSession,
     SidebarTop,
     SidebarBottom,
     SidebarNextProject,
@@ -242,6 +245,14 @@ impl NamedAction {
         )
     }
 
+    /// Valid only while the session on screen has exited.  The default trigger
+    /// is a bare `Enter`, which belongs to the PTY in every live session, so
+    /// dispatch must leave the press alone until the child that would have
+    /// read it is gone.
+    pub fn is_exited_session_scoped(&self) -> bool {
+        matches!(self, Self::CloseExitedSession)
+    }
+
     /// The git sidebar's equivalent.
     pub fn is_git_filter_scoped(&self) -> bool {
         matches!(
@@ -346,6 +357,7 @@ impl NamedAction {
             Self::AddProject => "Add a project to the sidebar".into(),
             Self::ToggleSidebarFocus => "Toggle keyboard focus between terminal and sidebar".into(),
             Self::CloseSession => "Close the cursored or active session".into(),
+            Self::CloseExitedSession => "Close the session on screen once its child exited".into(),
             Self::SidebarTop => "Move the sidebar cursor to the first row".into(),
             Self::SidebarBottom => "Move the sidebar cursor to the last row".into(),
             Self::SidebarNextProject => "Jump the sidebar cursor to the next project".into(),
@@ -663,6 +675,13 @@ fn default_bindings() -> Vec<KeyBinding> {
             key: Key::Enter,
             mods: Modifiers::NONE,
             action: BindingAction::Named(SidebarSearchConfirm),
+        },
+        // Shares that Enter, and the same reason it is safe: a held session has
+        // no child left to read the key.
+        KeyBinding {
+            key: Key::Enter,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(CloseExitedSession),
         },
         KeyBinding {
             key: Key::Escape,
@@ -1016,6 +1035,7 @@ pub fn bindable_actions() -> [NamedAction; 67] {
         AddProject,
         ToggleSidebarFocus,
         CloseSession,
+        CloseExitedSession,
         SidebarTop,
         SidebarBottom,
         SidebarNextProject,
@@ -1124,6 +1144,7 @@ pub fn parse_action(name: &str) -> BindingAction {
         "AddProject" => BindingAction::Named(AddProject),
         "ToggleSidebarFocus" => BindingAction::Named(ToggleSidebarFocus),
         "CloseSession" => BindingAction::Named(CloseSession),
+        "CloseExitedSession" => BindingAction::Named(CloseExitedSession),
         "SidebarTop" => BindingAction::Named(SidebarTop),
         "SidebarBottom" => BindingAction::Named(SidebarBottom),
         "SidebarNextProject" => BindingAction::Named(SidebarNextProject),
@@ -1512,9 +1533,12 @@ mod tests {
     #[test]
     fn search_actions_have_default_bindings() {
         let b = parse_bindings(vec![]);
-        assert_eq!(named_matches(&b, Key::Enter, Modifiers::NONE), vec![
-            NamedAction::SidebarSearchConfirm
-        ]);
+        // Enter is shared with the exited-session close: two disjoint scopes on
+        // one trigger, neither of which is live while the terminal is.
+        assert!(
+            named_matches(&b, Key::Enter, Modifiers::NONE)
+                .contains(&NamedAction::SidebarSearchConfirm)
+        );
         assert_eq!(named_matches(&b, Key::Escape, Modifiers::NONE), vec![
             NamedAction::SidebarSearchCancel
         ]);
@@ -1610,6 +1634,36 @@ mod tests {
         assert_eq!(named_matches(&b, Key::W, Modifiers::CTRL | Modifiers::SHIFT), vec![
             NamedAction::CloseSession
         ]);
+    }
+
+    /// The bare `Enter` default is only survivable because the action is
+    /// exited-scoped, and it shares the trigger with the sidebar's own
+    /// search-scoped `Enter`: both match, and scope decides which one acts.
+    #[test]
+    fn close_exited_session_has_a_bare_enter_default_and_parses() {
+        let b = parse_bindings(vec![]);
+        let matched = named_matches(&b, Key::Enter, Modifiers::NONE);
+        assert!(matched.contains(&NamedAction::CloseExitedSession), "{matched:?}");
+        assert!(matched.contains(&NamedAction::SidebarSearchConfirm), "{matched:?}");
+        assert!(matches!(
+            parse_action("CloseExitedSession"),
+            BindingAction::Named(NamedAction::CloseExitedSession)
+        ));
+    }
+
+    /// Exited scope is its own axis: sharing another would hand the bare
+    /// `Enter` a second dispatch path that a live session's PTY never sees.
+    #[test]
+    fn only_close_exited_session_is_exited_scoped() {
+        use NamedAction::*;
+        assert!(CloseExitedSession.is_exited_session_scoped());
+        assert!(!CloseExitedSession.is_search_scoped());
+        assert!(!CloseExitedSession.is_palette_scoped());
+        assert!(!CloseExitedSession.is_sidebar_scoped());
+        assert!(!CloseExitedSession.is_terminal_only());
+        for a in [CloseSession, SidebarSearchConfirm, PaletteTop, Quit, Paste] {
+            assert!(!a.is_exited_session_scoped(), "{a:?}");
+        }
     }
 
     #[test]
@@ -1856,6 +1910,7 @@ mod tests {
         all.extend(GIT_FILTER_ACTIONS);
         all.push(NamedAction::ToggleSearchScope);
         all.push(NamedAction::RefreshPrStatus);
+        all.push(NamedAction::CloseExitedSession);
         for a in all {
             let name = a.config_name();
             assert!(
