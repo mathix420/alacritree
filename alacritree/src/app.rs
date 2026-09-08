@@ -936,6 +936,22 @@ fn workspace_after_failed_attach(
     if current == switched_to { previous } else { current.clone() }
 }
 
+fn workspace_label_for(projects: &[Project], ws: &WorkspaceKey) -> String {
+    let Some(path) = ws else {
+        return "Home".to_string();
+    };
+    for project in projects {
+        for wt in &project.worktrees {
+            if &wt.path == path {
+                return format!("{} / {}", project.display_name(), wt.name);
+            }
+        }
+    }
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| wsl::display_path(path))
+}
+
 impl AlacritreeApp {
     pub fn new(cc: &CreationContext<'_>, config: Config) -> Self {
         // A job's own closure cannot wake the loop when it unwinds, and the
@@ -7789,7 +7805,7 @@ fn herdr_palette_content(
 ) -> PaletteSessionContent {
     let cwd = herdr_cwd(agent);
     let abbreviated_cwd = cwd.map(|cwd| path_style::render(cwd, cwd_style, cwd_home));
-    let generic = (!attached && !raw_title_present) || generic_herdr_title(&title, agent);
+    let generic = !raw_title_present || generic_herdr_title(&title, agent);
     let (primary, title_for_hover) = if generic {
         match workspace {
             Some(workspace) => (workspace.to_string(), workspace.to_string()),
@@ -10363,19 +10379,7 @@ impl AlacritreeApp {
     /// Human label for a workspace: `project / worktree` for a known worktree,
     /// "Home" for the home tab, else the path's final component.
     fn workspace_label(&self, ws: &WorkspaceKey) -> String {
-        let Some(path) = ws else {
-            return "Home".to_string();
-        };
-        for project in &self.projects {
-            for wt in &project.worktrees {
-                if &wt.path == path {
-                    return format!("{} / {}", project.display_name(), wt.name);
-                }
-            }
-        }
-        path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| wsl::display_path(path))
+        workspace_label_for(&self.projects, ws)
     }
 
     /// The (primary, secondary) a workspace palette row shows.
@@ -13518,7 +13522,7 @@ mod tests {
     }
 
     #[test]
-    fn attached_untitled_herdr_panes_keep_a_specific_pty_title() {
+    fn attached_untitled_herdr_panes_promote_home_and_keep_their_glyph() {
         let agent = herdr_agent(None);
         let content = herdr_palette_content(
             "build output".into(),
@@ -13530,7 +13534,7 @@ mod tests {
             None,
             true,
         );
-        assert_eq!((content.primary, content.subtitle), ("build output".into(), "◆".into()));
+        assert_eq!((content.primary, content.subtitle), ("Home".into(), "◆".into()));
     }
 
     #[test]
@@ -13555,6 +13559,96 @@ mod tests {
             "shell",
         );
         assert_eq!(basename.primary, "◆ renamed / main");
+    }
+
+    #[test]
+    fn native_generic_home_titles_reach_palette_items() {
+        let content = native_palette_content(
+            "claude".into(),
+            "Home".into(),
+            None,
+            Some("claude"),
+            Some("idle"),
+            "shell",
+        );
+        let item = PaletteItem::session(
+            1,
+            content.primary,
+            content.subtitle,
+            content.secondary,
+            "hover".into(),
+            Some("claude"),
+            false,
+        );
+        assert_eq!(item.primary, "Home");
+    }
+
+    #[test]
+    fn configured_workspace_labels_and_herdr_icons_reach_palette_items() {
+        let mut project = project_with("/repo", &["/repo/feature"]);
+        project.label = Some("renamed".into());
+        project.worktrees[1].name = "feature".into();
+        let workspace = Some(PathBuf::from("/repo/feature"));
+        let label = workspace_label_for(&[project], &workspace);
+        assert_eq!(label, "renamed / feature");
+
+        let agent = titled(Some("claude"), Some("claude"));
+        let mut config = Config::default();
+        config.ui.icons.herdr.glyph = Some("✦".into());
+        let configured = herdr_palette_content(
+            herdr_display_name(&agent).text,
+            &agent,
+            agent.title.is_some(),
+            Some(&label),
+            config.ui.icons.herdr.or_glyph(DEFAULT_HERDR_ICON.as_str()),
+            PathStyle::Fish,
+            None,
+            true,
+        );
+        let item = PaletteItem::herdr_agent(
+            command_palette::HerdrAttach {
+                key: herdr::HerdrKey {
+                    side: herdr::Side::Native,
+                    terminal_id: agent.terminal_id.clone(),
+                },
+                pane_id: agent.pane_id.clone(),
+                workspace: workspace.clone(),
+            },
+            configured.primary,
+            configured.subtitle,
+            configured.secondary,
+            "hover".into(),
+            agent.kind.as_deref(),
+        );
+        assert_eq!((item.primary, item.subtitle.as_deref()), (label, Some("✦")));
+
+        config.ui.icons.herdr.glyph = Some("  ".into());
+        let fallback = herdr_palette_content(
+            herdr_display_name(&agent).text,
+            &agent,
+            agent.title.is_some(),
+            Some("renamed / feature"),
+            config.ui.icons.herdr.or_glyph(DEFAULT_HERDR_ICON.as_str()),
+            PathStyle::Fish,
+            None,
+            true,
+        );
+        let fallback_item = PaletteItem::herdr_agent(
+            command_palette::HerdrAttach {
+                key: herdr::HerdrKey {
+                    side: herdr::Side::Native,
+                    terminal_id: agent.terminal_id.clone(),
+                },
+                pane_id: agent.pane_id.clone(),
+                workspace,
+            },
+            fallback.primary,
+            fallback.subtitle,
+            fallback.secondary,
+            "hover".into(),
+            agent.kind.as_deref(),
+        );
+        assert_eq!(fallback_item.subtitle.as_deref(), Some(DEFAULT_HERDR_ICON.as_str()));
     }
 
     #[test]
