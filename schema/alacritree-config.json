@@ -991,6 +991,11 @@
     },
     "RawSessionDisplay": {
       "properties": {
+        "palette_marks": {
+          "default": false,
+          "description": "Paint a session's sidebar status mark in its command-palette row too.",
+          "type": "boolean"
+        },
         "sidebar_always": {
           "default": false,
           "description": "Show a workspace's sidebar session row even with a single session.",

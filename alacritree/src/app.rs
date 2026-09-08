@@ -6176,11 +6176,20 @@ fn paint_palette_section(ui: &mut egui::Ui, theme: &Theme, cols: &PaletteColumns
 /// columns wrap as well; whatever is still cut short offers its full text on
 /// hover.  A selected row gets a soft accent wash and a crisp accent bar; a
 /// hovered one a faint fill.
+///
+/// `mark` is the row's status mark, chosen the same way the sidebar chooses
+/// one for the same session or herdr agent.  It paints into the column grid's
+/// own left padding, ahead of the description, which is already exactly its
+/// width — a row with no mark leaves that padding empty, so the grid's own
+/// arithmetic never has to change to make room for one.  Its hover is a
+/// second one, kept separate from the row's elided-text hover above.
 fn paint_palette_row(
     ui: &mut egui::Ui,
     theme: &Theme,
     cols: &PaletteColumns,
     item: &PaletteItem,
+    mark: Option<&(SessionMark, String)>,
+    item_index: usize,
     selected: bool,
 ) -> egui::Response {
     let s = theme.ui_scale;
@@ -6241,6 +6250,22 @@ fn paint_palette_row(
     // Top-aligned, so a wrapped description's first line shares a baseline with
     // the single-line columns beside it.
     let (left, top) = (rect.left(), rect.top() + v_pad);
+    if let Some((mark, hint)) = mark {
+        let mark_rect =
+            egui::Rect::from_min_size(egui::pos2(left, top), row_status_icon_size(theme));
+        match *mark {
+            SessionMark::Attention => paint_attention_dot(ui, mark_rect, theme),
+            SessionMark::Harness(harness_mark) => {
+                paint_harness_mark(ui, Some(harness_mark), mark_rect, theme)
+            },
+            SessionMark::Agent(live) => {
+                let quiet = if selected { theme.accent } else { theme.text };
+                paint_agent_mark(ui, agent_mark(live, quiet, theme.attention), mark_rect, theme);
+            },
+        }
+        let mark_id = ui.id().with(("palette_status_mark", item_index));
+        ui.interact(mark_rect, mark_id, egui::Sense::hover()).on_hover_text(hint.clone());
+    }
     painter.galley(egui::pos2(cols.desc_x(left), top), desc, theme.text);
     painter.galley(egui::pos2(cols.action_x(left), top), action, theme.text_dim);
     painter.galley(egui::pos2(cols.keys_x(left), top), keys, theme.accent);
@@ -6693,12 +6718,17 @@ const ATTENTION_HINT: &str = "needs attention";
 const LOADER_FRAME: Duration = Duration::from_millis(120);
 const CODEX_LOADER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Draw the attention dot into an already-allocated slot.
+fn paint_attention_dot(ui: &egui::Ui, rect: egui::Rect, theme: &Theme) {
+    let radius = 3.0 * theme.ui_scale;
+    ui.painter().circle_filled(rect.center(), radius, theme.attention);
+}
+
 /// Painted (rather than `RichText("●")`) so its size is independent of font
 /// metrics — `RichText("●")` renders inconsistently across fallback fonts.
 fn attention_dot(ui: &mut egui::Ui, theme: &Theme) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
-    let radius = 3.0 * theme.ui_scale;
-    ui.painter().circle_filled(rect.center(), radius, theme.attention);
+    paint_attention_dot(ui, rect, theme);
     resp
 }
 
@@ -6809,14 +6839,44 @@ struct RowStatus<'a> {
     managed: Option<&'a Managed>,
 }
 
+/// A session's status mark, independent of where it paints — the sidebar's
+/// fixed slot and the palette's row both ask `session_status_mark` for the
+/// identical session, so the two can never disagree about its state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionMark {
+    Attention,
+    Harness(HarnessMark),
+    Agent(LiveState),
+}
+
 /// Priority: attention dot > the harness's own state mark > the agent's live
-/// state > active highlight > the configured color > the built-in default.
+/// state.  A harness outranks the live axis because it watches the pane from
+/// outside and alacritree only reads its title, so where both have a reading
+/// the harness's is the better one — and drawing it in the harness's
+/// vocabulary is what keeps a pane looking the same listed and attached.
 ///
-/// A harness outranks the live axis because it watches the pane from outside
-/// and alacritree only reads its title, so where both have a reading the
-/// harness's is the better one — and drawing it in the harness's vocabulary is
-/// what keeps a pane looking the same listed and attached.
-///
+/// Returns the word the mark explains on hover alongside it.  `None` covers a
+/// shell session, which has no state to mark.
+fn session_status_mark(status: &RowStatus<'_>) -> Option<(SessionMark, String)> {
+    if status.attention {
+        return Some((SessionMark::Attention, ATTENTION_HINT.to_owned()));
+    }
+    if let Some(managed) = status.managed
+        && let Some(mark) = managed.mark
+    {
+        return Some((
+            SessionMark::Harness(mark),
+            format!("{} says {}", managed.harness, mark.label),
+        ));
+    }
+    match status.activity {
+        SessionActivity::Agent { name, live } => {
+            Some((SessionMark::Agent(live), agent_hint(live, name)))
+        },
+        SessionActivity::Shell => None,
+    }
+}
+
 /// Returns what the slot has to say on hover, for the row to register with the
 /// rest of its icons. The row icon proper reports nothing the row does not
 /// already spell out, so it stays silent.
@@ -6828,25 +6888,26 @@ fn paint_row_status_icon(
     default_glyph: BakedGlyph,
     is_active: bool,
 ) -> Option<(egui::Rect, String)> {
-    if status.attention {
-        return Some((attention_dot(ui, theme).rect, ATTENTION_HINT.to_owned()));
-    }
-    // Centered into the fixed slot: laying a glyph out as text would size the
-    // slot to its advance width and shift the label with it.
-    let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
-    if let Some(managed) = status.managed
-        && let Some(mark) = managed.mark
-    {
-        paint_harness_mark(ui, Some(mark), rect, theme);
-        return Some((rect, format!("{} says {}", managed.harness, mark.label)));
-    }
-    match status.activity {
-        SessionActivity::Agent { name, live } => {
+    match session_status_mark(&status) {
+        Some((SessionMark::Attention, hint)) => Some((attention_dot(ui, theme).rect, hint)),
+        Some((SessionMark::Harness(mark), hint)) => {
+            let (rect, _) =
+                ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
+            paint_harness_mark(ui, Some(mark), rect, theme);
+            Some((rect, hint))
+        },
+        Some((SessionMark::Agent(live), hint)) => {
+            let (rect, _) =
+                ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
             let quiet = if is_active { theme.accent } else { theme.text };
             paint_agent_mark(ui, agent_mark(live, quiet, theme.attention), rect, theme);
-            Some((rect, agent_hint(live, name)))
+            Some((rect, hint))
         },
-        SessionActivity::Shell => {
+        None => {
+            // Centered into the fixed slot: laying a glyph out as text would
+            // size the slot to its advance width and shift the label with it.
+            let (rect, _) =
+                ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
             let (glyph, font, resolved) =
                 resolve_icon(style, default_glyph, theme.text_muted, 10.0, 10.0, theme);
             let color = if is_active { theme.accent } else { resolved };
@@ -9645,6 +9706,7 @@ impl AlacritreeApp {
         let toggle = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::K));
 
         let items = self.palette_items();
+        let marks = self.palette_marks(&items);
         let hint = palette_hint(&self.config.bindings);
         let content_w = palette_content_width(s, ctx.screen_rect().width());
         let mut chosen: Option<PaletteAction> = None;
@@ -9716,9 +9778,16 @@ impl AlacritreeApp {
                                 paint_palette_section(ui, &theme, &cols, section.title());
                                 for &i in rows {
                                     let is_sel = row == selected;
-                                    let resp =
-                                        paint_palette_row(ui, &theme, &cols, &items[i], is_sel)
-                                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                    let resp = paint_palette_row(
+                                        ui,
+                                        &theme,
+                                        &cols,
+                                        &items[i],
+                                        marks[i].as_ref(),
+                                        i,
+                                        is_sel,
+                                    )
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
                                     if resp.clicked() {
                                         chosen = Some(items[i].action.clone());
                                     }
@@ -9828,6 +9897,54 @@ impl AlacritreeApp {
             ));
         }
         items
+    }
+
+    /// The status mark each palette row should paint, resolved the same way
+    /// the sidebar resolves one for the same session or unattached herdr
+    /// agent, so the two can never disagree.  Kept apart from `palette_items`
+    /// so building a row's text and picking its mark stay separate.  `None`
+    /// while `[ui.session_display] palette_marks` is off, and for any row
+    /// that is neither a session nor a herdr agent.
+    ///
+    /// A herdr agent has no `Session` of its own, so unlike a session row it
+    /// carries no attention flag or live-state axis: the harness mark is all
+    /// there is, and its hover is `managed_tooltip` — what the sidebar's own
+    /// unattached-agent row shows too.
+    fn palette_marks(&self, items: &[PaletteItem]) -> Vec<Option<(SessionMark, String)>> {
+        if !self.config.ui.session_display.palette_marks {
+            return vec![None; items.len()];
+        }
+        items
+            .iter()
+            .map(|item| match &item.action {
+                PaletteAction::ActivateSession(id) => {
+                    let session = self.sessions.iter().find(|s| s.id == *id)?;
+                    let activity = herdr_backed_activity(
+                        session.activity(),
+                        self.session_herdr_status(session),
+                    );
+                    let managed = self.session_managed(session);
+                    session_status_mark(&RowStatus {
+                        attention: session.needs_attention,
+                        activity,
+                        managed: managed.as_ref(),
+                    })
+                },
+                PaletteAction::AttachHerdrAgent(attach) => {
+                    let agent = self.find_herdr_agent(&attach.key.side, &attach.key.terminal_id)?;
+                    let settings = self.herdr_settings(&attach.key.side);
+                    let managed = Managed::herdr(
+                        &attach.key.side,
+                        &settings,
+                        self.config.integrations.herdr.attach,
+                        Some(agent),
+                    );
+                    let mark = managed.mark?;
+                    Some((SessionMark::Harness(mark), managed_tooltip(&managed)))
+                },
+                _ => None,
+            })
+            .collect()
     }
 
     /// Human label for a workspace: `project / worktree` for a known worktree,
@@ -12215,6 +12332,84 @@ mod tests {
         assert_eq!(agent_hint(LiveState::Working, Some("codex")), "codex is working");
         assert_eq!(agent_hint(LiveState::Blocked, Some("claude")), "claude is waiting for you");
         assert_eq!(agent_hint(LiveState::Blocked, None), "agent is waiting for you");
+    }
+
+    /// A shell session has no state axis to mark. The sidebar draws its own
+    /// icon here instead of a status mark, and the palette leaves the slot
+    /// empty, so both must read this as "no mark" rather than picking one.
+    #[test]
+    fn session_status_mark_picks_none_for_a_shell() {
+        let status =
+            RowStatus { attention: false, activity: SessionActivity::Shell, managed: None };
+        assert!(session_status_mark(&status).is_none());
+    }
+
+    /// The palette paints the identical mark and hover the sidebar would for
+    /// a local agent, whichever of the three live states it is in.
+    #[test]
+    fn session_status_mark_picks_each_live_state_for_a_local_agent() {
+        for live in [LiveState::Idle, LiveState::Working, LiveState::Blocked] {
+            let activity = SessionActivity::agent(Some("claude"), live);
+            let status = RowStatus { attention: false, activity, managed: None };
+            let (mark, hint) = session_status_mark(&status).expect("an agent always has a mark");
+            assert_eq!(mark, SessionMark::Agent(live));
+            assert_eq!(hint, agent_hint(live, Some("claude")));
+        }
+    }
+
+    /// Attention outranks every other reading a row could have, a harness's
+    /// included — a state that wants a human cannot also be quiet.
+    #[test]
+    fn session_status_mark_puts_attention_first() {
+        let agent = herdr_agent(Some("claude"));
+        let managed = Managed::herdr(
+            &herdr::Side::Native,
+            &herdr::Settings::default(),
+            AttachMode::Agent,
+            Some(&agent),
+        );
+        let status = RowStatus {
+            attention: true,
+            activity: SessionActivity::Shell,
+            managed: Some(&managed),
+        };
+        let (mark, hint) = session_status_mark(&status).expect("attention always has a mark");
+        assert_eq!(mark, SessionMark::Attention);
+        assert_eq!(hint, ATTENTION_HINT);
+    }
+
+    /// A herdr-backed session's mark and hover come from the same call the
+    /// sidebar makes for the identical `Managed`, so the two can never
+    /// disagree about what a pane is doing.
+    #[test]
+    fn session_status_mark_matches_the_sidebar_for_a_herdr_backed_session() {
+        let agent =
+            herdr::Agent { status: Some(herdr::Status::Working), ..herdr_agent(Some("claude")) };
+        let managed = Managed::herdr(
+            &herdr::Side::Native,
+            &herdr::Settings::default(),
+            AttachMode::Agent,
+            Some(&agent),
+        );
+        let activity = SessionActivity::agent(Some("claude"), LiveState::Idle);
+        let status = RowStatus { attention: false, activity, managed: Some(&managed) };
+        let (mark, hint) =
+            session_status_mark(&status).expect("a listed herdr agent always has a mark");
+        let harness_mark = managed.mark.expect("a listed agent always has one");
+        assert_eq!(mark, SessionMark::Harness(harness_mark));
+        assert_eq!(hint, format!("{} says {}", managed.harness, harness_mark.label));
+    }
+
+    /// The mark the palette paints sits in the column grid's own left
+    /// padding rather than a slot of its own, so a row with no mark leaves
+    /// nothing for the desc/action/keys arithmetic to notice.  If the two
+    /// ever drift apart, the mark either overruns the description or leaves
+    /// a visible gap before it.
+    #[test]
+    fn the_palette_mark_slot_fits_the_columns_own_padding() {
+        let theme = Theme::from_config(&Config::default());
+        let cols = PaletteColumns::new(theme.ui_scale, PALETTE_WIDTH);
+        assert_eq!(cols.pad, row_status_icon_size(&theme).x);
     }
 
     #[test]
