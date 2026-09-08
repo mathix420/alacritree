@@ -1620,9 +1620,8 @@ impl Session {
     /// Fed through alacritty's own parser because the PTY that would otherwise
     /// carry it is already gone.
     pub fn write_hold_notice(&self, chord: Option<&str>) {
-        let bytes = format!("\r\n{}\r\n", hold_notice(chord)).into_bytes();
         let mut term = self.term.lock();
-        Processor::<StdSyncHandler>::new().advance(&mut *term, &bytes);
+        Processor::<StdSyncHandler>::new().advance(&mut *term, &hold_notice_bytes(chord));
     }
 
     /// The distro a shimmed WSL session runs in.  Dropped paths need it to
@@ -1815,6 +1814,15 @@ fn hold_notice(chord: Option<&str>) -> String {
         Some(chord) => format!("[alacritree] session exited — press {chord} to close it"),
         None => "[alacritree] session exited — close it from the command palette".to_string(),
     }
+}
+
+/// The notice as the parser receives it.  A fresh `Processor` resets parser
+/// state but not the terminal's cursor template, so a child that died in
+/// reverse video or `ESC[8m` would otherwise paint the notice in its pen —
+/// invisibly, in the worst case.  wezterm's `emit_output_for_pane` leads with
+/// the same reset for the same reason.
+fn hold_notice_bytes(chord: Option<&str>) -> Vec<u8> {
+    format!("\x1b[0m\r\n{}\r\n", hold_notice(chord)).into_bytes()
 }
 
 fn clipboard_target(ty: ClipboardType) -> Target {
@@ -2409,6 +2417,33 @@ mod tests {
         // Column zero, not wherever the child left the cursor.
         assert!(written[1].starts_with("[alacritree] "), "{:?}", written[1]);
         assert!(written[1].contains("press Enter to close it"), "{:?}", written[1]);
+    }
+
+    /// A TUI that died mid-frame leaves its own pen in the cursor template.
+    /// The notice has to lead with a reset or it inherits it — reverse video,
+    /// a colour, or `ESC[8m`, which paints it invisibly.
+    #[test]
+    fn the_notice_does_not_inherit_the_dead_childs_pen() {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+
+        assert!(hold_notice_bytes(Some("Enter")).starts_with(b"\x1b[0m"));
+
+        let session = pty_less_probe(SessionKind::Shell, "shell");
+        {
+            let mut term = session.term.lock();
+            Processor::<StdSyncHandler>::new().advance(&mut *term, b"\x1b[7;1;8mdied mid-frame");
+        }
+        session.write_hold_notice(Some("Enter"));
+
+        let term = session.term.lock();
+        let row = &term.grid()[Line(1)];
+        let painted: Flags =
+            (0..12).map(|col| row[Column(col)].flags).fold(Flags::empty(), |acc, f| acc | f);
+        assert!(
+            !painted.intersects(Flags::INVERSE | Flags::BOLD | Flags::HIDDEN),
+            "notice inherited {painted:?}"
+        );
     }
 
     /// A user who unbound the action gets pointed at the palette instead of at
