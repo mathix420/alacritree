@@ -12402,6 +12402,48 @@ mod tests {
         assert_eq!(hint, format!("{} says {}", managed.harness, harness_mark.label));
     }
 
+    /// A herdr pane with no agent in it reports no state, so the harness rung
+    /// of the ladder is empty and a plain shell in one carries no mark at all.
+    /// The palette reads `managed.mark` directly while the sidebar goes
+    /// through the ladder, so the two only agree while both answer "none"
+    /// here.
+    #[test]
+    fn session_status_mark_leaves_an_agentless_pane_unmarked() {
+        let managed = Managed::herdr(
+            &herdr::Side::Native,
+            &herdr::Settings::default(),
+            AttachMode::Agent,
+            Some(&shell_pane()),
+        );
+        assert_eq!(managed.mark, None);
+        let status = RowStatus {
+            attention: false,
+            activity: SessionActivity::Shell,
+            managed: Some(&managed),
+        };
+        assert!(session_status_mark(&status).is_none());
+    }
+
+    /// A pane herdr reports no agent in can still be running one alacritree's
+    /// own title heuristic recognises.  The harness rung is empty, so the
+    /// ladder falls through to the live axis rather than stopping at a
+    /// managed row the way it did while every listed pane had a state.
+    #[test]
+    fn an_agentless_pane_falls_through_to_the_local_agent_reading() {
+        let managed = Managed::herdr(
+            &herdr::Side::Native,
+            &herdr::Settings::default(),
+            AttachMode::Agent,
+            Some(&shell_pane()),
+        );
+        let activity = SessionActivity::agent(Some("claude"), LiveState::Working);
+        assert_eq!(herdr_backed_activity(activity, None), activity);
+        let status = RowStatus { attention: false, activity, managed: Some(&managed) };
+        let (mark, hint) = session_status_mark(&status).expect("the live axis still has one");
+        assert_eq!(mark, SessionMark::Agent(LiveState::Working));
+        assert_eq!(hint, agent_hint(LiveState::Working, Some("claude")));
+    }
+
     /// The mark the palette paints sits in the column grid's own left
     /// padding rather than a slot of its own, so a row with no mark leaves
     /// nothing for the desc/action/keys arithmetic to notice.  If the two
