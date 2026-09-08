@@ -353,6 +353,32 @@ struct BindingScope {
     exited_session_focused: bool,
 }
 
+/// What the binding pass needs to know about the session on screen.
+#[derive(Clone, Copy)]
+struct SessionFocus {
+    scratchpad: bool,
+    exited: bool,
+}
+
+/// The scope a key press is judged in.  Kept apart from the frame it is read
+/// from so the mapping can be pinned on its own: `exited_session_focused` is
+/// what lets a bare `Enter` be a chord at all, and the filter chain below
+/// cannot tell a correct mapping from an inverted one.
+fn binding_scope(
+    focus: PaneFocus,
+    palette_open: bool,
+    active: Option<SessionFocus>,
+) -> BindingScope {
+    // The palette is a modal that owns every key while it is up.
+    let active = active.filter(|_| focus == PaneFocus::Terminal && !palette_open);
+    BindingScope {
+        sidebar_focused: focus == PaneFocus::ProjectsSidebar && !palette_open,
+        git_focused: focus == PaneFocus::GitSidebar && !palette_open,
+        scratchpad_focused: active.is_some_and(|s| s.scratchpad),
+        exited_session_focused: active.is_some_and(|s| s.exited),
+    }
+}
+
 /// Whether a matched binding's key press should reach `action`, given what
 /// currently owns keyboard focus. Filter actions are scoped to the
 /// sidebar that owns them so a bare letter like `d` doesn't fire a git-panel
@@ -2648,18 +2674,11 @@ impl AlacritreeApp {
     /// text input.  Matched events are consumed unless every matched action
     /// is `ReceiveChar` (alacritty's pass-through marker).
     fn handle_shortcuts(&mut self, ctx: &Context) {
-        let sidebar_focused = self.focus == PaneFocus::ProjectsSidebar && !self.palette.is_open();
-        let git_focused = self.focus == PaneFocus::GitSidebar && !self.palette.is_open();
-        let active_session = self
-            .active_session_index()
-            .filter(|_| self.focus == PaneFocus::Terminal)
-            .map(|idx| &self.sessions[idx]);
-        let scope = BindingScope {
-            sidebar_focused,
-            git_focused,
-            scratchpad_focused: active_session.is_some_and(|s| s.scratchpad.is_some()),
-            exited_session_focused: active_session.is_some_and(Session::is_exited),
-        };
+        let active = self.active_session_index().map(|idx| SessionFocus {
+            scratchpad: self.sessions[idx].scratchpad.is_some(),
+            exited: self.sessions[idx].is_exited(),
+        });
+        let scope = binding_scope(self.focus, self.palette.is_open(), active);
         let actions: Vec<BindingAction> = ctx.input_mut(|i| {
             let mut actions = Vec::new();
             i.events.retain(|ev| {
@@ -13459,6 +13478,48 @@ mod tests {
     /// scope test that does not say otherwise means.
     fn scope() -> BindingScope {
         BindingScope::default()
+    }
+
+    const LIVE: SessionFocus = SessionFocus { scratchpad: false, exited: false };
+    const EXITED: SessionFocus = SessionFocus { scratchpad: false, exited: true };
+    const SCRATCHPAD: SessionFocus = SessionFocus { scratchpad: true, exited: false };
+
+    /// The mapping the filter chain cannot check for itself: which pane owns
+    /// focus, and whether the session on screen still has a child.
+    #[test]
+    fn binding_scope_reads_focus_and_the_session_on_screen() {
+        let terminal = |active| binding_scope(PaneFocus::Terminal, false, active);
+
+        assert!(terminal(Some(EXITED)).exited_session_focused);
+        assert!(!terminal(Some(LIVE)).exited_session_focused);
+        assert!(!terminal(None).exited_session_focused);
+        assert!(terminal(Some(SCRATCHPAD)).scratchpad_focused);
+        assert!(!terminal(Some(LIVE)).scratchpad_focused);
+
+        let sidebar = binding_scope(PaneFocus::ProjectsSidebar, false, Some(EXITED));
+        assert!(sidebar.sidebar_focused);
+        assert!(!sidebar.git_focused);
+        assert!(
+            !sidebar.exited_session_focused,
+            "a session's chord is the terminal's, not the sidebar's"
+        );
+
+        let git = binding_scope(PaneFocus::GitSidebar, false, Some(EXITED));
+        assert!(git.git_focused);
+        assert!(!git.sidebar_focused);
+        assert!(!git.exited_session_focused);
+    }
+
+    /// The palette owns every key while it is up, so no scope is live under it.
+    #[test]
+    fn an_open_palette_leaves_no_scope_active() {
+        for focus in [PaneFocus::Terminal, PaneFocus::ProjectsSidebar, PaneFocus::GitSidebar] {
+            let scope = binding_scope(focus, true, Some(EXITED));
+            assert!(!scope.sidebar_focused, "{focus:?}");
+            assert!(!scope.git_focused, "{focus:?}");
+            assert!(!scope.scratchpad_focused, "{focus:?}");
+            assert!(!scope.exited_session_focused, "{focus:?}");
+        }
     }
 
     #[test]
