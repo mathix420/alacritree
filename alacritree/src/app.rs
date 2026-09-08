@@ -22,8 +22,8 @@ use crate::config::{
     DEFAULT_REORDER_ICON, DEFAULT_SEARCH_ICON, DEFAULT_SESSION_ICON,
     DEFAULT_UPSTREAM_DIVERGED_ICON, DEFAULT_UPSTREAM_GONE_ICON, DEFAULT_UPSTREAM_LEVEL_ICON,
     DEFAULT_UPSTREAM_UNTRACKED_ICON, DEFAULT_WORKTREE_ICON, DEFAULT_WORKTREE_MAIN_ICON, FontConfig,
-    IconStyle, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SearchScope, SidebarFocus,
-    SidebarTooltips, TextEmphasis, UiFont, UiTheme, profile_command,
+    IconStyle, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SearchDepth, SearchScope,
+    SidebarFocus, SidebarTooltips, TextEmphasis, UiFont, UiTheme, profile_command,
 };
 use crate::crash_log::{self, ExitReason};
 use crate::git_nav::{self, GitSection, SectionCount};
@@ -438,6 +438,15 @@ fn worktree_pr_passes(any_pr: bool, pr_matches: &HashMap<PathBuf, bool>, path: &
     !any_pr || pr_matches.get(path).copied().unwrap_or(false)
 }
 
+/// Whether `current_project_rows` resolves session and herdr-agent names for
+/// `child_matches` this frame. `[ui] search_depth` at its "workspaces"
+/// default answers false unconditionally, which is what keeps the pre-branch
+/// cost: no child name is ever computed, matching a query that could never
+/// reach one before session/agent matching existed.
+fn search_reaches_children(depth: SearchDepth, query_is_empty: bool) -> bool {
+    depth == SearchDepth::Sessions && !query_is_empty
+}
+
 /// Whether the projects panel is filtering on PR state this frame.  A toggle
 /// the scope has stood down narrows nothing, so it must not pull the cache
 /// generation into the reconciler or reach `gh` for a collapsed project.
@@ -528,6 +537,9 @@ pub struct AlacritreeApp {
     /// `[ui] search_scope`: whether a live query stands down both panels'
     /// toggle filters.  Toggled at runtime, never persisted.
     search_scope: SearchScope,
+    /// `[ui] search_depth`: whether a projects-panel query also matches
+    /// session titles and herdr agent names.  Not runtime-toggled.
+    search_depth: SearchDepth,
     /// Git-panel cursor, identified by `(section, path)`.  Rebuilt every render
     /// pass from `git_rows`, so it survives the 1.5 s status refresh.
     git_cursor: Option<git_nav::GitRow>,
@@ -985,6 +997,7 @@ impl AlacritreeApp {
             project_filter: PanelFilter::new(project_filter_toggles(config.ui.pr_status)),
             git_filter: PanelFilter::new(GIT_FILTER_TOGGLES),
             search_scope: config.ui.search_scope,
+            search_depth: config.ui.search_depth,
             git_cursor: None,
             git_cursor_moved: false,
             git_rows: Vec::new(),
@@ -2806,40 +2819,47 @@ impl AlacritreeApp {
         // Child names are resolved before the matcher borrows the filter: the
         // names come off `&self` helpers and the matcher wants `&mut
         // self.project_filter`, so the two cannot be live at once.  Skipped
-        // outright with an empty query, where `matches` answers true for
-        // everything and every workspace holding any child would surface.
-        let child_matches: HashMap<SidebarRow, bool> = if self.project_filter.query().is_empty() {
-            HashMap::new()
-        } else {
-            let names: Vec<(SidebarRow, String)> = listed
-                .values()
-                .flatten()
-                .map(|entry| {
-                    let name = match entry {
-                        sidebar_nav::WorkspaceEntry::Session(id) => self
-                            .sessions
-                            .iter()
-                            .find(|s| s.id == *id)
-                            .map(|s| {
-                                let activity = herdr_backed_activity(
-                                    s.activity(),
-                                    self.session_herdr_status(s),
-                                );
-                                session_row_name(&s.title, activity, self.session_herdr_agent(s))
-                            })
-                            .map(RowName::search_text)
-                            .unwrap_or_default(),
-                        sidebar_nav::WorkspaceEntry::Agent(side, terminal_id) => self
-                            .find_herdr_agent(side, terminal_id)
-                            .map(|a| herdr_display_name(a).search_text())
-                            .unwrap_or_default(),
-                    };
-                    (entry.row(), name)
-                })
-                .collect();
-            let filter = &mut self.project_filter;
-            names.into_iter().map(|(row, name)| (row, filter.matches(&name))).collect()
-        };
+        // outright by `search_reaches_children` with an empty query, where
+        // `matches` answers true for everything and every workspace holding
+        // any child would surface, and with `[ui] search_depth` at its
+        // "workspaces" default, which never descends past a workspace name.
+        let child_matches: HashMap<SidebarRow, bool> =
+            if search_reaches_children(self.search_depth, self.project_filter.query().is_empty()) {
+                let names: Vec<(SidebarRow, String)> = listed
+                    .values()
+                    .flatten()
+                    .map(|entry| {
+                        let name = match entry {
+                            sidebar_nav::WorkspaceEntry::Session(id) => self
+                                .sessions
+                                .iter()
+                                .find(|s| s.id == *id)
+                                .map(|s| {
+                                    let activity = herdr_backed_activity(
+                                        s.activity(),
+                                        self.session_herdr_status(s),
+                                    );
+                                    session_row_name(
+                                        &s.title,
+                                        activity,
+                                        self.session_herdr_agent(s),
+                                    )
+                                })
+                                .map(RowName::search_text)
+                                .unwrap_or_default(),
+                            sidebar_nav::WorkspaceEntry::Agent(side, terminal_id) => self
+                                .find_herdr_agent(side, terminal_id)
+                                .map(|a| herdr_display_name(a).search_text())
+                                .unwrap_or_default(),
+                        };
+                        (entry.row(), name)
+                    })
+                    .collect();
+                let filter = &mut self.project_filter;
+                names.into_iter().map(|(row, name)| (row, filter.matches(&name))).collect()
+            } else {
+                HashMap::new()
+            };
 
         let gate = |key: &WorkspaceKey| {
             project_toggles_pass(
@@ -11194,6 +11214,25 @@ mod tests {
 
     fn ws(p: &str) -> WorkspaceKey {
         Some(PathBuf::from(p))
+    }
+
+    /// The option off restores the pre-branch row set for a query naming a
+    /// session: `child_matches` never gets built, so `current_project_rows`
+    /// feeds `sidebar_nav::filtered_rows` a `None` child predicate exactly as
+    /// it did before session/agent name matching existed, whatever the query.
+    #[test]
+    fn search_reaches_children_stays_false_at_the_workspaces_default() {
+        assert!(!search_reaches_children(SearchDepth::Workspaces, false));
+        assert!(!search_reaches_children(SearchDepth::Workspaces, true));
+    }
+
+    /// The option on keeps the behaviour the branch added: a non-empty query
+    /// still resolves child names, so a session or agent row can match by
+    /// name rather than only through its workspace.
+    #[test]
+    fn search_reaches_children_only_with_sessions_depth_and_a_live_query() {
+        assert!(search_reaches_children(SearchDepth::Sessions, false));
+        assert!(!search_reaches_children(SearchDepth::Sessions, true));
     }
 
     #[test]

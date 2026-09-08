@@ -1310,6 +1310,14 @@
           ],
           "type": "string"
         },
+        "search_depth": {
+          "description": "How far a sidebar query reaches: \"workspaces\" (default) matches project\nand worktree names only; \"sessions\" also matches session titles and\nherdr agent names.",
+          "enum": [
+            "workspaces",
+            "sessions"
+          ],
+          "type": "string"
+        },
         "search_scope": {
           "default": "filtered",
           "description": "Whether a fuzzy query is confined by the panel's active toggle filters:\n\"filtered\" | \"all\".",

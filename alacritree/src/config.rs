@@ -894,6 +894,28 @@ fn parse_search_scope(raw: &str) -> SearchScope {
     }
 }
 
+/// `[ui] search_depth`: how far a sidebar query reaches.  `search_scope`
+/// says what a query is confined by; this says how far down it descends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub enum SearchDepth {
+    /// Matches project and worktree names only.
+    #[default]
+    Workspaces,
+    /// Also matches session titles and herdr agent names.
+    Sessions,
+}
+
+fn parse_search_depth(raw: &str) -> SearchDepth {
+    match raw {
+        "workspaces" => SearchDepth::Workspaces,
+        "sessions" => SearchDepth::Sessions,
+        other => {
+            log::warn!("unknown ui.search_depth value {other:?}, using \"workspaces\"");
+            SearchDepth::default()
+        },
+    }
+}
+
 /// `[ui.session_reorder] scope`: how far a session may travel when the user
 /// reorders it.  Widening it makes a reorder step able to change which
 /// workspace a session belongs to, which is why the default keeps a session
@@ -1222,6 +1244,8 @@ pub struct UiTheme {
     pub sidebar_scroll_align: ScrollAlign,
     /// Whether a fuzzy query is confined by the panel's active toggle filters.
     pub search_scope: SearchScope,
+    /// How far a sidebar query reaches beyond workspace names.
+    pub search_depth: SearchDepth,
     /// When a sidebar row spells its full name out on hover.
     pub sidebar_tooltips: SidebarTooltips,
     /// Whether a sidebar icon explains itself on hover — what a button does,
@@ -1337,6 +1361,7 @@ impl Default for UiTheme {
             sidebar_follow_active: false,
             sidebar_scroll_align: ScrollAlign::default(),
             search_scope: SearchScope::default(),
+            search_depth: SearchDepth::default(),
             sidebar_tooltips: SidebarTooltips::default(),
             icon_tooltips: true,
             session_display: SessionDisplay::default(),
@@ -2801,6 +2826,11 @@ struct RawUi {
     /// "filtered" | "all".
     #[schemars(extend("enum" = ["filtered", "all"]))]
     search_scope: String,
+    /// How far a sidebar query reaches: "workspaces" matches project and
+    /// worktree names only; "sessions" also matches session titles and herdr
+    /// agent names.
+    #[schemars(extend("enum" = ["workspaces", "sessions"]))]
+    search_depth: String,
     /// When a sidebar row spells its full name out on hover:
     /// "elided" | "always" | "off".
     #[schemars(extend("enum" = ["elided", "always", "off"]))]
@@ -2903,6 +2933,7 @@ impl Default for RawUi {
             sidebar_follow_active: false,
             sidebar_scroll_align: "minimal".to_string(),
             search_scope: "filtered".to_string(),
+            search_depth: "workspaces".to_string(),
             sidebar_tooltips: "elided".to_string(),
             icon_tooltips: true,
             session_display: RawSessionDisplay::default(),
@@ -3138,6 +3169,7 @@ impl RawConfig {
             sidebar_follow_active: self.ui.sidebar_follow_active,
             sidebar_scroll_align: parse_scroll_align(&self.ui.sidebar_scroll_align),
             search_scope: parse_search_scope(&self.ui.search_scope),
+            search_depth: parse_search_depth(&self.ui.search_depth),
             sidebar_tooltips: parse_sidebar_tooltips(&self.ui.sidebar_tooltips),
             icon_tooltips: self.ui.icon_tooltips,
             session_display: SessionDisplay {
@@ -4090,6 +4122,28 @@ mod tests {
     fn search_scope_invalid_falls_back_to_filtered() {
         let ui = ui_from_toml("[ui]\nsearch_scope = \"everywhere\"");
         assert_eq!(ui.search_scope, SearchScope::Filtered);
+    }
+
+    #[test]
+    fn search_depth_defaults_to_workspaces() {
+        let ui = ui_from_toml("");
+        assert_eq!(ui.search_depth, SearchDepth::Workspaces);
+    }
+
+    #[test]
+    fn search_depth_parses_both_values() {
+        for (raw, expected) in
+            [("workspaces", SearchDepth::Workspaces), ("sessions", SearchDepth::Sessions)]
+        {
+            let ui = ui_from_toml(&format!("[ui]\nsearch_depth = \"{raw}\""));
+            assert_eq!(ui.search_depth, expected, "value {raw:?}");
+        }
+    }
+
+    #[test]
+    fn search_depth_invalid_falls_back_to_workspaces() {
+        let ui = ui_from_toml("[ui]\nsearch_depth = \"everything\"");
+        assert_eq!(ui.search_depth, SearchDepth::Workspaces);
     }
 
     #[test]
