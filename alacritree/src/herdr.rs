@@ -578,10 +578,17 @@ fn parse_pane_inventory(stdout: &str) -> Result<HashSet<String>, PollError> {
         .collect()
 }
 
+/// Last known pane details, with live fields valid only in a current reply.
+pub struct PaneMetadata {
+    pub agent: Agent,
+    pub current: bool,
+}
+
 /// One herdr server's agents, refreshed off the UI thread.
 pub struct EndpointCache {
     side: Side,
     agents: Vec<Agent>,
+    attachment_panes: Vec<PaneMetadata>,
     generation: u64,
     reach: Reach,
     last_attempt: Option<Instant>,
@@ -597,6 +604,7 @@ impl EndpointCache {
         Self {
             side,
             agents: Vec::new(),
+            attachment_panes: Vec::new(),
             generation: 0,
             reach: Reach::default(),
             last_attempt: None,
@@ -620,6 +628,11 @@ impl EndpointCache {
 
     pub fn agents(&self) -> &[Agent] {
         &self.agents
+    }
+
+    /// Unfiltered attachment details survive an unavailable display poll.
+    pub fn attachment_pane(&self, terminal_id: &str) -> Option<&PaneMetadata> {
+        self.attachment_panes.iter().find(|pane| pane.agent.terminal_id == terminal_id)
     }
 
     /// When the successful listing began, so a focus change can reject a
@@ -656,13 +669,29 @@ impl EndpointCache {
 
     fn adopt_reply(&mut self, reply: ListingReply, display: Listing, attached: bool) {
         let mut agents = reply.agents;
-        if display == Listing::Agents && reply.listing == Listing::Panes {
-            agents.retain(|agent| agent.status.is_some());
-        }
         self.sampled_at = Some(reply.sampled_at);
         if let Some(inventory) = reply.inventory.filter(|_| attached) {
             match inventory {
                 Ok(terminal_ids) => {
+                    self.attachment_panes
+                        .retain(|pane| terminal_ids.contains(&pane.agent.terminal_id));
+                    for pane in &mut self.attachment_panes {
+                        pane.current = false;
+                        pane.agent.status = None;
+                        pane.agent.focused = false;
+                    }
+                    for agent in &agents {
+                        if let Some(pane) = self
+                            .attachment_panes
+                            .iter_mut()
+                            .find(|pane| pane.agent.terminal_id == agent.terminal_id)
+                        {
+                            *pane = PaneMetadata { agent: agent.clone(), current: true };
+                        } else {
+                            self.attachment_panes
+                                .push(PaneMetadata { agent: agent.clone(), current: true });
+                        }
+                    }
                     self.reach.record_success();
                     if self.inventory.as_ref().is_none_or(|old| old.terminal_ids != terminal_ids) {
                         log::debug!(
@@ -683,6 +712,10 @@ impl EndpointCache {
         } else {
             self.reach.record_success();
             self.inventory = None;
+            self.attachment_panes.clear();
+        }
+        if display == Listing::Agents && reply.listing == Listing::Panes {
+            agents.retain(|agent| agent.status.is_some());
         }
         if rendered_differs(&self.agents, &agents) {
             self.generation = self.generation.wrapping_add(1);
@@ -770,6 +803,14 @@ impl EndpointCache {
 
     /// Adopts a landed result and starts a new poll when due.  Never blocks.
     pub fn poll(&mut self, interval: Duration, listing: Listing, attached: bool) {
+        if attached && self.attachment_panes.is_empty() {
+            self.attachment_panes.extend(
+                self.agents
+                    .iter()
+                    .cloned()
+                    .map(|agent| PaneMetadata { agent, current: self.sampled_at.is_some() }),
+            );
+        }
         self.advance_settings();
         self.advance_session_name();
         if let Some(job) = &self.pending {
@@ -805,6 +846,7 @@ impl EndpointCache {
 
         if !attached {
             self.inventory = None;
+            self.attachment_panes.clear();
         }
         if !self.poll_due(interval, attached) {
             return;
@@ -830,6 +872,11 @@ impl EndpointCache {
     /// endpoint retried for the whole session still costs one line.
     fn note_failure(&mut self, error: &PollError) {
         self.inventory = None;
+        for pane in &mut self.attachment_panes {
+            pane.current = false;
+            pane.agent.status = None;
+            pane.agent.focused = false;
+        }
         let code = error.code();
         let novel = self.reach.record_failure(error);
         if novel && code != "server_not_running" {
@@ -1220,6 +1267,52 @@ enum Read<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_metadata_survives_a_first_poll_failure_after_binding() {
+        let mut cache = EndpointCache::new(Side::Native);
+        cache.settings = Read::Done(Settings::default());
+        cache.session_name = Read::Done("fixture".into());
+        cache.last_attempt = Some(Instant::now());
+        cache.pending = Some(jobs::Job::ready(Ok(ListingReply::parse(
+            r#"{"result":{"agents":[{"terminal_id":"agent","pane_id":"w1:p1","agent":"claude","agent_status":"working","terminal_title_stripped":"review work"}]}}"#,
+            Listing::Agents,
+            Instant::now(),
+            false,
+        ))));
+        cache.poll(Duration::from_secs(60), Listing::Agents, false);
+        assert!(cache.attachment_panes.is_empty());
+        assert_eq!(cache.agents()[0].title.as_deref(), Some("review work"));
+
+        cache.complete_listing_for_test(
+            Err(PollError::Absent("spawn_failed")),
+            Listing::Panes,
+            Listing::Agents,
+            Instant::now(),
+        );
+
+        let pane =
+            cache.attachment_pane("agent").expect("the bound pane retains its known details");
+        assert_eq!(pane.agent.title.as_deref(), Some("review work"));
+        assert!(!pane.current);
+        assert!(pane.agent.status.is_none());
+        assert!(!pane.agent.focused);
+    }
+
+    #[test]
+    fn attachment_metadata_is_released_without_bindings() {
+        let mut cache = EndpointCache::new(Side::Native);
+        cache.complete_listing_for_test(
+            Ok(r#"{"result":{"panes":[{"terminal_id":"shell","pane_id":"w1:p1"}]}}"#),
+            Listing::Panes,
+            Listing::Agents,
+            Instant::now(),
+        );
+        assert!(cache.attachment_pane("shell").is_some());
+        cache.poll(Duration::from_secs(60), Listing::Agents, false);
+        assert!(cache.attachment_pane("shell").is_none());
+        assert!(cache.pending.is_none());
+    }
 
     #[test]
     fn inventory_adoption_keeps_the_request_timestamp_when_display_changes_in_flight() {

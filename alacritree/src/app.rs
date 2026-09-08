@@ -6460,15 +6460,21 @@ fn paint_palette_row(
         cols.keys,
         cols.token_wrap(),
     );
-    let elided_hover = elided_hover(&[
-        (desc.elided, item.primary.as_str()),
-        (
-            subtitle.as_ref().is_some_and(|subtitle| subtitle.elided),
-            item.subtitle.as_deref().unwrap_or_default(),
-        ),
-        (action.elided, item.secondary.as_str()),
-        (keys.elided, item.keys.as_str()),
-    ]);
+    let elided_hover = item
+        .hover
+        .is_none()
+        .then(|| {
+            elided_hover(&[
+                (desc.elided, item.primary.as_str()),
+                (
+                    subtitle.as_ref().is_some_and(|subtitle| subtitle.elided),
+                    item.subtitle.as_deref().unwrap_or_default(),
+                ),
+                (action.elided, item.secondary.as_str()),
+                (keys.elided, item.keys.as_str()),
+            ])
+        })
+        .flatten();
     let subtitle_h = subtitle.as_ref().map_or(0.0, |subtitle| {
         let font = egui::FontId::new(subtitle_size, egui::FontFamily::Proportional);
         subtitle.size().y.max(ctx.fonts(|fonts| fonts.row_height(&font)))
@@ -7889,12 +7895,12 @@ fn native_palette_content(
                     .file_name()
                     .is_some_and(|name| title.eq_ignore_ascii_case(&name.to_string_lossy()))
         });
-    let primary = generic.then_some(workspace.clone()).unwrap_or_else(|| title.clone());
+    let primary = if generic { workspace.clone() } else { title };
     PaletteSessionContent {
         title_for_hover: primary.clone(),
+        secondary: session_middle(kind, status, &primary, fallback),
         primary,
-        subtitle: (!generic).then_some(workspace).unwrap_or_default(),
-        secondary: session_middle(kind, status, &title, fallback),
+        subtitle: if generic { String::new() } else { workspace },
     }
 }
 
@@ -10314,33 +10320,68 @@ impl AlacritreeApp {
             let activity =
                 herdr_backed_activity(session.activity(), self.session_herdr_status(session));
             let name = session_row_name(&session.title, activity, agent);
-            if let (Some(agent), Some(key)) = (agent, session.herdr_key.as_ref()) {
+            if let Some(key) = session.herdr_key.as_ref() {
+                let retained = self
+                    .herdr_endpoints
+                    .caches()
+                    .iter()
+                    .find(|cache| cache.side() == &key.side)
+                    .and_then(|cache| cache.attachment_pane(&key.terminal_id));
+                let current = retained.map_or(agent.is_some(), |pane| pane.current);
+                let agent = retained.map(|pane| &pane.agent).or(agent);
                 let workspace = session
                     .working_directory
                     .as_ref()
                     .map(|_| self.workspace_label(&session.working_directory));
-                let content = herdr_palette_content(
-                    name.text,
-                    agent,
-                    agent.title.is_some(),
-                    workspace.as_deref(),
-                    herdr_glyph,
-                    self.config.ui.path_style.git_rows,
-                    None,
-                    true,
-                );
-                let managed = self.session_managed(session);
+                let mut content = if let Some(agent) = agent {
+                    herdr_palette_content(
+                        session_row_name(&session.title, activity, Some(agent)).text,
+                        agent,
+                        agent.title.is_some(),
+                        workspace.as_deref(),
+                        herdr_glyph,
+                        self.config.ui.path_style.git_rows,
+                        None,
+                        true,
+                    )
+                } else {
+                    let mut content = native_palette_content(
+                        name.text,
+                        self.workspace_label(&session.working_directory),
+                        session.working_directory.as_deref(),
+                        None,
+                        None,
+                        "session",
+                    );
+                    content.subtitle = herdr_subtitle(
+                        herdr_glyph,
+                        (!content.subtitle.is_empty()).then_some(content.subtitle.as_str()),
+                    );
+                    content
+                };
+                let kind = agent.and_then(|agent| agent.kind.as_deref());
+                let status = agent.filter(|_| current).and_then(|agent| agent.status);
+                if !current {
+                    content.secondary = session_middle(kind, None, &content.primary, "session");
+                }
+                let mut managed = self.session_managed(session).unwrap();
+                managed.kind = kind.map(str::to_owned);
+                managed.title = agent
+                    .and_then(|agent| agent.title.clone())
+                    .filter(|title| Some(title.as_str()) != kind);
+                managed.mark = status
+                    .map(|status| herdr_mark(status, self.herdr_settings(&key.side).indicators));
                 let side = key.side.label().unwrap_or_else(|| "native".to_string());
                 let hover = palette_hover(
                     &content.title_for_hover,
-                    agent.kind.as_deref(),
-                    agent.status.map(|status| status.label()),
+                    kind,
+                    status.map(|status| status.label()),
                     &side,
                     session.working_directory.as_deref(),
-                    herdr_cwd(agent),
-                    Some(&agent.pane_id),
-                    Some(&agent.terminal_id),
-                    managed.as_ref(),
+                    agent.and_then(herdr_cwd),
+                    agent.map(|agent| agent.pane_id.as_str()),
+                    Some(&key.terminal_id),
+                    Some(&managed),
                     "switch to this session",
                 );
                 items.push(PaletteItem::session(
@@ -10349,7 +10390,7 @@ impl AlacritreeApp {
                     content.subtitle,
                     content.secondary,
                     hover,
-                    agent.kind.as_deref(),
+                    kind,
                     true,
                 ));
                 continue;
@@ -11987,6 +12028,152 @@ mod tests {
     }
 
     #[test]
+    fn attached_herdr_palette_keeps_filtered_shell_metadata() {
+        let mut app = herdr_lifecycle_app();
+        app.config.ui.path_style.git_rows = PathStyle::Fish;
+        app.config.integrations.herdr.show_panes = false;
+        app.config.ui.icons.herdr.glyph = Some("✦".into());
+        let side = herdr::Side::Native;
+        adopt_herdr_fixture(
+            &mut app,
+            side.clone(),
+            r#"{"result":{"panes":[
+            {"terminal_id":"term-shell","pane_id":"w1:p1","agent":"claude","agent_status":"working","terminal_title_stripped":"review work","cwd":"/private/project"}
+        ]}}"#,
+            Instant::now(),
+        );
+        let id = bind_herdr_fixture(&mut app, side.clone(), "term-shell");
+        adopt_herdr_fixture(
+            &mut app,
+            side,
+            r#"{"result":{"panes":[
+            {"terminal_id":"term-shell","pane_id":"w1:p1","terminal_title_stripped":"review work","cwd":"/private/project"}
+        ]}}"#,
+            Instant::now(),
+        );
+        app.reconcile_herdr_sessions(&Context::default());
+
+        assert_eq!(app.sessions[0].id, id);
+        assert!(app.herdr_agent_listing().is_empty());
+        let items = app.palette_items();
+        let row = items
+            .iter()
+            .position(|item| item.action == PaletteAction::ActivateSession(id))
+            .unwrap();
+        let item = &items[row];
+        assert_eq!(item.primary, "review work");
+        assert!(item.subtitle.as_deref().unwrap().starts_with("✦ "));
+        assert_eq!(item.secondary, "shell");
+        let hover = item.hover.as_deref().unwrap();
+        for detail in [
+            "Pane: w1:p1",
+            "Terminal: term-shell",
+            "Cwd: /private/project",
+            "herdr, shared view",
+            "Activate: switch to this session",
+        ] {
+            assert!(hover.contains(detail), "{detail}: {hover}");
+        }
+        assert!(!hover.contains("Status: working"));
+        let mut palette = CommandPalette::new();
+        *palette.query_mut() = "herdr".into();
+        assert!(palette.rank(&items).contains(&row));
+        for hidden in ["term-shell", "/private/project"] {
+            *palette.query_mut() = hidden.into();
+            assert!(!palette.rank(&items).contains(&row));
+        }
+    }
+
+    #[test]
+    fn attached_herdr_palette_keeps_known_details_after_failed_or_incomplete_poll() {
+        for reply in [
+            Err(herdr::PollError::Absent("spawn_failed")),
+            Ok(r#"{"result":{"panes":[{"terminal_id":"term-kept"}]}}"#),
+        ] {
+            let mut app = herdr_lifecycle_app();
+            app.config.ui.path_style.git_rows = PathStyle::Fish;
+            app.config.integrations.herdr.show_panes = false;
+            app.config.ui.icons.herdr.glyph = Some("✦".into());
+            let side = herdr::Side::Wsl("fixture-distro".into());
+            adopt_herdr_fixture(
+                &mut app,
+                side.clone(),
+                r#"{"result":{"panes":[
+                {"terminal_id":"term-kept","pane_id":"w1:p1","agent":"claude","agent_status":"working","terminal_title_stripped":"review work","cwd":"/private/project"}
+            ]}}"#,
+                Instant::now(),
+            );
+            let id = bind_herdr_fixture(&mut app, side.clone(), "term-kept");
+            let cache = app
+                .herdr_endpoints
+                .caches_mut_for_test()
+                .iter_mut()
+                .find(|cache| cache.side() == &side)
+                .unwrap();
+            cache.complete_listing_for_test(
+                reply,
+                herdr::Listing::Panes,
+                herdr::Listing::Agents,
+                Instant::now(),
+            );
+            app.reconcile_herdr_sessions(&Context::default());
+
+            assert_eq!(app.sessions[0].id, id);
+            let items = app.palette_items();
+            let row = items
+                .iter()
+                .position(|item| item.action == PaletteAction::ActivateSession(id))
+                .unwrap();
+            let item = &items[row];
+            assert_eq!(item.primary, "review work");
+            assert!(item.subtitle.as_deref().unwrap().starts_with("✦ "));
+            assert_eq!(item.secondary, "claude");
+            let hover = item.hover.as_deref().unwrap();
+            for detail in [
+                "Pane: w1:p1",
+                "Terminal: term-kept",
+                "Side: wsl:fixture-distro",
+                "Cwd: /private/project",
+                "herdr",
+                "Activate: switch to this session",
+            ] {
+                assert!(hover.contains(detail), "{detail}: {hover}");
+            }
+            assert!(!hover.contains("Status: working"));
+            let mut palette = CommandPalette::new();
+            *palette.query_mut() = "herdr".into();
+            assert!(palette.rank(&items).contains(&row));
+            for hidden in ["term-kept", "fixture-distro", "/private/project"] {
+                *palette.query_mut() = hidden.into();
+                assert!(!palette.rank(&items).contains(&row));
+            }
+        }
+    }
+
+    #[test]
+    fn attached_herdr_palette_without_metadata_uses_the_binding() {
+        let mut app = herdr_lifecycle_app();
+        app.config.ui.icons.herdr.glyph = Some("✦".into());
+        let id = bind_herdr_fixture(&mut app, herdr::Side::Native, "term-unseen");
+        let items = app.palette_items();
+        let row = items
+            .iter()
+            .position(|item| item.action == PaletteAction::ActivateSession(id))
+            .unwrap();
+        let item = &items[row];
+        assert!(item.subtitle.as_deref().unwrap().starts_with("✦"));
+        assert_eq!(item.secondary, "session");
+        let hover = item.hover.as_deref().unwrap();
+        assert!(hover.contains("Terminal: term-unseen"));
+        assert!(hover.contains("herdr, shared view."));
+        assert!(!hover.contains("Pane:"));
+        assert!(!hover.contains("Status:"));
+        let mut palette = CommandPalette::new();
+        *palette.query_mut() = "herdr".into();
+        assert!(palette.rank(&items).contains(&row));
+    }
+
+    #[test]
     fn herdr_inventory_removes_only_the_closed_terminal_through_session_cleanup() {
         let mut app = herdr_lifecycle_app();
         let side = herdr::Side::Native;
@@ -12015,6 +12202,7 @@ mod tests {
 
         assert_eq!(app.sessions.iter().map(|session| session.id).collect::<Vec<_>>(), [shell]);
         assert_eq!(app.active_session.get(&None), Some(&shell));
+        assert!(app.herdr_endpoints.caches()[0].attachment_pane("term-gone").is_none());
     }
 
     #[test]
@@ -14023,74 +14211,43 @@ mod tests {
             false,
         );
         assert_eq!(item.primary, "Home");
+        assert_eq!(item.secondary, "claude · idle");
     }
 
     #[test]
     fn configured_workspace_labels_and_herdr_icons_reach_palette_items() {
+        let workspace = Some(PathBuf::from("/repo/feature"));
+        let mut app = herdr_lifecycle_app();
         let mut project = project_with("/repo", &["/repo/feature"]);
         project.label = Some("renamed".into());
         project.worktrees[1].name = "feature".into();
-        let workspace = Some(PathBuf::from("/repo/feature"));
-        let label = workspace_label_for(&[project], &workspace);
-        assert_eq!(label, "renamed / feature");
+        app.projects.push(project);
+        app.config.ui.icons.herdr.glyph = Some("✦".into());
+        let side = herdr::Side::Native;
+        adopt_herdr_fixture(
+            &mut app,
+            side.clone(),
+            r#"{"result":{"panes":[
+            {"terminal_id":"configured-term","pane_id":"w1:p1","agent":"claude","agent_status":"idle","terminal_title_stripped":"claude"}
+        ]}}"#,
+            Instant::now(),
+        );
+        let id = bind_herdr_fixture(&mut app, side, "configured-term");
+        app.sessions[0].working_directory = workspace;
+        let items = app.palette_items();
+        let item =
+            items.iter().find(|item| item.action == PaletteAction::ActivateSession(id)).unwrap();
+        assert_eq!(item.section, command_palette::PaletteSection::OpenSessions);
+        assert_eq!(
+            (item.primary.as_str(), item.subtitle.as_deref()),
+            ("renamed / feature", Some("✦"))
+        );
 
-        let agent = titled(Some("claude"), Some("claude"));
-        let mut config = Config::default();
-        config.ui.icons.herdr.glyph = Some("✦".into());
-        let configured = herdr_palette_content(
-            herdr_display_name(&agent).text,
-            &agent,
-            agent.title.is_some(),
-            Some(&label),
-            config.ui.icons.herdr.or_glyph(DEFAULT_HERDR_ICON.as_str()),
-            PathStyle::Fish,
-            None,
-            true,
-        );
-        let item = PaletteItem::herdr_agent(
-            command_palette::HerdrAttach {
-                key: herdr::HerdrKey {
-                    side: herdr::Side::Native,
-                    terminal_id: agent.terminal_id.clone(),
-                },
-                pane_id: agent.pane_id.clone(),
-                workspace: workspace.clone(),
-            },
-            configured.primary,
-            configured.subtitle,
-            configured.secondary,
-            "hover".into(),
-            agent.kind.as_deref(),
-        );
-        assert_eq!((item.primary, item.subtitle.as_deref()), (label, Some("✦")));
-
-        config.ui.icons.herdr.glyph = Some("  ".into());
-        let fallback = herdr_palette_content(
-            herdr_display_name(&agent).text,
-            &agent,
-            agent.title.is_some(),
-            Some("renamed / feature"),
-            config.ui.icons.herdr.or_glyph(DEFAULT_HERDR_ICON.as_str()),
-            PathStyle::Fish,
-            None,
-            true,
-        );
-        let fallback_item = PaletteItem::herdr_agent(
-            command_palette::HerdrAttach {
-                key: herdr::HerdrKey {
-                    side: herdr::Side::Native,
-                    terminal_id: agent.terminal_id.clone(),
-                },
-                pane_id: agent.pane_id.clone(),
-                workspace,
-            },
-            fallback.primary,
-            fallback.subtitle,
-            fallback.secondary,
-            "hover".into(),
-            agent.kind.as_deref(),
-        );
-        assert_eq!(fallback_item.subtitle.as_deref(), Some(DEFAULT_HERDR_ICON.as_str()));
+        app.config.ui.icons.herdr.glyph = Some("  ".into());
+        let items = app.palette_items();
+        let item =
+            items.iter().find(|item| item.action == PaletteAction::ActivateSession(id)).unwrap();
+        assert_eq!(item.subtitle.as_deref(), Some(DEFAULT_HERDR_ICON.as_str()));
     }
 
     #[test]
