@@ -2826,16 +2826,7 @@ impl AlacritreeApp {
                         sidebar_nav::WorkspaceEntry::Agent(side, terminal_id) => self
                             .find_herdr_agent(side, terminal_id)
                             .map(|a| {
-                                // Mirrors `HerdrRowData::from_agent`'s fallback:
-                                // title, then kind, then the terminal id's tail.
-                                let name = herdr_row_name(a)
-                                    .map(|n| n.text)
-                                    .or_else(|| a.kind.clone())
-                                    .unwrap_or_else(|| {
-                                        let id = &a.terminal_id;
-                                        let skip = id.chars().count().saturating_sub(6);
-                                        id.chars().skip(skip).collect()
-                                    });
+                                let name = herdr_display_name(a).text;
                                 match &a.kind {
                                     Some(kind) if *kind != name => format!("{name} {kind}"),
                                     _ => name,
@@ -7414,16 +7405,7 @@ impl HerdrRowData {
         settings: &herdr::Settings,
         attach: AttachMode,
     ) -> Self {
-        // A listed row has nothing better than the terminal id's tail behind
-        // the kind, so the kind takes the name rather than standing in front
-        // of six characters nobody reads.
-        let name = herdr_row_name(agent).unwrap_or_else(|| {
-            RowName::plain(agent.kind.clone().unwrap_or_else(|| {
-                let id = &agent.terminal_id;
-                let skip = id.chars().count().saturating_sub(6);
-                id.chars().skip(skip).collect()
-            }))
-        });
+        let name = herdr_display_name(agent);
         Self {
             side: side.clone(),
             terminal_id: agent.terminal_id.clone(),
@@ -7458,6 +7440,22 @@ fn herdr_row_name(agent: &herdr::Agent) -> Option<RowName> {
     let title = agent.title.clone()?;
     let context = agent.kind.clone().filter(|kind| *kind != title);
     Some(RowName { text: title, context })
+}
+
+/// The sidebar row, the palette row and the text filter must all resolve an
+/// agent's name the same way, or the filter stops matching what the other two
+/// paint.  Falls back from herdr's title, to the agent's kind, to the last
+/// six characters of its terminal id — a listed row has nothing better than
+/// the terminal id's tail behind the kind, so the kind takes the name rather
+/// than standing in front of six characters nobody reads.
+fn herdr_display_name(agent: &herdr::Agent) -> RowName {
+    herdr_row_name(agent).unwrap_or_else(|| {
+        RowName::plain(agent.kind.clone().unwrap_or_else(|| {
+            let id = &agent.terminal_id;
+            let skip = id.chars().count().saturating_sub(6);
+            id.chars().skip(skip).collect()
+        }))
+    })
 }
 
 impl Managed {
@@ -9646,16 +9644,7 @@ impl AlacritreeApp {
             items.push(PaletteItem::session(session.id, name.text, secondary));
         }
         for (ws, side, agent) in self.herdr_agent_listing() {
-            // A listed row has nothing better than the terminal id's tail behind
-            // the kind, so the kind takes the name rather than standing in front
-            // of six characters nobody reads.
-            let name = herdr_row_name(agent).unwrap_or_else(|| {
-                RowName::plain(agent.kind.clone().unwrap_or_else(|| {
-                    let id = &agent.terminal_id;
-                    let skip = id.chars().count().saturating_sub(6);
-                    id.chars().skip(skip).collect()
-                }))
-            });
+            let name = herdr_display_name(agent);
             let secondary =
                 self.herdr_palette_secondary(side, agent.status, name.context.as_deref(), &ws);
             items.push(PaletteItem::herdr_agent(
@@ -12316,6 +12305,46 @@ mod tests {
             AttachMode::Agent,
         );
         assert_eq!(row.name, RowName::plain("t1".into()));
+    }
+
+    /// The sidebar, the palette and the filter all call `herdr_display_name`
+    /// rather than resolving a title themselves, so pinning its output here
+    /// pins what all three show.
+    #[test]
+    fn herdr_display_name_prefers_the_title() {
+        let agent = titled(Some("claude"), Some("primary"));
+        assert_eq!(herdr_display_name(&agent), RowName {
+            text: "primary".into(),
+            context: Some("claude".into())
+        });
+    }
+
+    #[test]
+    fn herdr_display_name_falls_back_to_the_kind_without_a_title() {
+        assert_eq!(
+            herdr_display_name(&herdr_agent(Some("claude"))),
+            RowName::plain("claude".into())
+        );
+    }
+
+    #[test]
+    fn herdr_display_name_falls_back_to_the_terminal_id_tail_without_a_kind() {
+        assert_eq!(herdr_display_name(&herdr_agent(None)), RowName::plain("300361".into()));
+    }
+
+    #[test]
+    fn herdr_display_name_keeps_a_short_terminal_id_whole() {
+        let agent = herdr::Agent {
+            terminal_id: "t1".into(),
+            pane_id: "w1:p1".into(),
+            kind: None,
+            title: None,
+            status: herdr::Status::Idle,
+            focused: false,
+            cwd: None,
+            foreground_cwd: None,
+        };
+        assert_eq!(herdr_display_name(&agent), RowName::plain("t1".into()));
     }
 
     /// On Linux and WSL an attach is full passthrough, so the pane the user
