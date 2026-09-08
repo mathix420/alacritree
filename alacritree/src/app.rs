@@ -439,10 +439,9 @@ fn worktree_pr_passes(any_pr: bool, pr_matches: &HashMap<PathBuf, bool>, path: &
 }
 
 /// Whether `current_project_rows` resolves session and herdr-agent names for
-/// `child_matches` this frame. `[ui] search_depth` at its "workspaces"
-/// default answers false unconditionally, which is what keeps the pre-branch
-/// cost: no child name is ever computed, matching a query that could never
-/// reach one before session/agent matching existed.
+/// `child_matches` this frame.  `[ui] search_depth` at its "workspaces"
+/// default answers false unconditionally, so no child name is ever computed
+/// and a query costs what matching workspace names alone costs.
 fn search_reaches_children(depth: SearchDepth, query_is_empty: bool) -> bool {
     depth == SearchDepth::Sessions && !query_is_empty
 }
@@ -11216,19 +11215,19 @@ mod tests {
         Some(PathBuf::from(p))
     }
 
-    /// The option off restores the pre-branch row set for a query naming a
-    /// session: `child_matches` never gets built, so `current_project_rows`
-    /// feeds `sidebar_nav::filtered_rows` a `None` child predicate exactly as
-    /// it did before session/agent name matching existed, whatever the query.
+    /// The "workspaces" depth never reaches a child, whatever the query:
+    /// `child_matches` is not built, so `current_project_rows` feeds
+    /// `sidebar_nav::filtered_rows` a `None` child predicate and a query
+    /// naming a session matches only that session's workspace.
     #[test]
     fn search_reaches_children_stays_false_at_the_workspaces_default() {
         assert!(!search_reaches_children(SearchDepth::Workspaces, false));
         assert!(!search_reaches_children(SearchDepth::Workspaces, true));
     }
 
-    /// The option on keeps the behaviour the branch added: a non-empty query
-    /// still resolves child names, so a session or agent row can match by
-    /// name rather than only through its workspace.
+    /// The "sessions" depth resolves child names for a non-empty query, so a
+    /// session or agent row can match by its own name rather than only
+    /// through its workspace.
     #[test]
     fn search_reaches_children_only_with_sessions_depth_and_a_live_query() {
         assert!(search_reaches_children(SearchDepth::Sessions, false));
