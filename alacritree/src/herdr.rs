@@ -7,6 +7,7 @@
 //! prints success on stdout and errors on stderr, which is why callers
 //! capture both.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -528,6 +529,55 @@ impl Reach {
     }
 }
 
+struct ListingReply {
+    sampled_at: Instant,
+    listing: Listing,
+    agents: Vec<Agent>,
+    inventory: Option<Result<HashSet<String>, PollError>>,
+}
+
+impl ListingReply {
+    fn parse(stdout: &str, listing: Listing, sampled_at: Instant, attached: bool) -> Self {
+        Self {
+            sampled_at,
+            listing,
+            agents: listing.parse(stdout),
+            inventory: (attached && listing == Listing::Panes)
+                .then(|| parse_pane_inventory(stdout)),
+        }
+    }
+}
+
+/// Full terminal membership from one successful pane-list request.
+pub struct PaneInventory {
+    pub sampled_at: Instant,
+    pub terminal_ids: HashSet<String>,
+}
+
+fn parse_pane_inventory(stdout: &str) -> Result<HashSet<String>, PollError> {
+    let malformed = || PollError::Absent("invalid_pane_inventory");
+    let envelope: serde_json::Value = serde_json::from_str(stdout).map_err(|_| malformed())?;
+    let envelope = envelope.as_object().ok_or_else(malformed)?;
+    if envelope.contains_key("error") {
+        return Err(malformed());
+    }
+    let panes = envelope
+        .get("result")
+        .and_then(|result| result.get("panes"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(malformed)?;
+    panes
+        .iter()
+        .map(|pane| {
+            pane.get("terminal_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or_else(malformed)
+        })
+        .collect()
+}
+
 /// One herdr server's agents, refreshed off the UI thread.
 pub struct EndpointCache {
     side: Side,
@@ -536,7 +586,8 @@ pub struct EndpointCache {
     reach: Reach,
     last_attempt: Option<Instant>,
     sampled_at: Option<Instant>,
-    pending: Option<jobs::Job<Result<Vec<Agent>, PollError>>>,
+    inventory: Option<PaneInventory>,
+    pending: Option<jobs::Job<Result<ListingReply, PollError>>>,
     settings: Read<Settings>,
     session_name: Read<String>,
 }
@@ -550,6 +601,7 @@ impl EndpointCache {
             reach: Reach::default(),
             last_attempt: None,
             sampled_at: None,
+            inventory: None,
             pending: None,
             settings: Read::Unread,
             session_name: Read::Unread,
@@ -576,8 +628,65 @@ impl EndpointCache {
         self.sampled_at
     }
 
+    pub fn inventory(&self) -> Option<&PaneInventory> {
+        self.inventory.as_ref()
+    }
+
     #[cfg(test)]
     pub fn set_agents_for_test(&mut self, agents: Vec<Agent>) {
+        self.agents = agents;
+    }
+
+    #[cfg(test)]
+    pub fn complete_listing_for_test(
+        &mut self,
+        result: Result<&str, PollError>,
+        listing: Listing,
+        display: Listing,
+        sampled_at: Instant,
+    ) {
+        self.settings = Read::Done(Settings::default());
+        self.session_name = Read::Done("fixture".into());
+        self.last_attempt = Some(Instant::now());
+        self.pending = Some(jobs::Job::ready(
+            result.map(|stdout| ListingReply::parse(stdout, listing, sampled_at, true)),
+        ));
+        self.poll(Duration::from_secs(60), display, true);
+    }
+
+    fn adopt_reply(&mut self, reply: ListingReply, display: Listing, attached: bool) {
+        let mut agents = reply.agents;
+        if display == Listing::Agents && reply.listing == Listing::Panes {
+            agents.retain(|agent| agent.status.is_some());
+        }
+        self.sampled_at = Some(reply.sampled_at);
+        if let Some(inventory) = reply.inventory.filter(|_| attached) {
+            match inventory {
+                Ok(terminal_ids) => {
+                    self.reach.record_success();
+                    if self.inventory.as_ref().is_none_or(|old| old.terminal_ids != terminal_ids) {
+                        log::debug!(
+                            "herdr inventory side={:?} sampled_at={:?} terminal_ids={:?}",
+                            self.side,
+                            reply.sampled_at,
+                            terminal_ids
+                        );
+                    }
+                    self.inventory =
+                        Some(PaneInventory { sampled_at: reply.sampled_at, terminal_ids });
+                },
+                Err(error) => {
+                    self.sampled_at = None;
+                    self.note_failure(&error);
+                },
+            }
+        } else {
+            self.reach.record_success();
+            self.inventory = None;
+        }
+        if rendered_differs(&self.agents, &agents) {
+            self.generation = self.generation.wrapping_add(1);
+        }
         self.agents = agents;
     }
 
@@ -660,20 +769,15 @@ impl EndpointCache {
     }
 
     /// Adopts a landed result and starts a new poll when due.  Never blocks.
-    pub fn poll(&mut self, interval: Duration, listing: Listing) {
+    pub fn poll(&mut self, interval: Duration, listing: Listing, attached: bool) {
         self.advance_settings();
         self.advance_session_name();
         if let Some(job) = &self.pending {
             match job.poll() {
-                Some(Ok(agents)) => {
-                    self.sampled_at = self.last_attempt;
-                    self.reach.record_success();
+                Some(Ok(reply)) => {
+                    self.adopt_reply(reply, listing, attached);
                     self.start_settings_read();
                     self.start_session_name_read();
-                    if rendered_differs(&self.agents, &agents) {
-                        self.generation = self.generation.wrapping_add(1);
-                    }
-                    self.agents = agents;
                     self.pending = None;
                 },
                 Some(Err(error)) => {
@@ -688,10 +792,10 @@ impl EndpointCache {
                     }
                     self.pending = None;
                 },
-                // A closure that unwound answered nothing, which is what
-                // `Reach` tracks, and recording it is what stops a panicking
-                // poll from being respawned every tick for the process life.
+                // A worker panic supplies no membership evidence. Attached
+                // sessions still need retries on the configured cadence.
                 None if job.failed() => {
+                    self.sampled_at = None;
                     self.note_failure(&PollError::Absent("poll_panicked"));
                     self.pending = None;
                 },
@@ -699,15 +803,23 @@ impl EndpointCache {
             }
         }
 
-        let since = self.last_attempt.map_or(interval, |t| t.elapsed());
-        if since < interval || !self.reach.should_retry(since) {
+        if !attached {
+            self.inventory = None;
+        }
+        if !self.poll_due(interval, attached) {
             return;
         }
         self.last_attempt = Some(Instant::now());
         let side = self.side.clone();
+        let listing = if attached { Listing::Panes } else { listing };
         self.pending = Some(jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
-            list_panes(&side, listing, blocking)
+            list_panes(&side, listing, attached, blocking)
         }));
+    }
+
+    fn poll_due(&self, interval: Duration, attached: bool) -> bool {
+        let since = self.last_attempt.map_or(interval, |t| t.elapsed());
+        since >= interval && (attached || self.reach.should_retry(since))
     }
 
     /// Records one poll that produced no agents, and says so once.  A novel
@@ -717,12 +829,17 @@ impl EndpointCache {
     /// sidebar.  A code that repeats is logged the first time only, so an
     /// endpoint retried for the whole session still costs one line.
     fn note_failure(&mut self, error: &PollError) {
+        self.inventory = None;
         let code = error.code();
-        if self.reach.record_failure(error) && code != "server_not_running" {
+        let novel = self.reach.record_failure(error);
+        if novel && code != "server_not_running" {
             log::warn!("herdr ({:?}): {code}", self.side);
         }
-        if self.reach.abandoned() {
-            log::debug!("herdr ({:?}): {code}; not polling this endpoint again", self.side);
+        if novel && self.reach.abandoned() {
+            log::debug!(
+                "herdr ({:?}): {code}; only attached sessions will retry this endpoint",
+                self.side
+            );
         }
     }
 }
@@ -766,6 +883,11 @@ impl Default for Endpoints {
 }
 
 impl Endpoints {
+    #[cfg(test)]
+    pub fn caches_mut_for_test(&mut self) -> &mut Vec<EndpointCache> {
+        &mut self.caches
+    }
+
     pub fn caches(&self) -> &[EndpointCache] {
         &self.caches
     }
@@ -783,10 +905,11 @@ impl Endpoints {
     }
 
     /// Refreshes the endpoint set and each endpoint's agents.  Never blocks.
-    pub fn poll(&mut self, interval: Duration, listing: Listing) {
+    pub fn poll(&mut self, interval: Duration, listing: Listing, attached: impl Fn(&Side) -> bool) {
         self.refresh_running();
         for cache in &mut self.caches {
-            cache.poll(interval, listing);
+            let has_attachments = attached(cache.side());
+            cache.poll(interval, listing, has_attachments);
         }
     }
 
@@ -799,7 +922,10 @@ impl Endpoints {
                     self.adopt_listing(listing);
                     self.running = None;
                 },
-                None if job.failed() => self.running = None,
+                None if job.failed() => {
+                    self.adopt_listing(None);
+                    self.running = None;
+                },
                 None => return,
             }
         }
@@ -828,6 +954,11 @@ impl Endpoints {
                 self.adopt_running(&running);
             },
             None => {
+                for cache in &mut self.caches {
+                    if matches!(cache.side, Side::Wsl(_)) {
+                        cache.inventory = None;
+                    }
+                }
                 if !self.listing_failed {
                     log::debug!("herdr: listing running distros failed; keeping the endpoints");
                     self.listing_failed = true;
@@ -888,9 +1019,11 @@ fn rendered_differs(was: &[Agent], now: &[Agent]) -> bool {
 fn list_panes(
     side: &Side,
     listing: Listing,
+    attached: bool,
     _blocking: &jobs::Blocking,
-) -> Result<Vec<Agent>, PollError> {
+) -> Result<ListingReply, PollError> {
     let (program, args) = side.command(&listing.args());
+    let sampled_at = Instant::now();
     let output = command_ext::hidden(program)
         .args(args)
         .env("WSL_UTF8", "1")
@@ -906,7 +1039,7 @@ fn list_panes(
             None => PollError::Absent("herdr_unavailable"),
         });
     }
-    Ok(listing.parse(&String::from_utf8_lossy(&output.stdout)))
+    Ok(ListingReply::parse(&String::from_utf8_lossy(&output.stdout), listing, sampled_at, attached))
 }
 
 /// herdr's own defaults.  A config that binds neither still detaches on
@@ -1089,6 +1222,138 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inventory_adoption_keeps_the_request_timestamp_when_display_changes_in_flight() {
+        let mut cache = EndpointCache::new(Side::Native);
+        let started = Instant::now() - Duration::from_secs(1);
+        cache.complete_listing_for_test(
+            Ok(r#"{"result":{"panes":[
+            {"terminal_id":"shell","pane_id":"w1:p1"},
+            {"terminal_id":"agent","pane_id":"w1:p2","agent":"codex","agent_status":"idle"}
+        ]}}"#),
+            Listing::Panes,
+            Listing::Agents,
+            started,
+        );
+
+        assert_eq!(cache.inventory().unwrap().sampled_at, started);
+        assert_eq!(cache.inventory().unwrap().terminal_ids.len(), 2);
+        assert_eq!(cache.agents()[0].terminal_id, "agent");
+        assert_eq!(cache.agents().len(), 1);
+
+        cache.complete_listing_for_test(
+            Ok(r#"{"result":{"agents":[]}}"#),
+            Listing::Agents,
+            Listing::Panes,
+            started,
+        );
+        assert!(cache.inventory().is_none());
+    }
+
+    #[test]
+    fn attached_inventory_retries_failed_and_malformed_polls_at_the_configured_interval() {
+        let interval = Duration::from_secs(2);
+        for result in [
+            Err(PollError::Absent("spawn_failed")),
+            Err(PollError::Server("server_not_running".into())),
+            Ok("invalid json"),
+        ] {
+            let mut cache = EndpointCache::new(Side::Native);
+            cache.complete_listing_for_test(
+                result,
+                Listing::Panes,
+                Listing::Agents,
+                Instant::now(),
+            );
+            assert!(cache.inventory().is_none());
+            assert!(!cache.poll_due(interval, true));
+            cache.last_attempt = Some(Instant::now() - interval);
+            assert!(cache.poll_due(interval, true));
+            assert!(!cache.poll_due(interval, false));
+        }
+    }
+
+    #[test]
+    fn failed_inventory_jobs_invalidate_success_and_keep_attached_retries_alive() {
+        let mut cache = EndpointCache::new(Side::Native);
+        cache.complete_listing_for_test(
+            Ok(r#"{"result":{"panes":[]}}"#),
+            Listing::Panes,
+            Listing::Panes,
+            Instant::now(),
+        );
+        assert!(cache.inventory().is_some());
+        cache.pending = Some(jobs::Job::panicked());
+
+        cache.poll(Duration::from_secs(60), Listing::Panes, true);
+
+        assert!(cache.inventory().is_none());
+        assert!(cache.sampled_at().is_none());
+        assert!(cache.pending.is_none());
+        cache.last_attempt = Some(Instant::now() - Duration::from_secs(2));
+        assert!(cache.poll_due(Duration::from_secs(2), true));
+    }
+
+    #[test]
+    fn inventory_unchanged_frames_do_not_request_immediate_polls() {
+        let mut cache = EndpointCache::new(Side::Native);
+        let started = Instant::now();
+        cache.complete_listing_for_test(
+            Ok(r#"{"result":{"panes":[]}}"#),
+            Listing::Panes,
+            Listing::Panes,
+            started,
+        );
+        for _ in 0..20 {
+            cache.poll(Duration::from_secs(60), Listing::Panes, true);
+            assert!(cache.pending.is_none());
+            assert_eq!(cache.inventory().unwrap().sampled_at, started);
+        }
+        cache.poll(Duration::from_secs(60), Listing::Panes, false);
+        assert!(cache.inventory().is_none());
+        assert!(cache.pending.is_none());
+    }
+
+    #[test]
+    fn pane_display_without_attachments_does_not_build_an_inventory() {
+        let mut cache = EndpointCache::new(Side::Native);
+        cache.settings = Read::Done(Settings::default());
+        cache.session_name = Read::Done("fixture".into());
+        cache.last_attempt = Some(Instant::now());
+        cache.pending = Some(jobs::Job::ready(Ok(ListingReply::parse(
+            r#"{"result":{"panes":[{"terminal_id":"shell","pane_id":"w1:p1"}]}}"#,
+            Listing::Panes,
+            Instant::now(),
+            false,
+        ))));
+
+        cache.poll(Duration::from_secs(60), Listing::Panes, false);
+
+        assert!(cache.inventory().is_none());
+        assert_eq!(cache.agents()[0].terminal_id, "shell");
+    }
+
+    #[test]
+    fn failed_distro_listing_invalidates_only_wsl_inventory_evidence() {
+        let mut endpoints = Endpoints::default();
+        endpoints.adopt_running(&["ubuntu".into()]);
+        for cache in &mut endpoints.caches {
+            cache.complete_listing_for_test(
+                Ok(r#"{"result":{"panes":[]}}"#),
+                Listing::Panes,
+                Listing::Panes,
+                Instant::now(),
+            );
+        }
+
+        endpoints.adopt_listing(None);
+
+        assert!(endpoints.caches[0].inventory().is_some());
+        assert!(endpoints.caches[1].inventory().is_none());
+        endpoints.adopt_running(&[]);
+        assert_eq!(endpoints.caches.len(), 1);
+    }
+
+    #[test]
     fn unchanged_listings_advance_freshness_without_rebuilding_rows() {
         let mut cache = EndpointCache::new(Side::Native);
         cache.settings = Read::Done(Settings::default());
@@ -1098,16 +1363,17 @@ mod tests {
         let mut first_generation = None;
         for started in [first, second] {
             cache.last_attempt = Some(started);
-            cache.pending = Some(jobs::pool().spawn(jobs::Priority::Background, |_| {
-                Ok(Listing::Panes.parse(
-                    r#"{"result":{"panes":[
+            cache.pending = Some(jobs::Job::ready(Ok(ListingReply::parse(
+                r#"{"result":{"panes":[
                         {"terminal_id":"t2","pane_id":"w2:p1","tab_id":"w2:t1","focused":true}
                     ]}}"#,
-                ))
-            }));
+                Listing::Panes,
+                started,
+                true,
+            ))));
             let deadline = Instant::now() + Duration::from_secs(2);
             while cache.pending.is_some() {
-                cache.poll(Duration::from_secs(60), Listing::Panes);
+                cache.poll(Duration::from_secs(60), Listing::Panes, true);
                 assert!(Instant::now() < deadline, "listing job did not settle");
                 std::thread::yield_now();
             }

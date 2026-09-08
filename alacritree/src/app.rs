@@ -953,6 +953,109 @@ fn workspace_label_for(projects: &[Project], ws: &WorkspaceKey) -> String {
 }
 
 impl AlacritreeApp {
+    fn from_parts(
+        config: Config,
+        persisted: state::PersistedState,
+        projects: Vec<Project>,
+        font_chain: Vec<crate::fonts::ChainFace>,
+        face_metrics: crate::fonts::FaceMetrics,
+        notify_rx: Receiver<SessionId>,
+        ipc: (Option<ipc::SocketHandle>, Option<Receiver<ipc::AppCall>>),
+    ) -> Self {
+        let theme = Theme::from_config(&config);
+        let color_glyph_budget_mb = config.font.color_glyph_cache_mb;
+        let (ipc_socket, ipc_rx) = ipc;
+        let row_labels = crate::row_label::LabelTemplates::new(
+            config.ui.worktree_name.clone(),
+            config.ui.project_name.clone(),
+        );
+
+        Self {
+            show_left_sidebar: persisted.show_left_sidebar,
+            show_right_sidebar: persisted.show_right_sidebar,
+            focus: PaneFocus::Terminal,
+            session_rows_always: config.ui.session_display.sidebar_always,
+            session_tabs_always: config.ui.session_display.tabs_always,
+            session_drag: config.ui.session_reorder.drag,
+            sessions_filter_counts_detached: config.ui.sessions_filter_counts_detached,
+            sidebar_cursor: None,
+            reorder_mode: false,
+            sidebar_auto_shown: false,
+            sidebar_cursor_moved: false,
+            last_followed: (None, None),
+            project_filter: PanelFilter::new(project_filter_toggles(config.ui.pr_status)),
+            git_filter: PanelFilter::new(GIT_FILTER_TOGGLES),
+            search_scope: config.ui.search_scope,
+            search_depth: config.ui.search_depth,
+            git_cursor: None,
+            git_cursor_moved: false,
+            git_rows: Vec::new(),
+            git_branch_base: None,
+            git_sidebar_auto_shown: false,
+            palette: CommandPalette::new(),
+            sessions: Vec::new(),
+            current_workspace: None,
+            active_session: HashMap::new(),
+            projects,
+            git_status: HashMap::new(),
+            base_branch_overrides: persisted
+                .base_branches
+                .iter()
+                .map(|b| (b.worktree.clone(), b.branch.clone()))
+                .collect(),
+            pr_cache: PrCache::new(),
+            row_labels,
+            config,
+            theme,
+            error_dialog: None,
+            quit_dialog_open: false,
+            pending_delete: None,
+            pending_deletes: Vec::new(),
+            pending_create: None,
+            pending_creates: Vec::new(),
+            pending_rename: None,
+            pending_base_branch: None,
+            pending_project_remove: None,
+            doppler_synced: HashSet::new(),
+            detached_jobs: Vec::new(),
+            pending_session_close: None,
+            notify_rx,
+            ipc_rx,
+            _ipc_socket: ipc_socket,
+            builtin_glyphs: crate::builtin_font::BuiltinGlyphCache::new(),
+            ime: crate::ime::Ime::default(),
+            color_glyphs: crate::color_glyph::ColorGlyphCache::new(
+                font_chain,
+                color_glyph_budget_mb,
+            ),
+            face_metrics,
+            glyph_cache: crate::glyph_cache::GlyphCache::new(),
+            grid_snapshot: crate::terminal_view::GridSnapshot::new(),
+            gpu_grid: crate::grid_gl::GpuGrid::new(),
+            frame_log: crate::frame_log::FrameLog::start(),
+            phases: crate::frame_log::Phases::new(),
+            grid_paint: std::time::Duration::ZERO,
+            last_pane_geometry: None,
+            project_refreshes: Default::default(),
+            project_refresh_jobs: HashMap::new(),
+            pending_spawns: Default::default(),
+            pending_herdr_attach: Vec::new(),
+            herdr_focused_view: HerdrViewSync::default(),
+            herdr_view_focus: None,
+            wsl_delta_paths: HashMap::new(),
+            pending_delta: HashMap::new(),
+            liveness: Default::default(),
+            liveness_probe: None,
+            last_input: Instant::now(),
+            sidebar_rows_cache: None,
+            sidebar_focus_prev: None,
+            sidebar_anchor: None,
+            sidebar_focus_written: None,
+            sidebar_deferred_close: None,
+            herdr_endpoints: herdr::Endpoints::default(),
+        }
+    }
+
     pub fn new(cc: &CreationContext<'_>, config: Config) -> Self {
         // A job's own closure cannot wake the loop when it unwinds, and the
         // failure it reports is only ever read from a frame.
@@ -963,7 +1066,6 @@ impl AlacritreeApp {
 
         let (font_chain, face_metrics) =
             crate::fonts::install_terminal_fonts(&cc.egui_ctx, &config.font, &config.ui_font);
-        let color_glyph_budget_mb = config.font.color_glyph_cache_mb;
 
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = theme.terminal_bg;
@@ -1068,96 +1170,16 @@ impl AlacritreeApp {
         // ever spawn one app per process, ignoring the error is fine.
         let _ = NOTIFY_TX.set(Mutex::new(notify_tx));
 
-        let row_labels = crate::row_label::LabelTemplates::new(
-            config.ui.worktree_name.clone(),
-            config.ui.project_name.clone(),
-        );
-
         let pr_status_concurrency = config.ui.pr_status_concurrency;
-        let mut app = Self {
-            show_left_sidebar: persisted.show_left_sidebar,
-            show_right_sidebar: persisted.show_right_sidebar,
-            focus: PaneFocus::Terminal,
-            session_rows_always: config.ui.session_display.sidebar_always,
-            session_tabs_always: config.ui.session_display.tabs_always,
-            session_drag: config.ui.session_reorder.drag,
-            sessions_filter_counts_detached: config.ui.sessions_filter_counts_detached,
-            sidebar_cursor: None,
-            reorder_mode: false,
-            sidebar_auto_shown: false,
-            sidebar_cursor_moved: false,
-            last_followed: (None, None),
-            project_filter: PanelFilter::new(project_filter_toggles(config.ui.pr_status)),
-            git_filter: PanelFilter::new(GIT_FILTER_TOGGLES),
-            search_scope: config.ui.search_scope,
-            search_depth: config.ui.search_depth,
-            git_cursor: None,
-            git_cursor_moved: false,
-            git_rows: Vec::new(),
-            git_branch_base: None,
-            git_sidebar_auto_shown: false,
-            palette: CommandPalette::new(),
-            sessions: Vec::new(),
-            current_workspace: None,
-            active_session: HashMap::new(),
-            projects,
-            git_status: HashMap::new(),
-            base_branch_overrides: persisted
-                .base_branches
-                .iter()
-                .map(|b| (b.worktree.clone(), b.branch.clone()))
-                .collect(),
-            pr_cache: PrCache::new(),
-            row_labels,
+        let mut app = Self::from_parts(
             config,
-            theme,
-            error_dialog: None,
-            quit_dialog_open: false,
-            pending_delete: None,
-            pending_deletes: Vec::new(),
-            pending_create: None,
-            pending_creates: Vec::new(),
-            pending_rename: None,
-            pending_base_branch: None,
-            pending_project_remove: None,
-            doppler_synced: HashSet::new(),
-            detached_jobs: Vec::new(),
-            pending_session_close: None,
-            notify_rx,
-            ipc_rx,
-            _ipc_socket: ipc_socket,
-            builtin_glyphs: crate::builtin_font::BuiltinGlyphCache::new(),
-            ime: crate::ime::Ime::default(),
-            color_glyphs: crate::color_glyph::ColorGlyphCache::new(
-                font_chain,
-                color_glyph_budget_mb,
-            ),
+            persisted,
+            projects,
+            font_chain,
             face_metrics,
-            glyph_cache: crate::glyph_cache::GlyphCache::new(),
-            grid_snapshot: crate::terminal_view::GridSnapshot::new(),
-            gpu_grid: crate::grid_gl::GpuGrid::new(),
-            frame_log: crate::frame_log::FrameLog::start(),
-            phases: crate::frame_log::Phases::new(),
-            grid_paint: std::time::Duration::ZERO,
-            last_pane_geometry: None,
-            project_refreshes: Default::default(),
-            project_refresh_jobs: HashMap::new(),
-            pending_spawns: Default::default(),
-            pending_herdr_attach: Vec::new(),
-            herdr_focused_view: HerdrViewSync::default(),
-            herdr_view_focus: None,
-            wsl_delta_paths: HashMap::new(),
-            pending_delta: HashMap::new(),
-            liveness: Default::default(),
-            liveness_probe: None,
-            last_input: Instant::now(),
-            sidebar_rows_cache: None,
-            sidebar_focus_prev: None,
-            sidebar_anchor: None,
-            sidebar_focus_written: None,
-            sidebar_deferred_close: None,
-            herdr_endpoints: herdr::Endpoints::default(),
-        };
+            notify_rx,
+            (ipc_socket, ipc_rx),
+        );
 
         app.pr_cache.set_concurrency(pr_status_concurrency);
 
@@ -1650,7 +1672,7 @@ impl AlacritreeApp {
         match self.spawn_session_with_shell(ctx, workspace, Some(shell), None) {
             Ok(id) => {
                 if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
-                    session.herdr_key = Some(key);
+                    session.bind_herdr(key);
                 }
                 if shared_view {
                     self.herdr_focused_view.attached(id, Instant::now());
@@ -1692,6 +1714,10 @@ impl AlacritreeApp {
             self.herdr_view_focus.is_some() || !self.pending_herdr_attach.is_empty(),
         );
         if let Some(pending) = self.herdr_view_focus.take() {
+            if !self.sessions.iter().any(|session| session.id == pending.session) {
+                ctx.request_repaint();
+                return;
+            }
             match pending.job.poll() {
                 Some(result) => {
                     let succeeded = result.is_ok();
@@ -1725,6 +1751,42 @@ impl AlacritreeApp {
             },
             Some(HerdrViewAction::Follow(key)) => self.follow_herdr_view(ctx, key),
             None => {},
+        }
+    }
+
+    fn reconcile_herdr_sessions(&mut self, ctx: &Context) {
+        if !self.config.integrations.herdr.enabled {
+            return;
+        }
+        let mut index = 0;
+        while index < self.sessions.len() {
+            let session = &self.sessions[index];
+            let evidence = session.herdr_key.as_ref().zip(session.herdr_bound_at).and_then(
+                |(key, bound_at)| {
+                    self.herdr_endpoints
+                        .caches()
+                        .iter()
+                        .find(|cache| cache.side() == &key.side)
+                        .and_then(herdr::EndpointCache::inventory)
+                        .filter(|inventory| {
+                            inventory.sampled_at > bound_at
+                                && !inventory.terminal_ids.contains(&key.terminal_id)
+                        })
+                        .map(|inventory| (key, bound_at, inventory.sampled_at))
+                },
+            );
+            if let Some((key, bound_at, sampled_at)) = evidence {
+                let id = session.id;
+                log::debug!(
+                    "herdr removal session={id} side={:?} terminal_id={} bound_at={bound_at:?} \
+                     sampled_at={sampled_at:?}",
+                    key.side,
+                    key.terminal_id
+                );
+                self.close_session(ctx, id);
+            } else {
+                index += 1;
+            }
         }
     }
 
@@ -1961,6 +2023,16 @@ impl AlacritreeApp {
             return;
         };
         let workspace = self.sessions[idx].working_directory.clone();
+        if let Some(key) = &self.sessions[idx].herdr_key {
+            self.pending_herdr_attach.retain(|pending| &pending.key != key);
+        }
+        if self.herdr_view_focus.as_ref().is_some_and(|pending| pending.session == id) {
+            self.herdr_view_focus = None;
+        }
+        self.herdr_focused_view.closed(id);
+        if self.pending_session_close == Some(id) {
+            self.pending_session_close = None;
+        }
         let policy = self.config.ui.last_session_close;
         let ring = policy.rings().then(|| self.session_ring()).unwrap_or_default();
         self.sessions.remove(idx);
@@ -9196,6 +9268,16 @@ enum HerdrViewAction {
 }
 
 impl HerdrViewSync {
+    fn closed(&mut self, id: SessionId) {
+        if self.visible == Some(id) {
+            self.visible = None;
+            self.follow_after = None;
+        }
+        if self.focused == Some(id) {
+            self.focused = None;
+        }
+    }
+
     fn attached(&mut self, id: SessionId, at: Instant) {
         self.visible = Some(id);
         self.settled(id, true, at);
@@ -9717,6 +9799,11 @@ impl AlacritreeApp {
         self.herdr_endpoints.poll(
             self.config.integrations.herdr.poll_interval,
             herdr::Listing::wanted(self.config.integrations.herdr.show_panes),
+            |side| {
+                self.sessions
+                    .iter()
+                    .any(|session| session.herdr_key.as_ref().is_some_and(|key| &key.side == side))
+            },
         );
     }
 
@@ -11551,6 +11638,7 @@ impl eframe::App for AlacritreeApp {
         self.poll_pending_deletes(ctx);
         self.poll_pending_creates(ctx);
         self.poll_herdr_endpoints();
+        self.reconcile_herdr_sessions(ctx);
         self.sync_herdr_view_focus(ctx);
         // Poll first, then check `failed`: a panicked job's `poll` returns
         // `None` forever, so `failed` is what stops its handle from sitting
@@ -11849,6 +11937,323 @@ fn notify_worker(body: String, id: SessionId, _ctx: egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn herdr_lifecycle_app() -> AlacritreeApp {
+        let mut config = Config::default();
+        config.integrations.herdr.enabled = true;
+        config.integrations.herdr.show_unmatched = true;
+        let (_, notify_rx) = mpsc::channel();
+        let mut app = AlacritreeApp::from_parts(
+            config,
+            state::PersistedState::default(),
+            Vec::new(),
+            Vec::new(),
+            crate::fonts::FaceMetrics::default(),
+            notify_rx,
+            (None, None),
+        );
+        app.current_workspace = Some(PathBuf::from("unopened-workspace"));
+        app
+    }
+
+    fn bind_herdr_fixture(app: &mut AlacritreeApp, side: herdr::Side, terminal: &str) -> SessionId {
+        let (mut session, _) = Session::pending_shell(
+            Context::default(),
+            &app.config,
+            None,
+            TermSize { columns: 80, screen_lines: 24 },
+            (8.0, 16.0),
+            None,
+            None,
+        );
+        session.bind_herdr(herdr::HerdrKey { side, terminal_id: terminal.into() });
+        let id = session.id;
+        app.sessions.push(session);
+        id
+    }
+
+    fn adopt_herdr_fixture(app: &mut AlacritreeApp, side: herdr::Side, json: &str, at: Instant) {
+        let display = herdr::Listing::wanted(app.config.integrations.herdr.show_panes);
+        let caches = app.herdr_endpoints.caches_mut_for_test();
+        if !caches.iter().any(|cache| cache.side() == &side) {
+            caches.push(herdr::EndpointCache::new(side.clone()));
+        }
+        caches.iter_mut().find(|cache| cache.side() == &side).unwrap().complete_listing_for_test(
+            Ok(json),
+            herdr::Listing::Panes,
+            display,
+            at,
+        );
+    }
+
+    #[test]
+    fn herdr_inventory_removes_only_the_closed_terminal_through_session_cleanup() {
+        let mut app = herdr_lifecycle_app();
+        let side = herdr::Side::Native;
+        adopt_herdr_fixture(
+            &mut app,
+            side.clone(),
+            r#"{"result":{"panes":[
+            {"terminal_id":"term-shell","pane_id":"w1:p1"},
+            {"terminal_id":"term-gone","pane_id":"w1:p2","agent":"claude","agent_status":"working"}
+        ]}}"#,
+            Instant::now(),
+        );
+        let shell = bind_herdr_fixture(&mut app, side.clone(), "term-shell");
+        let gone = bind_herdr_fixture(&mut app, side.clone(), "term-gone");
+        app.active_session.insert(None, gone);
+        adopt_herdr_fixture(
+            &mut app,
+            side,
+            r#"{"result":{"panes":[
+            {"terminal_id":"term-shell","pane_id":"w1:p1"}
+        ]}}"#,
+            Instant::now(),
+        );
+
+        app.reconcile_herdr_sessions(&Context::default());
+
+        assert_eq!(app.sessions.iter().map(|session| session.id).collect::<Vec<_>>(), [shell]);
+        assert_eq!(app.active_session.get(&None), Some(&shell));
+    }
+
+    #[test]
+    fn herdr_inventory_empty_reply_removes_rows_and_cancels_local_focus_bookkeeping() {
+        let mut app = herdr_lifecycle_app();
+        let side = herdr::Side::Native;
+        let gone = bind_herdr_fixture(&mut app, side.clone(), "term-gone");
+        let other = bind_herdr_fixture(&mut app, side.clone(), "term-other");
+        app.active_session.insert(None, gone);
+        app.pending_session_close = Some(gone);
+        app.herdr_focused_view.attached(gone, Instant::now());
+        app.herdr_view_focus =
+            Some(HerdrViewFocus { session: gone, job: jobs::Job::ready(Ok(())) });
+        app.pending_herdr_attach.push(PendingHerdrAttach {
+            key: app.sessions[0].herdr_key.clone().unwrap(),
+            focus: Vec::new(),
+            workspace: None,
+            previous: None,
+            job: Some(jobs::Job::ready(Ok(("herdr".into(), Vec::new())))),
+        });
+        adopt_herdr_fixture(&mut app, side, r#"{"result":{"panes":[]}}"#, Instant::now());
+
+        app.reconcile_herdr_sessions(&Context::default());
+
+        assert!(!app.sessions.iter().any(|session| [gone, other].contains(&session.id)));
+        assert!(!app.active_session.contains_key(&None));
+        assert!(app.pending_session_close.is_none());
+        assert!(app.herdr_view_focus.is_none());
+        assert!(app.herdr_focused_view.visible.is_none());
+        assert!(app.herdr_focused_view.focused.is_none());
+        assert!(app.pending_herdr_attach.is_empty());
+    }
+
+    #[test]
+    fn herdr_inventory_keeps_the_shell_after_its_agent_exits_with_panes_hidden() {
+        let mut app = herdr_lifecycle_app();
+        app.config.integrations.herdr.show_panes = false;
+        let side = herdr::Side::Native;
+        adopt_herdr_fixture(
+            &mut app,
+            side.clone(),
+            r#"{"result":{"panes":[
+            {"terminal_id":"term-shell","pane_id":"w1:p1","agent":"claude","agent_status":"working"}
+        ]}}"#,
+            Instant::now(),
+        );
+        let shell = bind_herdr_fixture(&mut app, side.clone(), "term-shell");
+        adopt_herdr_fixture(
+            &mut app,
+            side,
+            r#"{"result":{"panes":[
+            {"terminal_id":"term-shell","pane_id":"w1:p1"},
+            {"terminal_id":"unattached-shell","pane_id":"w1:p2"},
+            {"terminal_id":"unattached-agent","pane_id":"w1:p3","agent":"codex","agent_status":"idle"}
+        ]}}"#,
+            Instant::now(),
+        );
+
+        app.reconcile_herdr_sessions(&Context::default());
+
+        assert_eq!(app.sessions[0].id, shell);
+        assert_eq!(
+            app.herdr_agent_listing()
+                .iter()
+                .map(|(_, _, agent)| agent.terminal_id.as_str())
+                .collect::<Vec<_>>(),
+            ["unattached-agent"]
+        );
+        assert!(
+            app.herdr_endpoints.caches()[0]
+                .inventory()
+                .unwrap()
+                .terminal_ids
+                .contains("term-shell")
+        );
+    }
+
+    #[test]
+    fn herdr_inventory_rejects_malformed_or_agent_only_replies_without_closing_rows() {
+        for json in [
+            "not json",
+            "[]",
+            "{}",
+            r#"{"result":{}}"#,
+            r#"{"result":{"panes":{}}}"#,
+            r#"{"result":{"agents":[]}}"#,
+            r#"{"error":{"code":"server_not_running"}}"#,
+            r#"{"error":{},"result":{"panes":[]}}"#,
+            r#"{"result":{"panes":[{}]}}"#,
+            r#"{"result":{"panes":[{"terminal_id":null}]}}"#,
+            r#"{"result":{"panes":[{"terminal_id":42}]}}"#,
+            r#"{"result":{"panes":[{"terminal_id":" "}]}}"#,
+        ] {
+            let mut app = herdr_lifecycle_app();
+            let side = herdr::Side::Native;
+            let id = bind_herdr_fixture(&mut app, side.clone(), "term-gone");
+            adopt_herdr_fixture(
+                &mut app,
+                side.clone(),
+                r#"{"result":{"panes":[]}}"#,
+                Instant::now(),
+            );
+            adopt_herdr_fixture(&mut app, side, json, Instant::now());
+
+            app.reconcile_herdr_sessions(&Context::default());
+
+            assert_eq!(app.sessions[0].id, id, "{json}");
+            assert!(app.herdr_endpoints.caches()[0].inventory().is_none(), "{json}");
+        }
+    }
+
+    #[test]
+    fn herdr_inventory_poll_failure_invalidates_successful_deletion_evidence() {
+        for error in [
+            herdr::PollError::Absent("spawn_failed"),
+            herdr::PollError::Absent("herdr_unavailable"),
+            herdr::PollError::Server("server_not_running".into()),
+        ] {
+            let mut app = herdr_lifecycle_app();
+            let side = herdr::Side::Native;
+            let id = bind_herdr_fixture(&mut app, side.clone(), "term-gone");
+            adopt_herdr_fixture(&mut app, side, r#"{"result":{"panes":[]}}"#, Instant::now());
+            app.herdr_endpoints.caches_mut_for_test()[0].complete_listing_for_test(
+                Err(error),
+                herdr::Listing::Panes,
+                herdr::Listing::Panes,
+                Instant::now(),
+            );
+
+            app.reconcile_herdr_sessions(&Context::default());
+
+            assert_eq!(app.sessions[0].id, id);
+            assert!(app.herdr_endpoints.caches()[0].inventory().is_none());
+        }
+    }
+
+    #[test]
+    fn herdr_inventory_cannot_close_new_or_rebound_sessions_from_an_older_request() {
+        let mut app = herdr_lifecycle_app();
+        let side = herdr::Side::Native;
+        let old = Instant::now() - Duration::from_secs(1);
+        let id = bind_herdr_fixture(&mut app, side.clone(), "term-gone");
+        adopt_herdr_fixture(&mut app, side.clone(), r#"{"result":{"panes":[]}}"#, old);
+        app.reconcile_herdr_sessions(&Context::default());
+        assert_eq!(app.sessions[0].id, id);
+
+        let before_rebind = Instant::now();
+        let key = app.sessions[0].herdr_key.clone().unwrap();
+        app.sessions[0].bind_herdr(key);
+        adopt_herdr_fixture(&mut app, side, r#"{"result":{"panes":[]}}"#, before_rebind);
+        app.reconcile_herdr_sessions(&Context::default());
+        assert_eq!(app.sessions[0].id, id);
+    }
+
+    #[test]
+    fn herdr_inventory_requires_binding_provenance_and_enabled_integration() {
+        let mut app = herdr_lifecycle_app();
+        let id = bind_herdr_fixture(&mut app, herdr::Side::Native, "term-gone");
+        adopt_herdr_fixture(
+            &mut app,
+            herdr::Side::Native,
+            r#"{"result":{"panes":[]}}"#,
+            Instant::now(),
+        );
+        app.config.integrations.herdr.enabled = false;
+        app.reconcile_herdr_sessions(&Context::default());
+        assert_eq!(app.sessions[0].id, id);
+
+        app.config.integrations.herdr.enabled = true;
+        app.sessions[0].herdr_bound_at = None;
+        app.reconcile_herdr_sessions(&Context::default());
+        assert_eq!(app.sessions[0].id, id);
+    }
+
+    #[test]
+    fn herdr_inventory_terminal_identity_is_scoped_to_the_endpoint() {
+        let mut app = herdr_lifecycle_app();
+        let native = bind_herdr_fixture(&mut app, herdr::Side::Native, "same-id");
+        let wsl = herdr::Side::Wsl("ubuntu".into());
+        let linux = bind_herdr_fixture(&mut app, wsl.clone(), "same-id");
+        let absent = bind_herdr_fixture(&mut app, herdr::Side::Wsl("debian".into()), "same-id");
+        adopt_herdr_fixture(
+            &mut app,
+            herdr::Side::Native,
+            r#"{"result":{"panes":[]}}"#,
+            Instant::now(),
+        );
+        adopt_herdr_fixture(
+            &mut app,
+            wsl,
+            r#"{"result":{"panes":[{"terminal_id":"same-id"}]}}"#,
+            Instant::now(),
+        );
+
+        app.reconcile_herdr_sessions(&Context::default());
+
+        assert!(!app.sessions.iter().any(|session| session.id == native));
+        assert_eq!(app.sessions.iter().map(|session| session.id).collect::<Vec<_>>(), [
+            linux, absent
+        ]);
+    }
+
+    #[test]
+    fn herdr_inventory_ignores_invalid_optional_display_metadata() {
+        let mut app = herdr_lifecycle_app();
+        let id = bind_herdr_fixture(&mut app, herdr::Side::Native, "term-shell");
+        adopt_herdr_fixture(
+            &mut app,
+            herdr::Side::Native,
+            r#"{"result":{"panes":[
+            {"terminal_id":"term-shell","agent":"claude","cwd":42,"terminal_title_stripped":false}
+        ]}}"#,
+            Instant::now(),
+        );
+
+        app.reconcile_herdr_sessions(&Context::default());
+
+        assert_eq!(app.sessions[0].id, id);
+        assert!(
+            app.herdr_endpoints.caches()[0]
+                .inventory()
+                .unwrap()
+                .terminal_ids
+                .contains("term-shell")
+        );
+    }
+
+    #[test]
+    fn herdr_focus_completion_for_a_removed_session_is_ignored() {
+        let mut app = herdr_lifecycle_app();
+        app.herdr_focused_view.attached(999, Instant::now());
+        app.herdr_view_focus = Some(HerdrViewFocus { session: 999, job: jobs::Job::ready(Ok(())) });
+
+        app.sync_herdr_view_focus(&Context::default());
+
+        assert!(app.herdr_view_focus.is_none());
+        assert!(app.herdr_focused_view.visible.is_none());
+        assert!(app.herdr_focused_view.focused.is_none());
+    }
 
     #[test]
     fn herdr_shared_view_follows_new_tabs_and_refocuses_on_return() {

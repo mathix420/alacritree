@@ -293,6 +293,8 @@ pub struct Session {
     /// sidebar draws one row for that agent rather than two.  Dies with the
     /// session, which is why it lives here and not in a map.
     pub herdr_key: Option<herdr::HerdrKey>,
+    /// Inventories started before this binding cannot establish its absence.
+    pub herdr_bound_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1258,6 +1260,19 @@ pub fn open(request: OpenRequest) -> std::io::Result<Attachment> {
 }
 
 impl Session {
+    pub fn bind_herdr(&mut self, key: herdr::HerdrKey) {
+        let bound_at = Instant::now();
+        log::debug!(
+            "herdr binding session={} side={:?} terminal_id={} bound_at={:?}",
+            self.id,
+            key.side,
+            key.terminal_id,
+            bound_at
+        );
+        self.herdr_bound_at = Some(bound_at);
+        self.herdr_key = Some(key);
+    }
+
     pub fn spawn_scratchpad(
         ctx: egui::Context,
         config: &Config,
@@ -1293,6 +1308,7 @@ impl Session {
             proxy,
             exit_status: None,
             herdr_key: None,
+            herdr_bound_at: None,
         })
     }
 
@@ -1466,6 +1482,7 @@ impl Session {
             proxy: proxy.clone(),
             exit_status: None,
             herdr_key: None,
+            herdr_bound_at: None,
         };
 
         let request = OpenRequest {
@@ -2293,6 +2310,7 @@ mod tests {
             proxy,
             exit_status: None,
             herdr_key: None,
+            herdr_bound_at: None,
         }
     }
 
