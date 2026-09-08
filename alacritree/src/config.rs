@@ -2399,7 +2399,7 @@ macro_rules! raw_palette_set {
 raw_palette_set!(RawNormalSet, Palette::default().normal);
 raw_palette_set!(RawBrightSet, Palette::default().bright);
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
 struct RawIndexed {
     /// Palette slot to override, 16–255.
     index: u8,
@@ -3099,7 +3099,7 @@ struct RawTextEmphasis {
 
 /// One `[[ui.profiles]]` entry.  Fields are optional so a malformed entry
 /// degrades to a warning instead of failing the whole config parse.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, serde::Serialize, JsonSchema)]
 #[serde(default)]
 struct RawProfile {
     /// Name shown in the session picker and matched by `default_profile`.
@@ -3120,7 +3120,7 @@ struct RawWorkspace {
     overrides: Vec<RawWorktreeOverride>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
 struct RawWorktreeOverride {
     /// Path to the project this override applies to.
     project: String,

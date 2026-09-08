@@ -68,3 +68,17 @@ fn the_committed_schema_names_where_it_is_published() {
         "https://github.com/mathix420/alacritree/releases/latest/download/alacritree-config.json"
     );
 }
+
+#[test]
+fn empty_collections_publish_their_defaults() {
+    let schema: serde_json::Value = serde_json::from_str(&generated()).unwrap();
+    for (section, key) in
+        [("RawColors", "indexed_colors"), ("RawUi", "profiles"), ("RawWorkspace", "overrides")]
+    {
+        assert_eq!(
+            schema["$defs"][section]["properties"][key].get("default"),
+            Some(&serde_json::json!([])),
+            "{section}.{key} must publish its empty-list default"
+        );
+    }
+}
