@@ -2966,6 +2966,7 @@ impl AlacritreeApp {
             self.session_inputs(self.observes_session_titles()),
             sidebar_focus::UiInputs {
                 session_rows_always: self.session_rows_always,
+                sessions_filter_counts_detached: self.sessions_filter_counts_detached,
                 query: self.project_filter.query(),
                 toggles: self.project_filter.toggle_bits(),
                 toggles_apply: self.project_filter.toggles_apply(self.search_scope),
@@ -3019,6 +3020,7 @@ impl AlacritreeApp {
                     self.session_inputs(self.observes_session_titles()),
                     sidebar_focus::UiInputs {
                         session_rows_always: self.session_rows_always,
+                        sessions_filter_counts_detached: self.sessions_filter_counts_detached,
                         query: self.project_filter.query(),
                         toggles: self.project_filter.toggle_bits(),
                         toggles_apply: self.project_filter.toggles_apply(self.search_scope),

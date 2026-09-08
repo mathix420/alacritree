@@ -125,6 +125,7 @@ mod tests {
         let live = sessions(150);
         let ui = UiInputs {
             session_rows_always: false,
+            sessions_filter_counts_detached: false,
             query: "worktree",
             toggles: 0,
             toggles_apply: true,
@@ -154,6 +155,7 @@ mod tests {
         let live = sessions(150);
         let ui = UiInputs {
             session_rows_always: false,
+            sessions_filter_counts_detached: false,
             query: "worktree-3",
             toggles: 0b11,
             toggles_apply: true,
@@ -192,6 +194,7 @@ mod tests {
         let big = tree(50, 10);
         let ui = UiInputs {
             session_rows_always: false,
+            sessions_filter_counts_detached: false,
             query: "",
             toggles: 0,
             toggles_apply: true,
@@ -231,6 +234,7 @@ mod tests {
             let live = sessions(s);
             let ui = UiInputs {
                 session_rows_always: false,
+                sessions_filter_counts_detached: false,
                 query: "worktree",
                 toggles: 0,
                 toggles_apply: true,
