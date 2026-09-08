@@ -7702,46 +7702,151 @@ impl RowName {
     }
 }
 
-/// The secondary column a herdr row shows: the integration, then whatever
-/// context the name did not already carry, then herdr's own status word, then
-/// the side it runs on, then where the row lives.  Shared by the attached and
-/// unattached rows so one heading's worth of vocabulary reads the same across
-/// both.  The native side contributes nothing, since a row that says nothing
-/// about a side is on the one the app itself runs on.
-///
-/// A pane with no agent in it carries no status word: `unknown` is what herdr
-/// calls an agent it cannot classify, and spending it on a shell would say
-/// the pane holds one.
-fn herdr_palette_secondary(
-    side: &herdr::Side,
-    status: Option<herdr::Status>,
-    context: Option<&str>,
-    workspace: String,
-) -> String {
-    let mut parts = vec!["herdr".to_string()];
-    parts.extend(context.map(str::to_string));
-    parts.extend(status.map(|s| s.label().to_string()));
-    parts.extend(side.label());
-    parts.push(workspace);
-    parts.join(" · ")
+struct PaletteSessionContent {
+    primary: String,
+    subtitle: String,
+    secondary: String,
+    title_for_hover: String,
 }
 
-/// The secondary column for a session whose activity is an agent with no
-/// herdr agent behind it: the local reading of the same axes herdr's shape
-/// would report if herdr were watching.  Elides the name the same way
-/// `herdr_row_name` elides its context — when the row's primary already
-/// spells it out, the secondary does not repeat it.
-fn agent_palette_secondary(
-    name: Option<&str>,
-    primary: &str,
-    live: LiveState,
+fn contains_case_insensitive(text: &str, needle: &str) -> bool {
+    text.to_lowercase().contains(&needle.to_lowercase())
+}
+
+fn herdr_cwd(agent: &herdr::Agent) -> Option<&str> {
+    agent
+        .foreground_cwd
+        .as_deref()
+        .filter(|cwd| !cwd.trim().is_empty())
+        .or_else(|| agent.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()))
+}
+
+fn path_last_component(path: &str) -> &str {
+    path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or_default()
+}
+
+fn generic_herdr_title(title: &str, agent: &herdr::Agent) -> bool {
+    title.trim().is_empty()
+        || agent.kind.as_deref().is_some_and(|kind| title.eq_ignore_ascii_case(kind))
+        || [agent.foreground_cwd.as_deref(), agent.cwd.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter(|cwd| !cwd.trim().is_empty())
+            .any(|cwd| {
+                title.eq_ignore_ascii_case(cwd)
+                    || title.eq_ignore_ascii_case(path_last_component(cwd))
+            })
+}
+
+fn session_middle(kind: Option<&str>, status: Option<&str>, title: &str, fallback: &str) -> String {
+    let mut parts = Vec::new();
+    if let Some(kind) = kind.filter(|kind| !contains_case_insensitive(title, kind)) {
+        parts.push(kind.to_lowercase());
+    }
+    parts.extend(status.map(str::to_owned));
+    if parts.is_empty() { fallback.to_string() } else { parts.join(" · ") }
+}
+
+fn native_palette_content(
+    title: String,
     workspace: String,
+    kind: Option<&str>,
+    status: Option<&str>,
+    fallback: &str,
+) -> PaletteSessionContent {
+    let generic =
+        title.trim().is_empty() || kind.is_some_and(|kind| title.eq_ignore_ascii_case(kind));
+    let primary = generic.then_some(workspace.clone()).unwrap_or_else(|| title.clone());
+    PaletteSessionContent {
+        title_for_hover: primary.clone(),
+        primary,
+        subtitle: (!generic).then_some(workspace).unwrap_or_default(),
+        secondary: session_middle(kind, status, &title, fallback),
+    }
+}
+
+fn herdr_subtitle(glyph: &str, location: Option<&str>) -> String {
+    location.map(|location| format!("{glyph} {location}")).unwrap_or_else(|| glyph.to_string())
+}
+
+fn herdr_palette_content(
+    title: String,
+    agent: &herdr::Agent,
+    workspace: Option<&str>,
+    glyph: &str,
+    cwd_style: PathStyle,
+    cwd_home: Option<&str>,
+    attached: bool,
+) -> PaletteSessionContent {
+    let cwd = herdr_cwd(agent);
+    let abbreviated_cwd = cwd.map(|cwd| path_style::render(cwd, cwd_style, cwd_home));
+    let generic = generic_herdr_title(&title, agent);
+    let (primary, title_for_hover) = if generic {
+        match workspace {
+            Some(workspace) => (workspace.to_string(), workspace.to_string()),
+            None => match (abbreviated_cwd.clone(), cwd) {
+                (Some(cwd), Some(full_cwd)) => (cwd, full_cwd.to_string()),
+                _ => ("Home".to_string(), "Home".to_string()),
+            },
+        }
+    } else {
+        (title.clone(), title)
+    };
+    let subtitle = if generic {
+        if attached { glyph.to_string() } else { agent.pane_id.clone() }
+    } else {
+        let location = workspace.or(abbreviated_cwd.as_deref());
+        if attached {
+            herdr_subtitle(glyph, location)
+        } else {
+            location.unwrap_or_default().to_string()
+        }
+    };
+    let fallback = if agent.status.is_some() { "" } else { "shell" };
+    PaletteSessionContent {
+        primary: primary.clone(),
+        subtitle,
+        secondary: session_middle(
+            agent.kind.as_deref(),
+            agent.status.map(|status| status.label()),
+            &primary,
+            fallback,
+        ),
+        title_for_hover,
+    }
+}
+
+fn palette_hover(
+    title: &str,
+    kind: Option<&str>,
+    status: Option<&str>,
+    side: &str,
+    workspace: Option<&Path>,
+    cwd: Option<&str>,
+    pane_id: Option<&str>,
+    terminal_id: Option<&str>,
+    managed: Option<&Managed>,
+    activation: &str,
 ) -> String {
-    let mut parts = vec!["agent".to_string()];
-    parts.extend(name.filter(|n| *n != primary).map(str::to_string));
-    parts.push(live.label().to_string());
-    parts.push(workspace);
-    parts.join(" · ")
+    let mut lines = vec![format!("Title: {title}")];
+    lines.extend(kind.map(|kind| format!("Kind: {kind}")));
+    lines.extend(status.map(|status| format!("Status: {status}")));
+    lines.push(format!("Side: {side}"));
+    lines.extend(workspace.map(|workspace| format!("Workspace: {}", wsl::display_path(workspace))));
+    lines.extend(cwd.map(|cwd| format!("Cwd: {cwd}")));
+    lines.extend(pane_id.map(|pane_id| format!("Pane: {pane_id}")));
+    lines.extend(terminal_id.map(|terminal_id| format!("Terminal: {terminal_id}")));
+    lines.extend(managed.map(managed_tooltip));
+    lines.push(format!("Activate: {activation}"));
+    lines.join("\n")
+}
+
+fn session_fallback_kind(kind: &SessionKind) -> &'static str {
+    match kind {
+        SessionKind::Shell => "shell",
+        SessionKind::Diff { .. } => "diff",
+        SessionKind::Scratchpad { .. } => "scratchpad",
+    }
 }
 
 /// The name herdr reports for a pane, and `None` when it reports none.  The
@@ -10044,6 +10149,7 @@ impl AlacritreeApp {
     /// ranking, and always current as sessions and worktrees come and go.
     fn palette_items(&self) -> Vec<PaletteItem> {
         let mut items = command_palette::action_items(&self.config.bindings);
+        let herdr_glyph = self.config.ui.icons.herdr.or_glyph(DEFAULT_HERDR_ICON.as_str());
         for (i, profile) in self.config.profiles.iter().enumerate() {
             let index = i + 1;
             // SpawnProfile only binds indices 1..=9; past that there is no
@@ -10059,32 +10165,110 @@ impl AlacritreeApp {
             let activity =
                 herdr_backed_activity(session.activity(), self.session_herdr_status(session));
             let name = session_row_name(&session.title, activity, agent);
-            let secondary = match (agent, session.herdr_key.as_ref(), activity) {
-                (Some(a), Some(key), _) => herdr_palette_secondary(
-                    &key.side,
-                    a.status,
-                    name.context.as_deref(),
-                    self.workspace_label(&session.working_directory),
-                ),
-                (_, _, SessionActivity::Agent { name: agent_name, live }) => {
-                    agent_palette_secondary(
-                        agent_name,
-                        &name.text,
-                        live,
-                        self.workspace_label(&session.working_directory),
-                    )
-                },
-                _ => format!("session · {}", self.workspace_label(&session.working_directory)),
+            if let (Some(agent), Some(key)) = (agent, session.herdr_key.as_ref()) {
+                let workspace = session
+                    .working_directory
+                    .as_ref()
+                    .map(|_| self.workspace_label(&session.working_directory));
+                let content = herdr_palette_content(
+                    name.text,
+                    agent,
+                    workspace.as_deref(),
+                    herdr_glyph,
+                    self.config.ui.path_style.git_rows,
+                    None,
+                    true,
+                );
+                let managed = self.session_managed(session);
+                let side = key.side.label().unwrap_or_else(|| "native".to_string());
+                let hover = palette_hover(
+                    &content.title_for_hover,
+                    agent.kind.as_deref(),
+                    agent.status.map(|status| status.label()),
+                    &side,
+                    session.working_directory.as_deref(),
+                    herdr_cwd(agent),
+                    Some(&agent.pane_id),
+                    Some(&agent.terminal_id),
+                    managed.as_ref(),
+                    "switch to this session",
+                );
+                items.push(PaletteItem::session(
+                    session.id,
+                    content.primary,
+                    content.subtitle,
+                    content.secondary,
+                    hover,
+                    agent.kind.as_deref(),
+                    true,
+                ));
+                continue;
+            }
+            let (agent_kind, status) = match activity {
+                SessionActivity::Agent { name, live } => (name, Some(live.label())),
+                SessionActivity::Shell => (None, None),
             };
-            items.push(PaletteItem::session(session.id, name.text, secondary));
+            let content = native_palette_content(
+                name.text,
+                self.workspace_label(&session.working_directory),
+                agent_kind,
+                status,
+                session_fallback_kind(&session.kind),
+            );
+            let side = session
+                .wsl_distro()
+                .map(|distro| format!("wsl:{distro}"))
+                .unwrap_or_else(|| "native".to_string());
+            let hover = palette_hover(
+                &content.title_for_hover,
+                agent_kind.or_else(|| {
+                    (session.kind != SessionKind::Shell)
+                        .then(|| session_fallback_kind(&session.kind))
+                }),
+                status,
+                &side,
+                session.working_directory.as_deref(),
+                None,
+                None,
+                None,
+                None,
+                "switch to this session",
+            );
+            items.push(PaletteItem::session(
+                session.id,
+                content.primary,
+                content.subtitle,
+                content.secondary,
+                hover,
+                agent_kind,
+                false,
+            ));
         }
         for (ws, side, agent) in self.herdr_agent_listing() {
-            let name = herdr_display_name(agent);
-            let secondary = herdr_palette_secondary(
-                side,
-                agent.status,
-                name.context.as_deref(),
-                self.workspace_label(&ws),
+            let workspace = ws.as_ref().map(|_| self.workspace_label(&ws));
+            let content = herdr_palette_content(
+                herdr_display_name(agent).text,
+                agent,
+                workspace.as_deref(),
+                herdr_glyph,
+                self.config.ui.path_style.git_rows,
+                None,
+                false,
+            );
+            let settings = self.herdr_settings(side);
+            let managed =
+                Managed::herdr(side, &settings, self.config.integrations.herdr.attach, Some(agent));
+            let hover = palette_hover(
+                &content.title_for_hover,
+                agent.kind.as_deref(),
+                agent.status.map(|status| status.label()),
+                &side.label().unwrap_or_else(|| "native".to_string()),
+                ws.as_deref(),
+                herdr_cwd(agent),
+                Some(&agent.pane_id),
+                Some(&agent.terminal_id),
+                Some(&managed),
+                "attach to this herdr pane",
             );
             items.push(PaletteItem::herdr_agent(
                 command_palette::HerdrAttach {
@@ -10095,8 +10279,11 @@ impl AlacritreeApp {
                     pane_id: agent.pane_id.clone(),
                     workspace: ws.clone(),
                 },
-                name.text,
-                secondary,
+                content.primary,
+                content.subtitle,
+                content.secondary,
+                hover,
+                agent.kind.as_deref(),
             ));
         }
         for ws in self.workspace_order() {
@@ -13065,9 +13252,19 @@ mod tests {
     /// wearing it would claim an agent is there.
     #[test]
     fn an_agentless_pane_claims_no_status() {
+        let agent = shell_pane();
+        let content = herdr_palette_content(
+            herdr_display_name(&agent).text,
+            &agent,
+            Some("alacritree / master"),
+            "◆",
+            PathStyle::Fish,
+            None,
+            false,
+        );
         assert_eq!(
-            herdr_palette_secondary(&herdr::Side::Native, None, None, "Home".into()),
-            "herdr \u{b7} Home"
+            (content.primary, content.subtitle, content.secondary),
+            ("~/G/g/alacritree".into(), "alacritree / master".into(), "shell".into(),)
         );
     }
 
@@ -13147,77 +13344,141 @@ mod tests {
     }
 
     #[test]
-    fn palette_secondary_spells_out_the_context_the_name_dropped() {
+    fn specific_herdr_titles_keep_workspace_and_status_separate() {
+        let agent = herdr::Agent {
+            status: Some(herdr::Status::Working),
+            ..titled(Some("claude"), Some("fix the wrap bug"))
+        };
+        let content = herdr_palette_content(
+            herdr_display_name(&agent).text,
+            &agent,
+            Some("alacritree / master"),
+            "◆",
+            PathStyle::Fish,
+            None,
+            true,
+        );
         assert_eq!(
-            herdr_palette_secondary(
-                &herdr::Side::Wsl("ubuntu".into()),
-                Some(herdr::Status::Working),
-                Some("claude"),
-                "alacritree / master".into(),
-            ),
-            "herdr \u{b7} claude \u{b7} working \u{b7} wsl:ubuntu \u{b7} alacritree / master"
+            (content.primary, content.subtitle, content.secondary),
+            ("fix the wrap bug".into(), "◆ alacritree / master".into(), "claude · working".into(),)
         );
     }
 
-    /// The name already said "claude", so repeating it in the secondary would
-    /// spell one thing twice on one row.
     #[test]
-    fn palette_secondary_omits_a_context_the_name_already_carried() {
+    fn generic_herdr_titles_promote_their_directory() {
+        let agent = agent_in("/home/dev/Git/devkit");
+        let content = herdr_palette_content(
+            herdr_display_name(&agent).text,
+            &agent,
+            None,
+            "◆",
+            PathStyle::Fish,
+            None,
+            false,
+        );
         assert_eq!(
-            herdr_palette_secondary(
-                &herdr::Side::Wsl("ubuntu".into()),
-                Some(herdr::Status::Idle),
+            (content.primary, content.subtitle, content.secondary),
+            ("/h/d/G/devkit".into(), "w5:p1".into(), "claude · idle".into(),)
+        );
+    }
+
+    #[test]
+    fn generic_herdr_titles_without_a_directory_use_home() {
+        let agent = herdr_agent(Some("claude"));
+        let content = herdr_palette_content(
+            herdr_display_name(&agent).text,
+            &agent,
+            None,
+            "◆",
+            PathStyle::Fish,
+            None,
+            true,
+        );
+        assert_eq!(
+            (content.primary, content.subtitle, content.secondary),
+            ("Home".into(), "◆".into(), "claude · idle".into(),)
+        );
+    }
+
+    #[test]
+    fn duplicate_unmatched_herdr_panes_keep_visible_searchable_context() {
+        let panes = herdr::Listing::Panes.parse(
+            r#"{"result":{"panes":[
+            {"terminal_id":"t1","pane_id":"w7:p1","agent":"codex",
+             "agent_status":"working","terminal_title_stripped":"~/.local/share/chezmoi",
+             "cwd":"~/.local/share/chezmoi"},
+            {"terminal_id":"t2","pane_id":"w7:p3","agent":"codex",
+             "agent_status":"idle","terminal_title_stripped":"~/.local/share/chezmoi",
+             "cwd":"~/.local/share/chezmoi"}
+        ]}}"#,
+        );
+        let side = herdr::Side::Wsl("kali-linux".into());
+        let mut cache = herdr::EndpointCache::new(side.clone());
+        cache.set_agents_for_test(panes);
+        let caches = [cache];
+        let mut items = Vec::new();
+        for (workspace, side, agent) in listed_herdr_agents(&caches, &[], &[], true) {
+            let content = herdr_palette_content(
+                herdr_display_name(agent).text,
+                agent,
                 None,
-                "Home".into(),
-            ),
-            "herdr \u{b7} idle \u{b7} wsl:ubuntu \u{b7} Home"
-        );
-    }
-
-    /// A row that names no side is on the side alacritree itself runs on, so
-    /// the native one is worth no column width.
-    #[test]
-    fn palette_secondary_leaves_the_native_side_unsaid() {
-        assert_eq!(
-            herdr_palette_secondary(
-                &herdr::Side::Native,
-                Some(herdr::Status::Done),
+                "◆",
+                PathStyle::Fish,
                 None,
-                "Home".into(),
-            ),
-            "herdr \u{b7} done \u{b7} Home"
+                false,
+            );
+            items.push(PaletteItem::herdr_agent(
+                command_palette::HerdrAttach {
+                    key: herdr::HerdrKey {
+                        side: side.clone(),
+                        terminal_id: agent.terminal_id.clone(),
+                    },
+                    pane_id: agent.pane_id.clone(),
+                    workspace,
+                },
+                content.primary,
+                content.subtitle,
+                content.secondary,
+                "hover".into(),
+                agent.kind.as_deref(),
+            ));
+        }
+        assert_eq!(items[0].primary, "~/.l/s/chezmoi");
+        assert_eq!(items[1].primary, "~/.l/s/chezmoi");
+        assert_eq!(items[0].subtitle.as_deref(), Some("w7:p1"));
+        assert_eq!(items[1].subtitle.as_deref(), Some("w7:p3"));
+        assert_eq!(items[0].secondary, "codex · working");
+        assert_eq!(items[1].secondary, "codex · idle");
+        let mut palette = CommandPalette::new();
+        let ranked = palette.rank(&items);
+        assert_eq!(command_palette::group(&items, &ranked), vec![(
+            command_palette::PaletteSection::HerdrSessions,
+            vec![0, 1],
+        )]);
+        for (query, expected) in [("w7:p1", 0), ("w7:p3", 1), ("chezmoi", 0)] {
+            palette.clear_query();
+            palette.query_mut().push_str(query);
+            assert_eq!(palette.rank(&items).first(), Some(&expected));
+        }
+    }
+
+    #[test]
+    fn session_middle_omits_a_kind_already_in_its_title() {
+        assert_eq!(session_middle(Some("claude"), Some("idle"), "Claude Code", "shell"), "idle");
+    }
+
+    #[test]
+    fn session_middle_keeps_a_different_detected_kind() {
+        assert_eq!(
+            session_middle(Some("codex"), Some("idle"), "Claude Code", "shell"),
+            "codex · idle"
         );
     }
 
-    /// A local agent's name is worth a column when the primary painted
-    /// something else, the same way herdr's own context is.
     #[test]
-    fn agent_palette_secondary_spells_out_a_name_the_primary_did_not_carry() {
-        assert_eq!(
-            agent_palette_secondary(Some("claude"), "zsh", LiveState::Working, "myrepo".into()),
-            "agent \u{b7} claude \u{b7} working \u{b7} myrepo"
-        );
-    }
-
-    /// Stripping the decorative mark leaves the primary saying "claude"
-    /// already, so the secondary does not spell it out a second time.
-    #[test]
-    fn agent_palette_secondary_omits_a_name_the_primary_already_carried() {
-        assert_eq!(
-            agent_palette_secondary(Some("claude"), "claude", LiveState::Working, "myrepo".into()),
-            "agent \u{b7} working \u{b7} myrepo"
-        );
-    }
-
-    /// An agent recognized only by its decorative prefix has no name to
-    /// spell out at all, so the secondary is exactly as bare as the elided
-    /// case above.
-    #[test]
-    fn agent_palette_secondary_has_nothing_to_elide_without_a_recognized_name() {
-        assert_eq!(
-            agent_palette_secondary(None, "claude", LiveState::Idle, "Home".into()),
-            "agent \u{b7} idle \u{b7} Home"
-        );
+    fn native_shells_keep_a_shell_middle_cell() {
+        let content = native_palette_content("terminal".into(), "Home".into(), None, None, "shell");
+        assert_eq!(content.secondary, "shell");
     }
 
     /// The click switched workspace before handing the gesture over, so a

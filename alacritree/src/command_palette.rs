@@ -64,7 +64,7 @@ pub enum PaletteSection {
     Window,
     Profiles,
     OpenSessions,
-    HerdrAgents,
+    HerdrSessions,
     SwitchWorkspace,
     NewWorktree,
 }
@@ -81,7 +81,7 @@ impl PaletteSection {
             Self::Window => "Window & application",
             Self::Profiles => "Shell profiles",
             Self::OpenSessions => "Open sessions",
-            Self::HerdrAgents => "Herdr agents",
+            Self::HerdrSessions => "Herdr sessions",
             Self::SwitchWorkspace => "Switch workspace",
             Self::NewWorktree => "New worktree",
         }
@@ -129,7 +129,9 @@ pub struct PaletteItem {
     pub section: PaletteSection,
     pub keys: String,
     pub primary: String,
+    pub subtitle: Option<String>,
     pub secondary: String,
+    pub hover: Option<String>,
     search: String,
 }
 
@@ -142,21 +144,33 @@ impl PaletteItem {
         secondary: String,
     ) -> Self {
         let search = format!("{primary} {secondary} {keys}");
-        Self { action, section, keys, primary, secondary, search }
+        Self { action, section, keys, primary, subtitle: None, secondary, hover: None, search }
     }
 
     fn action(a: NamedAction, keys: String) -> Self {
         Self::new(PaletteAction::Run(a), section_of(a), keys, a.description(), a.config_name())
     }
 
-    pub fn session(id: SessionId, primary: String, secondary: String) -> Self {
-        Self::new(
-            PaletteAction::ActivateSession(id),
-            PaletteSection::OpenSessions,
-            String::new(),
+    pub fn session(
+        id: SessionId,
+        primary: String,
+        subtitle: String,
+        secondary: String,
+        hover: String,
+        agent_kind: Option<&str>,
+        is_herdr: bool,
+    ) -> Self {
+        let search = session_search(&primary, &subtitle, &secondary, agent_kind, is_herdr);
+        Self {
+            action: PaletteAction::ActivateSession(id),
+            section: PaletteSection::OpenSessions,
+            keys: String::new(),
             primary,
+            subtitle: Some(subtitle),
             secondary,
-        )
+            hover: Some(hover),
+            search,
+        }
     }
 
     pub fn workspace(ws: WorkspaceKey, primary: String, secondary: String) -> Self {
@@ -198,21 +212,45 @@ impl PaletteItem {
         item
     }
 
-    /// A herdr agent nothing is attached to.  `herdr` is folded into the
-    /// search haystack without being painted, so the integration's own name
-    /// finds these rows as well as the attached ones, whose secondary column
-    /// already carries it.
-    pub fn herdr_agent(attach: HerdrAttach, primary: String, secondary: String) -> Self {
-        let mut item = Self::new(
-            PaletteAction::AttachHerdrAgent(attach),
-            PaletteSection::HerdrAgents,
-            String::new(),
+    /// A herdr pane available to attach to, filed apart from open sessions.
+    pub fn herdr_agent(
+        attach: HerdrAttach,
+        primary: String,
+        subtitle: String,
+        secondary: String,
+        hover: String,
+        agent_kind: Option<&str>,
+    ) -> Self {
+        let search = session_search(&primary, &subtitle, &secondary, agent_kind, true);
+        Self {
+            action: PaletteAction::AttachHerdrAgent(attach),
+            section: PaletteSection::HerdrSessions,
+            keys: String::new(),
             primary,
+            subtitle: Some(subtitle),
             secondary,
-        );
-        item.search.push_str(" herdr");
-        item
+            hover: Some(hover),
+            search,
+        }
     }
+}
+
+fn session_search(
+    primary: &str,
+    subtitle: &str,
+    secondary: &str,
+    agent_kind: Option<&str>,
+    is_herdr: bool,
+) -> String {
+    let mut search = format!("{primary} {subtitle} {secondary}");
+    if let Some(agent_kind) = agent_kind {
+        search.push(' ');
+        search.push_str(agent_kind);
+    }
+    if is_herdr {
+        search.push_str(" herdr");
+    }
+    search
 }
 
 /// Rows the palette must not offer to run: unbinds, the pass-through marker,
@@ -679,23 +717,35 @@ mod tests {
         }
     }
 
-    /// One heading is enough only if the integration's own name reaches both
-    /// kinds of row, so `herdr` is folded into the haystack of the unattached
-    /// ones and already sits in the attached ones' secondary column.
     #[test]
     fn typing_herdr_ranks_attached_and_unattached_rows() {
         let items = vec![
             PaletteItem::session(
                 1,
                 "fix the wrap bug".into(),
-                "herdr · claude · working · Home".into(),
+                "Home".into(),
+                "working".into(),
+                "hover".into(),
+                Some("claude"),
+                true,
             ),
             PaletteItem::herdr_agent(
                 attach("t1"),
                 "review the schema".into(),
-                "claude · idle · Home".into(),
+                "w1:p1".into(),
+                "idle".into(),
+                "hover".into(),
+                Some("claude"),
             ),
-            PaletteItem::session(2, "nvim config".into(), "session · Home".into()),
+            PaletteItem::session(
+                2,
+                "nvim config".into(),
+                "Home".into(),
+                "shell".into(),
+                "hover".into(),
+                None,
+                false,
+            ),
         ];
         let mut palette = CommandPalette::new();
         palette.query_mut().push_str("herdr");
@@ -705,18 +755,51 @@ mod tests {
         assert!(!ranked.contains(&2), "a plain session row should not match");
     }
 
-    /// Grouping is by first appearance, so building the agent block right after
-    /// the session block is what puts the heading under Open sessions.
     #[test]
-    fn herdr_agents_group_after_open_sessions() {
+    fn herdr_panes_have_their_own_section() {
         let items = vec![
-            PaletteItem::session(1, "nvim".into(), "session · Home".into()),
-            PaletteItem::herdr_agent(attach("t1"), "review".into(), "claude · idle · Home".into()),
+            PaletteItem::session(
+                1,
+                "nvim".into(),
+                "Home".into(),
+                "shell".into(),
+                "hover".into(),
+                None,
+                false,
+            ),
+            PaletteItem::herdr_agent(
+                attach("t1"),
+                "review".into(),
+                "w1:p1".into(),
+                "claude · idle".into(),
+                "hover".into(),
+                Some("claude"),
+            ),
         ];
         let mut palette = CommandPalette::new();
         let ranked = palette.rank(&items);
         let sections: Vec<PaletteSection> =
             group(&items, &ranked).into_iter().map(|(s, _)| s).collect();
-        assert_eq!(sections, vec![PaletteSection::OpenSessions, PaletteSection::HerdrAgents]);
+        assert_eq!(sections, vec![PaletteSection::OpenSessions, PaletteSection::HerdrSessions]);
+        assert_eq!(items[1].section.title(), "Herdr sessions");
+    }
+
+    #[test]
+    fn session_search_excludes_tooltip_only_details() {
+        let items = vec![PaletteItem::session(
+            1,
+            "Claude Code".into(),
+            "project / main".into(),
+            "idle".into(),
+            "Terminal: term_123\nWorkspace: C:\\full\\private".into(),
+            Some("claude"),
+            false,
+        )];
+        let mut palette = CommandPalette::new();
+        palette.query_mut().push_str("private");
+        assert!(palette.rank(&items).is_empty());
+        palette.clear_query();
+        palette.query_mut().push_str("project");
+        assert_eq!(palette.rank(&items), vec![0]);
     }
 }
