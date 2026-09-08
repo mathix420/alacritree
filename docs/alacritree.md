@@ -78,6 +78,7 @@ project, its Git worktrees.
 
 herdr is a terminal workspace manager for coding agents. When a herdr server is running, the agents it manages appear in the sidebar under the worktree each agent's working directory matches, dimmed and carrying the `◫` mark that says the pane belongs to herdr rather than to alacritree. A row names the agent's pane title where herdr reports one, with the agent kind in front of it as context, so two agents of one kind in one checkout can be told apart; an agent with no title is named by its kind alone. An agent whose directory matches no worktree — including one whose checkout has been removed — is listed under Home.
 
+- **Panes with no agent.** `[integrations.herdr] show_panes` widens the listing from the panes herdr detected an agent in to every pane it owns, so a herdr pane running a plain shell gets a row too. Such a row is named by the pane's own title and carries no status word, since `unknown` is what herdr calls an agent it cannot classify rather than a way of saying there is none. Opening one shares herdr's view of the tab that holds it: every `herdr agent` subcommand resolves its target through the agent registry, which holds nothing for such a pane, so a direct attach is never offered for it whatever `attach` says.
 - **Attaching.** Enter or a click opens a session attached to that agent, and the row is replaced by the session's own row, which keeps the herdr mark so an attached agent still says where it lives. Hovering either row spells out the same sentence — the state, the harness, and what herdr calls the pane, with the way out after them. Detaching is herdr's own chord, not one of alacritree's, read from herdr's `config.toml` so a rebound `keys.prefix` or `keys.detach` is what you are told. The row's `×` ends the attach and leaves the pane running under herdr, so it offers to detach rather than to close, and the agent's own row comes back. Whether it asks first is `[ui] confirm_session_detach`, a switch of its own: a detach destroys nothing, so the busy question `confirm_session_close` asks has no answer here, and turning one off says nothing about the other.
 - **Finding an agent by name.** The command palette (`Ctrl+K`) lists agents alongside sessions: an attached one sits under *Open sessions*, named the way its sidebar row is, and one nothing is attached to sits under *Herdr agents*, where Enter attaches it in the workspace its working directory matched. Typing `herdr` brings up both kinds. The sidebar's own search (`/`) reaches agents and session titles too when `[ui] search_depth` is `"sessions"`, so a query naming one agent shows that agent rather than its whole workspace; at the default `"workspaces"` a query only ever matches project and worktree names, and a query naming the workspace still shows everything under it. A session the sidebar does not list has no row to match — by default a workspace's only shell is folded into its workspace row, which `session_display.sidebar_always` turns off.
 - **Order.** A workspace draws its own shell sessions first, then every herdr pane it holds — the sessions attached to one and the agents nothing is attached to alike — in herdr's own order. Attaching therefore changes how a pane is drawn and never where it sits, and neither does detaching or a restart. Reordering is for alacritree's own sessions: a herdr pane's place belongs to herdr, so drag and `MoveSessionUp` / `MoveSessionDown` pass over one. Sort the panes in herdr and the sidebar follows within a poll.
@@ -615,8 +616,15 @@ poll_interval_ms = 2000     # how often a reachable server is asked for its
                             # after one attempt, so a machine without herdr
                             # pays a single failed spawn; a side that has one
                             # is retried even while its server is down
-show_unmatched   = true     # list an agent whose directory matches no
+show_unmatched   = true     # list a pane whose directory matches no
                             # worktree under Home; false hides it instead
+show_panes       = false    # list every pane a herdr server owns, not only
+                            # the ones it detected an agent in. A pane running
+                            # a plain shell is named by its own title and
+                            # shows no status. Needs a herdr that knows
+                            # `pane list` (0.8.2 does); an older one reads as
+                            # no herdr on that side and stops the polling
+                            # there until this goes back to false
 attach           = "agent"  # what opening a row attaches to. "agent" opens the
                             # pane on its own; "session" opens the herdr session
                             # around it with that pane focused, which hands the
