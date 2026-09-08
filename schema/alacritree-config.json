@@ -539,7 +539,7 @@
         },
         "show_panes": {
           "default": false,
-          "description": "List every pane a herdr server owns, not only the ones it detected an\nagent in.  A pane running a plain shell gets a row named by its own\ntitle, carrying no status, and opening it shares herdr's view of the\ntab that holds it rather than attaching to the pane.\n\nNeeds a herdr that knows `pane list` (0.8.2 does).  An older one\nanswers with a usage error, which reads as no herdr on that side and\nstops the polling there until this is turned off and alacritree\nrestarted.",
+          "description": "List every pane a herdr server owns, not only the ones it detected an\nagent in.  A pane running a plain shell gets a row named by its own\ntitle, carrying no status, and opening it shares herdr's view of the\ntab that holds it rather than attaching to the pane.\n\nNeeds a herdr that knows `pane list` (0.8.2 does).  An older one\nanswers with a usage error, which reads as no herdr on that side.  A\nside that has never answered is then abandoned for the process\nlifetime; one that answered before this was turned on keeps retrying\nand recovers when it goes back off.",
           "type": "boolean"
         },
         "show_unmatched": {

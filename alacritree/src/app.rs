@@ -9200,10 +9200,10 @@ impl AlacritreeApp {
         self.find_herdr_agent(&key.side, &key.terminal_id)
     }
 
-    /// Whether herdr reports an agent in the pane `key` names.  A pane herdr
-    /// has stopped listing keeps the answer it had, so a session does not
-    /// start calling itself a shared view the moment herdr lets go of its
-    /// pane; a session that is not herdr's at all answers the same way.
+    /// Whether herdr reports an agent in the pane `key` names.  A pane the
+    /// listing no longer carries answers true, as does a session that is not
+    /// herdr's at all: with nothing to read, the agent-registry answer is the
+    /// one that keeps every caller on the path it took before the pane went.
     fn herdr_pane_has_agent(&self, key: Option<&herdr::HerdrKey>) -> bool {
         key.and_then(|key| self.find_herdr_agent(&key.side, &key.terminal_id))
             .is_none_or(|agent| agent.status.is_some())

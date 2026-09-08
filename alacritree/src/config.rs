@@ -2754,9 +2754,10 @@ struct RawHerdr {
     /// tab that holds it rather than attaching to the pane.
     ///
     /// Needs a herdr that knows `pane list` (0.8.2 does).  An older one
-    /// answers with a usage error, which reads as no herdr on that side and
-    /// stops the polling there until this is turned off and alacritree
-    /// restarted.
+    /// answers with a usage error, which reads as no herdr on that side.  A
+    /// side that has never answered is then abandoned for the process
+    /// lifetime; one that answered before this was turned on keeps retrying
+    /// and recovers when it goes back off.
     show_panes: bool,
     /// Whether opening a row attaches to that agent's pane directly
     /// ("agent") or to the herdr session around it with the pane focused
