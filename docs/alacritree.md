@@ -487,20 +487,20 @@ last_session_close = "respawn"   # what happens when the on-screen workspace
                                  # "ring_global" and "ring_project" move to the
                                  # nearest surviving session in the ring, else
                                  # home
-hold_exited_sessions = "never"  # whether a session whose child has exited
-                                # stays on screen instead of closing with it
-                                # "never" (default): every exit closes its
-                                # session
-                                # "on_error": a non-zero exit is held, so the
-                                # error the child printed survives
-                                # "always": any exit is held
-                                # A held session writes one line into its own
-                                # grid naming the key bound to
-                                # CloseExitedSession, or the command palette
-                                # when nothing is bound.
-                                # A refused herdr attach is held whatever this
-                                # says: its refusal message is the only report
-                                # of what happened.
+hold_exited_sessions = "never"   # whether a session whose child has exited
+                                 # stays on screen instead of closing with it
+                                 # "never" (default): every exit closes its
+                                 # session
+                                 # "on_error": a non-zero exit is held, so the
+                                 # error the child printed survives
+                                 # "always": any exit is held
+                                 # A held session writes one line into its own
+                                 # grid naming the key bound to
+                                 # CloseExitedSession, or the command palette
+                                 # when nothing is bound.
+                                 # A refused herdr attach is held whatever this
+                                 # says: its refusal message is the only report
+                                 # of what happened.
 pr_status          = false  # poll `gh` for each branch's open PR, which drives
                             # the PR row icons, the PR-state filters, and $pr
                             # below (default false)
