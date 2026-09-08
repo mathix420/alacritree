@@ -1359,7 +1359,7 @@
           "description": "Whether session rows can be dragged, and how far a reorder may carry\na session."
         },
         "sessions_filter_counts_detached": {
-          "description": "Whether the sidebar's sessions toggle counts a listed detached herdr\nagent the same as a live session.  Default false: an existing config\nkeeps the toggle's original session-only behavior.",
+          "description": "Whether the sidebar's sessions toggle counts an unattached herdr row\nthe same as a live session — an agent nothing is attached to, and,\nonce `show_panes` is on, an agentless pane.  Default false: an\nexisting config keeps the toggle's original session-only behavior.",
           "type": "boolean"
         },
         "sidebar_accent": {
