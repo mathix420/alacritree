@@ -487,6 +487,20 @@ last_session_close = "respawn"   # what happens when the on-screen workspace
                                  # "ring_global" and "ring_project" move to the
                                  # nearest surviving session in the ring, else
                                  # home
+hold_exited_sessions = "never"  # whether a session whose child has exited
+                                # stays on screen instead of closing with it
+                                # "never" (default): every exit closes its
+                                # session
+                                # "on_error": a non-zero exit is held, so the
+                                # error the child printed survives
+                                # "always": any exit is held
+                                # A held session writes one line into its own
+                                # grid naming the key bound to
+                                # CloseExitedSession, or the command palette
+                                # when nothing is bound.
+                                # A refused herdr attach is held whatever this
+                                # says: its refusal message is the only report
+                                # of what happened.
 pr_status          = false  # poll `gh` for each branch's open PR, which drives
                             # the PR row icons, the PR-state filters, and $pr
                             # below (default false)
@@ -727,7 +741,7 @@ Two things worth knowing about what the schema does and does not do:
   `alacritty.toml` legitimately carries keys only the real alacritty acts on —
   `[hints]`, `[bell]`, `[mouse]`, `[general] import`. Those get no completion,
   but they are not flagged.
-- **Closed-value keys are completed.** `confirm_session_close`, `scrollbar`, `sidebar_focus`, `sidebar_scroll_align`, `search_scope`, `sidebar_tooltips`, `last_session_close`, `path_style.*` and `drop.quote` offer their accepted spellings. A binding's `action` completes from every action alacritree implements but rejects nothing, so an alacritty-only action still validates. Cursor `shape` and `blinking`, where Alacritty accepts more than one spelling for the same value, are deliberately left unconstrained, so a working config is never marked wrong.
+- **Closed-value keys are completed.** `confirm_session_close`, `scrollbar`, `sidebar_focus`, `sidebar_scroll_align`, `search_scope`, `sidebar_tooltips`, `last_session_close`, `hold_exited_sessions`, `path_style.*` and `drop.quote` offer their accepted spellings. A binding's `action` completes from every action alacritree implements but rejects nothing, so an alacritty-only action still validates. Cursor `shape` and `blinking`, where Alacritty accepts more than one spelling for the same value, are deliberately left unconstrained, so a working config is never marked wrong.
 
 [taplo]: https://taplo.tamasfe.dev/
 [ebt]: https://marketplace.visualstudio.com/items?itemName=tamasfe.even-better-toml

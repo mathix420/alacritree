@@ -9030,8 +9030,9 @@ fn herdr_row(
 
 impl AlacritreeApp {
     fn reap_exited_sessions(&mut self, ctx: &Context) {
+        let hold = self.config.ui.hold_exited_sessions;
         let exited_ids: Vec<SessionId> =
-            self.sessions.iter().filter(|s| s.should_reap()).map(|s| s.id).collect();
+            self.sessions.iter().filter(|s| s.should_reap(hold)).map(|s| s.id).collect();
         for id in exited_ids {
             self.close_session(ctx, id);
         }
@@ -9076,6 +9077,7 @@ impl AlacritreeApp {
         crate::focus_priority::set_self_boosted(anything_raised);
 
         let grace = self.config.ui.attention_grace;
+        let hold = self.config.ui.hold_exited_sessions;
         for idx in 0..self.sessions.len() {
             // Window focus is deliberately not part of this: an unfocused
             // window still shows its grid, so its output still has to repaint.
@@ -9085,6 +9087,16 @@ impl AlacritreeApp {
             // with OSC 52 still owns the clipboard.
             for (target, text) in &outcome.clipboard {
                 clipboard::write(*target, text);
+            }
+            // The exit is the last thing the PTY will ever deliver, so a
+            // session that survives it says here how to dismiss it — nothing
+            // else on screen would.
+            if outcome.exited && !self.sessions[idx].should_reap(hold) {
+                let chord = command_palette::first_key(
+                    &self.config.bindings,
+                    NamedAction::CloseExitedSession,
+                );
+                self.sessions[idx].write_hold_notice(chord.as_deref());
             }
             let is_visible_to_user = Some(idx) == visible_idx && focused;
             if is_visible_to_user {

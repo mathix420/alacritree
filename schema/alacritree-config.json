@@ -1227,6 +1227,16 @@
           "description": "Draw the terminal grid through an OpenGL paint callback instead of\nhanding epaint a mesh.  It needs a GL 3 context and bypasses the\nrenderer every other panel goes through, so an unmodified config keeps\nthe path that has always drawn the grid.  A context too old for\ninstanced arrays logs once and paints the mesh from the next frame on.",
           "type": "boolean"
         },
+        "hold_exited_sessions": {
+          "default": "never",
+          "description": "Whether a session whose child has exited stays on screen instead of\nclosing with it: \"never\" | \"on_error\" | \"always\".  A held session\nwrites one line into its own grid naming the key that closes it.  A\nherdr attach that was refused is held whatever this says, since its\nrefusal message is the only report of what happened.",
+          "enum": [
+            "never",
+            "on_error",
+            "always"
+          ],
+          "type": "string"
+        },
         "icon_tooltips": {
           "default": true,
           "description": "Whether a sidebar icon explains itself on hover.",
