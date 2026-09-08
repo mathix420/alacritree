@@ -836,6 +836,18 @@ fn git_row_diff_request(row: &git_nav::GitRow, base: Option<&str>) -> Option<Dif
     Some(DiffRequest { file: row.path.clone(), source })
 }
 
+/// Where the user lands when a herdr attach fails after switching them.  The
+/// job answers frames later, so a switch made in between is theirs and
+/// outranks the restore: `previous` is handed back only while `current` is
+/// still the workspace the attach moved them to.
+fn workspace_after_failed_attach(
+    current: &WorkspaceKey,
+    switched_to: &WorkspaceKey,
+    previous: WorkspaceKey,
+) -> WorkspaceKey {
+    if current == switched_to { previous } else { current.clone() }
+}
+
 impl AlacritreeApp {
     pub fn new(cc: &CreationContext<'_>, config: Config) -> Self {
         // A job's own closure cannot wake the loop when it unwinds, and the
@@ -1466,19 +1478,20 @@ impl AlacritreeApp {
         for pending in std::mem::take(&mut self.pending_herdr_attach) {
             match pending.job.poll() {
                 Some(Ok((program, argv))) => {
-                    let still_here = self.current_workspace == pending.workspace;
+                    // The open takes the workspace by value, so the arm keeps
+                    // its own copy to judge the restore against afterwards.
+                    let switched_to = pending.workspace.clone();
                     if !self.open_herdr_session(ctx, pending.key, pending.workspace, program, argv)
-                        && still_here
                     {
-                        self.current_workspace = pending.previous;
+                        self.restore_after_failed_attach(&switched_to, pending.previous);
                     }
                 },
                 Some(Err(e)) => {
-                    self.restore_after_failed_attach(&pending);
+                    self.restore_after_failed_attach(&pending.workspace, pending.previous);
                     self.error_dialog = Some(e);
                 },
                 None if pending.job.failed() => {
-                    self.restore_after_failed_attach(&pending);
+                    self.restore_after_failed_attach(&pending.workspace, pending.previous);
                     self.error_dialog = Some("the herdr attach did not finish".to_string());
                 },
                 None => running.push(pending),
@@ -1487,13 +1500,9 @@ impl AlacritreeApp {
         self.pending_herdr_attach = running;
     }
 
-    /// Hand the user back only if they are still sitting on the workspace this
-    /// attach switched them to.  The job answers frames later, so a switch
-    /// made in between is theirs and outranks the restore.
-    fn restore_after_failed_attach(&mut self, pending: &PendingHerdrAttach) {
-        if self.current_workspace == pending.workspace {
-            self.current_workspace = pending.previous.clone();
-        }
+    fn restore_after_failed_attach(&mut self, switched_to: &WorkspaceKey, previous: WorkspaceKey) {
+        self.current_workspace =
+            workspace_after_failed_attach(&self.current_workspace, switched_to, previous);
     }
 
     /// Open the session that runs an attach client.  A shared view starts on
@@ -2818,20 +2827,11 @@ impl AlacritreeApp {
                                 );
                                 session_row_name(&s.title, activity, self.session_herdr_agent(s))
                             })
-                            .map(|n| match n.context {
-                                Some(context) => format!("{} {}", n.text, context),
-                                None => n.text,
-                            })
+                            .map(RowName::search_text)
                             .unwrap_or_default(),
                         sidebar_nav::WorkspaceEntry::Agent(side, terminal_id) => self
                             .find_herdr_agent(side, terminal_id)
-                            .map(|a| {
-                                let name = herdr_display_name(a).text;
-                                match &a.kind {
-                                    Some(kind) if *kind != name => format!("{name} {kind}"),
-                                    _ => name,
-                                }
-                            })
+                            .map(|a| herdr_display_name(a).search_text())
                             .unwrap_or_default(),
                     };
                     (entry.row(), name)
@@ -2881,6 +2881,15 @@ impl AlacritreeApp {
         self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect()
     }
 
+    /// Whether the sidebar's observed inputs carry session titles.  The
+    /// capture and the per-frame compare must read this from one place: a
+    /// capture that banks titles the compare stands down on can never match
+    /// again, and the reconciler then rebuilds the tree on every frame with
+    /// nothing failing to say so.
+    fn observes_session_titles(&self) -> bool {
+        !self.project_filter.query().is_empty()
+    }
+
     /// Live sessions borrowed for the unchanged-inputs check, which runs on
     /// every frame and must not allocate.  `titles` is off unless a query is
     /// live, so a shell repainting its prompt does not invalidate a projection
@@ -2903,7 +2912,7 @@ impl AlacritreeApp {
             active_workspace.and_then(|p| self.git_status.get(p)).and_then(|c| c.current_branch());
         let inputs = sidebar_focus::ObservedInputs::capture(
             &self.projects,
-            self.session_inputs(!self.project_filter.query().is_empty()),
+            self.session_inputs(self.observes_session_titles()),
             sidebar_focus::UiInputs {
                 session_rows_always: self.session_rows_always,
                 query: self.project_filter.query(),
@@ -2956,7 +2965,7 @@ impl AlacritreeApp {
             if let Some(prev) = &self.sidebar_focus_prev {
                 let unchanged = prev.inputs.matches(
                     &self.projects,
-                    self.session_inputs(!self.project_filter.query().is_empty()),
+                    self.session_inputs(self.observes_session_titles()),
                     sidebar_focus::UiInputs {
                         session_rows_always: self.session_rows_always,
                         query: self.project_filter.query(),
@@ -7430,6 +7439,36 @@ impl RowName {
     fn plain(text: String) -> Self {
         Self { text, context: None }
     }
+
+    /// What a text filter matches this row on.  Both parts, because the row
+    /// shows both, and the context only when the row spells it out: a query
+    /// naming a category an identity already carries must not match twice.
+    fn search_text(self) -> String {
+        match self.context {
+            Some(context) => format!("{} {}", self.text, context),
+            None => self.text,
+        }
+    }
+}
+
+/// The secondary column a herdr row shows: the integration, then whatever
+/// context the name did not already carry, then herdr's own status word, then
+/// the side it runs on, then where the row lives.  Shared by the attached and
+/// unattached rows so one heading's worth of vocabulary reads the same across
+/// both.  The native side contributes nothing, since a row that says nothing
+/// about a side is on the one the app itself runs on.
+fn herdr_palette_secondary(
+    side: &herdr::Side,
+    status: herdr::Status,
+    context: Option<&str>,
+    workspace: String,
+) -> String {
+    let mut parts = vec!["herdr".to_string()];
+    parts.extend(context.map(str::to_string));
+    parts.push(status.label().to_string());
+    parts.extend(side.label());
+    parts.push(workspace);
+    parts.join(" · ")
 }
 
 /// The name herdr reports for a pane, and `None` when it reports none.  The
@@ -9632,21 +9671,25 @@ impl AlacritreeApp {
             let activity =
                 herdr_backed_activity(session.activity(), self.session_herdr_status(session));
             let name = session_row_name(&session.title, activity, agent);
-            let secondary = match agent {
-                Some(a) => self.herdr_palette_secondary(
-                    &session.herdr_key.as_ref().expect("an agent implies a key").side,
+            let secondary = match (agent, session.herdr_key.as_ref()) {
+                (Some(a), Some(key)) => herdr_palette_secondary(
+                    &key.side,
                     a.status,
                     name.context.as_deref(),
-                    &session.working_directory,
+                    self.workspace_label(&session.working_directory),
                 ),
-                None => format!("session · {}", self.workspace_label(&session.working_directory)),
+                _ => format!("session · {}", self.workspace_label(&session.working_directory)),
             };
             items.push(PaletteItem::session(session.id, name.text, secondary));
         }
         for (ws, side, agent) in self.herdr_agent_listing() {
             let name = herdr_display_name(agent);
-            let secondary =
-                self.herdr_palette_secondary(side, agent.status, name.context.as_deref(), &ws);
+            let secondary = herdr_palette_secondary(
+                side,
+                agent.status,
+                name.context.as_deref(),
+                self.workspace_label(&ws),
+            );
             items.push(PaletteItem::herdr_agent(
                 command_palette::HerdrAttach {
                     key: herdr::HerdrKey {
@@ -9690,26 +9733,6 @@ impl AlacritreeApp {
         path.file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| wsl::display_path(path))
-    }
-
-    /// The secondary column a herdr row shows: the integration, then whatever
-    /// context the name did not already carry, then herdr's own status word,
-    /// then the side it runs on, then where the row lives.  Shared by the
-    /// attached and unattached rows so one heading's worth of vocabulary reads
-    /// the same across both.
-    fn herdr_palette_secondary(
-        &self,
-        side: &herdr::Side,
-        status: herdr::Status,
-        context: Option<&str>,
-        workspace: &WorkspaceKey,
-    ) -> String {
-        let mut parts = vec!["herdr".to_string()];
-        parts.extend(context.map(str::to_string));
-        parts.push(status.label().to_string());
-        parts.extend(side.label());
-        parts.push(self.workspace_label(workspace));
-        parts.join(" · ")
     }
 
     /// The (primary, secondary) a workspace palette row shows.
@@ -12345,6 +12368,89 @@ mod tests {
             foreground_cwd: None,
         };
         assert_eq!(herdr_display_name(&agent), RowName::plain("t1".into()));
+    }
+
+    /// The filter matches what the row paints, so a query naming the category
+    /// in front of an identity finds the row that shows both.
+    #[test]
+    fn search_text_carries_the_context_behind_the_identity() {
+        let name = RowName { text: "primary".into(), context: Some("claude".into()) };
+        assert_eq!(name.search_text(), "primary claude");
+    }
+
+    /// A row whose identity is already its category paints one word, so the
+    /// filter searches one word rather than the same word twice.
+    #[test]
+    fn search_text_of_a_plain_name_is_the_name() {
+        assert_eq!(RowName::plain("claude".into()).search_text(), "claude");
+    }
+
+    #[test]
+    fn palette_secondary_spells_out_the_context_the_name_dropped() {
+        assert_eq!(
+            herdr_palette_secondary(
+                &herdr::Side::Wsl("ubuntu".into()),
+                herdr::Status::Working,
+                Some("claude"),
+                "alacritree / master".into(),
+            ),
+            "herdr \u{b7} claude \u{b7} working \u{b7} wsl:ubuntu \u{b7} alacritree / master"
+        );
+    }
+
+    /// The name already said "claude", so repeating it in the secondary would
+    /// spell one thing twice on one row.
+    #[test]
+    fn palette_secondary_omits_a_context_the_name_already_carried() {
+        assert_eq!(
+            herdr_palette_secondary(
+                &herdr::Side::Wsl("ubuntu".into()),
+                herdr::Status::Idle,
+                None,
+                "Home".into(),
+            ),
+            "herdr \u{b7} idle \u{b7} wsl:ubuntu \u{b7} Home"
+        );
+    }
+
+    /// A row that names no side is on the side alacritree itself runs on, so
+    /// the native one is worth no column width.
+    #[test]
+    fn palette_secondary_leaves_the_native_side_unsaid() {
+        assert_eq!(
+            herdr_palette_secondary(&herdr::Side::Native, herdr::Status::Done, None, "Home".into()),
+            "herdr \u{b7} done \u{b7} Home"
+        );
+    }
+
+    /// The click switched workspace before handing the gesture over, so a
+    /// failure puts the user back where the click found them.
+    #[test]
+    fn a_failed_attach_hands_back_the_workspace_it_switched_from() {
+        let switched_to = Some(PathBuf::from("/code/wt"));
+        let previous = Some(PathBuf::from("/code/other"));
+        assert_eq!(
+            workspace_after_failed_attach(&switched_to, &switched_to, previous.clone()),
+            previous
+        );
+    }
+
+    /// The home tab is a workspace like any other, so an attach launched from
+    /// it is restored to it rather than read as nothing to go back to.
+    #[test]
+    fn a_failed_attach_restores_the_home_tab() {
+        let switched_to = Some(PathBuf::from("/code/wt"));
+        assert_eq!(workspace_after_failed_attach(&switched_to, &switched_to, None), None);
+    }
+
+    /// herdr answers frames after the click, and a switch made in between is
+    /// the user's own: restoring over it would pull them out of a workspace
+    /// they chose.
+    #[test]
+    fn a_failed_attach_leaves_a_workspace_the_user_moved_to_alone() {
+        let current = Some(PathBuf::from("/code/elsewhere"));
+        let switched_to = Some(PathBuf::from("/code/wt"));
+        assert_eq!(workspace_after_failed_attach(&current, &switched_to, None), current);
     }
 
     /// On Linux and WSL an attach is full passthrough, so the pane the user

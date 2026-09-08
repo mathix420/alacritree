@@ -90,25 +90,30 @@ mod tests {
             .collect()
     }
 
-    fn sessions(count: usize) -> Vec<(Option<std::path::PathBuf>, u64)> {
+    /// Sessions carrying the titles a live query makes the compare walk.  An
+    /// empty title compares without allocating whatever `matches` does with
+    /// it, so a fixture full of them cannot tell a borrowed comparison from
+    /// one that copies each title first.
+    fn sessions(count: usize) -> Vec<(Option<std::path::PathBuf>, u64, String)> {
         (0..count)
             .map(|i| {
                 (
                     Some(std::path::PathBuf::from(format!("/home/user/code/p0/worktree-{i}"))),
                     i as u64,
+                    format!("nvim src/worktree-{i}.rs"),
                 )
             })
             .collect()
     }
 
     fn inputs<'a>(
-        s: &'a [(Option<std::path::PathBuf>, u64)],
+        s: &'a [(Option<std::path::PathBuf>, u64, String)],
     ) -> impl Iterator<Item = SessionInput<'a>> {
-        s.iter().map(|(ws, id)| SessionInput {
+        s.iter().map(|(ws, id, title)| SessionInput {
             workspace: ws,
             id: *id,
             attention: false,
-            title: "",
+            title,
         })
     }
 
@@ -118,7 +123,7 @@ mod tests {
         let live = sessions(150);
         let ui = UiInputs {
             session_rows_always: false,
-            query: "",
+            query: "worktree",
             toggles: 0,
             toggles_apply: true,
             pr_generation: 0,
@@ -222,7 +227,7 @@ mod tests {
             let live = sessions(s);
             let ui = UiInputs {
                 session_rows_always: false,
-                query: "",
+                query: "worktree",
                 toggles: 0,
                 toggles_apply: true,
                 pr_generation: 0,
