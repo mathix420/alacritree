@@ -117,8 +117,10 @@ mod tests {
         })
     }
 
+    /// A live query that every title matches exercises the per-title compare
+    /// with no toggle filtering narrowing anything on top of it.
     #[test]
-    fn an_unchanged_frame_allocates_nothing() {
+    fn an_unchanged_frame_with_a_matching_query_allocates_nothing() {
         let projects = tree(10, 5);
         let live = sessions(150);
         let ui = UiInputs {
@@ -144,8 +146,10 @@ mod tests {
         );
     }
 
+    /// Toggle filters plus a query that only some titles match exercise the
+    /// narrower projection on top of the per-title compare.
     #[test]
-    fn an_unchanged_filtering_frame_allocates_nothing() {
+    fn an_unchanged_frame_with_toggle_filters_and_a_narrow_query_allocates_nothing() {
         let projects = tree(10, 5);
         let live = sessions(150);
         let ui = UiInputs {
