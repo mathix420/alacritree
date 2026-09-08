@@ -7750,12 +7750,20 @@ fn session_middle(kind: Option<&str>, status: Option<&str>, title: &str, fallbac
 fn native_palette_content(
     title: String,
     workspace: String,
+    workspace_path: Option<&Path>,
     kind: Option<&str>,
     status: Option<&str>,
     fallback: &str,
 ) -> PaletteSessionContent {
-    let generic =
-        title.trim().is_empty() || kind.is_some_and(|kind| title.eq_ignore_ascii_case(kind));
+    let generic = title.trim().is_empty()
+        || kind.is_some_and(|kind| title.eq_ignore_ascii_case(kind))
+        || workspace_path.is_some_and(|path| {
+            let path = wsl::display_path(path);
+            title.eq_ignore_ascii_case(&path)
+                || Path::new(&path)
+                    .file_name()
+                    .is_some_and(|name| title.eq_ignore_ascii_case(&name.to_string_lossy()))
+        });
     let primary = generic.then_some(workspace.clone()).unwrap_or_else(|| title.clone());
     PaletteSessionContent {
         title_for_hover: primary.clone(),
@@ -7772,6 +7780,7 @@ fn herdr_subtitle(glyph: &str, location: Option<&str>) -> String {
 fn herdr_palette_content(
     title: String,
     agent: &herdr::Agent,
+    raw_title_present: bool,
     workspace: Option<&str>,
     glyph: &str,
     cwd_style: PathStyle,
@@ -7780,7 +7789,7 @@ fn herdr_palette_content(
 ) -> PaletteSessionContent {
     let cwd = herdr_cwd(agent);
     let abbreviated_cwd = cwd.map(|cwd| path_style::render(cwd, cwd_style, cwd_home));
-    let generic = generic_herdr_title(&title, agent);
+    let generic = (!attached && !raw_title_present) || generic_herdr_title(&title, agent);
     let (primary, title_for_hover) = if generic {
         match workspace {
             Some(workspace) => (workspace.to_string(), workspace.to_string()),
@@ -10173,6 +10182,7 @@ impl AlacritreeApp {
                 let content = herdr_palette_content(
                     name.text,
                     agent,
+                    agent.title.is_some(),
                     workspace.as_deref(),
                     herdr_glyph,
                     self.config.ui.path_style.git_rows,
@@ -10211,6 +10221,7 @@ impl AlacritreeApp {
             let content = native_palette_content(
                 name.text,
                 self.workspace_label(&session.working_directory),
+                session.working_directory.as_deref(),
                 agent_kind,
                 status,
                 session_fallback_kind(&session.kind),
@@ -10249,6 +10260,7 @@ impl AlacritreeApp {
             let content = herdr_palette_content(
                 herdr_display_name(agent).text,
                 agent,
+                agent.title.is_some(),
                 workspace.as_deref(),
                 herdr_glyph,
                 self.config.ui.path_style.git_rows,
@@ -13256,6 +13268,7 @@ mod tests {
         let content = herdr_palette_content(
             herdr_display_name(&agent).text,
             &agent,
+            agent.title.is_some(),
             Some("alacritree / master"),
             "◆",
             PathStyle::Fish,
@@ -13352,6 +13365,7 @@ mod tests {
         let content = herdr_palette_content(
             herdr_display_name(&agent).text,
             &agent,
+            agent.title.is_some(),
             Some("alacritree / master"),
             "◆",
             PathStyle::Fish,
@@ -13370,6 +13384,7 @@ mod tests {
         let content = herdr_palette_content(
             herdr_display_name(&agent).text,
             &agent,
+            agent.title.is_some(),
             None,
             "◆",
             PathStyle::Fish,
@@ -13388,6 +13403,7 @@ mod tests {
         let content = herdr_palette_content(
             herdr_display_name(&agent).text,
             &agent,
+            agent.title.is_some(),
             None,
             "◆",
             PathStyle::Fish,
@@ -13421,6 +13437,7 @@ mod tests {
             let content = herdr_palette_content(
                 herdr_display_name(agent).text,
                 agent,
+                agent.title.is_some(),
                 None,
                 "◆",
                 PathStyle::Fish,
@@ -13463,6 +13480,100 @@ mod tests {
     }
 
     #[test]
+    fn untitled_herdr_panes_promote_home_before_terminal_id_fallback() {
+        let agent = herdr::Agent {
+            kind: None,
+            title: None,
+            cwd: None,
+            foreground_cwd: None,
+            ..herdr_agent(None)
+        };
+        let content = herdr_palette_content(
+            herdr_display_name(&agent).text,
+            &agent,
+            agent.title.is_some(),
+            None,
+            "◆",
+            PathStyle::Fish,
+            None,
+            false,
+        );
+        let item = PaletteItem::herdr_agent(
+            command_palette::HerdrAttach {
+                key: herdr::HerdrKey {
+                    side: herdr::Side::Native,
+                    terminal_id: agent.terminal_id.clone(),
+                },
+                pane_id: agent.pane_id.clone(),
+                workspace: None,
+            },
+            content.primary,
+            content.subtitle,
+            content.secondary,
+            "hover".into(),
+            agent.kind.as_deref(),
+        );
+        assert_eq!(item.primary, "Home");
+        assert_eq!(item.subtitle.as_deref(), Some("w5:p1"));
+    }
+
+    #[test]
+    fn attached_untitled_herdr_panes_keep_a_specific_pty_title() {
+        let agent = herdr_agent(None);
+        let content = herdr_palette_content(
+            "build output".into(),
+            &agent,
+            false,
+            None,
+            "◆",
+            PathStyle::Fish,
+            None,
+            true,
+        );
+        assert_eq!((content.primary, content.subtitle), ("build output".into(), "◆".into()));
+    }
+
+    #[test]
+    fn native_workspace_titles_promote_the_configured_workspace_label() {
+        let content = native_palette_content(
+            "/repo/feature".into(),
+            "◆ renamed / main".into(),
+            Some(Path::new("/repo/feature")),
+            Some("claude"),
+            Some("idle"),
+            "shell",
+        );
+        assert_eq!(content.primary, "◆ renamed / main");
+        assert_eq!(content.subtitle, "");
+
+        let basename = native_palette_content(
+            "feature".into(),
+            "◆ renamed / main".into(),
+            Some(Path::new("/repo/feature")),
+            Some("claude"),
+            Some("idle"),
+            "shell",
+        );
+        assert_eq!(basename.primary, "◆ renamed / main");
+    }
+
+    #[test]
+    fn configured_workspace_label_and_herdr_glyph_survive_generic_rows() {
+        let agent = titled(Some("claude"), Some("claude"));
+        let content = herdr_palette_content(
+            herdr_display_name(&agent).text,
+            &agent,
+            agent.title.is_some(),
+            Some("◆ renamed / main"),
+            "✦",
+            PathStyle::Fish,
+            None,
+            true,
+        );
+        assert_eq!((content.primary, content.subtitle), ("◆ renamed / main".into(), "✦".into()));
+    }
+
+    #[test]
     fn session_middle_omits_a_kind_already_in_its_title() {
         assert_eq!(session_middle(Some("claude"), Some("idle"), "Claude Code", "shell"), "idle");
     }
@@ -13477,7 +13588,8 @@ mod tests {
 
     #[test]
     fn native_shells_keep_a_shell_middle_cell() {
-        let content = native_palette_content("terminal".into(), "Home".into(), None, None, "shell");
+        let content =
+            native_palette_content("terminal".into(), "Home".into(), None, None, None, "shell");
         assert_eq!(content.secondary, "shell");
     }
 
