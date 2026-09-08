@@ -520,9 +520,13 @@ bold_family        = "Inter Display"  # unset falls back to family
 italic_family      = "Inter"          # unset falls back to family
 bold_italic_family = "Inter Display"  # unset falls back to family
 
-[ui.session_display]        # startup defaults; key bindings toggle both at runtime
+[ui.session_display]        # sidebar_always and tabs_always are startup
+                            # defaults key bindings toggle at runtime
 sidebar_always = false      # keep a sidebar session row even with one session
 tabs_always    = false      # keep a tab-strip segment even with one session
+palette_marks  = false      # paint a session's sidebar status mark in its
+                            # command-palette row too, so a row reads the same
+                            # in both places
 
 [ui.session_reorder]        # startup default; ToggleSessionDrag flips drag at runtime
 drag  = false               # drag a session row with the mouse to reorder it
