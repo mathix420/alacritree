@@ -12,6 +12,7 @@ mod wire;
 mod cli;
 mod settings;
 mod poll;
+mod view;
 
 pub(in crate::herdr) use poll::ListingReply;
 
@@ -22,7 +23,8 @@ pub use model::{
 pub use wire::error_code;
 pub use cli::{
     attach_args, attaches_directly, can_attach, focus_args, focus_pane, focus_pane_args,
-    running_session_name,
+    herdr_attach_gesture, running_session_name, HerdrAttachResult,
 };
 pub use settings::settings;
 pub use poll::{EndpointCache, Endpoints, PaneInventory, PaneMetadata, Reach};
+pub use view::{needs_view_focus, HerdrViewAction, HerdrViewFocus, HerdrViewSync};

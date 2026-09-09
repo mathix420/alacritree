@@ -219,6 +219,33 @@ pub(super) fn list_panes(
     Ok(ListingReply::parse(&String::from_utf8_lossy(&output.stdout), listing, sampled_at, attached))
 }
 
+pub type HerdrAttachResult = Result<(String, Vec<String>), String>;
+
+/// What a shared-view attach asks herdr before its client can start: focus
+/// the pane, since every app client draws whatever herdr has focused, then
+/// name the session, since that is what the client attaches to.  Both are
+/// process spawns, and on native Windows both wait on herdr starting up,
+/// which is why this only ever runs on the pool.
+///
+/// `cached_name` is what the endpoint learned in the background.  A gesture
+/// that beats the first read asks herdr itself: a wait is better than a
+/// refusal.
+pub fn herdr_attach_gesture(
+    side: &Side,
+    focus: &[String],
+    cached_name: Option<String>,
+) -> HerdrAttachResult {
+    // Two argv spawns, no shell: the only shell a `Native` command could
+    // reach on this side is cmd.exe, which does not understand `sh_quote`'s
+    // single-quoting.
+    focus_pane(side, focus)?;
+    let session = match cached_name {
+        Some(session) => session,
+        None => running_session_name(side)?,
+    };
+    Ok(side.command(&["session", "attach", &session]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
