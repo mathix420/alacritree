@@ -12,7 +12,7 @@ impl Listing {
     /// Panes from one reply.  An entry missing an identity — or, where the
     /// entry is an agent, a status — is dropped on its own; its siblings
     /// still parse.
-    pub fn parse(self, stdout: &str) -> Vec<Agent> {
+    pub fn parse(&self, stdout: &str) -> Vec<Agent> {
         let Ok(envelope) = serde_json::from_str::<Envelope>(stdout) else {
             return Vec::new();
         };
@@ -23,8 +23,22 @@ impl Listing {
             Self::Agents => listed.agents,
             Self::Panes => listed.panes,
         };
-        raw.into_iter().filter_map(|raw| raw.into_agent(self)).collect()
+        raw.into_iter().filter_map(|raw| raw.into_agent(*self)).collect()
     }
+}
+
+/// The `code` from an error envelope on stderr, for deciding whether a
+/// failure is the ordinary "no server" case or worth a log line.
+pub fn error_code(stderr: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct ErrEnvelope {
+        error: ErrBody,
+    }
+    #[derive(Deserialize)]
+    struct ErrBody {
+        code: String,
+    }
+    serde_json::from_str::<ErrEnvelope>(stderr).ok().map(|e| e.error.code)
 }
 
 #[derive(Deserialize)]
@@ -102,6 +116,7 @@ pub(super) struct RawSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::error_code;
 
     /// herdr strips its own decorative title prefix already, and that stripped
     /// form is what distinguishes two agents of the same kind in one checkout.
@@ -235,13 +250,6 @@ mod tests {
         assert_eq!(panes[1].tab_id.as_deref(), Some("w1:t4"));
     }
 
-    #[test]
-    fn a_pane_with_no_agent_is_focused_through_its_tab() {
-        let panes = Listing::Panes.parse(PANES);
-        assert_eq!(super::super::focus_args(&panes[0]), vec!["agent", "focus", "w1:p1"]);
-        assert_eq!(super::super::focus_args(&panes[1]), vec!["tab", "focus", "w1:t4"]);
-    }
-
     /// One call either way: each poll is a process spawn per side, and the
     /// pane listing already carries everything the agent listing does.
     #[test]
@@ -255,7 +263,7 @@ mod tests {
     #[test]
     fn reads_the_error_code_off_stderr() {
         let stderr = r#"{"error":{"code":"server_not_running","message":"no herdr server"},"id":"cli:agent:list"}"#;
-        assert_eq!(super::super::error_code(stderr).as_deref(), Some("server_not_running"));
+        assert_eq!(error_code(stderr).as_deref(), Some("server_not_running"));
         assert!(Listing::Agents.parse("").is_empty());
     }
 }

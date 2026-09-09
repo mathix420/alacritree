@@ -11,9 +11,10 @@ mod model;
 mod wire;
 
 pub use model::{
-    Agent, HerdrKey, Indicators, Listing, PollError, Settings, Side, Status, error_code,
-    match_workspace, unattached,
+    Agent, HerdrKey, Indicators, Listing, PollError, Settings, Side, Status, match_workspace,
+    unattached,
 };
+pub use wire::error_code;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -1326,6 +1327,29 @@ status_indicators = \"symbols\"
             detach: Some("F12 q".into()),
             indicators: Indicators::Symbols
         });
+    }
+
+    /// Captured from a native Windows server.  The second pane runs a plain
+    /// shell: herdr carries no `agent` key for it and calls its status
+    /// `unknown`, which is the state word of an agent it cannot classify and
+    /// not a claim that one is there.
+    const PANES: &str = r#"{"id":"cli:pane:list","result":{"panes":[
+        {"agent":"claude","agent_status":"idle","pane_id":"w1:p1","tab_id":"w1:t1",
+         "terminal_id":"term_a","cwd":"C:\\projects\\alacritree","focused":true,
+         "terminal_title":"✫ Claude Code","terminal_title_stripped":"Claude Code",
+         "scroll":{"offset_from_bottom":0},"workspace_id":"w1"},
+        {"agent_status":"unknown","pane_id":"w1:p4","tab_id":"w1:t4",
+         "terminal_id":"term_b","cwd":"C:\\projects\\alacritree","focused":false,
+         "terminal_title":"~/p/alacritree","terminal_title_stripped":"~/p/alacritree",
+         "scroll":{"offset_from_bottom":0},"workspace_id":"w1"}],"type":"pane_list"}}"#;
+
+    /// `herdr agent focus` answers `agent_not_found` for a pane with no agent
+    /// in it, so the tab is the only handle such a pane has.
+    #[test]
+    fn a_pane_with_no_agent_is_focused_through_its_tab() {
+        let panes = Listing::Panes.parse(PANES);
+        assert_eq!(focus_args(&panes[0]), vec!["agent", "focus", "w1:p1"]);
+        assert_eq!(focus_args(&panes[1]), vec!["tab", "focus", "w1:t4"]);
     }
 
     /// A pane herdr detected no agent in has nothing `herdr agent attach`

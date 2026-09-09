@@ -131,20 +131,6 @@ pub fn unattached<'a>(agents: &'a [Agent], side: &Side, claimed: &[HerdrKey]) ->
         .collect()
 }
 
-/// The `code` from an error envelope on stderr, for deciding whether a
-/// failure is the ordinary "no server" case or worth a log line.
-pub fn error_code(stderr: &str) -> Option<String> {
-    #[derive(serde::Deserialize)]
-    struct ErrEnvelope {
-        error: ErrBody,
-    }
-    #[derive(serde::Deserialize)]
-    struct ErrBody {
-        code: String,
-    }
-    serde_json::from_str::<ErrEnvelope>(stderr).ok().map(|e| e.error.code)
-}
-
 /// The sidebar workspace an agent is working in, by longest path prefix.
 /// `None` means it belongs under Home.
 pub fn match_workspace(agent: &Agent, side: &Side, workspaces: &[PathBuf]) -> Option<PathBuf> {
