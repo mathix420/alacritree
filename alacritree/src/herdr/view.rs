@@ -113,14 +113,14 @@ mod tests {
 
     use std::time::Duration;
 
-    use crate::herdr::Listing;
+    use crate::herdr;
 
     #[test]
     fn herdr_shared_view_follows_new_tabs_and_refocuses_on_return() {
-        let side = Side::Native;
-        let t1 = HerdrKey { side: side.clone(), terminal_id: "t1".into() };
-        let t2 = HerdrKey { side: side.clone(), terminal_id: "t2".into() };
-        let panes = Listing::Panes.parse(
+        let side = herdr::Side::Native;
+        let t1 = herdr::HerdrKey { side: side.clone(), terminal_id: "t1".into() };
+        let t2 = herdr::HerdrKey { side: side.clone(), terminal_id: "t2".into() };
+        let panes = herdr::Listing::Panes.parse(
             r#"{"result":{"panes":[
                 {"terminal_id":"t1","pane_id":"w1:p1","tab_id":"w1:t1","focused":false},
                 {"terminal_id":"t2","pane_id":"w2:p1","tab_id":"w2:t1","focused":true}
@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn herdr_shared_view_refocuses_after_an_ordinary_session() {
-        let key = HerdrKey { side: Side::Native, terminal_id: "t1".into() };
+        let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
         let mut sync = HerdrViewSync::default();
         sync.attached(1, Instant::now());
         assert_eq!(sync.next(None, AttachMode::Session, None, false), None);
@@ -162,9 +162,9 @@ mod tests {
 
     #[test]
     fn herdr_follow_attempts_wait_for_a_new_snapshot() {
-        let side = Side::Native;
-        let key = HerdrKey { side: side.clone(), terminal_id: "t1".into() };
-        let panes = Listing::Panes.parse(
+        let side = herdr::Side::Native;
+        let key = herdr::HerdrKey { side: side.clone(), terminal_id: "t1".into() };
+        let panes = herdr::Listing::Panes.parse(
             r#"{"result":{"panes":[
                 {"terminal_id":"t2","pane_id":"w2:p1","tab_id":"w2:t1","focused":true}
             ]}}"#,
@@ -191,10 +191,10 @@ mod tests {
 
     #[test]
     fn herdr_shared_view_rejects_stale_and_foreign_focus_snapshots() {
-        let side = Side::Wsl("ubuntu".into());
-        let other_side = Side::Wsl("debian".into());
-        let key = HerdrKey { side: side.clone(), terminal_id: "t1".into() };
-        let panes = Listing::Panes.parse(
+        let side = herdr::Side::Wsl("ubuntu".into());
+        let other_side = herdr::Side::Wsl("debian".into());
+        let key = herdr::HerdrKey { side: side.clone(), terminal_id: "t1".into() };
+        let panes = herdr::Listing::Panes.parse(
             r#"{"result":{"panes":[
                 {"terminal_id":"t2","pane_id":"w2:p1","tab_id":"w2:t1","focused":true}
             ]}}"#,
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn herdr_focus_completion_cannot_restore_a_view_left_while_pending() {
-        let key = HerdrKey { side: Side::Native, terminal_id: "t1".into() };
+        let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
         let active = Some((1, &key, false));
         let mut sync = HerdrViewSync::default();
         assert_eq!(
@@ -257,7 +257,7 @@ mod tests {
     /// screen has to keep asking for its own.
     #[test]
     fn a_shared_view_asks_herdr_for_its_pane() {
-        let key = HerdrKey { side: Side::Native, terminal_id: "t1".into() };
+        let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
         let asks = needs_view_focus(Some(&key), AttachMode::Agent, true, 1, None);
         assert_eq!(asks, cfg!(windows));
     }
@@ -266,7 +266,7 @@ mod tests {
     /// about what it draws.
     #[test]
     fn a_direct_attach_never_asks_herdr_for_its_pane() {
-        let key = HerdrKey { side: Side::Wsl("d".into()), terminal_id: "t1".into() };
+        let key = herdr::HerdrKey { side: herdr::Side::Wsl("d".into()), terminal_id: "t1".into() };
         assert!(!needs_view_focus(Some(&key), AttachMode::Agent, true, 1, None));
         assert!(!needs_view_focus(None, AttachMode::Agent, true, 1, None));
     }
@@ -275,7 +275,7 @@ mod tests {
     /// again every frame would spawn a herdr per frame.
     #[test]
     fn a_shared_view_asks_once_per_switch() {
-        let key = HerdrKey { side: Side::Native, terminal_id: "t1".into() };
+        let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
         assert!(!needs_view_focus(Some(&key), AttachMode::Agent, true, 1, Some(1)));
         let asks = needs_view_focus(Some(&key), AttachMode::Agent, true, 2, Some(1));
         assert_eq!(asks, cfg!(windows));
