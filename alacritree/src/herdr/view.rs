@@ -280,4 +280,12 @@ mod tests {
         let asks = needs_view_focus(Some(&key), AttachMode::Agent, true, 2, Some(1));
         assert_eq!(asks, cfg!(windows));
     }
+
+    /// A pane with no agent in it has no direct attach on any side, so its
+    /// session is a shared view and keeps asking for its own pane.
+    #[test]
+    fn an_agentless_pane_asks_herdr_for_its_pane_on_every_side() {
+        let key = herdr::HerdrKey { side: herdr::Side::Wsl("d".into()), terminal_id: "t1".into() };
+        assert!(needs_view_focus(Some(&key), AttachMode::Agent, false, 1, None));
+    }
 }
