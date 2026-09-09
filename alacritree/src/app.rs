@@ -7850,23 +7850,6 @@ fn herdr_cwd(agent: &herdr::Agent) -> Option<&str> {
         .or_else(|| agent.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()))
 }
 
-fn path_last_component(path: &str) -> &str {
-    path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or_default()
-}
-
-fn generic_herdr_title(title: &str, agent: &herdr::Agent) -> bool {
-    title.trim().is_empty()
-        || agent.kind.as_deref().is_some_and(|kind| title.eq_ignore_ascii_case(kind))
-        || [agent.foreground_cwd.as_deref(), agent.cwd.as_deref()]
-            .into_iter()
-            .flatten()
-            .filter(|cwd| !cwd.trim().is_empty())
-            .any(|cwd| {
-                title.eq_ignore_ascii_case(cwd)
-                    || title.eq_ignore_ascii_case(path_last_component(cwd))
-            })
-}
-
 /// The middle column's words, most general first: where the row comes from,
 /// what runs in it, what that is doing.  The kind is spelled out whether or
 /// not the title repeats it, so every row in one state reads identically.
@@ -7885,29 +7868,22 @@ fn session_middle(
     parts.join(" · ")
 }
 
+/// The second line is where the row lives, whether or not the title above it
+/// repeats part of the path.  Only a titleless row gives the first line up to
+/// the workspace, and then the second has nothing left to say.
 fn native_palette_content(
     title: String,
     workspace: String,
-    workspace_path: Option<&Path>,
     kind: Option<&str>,
     status: Option<&str>,
     fallback: &str,
 ) -> PaletteSessionContent {
-    let generic = title.trim().is_empty()
-        || kind.is_some_and(|kind| title.eq_ignore_ascii_case(kind))
-        || workspace_path.is_some_and(|path| {
-            let path = wsl::display_path(path);
-            title.eq_ignore_ascii_case(&path)
-                || Path::new(&path)
-                    .file_name()
-                    .is_some_and(|name| title.eq_ignore_ascii_case(&name.to_string_lossy()))
-        });
-    let primary = if generic { workspace.clone() } else { title };
+    let primary = if title.trim().is_empty() { workspace.clone() } else { title };
     PaletteSessionContent {
         title_for_hover: primary.clone(),
         secondary: session_middle(None, kind, status, fallback),
+        subtitle: if workspace == primary { String::new() } else { workspace },
         primary,
-        subtitle: if generic { String::new() } else { workspace },
     }
 }
 
@@ -7926,8 +7902,10 @@ fn herdr_palette_content(
 ) -> PaletteSessionContent {
     let cwd = herdr_cwd(agent);
     let abbreviated_cwd = cwd.map(|cwd| path_style::render(cwd, cwd_style, cwd_home));
-    let generic = !raw_title_present || generic_herdr_title(&title, agent);
-    let (primary, title_for_hover) = if generic {
+    let named = raw_title_present && !title.trim().is_empty();
+    let (primary, title_for_hover) = if named {
+        (title.clone(), title)
+    } else {
         match workspace {
             Some(workspace) => (workspace.to_string(), workspace.to_string()),
             None => match (abbreviated_cwd.clone(), cwd) {
@@ -7935,14 +7913,16 @@ fn herdr_palette_content(
                 _ => ("Home".to_string(), "Home".to_string()),
             },
         }
-    } else {
-        (title.clone(), title)
     };
-    let subtitle = if generic {
-        glyph.to_string()
-    } else {
-        let location = workspace.or(abbreviated_cwd.as_deref());
-        herdr_subtitle(glyph, location)
+    // A workspace names the project a pane belongs to, which its path does
+    // not, so it holds the second line whatever the title says.
+    let location = match workspace {
+        Some(workspace) => Some(workspace.to_string()),
+        None => abbreviated_cwd.clone().filter(|_| cwd != Some(primary.as_str())),
+    };
+    let subtitle = match location.filter(|location| *location != primary) {
+        Some(location) => herdr_subtitle(glyph, Some(&location)),
+        None => glyph.to_string(),
     };
     PaletteSessionContent {
         primary,
@@ -10358,7 +10338,6 @@ impl AlacritreeApp {
                     let mut content = native_palette_content(
                         name.text,
                         self.workspace_label(&session.working_directory),
-                        session.working_directory.as_deref(),
                         None,
                         None,
                         "shell",
@@ -10416,7 +10395,6 @@ impl AlacritreeApp {
             let content = native_palette_content(
                 name.text,
                 self.workspace_label(&session.working_directory),
-                session.working_directory.as_deref(),
                 agent_kind,
                 status,
                 fallback_kind,
@@ -14121,8 +14099,52 @@ mod tests {
         );
     }
 
+    /// herdr's own word for the pane is what the row is called, even when it
+    /// says no more than the kind already in the middle column: the line under
+    /// it is the workspace, which is the part that tells two rows apart.
     #[test]
-    fn generic_herdr_titles_promote_their_directory() {
+    fn a_herdr_title_repeating_its_kind_keeps_the_workspace_below_it() {
+        let agent = titled(Some("claude"), Some("claude"));
+        let content = herdr_palette_content(
+            herdr_display_name(&agent).text,
+            &agent,
+            agent.title.is_some(),
+            Some("renamed / main"),
+            "◆",
+            PathStyle::Fish,
+            None,
+        );
+        assert_eq!(
+            (content.primary, content.subtitle, content.secondary),
+            ("claude".into(), "◆ renamed / main".into(), "herdr · claude · idle".into())
+        );
+    }
+
+    /// A title herdr took from the pane's own directory says nothing about
+    /// which project holds it, so the workspace label still gets its line.
+    #[test]
+    fn a_herdr_title_naming_its_directory_keeps_the_workspace_below_it() {
+        let agent = herdr::Agent {
+            cwd: Some("/home/dev/Git/devkit".into()),
+            ..titled(Some("claude"), Some("devkit"))
+        };
+        let content = herdr_palette_content(
+            herdr_display_name(&agent).text,
+            &agent,
+            agent.title.is_some(),
+            Some("devkit / main"),
+            "◆",
+            PathStyle::Fish,
+            None,
+        );
+        assert_eq!(
+            (content.primary, content.subtitle),
+            ("devkit".into(), "◆ devkit / main".into())
+        );
+    }
+
+    #[test]
+    fn untitled_herdr_panes_promote_their_directory() {
         let agent = agent_in("/home/dev/Git/devkit");
         let content = herdr_palette_content(
             herdr_display_name(&agent).text,
@@ -14140,7 +14162,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_herdr_titles_without_a_directory_use_home() {
+    fn untitled_herdr_panes_without_a_directory_use_home() {
         let agent = herdr_agent(Some("claude"));
         let content = herdr_palette_content(
             herdr_display_name(&agent).text,
@@ -14157,10 +14179,10 @@ mod tests {
         );
     }
 
-    /// Two unmatched panes with the same cwd abbreviate to one identical
-    /// primary and subtitle, so nothing in the row's identity tells them
-    /// apart; a query still reaches each one on its own through fields the
-    /// row's identity does not carry, like the terminal id.
+    /// Two unmatched panes titled with the same cwd read identically down
+    /// both lines, so nothing in the row's identity tells them apart; a query
+    /// still reaches each one on its own through fields the row's identity
+    /// does not carry, like the terminal id.
     #[test]
     fn duplicate_unmatched_herdr_panes_share_a_primary_but_stay_searchable() {
         let panes = herdr::Listing::Panes.parse(
@@ -14204,8 +14226,8 @@ mod tests {
                 agent.kind.as_deref(),
             ));
         }
-        assert_eq!(items[0].primary, "~/.l/s/chezmoi");
-        assert_eq!(items[1].primary, "~/.l/s/chezmoi");
+        assert_eq!(items[0].primary, "~/.local/share/chezmoi");
+        assert_eq!(items[1].primary, "~/.local/share/chezmoi");
         assert_eq!(items[0].subtitle.as_deref(), Some("◆"));
         assert_eq!(items[1].subtitle.as_deref(), Some("◆"));
         assert_eq!(items[0].secondary, "herdr · codex · working");
@@ -14277,36 +14299,48 @@ mod tests {
         assert_eq!((content.primary, content.subtitle), ("Home".into(), "◆".into()));
     }
 
+    /// A title that spells out the session's own directory, in full or as its
+    /// last component, still leaves the workspace label as the only thing on
+    /// the row naming the project, so it keeps the line under the title.
     #[test]
-    fn native_workspace_titles_promote_the_configured_workspace_label() {
+    fn native_titles_naming_their_directory_keep_the_workspace_label() {
         let content = native_palette_content(
             "/repo/feature".into(),
             "◆ renamed / main".into(),
-            Some(Path::new("/repo/feature")),
             Some("claude"),
             Some("idle"),
             "shell",
         );
-        assert_eq!(content.primary, "◆ renamed / main");
-        assert_eq!(content.subtitle, "");
+        assert_eq!(content.primary, "/repo/feature");
+        assert_eq!(content.subtitle, "◆ renamed / main");
 
         let basename = native_palette_content(
             "feature".into(),
             "◆ renamed / main".into(),
-            Some(Path::new("/repo/feature")),
             Some("claude"),
             Some("idle"),
             "shell",
         );
-        assert_eq!(basename.primary, "◆ renamed / main");
+        assert_eq!(
+            (basename.primary, basename.subtitle),
+            ("feature".into(), "◆ renamed / main".into())
+        );
+    }
+
+    /// Nothing but the workspace label is left to name a titleless row, and
+    /// once it takes the first line the second would only repeat it.
+    #[test]
+    fn a_titleless_native_row_is_named_by_its_workspace() {
+        let content =
+            native_palette_content(String::new(), "renamed / main".into(), None, None, "shell");
+        assert_eq!((content.primary, content.subtitle), ("renamed / main".into(), String::new()));
     }
 
     #[test]
-    fn native_generic_home_titles_reach_palette_items() {
+    fn native_home_titles_reach_palette_items() {
         let content = native_palette_content(
             "claude".into(),
             "Home".into(),
-            None,
             Some("claude"),
             Some("idle"),
             "shell",
@@ -14321,7 +14355,8 @@ mod tests {
             None,
             false,
         );
-        assert_eq!(item.primary, "Home");
+        assert_eq!(item.primary, "claude");
+        assert_eq!(item.subtitle.as_deref(), Some("Home"));
         assert_eq!(item.secondary, "claude · idle");
     }
 
@@ -14351,19 +14386,22 @@ mod tests {
         assert_eq!(item.section, command_palette::PaletteSection::OpenSessions);
         assert_eq!(
             (item.primary.as_str(), item.subtitle.as_deref()),
-            ("renamed / feature", Some("✦"))
+            ("claude", Some("✦ renamed / feature"))
         );
 
         app.config.ui.icons.herdr.glyph = Some("  ".into());
         let items = app.palette_items();
         let item =
             items.iter().find(|item| item.action == PaletteAction::ActivateSession(id)).unwrap();
-        assert_eq!(item.subtitle.as_deref(), Some(DEFAULT_HERDR_ICON.as_str()));
+        assert_eq!(
+            item.subtitle.as_deref(),
+            Some(format!("{} renamed / feature", DEFAULT_HERDR_ICON.as_str()).as_str())
+        );
     }
 
     #[test]
-    fn configured_workspace_label_and_herdr_glyph_survive_generic_rows() {
-        let agent = titled(Some("claude"), Some("claude"));
+    fn configured_workspace_label_and_herdr_glyph_survive_untitled_rows() {
+        let agent = herdr_agent(Some("claude"));
         let content = herdr_palette_content(
             herdr_display_name(&agent).text,
             &agent,
@@ -14416,26 +14454,23 @@ mod tests {
 
     #[test]
     fn native_shells_keep_a_shell_middle_cell() {
-        let content =
-            native_palette_content("terminal".into(), "Home".into(), None, None, None, "shell");
+        let content = native_palette_content("terminal".into(), "Home".into(), None, None, "shell");
         assert_eq!(content.secondary, "shell");
     }
 
-    /// A scratchpad's title is the literal word `scratchpad`, equal to its
-    /// own kind, so it reads as generic and yields the primary slot to the
-    /// workspace label, the part that tells one scratchpad row from another.
+    /// Every scratchpad row carries the same one-word title, so the workspace
+    /// label under it is what tells one from another.
     #[test]
-    fn a_scratchpad_titled_only_with_its_kind_promotes_the_workspace() {
+    fn a_scratchpad_reads_its_kind_over_its_workspace() {
         let content = native_palette_content(
             "scratchpad".into(),
             "◆ renamed / main".into(),
-            None,
             Some("scratchpad"),
             None,
             "shell",
         );
-        assert_eq!(content.primary, "◆ renamed / main");
-        assert_eq!(content.subtitle, "");
+        assert_eq!(content.primary, "scratchpad");
+        assert_eq!(content.subtitle, "◆ renamed / main");
         assert_eq!(content.secondary, "scratchpad");
     }
 
