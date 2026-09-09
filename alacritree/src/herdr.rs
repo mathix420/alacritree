@@ -192,7 +192,11 @@ impl RawPane {
             pane_id: self.pane_id?,
             tab_id: self.tab_id,
             status,
-            kind: self.display_agent.or(self.agent),
+            kind: self
+                .display_agent
+                .or(self.agent)
+                .map(|kind| kind.trim().to_string())
+                .filter(|kind| !kind.is_empty()),
             title: self
                 .terminal_title_stripped
                 .map(|t| t.trim().to_string())
@@ -1516,6 +1520,15 @@ mod tests {
             {"terminal_id":"t1","pane_id":"w5:p1","agent_status":"idle","agent":"claude",
              "terminal_title_stripped":"   "}]}}"#;
         assert_eq!(Listing::Agents.parse(stdout)[0].title, None);
+    }
+
+    /// A kind of nothing but spaces names no agent, and a row that carried it
+    /// would render an empty word between its separators.
+    #[test]
+    fn a_blank_kind_is_no_kind() {
+        let stdout = r#"{"result":{"agents":[
+            {"terminal_id":"t1","pane_id":"w5:p1","agent_status":"idle","agent":"  "}]}}"#;
+        assert_eq!(Listing::Agents.parse(stdout)[0].kind, None);
     }
 
     /// herdr ships `ctrl+b` / `prefix+q`, so an untouched config is not an
