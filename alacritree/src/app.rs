@@ -7992,6 +7992,16 @@ fn session_fallback_kind(kind: &SessionKind) -> &'static str {
     }
 }
 
+/// Whether a shell row can say what it is doing.  Only a plain shell has a
+/// foreground job to read; a diff or scratchpad row has no process behind it
+/// and would be inventing a state.
+fn shell_state_for(kind: &SessionKind, busy: bool) -> Option<&'static str> {
+    match kind {
+        SessionKind::Shell => Some(if busy { "busy" } else { "idle" }),
+        SessionKind::Diff { .. } | SessionKind::Scratchpad { .. } => None,
+    }
+}
+
 /// The name herdr reports for a pane, and `None` when it reports none.  The
 /// kind rides along as context unless it says the same thing as the title.
 /// What a titleless agent falls back to differs by row, so each caller says
@@ -10398,9 +10408,12 @@ impl AlacritreeApp {
                 ));
                 continue;
             }
+            let fallback_kind = session_fallback_kind(&session.kind);
             let (agent_kind, status) = match activity {
                 SessionActivity::Agent { name, live } => (name, Some(live.label())),
-                SessionActivity::Shell => (None, None),
+                SessionActivity::Shell => {
+                    (Some(fallback_kind), shell_state_for(&session.kind, session.is_busy()))
+                },
             };
             let content = native_palette_content(
                 name.text,
@@ -14387,6 +14400,18 @@ mod tests {
     #[test]
     fn a_lead_survives_an_otherwise_empty_middle_column() {
         assert_eq!(session_middle(Some("herdr"), None, None, "shell"), "herdr · shell");
+    }
+
+    /// A shell row reports whether a job holds the terminal, which is the one
+    /// thing about a shell worth reading off a list.  A kind with no
+    /// foreground job of its own reports nothing rather than a state it
+    /// cannot observe.
+    #[test]
+    fn only_a_plain_shell_reports_a_busy_state() {
+        assert_eq!(shell_state_for(&SessionKind::Shell, true), Some("busy"));
+        assert_eq!(shell_state_for(&SessionKind::Shell, false), Some("idle"));
+        assert_eq!(shell_state_for(&SessionKind::Scratchpad { path: PathBuf::new() }, true), None);
+        assert_eq!(shell_state_for(&SessionKind::Diff { key: "k".into() }, true), None);
     }
 
     #[test]
