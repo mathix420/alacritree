@@ -115,8 +115,8 @@ pub(super) struct RawSession {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::error_code;
+    use super::*;
 
     /// herdr strips its own decorative title prefix already, and that stripped
     /// form is what distinguishes two agents of the same kind in one checkout.

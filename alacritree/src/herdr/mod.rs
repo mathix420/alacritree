@@ -7,24 +7,24 @@
 //! prints success on stdout and errors on stderr, which is why callers
 //! capture both.
 
-mod model;
-mod wire;
 mod cli;
-mod settings;
+mod model;
 mod poll;
+mod settings;
 mod view;
+mod wire;
 
 pub(in crate::herdr) use poll::ListingReply;
 
+pub use cli::{
+    HerdrAttachResult, attach_args, attaches_directly, can_attach, focus_args, focus_pane,
+    focus_pane_args, herdr_attach_gesture, running_session_name,
+};
 pub use model::{
     Agent, HerdrKey, Indicators, Listing, PollError, Settings, Side, Status, match_workspace,
     unattached,
 };
-pub use wire::error_code;
-pub use cli::{
-    attach_args, attaches_directly, can_attach, focus_args, focus_pane, focus_pane_args,
-    herdr_attach_gesture, running_session_name, HerdrAttachResult,
-};
-pub use settings::settings;
 pub use poll::{EndpointCache, Endpoints, PaneInventory, PaneMetadata, Reach};
-pub use view::{needs_view_focus, HerdrViewAction, HerdrViewFocus, HerdrViewSync};
+pub use settings::settings;
+pub use view::{HerdrViewAction, HerdrViewFocus, HerdrViewSync, needs_view_focus};
+pub use wire::error_code;

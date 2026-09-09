@@ -12,7 +12,7 @@ use crate::config::AttachMode;
 use crate::{command_ext, jobs, wsl};
 
 use super::wire::SessionList;
-use super::{error_code, Agent, Listing, ListingReply, PollError, Side};
+use super::{Agent, Listing, ListingReply, PollError, Side, error_code};
 
 /// Single-quote a POSIX argument, since WSL invocations are one `sh -lc`
 /// string rather than an argv.

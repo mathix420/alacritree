@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::{jobs, wsl};
 
 use super::cli::list_panes;
-use super::{running_session_name, settings, Agent, Listing, PollError, Settings, Side};
+use super::{Agent, Listing, PollError, Settings, Side, running_session_name, settings};
 
 /// How long an endpoint known to have a herdr waits before being retried.
 const RECOVERY_RETRY: Duration = Duration::from_secs(30);
@@ -67,7 +67,12 @@ pub(super) struct ListingReply {
 }
 
 impl ListingReply {
-    pub(super) fn parse(stdout: &str, listing: Listing, sampled_at: Instant, attached: bool) -> Self {
+    pub(super) fn parse(
+        stdout: &str,
+        listing: Listing,
+        sampled_at: Instant,
+        attached: bool,
+    ) -> Self {
         Self {
             sampled_at,
             listing,

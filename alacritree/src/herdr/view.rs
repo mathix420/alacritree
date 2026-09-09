@@ -10,7 +10,7 @@ use crate::config::AttachMode;
 use crate::jobs;
 use crate::session::SessionId;
 
-use super::{attaches_directly, Agent, HerdrKey, Side};
+use super::{Agent, HerdrKey, Side, attaches_directly};
 
 /// The shared view herdr is being pointed at, and the call doing the
 /// pointing.  The handle is held rather than dropped because dropping a job
@@ -63,8 +63,8 @@ impl HerdrViewSync {
         snapshot: Option<(Instant, &Side, &[Agent])>,
         busy: bool,
     ) -> Option<HerdrViewAction> {
-        let active = active
-            .filter(|(_, key, has_agent)| !attaches_directly(&key.side, attach, *has_agent));
+        let active =
+            active.filter(|(_, key, has_agent)| !attaches_directly(&key.side, attach, *has_agent));
         let visible = active.map(|(id, ..)| id);
         if self.visible != visible {
             self.visible = visible;
