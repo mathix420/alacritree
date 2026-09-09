@@ -7924,7 +7924,6 @@ fn herdr_palette_content(
     glyph: &str,
     cwd_style: PathStyle,
     cwd_home: Option<&str>,
-    _attached: bool,
 ) -> PaletteSessionContent {
     let cwd = herdr_cwd(agent);
     let abbreviated_cwd = cwd.map(|cwd| path_style::render(cwd, cwd_style, cwd_home));
@@ -10346,7 +10345,6 @@ impl AlacritreeApp {
                         herdr_glyph,
                         self.config.ui.path_style.git_rows,
                         None,
-                        true,
                     )
                 } else {
                     let mut content = native_palette_content(
@@ -10395,6 +10393,7 @@ impl AlacritreeApp {
                     content.secondary,
                     hover,
                     kind,
+                    agent.map(|agent| agent.pane_id.as_str()),
                     true,
                 ));
                 continue;
@@ -10437,6 +10436,7 @@ impl AlacritreeApp {
                 content.secondary,
                 hover,
                 agent_kind,
+                None,
                 false,
             ));
         }
@@ -10450,7 +10450,6 @@ impl AlacritreeApp {
                 herdr_glyph,
                 self.config.ui.path_style.git_rows,
                 None,
-                false,
             );
             let settings = self.herdr_settings(side);
             let managed =
@@ -12244,6 +12243,46 @@ mod tests {
         assert!(palette.rank(&items).contains(&row));
     }
 
+    /// A stale retained pane still names herdr in the middle column.  The
+    /// override that drops its status for staleness carries the "herdr" lead
+    /// itself rather than relying on `herdr_palette_content` to have already
+    /// supplied one.
+    #[test]
+    fn a_stale_herdr_row_still_leads_its_middle_column_with_herdr() {
+        let mut app = herdr_lifecycle_app();
+        let side = herdr::Side::Native;
+        adopt_herdr_fixture(
+            &mut app,
+            side.clone(),
+            r#"{"result":{"panes":[
+            {"terminal_id":"term-stale","pane_id":"w1:p1","terminal_title_stripped":"review work","cwd":"/private/project"}
+        ]}}"#,
+            Instant::now(),
+        );
+        let id = bind_herdr_fixture(&mut app, side.clone(), "term-stale");
+        let cache = app
+            .herdr_endpoints
+            .caches_mut_for_test()
+            .iter_mut()
+            .find(|cache| cache.side() == &side)
+            .unwrap();
+        cache.complete_listing_for_test(
+            Err(herdr::PollError::Absent("spawn_failed")),
+            herdr::Listing::Panes,
+            herdr::Listing::Agents,
+            Instant::now(),
+        );
+        app.reconcile_herdr_sessions(&Context::default());
+
+        assert_eq!(app.sessions[0].id, id);
+        let pane = app.herdr_endpoints.caches()[0].attachment_pane("term-stale").unwrap();
+        assert!(!pane.current);
+        let items = app.palette_items();
+        let item =
+            items.iter().find(|item| item.action == PaletteAction::ActivateSession(id)).unwrap();
+        assert_eq!(item.secondary, "herdr · session");
+    }
+
     #[test]
     fn herdr_inventory_removes_only_the_closed_terminal_through_session_cleanup() {
         let mut app = herdr_lifecycle_app();
@@ -13966,7 +14005,6 @@ mod tests {
             "◆",
             PathStyle::Fish,
             None,
-            false,
         );
         assert_eq!(
             (content.primary, content.subtitle, content.secondary),
@@ -14063,7 +14101,6 @@ mod tests {
             "◆",
             PathStyle::Fish,
             None,
-            true,
         );
         assert_eq!(
             (content.primary, content.subtitle, content.secondary),
@@ -14086,7 +14123,6 @@ mod tests {
             "◆",
             PathStyle::Fish,
             None,
-            false,
         );
         assert_eq!(
             (content.primary, content.subtitle, content.secondary),
@@ -14105,7 +14141,6 @@ mod tests {
             "◆",
             PathStyle::Fish,
             None,
-            true,
         );
         assert_eq!(
             (content.primary, content.subtitle, content.secondary),
@@ -14139,7 +14174,6 @@ mod tests {
                 "◆",
                 PathStyle::Fish,
                 None,
-                false,
             );
             items.push(PaletteItem::herdr_agent(
                 command_palette::HerdrAttach {
@@ -14169,7 +14203,9 @@ mod tests {
             command_palette::PaletteSection::HerdrSessions,
             vec![0, 1],
         )]);
-        for (query, expected) in [("working", 0), ("idle", 1), ("chezmoi", 0)] {
+        for (query, expected) in
+            [("w7:p1", 0), ("w7:p3", 1), ("working", 0), ("idle", 1), ("chezmoi", 0)]
+        {
             palette.clear_query();
             palette.query_mut().push_str(query);
             assert_eq!(palette.rank(&items).first(), Some(&expected));
@@ -14193,7 +14229,6 @@ mod tests {
             "◆",
             PathStyle::Fish,
             None,
-            false,
         );
         let item = PaletteItem::herdr_agent(
             command_palette::HerdrAttach {
@@ -14225,7 +14260,6 @@ mod tests {
             "◆",
             PathStyle::Fish,
             None,
-            true,
         );
         assert_eq!((content.primary, content.subtitle), ("Home".into(), "◆".into()));
     }
@@ -14271,6 +14305,7 @@ mod tests {
             content.secondary,
             "hover".into(),
             Some("claude"),
+            None,
             false,
         );
         assert_eq!(item.primary, "Home");
@@ -14324,7 +14359,6 @@ mod tests {
             "✦",
             PathStyle::Fish,
             None,
-            true,
         );
         assert_eq!((content.primary, content.subtitle), ("◆ renamed / main".into(), "✦".into()));
     }
@@ -17303,6 +17337,7 @@ mod tests {
             secondary.to_owned(),
             hover.to_owned(),
             Some("codex"),
+            None,
             true,
         )
     }

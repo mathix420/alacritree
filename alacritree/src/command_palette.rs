@@ -158,9 +158,10 @@ impl PaletteItem {
         secondary: String,
         hover: String,
         agent_kind: Option<&str>,
+        pane_id: Option<&str>,
         is_herdr: bool,
     ) -> Self {
-        let search = session_search(&primary, &subtitle, &secondary, agent_kind, is_herdr);
+        let search = session_search(&primary, &subtitle, &secondary, agent_kind, pane_id, is_herdr);
         Self {
             action: PaletteAction::ActivateSession(id),
             section: PaletteSection::OpenSessions,
@@ -221,7 +222,14 @@ impl PaletteItem {
         hover: String,
         agent_kind: Option<&str>,
     ) -> Self {
-        let search = session_search(&primary, &subtitle, &secondary, agent_kind, true);
+        let search = session_search(
+            &primary,
+            &subtitle,
+            &secondary,
+            agent_kind,
+            Some(&attach.pane_id),
+            true,
+        );
         Self {
             action: PaletteAction::AttachHerdrAgent(attach),
             section: PaletteSection::HerdrSessions,
@@ -235,17 +243,25 @@ impl PaletteItem {
     }
 }
 
+/// `pane_id` is folded in unpainted: a generic herdr row's second line is
+/// just the glyph, so duplicate rows with the same title, cwd and status
+/// would otherwise be findable by neither sight nor search.
 fn session_search(
     primary: &str,
     subtitle: &str,
     secondary: &str,
     agent_kind: Option<&str>,
+    pane_id: Option<&str>,
     is_herdr: bool,
 ) -> String {
     let mut search = format!("{primary} {subtitle} {secondary}");
     if let Some(agent_kind) = agent_kind {
         search.push(' ');
         search.push_str(agent_kind);
+    }
+    if let Some(pane_id) = pane_id {
+        search.push(' ');
+        search.push_str(pane_id);
     }
     if is_herdr {
         search.push_str(" herdr");
@@ -727,6 +743,7 @@ mod tests {
                 "working".into(),
                 "hover".into(),
                 Some("claude"),
+                None,
                 true,
             ),
             PaletteItem::herdr_agent(
@@ -743,6 +760,7 @@ mod tests {
                 "Home".into(),
                 "shell".into(),
                 "hover".into(),
+                None,
                 None,
                 false,
             ),
@@ -764,6 +782,7 @@ mod tests {
                 "Home".into(),
                 "shell".into(),
                 "hover".into(),
+                None,
                 None,
                 false,
             ),
@@ -793,6 +812,7 @@ mod tests {
             "idle".into(),
             "Terminal: term_123\nWorkspace: C:\\full\\private".into(),
             Some("claude"),
+            None,
             false,
         )];
         let mut palette = CommandPalette::new();
