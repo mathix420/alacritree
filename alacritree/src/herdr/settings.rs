@@ -7,6 +7,7 @@ use std::process::Stdio;
 use crate::{command_ext, jobs, wsl};
 use serde::Deserialize;
 
+use super::cli::bounded;
 use super::{Indicators, Settings, Side};
 
 const DEFAULT_PREFIX: &str = "ctrl+b";
@@ -153,13 +154,15 @@ fn read_config(side: &Side, _blocking: &jobs::Blocking) -> Option<String> {
         Side::Wsl(distro) => {
             let (program, args) = wsl::exec_invocation(distro, &["sh", "-lc", CONFIG_SCRIPT]);
             #[allow(clippy::disallowed_methods)] // Reading the distro's config is this arm's job.
-            let output = command_ext::hidden(program)
-                .args(args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .output()
-                .ok()?;
+            let run = move || {
+                command_ext::hidden(program)
+                    .args(args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .output()
+            };
+            let output = bounded(run)?.ok()?;
             output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
         },
     }
