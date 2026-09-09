@@ -7879,10 +7879,9 @@ fn session_middle(
     let mut parts: Vec<String> = lead.map(str::to_owned).into_iter().collect();
     parts.extend(kind.map(str::to_lowercase));
     parts.extend(status.map(str::to_owned));
-    if parts.len() == lead.iter().count() {
+    if kind.is_none() && status.is_none() {
         parts.push(fallback.to_string());
     }
-    parts.retain(|part| !part.is_empty());
     parts.join(" · ")
 }
 
@@ -7945,7 +7944,6 @@ fn herdr_palette_content(
         let location = workspace.or(abbreviated_cwd.as_deref());
         herdr_subtitle(glyph, location)
     };
-    let fallback = if agent.status.is_some() { "" } else { "shell" };
     PaletteSessionContent {
         primary,
         subtitle,
@@ -7953,7 +7951,7 @@ fn herdr_palette_content(
             Some("herdr"),
             agent.kind.as_deref(),
             agent.status.map(|status| status.label()),
-            fallback,
+            "shell",
         ),
         title_for_hover,
     }
@@ -10363,7 +10361,7 @@ impl AlacritreeApp {
                         session.working_directory.as_deref(),
                         None,
                         None,
-                        "session",
+                        "shell",
                     );
                     content.subtitle = herdr_subtitle(
                         herdr_glyph,
@@ -10374,7 +10372,7 @@ impl AlacritreeApp {
                 let kind = agent.and_then(|agent| agent.kind.as_deref());
                 let status = agent.filter(|_| current).and_then(|agent| agent.status);
                 if !current {
-                    content.secondary = session_middle(Some("herdr"), kind, None, "session");
+                    content.secondary = session_middle(Some("herdr"), kind, None, "shell");
                 }
                 let mut managed = self.session_managed(session).unwrap();
                 managed.kind = kind.map(str::to_owned);
@@ -10421,7 +10419,7 @@ impl AlacritreeApp {
                 session.working_directory.as_deref(),
                 agent_kind,
                 status,
-                session_fallback_kind(&session.kind),
+                fallback_kind,
             );
             let side = session
                 .wsl_distro()
@@ -10429,10 +10427,8 @@ impl AlacritreeApp {
                 .unwrap_or_else(|| "native".to_string());
             let hover = palette_hover(
                 &content.title_for_hover,
-                agent_kind.or_else(|| {
-                    (session.kind != SessionKind::Shell)
-                        .then(|| session_fallback_kind(&session.kind))
-                }),
+                agent_kind
+                    .or_else(|| (session.kind != SessionKind::Shell).then_some(fallback_kind)),
                 status,
                 &side,
                 session.working_directory.as_deref(),
@@ -12245,7 +12241,7 @@ mod tests {
             .unwrap();
         let item = &items[row];
         assert!(item.subtitle.as_deref().unwrap().starts_with("✦"));
-        assert_eq!(item.secondary, "herdr · session");
+        assert_eq!(item.secondary, "herdr · shell");
         let hover = item.hover.as_deref().unwrap();
         assert!(hover.contains("Terminal: term-unseen"));
         assert!(hover.contains("herdr, shared view."));
@@ -12293,7 +12289,7 @@ mod tests {
         let items = app.palette_items();
         let item =
             items.iter().find(|item| item.action == PaletteAction::ActivateSession(id)).unwrap();
-        assert_eq!(item.secondary, "herdr · session");
+        assert_eq!(item.secondary, "herdr · shell");
     }
 
     #[test]
@@ -14161,8 +14157,12 @@ mod tests {
         );
     }
 
+    /// Two unmatched panes with the same cwd abbreviate to one identical
+    /// primary and subtitle, so nothing in the row's identity tells them
+    /// apart; a query still reaches each one on its own through fields the
+    /// row's identity does not carry, like the terminal id.
     #[test]
-    fn duplicate_unmatched_herdr_panes_keep_visible_searchable_context() {
+    fn duplicate_unmatched_herdr_panes_share_a_primary_but_stay_searchable() {
         let panes = herdr::Listing::Panes.parse(
             r#"{"result":{"panes":[
             {"terminal_id":"t1","pane_id":"w7:p1","agent":"codex",
@@ -14419,6 +14419,24 @@ mod tests {
         let content =
             native_palette_content("terminal".into(), "Home".into(), None, None, None, "shell");
         assert_eq!(content.secondary, "shell");
+    }
+
+    /// A scratchpad's title is the literal word `scratchpad`, equal to its
+    /// own kind, so it reads as generic and yields the primary slot to the
+    /// workspace label, the part that tells one scratchpad row from another.
+    #[test]
+    fn a_scratchpad_titled_only_with_its_kind_promotes_the_workspace() {
+        let content = native_palette_content(
+            "scratchpad".into(),
+            "◆ renamed / main".into(),
+            None,
+            Some("scratchpad"),
+            None,
+            "shell",
+        );
+        assert_eq!(content.primary, "◆ renamed / main");
+        assert_eq!(content.subtitle, "");
+        assert_eq!(content.secondary, "scratchpad");
     }
 
     /// The click switched workspace before handing the gesture over, so a
