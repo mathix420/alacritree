@@ -12,7 +12,7 @@ impl Listing {
     /// Panes from one reply.  An entry missing an identity — or, where the
     /// entry is an agent, a status — is dropped on its own; its siblings
     /// still parse.
-    pub fn parse(&self, stdout: &str) -> Vec<Agent> {
+    pub fn parse(self, stdout: &str) -> Vec<Agent> {
         let Ok(envelope) = serde_json::from_str::<Envelope>(stdout) else {
             return Vec::new();
         };
@@ -23,7 +23,7 @@ impl Listing {
             Self::Agents => listed.agents,
             Self::Panes => listed.panes,
         };
-        raw.into_iter().filter_map(|raw| raw.into_agent(*self)).collect()
+        raw.into_iter().filter_map(|raw| raw.into_agent(self)).collect()
     }
 }
 
