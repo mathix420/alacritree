@@ -5553,6 +5553,7 @@ fn row_status_icon_size(theme: &Theme) -> egui::Vec2 {
 
 const ATTENTION_HINT: &str = "needs attention";
 const LOADER_FRAME: Duration = Duration::from_millis(120);
+const CODEX_LOADER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Painted (rather than `RichText("●")`) so its size is independent of font
 /// metrics — `RichText("●")` renders inconsistently across fallback fonts.
@@ -5563,40 +5564,32 @@ fn attention_dot(ui: &mut egui::Ui, theme: &Theme) -> egui::Response {
     resp
 }
 
-/// The loader is geometry rather than text so its three square dots stay the
-/// same shape in status and action slots on every font stack.
-fn three_square_loader_dots(rect: egui::Rect, missing: usize) -> [egui::Rect; 3] {
-    let side = rect.width().min(rect.height());
-    let canvas = egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(side));
-    let gap = side / 6.0;
-    let dot = (side - gap) / 2.0;
-    let corners = [
-        canvas.left_top(),
-        egui::pos2(canvas.right() - dot, canvas.top()),
-        egui::pos2(canvas.right() - dot, canvas.bottom() - dot),
-        egui::pos2(canvas.left(), canvas.bottom() - dot),
-    ];
-    const VISIBLE: [[usize; 3]; 4] = [[1, 2, 3], [0, 2, 3], [0, 1, 3], [0, 1, 2]];
-    VISIBLE[missing % VISIBLE.len()]
-        .map(|index| egui::Rect::from_min_size(corners[index], egui::Vec2::splat(dot)))
+fn loader_glyph(frame: usize) -> &'static str {
+    CODEX_LOADER_FRAMES[frame % CODEX_LOADER_FRAMES.len()]
 }
 
-fn paint_three_square_loader(ui: &mut egui::Ui, rect: egui::Rect, color: Color32) {
+/// Match Codex's own six-dot Braille cycle so working sessions keep the same
+/// visual signal in the terminal and sidebar.
+fn paint_braille_loader(ui: &mut egui::Ui, rect: egui::Rect, size: f32, color: Color32) {
     if !ui.is_rect_visible(rect) {
         return;
     }
     ui.ctx().request_repaint_after(LOADER_FRAME);
 
-    let missing = ui.input(|i| (i.time / LOADER_FRAME.as_secs_f64()) as usize % 4);
-    for dot in three_square_loader_dots(rect, missing) {
-        ui.painter().rect_filled(dot, 0.0, color);
-    }
+    let frame = ui.input(|i| (i.time / LOADER_FRAME.as_secs_f64()) as usize);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        loader_glyph(frame),
+        egui::FontId::proportional(size),
+        color,
+    );
 }
 
-fn three_square_loader(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
+fn braille_loader(ui: &mut egui::Ui, size: f32, color: Color32) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover());
     response.widget_info(|| egui::WidgetInfo::new(egui::WidgetType::ProgressIndicator));
-    paint_three_square_loader(ui, rect, color);
+    paint_braille_loader(ui, rect, size, color);
     response
 }
 
@@ -5621,8 +5614,7 @@ fn paint_row_status_icon(
     let s = theme.ui_scale;
     if let SessionActivity::Loading(agent) = activity {
         let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
-        let loader = egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(10.0 * s));
-        paint_three_square_loader(ui, loader, theme.accent);
+        paint_braille_loader(ui, rect, 10.0 * s, theme.accent);
         let hint = agent.map_or_else(|| "working".to_owned(), |name| format!("{name} is working"));
         return Some((rect, hint));
     }
@@ -6542,7 +6534,7 @@ fn creating_row(ui: &mut egui::Ui, branch: &str, icons: &Icons, theme: &Theme) {
                 let _ = name_tooltip(resp, branch, galley.elided, theme.sidebar_tooltips);
             },
             |ui| {
-                three_square_loader(ui, 12.0 * s, theme.accent);
+                braille_loader(ui, 12.0 * s, theme.accent);
             },
         );
     });
@@ -6688,7 +6680,7 @@ fn worktree_row(
                     // Mid-removal the row is inert: swap its controls for a
                     // spinner so the user sees the delete is in flight.
                     if deleting {
-                        three_square_loader(ui, 12.0 * theme.ui_scale, theme.accent);
+                        braille_loader(ui, 12.0 * theme.ui_scale, theme.accent);
                         return;
                     }
                     if !wt.is_main {
@@ -9242,25 +9234,10 @@ mod tests {
     }
 
     #[test]
-    fn loader_is_three_equal_squares_rotating_around_a_two_by_two_grid() {
-        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::splat(12.0));
-        let corners = [
-            egui::pos2(0.0, 0.0),
-            egui::pos2(7.0, 0.0),
-            egui::pos2(7.0, 7.0),
-            egui::pos2(0.0, 7.0),
-        ];
-        for missing in 0..4 {
-            let dots = three_square_loader_dots(rect, missing);
-            assert!(dots.iter().all(|dot| dot.size() == egui::Vec2::splat(5.0)));
-            for (index, corner) in corners.iter().enumerate() {
-                assert_eq!(
-                    dots.iter().any(|dot| dot.min == *corner),
-                    index != missing,
-                    "frame {missing}, corner {index}"
-                );
-            }
-        }
+    fn loader_cycles_through_codex_braille_frames() {
+        let frames: Vec<&str> = (0..CODEX_LOADER_FRAMES.len()).map(loader_glyph).collect();
+        assert_eq!(frames, ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]);
+        assert_eq!(loader_glyph(CODEX_LOADER_FRAMES.len()), "⠋");
     }
 
     #[test]
