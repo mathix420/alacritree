@@ -7868,9 +7868,10 @@ fn session_middle(
     parts.join(" · ")
 }
 
-/// The second line is where the row lives, whether or not the title above it
-/// repeats part of the path.  Only a titleless row gives the first line up to
-/// the workspace, and then the second has nothing left to say.
+/// The second line names the workspace regardless of what the title says
+/// above it — the two are never compared.  Only a titleless row gives the
+/// first line up to the workspace, and then the second has nothing left to
+/// say.
 fn native_palette_content(
     title: String,
     workspace: String,
@@ -7892,9 +7893,8 @@ fn herdr_subtitle(glyph: &str, location: Option<&str>) -> String {
 }
 
 fn herdr_palette_content(
-    title: String,
+    title: Option<String>,
     agent: &herdr::Agent,
-    raw_title_present: bool,
     workspace: Option<&str>,
     glyph: &str,
     cwd_style: PathStyle,
@@ -7902,8 +7902,9 @@ fn herdr_palette_content(
 ) -> PaletteSessionContent {
     let cwd = herdr_cwd(agent);
     let abbreviated_cwd = cwd.map(|cwd| path_style::render(cwd, cwd_style, cwd_home));
-    let named = raw_title_present && !title.trim().is_empty();
+    let named = title.as_deref().is_some_and(|title| !title.trim().is_empty());
     let (primary, title_for_hover) = if named {
+        let title = title.unwrap();
         (title.clone(), title)
     } else {
         match workspace {
@@ -10326,9 +10327,8 @@ impl AlacritreeApp {
                     .map(|_| self.workspace_label(&session.working_directory));
                 let mut content = if let Some(agent) = agent {
                     herdr_palette_content(
-                        session_row_name(&session.title, activity, Some(agent)).text,
+                        Some(session_row_name(&session.title, activity, Some(agent)).text),
                         agent,
-                        agent.title.is_some(),
                         workspace.as_deref(),
                         herdr_glyph,
                         self.config.ui.path_style.git_rows,
@@ -10430,9 +10430,8 @@ impl AlacritreeApp {
         for (ws, side, agent) in self.herdr_agent_listing() {
             let workspace = ws.as_ref().map(|_| self.workspace_label(&ws));
             let content = herdr_palette_content(
-                herdr_display_name(agent).text,
+                agent.title.clone(),
                 agent,
-                agent.title.is_some(),
                 workspace.as_deref(),
                 herdr_glyph,
                 self.config.ui.path_style.git_rows,
@@ -13985,9 +13984,8 @@ mod tests {
     fn an_agentless_pane_claims_no_status() {
         let agent = shell_pane();
         let content = herdr_palette_content(
-            herdr_display_name(&agent).text,
+            agent.title.clone(),
             &agent,
-            agent.title.is_some(),
             Some("alacritree / master"),
             "◆",
             PathStyle::Fish,
@@ -14081,9 +14079,8 @@ mod tests {
             ..titled(Some("claude"), Some("fix the wrap bug"))
         };
         let content = herdr_palette_content(
-            herdr_display_name(&agent).text,
+            agent.title.clone(),
             &agent,
-            agent.title.is_some(),
             Some("alacritree / master"),
             "◆",
             PathStyle::Fish,
@@ -14106,9 +14103,8 @@ mod tests {
     fn a_herdr_title_repeating_its_kind_keeps_the_workspace_below_it() {
         let agent = titled(Some("claude"), Some("claude"));
         let content = herdr_palette_content(
-            herdr_display_name(&agent).text,
+            agent.title.clone(),
             &agent,
-            agent.title.is_some(),
             Some("renamed / main"),
             "◆",
             PathStyle::Fish,
@@ -14129,9 +14125,8 @@ mod tests {
             ..titled(Some("claude"), Some("devkit"))
         };
         let content = herdr_palette_content(
-            herdr_display_name(&agent).text,
+            agent.title.clone(),
             &agent,
-            agent.title.is_some(),
             Some("devkit / main"),
             "◆",
             PathStyle::Fish,
@@ -14146,15 +14141,8 @@ mod tests {
     #[test]
     fn untitled_herdr_panes_promote_their_directory() {
         let agent = agent_in("/home/dev/Git/devkit");
-        let content = herdr_palette_content(
-            herdr_display_name(&agent).text,
-            &agent,
-            agent.title.is_some(),
-            None,
-            "◆",
-            PathStyle::Fish,
-            None,
-        );
+        let content =
+            herdr_palette_content(agent.title.clone(), &agent, None, "◆", PathStyle::Fish, None);
         assert_eq!(
             (content.primary, content.subtitle, content.secondary),
             ("/h/d/G/devkit".into(), "◆".into(), "herdr · claude · idle".into(),)
@@ -14164,15 +14152,8 @@ mod tests {
     #[test]
     fn untitled_herdr_panes_without_a_directory_use_home() {
         let agent = herdr_agent(Some("claude"));
-        let content = herdr_palette_content(
-            herdr_display_name(&agent).text,
-            &agent,
-            agent.title.is_some(),
-            None,
-            "◆",
-            PathStyle::Fish,
-            None,
-        );
+        let content =
+            herdr_palette_content(agent.title.clone(), &agent, None, "◆", PathStyle::Fish, None);
         assert_eq!(
             (content.primary, content.subtitle, content.secondary),
             ("Home".into(), "◆".into(), "herdr · claude · idle".into(),)
@@ -14201,15 +14182,8 @@ mod tests {
         let caches = [cache];
         let mut items = Vec::new();
         for (workspace, side, agent) in listed_herdr_agents(&caches, &[], &[], true) {
-            let content = herdr_palette_content(
-                herdr_display_name(agent).text,
-                agent,
-                agent.title.is_some(),
-                None,
-                "◆",
-                PathStyle::Fish,
-                None,
-            );
+            let content =
+                herdr_palette_content(agent.title.clone(), agent, None, "◆", PathStyle::Fish, None);
             items.push(PaletteItem::herdr_agent(
                 command_palette::HerdrAttach {
                     key: herdr::HerdrKey {
@@ -14256,15 +14230,8 @@ mod tests {
             foreground_cwd: None,
             ..herdr_agent(None)
         };
-        let content = herdr_palette_content(
-            herdr_display_name(&agent).text,
-            &agent,
-            agent.title.is_some(),
-            None,
-            "◆",
-            PathStyle::Fish,
-            None,
-        );
+        let content =
+            herdr_palette_content(agent.title.clone(), &agent, None, "◆", PathStyle::Fish, None);
         let item = PaletteItem::herdr_agent(
             command_palette::HerdrAttach {
                 key: herdr::HerdrKey {
@@ -14287,21 +14254,33 @@ mod tests {
     #[test]
     fn attached_untitled_herdr_panes_promote_home_and_keep_their_glyph() {
         let agent = herdr_agent(None);
+        let content = herdr_palette_content(None, &agent, None, "◆", PathStyle::Fish, None);
+        assert_eq!((content.primary, content.subtitle), ("Home".into(), "◆".into()));
+    }
+
+    /// The palette names a row the way the sidebar does: herdr's title when it
+    /// has one, else the session's own PTY title, so a pane herdr reports no
+    /// title for still keeps that name instead of losing it to the workspace.
+    #[test]
+    fn an_attached_panes_pty_title_survives_a_titleless_herdr_report() {
+        let agent = herdr_agent(None);
         let content = herdr_palette_content(
-            "build output".into(),
+            Some("vim src/main.rs".into()),
             &agent,
-            false,
-            None,
+            Some("alacritree / master"),
             "◆",
             PathStyle::Fish,
             None,
         );
-        assert_eq!((content.primary, content.subtitle), ("Home".into(), "◆".into()));
+        assert_eq!(
+            (content.primary, content.subtitle),
+            ("vim src/main.rs".into(), "◆ alacritree / master".into())
+        );
     }
 
-    /// A title that spells out the session's own directory, in full or as its
-    /// last component, still leaves the workspace label as the only thing on
-    /// the row naming the project, so it keeps the line under the title.
+    /// The row never compares its title against its own path, so a title that
+    /// reads like a directory is named no differently than one that does
+    /// not — the workspace label still keeps the line under it.
     #[test]
     fn native_titles_naming_their_directory_keep_the_workspace_label() {
         let content = native_palette_content(
@@ -14313,18 +14292,6 @@ mod tests {
         );
         assert_eq!(content.primary, "/repo/feature");
         assert_eq!(content.subtitle, "◆ renamed / main");
-
-        let basename = native_palette_content(
-            "feature".into(),
-            "◆ renamed / main".into(),
-            Some("claude"),
-            Some("idle"),
-            "shell",
-        );
-        assert_eq!(
-            (basename.primary, basename.subtitle),
-            ("feature".into(), "◆ renamed / main".into())
-        );
     }
 
     /// Nothing but the workspace label is left to name a titleless row, and
@@ -14403,9 +14370,8 @@ mod tests {
     fn configured_workspace_label_and_herdr_glyph_survive_untitled_rows() {
         let agent = herdr_agent(Some("claude"));
         let content = herdr_palette_content(
-            herdr_display_name(&agent).text,
+            agent.title.clone(),
             &agent,
-            agent.title.is_some(),
             Some("◆ renamed / main"),
             "✦",
             PathStyle::Fish,
