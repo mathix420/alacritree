@@ -7868,10 +7868,10 @@ fn session_middle(
     parts.join(" · ")
 }
 
-/// The second line names the workspace regardless of what the title says
-/// above it — the two are never compared.  Only a titleless row gives the
-/// first line up to the workspace, and then the second has nothing left to
-/// say.
+/// The second line names the workspace, blanked only on an exact string
+/// match — a title that merely reads like a directory into the workspace is
+/// not matched against it.  Only a titleless row gives the first line up to
+/// the workspace, and then the second has nothing left to say.
 fn native_palette_content(
     title: String,
     workspace: String,
@@ -7902,19 +7902,18 @@ fn herdr_palette_content(
 ) -> PaletteSessionContent {
     let cwd = herdr_cwd(agent);
     let abbreviated_cwd = cwd.map(|cwd| path_style::render(cwd, cwd_style, cwd_home));
-    let named = title.as_deref().is_some_and(|title| !title.trim().is_empty());
-    let (primary, title_for_hover) = if named {
-        let title = title.unwrap();
-        (title.clone(), title)
-    } else {
-        match workspace {
-            Some(workspace) => (workspace.to_string(), workspace.to_string()),
-            None => match (abbreviated_cwd.clone(), cwd) {
-                (Some(cwd), Some(full_cwd)) => (cwd, full_cwd.to_string()),
-                _ => ("Home".to_string(), "Home".to_string()),
-            },
-        }
-    };
+    let (primary, title_for_hover) =
+        if let Some(title) = title.filter(|title| !title.trim().is_empty()) {
+            (title.clone(), title)
+        } else {
+            match workspace {
+                Some(workspace) => (workspace.to_string(), workspace.to_string()),
+                None => match (abbreviated_cwd.clone(), cwd) {
+                    (Some(cwd), Some(full_cwd)) => (cwd, full_cwd.to_string()),
+                    _ => ("Home".to_string(), "Home".to_string()),
+                },
+            }
+        };
     // A workspace names the project a pane belongs to, which its path does
     // not, so it holds the second line whatever the title says.
     let location = match workspace {
@@ -14251,10 +14250,14 @@ mod tests {
         assert_eq!(item.subtitle.as_deref(), Some("◆"));
     }
 
+    /// An attached row always resolves a title, even an empty one from a PTY
+    /// that never set an OSC title — `session.rs` leaves it unfiltered. The
+    /// blank string must fall through exactly like no title at all.
     #[test]
     fn attached_untitled_herdr_panes_promote_home_and_keep_their_glyph() {
         let agent = herdr_agent(None);
-        let content = herdr_palette_content(None, &agent, None, "◆", PathStyle::Fish, None);
+        let content =
+            herdr_palette_content(Some(String::new()), &agent, None, "◆", PathStyle::Fish, None);
         assert_eq!((content.primary, content.subtitle), ("Home".into(), "◆".into()));
     }
 
