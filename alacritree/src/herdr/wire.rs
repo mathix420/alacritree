@@ -114,6 +114,21 @@ pub(super) struct RawSession {
 }
 
 #[cfg(test)]
+/// Captured from a native Windows server.  The second pane runs a plain
+/// shell: herdr carries no `agent` key for it and calls its status
+/// `unknown`, which is the state word of an agent it cannot classify and
+/// not a claim that one is there.
+pub(super) const PANES: &str = r#"{"id":"cli:pane:list","result":{"panes":[
+    {"agent":"claude","agent_status":"idle","pane_id":"w1:p1","tab_id":"w1:t1",
+     "terminal_id":"term_a","cwd":"C:\\projects\\alacritree","focused":true,
+     "terminal_title":"✫ Claude Code","terminal_title_stripped":"Claude Code",
+     "scroll":{"offset_from_bottom":0},"workspace_id":"w1"},
+    {"agent_status":"unknown","pane_id":"w1:p4","tab_id":"w1:t4",
+     "terminal_id":"term_b","cwd":"C:\\projects\\alacritree","focused":false,
+     "terminal_title":"~/p/alacritree","terminal_title_stripped":"~/p/alacritree",
+     "scroll":{"offset_from_bottom":0},"workspace_id":"w1"}],"type":"pane_list"}}"#;
+
+#[cfg(test)]
 mod tests {
     use super::super::error_code;
     use super::*;
@@ -223,20 +238,6 @@ mod tests {
              "agent":"claude","display_agent":"Claude Code"}],"type":"agent_list"}}"#;
         assert_eq!(Listing::Agents.parse(reply)[0].kind.as_deref(), Some("Claude Code"));
     }
-
-    /// Captured from a native Windows server.  The second pane runs a plain
-    /// shell: herdr carries no `agent` key for it and calls its status
-    /// `unknown`, which is the state word of an agent it cannot classify and
-    /// not a claim that one is there.
-    const PANES: &str = r#"{"id":"cli:pane:list","result":{"panes":[
-        {"agent":"claude","agent_status":"idle","pane_id":"w1:p1","tab_id":"w1:t1",
-         "terminal_id":"term_a","cwd":"C:\\projects\\alacritree","focused":true,
-         "terminal_title":"✫ Claude Code","terminal_title_stripped":"Claude Code",
-         "scroll":{"offset_from_bottom":0},"workspace_id":"w1"},
-        {"agent_status":"unknown","pane_id":"w1:p4","tab_id":"w1:t4",
-         "terminal_id":"term_b","cwd":"C:\\projects\\alacritree","focused":false,
-         "terminal_title":"~/p/alacritree","terminal_title_stripped":"~/p/alacritree",
-         "scroll":{"offset_from_bottom":0},"workspace_id":"w1"}],"type":"pane_list"}}"#;
 
     #[test]
     fn a_pane_listing_keeps_the_shell_beside_the_agent() {
