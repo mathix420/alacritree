@@ -1450,14 +1450,13 @@ prefix = \"f12\"
 [ui]
 status_indicators = \"symbols\"
 ";
-        assert_eq!(
-            settings_from(cfg),
-            Settings { detach: Some("F12 q".into()), indicators: Indicators::Symbols }
-        );
+        assert_eq!(settings_from(cfg), Settings {
+            detach: Some("F12 q".into()),
+            indicators: Indicators::Symbols
+        });
     }
 
     /// Captured from a native Windows server.  `skip_serializing_if` drops
-    /// `foreground_cwd`, `name`, `display_agent` and `agent_session` rather
     /// `foreground_cwd`, `name`, `display_agent` and `agent_session` rather
     /// than emitting them as null.
     const WINDOWS: &str = r#"{"id":"cli:agent:list","result":{"agents":[
