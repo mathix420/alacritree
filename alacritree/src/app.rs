@@ -6418,14 +6418,14 @@ fn paint_palette_row(
         cols.desc,
         if is_session { 2 } else { usize::MAX },
     );
-    let subtitle_size = (theme.font_normal - 2.0).max(8.0);
+    let subtitle_size = (theme.font_normal - 1.0).max(8.0);
     let subtitle = item.subtitle.as_deref().map(|text| {
         column_galley(
             ctx,
             text,
             egui::FontFamily::Proportional,
             subtitle_size,
-            theme.text_muted,
+            theme.text,
             cols.desc,
             ColumnWrap::Clip,
         )
@@ -6526,7 +6526,7 @@ fn paint_palette_row(
     let subtitle_y = top + desc.size().y;
     painter.galley(egui::pos2(cols.desc_x(left), top), desc, theme.text);
     if let Some(subtitle) = subtitle {
-        painter.galley(egui::pos2(cols.desc_x(left), subtitle_y), subtitle, theme.text_muted);
+        painter.galley(egui::pos2(cols.desc_x(left), subtitle_y), subtitle, theme.text);
     }
     painter.galley(egui::pos2(cols.action_x(left), top), action, theme.text_dim);
     painter.galley(egui::pos2(cols.keys_x(left), top), keys, theme.accent);
@@ -7842,10 +7842,6 @@ struct PaletteSessionContent {
     title_for_hover: String,
 }
 
-fn contains_case_insensitive(text: &str, needle: &str) -> bool {
-    text.to_lowercase().contains(&needle.to_lowercase())
-}
-
 fn herdr_cwd(agent: &herdr::Agent) -> Option<&str> {
     agent
         .foreground_cwd
@@ -7871,13 +7867,23 @@ fn generic_herdr_title(title: &str, agent: &herdr::Agent) -> bool {
             })
 }
 
-fn session_middle(kind: Option<&str>, status: Option<&str>, title: &str, fallback: &str) -> String {
-    let mut parts = Vec::new();
-    if let Some(kind) = kind.filter(|kind| !contains_case_insensitive(title, kind)) {
-        parts.push(kind.to_lowercase());
-    }
+/// The middle column's words, most general first: where the row comes from,
+/// what runs in it, what that is doing.  The kind is spelled out whether or
+/// not the title repeats it, so every row in one state reads identically.
+fn session_middle(
+    lead: Option<&str>,
+    kind: Option<&str>,
+    status: Option<&str>,
+    fallback: &str,
+) -> String {
+    let mut parts: Vec<String> = lead.map(str::to_owned).into_iter().collect();
+    parts.extend(kind.map(str::to_lowercase));
     parts.extend(status.map(str::to_owned));
-    if parts.is_empty() { fallback.to_string() } else { parts.join(" · ") }
+    if parts.len() == lead.iter().count() {
+        parts.push(fallback.to_string());
+    }
+    parts.retain(|part| !part.is_empty());
+    parts.join(" · ")
 }
 
 fn native_palette_content(
@@ -7900,7 +7906,7 @@ fn native_palette_content(
     let primary = if generic { workspace.clone() } else { title };
     PaletteSessionContent {
         title_for_hover: primary.clone(),
-        secondary: session_middle(kind, status, &primary, fallback),
+        secondary: session_middle(None, kind, status, fallback),
         primary,
         subtitle: if generic { String::new() } else { workspace },
     }
@@ -7918,7 +7924,7 @@ fn herdr_palette_content(
     glyph: &str,
     cwd_style: PathStyle,
     cwd_home: Option<&str>,
-    attached: bool,
+    _attached: bool,
 ) -> PaletteSessionContent {
     let cwd = herdr_cwd(agent);
     let abbreviated_cwd = cwd.map(|cwd| path_style::render(cwd, cwd_style, cwd_home));
@@ -7935,23 +7941,19 @@ fn herdr_palette_content(
         (title.clone(), title)
     };
     let subtitle = if generic {
-        if attached { glyph.to_string() } else { agent.pane_id.clone() }
+        glyph.to_string()
     } else {
         let location = workspace.or(abbreviated_cwd.as_deref());
-        if attached {
-            herdr_subtitle(glyph, location)
-        } else {
-            location.unwrap_or_default().to_string()
-        }
+        herdr_subtitle(glyph, location)
     };
     let fallback = if agent.status.is_some() { "" } else { "shell" };
     PaletteSessionContent {
-        primary: primary.clone(),
+        primary,
         subtitle,
         secondary: session_middle(
+            Some("herdr"),
             agent.kind.as_deref(),
             agent.status.map(|status| status.label()),
-            &primary,
             fallback,
         ),
         title_for_hover,
@@ -10364,7 +10366,7 @@ impl AlacritreeApp {
                 let kind = agent.and_then(|agent| agent.kind.as_deref());
                 let status = agent.filter(|_| current).and_then(|agent| agent.status);
                 if !current {
-                    content.secondary = session_middle(kind, None, &content.primary, "session");
+                    content.secondary = session_middle(Some("herdr"), kind, None, "session");
                 }
                 let mut managed = self.session_managed(session).unwrap();
                 managed.kind = kind.map(str::to_owned);
@@ -12065,7 +12067,7 @@ mod tests {
         let item = &items[row];
         assert_eq!(item.primary, "review work");
         assert!(item.subtitle.as_deref().unwrap().starts_with("✦ "));
-        assert_eq!(item.secondary, "shell");
+        assert_eq!(item.secondary, "herdr · shell");
         let hover = item.hover.as_deref().unwrap();
         for detail in [
             "Pane: w1:p1",
@@ -12129,7 +12131,7 @@ mod tests {
             let item = &items[row];
             assert_eq!(item.primary, "review work");
             assert!(item.subtitle.as_deref().unwrap().starts_with("✦ "));
-            assert_eq!(item.secondary, "claude");
+            assert_eq!(item.secondary, "herdr · claude");
             let hover = item.hover.as_deref().unwrap();
             for detail in [
                 "Pane: w1:p1",
@@ -12192,7 +12194,7 @@ mod tests {
                 .unwrap();
             let item = &items[row];
             assert_eq!(item.primary, "review work", "after failure: {after_failure}");
-            assert_eq!(item.secondary, "claude");
+            assert_eq!(item.secondary, "herdr · claude");
             assert!(item.subtitle.as_deref().unwrap().starts_with("✦ "));
             let hover = item.hover.as_deref().unwrap();
             for detail in [
@@ -12231,7 +12233,7 @@ mod tests {
             .unwrap();
         let item = &items[row];
         assert!(item.subtitle.as_deref().unwrap().starts_with("✦"));
-        assert_eq!(item.secondary, "session");
+        assert_eq!(item.secondary, "herdr · session");
         let hover = item.hover.as_deref().unwrap();
         assert!(hover.contains("Terminal: term-unseen"));
         assert!(hover.contains("herdr, shared view."));
@@ -13968,7 +13970,7 @@ mod tests {
         );
         assert_eq!(
             (content.primary, content.subtitle, content.secondary),
-            ("~/G/g/alacritree".into(), "alacritree / master".into(), "shell".into(),)
+            ("~/G/g/alacritree".into(), "◆ alacritree / master".into(), "herdr · shell".into(),)
         );
     }
 
@@ -14065,7 +14067,11 @@ mod tests {
         );
         assert_eq!(
             (content.primary, content.subtitle, content.secondary),
-            ("fix the wrap bug".into(), "◆ alacritree / master".into(), "claude · working".into(),)
+            (
+                "fix the wrap bug".into(),
+                "◆ alacritree / master".into(),
+                "herdr · claude · working".into(),
+            )
         );
     }
 
@@ -14084,7 +14090,7 @@ mod tests {
         );
         assert_eq!(
             (content.primary, content.subtitle, content.secondary),
-            ("/h/d/G/devkit".into(), "w5:p1".into(), "claude · idle".into(),)
+            ("/h/d/G/devkit".into(), "◆".into(), "herdr · claude · idle".into(),)
         );
     }
 
@@ -14103,7 +14109,7 @@ mod tests {
         );
         assert_eq!(
             (content.primary, content.subtitle, content.secondary),
-            ("Home".into(), "◆".into(), "claude · idle".into(),)
+            ("Home".into(), "◆".into(), "herdr · claude · idle".into(),)
         );
     }
 
@@ -14153,17 +14159,17 @@ mod tests {
         }
         assert_eq!(items[0].primary, "~/.l/s/chezmoi");
         assert_eq!(items[1].primary, "~/.l/s/chezmoi");
-        assert_eq!(items[0].subtitle.as_deref(), Some("w7:p1"));
-        assert_eq!(items[1].subtitle.as_deref(), Some("w7:p3"));
-        assert_eq!(items[0].secondary, "codex · working");
-        assert_eq!(items[1].secondary, "codex · idle");
+        assert_eq!(items[0].subtitle.as_deref(), Some("◆"));
+        assert_eq!(items[1].subtitle.as_deref(), Some("◆"));
+        assert_eq!(items[0].secondary, "herdr · codex · working");
+        assert_eq!(items[1].secondary, "herdr · codex · idle");
         let mut palette = CommandPalette::new();
         let ranked = palette.rank(&items);
         assert_eq!(command_palette::group(&items, &ranked), vec![(
             command_palette::PaletteSection::HerdrSessions,
             vec![0, 1],
         )]);
-        for (query, expected) in [("w7:p1", 0), ("w7:p3", 1), ("chezmoi", 0)] {
+        for (query, expected) in [("working", 0), ("idle", 1), ("chezmoi", 0)] {
             palette.clear_query();
             palette.query_mut().push_str(query);
             assert_eq!(palette.rank(&items).first(), Some(&expected));
@@ -14205,7 +14211,7 @@ mod tests {
             agent.kind.as_deref(),
         );
         assert_eq!(item.primary, "Home");
-        assert_eq!(item.subtitle.as_deref(), Some("w5:p1"));
+        assert_eq!(item.subtitle.as_deref(), Some("◆"));
     }
 
     #[test]
@@ -14323,17 +14329,30 @@ mod tests {
         assert_eq!((content.primary, content.subtitle), ("◆ renamed / main".into(), "✦".into()));
     }
 
+    /// The kind is spelled out even when the title already carries it: two
+    /// rows in one state must read the same, and one repeated word is a
+    /// cheaper price than a column that changes shape per row.
     #[test]
-    fn session_middle_omits_a_kind_already_in_its_title() {
-        assert_eq!(session_middle(Some("claude"), Some("idle"), "Claude Code", "shell"), "idle");
+    fn the_middle_column_spells_the_kind_out_beside_a_title_that_shares_it() {
+        assert_eq!(session_middle(None, Some("claude"), Some("idle"), "shell"), "claude · idle");
     }
 
+    /// A herdr-backed row names herdr ahead of the agent, so the palette says
+    /// where a row comes from without the reader decoding a glyph.
     #[test]
-    fn session_middle_keeps_a_different_detected_kind() {
+    fn a_herdr_rows_middle_column_leads_with_herdr() {
         assert_eq!(
-            session_middle(Some("codex"), Some("idle"), "Claude Code", "shell"),
-            "codex · idle"
+            session_middle(Some("herdr"), Some("codex"), Some("working"), "shell"),
+            "herdr · codex · working"
         );
+    }
+
+    /// A lead with nothing after it still names itself rather than falling
+    /// through to the fallback: the row is herdr-backed whatever else is
+    /// unknown about it.
+    #[test]
+    fn a_lead_survives_an_otherwise_empty_middle_column() {
+        assert_eq!(session_middle(Some("herdr"), None, None, "shell"), "herdr · shell");
     }
 
     #[test]
@@ -17308,8 +17327,8 @@ mod tests {
         assert_eq!(title_paint.font_size, theme.font_normal);
         assert_eq!(title_paint.color, theme.text);
         assert_eq!(subtitle_paint.rows, 1);
-        assert_eq!(subtitle_paint.font_size, (theme.font_normal - 2.0).max(8.0));
-        assert_eq!(subtitle_paint.color, theme.text_muted);
+        assert_eq!(subtitle_paint.font_size, (theme.font_normal - 1.0).max(8.0));
+        assert_eq!(subtitle_paint.color, theme.text);
         assert!(subtitle_paint.pos.y >= title_paint.pos.y + title_paint.size.y - 0.5);
         assert_eq!(middle_paint.rows, 3);
         assert!(middle_paint.elided);
