@@ -6515,8 +6515,7 @@ fn paint_palette_row(
                 paint_harness_mark(ui, Some(harness_mark), mark_rect, theme)
             },
             SessionMark::Agent(live) => {
-                let quiet = if selected { theme.accent } else { theme.text };
-                paint_agent_mark(ui, agent_mark(live, quiet, theme.attention), mark_rect, theme);
+                paint_agent_mark(ui, agent_mark(live, theme), mark_rect, theme)
             },
         }
         if item.hover.is_none() {
@@ -7036,15 +7035,19 @@ enum AgentMark {
     Glyph(BakedGlyph, Color32),
 }
 
-/// `quiet` is the row's own weight for an agent with nothing to report — dim
-/// on a listed herdr row, ordinary text on a live session.  Blocked takes
-/// `attention` wherever it appears, an active row's accent included: a state
-/// that wants a human cannot also be quiet.
-fn agent_mark(live: LiveState, quiet: Color32, attention: Color32) -> AgentMark {
+/// Colour comes from the state, not from the row: an idle agent reads the
+/// same on a selected row as on a quiet one, and the same as a harness-backed
+/// row reporting the same state.  Working animates because a static glyph
+/// would have to blink to say as much.
+fn agent_mark(live: LiveState, theme: &Theme) -> AgentMark {
     match live {
-        LiveState::Idle => AgentMark::Glyph(DEFAULT_AGENT_ICON, quiet),
+        LiveState::Idle => {
+            AgentMark::Glyph(DEFAULT_AGENT_ICON, theme.harness_state.of(StateTone::Idle))
+        },
         LiveState::Working => AgentMark::Loader,
-        LiveState::Blocked => AgentMark::Glyph(DEFAULT_BLOCKED_ICON, attention),
+        LiveState::Blocked => {
+            AgentMark::Glyph(DEFAULT_BLOCKED_ICON, theme.harness_state.of(StateTone::Blocked))
+        },
     }
 }
 
@@ -7166,8 +7169,7 @@ fn paint_row_status_icon(
         Some((SessionMark::Agent(live), hint)) => {
             let (rect, _) =
                 ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
-            let quiet = if is_active { theme.accent } else { theme.text };
-            paint_agent_mark(ui, agent_mark(live, quiet, theme.attention), rect, theme);
+            paint_agent_mark(ui, agent_mark(live, theme), rect, theme);
             Some((rect, hint))
         },
         None => {
@@ -13549,33 +13551,21 @@ mod tests {
         assert_eq!(session_row_title("✳ ", agent), "✳ ");
     }
 
-    /// The status slot is the only place a blocked agent announces itself, so
-    /// the three live states must not collapse into the same mark.
+    /// A native agent's mark is coloured by the state it reports, the same
+    /// way a harness-backed row's mark is, so two rows in one state never
+    /// disagree about what that state looks like.
     #[test]
-    fn each_live_state_draws_its_own_mark() {
-        let quiet = Color32::from_rgb(1, 1, 1);
-        let attention = Color32::from_rgb(2, 2, 2);
+    fn an_agent_mark_takes_its_colour_from_the_state_it_reports() {
+        let theme = Theme::from_config(&Config::default());
         assert_eq!(
-            agent_mark(LiveState::Idle, quiet, attention),
-            AgentMark::Glyph(DEFAULT_AGENT_ICON, quiet)
+            agent_mark(LiveState::Idle, &theme),
+            AgentMark::Glyph(DEFAULT_AGENT_ICON, theme.harness_state.of(StateTone::Idle))
         );
-        assert_eq!(agent_mark(LiveState::Working, quiet, attention), AgentMark::Loader);
         assert_eq!(
-            agent_mark(LiveState::Blocked, quiet, attention),
-            AgentMark::Glyph(DEFAULT_BLOCKED_ICON, attention)
+            agent_mark(LiveState::Blocked, &theme),
+            AgentMark::Glyph(DEFAULT_BLOCKED_ICON, theme.harness_state.of(StateTone::Blocked))
         );
-    }
-
-    /// A blocked agent stays amber on the row the user is looking at, where
-    /// the accent would otherwise claim the slot.
-    #[test]
-    fn blocked_keeps_its_color_over_the_active_rows_accent() {
-        let accent = Color32::from_rgb(3, 3, 3);
-        let attention = Color32::from_rgb(4, 4, 4);
-        assert_eq!(
-            agent_mark(LiveState::Blocked, accent, attention),
-            AgentMark::Glyph(DEFAULT_BLOCKED_ICON, attention)
-        );
+        assert_eq!(agent_mark(LiveState::Working, &theme), AgentMark::Loader);
     }
 
     #[test]
