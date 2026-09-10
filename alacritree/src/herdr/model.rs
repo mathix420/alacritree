@@ -25,6 +25,19 @@ impl Side {
             Self::Wsl(distro) => format!("wsl:{distro}"),
         }
     }
+
+    /// Read back what `name` wrote.  A `wsl:` with nothing after it names no
+    /// server, so it is refused rather than resolving to a distro called the
+    /// empty string.
+    pub fn parse(name: &str) -> Option<Self> {
+        if name == "native" {
+            return Some(Self::Native);
+        }
+        match name.strip_prefix("wsl:") {
+            None | Some("") => None,
+            Some(distro) => Some(Self::Wsl(distro.to_string())),
+        }
+    }
 }
 
 /// Which of herdr's two indicator sets its config selects.  Rows follow the
@@ -233,6 +246,23 @@ mod tests {
     fn a_side_names_itself_on_both_sides_of_the_wire() {
         assert_eq!(Side::Native.name(), "native");
         assert_eq!(Side::Wsl("Ubuntu-24.04".into()).name(), "wsl:Ubuntu-24.04");
+    }
+
+    /// A client names a pane by the side it read out of a listing, so a side
+    /// that does not survive the round trip points an attach at the wrong
+    /// server or at none.
+    #[test]
+    fn a_side_reads_back_as_the_side_it_spelled() {
+        for side in [Side::Native, Side::Wsl("Ubuntu-24.04".into())] {
+            assert_eq!(Side::parse(&side.name()), Some(side));
+        }
+    }
+
+    #[test]
+    fn a_side_that_names_no_server_is_refused() {
+        for name in ["", "wsl", "wsl:", "Native", "tmux:0"] {
+            assert_eq!(Side::parse(name), None, "{name} named a server");
+        }
     }
 
     fn agent(id: &str, status: Status) -> Agent {

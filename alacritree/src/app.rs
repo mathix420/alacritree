@@ -1568,9 +1568,13 @@ impl AlacritreeApp {
         pane_id: &str,
         workspace: WorkspaceKey,
         previous: WorkspaceKey,
+        waiter: Option<mpsc::Sender<ipc::IpcResult>>,
     ) -> bool {
         if let Some(id) = self.herdr_session_for(&key) {
             self.activate_session_by_id(id);
+            if let Some(waiter) = waiter {
+                let _ = waiter.send(Ok(json!({ "session_id": id })));
+            }
             return true;
         }
         if self.herdr_attaches_directly(&key) {
@@ -1579,7 +1583,18 @@ impl AlacritreeApp {
             let args = herdr::attach_args(pane_id);
             let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
             let (program, argv) = key.side.command(&borrowed);
-            return self.open_herdr_session(ctx, key, workspace, program, argv);
+            return match self.open_herdr_session(ctx, key, workspace, program, argv) {
+                Some(id) => {
+                    self.park_attach_reply(id, waiter);
+                    true
+                },
+                None => {
+                    if let Some(waiter) = waiter {
+                        let _ = waiter.send(Err("failed to attach the pane".to_string()));
+                    }
+                    false
+                },
+            };
         }
 
         // Every one of herdr's app clients draws the same focused pane, so a
@@ -1587,7 +1602,8 @@ impl AlacritreeApp {
         // The attach focuses it so the first frame is already right, and
         // `sync_herdr_view_focus` focuses it again whenever the session comes
         // back up, which is what lets a side hold one session per row.
-        if self.pending_herdr_attach.iter().any(|pending| pending.key == key) {
+        if let Some(pending) = self.pending_herdr_attach.iter_mut().find(|p| p.key == key) {
+            pending.waiters.extend(waiter);
             return true;
         }
         // The gesture is two herdr processes whatever `async_session_spawn`
@@ -1602,9 +1618,20 @@ impl AlacritreeApp {
             key,
             workspace,
             previous,
+            waiters: waiter.into_iter().collect(),
         });
         ctx.request_repaint();
         true
+    }
+
+    /// Answer an attach once the session's PTY is live.  A client that
+    /// attached in order to read the pane would otherwise be handed an id
+    /// before anything behind it can answer.
+    fn park_attach_reply(&mut self, id: SessionId, waiter: Option<mpsc::Sender<ipc::IpcResult>>) {
+        let Some(waiter) = waiter else { return };
+        if let Some(waiter) = self.pending_spawns.watch(id, waiter) {
+            let _ = waiter.send(Ok(json!({ "session_id": id })));
+        }
     }
 
     /// Adopt the shared-view attaches whose herdr calls have landed.  Each
@@ -1623,18 +1650,42 @@ impl AlacritreeApp {
                     // The open takes the workspace by value, so the arm keeps
                     // its own copy to judge the restore against afterwards.
                     let switched_to = pending.workspace.clone();
-                    if !self.open_herdr_session(ctx, pending.key, pending.workspace, program, argv)
-                    {
-                        self.restore_after_failed_attach(&switched_to, pending.previous);
+                    let waiters = std::mem::take(&mut pending.waiters);
+                    match self.open_herdr_session(
+                        ctx,
+                        pending.key,
+                        pending.workspace,
+                        program,
+                        argv,
+                    ) {
+                        Some(id) => {
+                            for waiter in waiters {
+                                self.park_attach_reply(id, Some(waiter));
+                            }
+                        },
+                        None => {
+                            self.restore_after_failed_attach(&switched_to, pending.previous);
+                            let message = self.error_dialog.clone().unwrap_or_default();
+                            for waiter in waiters {
+                                let _ = waiter.send(Err(message.clone()));
+                            }
+                        },
                     }
                 },
                 Some(Err(e)) => {
                     self.restore_after_failed_attach(&pending.workspace, pending.previous);
+                    for waiter in std::mem::take(&mut pending.waiters) {
+                        let _ = waiter.send(Err(e.clone()));
+                    }
                     self.error_dialog = Some(e);
                 },
                 None if job.failed() => {
                     self.restore_after_failed_attach(&pending.workspace, pending.previous);
-                    self.error_dialog = Some("the herdr attach did not finish".to_string());
+                    let message = "the herdr attach did not finish".to_string();
+                    for waiter in std::mem::take(&mut pending.waiters) {
+                        let _ = waiter.send(Err(message.clone()));
+                    }
+                    self.error_dialog = Some(message);
                 },
                 None => self.pending_herdr_attach.insert(0, pending),
             }
@@ -1669,7 +1720,7 @@ impl AlacritreeApp {
         workspace: WorkspaceKey,
         program: String,
         argv: Vec<String>,
-    ) -> bool {
+    ) -> Option<SessionId> {
         let shared_view = !self.herdr_attaches_directly(&key);
         // `alacritty_terminal::tty::Shell`'s fields are crate-private, so
         // this goes through the constructor rather than a struct literal.
@@ -1682,11 +1733,11 @@ impl AlacritreeApp {
                 if shared_view {
                     self.herdr_focused_view.attached(id, Some(&key), Instant::now());
                 }
-                true
+                Some(id)
             },
             Err(e) => {
                 self.error_dialog = Some(format!("failed to attach herdr agent: {e}"));
-                false
+                None
             },
         }
     }
@@ -1825,9 +1876,7 @@ impl AlacritreeApp {
             let name = self.herdr_session_name(&key.side)?;
             key.side.command(&["session", "attach", &name])
         };
-        if !self.open_herdr_session(ctx, key.clone(), workspace, program, argv) {
-            return None;
-        }
+        self.open_herdr_session(ctx, key.clone(), workspace, program, argv)?;
         self.herdr_session_for(key)
     }
 
@@ -3380,7 +3429,14 @@ impl AlacritreeApp {
                     // screen.
                     let previous =
                         std::mem::replace(&mut self.current_workspace, workspace.clone());
-                    if self.attach_herdr_agent(ctx, key, &pane_id, workspace, previous.clone()) {
+                    if self.attach_herdr_agent(
+                        ctx,
+                        key,
+                        &pane_id,
+                        workspace,
+                        previous.clone(),
+                        None,
+                    ) {
                         self.focus_terminal();
                     } else {
                         self.current_workspace = previous;
@@ -5189,7 +5245,7 @@ impl AlacritreeApp {
             // Switches first, same as `spawn_shell_request` below: a refusal
             // is only visible if the workspace it happened in is on screen.
             let previous = std::mem::replace(&mut self.current_workspace, ws.clone());
-            if self.attach_herdr_agent(ctx, key, &pane_id, ws, previous.clone()) {
+            if self.attach_herdr_agent(ctx, key, &pane_id, ws, previous.clone(), None) {
                 workspace_activated = true;
             } else {
                 self.current_workspace = previous;
@@ -9250,6 +9306,10 @@ struct PendingHerdrAttach {
     /// attach answers frames after the switch, so the caller cannot restore
     /// the workspace itself the way a direct attach lets it.
     previous: WorkspaceKey,
+    /// Clients parked on this attach.  A shared-view attach opens its session
+    /// frames after the request that asked for it, so there is nothing to
+    /// answer with until `poll_herdr_attach` resolves.
+    waiters: Vec<mpsc::Sender<ipc::IpcResult>>,
 }
 
 /// Whether ending a session asks first.  A harness-managed one is a detach
@@ -10542,7 +10602,14 @@ impl AlacritreeApp {
                 // Switches first, same as both sidebar paths: a refusal is only
                 // visible if the workspace it happened in is on screen.
                 let previous = std::mem::replace(&mut self.current_workspace, a.workspace.clone());
-                if self.attach_herdr_agent(ctx, a.key, &a.pane_id, a.workspace, previous.clone()) {
+                if self.attach_herdr_agent(
+                    ctx,
+                    a.key,
+                    &a.pane_id,
+                    a.workspace,
+                    previous.clone(),
+                    None,
+                ) {
                     self.focus_terminal();
                 } else {
                     self.current_workspace = previous;
@@ -11326,6 +11393,10 @@ impl AlacritreeApp {
                     self.defer_create_session(ctx, workspace, reply_tx);
                     continue;
                 },
+                ipc::IpcRequest::AttachMultiplexerPane { side, terminal_id } => {
+                    self.defer_attach_multiplexer_pane(ctx, &side, &terminal_id, reply_tx);
+                    continue;
+                },
                 other => other,
             };
             let name = request.name();
@@ -11408,6 +11479,49 @@ impl AlacritreeApp {
         }
     }
 
+    /// Attach to a pane the way its sidebar row does, holding the reply until
+    /// the session behind it can be read.  A refusal names what went wrong
+    /// precisely enough to act on: a side that names no server, a pane no
+    /// endpoint is reporting, and an integration that is switched off are
+    /// three different situations, and only the last is worth retrying after
+    /// a config change.
+    fn defer_attach_multiplexer_pane(
+        &mut self,
+        ctx: &Context,
+        side: &str,
+        terminal_id: &str,
+        reply_tx: mpsc::Sender<ipc::IpcResult>,
+    ) {
+        if !self.config.integrations.herdr.enabled {
+            let _ = reply_tx.send(Err("the herdr integration is disabled ([integrations.herdr] \
+                                       enabled)"
+                .to_string()));
+            return;
+        }
+        let Some(parsed_side) = herdr::Side::parse(side) else {
+            let _ = reply_tx
+                .send(Err(format!("`{side}` is not a side, expected `native` or `wsl:<distro>`")));
+            return;
+        };
+        let Some(agent) = self.find_herdr_agent(&parsed_side, terminal_id) else {
+            let _ = reply_tx.send(Err(format!(
+                "no pane `{terminal_id}` on {side}, see list_multiplexer_panes"
+            )));
+            return;
+        };
+        let pane_id = agent.pane_id.clone();
+        let key =
+            herdr::HerdrKey { side: parsed_side.clone(), terminal_id: terminal_id.to_string() };
+        let workspaces = herdr_workspaces(&self.projects, |path| self.liveness.missing(path));
+        let workspace = herdr::match_workspace(agent, &parsed_side, &workspaces);
+
+        let previous = std::mem::replace(&mut self.current_workspace, workspace.clone());
+        if !self.attach_herdr_agent(ctx, key, &pane_id, workspace, previous.clone(), Some(reply_tx))
+        {
+            self.current_workspace = previous;
+        }
+    }
+
     fn handle_ipc_request(&mut self, ctx: &Context, request: ipc::IpcRequest) -> ipc::IpcResult {
         use ipc::IpcRequest as Req;
         match request {
@@ -11442,6 +11556,12 @@ impl AlacritreeApp {
             // held until the session's PTY is live, which needs the reply
             // channel this method does not have.
             Req::CreateSession { .. } => Err("create_session was not deferred".to_string()),
+            // Claimed by `process_ipc_calls` before dispatch: the reply is
+            // held until the attached session's PTY is live, which needs the
+            // reply channel this method does not have.
+            Req::AttachMultiplexerPane { .. } => {
+                Err("attach_multiplexer_pane was not deferred".to_string())
+            },
             Req::CloseSession { session_id } => {
                 if !self.sessions.iter().any(|s| s.id == session_id) {
                     return Err(format!("no session with id {session_id}"));
@@ -12218,6 +12338,74 @@ mod tests {
         assert_eq!(json["panes"].as_array().expect("panes array").len(), 0);
     }
 
+    /// Three refusals a client acts on differently: only the disabled one is
+    /// worth retrying after a config change, and a caller that cannot tell
+    /// them apart retries all three or none.
+    #[test]
+    fn attaching_to_a_side_that_names_no_server_is_refused_by_name() {
+        let mut app = test_app();
+        app.config.integrations.herdr.enabled = true;
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        app.defer_attach_multiplexer_pane(&Context::default(), "bogus", "t1", reply_tx);
+
+        assert_eq!(
+            reply_rx.try_recv().unwrap(),
+            Err("`bogus` is not a side, expected `native` or `wsl:<distro>`".to_string())
+        );
+    }
+
+    #[test]
+    fn attaching_to_a_pane_no_endpoint_reports_is_refused_by_name() {
+        let mut app = test_app();
+        app.config.integrations.herdr.enabled = true;
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        app.defer_attach_multiplexer_pane(&Context::default(), "native", "missing", reply_tx);
+
+        assert_eq!(
+            reply_rx.try_recv().unwrap(),
+            Err("no pane `missing` on native, see list_multiplexer_panes".to_string())
+        );
+    }
+
+    #[test]
+    fn attaching_while_the_integration_is_disabled_says_so() {
+        let mut app = test_app();
+        app.config.integrations.herdr.enabled = false;
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        app.defer_attach_multiplexer_pane(&Context::default(), "native", "t1", reply_tx);
+
+        assert_eq!(
+            reply_rx.try_recv().unwrap(),
+            Err("the herdr integration is disabled ([integrations.herdr] enabled)".to_string())
+        );
+    }
+
+    /// A pane a session already holds answers with that session rather than
+    /// opening a second attach client against the same pane.
+    #[test]
+    fn attaching_to_a_pane_a_session_already_holds_returns_that_session() {
+        let mut app = test_app();
+        app.config.integrations.herdr.enabled = true;
+        let side = herdr::Side::Native;
+        adopt_herdr_fixture(
+            &mut app,
+            side.clone(),
+            r#"{"result":{"panes":[
+                {"terminal_id":"term-held","pane_id":"w1:p1","agent":"claude","agent_status":"working","cwd":"/repo"}
+            ]}}"#,
+            Instant::now(),
+        );
+        let id = bind_herdr_fixture(&mut app, side, "term-held");
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        app.defer_attach_multiplexer_pane(&Context::default(), "native", "term-held", reply_tx);
+
+        assert_eq!(reply_rx.try_recv().unwrap(), Ok(json!({ "session_id": id })));
+    }
+
     #[test]
     fn attached_herdr_palette_keeps_filtered_shell_metadata() {
         let mut app = herdr_lifecycle_app();
@@ -12523,6 +12711,7 @@ mod tests {
             workspace: None,
             previous: None,
             job: Some(jobs::Job::ready(Ok(("herdr".into(), Vec::new())))),
+            waiters: Vec::new(),
         });
         adopt_herdr_fixture(&mut app, side, r#"{"result":{"panes":[]}}"#, Instant::now());
 

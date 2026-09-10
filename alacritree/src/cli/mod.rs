@@ -240,6 +240,14 @@ enum SessionCommand {
 enum MultiplexerCommand {
     /// List every detected pane, attached or not.
     List,
+    /// Open a session on a detected pane, as clicking its sidebar row does.
+    Attach {
+        /// `native`, or `wsl:<distro>`, as `multiplexer list` reports it.
+        side: String,
+        /// Terminal id from `multiplexer list`.  Not the pane id, which
+        /// changes when a pane moves between workspaces.
+        terminal_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -433,6 +441,9 @@ fn to_request(command: Command) -> IpcRequest {
         },
         Command::Multiplexer { command } => match command {
             MultiplexerCommand::List => IpcRequest::ListMultiplexerPanes,
+            MultiplexerCommand::Attach { side, terminal_id } => {
+                IpcRequest::AttachMultiplexerPane { side, terminal_id }
+            },
         },
         Command::Workspace { command } => match command {
             WorkspaceCommand::Select { path } => {
