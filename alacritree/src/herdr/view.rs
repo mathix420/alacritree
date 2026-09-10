@@ -137,11 +137,13 @@ impl HerdrViewSync {
         }
     }
 
-    /// Record where herdr's focus now is, without proposing anything.  Every
-    /// path that moves herdr's focus calls this, so the move alacritree asked
-    /// for is never mistaken for one the user made inside herdr, and a
-    /// pending follow on the same side — proposed against a state this
-    /// stamp just superseded — goes with it.
+    /// Settle where the focus on a side now stands, without proposing
+    /// anything.  Every decision about a pane records itself here, whether
+    /// the focus was moved onto it or a follow to it was refused, so a move
+    /// alacritree asked for is never mistaken for one the user made inside
+    /// herdr and a refusal is never re-proposed from the same stale entry.
+    /// A pending follow on the same side, proposed against a state this
+    /// stamp just superseded, goes with it.
     pub fn moved_focus(&mut self, key: &HerdrKey, at: Instant) {
         self.trail.insert(key.side.clone(), TrailEntry {
             terminal_id: key.terminal_id.clone(),
