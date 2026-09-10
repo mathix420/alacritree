@@ -16,13 +16,15 @@ mod wire;
 
 pub(in crate::herdr) use poll::ListingReply;
 
+/// A side belongs to the multiplexer module, which every multiplexer's server
+/// runs under; herdr names it here for the convenience of its own callers.
+pub use crate::multiplexer::Side;
 pub use cli::{
-    HerdrAttachResult, attach_args, attaches_directly, focus_args, focus_pane, focus_pane_args,
-    herdr_attach_gesture, running_session_name,
+    PROGRAM, attach_args, attaches_directly, focus_args, focus_pane, herdr_attach_gesture,
+    running_session_name,
 };
 pub use model::{
-    Agent, HerdrKey, Indicators, Listing, PollError, Settings, Side, Status, match_workspace,
-    unattached,
+    Agent, HerdrKey, Indicators, Listing, PollError, Settings, Status, match_workspace, unattached,
 };
 pub use poll::{EndpointCache, Endpoints};
 pub use settings::settings;

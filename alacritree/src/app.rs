@@ -28,6 +28,7 @@ use crate::config::{
 use crate::crash_log::{self, ExitReason};
 use crate::git_nav::{self, GitSection, SectionCount};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
+use crate::multiplexer::{Launch, Multiplexer, MultiplexerSession, PaneTarget};
 use crate::panel_filter::{self, PanelFilter};
 use crate::path_style::PathStyle;
 use crate::pending_spawn::{Finished, PendingSpawns};
@@ -1577,13 +1578,15 @@ impl AlacritreeApp {
             }
             return true;
         }
-        if self.herdr_attaches_directly(&key) {
+        let target = self
+            .find_herdr_agent(&key.side, &key.terminal_id)
+            .map_or_else(|| unlisted_pane_target(&key, pane_id), |agent| agent.target(&key.side));
+        let multiplexer = Multiplexer::owning(&key);
+        let attach = self.config.integrations.herdr.attach;
+        if let Some(launch) = multiplexer.open_multiplexer_session(&target, attach) {
             // Nothing to ask herdr first: the pane id is the whole target,
             // and the client attaches to it directly.
-            let args = herdr::attach_args(pane_id);
-            let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-            let (program, argv) = key.side.command(&borrowed);
-            return match self.open_herdr_session(ctx, key, workspace, program, argv) {
+            return match self.open_herdr_session(ctx, key, workspace, launch.program, launch.argv) {
                 Some(id) => {
                     self.park_attach_reply(id, waiter);
                     true
@@ -1609,12 +1612,9 @@ impl AlacritreeApp {
         // The gesture is two herdr processes whatever `async_session_spawn`
         // says, and running them from the click would hold the frame for as
         // long as herdr takes to answer.
-        let focus = self
-            .find_herdr_agent(&key.side, &key.terminal_id)
-            .map_or_else(|| herdr::focus_pane_args(pane_id), herdr::focus_args);
         self.pending_herdr_attach.push(PendingHerdrAttach {
             job: None,
-            focus,
+            target,
             key,
             workspace,
             previous,
@@ -1646,7 +1646,7 @@ impl AlacritreeApp {
         let mut pending = self.pending_herdr_attach.remove(0);
         if let Some(job) = &pending.job {
             match job.poll() {
-                Some(Ok((program, argv))) => {
+                Some(Ok(launch)) => {
                     // The open takes the workspace by value, so the arm keeps
                     // its own copy to judge the restore against afterwards.
                     let switched_to = pending.workspace.clone();
@@ -1655,8 +1655,8 @@ impl AlacritreeApp {
                         ctx,
                         pending.key,
                         pending.workspace,
-                        program,
-                        argv,
+                        launch.program,
+                        launch.argv,
                     ) {
                         Some(id) => {
                             for waiter in waiters {
@@ -1692,11 +1692,12 @@ impl AlacritreeApp {
         } else {
             let name = self.herdr_session_name(&pending.key.side);
             let side = pending.key.side.clone();
-            let focus = self
+            let target = self
                 .find_herdr_agent(&side, &pending.key.terminal_id)
-                .map_or_else(|| pending.focus.clone(), herdr::focus_args);
+                .map_or_else(|| pending.target.clone(), |agent| agent.target(&side));
+            let multiplexer = Multiplexer::owning(&pending.key);
             pending.job = Some(jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
-                herdr::herdr_attach_gesture(&side, &focus, name)
+                multiplexer.shared_view_gesture(&target, name)
             }));
             self.pending_herdr_attach.insert(0, pending);
         }
@@ -1793,8 +1794,9 @@ impl AlacritreeApp {
         match action {
             Some(herdr::HerdrViewAction::Focus(id)) => {
                 let Some(key) = key else { return };
-                let Some(focus) =
-                    self.find_herdr_agent(&key.side, &key.terminal_id).map(herdr::focus_args)
+                let Some(focus) = self
+                    .find_herdr_agent(&key.side, &key.terminal_id)
+                    .map(|agent| herdr::focus_args(&agent.target(&key.side)))
                 else {
                     return;
                 };
@@ -1871,10 +1873,10 @@ impl AlacritreeApp {
             let agent = self.find_herdr_agent(&key.side, &key.terminal_id)?;
             let args = herdr::attach_args(&agent.pane_id);
             let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-            key.side.command(&borrowed)
+            key.side.command(herdr::PROGRAM, &borrowed)
         } else {
             let name = self.herdr_session_name(&key.side)?;
-            key.side.command(&["session", "attach", &name])
+            key.side.command(herdr::PROGRAM, &["session", "attach", &name])
         };
         self.open_herdr_session(ctx, key.clone(), workspace, program, argv)?;
         self.herdr_session_for(key)
@@ -9310,8 +9312,10 @@ fn managed_tooltip(managed: &Managed) -> String {
 /// its client runs, so everything the session needs is in hand by the time it
 /// opens.
 struct PendingHerdrAttach {
-    job: Option<jobs::Job<herdr::HerdrAttachResult>>,
-    focus: Vec<String>,
+    job: Option<jobs::Job<Result<Launch, String>>>,
+    /// The pane to focus once the gesture runs.  A pane the listing has since
+    /// dropped is focused as this said, since nothing newer says otherwise.
+    target: PaneTarget,
     key: herdr::HerdrKey,
     workspace: WorkspaceKey,
     /// Where to hand the user back when herdr refuses.  A shared-view
@@ -9322,6 +9326,18 @@ struct PendingHerdrAttach {
     /// frames after the request that asked for it, so there is nothing to
     /// answer with until `poll_herdr_attach` resolves.
     waiters: Vec<mpsc::Sender<ipc::IpcResult>>,
+}
+
+/// A pane the listing no longer carries.  Claiming an agent is in it keeps
+/// every caller on the path it took before the pane went, which is what
+/// `herdr_pane_has_agent` answers for the same reason.
+fn unlisted_pane_target(key: &herdr::HerdrKey, pane_id: &str) -> PaneTarget {
+    PaneTarget {
+        side: key.side.clone(),
+        pane_id: pane_id.to_string(),
+        tab_id: None,
+        has_agent: true,
+    }
 }
 
 /// Whether ending a session asks first.  A harness-managed one is a detach
@@ -12717,12 +12733,13 @@ mod tests {
             key: herdr::HerdrKey { side: side.clone(), terminal_id: "term-gone".into() },
             job: jobs::Job::ready(Ok(())),
         });
+        let key = app.sessions[0].herdr_key.clone().unwrap();
         app.pending_herdr_attach.push(PendingHerdrAttach {
-            key: app.sessions[0].herdr_key.clone().unwrap(),
-            focus: Vec::new(),
+            target: unlisted_pane_target(&key, "w1:p1"),
+            key,
             workspace: None,
             previous: None,
-            job: Some(jobs::Job::ready(Ok(("herdr".into(), Vec::new())))),
+            job: Some(jobs::Job::ready(Ok(Launch { program: "herdr".into(), argv: Vec::new() }))),
             waiters: Vec::new(),
         });
         adopt_herdr_fixture(&mut app, side, r#"{"result":{"panes":[]}}"#, Instant::now());
@@ -12747,7 +12764,7 @@ mod tests {
         let (reply_tx, reply_rx) = mpsc::channel();
         app.pending_herdr_attach.push(PendingHerdrAttach {
             job: Some(jobs::Job::ready(Err("boom".to_string()))),
-            focus: Vec::new(),
+            target: unlisted_pane_target(&key, "w1:p1"),
             key,
             workspace: None,
             previous: None,
@@ -12768,7 +12785,7 @@ mod tests {
         let (reply_tx, reply_rx) = mpsc::channel();
         app.pending_herdr_attach.push(PendingHerdrAttach {
             job: Some(jobs::Job::panicked()),
-            focus: Vec::new(),
+            target: unlisted_pane_target(&key, "w1:p1"),
             key,
             workspace: None,
             previous: None,
@@ -12795,8 +12812,8 @@ mod tests {
         let workspace = PathBuf::from("this/path/does/not/exist");
         let (reply_tx, reply_rx) = mpsc::channel();
         app.pending_herdr_attach.push(PendingHerdrAttach {
-            job: Some(jobs::Job::ready(Ok(("herdr".into(), Vec::new())))),
-            focus: Vec::new(),
+            job: Some(jobs::Job::ready(Ok(Launch { program: "herdr".into(), argv: Vec::new() }))),
+            target: unlisted_pane_target(&key, "w1:p1"),
             key,
             workspace: Some(workspace.clone()),
             previous: None,
@@ -12867,7 +12884,7 @@ mod tests {
         let (reply_tx, reply_rx) = mpsc::channel();
         app.pending_herdr_attach.push(PendingHerdrAttach {
             job: None,
-            focus: Vec::new(),
+            target: unlisted_pane_target(&key, "w1:p1"),
             key,
             workspace: None,
             previous: None,

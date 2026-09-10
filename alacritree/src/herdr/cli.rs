@@ -9,49 +9,15 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use crate::config::AttachMode;
-use crate::{command_ext, jobs, wsl};
+use crate::multiplexer::PaneTarget;
+use crate::{command_ext, jobs};
 
 use super::wire::SessionList;
-use super::{Agent, Listing, ListingReply, PollError, Side, error_code};
+use super::{Listing, ListingReply, PollError, Side, error_code};
 
-/// Single-quote a POSIX argument, since WSL invocations are one `sh -lc`
-/// string rather than an argv.
-fn sh_quote(arg: &str) -> String {
-    if !arg.is_empty() && arg.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=".contains(c)) {
-        return arg.to_string();
-    }
-    format!("'{}'", arg.replace('\'', r"'\''"))
-}
-
-impl Side {
-    /// Program and argv that run `herdr <args>` on this side.  WSL goes
-    /// through a login shell because herdr lives in `~/.local/bin`, which is
-    /// not on the PATH `wsl.exe -e` inherits.
-    pub fn command(&self, args: &[&str]) -> (String, Vec<String>) {
-        match self {
-            Self::Native => ("herdr".to_string(), args.iter().map(|a| (*a).to_string()).collect()),
-            Self::Wsl(distro) => {
-                let script = std::iter::once("herdr".to_string())
-                    .chain(args.iter().map(|a| sh_quote(a)))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                // `--exec` hands wsl.exe a bare program lookup, and herdr
-                // installs to ~/.local/bin, which is off that PATH; routing
-                // through `sh -lc` sources the login shell that puts it back.
-                wsl::exec_invocation(distro, &["sh", "-lc", &script])
-            },
-        }
-    }
-
-    /// How a row names this side.  `None` on the native one, whose name would
-    /// be the same word on every row of a machine that has only it.
-    pub fn label(&self) -> Option<String> {
-        match self {
-            Self::Native => None,
-            Self::Wsl(distro) => Some(format!("wsl:{distro}")),
-        }
-    }
-}
+/// The binary every call here runs.  `Side::command` takes it as an argument
+/// so a second multiplexer reaches its own through the same plumbing.
+pub const PROGRAM: &str = "herdr";
 
 /// Direct attach to one agent.  Unsupported on native Windows, where
 /// `run_terminal_attach` is a `#[cfg(windows)]` refusal.
@@ -105,14 +71,14 @@ pub(super) fn bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static)
     rx.recv_timeout(GESTURE_TIMEOUT).ok()
 }
 
-/// The `herdr` subcommand that brings `agent`'s pane to the front of the
+/// The `herdr` subcommand that brings `target`'s pane to the front of the
 /// user's own herdr window.  `agent focus` resolves its target through the
 /// agent registry and answers `agent_not_found` for a pane with no agent in
 /// it, so such a pane is reached by focusing the tab that holds it.
-pub fn focus_args(agent: &Agent) -> Vec<String> {
-    match (agent.status, &agent.tab_id) {
-        (None, Some(tab_id)) => vec!["tab".into(), "focus".into(), tab_id.clone()],
-        _ => focus_pane_args(&agent.pane_id),
+pub fn focus_args(target: &PaneTarget) -> Vec<String> {
+    match (target.has_agent, &target.tab_id) {
+        (false, Some(tab_id)) => vec!["tab".into(), "focus".into(), tab_id.clone()],
+        _ => focus_pane_args(&target.pane_id),
     }
 }
 
@@ -129,7 +95,7 @@ pub fn focus_pane_args(pane_id: &str) -> Vec<String> {
 /// way.
 pub fn focus_pane(side: &Side, focus: &[String]) -> Result<(), String> {
     let borrowed: Vec<&str> = focus.iter().map(String::as_str).collect();
-    let (program, args) = side.command(&borrowed);
+    let (program, args) = side.command(PROGRAM, &borrowed);
     #[allow(clippy::disallowed_methods)] // Running herdr is this function's job.
     let run = move || {
         command_ext::hidden(program)
@@ -157,7 +123,7 @@ pub fn focus_pane(side: &Side, focus: &[String]) -> Result<(), String> {
 /// inside [`GESTURE_TIMEOUT`] is an `Err`, because attaching to a guessed
 /// name would only park the wedged wait inside the new session.
 pub fn running_session_name(side: &Side) -> Result<String, String> {
-    let (program, args) = side.command(&["session", "list", "--json"]);
+    let (program, args) = side.command(PROGRAM, &["session", "list", "--json"]);
     #[allow(clippy::disallowed_methods)] // Running herdr is this function's job.
     let run = move || {
         command_ext::hidden(program)
@@ -199,7 +165,7 @@ pub(super) fn list_panes(
     attached: bool,
     _blocking: &jobs::Blocking,
 ) -> Result<ListingReply, PollError> {
-    let (program, args) = side.command(&listing.args());
+    let (program, args) = side.command(PROGRAM, &listing.args());
     let sampled_at = Instant::now();
     let output = command_ext::hidden(program)
         .args(args)
@@ -243,7 +209,7 @@ pub fn herdr_attach_gesture(
         Some(session) => session,
         None => running_session_name(side)?,
     };
-    Ok(side.command(&["session", "attach", &session]))
+    Ok(side.command(PROGRAM, &["session", "attach", &session]))
 }
 
 #[cfg(test)]
@@ -256,8 +222,8 @@ mod tests {
     #[test]
     fn a_pane_with_no_agent_is_focused_through_its_tab() {
         let panes = Listing::Panes.parse(PANES);
-        assert_eq!(focus_args(&panes[0]), vec!["agent", "focus", "w1:p1"]);
-        assert_eq!(focus_args(&panes[1]), vec!["tab", "focus", "w1:t4"]);
+        assert_eq!(focus_args(&panes[0].target(&Side::Native)), vec!["agent", "focus", "w1:p1"]);
+        assert_eq!(focus_args(&panes[1].target(&Side::Native)), vec!["tab", "focus", "w1:t4"]);
     }
 
     /// A pane herdr detected no agent in has nothing `herdr agent attach`
@@ -287,28 +253,6 @@ mod tests {
         assert!(!attaches_directly(&wsl, AttachMode::Session, true));
         assert!(!attaches_directly(&Side::Native, AttachMode::Session, true));
         assert_eq!(attaches_directly(&Side::Native, AttachMode::Agent, true), !cfg!(windows));
-    }
-
-    #[test]
-    fn native_runs_herdr_directly() {
-        let (program, args) = Side::Native.command(&["agent", "list"]);
-        assert_eq!(program, "herdr");
-        assert_eq!(args, vec!["agent", "list"]);
-    }
-
-    /// herdr installs to ~/.local/bin, which reaches PATH only under a login
-    /// shell.  `wsl.exe -e herdr` fails with execvpe ENOENT.
-    #[test]
-    fn wsl_wraps_in_a_login_shell() {
-        let (program, args) = Side::Wsl("kali-linux".into()).command(&["agent", "list"]);
-        assert_eq!(program, "wsl.exe");
-        assert_eq!(args, vec!["-d", "kali-linux", "--exec", "sh", "-lc", "herdr agent list"]);
-    }
-
-    #[test]
-    fn wsl_quotes_arguments_that_need_it() {
-        let (_, args) = Side::Wsl("d".into()).command(&["agent", "attach", "w1:p1"]);
-        assert_eq!(args.last().unwrap(), "herdr agent attach 'w1:p1'");
     }
 
     #[test]

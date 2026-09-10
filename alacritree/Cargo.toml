@@ -62,6 +62,13 @@ clap_complete = "4"
 # reads, so the published schema cannot drift from what the parser accepts.
 schemars = "1.2"
 nucleo-matcher = "0.3"
+# One trait call in `app.rs` reaches whichever multiplexer owns the pane, so
+# a second one is a new variant rather than a new branch at every call site.
+# Static dispatch: the enum carries no vtable.
+enum_dispatch = "0.3"
+# Spells a multiplexer's name for the wire and reads it back, off the same
+# enum the dispatch uses, so the two cannot disagree.
+strum = { version = "0.26", features = ["derive"] }
 
 [dev-dependencies]
 # Throwaway repos and state files for worktree, prune, and persistence tests.
