@@ -314,3 +314,57 @@ fn always_follows_a_new_pane_from_a_native_session() {
     });
     assert!(landed.is_ok(), "the window never followed herdr: {:#}", harness.sessions());
 }
+
+/// One keystroke into the foreground window, through the OS.
+fn type_a_key(harness: &Harness) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VK_F13,
+    };
+    // Typing goes to whatever holds the foreground, so this runs only once
+    // the window is known to be the child's. F13 maps to an egui::Key but
+    // sits on no normal keyboard, so nothing lands in the shell.
+    assert!(harness.foreground_is_child(), "refusing to type into a foreign window");
+    let mut down: INPUT = unsafe { std::mem::zeroed() };
+    down.r#type = INPUT_KEYBOARD;
+    down.Anonymous.ki = KEYBDINPUT { wVk: VK_F13, wScan: 0, dwFlags: 0, time: 0, dwExtraInfo: 0 };
+    let mut up = down;
+    up.Anonymous.ki.dwFlags = KEYEVENTF_KEYUP;
+    let inputs = [down, up];
+    let sent =
+        unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32) };
+    // A refused injection is silent, and would surface as the hold-off
+    // assertion failing with a cause it does not name.
+    assert_eq!(sent, inputs.len() as u32, "the OS refused the synthetic keystroke");
+}
+
+/// A follow arriving while the user is typing waits, and lands once they
+/// stop.  Only real keyboard input through the OS can show this: no CLI
+/// surface produces an egui event, so a test built on one would pass
+/// against a debounce hung on a clock that never moves at all.
+#[test]
+#[ignore = "types into the foreground window; run with the e2e task"]
+fn a_follow_waits_while_the_user_types() {
+    let harness = Harness::start("always");
+    let before = active_terminal(&harness.sessions());
+    let created = harness.herdr(&["tab", "create", "--focus"]);
+    assert!(created.status.success(), "tab create failed: {created:?}");
+
+    // Type continuously for longer than the quiet gap, well short of the
+    // expiry, and assert the window has not moved.
+    let typing_until = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < typing_until {
+        type_a_key(&harness);
+        std::thread::sleep(Duration::from_millis(75));
+    }
+    assert_eq!(
+        active_terminal(&harness.sessions()),
+        before,
+        "the window followed herdr while the user was typing"
+    );
+
+    let landed = wait_for(|| {
+        let sessions = harness.sessions();
+        active_terminal(&sessions).is_some() && active_terminal(&sessions) != before
+    });
+    assert!(landed.is_ok(), "the follow never landed after the typing stopped");
+}
