@@ -195,7 +195,12 @@ pub enum Multiplexer {
 impl Multiplexer {
     /// The multiplexer that owns the pane `key` names.  Every key alacritree
     /// holds today names a herdr pane; a second multiplexer decides here, off
-    /// whatever its own keys carry, and nowhere else.
+    /// whatever its own keys carry.
+    ///
+    /// A pane nothing has made yet has no key to decide from, so a caller
+    /// asking for one names its multiplexer itself.  A side cannot stand in
+    /// for the key: it names a server, and two multiplexers can each have one
+    /// on the same side.
     pub fn owning(_key: &herdr::HerdrKey) -> Self {
         Herdr.into()
     }

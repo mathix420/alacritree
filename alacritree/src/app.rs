@@ -12741,6 +12741,115 @@ mod tests {
         assert_eq!(multiplexer_cwd(&herdr::Side::Wsl("ubuntu".into()), None), None);
     }
 
+    /// A create herdr refused must answer whoever asked for the pane, not
+    /// just leave a dialog on a window the caller cannot see.
+    #[test]
+    fn poll_herdr_create_answers_the_waiter_when_herdr_refuses() {
+        let mut app = test_app();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        app.pending_herdr_create.push(PendingHerdrCreate {
+            job: jobs::Job::ready(Err("boom".to_string())),
+            side: herdr::Side::Native,
+            workspace: Some(PathBuf::from("some/workspace")),
+            waiter: Some(reply_tx),
+        });
+
+        app.poll_herdr_create(&Context::default());
+
+        assert_eq!(reply_rx.try_recv().unwrap(), Err("boom".to_string()));
+        assert_eq!(app.error_dialog.as_deref(), Some("boom"));
+        assert_eq!(app.current_workspace, None, "a refused create moved the user");
+    }
+
+    /// A create whose worker panicked resolves through the same `failed()`
+    /// path a stalled one does, and owes its waiter the same answer.
+    #[test]
+    fn poll_herdr_create_answers_the_waiter_when_the_create_never_finished() {
+        let mut app = test_app();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        app.pending_herdr_create.push(PendingHerdrCreate {
+            job: jobs::Job::panicked(),
+            side: herdr::Side::Native,
+            workspace: None,
+            waiter: Some(reply_tx),
+        });
+
+        app.poll_herdr_create(&Context::default());
+
+        assert_eq!(
+            reply_rx.try_recv().unwrap(),
+            Err("the herdr pane create did not finish".to_string())
+        );
+    }
+
+    /// The pane herdr just made is what the attach is pointed at: its
+    /// terminal id becomes the session's key and its pane id the target, in
+    /// the workspace the create was asked for.
+    #[test]
+    fn poll_herdr_create_hands_the_new_pane_to_the_attach() {
+        let mut app = test_app();
+        // Asking for a shared view never opens a pane directly, so the attach
+        // queues on every platform instead of branching on `can_attach`.
+        app.config.integrations.herdr.attach = AttachMode::Session;
+        let side = herdr::Side::Wsl("distro".into());
+        let workspace = Some(PathBuf::from("some/workspace"));
+        app.pending_herdr_create.push(PendingHerdrCreate {
+            job: jobs::Job::ready(Ok(CreatedPane {
+                terminal_id: "term-new".into(),
+                pane_id: "w1:p2".into(),
+            })),
+            side: side.clone(),
+            workspace: workspace.clone(),
+            waiter: None,
+        });
+
+        app.poll_herdr_create(&Context::default());
+
+        let queued = app.pending_herdr_attach.first().expect("the create queued an attach");
+        assert_eq!(queued.key, herdr::HerdrKey { side, terminal_id: "term-new".into() });
+        assert_eq!(queued.target.pane_id, "w1:p2");
+        assert_eq!(queued.workspace, workspace);
+        assert_eq!(app.current_workspace, workspace);
+        assert!(app.pending_herdr_create.is_empty());
+    }
+
+    /// An attach that refuses before any PTY leaves the user in the workspace
+    /// they were in, not the one the create switched to on its way.
+    #[test]
+    fn poll_herdr_create_restores_the_workspace_when_the_attach_refuses() {
+        let mut app = test_app();
+        // A WSL side with no cache entry takes the direct-attach branch, where
+        // `spawn_session_with_shell` refuses a workspace that is not on disk
+        // before it touches a PTY.
+        let workspace = PathBuf::from("this/path/does/not/exist");
+        let (reply_tx, reply_rx) = mpsc::channel();
+        app.pending_herdr_create.push(PendingHerdrCreate {
+            job: jobs::Job::ready(Ok(CreatedPane {
+                terminal_id: "term-new".into(),
+                pane_id: "w1:p2".into(),
+            })),
+            side: herdr::Side::Wsl("distro".into()),
+            workspace: Some(workspace),
+            waiter: Some(reply_tx),
+        });
+
+        app.poll_herdr_create(&Context::default());
+
+        assert_eq!(reply_rx.try_recv().unwrap(), Err("failed to attach the pane".to_string()));
+        assert_eq!(app.current_workspace, None, "a refused attach left the user moved");
+    }
+
+    #[test]
+    fn creating_a_pane_while_the_integration_is_disabled_says_so() {
+        let mut app = test_app();
+        app.config.integrations.herdr.enabled = false;
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        app.defer_create_multiplexer_pane(&Context::default(), None, None, reply_tx);
+
+        assert_eq!(reply_rx.try_recv().unwrap(), Err(HERDR_DISABLED.to_string()));
+    }
+
     #[test]
     fn attached_herdr_palette_keeps_filtered_shell_metadata() {
         let mut app = herdr_lifecycle_app();
