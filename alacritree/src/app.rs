@@ -3872,12 +3872,16 @@ impl AlacritreeApp {
                 self.sessions_filter_counts_detached = !self.sessions_filter_counts_detached;
             },
             BindingAction::Named(NamedAction::NewMultiplexerPane) => {
-                match self.default_multiplexer_side() {
-                    Ok(side) => {
-                        let workspace = self.current_workspace.clone();
-                        self.create_multiplexer_pane(ctx, side, workspace, None);
-                    },
-                    Err(e) => self.error_dialog = Some(e),
+                if !self.config.integrations.herdr.enabled {
+                    self.error_dialog = Some(HERDR_DISABLED.to_string());
+                } else {
+                    match self.default_multiplexer_side() {
+                        Ok(side) => {
+                            let workspace = self.current_workspace.clone();
+                            self.create_multiplexer_pane(ctx, side, workspace, None);
+                        },
+                        Err(e) => self.error_dialog = Some(e),
+                    }
                 }
             },
             BindingAction::Named(NamedAction::SelectNextWorkspace) => {
@@ -12701,6 +12705,24 @@ mod tests {
             Some("no herdr server is answering; start one, or name a side")
         );
         assert!(app.pending_herdr_create.is_empty(), "an unresolved side still asked herdr");
+    }
+
+    /// A disabled integration must say so, not blame a missing server: the
+    /// no-server wording sends the user to start one, which does nothing
+    /// while `enabled` stays false.
+    #[test]
+    fn dispatching_new_multiplexer_pane_while_disabled_names_the_integration() {
+        let mut app = test_app();
+        app.config.integrations.herdr.enabled = false;
+
+        app.dispatch_action(
+            &Context::default(),
+            BindingAction::Named(NamedAction::NewMultiplexerPane),
+            ActionOrigin::Keyboard,
+        );
+
+        assert_eq!(app.error_dialog.as_deref(), Some(HERDR_DISABLED));
+        assert!(app.pending_herdr_create.is_empty(), "a disabled integration still asked herdr");
     }
 
     /// The side of the pane already on screen is what asking for another one
