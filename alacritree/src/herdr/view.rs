@@ -106,7 +106,7 @@ pub struct ViewInputs<'a> {
 }
 
 impl HerdrViewSync {
-    pub fn closed(&mut self, id: SessionId, key: Option<&HerdrKey>) {
+    pub fn closed(&mut self, id: SessionId, key: Option<&HerdrKey>, at: Instant) {
         if self.visible == Some(id) {
             self.visible = None;
             self.follow_after = None;
@@ -115,11 +115,10 @@ impl HerdrViewSync {
             self.focused = None;
         }
         // A follow to a row the user just closed would respawn its attach
-        // client.  The tick baseline goes too, or a pending reborn from the
-        // same stale entry inherits the gap since the drop and delivers anyway.
-        if key.is_some_and(|key| self.pending.as_ref().is_some_and(|p| &p.key == key)) {
-            self.pending = None;
-            self.ticked_at = None;
+        // client.  herdr still reports that pane as focused, so only stamping
+        // the refusal stops the same edge re-forming on the next frame.
+        if let Some(key) = key.filter(|key| self.pending.as_ref().is_some_and(|p| &p.key == *key)) {
+            self.moved_focus(key, at);
         }
     }
 
@@ -222,8 +221,7 @@ impl HerdrViewSync {
 
     /// Attentive time since the previous frame.  Counted on every call so a
     /// busy or inattentive stretch is skipped rather than back-charged to the
-    /// pending follow on the frame after it.  `closed` also forgets this
-    /// baseline on a cancellation, for the same reason.
+    /// pending follow on the frame after it.
     fn tick(&mut self, inputs: &ViewInputs<'_>) -> Duration {
         let previous = self.ticked_at.replace(inputs.now);
         if inputs.busy || !inputs.attentive {
@@ -958,9 +956,10 @@ mod tests {
         assert_eq!(sync.next(quiet), None);
     }
 
-    /// Following a row the user just closed would respawn its attach client.
+    /// Following a row the user just closed would respawn its attach client,
+    /// and herdr keeps reporting that row as focused for as long as it is.
     #[test]
-    fn a_pending_follow_is_dropped_when_its_target_closes() {
+    fn a_closed_target_suppresses_the_follow_rather_than_delaying_it() {
         let side = herdr::Side::Native;
         let target = HerdrKey { side: side.clone(), terminal_id: "t2".into() };
         let start = Instant::now();
@@ -972,11 +971,18 @@ mod tests {
         let mut typing = always(Some((1, None, false)), &second, sampled);
         typing.last_direct_input = Some(sampled);
         assert_eq!(sync.next(typing), None);
-        sync.closed(9, Some(&target));
-        let mut quiet =
-            always(Some((1, None, false)), &second, sampled + Duration::from_millis(1300));
-        quiet.last_direct_input = Some(sampled);
-        assert_eq!(sync.next(quiet), None);
+
+        sync.closed(9, Some(&target), sampled + Duration::from_millis(1));
+
+        // Two frames past the gap, because a drop the trail never learned
+        // about only costs the re-formed edge the one frame it takes to
+        // gather a gap of its own.
+        for step in [1300, 2600] {
+            let mut quiet =
+                always(Some((1, None, false)), &second, sampled + Duration::from_millis(step));
+            quiet.last_direct_input = Some(sampled);
+            assert_eq!(sync.next(quiet), None, "the closed row was followed {step} ms in");
+        }
     }
 
     /// The shared-view path outranks the trail, and a pending it leaves
@@ -1071,8 +1077,8 @@ mod tests {
         assert!(matches!(sync.next(back), Some(HerdrViewAction::Follow(_))));
     }
 
-    /// A follow the app could not deliver leaves the trail unstamped, so the
-    /// same change is proposed again rather than lost.
+    /// Returning a follow stamps nothing; the caller stamps, on arrival or on
+    /// refusal.  Until it does, the change stands and is proposed again.
     #[test]
     fn an_undelivered_follow_is_proposed_again() {
         let side = herdr::Side::Native;

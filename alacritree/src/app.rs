@@ -1796,34 +1796,39 @@ impl AlacritreeApp {
     }
 
     fn follow_herdr_view(&mut self, ctx: &Context, key: herdr::HerdrKey) {
-        let id = if let Some(id) = self.herdr_session_for(&key) {
-            id
-        } else {
-            let Some(workspace) = self.herdr_row_workspace(&key.side, &key.terminal_id) else {
-                return;
-            };
-            let (program, argv) = if self.herdr_attaches_directly(&key) {
-                let Some(agent) = self.find_herdr_agent(&key.side, &key.terminal_id) else {
-                    return;
-                };
-                let args = herdr::attach_args(&agent.pane_id);
-                let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-                key.side.command(&borrowed)
-            } else {
-                let Some(name) = self.herdr_session_name(&key.side) else { return };
-                key.side.command(&["session", "attach", &name])
-            };
-            if !self.open_herdr_session(ctx, key.clone(), workspace, program, argv) {
-                return;
-            }
-            let Some(id) = self.herdr_session_for(&key) else { return };
-            id
+        let Some(id) = self.herdr_follow_target(ctx, &key) else {
+            // herdr keeps reporting this pane as focused, so a target the app
+            // cannot reach is proposed again on every poll until the refusal
+            // is on the trail.
+            self.herdr_focused_view.moved_focus(&key, Instant::now());
+            return;
         };
         self.activate_session_by_id(id);
         self.reveal_search_row(&SidebarRow::Session(id));
         self.set_sidebar_cursor(SidebarRow::Session(id));
         self.focus_terminal();
         self.herdr_focused_view.attached(id, Some(&key), Instant::now());
+    }
+
+    /// The session showing `key`, opening one if the row is attachable.
+    fn herdr_follow_target(&mut self, ctx: &Context, key: &herdr::HerdrKey) -> Option<SessionId> {
+        if let Some(id) = self.herdr_session_for(key) {
+            return Some(id);
+        }
+        let workspace = self.herdr_row_workspace(&key.side, &key.terminal_id)?;
+        let (program, argv) = if self.herdr_attaches_directly(key) {
+            let agent = self.find_herdr_agent(&key.side, &key.terminal_id)?;
+            let args = herdr::attach_args(&agent.pane_id);
+            let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+            key.side.command(&borrowed)
+        } else {
+            let name = self.herdr_session_name(&key.side)?;
+            key.side.command(&["session", "attach", &name])
+        };
+        if !self.open_herdr_session(ctx, key.clone(), workspace, program, argv) {
+            return None;
+        }
+        self.herdr_session_for(key)
     }
 
     fn toggle_scratchpad_tab(&mut self, ctx: &Context) {
@@ -2035,7 +2040,7 @@ impl AlacritreeApp {
         if self.herdr_view_focus.as_ref().is_some_and(|pending| pending.session == id) {
             self.herdr_view_focus = None;
         }
-        self.herdr_focused_view.closed(id, herdr_key.as_ref());
+        self.herdr_focused_view.closed(id, herdr_key.as_ref(), Instant::now());
         if self.pending_session_close == Some(id) {
             self.pending_session_close = None;
         }
