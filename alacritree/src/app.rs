@@ -12783,6 +12783,78 @@ mod tests {
         );
     }
 
+    /// `open_herdr_session` can fail synchronously, with no process ever
+    /// spawned: `spawn_session_with_shell` refuses a workspace
+    /// `worktree_gone` cannot find on disk before it touches a PTY. A pending
+    /// attach that resolves into that refusal still owes its waiters an
+    /// answer, not just the error dialog.
+    #[test]
+    fn poll_herdr_attach_answers_waiters_when_the_open_fails_before_any_pty() {
+        let mut app = test_app();
+        let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
+        let workspace = PathBuf::from("this/path/does/not/exist");
+        let (reply_tx, reply_rx) = mpsc::channel();
+        app.pending_herdr_attach.push(PendingHerdrAttach {
+            job: Some(jobs::Job::ready(Ok(("herdr".into(), Vec::new())))),
+            focus: Vec::new(),
+            key,
+            workspace: Some(workspace.clone()),
+            previous: None,
+            waiters: vec![reply_tx],
+        });
+
+        app.poll_herdr_attach(&Context::default());
+
+        let expected = format!(
+            "failed to attach herdr agent: worktree is no longer checked out: {}",
+            workspace.display()
+        );
+        assert_eq!(reply_rx.try_recv().unwrap(), Err(expected));
+    }
+
+    /// The direct-attach branch of `attach_herdr_agent` hits the same
+    /// synchronous refusal as the shared-view path above, without ever
+    /// reaching `poll_herdr_attach`.
+    #[test]
+    fn attach_herdr_agent_direct_attach_answers_a_synchronous_open_failure() {
+        let mut app = test_app();
+        // A WSL side with no cache entry: `herdr_pane_has_agent` defaults an
+        // unknown pane to "has one", so this takes the direct-attach branch
+        // with no fixture setup, unlike native on this platform.
+        let key =
+            herdr::HerdrKey { side: herdr::Side::Wsl("distro".into()), terminal_id: "t1".into() };
+        let workspace = PathBuf::from("this/path/does/not/exist");
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        let opened = app.attach_herdr_agent(
+            &Context::default(),
+            key,
+            "w1:p1",
+            Some(workspace),
+            None,
+            Some(reply_tx),
+        );
+
+        assert!(!opened);
+        assert_eq!(reply_rx.try_recv().unwrap(), Err("failed to attach the pane".to_string()));
+    }
+
+    /// `park_attach_reply` builds the `Ok` reply itself when nothing is
+    /// opening for the id; `pending_spawn.rs` proves `watch` hands the
+    /// channel back in that case, but nothing there asserts what this
+    /// method does with it, so a dropped `Ok` wrap or a wrong id would go
+    /// uncaught.
+    #[test]
+    fn park_attach_reply_answers_at_once_when_nothing_is_opening_for_the_id() {
+        let mut app = test_app();
+        let id = app.sessions.first().expect("a session").id;
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        app.park_attach_reply(id, Some(reply_tx));
+
+        assert_eq!(reply_rx.try_recv().unwrap(), Ok(json!({ "session_id": id })));
+    }
+
     /// Closing a session must not silently drop a still-queued attach for its
     /// own pane: without the drain, its waiters would wait out their own
     /// timeout instead of learning the session went away.
