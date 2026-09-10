@@ -296,3 +296,21 @@ fn the_default_mode_does_not_follow_from_a_native_session() {
     std::thread::sleep(Duration::from_secs(6));
     assert_eq!(active_terminal(&harness.sessions()), before, "the window followed herdr");
 }
+
+/// The whole feature, through the real window: a pane created inside herdr
+/// while a native session is active pulls alacritree onto it.
+#[test]
+#[ignore = "spawns a herdr server and a window; run with the e2e task"]
+fn always_follows_a_new_pane_from_a_native_session() {
+    let harness = Harness::start("always");
+    let before = active_terminal(&harness.sessions());
+    // Without --focus the server does not move, and no edge forms, so the
+    // test would fail for a reason that is not the feature.
+    let created = harness.herdr(&["tab", "create", "--focus"]);
+    assert!(created.status.success(), "tab create failed: {created:?}");
+    let landed = wait_for(|| {
+        let sessions = harness.sessions();
+        active_terminal(&sessions).is_some() && active_terminal(&sessions) != before
+    });
+    assert!(landed.is_ok(), "the window never followed herdr: {:#}", harness.sessions());
+}

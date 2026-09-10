@@ -740,6 +740,10 @@ pub struct AlacritreeApp {
     /// When the user last gave the app an event.  Timed wake-ups are armed
     /// only just after one, so an app left open overnight goes fully quiet.
     last_input: Instant,
+    /// When input the user aimed at this window last arrived.  Distinct from
+    /// `last_input`, which also advances on bare pointer motion, and which
+    /// the liveness probe reads as its grace period.
+    last_direct_input: Option<Instant>,
     /// Rows behind the last-built focus snapshot. Paint reuses this until the
     /// next rebuild instead of recomputing the projection every frame.
     sidebar_rows_cache: Option<Vec<SidebarRow>>,
@@ -1047,6 +1051,7 @@ impl AlacritreeApp {
             liveness: Default::default(),
             liveness_probe: None,
             last_input: Instant::now(),
+            last_direct_input: None,
             sidebar_rows_cache: None,
             sidebar_focus_prev: None,
             sidebar_anchor: None,
@@ -1706,7 +1711,7 @@ impl AlacritreeApp {
             attentive,
             busy: self.herdr_view_focus.is_some() || !self.pending_herdr_attach.is_empty(),
             now: Instant::now(),
-            last_direct_input: Some(self.last_input),
+            last_direct_input: self.last_direct_input,
         });
         if let Some(pending) = self.herdr_view_focus.take() {
             if !self.sessions.iter().any(|session| session.id == pending.session) {
@@ -11547,6 +11552,28 @@ fn side_label(side: &herdr::Side) -> String {
     }
 }
 
+/// Input the user aimed at this window: keystrokes, text, IME composition,
+/// clipboard actions, scrolling, zooming, pointer clicks, touches and window
+/// focus.  Bare pointer motion is the one deliberate exclusion, or a mouse
+/// resting over the window would hold a follow off forever; a finger cannot
+/// rest without touching, so a touch is always an action.
+fn is_direct_input(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key { .. }
+            | egui::Event::Text(_)
+            | egui::Event::Ime(_)
+            | egui::Event::Paste(_)
+            | egui::Event::Copy
+            | egui::Event::Cut
+            | egui::Event::MouseWheel { .. }
+            | egui::Event::Zoom(_)
+            | egui::Event::PointerButton { .. }
+            | egui::Event::Touch { .. }
+            | egui::Event::WindowFocused(_)
+    )
+}
+
 impl eframe::App for AlacritreeApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         // This clear is the only thing painting a cell the grid leaves alone,
@@ -11571,8 +11598,13 @@ impl eframe::App for AlacritreeApp {
             .as_ref()
             .map(|_| (std::time::Instant::now(), crate::frame_log::output_wait()));
         self.grid_paint = std::time::Duration::ZERO;
-        if ctx.input(|i| !i.events.is_empty()) {
+        let (any_event, direct_input) =
+            ctx.input(|i| (!i.events.is_empty(), i.events.iter().any(is_direct_input)));
+        if any_event {
             self.last_input = Instant::now();
+        }
+        if direct_input {
+            self.last_direct_input = Some(Instant::now());
         }
         self.phases.restart();
         self.glyph_cache.begin_frame(ctx);
@@ -11964,6 +11996,74 @@ mod tests {
             display,
             at,
         );
+    }
+
+    /// Every variant of `egui::Event` as compiled in this build, so an egui
+    /// bump that adds, removes or renames one fails this test instead of
+    /// silently narrowing or widening the direct-input clock.
+    #[test]
+    fn is_direct_input_classifies_every_compiled_event_variant() {
+        let modifiers = egui::Modifiers::default();
+        let cases: &[(egui::Event, bool)] = &[
+            (egui::Event::Copy, true),
+            (egui::Event::Cut, true),
+            (egui::Event::Paste(String::new()), true),
+            (egui::Event::Text(String::new()), true),
+            (
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+                true,
+            ),
+            (egui::Event::PointerMoved(egui::Pos2::ZERO), false),
+            (egui::Event::MouseMoved(egui::Vec2::ZERO), false),
+            (
+                egui::Event::PointerButton {
+                    pos: egui::Pos2::ZERO,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers,
+                },
+                true,
+            ),
+            (egui::Event::PointerGone, false),
+            (egui::Event::Zoom(1.0), true),
+            (egui::Event::Ime(egui::ImeEvent::Commit(String::new())), true),
+            (
+                egui::Event::Touch {
+                    device_id: egui::TouchDeviceId(0),
+                    id: egui::TouchId(0),
+                    phase: egui::TouchPhase::Start,
+                    pos: egui::Pos2::ZERO,
+                    force: None,
+                },
+                true,
+            ),
+            (
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::Vec2::ZERO,
+                    modifiers,
+                },
+                true,
+            ),
+            (egui::Event::WindowFocused(true), true),
+            (
+                egui::Event::Screenshot {
+                    viewport_id: egui::ViewportId::default(),
+                    user_data: egui::UserData::default(),
+                    image: Arc::new(egui::ColorImage::new([1, 1], egui::Color32::BLACK)),
+                },
+                false,
+            ),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(is_direct_input(event), *expected, "{event:?}");
+        }
     }
 
     #[test]
