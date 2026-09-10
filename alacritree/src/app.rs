@@ -9660,23 +9660,53 @@ impl AlacritreeApp {
             "needs_attention": session.needs_attention,
             "agent": activity_json(activity),
             "busy": key.is_none().then(|| session.is_busy()),
-            "multiplexer": key.map(|key| self.multiplexer_json(key)),
+            "multiplexer": key.map(|key| self.session_multiplexer_json(key)),
         })
     }
 
-    /// Where a herdr-backed session lives.  `pane_id` and `tab_id` come from
-    /// the live listing, so a null says the cache does not know right now
-    /// rather than that the pane is gone.
-    fn multiplexer_json(&self, key: &herdr::HerdrKey) -> Value {
-        let pane = self.find_herdr_agent(&key.side, &key.terminal_id);
-        json!({
-            "name": "herdr",
-            "side": side_label(&key.side),
-            "session": self.herdr_session_name(&key.side),
-            "terminal_id": key.terminal_id,
-            "pane_id": pane.map(|pane| pane.pane_id.clone()),
-            "tab_id": pane.and_then(|pane| pane.tab_id.clone()),
-        })
+    /// Where a herdr-backed session lives, looked up from the key the session
+    /// carries.
+    fn session_multiplexer_json(&self, key: &herdr::HerdrKey) -> Value {
+        multiplexer_json(
+            &key.side,
+            &key.terminal_id,
+            self.herdr_session_name(&key.side),
+            self.find_herdr_agent(&key.side, &key.terminal_id),
+        )
+    }
+
+    /// Every pane herdr reports, on every side, attached or not.  Unlike the
+    /// sidebar this hides nothing: `show_unmatched` decides what is worth
+    /// drawing, and a caller naming a pane by its id is not browsing.
+    fn multiplexer_panes_json(&self) -> Value {
+        if !self.config.integrations.herdr.enabled {
+            return json!({ "panes": [] });
+        }
+        let workspaces = herdr_workspaces(&self.projects, |path| self.liveness.missing(path));
+        let mut panes = Vec::new();
+        for cache in self.herdr_endpoints.caches() {
+            let side = cache.side();
+            let session = cache.session_name();
+            for agent in cache.agents() {
+                let key =
+                    herdr::HerdrKey { side: side.clone(), terminal_id: agent.terminal_id.clone() };
+                panes.push(json!({
+                    "multiplexer": multiplexer_json(
+                        side,
+                        &agent.terminal_id,
+                        session.clone(),
+                        Some(agent),
+                    ),
+                    "kind": agent.kind,
+                    "title": agent.title,
+                    "status": agent.status.map(|status| status.label()),
+                    "focused": agent.focused,
+                    "workspace": herdr::match_workspace(agent, side, &workspaces),
+                    "session_id": self.herdr_session_for(&key),
+                }));
+            }
+        }
+        json!({ "panes": panes })
     }
 
     /// The session already attached to this agent, if one is open.
@@ -11486,6 +11516,7 @@ impl AlacritreeApp {
                 let idx = self.rename_project(&root, label)?;
                 Ok(project_json(&self.projects[idx]))
             },
+            Req::ListMultiplexerPanes => Ok(self.multiplexer_panes_json()),
             Req::RunAction { action } => match crate::bindings::parse_action(&action) {
                 BindingAction::Unsupported(name) => Err(format!("unknown action `{name}`")),
                 parsed => {
@@ -11536,6 +11567,26 @@ fn unknown_worktree(path: &Path) -> String {
     format!("{} is not a worktree in the sidebar — see list_projects", path.display())
 }
 
+/// Where a herdr pane lives, in the fields an attach takes back.  `pane_id`
+/// and `tab_id` are null when the listing does not carry the pane, which
+/// says the cache does not know right now rather than that the pane is
+/// gone.
+fn multiplexer_json(
+    side: &herdr::Side,
+    terminal_id: &str,
+    session: Option<String>,
+    pane: Option<&herdr::Agent>,
+) -> Value {
+    json!({
+        "name": "herdr",
+        "side": side.name(),
+        "session": session,
+        "terminal_id": terminal_id,
+        "pane_id": pane.map(|pane| pane.pane_id.clone()),
+        "tab_id": pane.and_then(|pane| pane.tab_id.clone()),
+    })
+}
+
 /// `SessionActivity` as the reply spells it.  A plain shell is null rather
 /// than an object, so a consumer testing for presence needs no second field.
 fn activity_json(activity: SessionActivity) -> Value {
@@ -11545,15 +11596,6 @@ fn activity_json(activity: SessionActivity) -> Value {
             "name": name,
             "state": live.label(),
         }),
-    }
-}
-
-/// Two herdr servers on one machine cannot see each other, so the side is
-/// part of an agent's identity and the reply spells it out.
-fn side_label(side: &herdr::Side) -> String {
-    match side {
-        herdr::Side::Native => "native".to_string(),
-        herdr::Side::Wsl(distro) => format!("wsl:{distro}"),
     }
 }
 
@@ -12110,6 +12152,70 @@ mod tests {
         }
         let session = app.sessions.iter().find(|s| s.id == id).expect("a session");
         assert_eq!(app.session_json(session, true)["multiplexer"]["side"], "wsl:ubuntu");
+    }
+
+    /// The listing is the only way a client learns a pane exists before
+    /// anything is attached to it, so a pane no session holds must appear
+    /// with a null session id rather than be filtered out the way the
+    /// sidebar filters one.
+    #[test]
+    fn the_pane_listing_carries_an_unattached_pane_with_a_null_session_id() {
+        let mut app = test_app();
+        adopt_herdr_fixture(
+            &mut app,
+            herdr::Side::Native,
+            r#"{"result":{"panes":[
+                {"terminal_id":"term-loose","pane_id":"w1:p1","agent":"claude","agent_status":"working","terminal_title_stripped":"loose pane","cwd":"/repo"}
+            ]}}"#,
+            Instant::now(),
+        );
+        let json = app.multiplexer_panes_json();
+        let panes = json["panes"].as_array().expect("panes array");
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0]["multiplexer"]["terminal_id"], "term-loose");
+        assert_eq!(panes[0]["session_id"], Value::Null);
+    }
+
+    /// A pane a session already holds still appears, naming that session, so
+    /// a client can tell "already open" from "not there".
+    #[test]
+    fn the_pane_listing_names_the_session_holding_a_pane() {
+        let mut app = test_app();
+        let side = herdr::Side::Native;
+        adopt_herdr_fixture(
+            &mut app,
+            side.clone(),
+            r#"{"result":{"panes":[
+                {"terminal_id":"term-held","pane_id":"w1:p1","agent":"claude","agent_status":"working","terminal_title_stripped":"held pane","cwd":"/repo"}
+            ]}}"#,
+            Instant::now(),
+        );
+        let id = bind_herdr_fixture(&mut app, side, "term-held");
+        let json = app.multiplexer_panes_json();
+        let panes = json["panes"].as_array().expect("panes array");
+        let pane = panes
+            .iter()
+            .find(|p| p["multiplexer"]["terminal_id"] == "term-held")
+            .expect("the fixture pane");
+        assert_eq!(pane["session_id"].as_u64(), Some(id));
+    }
+
+    /// A cache nothing polls has nothing to report, so the reply is empty
+    /// rather than an error: there is no pane to fail to find.
+    #[test]
+    fn the_pane_listing_is_empty_while_the_integration_is_disabled() {
+        let mut app = test_app();
+        app.config.integrations.herdr.enabled = false;
+        adopt_herdr_fixture(
+            &mut app,
+            herdr::Side::Native,
+            r#"{"result":{"panes":[
+                {"terminal_id":"term-hidden","pane_id":"w1:p1","cwd":"/repo"}
+            ]}}"#,
+            Instant::now(),
+        );
+        let json = app.multiplexer_panes_json();
+        assert_eq!(json["panes"].as_array().expect("panes array").len(), 0);
     }
 
     #[test]

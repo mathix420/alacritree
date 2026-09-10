@@ -134,6 +134,11 @@ fn tool_definitions() -> Value {
             "inputSchema": { "type": "object", "properties": {} },
         },
         {
+            "name": "list_multiplexer_panes",
+            "description": "List every pane of the terminal multiplexer alacritree has detected (herdr), on every side it reaches, whether or not a session is attached to one. Each entry carries the multiplexer block naming the pane (side and terminal_id), the pane's agent kind, title and live status, whether the multiplexer's own window is showing it, the workspace its working directory matches, and the id of the alacritree session holding it (null when none is). Unattached panes appear here and nowhere else.",
+            "inputSchema": { "type": "object", "properties": {} },
+        },
+        {
             "name": "select_workspace",
             "description": "Focus a workspace in the alacritree window, like clicking it in the sidebar. Pass a worktree path from list_projects, or omit path for the home workspace.",
             "inputSchema": {
@@ -307,6 +312,7 @@ mod tests {
         vec![
             IpcRequest::ListProjects,
             IpcRequest::ListSessions,
+            IpcRequest::ListMultiplexerPanes,
             IpcRequest::SelectWorkspace { path: None },
             IpcRequest::CreateSession { workspace: None },
             IpcRequest::CloseSession { session_id: 1 },
@@ -328,6 +334,7 @@ mod tests {
         match request {
             IpcRequest::ListProjects => "list_projects",
             IpcRequest::ListSessions => "list_sessions",
+            IpcRequest::ListMultiplexerPanes => "list_multiplexer_panes",
             IpcRequest::SelectWorkspace { .. } => "select_workspace",
             IpcRequest::CreateSession { .. } => "create_session",
             IpcRequest::CloseSession { .. } => "close_session",

@@ -14,6 +14,19 @@ pub enum Side {
     Wsl(String),
 }
 
+impl Side {
+    /// How a side is spelled outside the process: `native`, or `wsl:<distro>`
+    /// as `wsl.exe -d` names it.  Two herdr servers on one machine cannot see
+    /// each other, so a pane named to a client without its side is not named
+    /// at all.
+    pub fn name(&self) -> String {
+        match self {
+            Self::Native => "native".to_string(),
+            Self::Wsl(distro) => format!("wsl:{distro}"),
+        }
+    }
+}
+
 /// Which of herdr's two indicator sets its config selects.  Rows follow the
 /// user's own choice, so a pane's mark in the sidebar is the mark it carries
 /// in herdr itself.
@@ -211,6 +224,15 @@ mod tests {
         assert_eq!(Status::Blocked.label(), "blocked");
         assert_eq!(Status::Done.label(), "done");
         assert_eq!(Status::Unknown.label(), "unknown");
+    }
+
+    /// A side has two spellings and they are not interchangeable: `label` is
+    /// a row's word for it and stays silent on the native side, while a
+    /// client that cannot see the row needs the side named every time.
+    #[test]
+    fn a_side_names_itself_on_both_sides_of_the_wire() {
+        assert_eq!(Side::Native.name(), "native");
+        assert_eq!(Side::Wsl("Ubuntu-24.04".into()).name(), "wsl:Ubuntu-24.04");
     }
 
     fn agent(id: &str, status: Status) -> Agent {

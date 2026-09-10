@@ -835,6 +835,7 @@ Tools:
 | --- | --- |
 | `list_projects` | Sidebar projects with their worktrees, branches, and default branch |
 | `list_sessions` | All sessions: id, title, workspace, kind, size, active tab, attention flag |
+| `list_multiplexer_panes` | Every herdr pane alacritree has detected, attached or not, with the side and terminal id an attach takes |
 | `select_workspace` | Focus a workspace, like clicking it in the sidebar |
 | `create_session` | Open a new shell session in a workspace |
 | `close_session` | Close a session |

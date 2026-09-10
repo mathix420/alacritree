@@ -99,6 +99,13 @@ enum Command {
         command: SessionCommand,
     },
 
+    /// Panes of the terminal multiplexer alacritree has detected.  Needs a
+    /// running alacritree.
+    Multiplexer {
+        #[command(subcommand)]
+        command: MultiplexerCommand,
+    },
+
     /// The focused workspace.  Needs a running alacritree.
     Workspace {
         #[command(subcommand)]
@@ -227,6 +234,12 @@ enum SessionCommand {
         /// A path inside the target worktree (e.g. `.`).
         path: PathBuf,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum MultiplexerCommand {
+    /// List every detected pane, attached or not.
+    List,
 }
 
 #[derive(Debug, Subcommand)]
@@ -417,6 +430,9 @@ fn to_request(command: Command) -> IpcRequest {
             SessionCommand::Move { session_id, path } => {
                 IpcRequest::MoveSession { session_id, path: absolute(path) }
             },
+        },
+        Command::Multiplexer { command } => match command {
+            MultiplexerCommand::List => IpcRequest::ListMultiplexerPanes,
         },
         Command::Workspace { command } => match command {
             WorkspaceCommand::Select { path } => {

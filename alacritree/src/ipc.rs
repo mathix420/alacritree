@@ -119,6 +119,11 @@ pub enum IpcRequest {
         project_root: PathBuf,
         branch: String,
     },
+    /// Every pane the multiplexer integration has detected, whether or not a
+    /// session is attached to one.  A caller reaches an unattached pane no
+    /// other way: `ListSessions` describes only what alacritree already
+    /// holds.
+    ListMultiplexerPanes,
     /// Run a named key-binding action (`FocusLeft`, `ToggleLeftSidebar`, …)
     /// as if its key had been pressed.  `bindings::parse_action` defines the
     /// accepted names, so every action a key can be bound to is reachable
@@ -148,6 +153,7 @@ impl IpcRequest {
             Self::RenameProject { .. } => "RenameProject",
             Self::GitStatus { .. } => "GitStatus",
             Self::CreateWorktree { .. } => "CreateWorktree",
+            Self::ListMultiplexerPanes => "ListMultiplexerPanes",
             Self::RunAction { .. } => "RunAction",
         }
     }
