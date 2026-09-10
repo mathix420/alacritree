@@ -2084,7 +2084,19 @@ impl AlacritreeApp {
         let workspace = self.sessions[idx].working_directory.clone();
         let herdr_key = self.sessions[idx].herdr_key.clone();
         if let Some(key) = &herdr_key {
-            self.pending_herdr_attach.retain(|pending| &pending.key != key);
+            // A plain `retain` would drop a queued attach's waiters with it,
+            // leaving a parked client to time out rather than learn why.
+            let (removed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_herdr_attach)
+                .into_iter()
+                .partition(|pending| &pending.key == key);
+            self.pending_herdr_attach = kept;
+            for pending in removed {
+                for waiter in pending.waiters {
+                    let _ = waiter.send(Err("the session behind this pane was closed before the \
+                                             attach finished"
+                        .to_string()));
+                }
+            }
         }
         if self.herdr_view_focus.as_ref().is_some_and(|pending| pending.session == id) {
             self.herdr_view_focus = None;
@@ -12723,6 +12735,79 @@ mod tests {
         assert!(app.herdr_view_focus.is_none());
         assert!(app.herdr_focused_view.visible.is_none());
         assert!(app.herdr_focused_view.focused.is_none());
+        assert!(app.pending_herdr_attach.is_empty());
+    }
+
+    /// A shared-view gesture herdr refused must still answer whoever attached
+    /// in order to read the pane, not just clear the error dialog.
+    #[test]
+    fn poll_herdr_attach_sends_a_refused_gestures_error_to_every_waiter() {
+        let mut app = test_app();
+        let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
+        let (reply_tx, reply_rx) = mpsc::channel();
+        app.pending_herdr_attach.push(PendingHerdrAttach {
+            job: Some(jobs::Job::ready(Err("boom".to_string()))),
+            focus: Vec::new(),
+            key,
+            workspace: None,
+            previous: None,
+            waiters: vec![reply_tx],
+        });
+
+        app.poll_herdr_attach(&Context::default());
+
+        assert_eq!(reply_rx.try_recv().unwrap(), Err("boom".to_string()));
+    }
+
+    /// A gesture whose worker panicked resolves through the same `failed()`
+    /// path a stalled one does, and owes its waiters the same answer.
+    #[test]
+    fn poll_herdr_attach_sends_a_panicked_gestures_message_to_every_waiter() {
+        let mut app = test_app();
+        let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
+        let (reply_tx, reply_rx) = mpsc::channel();
+        app.pending_herdr_attach.push(PendingHerdrAttach {
+            job: Some(jobs::Job::panicked()),
+            focus: Vec::new(),
+            key,
+            workspace: None,
+            previous: None,
+            waiters: vec![reply_tx],
+        });
+
+        app.poll_herdr_attach(&Context::default());
+
+        assert_eq!(
+            reply_rx.try_recv().unwrap(),
+            Err("the herdr attach did not finish".to_string())
+        );
+    }
+
+    /// Closing a session must not silently drop a still-queued attach for its
+    /// own pane: without the drain, its waiters would wait out their own
+    /// timeout instead of learning the session went away.
+    #[test]
+    fn closing_a_session_answers_a_still_queued_attach_for_its_own_pane() {
+        let mut app = test_app();
+        let side = herdr::Side::Native;
+        let id = bind_herdr_fixture(&mut app, side.clone(), "term-queued");
+        let key = herdr::HerdrKey { side, terminal_id: "term-queued".into() };
+        let (reply_tx, reply_rx) = mpsc::channel();
+        app.pending_herdr_attach.push(PendingHerdrAttach {
+            job: None,
+            focus: Vec::new(),
+            key,
+            workspace: None,
+            previous: None,
+            waiters: vec![reply_tx],
+        });
+
+        app.close_session(&Context::default(), id);
+
+        assert_eq!(
+            reply_rx.try_recv().unwrap(),
+            Err("the session behind this pane was closed before the attach finished".to_string())
+        );
         assert!(app.pending_herdr_attach.is_empty());
     }
 
