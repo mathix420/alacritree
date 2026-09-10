@@ -26,5 +26,5 @@ pub use model::{
 };
 pub use poll::{EndpointCache, Endpoints};
 pub use settings::settings;
-pub use view::{HerdrViewAction, HerdrViewFocus, HerdrViewSync};
+pub use view::{HerdrViewAction, HerdrViewFocus, HerdrViewSync, ViewInputs};
 pub use wire::error_code;

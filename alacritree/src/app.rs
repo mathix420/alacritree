@@ -1693,26 +1693,19 @@ impl AlacritreeApp {
         let active = self.active_session_index().map(|index| &self.sessions[index]);
         let key = active.and_then(|session| session.herdr_key.clone());
         let selection = active
-            .zip(key.as_ref())
-            .map(|(session, key)| (session.id, key, self.herdr_pane_has_agent(Some(key))));
-        let snapshot = key
-            .as_ref()
-            .and_then(|key| {
-                self.herdr_endpoints.caches().iter().find(|cache| cache.side() == &key.side)
-            })
-            .and_then(|cache| cache.sampled_at().map(|at| (at, cache.side(), cache.agents())))
-            .filter(|_| {
-                self.focus == PaneFocus::Terminal
-                    && !self.is_modal_open()
-                    && !self.palette.is_open()
-                    && ctx.input(|input| input.viewport().focused).unwrap_or(true)
-            });
-        let action = self.herdr_focused_view.next(
-            selection,
-            self.config.integrations.herdr.attach,
-            snapshot,
-            self.herdr_view_focus.is_some() || !self.pending_herdr_attach.is_empty(),
-        );
+            .map(|session| (session.id, key.as_ref(), self.herdr_pane_has_agent(key.as_ref())));
+        let attentive = self.focus == PaneFocus::Terminal
+            && !self.is_modal_open()
+            && !self.palette.is_open()
+            && ctx.input(|input| input.viewport().focused).unwrap_or(true);
+        let action = self.herdr_focused_view.next(herdr::ViewInputs {
+            active: selection,
+            attach: self.config.integrations.herdr.attach,
+            follow: self.config.integrations.herdr.follow_focus,
+            caches: self.herdr_endpoints.caches(),
+            attentive,
+            busy: self.herdr_view_focus.is_some() || !self.pending_herdr_attach.is_empty(),
+        });
         if let Some(pending) = self.herdr_view_focus.take() {
             if !self.sessions.iter().any(|session| session.id == pending.session) {
                 ctx.request_repaint();
