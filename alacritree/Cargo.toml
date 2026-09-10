@@ -156,8 +156,15 @@ objc2-user-notifications = { version = "0.3", default-features = false, features
 
 [target.'cfg(windows)'.dev-dependencies]
 # Share-mode constants for tests that hold a file the way the loader holds a
-# running exe image: writes denied, rename allowed.
-windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+# running exe image: writes denied, rename allowed. The UI features are the
+# foreground check and the synthetic input the end-to-end suite needs, which
+# no CLI surface can produce.
+windows-sys = { version = "0.59", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
 
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3.0.2"
