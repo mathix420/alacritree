@@ -175,22 +175,40 @@ impl HerdrViewSync {
             };
             let key =
                 HerdrKey { side: cache.side().clone(), terminal_id: focused.terminal_id.clone() };
-            match self.trail.get(cache.side()) {
-                // An id appearing where there was no entry is first sight.
-                None => self.moved_focus(&key, sampled_at),
-                Some(entry) => {
-                    if entry.terminal_id == focused.terminal_id || sampled_at <= entry.stamped_at {
-                        continue;
-                    }
-                    if active_key == Some(&key) {
-                        self.moved_focus(&key, sampled_at);
-                        continue;
-                    }
-                    edge.get_or_insert(key);
-                },
+            // An id appearing where there was no entry is first sight.
+            let Some(entry) = self.trail.get(cache.side()) else {
+                self.moved_focus(&key, sampled_at);
+                continue;
+            };
+            if sampled_at <= entry.stamped_at {
+                continue;
             }
+            let trailed = entry.terminal_id == focused.terminal_id;
+            self.void_pending(&key);
+            if trailed {
+                continue;
+            }
+            if active_key == Some(&key) {
+                self.moved_focus(&key, sampled_at);
+                continue;
+            }
+            edge.get_or_insert(key);
         }
         edge
+    }
+
+    /// Drop a pending whose side herdr has moved off the proposed pane.  The
+    /// proposal exists because herdr focused that pane; following once herdr
+    /// is elsewhere lands the user on a pane herdr has left, which a shared
+    /// view there would then drag herdr back to.
+    fn void_pending(&mut self, focused: &HerdrKey) {
+        let stale = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.key.side == focused.side && pending.key != *focused);
+        if stale {
+            self.pending = None;
+        }
     }
 
     pub fn next(&mut self, inputs: ViewInputs<'_>) -> Option<HerdrViewAction> {
@@ -230,11 +248,12 @@ impl HerdrViewSync {
         previous.map_or(Duration::ZERO, |previous| inputs.now.saturating_duration_since(previous))
     }
 
-    /// The newest change wins: a second edge replaces the target and restarts
-    /// the clock.  Re-seeing the same edge, which happens every frame until
-    /// the trail is stamped, changes nothing.  `input_seen` is left for
-    /// `deliver` to reconcile, so a pending born this frame is never credited
-    /// with quiet time that predates its own proposal.
+    /// A second edge replaces the target and restarts the clock; re-seeing
+    /// the same edge, which happens every frame until the trail is stamped,
+    /// changes nothing.  A move back to the trailed pane forms no edge to see,
+    /// so `void_pending` is what retires the proposal there.  `input_seen` is
+    /// left for `deliver` to reconcile, so a pending born this frame is never
+    /// credited with quiet time that predates its own proposal.
     fn propose(&mut self, key: HerdrKey, inputs: &ViewInputs<'_>) {
         if self.pending.as_ref().is_some_and(|pending| pending.key == key) {
             return;
@@ -983,6 +1002,29 @@ mod tests {
             quiet.last_direct_input = Some(sampled);
             assert_eq!(sync.next(quiet), None, "the closed row was followed {step} ms in");
         }
+    }
+
+    /// A pending proposes going where herdr went.  herdr going back before
+    /// the gap clears takes the reason with it, and following anyway lands
+    /// the user on a pane herdr has left.
+    #[test]
+    fn a_pending_follow_is_dropped_when_herdr_returns_to_the_trailed_pane() {
+        let side = herdr::Side::Native;
+        let start = Instant::now();
+        let mut sync = HerdrViewSync::default();
+        let first = one_focused(&side, "t1", start);
+        assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
+
+        let moved_at = start + Duration::from_millis(1);
+        let second = one_focused(&side, "t2", moved_at);
+        assert_eq!(sync.next(always(Some((1, None, false)), &second, moved_at)), None);
+
+        let back_at = moved_at + Duration::from_millis(1);
+        let back = one_focused(&side, "t1", back_at);
+        assert_eq!(sync.next(always(Some((1, None, false)), &back, back_at)), None);
+
+        let quiet = back_at + FOLLOW_QUIET_GAP + Duration::from_millis(1);
+        assert_eq!(sync.next(always(Some((1, None, false)), &back, quiet)), None);
     }
 
     /// The shared-view path outranks the trail, and a pending it leaves
