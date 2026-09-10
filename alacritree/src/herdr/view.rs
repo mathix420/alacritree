@@ -424,6 +424,10 @@ mod tests {
         let caches = one_focused(&side, "t1", now);
         let mut sync = HerdrViewSync::default();
         assert_eq!(sync.next(always(Some((1, None, false)), &caches, now)), None);
+        // Past the quiet gap, which is where a first sight mistaken for a
+        // change would deliver.
+        let quiet = now + FOLLOW_QUIET_GAP + Duration::from_millis(1);
+        assert_eq!(sync.next(always(Some((1, None, false)), &caches, quiet)), None);
     }
 
     #[test]
@@ -521,11 +525,13 @@ mod tests {
         assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
         let moved = start + Duration::from_millis(5);
         sync.moved_focus(&HerdrKey { side: side.clone(), terminal_id: "t3".into() }, moved);
-        let in_flight = one_focused(&side, "t2", start + Duration::from_millis(2));
-        assert_eq!(
-            sync.next(always(Some((1, None, false)), &in_flight, start + Duration::from_millis(2))),
-            None
-        );
+        let arrived = start + Duration::from_millis(2);
+        let in_flight = one_focused(&side, "t2", arrived);
+        assert_eq!(sync.next(always(Some((1, None, false)), &in_flight, arrived)), None);
+        // Past the quiet gap, which is where an edge formed from the stale
+        // sample would deliver.
+        let quiet = arrived + FOLLOW_QUIET_GAP + Duration::from_millis(1);
+        assert_eq!(sync.next(always(Some((1, None, false)), &in_flight, quiet)), None);
     }
 
     /// `attached` stamps the trail, so a pane it just opened is not mistaken
@@ -547,6 +553,10 @@ mod tests {
         let later = attached_at + Duration::from_millis(1);
         let second = one_focused(&side, "t2", later);
         assert_eq!(sync.next(always(Some((3, None, false)), &second, later)), None);
+        // Past the quiet gap, which is where the attach's own pane taken for
+        // a change would deliver.
+        let quiet = later + FOLLOW_QUIET_GAP + Duration::from_millis(1);
+        assert_eq!(sync.next(always(Some((3, None, false)), &second, quiet)), None);
     }
 
     /// A side that stops answering empties its listing, and a side whose
@@ -558,18 +568,24 @@ mod tests {
         let first = one_focused(&side, "t1", start);
         let mut sync = HerdrViewSync::default();
         assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
-        let later = start + Duration::from_millis(1);
-        let silent = vec![herdr::EndpointCache::for_test(side.clone(), Vec::new(), later)];
-        assert_eq!(sync.next(always(Some((1, None, false)), &silent, later)), None);
+
+        let silent_at = start + Duration::from_millis(1);
+        let silent = vec![herdr::EndpointCache::for_test(side.clone(), Vec::new(), silent_at)];
+        assert_eq!(sync.next(always(Some((1, None, false)), &silent, silent_at)), None);
+        let after_silence = silent_at + FOLLOW_QUIET_GAP + Duration::from_millis(1);
+        assert_eq!(sync.next(always(Some((1, None, false)), &silent, after_silence)), None);
+
         let gone: Vec<herdr::EndpointCache> = Vec::new();
-        assert_eq!(sync.next(always(Some((1, None, false)), &gone, later)), None);
+        let gone_at = after_silence + Duration::from_millis(1);
+        assert_eq!(sync.next(always(Some((1, None, false)), &gone, gone_at)), None);
+
         // The side comes back: its first reading is a baseline again, not the
         // change it looks like against the entry that used to be there.
-        let back = one_focused(&side, "t9", later + Duration::from_millis(1));
-        assert_eq!(
-            sync.next(always(Some((1, None, false)), &back, later + Duration::from_millis(1))),
-            None
-        );
+        let back_at = gone_at + Duration::from_millis(1);
+        let back = one_focused(&side, "t9", back_at);
+        assert_eq!(sync.next(always(Some((1, None, false)), &back, back_at)), None);
+        let after_return = back_at + FOLLOW_QUIET_GAP + Duration::from_millis(1);
+        assert_eq!(sync.next(always(Some((1, None, false)), &back, after_return)), None);
     }
 
     /// Following acts on any reachable side, and a side nobody touched is
