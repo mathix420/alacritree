@@ -13,6 +13,11 @@ use super::{Agent, Listing, PollError, Settings, Side, running_session_name, set
 /// How long an endpoint known to have a herdr waits before being retried.
 const RECOVERY_RETRY: Duration = Duration::from_secs(30);
 
+/// How many polls in a row a side may fail before what it last reported is
+/// dropped.  Counted in polls rather than in seconds so a slower cadence waits
+/// proportionally longer, rather than giving its rows up on one missed turn.
+const GRACE_POLLS: u32 = 3;
+
 /// Whether an endpoint is worth talking to.  A side with no herdr on it is
 /// abandoned, so a machine with none pays one failed spawn rather than one
 /// per tick; a side that has a herdr is retried forever, because starting the
@@ -127,6 +132,9 @@ pub struct EndpointCache {
     generation: u64,
     reach: Reach,
     last_attempt: Option<Instant>,
+    /// When a run of failed listings stops being worth waiting out.  Set on
+    /// the first failure of the run and cleared by the next answer.
+    blank_at: Option<Instant>,
     sampled_at: Option<Instant>,
     inventory: Option<PaneInventory>,
     pending: Option<jobs::Job<Result<ListingReply, PollError>>>,
@@ -143,6 +151,7 @@ impl EndpointCache {
             generation: 0,
             reach: Reach::default(),
             last_attempt: None,
+            blank_at: None,
             sampled_at: None,
             inventory: None,
             pending: None,
@@ -195,6 +204,13 @@ impl EndpointCache {
         cache
     }
 
+    /// One listing driven to completion, for tests that need a cache in the
+    /// state a given reply leaves it in.
+    ///
+    /// A failure handed straight in is one on a side that has been failing
+    /// long enough to have given its rows up; the grace period holding the
+    /// first of a run is its own concern, and `fail_listing_for_test` drives
+    /// that.
     #[cfg(test)]
     pub fn complete_listing_for_test(
         &mut self,
@@ -203,6 +219,9 @@ impl EndpointCache {
         display: Listing,
         sampled_at: Instant,
     ) {
+        if result.is_err() {
+            self.blank_at = Some(Instant::now());
+        }
         self.settings = Read::Done(Settings::default());
         self.session_name = Read::Done("fixture".into());
         self.last_attempt = Some(Instant::now());
@@ -210,6 +229,25 @@ impl EndpointCache {
             result.map(|stdout| ListingReply::parse(stdout, listing, sampled_at, true)),
         ));
         self.poll(Duration::from_secs(60), display, true);
+    }
+
+    /// One listing that did not answer, with the grace period holding what
+    /// herdr last reported still running.
+    #[cfg(test)]
+    pub fn fail_listing_for_test(&mut self, error: PollError, interval: Duration) {
+        self.settings = Read::Done(Settings::default());
+        self.session_name = Read::Done("fixture".into());
+        self.last_attempt = Some(Instant::now());
+        self.pending = Some(jobs::Job::ready(Err(error)));
+        self.poll(interval, Listing::Agents, true);
+    }
+
+    /// Ages the current run of failures past its grace period, so a test
+    /// reaches the state a side that stopped answering ends up in without
+    /// waiting the polls out.
+    #[cfg(test)]
+    pub fn expire_grace_for_test(&mut self) {
+        self.blank_at = Some(Instant::now());
     }
 
     fn adopt_reply(&mut self, reply: ListingReply, display: Listing, attached: bool) {
@@ -237,7 +275,7 @@ impl EndpointCache {
                                 .push(PaneMetadata { agent: agent.clone(), current: true });
                         }
                     }
-                    self.reach.record_success();
+                    self.note_success();
                     if self.inventory.as_ref().is_none_or(|old| old.terminal_ids != terminal_ids) {
                         log::debug!(
                             "herdr inventory side={:?} sampled_at={:?} terminal_ids={:?}",
@@ -255,7 +293,7 @@ impl EndpointCache {
                 },
             }
         } else {
-            self.reach.record_success();
+            self.note_success();
             self.inventory = None;
             if attached {
                 for pane in &mut self.attachment_panes {
@@ -376,21 +414,17 @@ impl EndpointCache {
                 },
                 Some(Err(error)) => {
                     self.sampled_at = None;
-                    self.note_failure(&error);
+                    self.note_missing_listing(&error, interval);
                     // herdr restarting may name its session differently, and
                     // attaching to the old name reaches nothing.
                     self.session_name = Read::Unread;
-                    if !self.agents.is_empty() {
-                        self.agents.clear();
-                        self.generation = self.generation.wrapping_add(1);
-                    }
                     self.pending = None;
                 },
                 // A worker panic supplies no membership evidence. Attached
                 // sessions still need retries on the configured cadence.
                 None if job.failed() => {
                     self.sampled_at = None;
-                    self.note_failure(&PollError::Absent("poll_panicked"));
+                    self.note_missing_listing(&PollError::Absent("poll_panicked"), interval);
                     self.pending = None;
                 },
                 None => return,
@@ -417,19 +451,60 @@ impl EndpointCache {
         since >= interval && (attached || self.reach.should_retry(since))
     }
 
-    /// Records one poll that produced no agents, and says so once.  A novel
-    /// code that is not the ordinary "no server here" is a warning; giving up
-    /// on an endpoint is a debug line, so a herdr that is installed but never
-    /// answers can still be explained from a log rather than only by an empty
-    /// sidebar.  A code that repeats is logged the first time only, so an
-    /// endpoint retried for the whole session still costs one line.
+    /// Records a reply that landed but could not be read.  Something did
+    /// answer here, so it is evidence about this side, and what it displaces
+    /// goes at once.
     fn note_failure(&mut self, error: &PollError) {
         self.inventory = None;
+        self.forget_listing();
+        self.log_failure(error);
+    }
+
+    /// Records a listing that never answered.  A poll that could not run is no
+    /// evidence about the agents, since herdr's own state is untouched by a
+    /// process that failed to spawn, so what it last said stands until the
+    /// failures outlast [`GRACE_POLLS`] of them.  Giving the rows up on the
+    /// first trades a rare stale status for a certain blank whenever a spawn
+    /// hiccups, which on a loaded machine is the common case.
+    fn note_missing_listing(&mut self, error: &PollError, interval: Duration) {
+        // Membership is the exception: a pane is removed on a listing that
+        // carries every pane but that one, which a failure is not.
+        self.inventory = None;
+        let blank_at =
+            *self.blank_at.get_or_insert_with(|| Instant::now() + interval * GRACE_POLLS);
+        if Instant::now() >= blank_at {
+            self.forget_listing();
+            if !self.agents.is_empty() {
+                self.agents.clear();
+                self.generation = self.generation.wrapping_add(1);
+            }
+        }
+        self.log_failure(error);
+    }
+
+    /// Drops the live half of what herdr last said about this side's panes.
+    /// A status nothing is refreshing still reads as current, which is worse
+    /// than showing none at all.
+    fn forget_listing(&mut self) {
         for pane in &mut self.attachment_panes {
             pane.current = false;
             pane.agent.status = None;
             pane.agent.focused = false;
         }
+    }
+
+    fn note_success(&mut self) {
+        self.reach.record_success();
+        self.blank_at = None;
+    }
+
+    /// Says a poll produced no agents, once.  A novel code that is not the
+    /// ordinary "no server here" is a warning; giving up on an endpoint is a
+    /// debug line, so a herdr that is installed but never answers can still be
+    /// explained from a log rather than only by an empty sidebar.  A code that
+    /// repeats is logged the first time only, so an endpoint retried for the
+    /// whole session still costs one line.
+    fn log_failure(&mut self, error: &PollError) {
         let code = error.code();
         let novel = self.reach.record_failure(error);
         if novel && code != "server_not_running" {
@@ -621,8 +696,14 @@ mod tests {
     use super::*;
     use crate::herdr::Status;
 
+    /// One working agent, for the tests about what survives a poll that did
+    /// not answer.
+    const LISTING: &str = r#"{"result":{"panes":[
+        {"terminal_id":"agent","pane_id":"w1:p1","agent":"claude","agent_status":"working"}
+    ]}}"#;
+
     #[test]
-    fn attachment_metadata_survives_a_first_poll_failure_after_binding() {
+    fn attachment_metadata_survives_a_side_that_stopped_answering() {
         let mut cache = EndpointCache::new(Side::Native);
         cache.settings = Read::Done(Settings::default());
         cache.session_name = Read::Done("fixture".into());
@@ -650,6 +731,77 @@ mod tests {
         assert!(!pane.current);
         assert!(pane.agent.status.is_none());
         assert!(!pane.agent.focused);
+    }
+
+    /// A spawn that could not run is not evidence that the agents went away,
+    /// and the poll two seconds behind it usually answers.  Blanking on the
+    /// first failure is what a loaded machine shows: every status on the side
+    /// goes at once, and comes back a poll or two later.
+    #[test]
+    fn one_failed_listing_keeps_what_herdr_last_reported() {
+        let mut cache = EndpointCache::new(Side::Native);
+        cache.complete_listing_for_test(
+            Ok(LISTING),
+            Listing::Panes,
+            Listing::Panes,
+            Instant::now(),
+        );
+
+        cache.fail_listing_for_test(PollError::Absent("spawn_failed"), Duration::from_secs(2));
+
+        assert_eq!(cache.agents().len(), 1);
+        assert_eq!(cache.agents()[0].status, Some(Status::Working));
+        let pane = cache.attachment_pane("agent").expect("the pane keeps its row");
+        assert_eq!(pane.agent.status, Some(Status::Working));
+        assert!(pane.current);
+        // Membership is not held back: a failure may never remove a pane, and
+        // holding the last listing as evidence would let it.
+        assert!(cache.inventory().is_none());
+    }
+
+    /// A side that has stopped answering has to give its rows up in the end,
+    /// or a herdr that went down leaves a status nobody is refreshing on
+    /// screen for the rest of the session.
+    #[test]
+    fn listings_that_keep_failing_drop_what_they_knew() {
+        let mut cache = EndpointCache::new(Side::Native);
+        cache.complete_listing_for_test(
+            Ok(LISTING),
+            Listing::Panes,
+            Listing::Panes,
+            Instant::now(),
+        );
+        let interval = Duration::from_secs(2);
+        cache.fail_listing_for_test(PollError::Absent("spawn_failed"), interval);
+        cache.expire_grace_for_test();
+
+        cache.fail_listing_for_test(PollError::Absent("spawn_failed"), interval);
+
+        assert!(cache.agents().is_empty());
+        let pane = cache.attachment_pane("agent").expect("the bound pane keeps its row");
+        assert!(pane.agent.status.is_none());
+        assert!(!pane.current);
+    }
+
+    /// The run is measured from its first failure, so an answer in between
+    /// has to start the next run over rather than leaving the side one miss
+    /// away from blanking for the rest of the session.
+    #[test]
+    fn an_answer_between_failures_starts_the_grace_over() {
+        let mut cache = EndpointCache::new(Side::Native);
+        let interval = Duration::from_secs(2);
+        cache.fail_listing_for_test(PollError::Absent("spawn_failed"), interval);
+        cache.expire_grace_for_test();
+
+        cache.complete_listing_for_test(
+            Ok(LISTING),
+            Listing::Panes,
+            Listing::Panes,
+            Instant::now(),
+        );
+        cache.fail_listing_for_test(PollError::Absent("spawn_failed"), interval);
+
+        assert_eq!(cache.agents()[0].status, Some(Status::Working));
     }
 
     #[test]

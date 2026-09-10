@@ -11856,7 +11856,8 @@ impl AlacritreeApp {
             return Ok(side);
         }
         // A cache holds a sample time only while its last listing succeeded,
-        // which is the same evidence the sidebar draws that side's rows on.
+        // so a side that has never answered is not offered as the one a create
+        // must have meant.
         let answering: Vec<&herdr::Side> = self
             .herdr_endpoints
             .caches()
@@ -13257,6 +13258,36 @@ mod tests {
         let mut palette = CommandPalette::new();
         *palette.query_mut() = "herdr".into();
         assert!(palette.rank(&items).contains(&row));
+    }
+
+    /// One poll that could not spawn is not evidence that the agents went
+    /// away, and the poll behind it usually answers.  Dropping the listing on
+    /// the first failure takes every status on the side down at once, which on
+    /// a loaded machine is what the user gets instead of an agent's state.
+    #[test]
+    fn a_single_failed_poll_leaves_a_rows_status_alone() {
+        let mut app = herdr_lifecycle_app();
+        let side = herdr::Side::Native;
+        adopt_herdr_fixture(
+            &mut app,
+            side.clone(),
+            r#"{"result":{"panes":[
+            {"terminal_id":"term-kept","pane_id":"w1:p1","agent":"claude","agent_status":"working","cwd":"/private/project"}
+        ]}}"#,
+            Instant::now(),
+        );
+        let id = bind_herdr_fixture(&mut app, side, "term-kept");
+
+        app.herdr_endpoints.caches_mut_for_test()[0].fail_listing_for_test(
+            herdr::PollError::Absent("spawn_failed"),
+            Duration::from_secs(2),
+        );
+
+        assert_eq!(app.session_herdr_status(&app.sessions[0]), Some(herdr::Status::Working));
+        let items = app.palette_items();
+        let item =
+            items.iter().find(|item| item.action == PaletteAction::ActivateSession(id)).unwrap();
+        assert!(item.hover.as_deref().unwrap().contains("Status: working"));
     }
 
     /// A stale retained pane still names herdr in the middle column.  The
