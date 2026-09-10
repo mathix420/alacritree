@@ -1871,9 +1871,13 @@ impl AlacritreeApp {
         let workspace = self.herdr_row_workspace(&key.side, &key.terminal_id)?;
         let (program, argv) = if self.herdr_attaches_directly(key) {
             let agent = self.find_herdr_agent(&key.side, &key.terminal_id)?;
-            let args = herdr::attach_args(&agent.pane_id);
-            let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-            key.side.command(herdr::PROGRAM, &borrowed)
+            let attach = self.config.integrations.herdr.attach;
+            // The branch already asked the question the multiplexer answers
+            // here, so the `None` is unreachable; not following the pane is
+            // the right answer anyway if the two ever disagree.
+            let launch = Multiplexer::owning(key)
+                .open_multiplexer_session(&agent.target(&key.side), attach)?;
+            (launch.program, launch.argv)
         } else {
             let name = self.herdr_session_name(&key.side)?;
             key.side.command(herdr::PROGRAM, &["session", "attach", &name])
