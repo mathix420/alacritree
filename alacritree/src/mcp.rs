@@ -130,7 +130,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "list_sessions",
-            "description": "List tabs across all workspaces: id, title, workspace path (null = the home workspace), kind (shell, diff, or scratchpad editor), grid size, whether it is its workspace's active tab, and whether it flagged for attention (bell / agent finished).",
+            "description": "List tabs across all workspaces: id, title, workspace path (null = the home workspace), kind (shell, diff, or scratchpad editor), grid size, whether it is its workspace's active tab, whether it flagged for attention (bell / agent finished), the agent's name and live state when one runs in it, whether a session with no multiplexer looks busy, and the multiplexer (if any) hosting it.",
             "inputSchema": { "type": "object", "properties": {} },
         },
         {

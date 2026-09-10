@@ -79,7 +79,19 @@ fn sessions(value: &Value) {
         let active = if s["is_active_tab"].as_bool().unwrap_or(false) { "*" } else { " " };
         let attention = if s["needs_attention"].as_bool().unwrap_or(false) { " (!)" } else { "" };
         let workspace = s["workspace"].as_str().unwrap_or("home");
-        println!("{active} {}  {}  {workspace}{attention}", text(&s["id"]), text(&s["title"]));
+        let state = match s["agent"]["state"].as_str() {
+            Some(state) => format!("  [{state}]"),
+            None => String::new(),
+        };
+        let via = match s["multiplexer"]["name"].as_str() {
+            Some(name) => format!("  via {name}"),
+            None => String::new(),
+        };
+        println!(
+            "{active} {}  {}  {workspace}{state}{via}{attention}",
+            text(&s["id"]),
+            text(&s["title"])
+        );
     }
 }
 
@@ -158,5 +170,24 @@ mod tests {
         ] {
             human(&request, &serde_json::json!({}));
         }
+    }
+
+    #[test]
+    fn a_session_line_names_its_agent_state_and_multiplexer() {
+        human(
+            &IpcRequest::ListSessions,
+            &serde_json::json!({
+                "sessions": [{
+                    "id": 1,
+                    "title": "claude",
+                    "workspace": "/repo",
+                    "is_active_tab": true,
+                    "needs_attention": false,
+                    "agent": { "name": "claude", "state": "working" },
+                    "busy": serde_json::Value::Null,
+                    "multiplexer": { "name": "herdr", "side": "native", "terminal_id": "t1" },
+                }]
+            }),
+        );
     }
 }

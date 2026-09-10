@@ -9626,6 +9626,48 @@ impl AlacritreeApp {
             .and_then(herdr::EndpointCache::session_name)
     }
 
+    /// One session as the IPC reply describes it.  `agent`, `busy` and
+    /// `multiplexer` are nullable because a plain shell has no agent, a
+    /// multiplexer-backed session has no foreground job of its own to probe,
+    /// and a session owning its PTY belongs to no multiplexer.
+    fn session_json(&self, session: &Session, is_active_tab: bool) -> Value {
+        let key = session.herdr_key.as_ref();
+        let activity =
+            herdr_backed_activity(session.activity(), self.session_herdr_status(session));
+        json!({
+            "id": session.id,
+            "title": session.title,
+            "workspace": session.working_directory,
+            "kind": match &session.kind {
+                SessionKind::Shell => "shell",
+                SessionKind::Diff { .. } => "diff",
+                SessionKind::Scratchpad { .. } => "scratchpad",
+            },
+            "columns": session.size.columns,
+            "lines": session.size.screen_lines,
+            "is_active_tab": is_active_tab,
+            "needs_attention": session.needs_attention,
+            "agent": activity_json(activity),
+            "busy": key.is_none().then(|| session.is_busy()),
+            "multiplexer": key.map(|key| self.multiplexer_json(key)),
+        })
+    }
+
+    /// Where a herdr-backed session lives.  `pane_id` and `tab_id` come from
+    /// the live listing, so a null says the cache does not know right now
+    /// rather than that the pane is gone.
+    fn multiplexer_json(&self, key: &herdr::HerdrKey) -> Value {
+        let pane = self.find_herdr_agent(&key.side, &key.terminal_id);
+        json!({
+            "name": "herdr",
+            "side": side_label(&key.side),
+            "session": self.herdr_session_name(&key.side),
+            "terminal_id": key.terminal_id,
+            "pane_id": pane.map(|pane| pane.pane_id.clone()),
+            "tab_id": pane.and_then(|pane| pane.tab_id.clone()),
+        })
+    }
+
     /// The session already attached to this agent, if one is open.
     fn herdr_session_for(&self, key: &herdr::HerdrKey) -> Option<SessionId> {
         self.sessions.iter().find(|s| s.herdr_key.as_ref() == Some(key)).map(|s| s.id)
@@ -11339,7 +11381,7 @@ impl AlacritreeApp {
                     .map(|s| {
                         let active =
                             self.active_session.get(&s.working_directory).copied() == Some(s.id);
-                        session_json(s, active)
+                        self.session_json(s, active)
                     })
                     .collect();
                 Ok(json!({ "current_workspace": self.current_workspace, "sessions": sessions }))
@@ -11483,21 +11525,25 @@ fn unknown_worktree(path: &Path) -> String {
     format!("{} is not a worktree in the sidebar — see list_projects", path.display())
 }
 
-fn session_json(session: &Session, is_active_tab: bool) -> Value {
-    json!({
-        "id": session.id,
-        "title": session.title,
-        "workspace": session.working_directory,
-        "kind": match &session.kind {
-            SessionKind::Shell => "shell",
-            SessionKind::Diff { .. } => "diff",
-            SessionKind::Scratchpad { .. } => "scratchpad",
-        },
-        "columns": session.size.columns,
-        "lines": session.size.screen_lines,
-        "is_active_tab": is_active_tab,
-        "needs_attention": session.needs_attention,
-    })
+/// `SessionActivity` as the reply spells it.  A plain shell is null rather
+/// than an object, so a consumer testing for presence needs no second field.
+fn activity_json(activity: SessionActivity) -> Value {
+    match activity {
+        SessionActivity::Shell => Value::Null,
+        SessionActivity::Agent { name, live } => json!({
+            "name": name,
+            "state": live.label(),
+        }),
+    }
+}
+
+/// Two herdr servers on one machine cannot see each other, so the side is
+/// part of an agent's identity and the reply spells it out.
+fn side_label(side: &herdr::Side) -> String {
+    match side {
+        herdr::Side::Native => "native".to_string(),
+        herdr::Side::Wsl(distro) => format!("wsl:{distro}"),
+    }
 }
 
 impl eframe::App for AlacritreeApp {
@@ -11863,6 +11909,32 @@ mod tests {
         app
     }
 
+    /// An app with one plain shell session, for tests that need nothing
+    /// herdr-specific from the app itself.
+    fn test_app() -> AlacritreeApp {
+        let (_, notify_rx) = mpsc::channel();
+        let mut app = AlacritreeApp::from_parts(
+            Config::default(),
+            state::PersistedState::default(),
+            Vec::new(),
+            Vec::new(),
+            crate::fonts::FaceMetrics::default(),
+            notify_rx,
+            (None, None),
+        );
+        let (session, _) = Session::pending_shell(
+            Context::default(),
+            &app.config,
+            None,
+            TermSize { columns: 80, screen_lines: 24 },
+            (8.0, 16.0),
+            None,
+            None,
+        );
+        app.sessions.push(session);
+        app
+    }
+
     fn bind_herdr_fixture(app: &mut AlacritreeApp, side: herdr::Side, terminal: &str) -> SessionId {
         let (mut session, _) = Session::pending_shell(
             Context::default(),
@@ -11891,6 +11963,47 @@ mod tests {
             display,
             at,
         );
+    }
+
+    #[test]
+    fn a_plain_shell_session_reports_no_agent_and_no_multiplexer() {
+        let app = test_app();
+        let session = app.sessions.first().expect("the app starts with a session");
+        let json = app.session_json(session, true);
+        assert_eq!(json["agent"], Value::Null);
+        assert_eq!(json["multiplexer"], Value::Null);
+        assert!(json["busy"].is_boolean());
+    }
+
+    #[test]
+    fn a_herdr_backed_session_names_its_side_and_terminal() {
+        let mut app = test_app();
+        let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t7".into() };
+        let id = app.sessions.first().expect("a session").id;
+        if let Some(session) = app.sessions.iter_mut().find(|s| s.id == id) {
+            session.bind_herdr(key);
+        }
+        let session = app.sessions.iter().find(|s| s.id == id).expect("a session");
+        let json = app.session_json(session, true);
+        assert_eq!(json["multiplexer"]["name"], "herdr");
+        assert_eq!(json["multiplexer"]["side"], "native");
+        assert_eq!(json["multiplexer"]["terminal_id"], "t7");
+        // The attach client is itself the foreground job, so probing it would
+        // answer true forever.
+        assert_eq!(json["busy"], Value::Null);
+    }
+
+    #[test]
+    fn a_wsl_side_spells_its_distro() {
+        let mut app = test_app();
+        let key =
+            herdr::HerdrKey { side: herdr::Side::Wsl("ubuntu".into()), terminal_id: "t1".into() };
+        let id = app.sessions.first().expect("a session").id;
+        if let Some(session) = app.sessions.iter_mut().find(|s| s.id == id) {
+            session.bind_herdr(key);
+        }
+        let session = app.sessions.iter().find(|s| s.id == id).expect("a session");
+        assert_eq!(app.session_json(session, true)["multiplexer"]["side"], "wsl:ubuntu");
     }
 
     #[test]
