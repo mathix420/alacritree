@@ -5,7 +5,7 @@
 //! start, and follows herdr afterwards.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::config::{AttachMode, FollowFocus};
 use crate::herdr::EndpointCache;
@@ -21,6 +21,31 @@ use super::{HerdrKey, Side, attaches_directly};
 struct TrailEntry {
     terminal_id: String,
     stamped_at: Instant,
+}
+
+/// How long the user has to stop typing before a follow lands.  Long enough
+/// to clear the pause between keystrokes and short enough that a deliberate
+/// pause is not mistaken for continued work.
+const FOLLOW_QUIET_GAP: Duration = Duration::from_millis(750);
+
+/// How long a proposed follow keeps waiting.  Matches `PROBE_GRACE`, the
+/// codebase's one existing answer to "the user is active".  Past it the
+/// change is stale, and moving the user then is worse than not moving them.
+const FOLLOW_EXPIRY: Duration = Duration::from_secs(10);
+
+/// A follow that has been proposed and is waiting for the user to stop
+/// typing.  Both clocks count attentive time only: counting wall-clock time
+/// would expire a follow while the user was in another window, which is the
+/// catch-up-on-return case the trail exists to preserve.
+struct PendingFollow {
+    key: HerdrKey,
+    /// The session that was active when this was proposed.  A different one
+    /// means the proposal no longer describes the situation.
+    active: Option<SessionId>,
+    /// Attentive time since the last direct input.
+    quiet: Duration,
+    /// Attentive time since the proposal.
+    age: Duration,
 }
 
 /// The shared view herdr is being pointed at, and the call doing the
@@ -41,6 +66,12 @@ pub struct HerdrViewSync {
     pub focused: Option<SessionId>,
     follow_after: Option<Instant>,
     trail: HashMap<Side, TrailEntry>,
+    pending: Option<PendingFollow>,
+    /// When `next` last counted attentive time, so a frame's contribution is
+    /// the gap since the previous one rather than a fixed tick.
+    ticked_at: Option<Instant>,
+    /// The direct-input reading the current `quiet` was measured from.
+    input_seen: Option<Instant>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -64,16 +95,31 @@ pub struct ViewInputs<'a> {
     /// modal nor the palette is open.
     pub attentive: bool,
     pub busy: bool,
+    /// This frame's clock reading, for timing a pending follow's quiet gap
+    /// and expiry.
+    pub now: Instant,
+    /// When the user last gave the app a direct-input event, if ever.  A
+    /// pending follow's quiet gap is measured from this rather than from
+    /// `now`, so it restarts on new input instead of aging out from under
+    /// continued typing.
+    pub last_direct_input: Option<Instant>,
 }
 
 impl HerdrViewSync {
-    pub fn closed(&mut self, id: SessionId) {
+    pub fn closed(&mut self, id: SessionId, key: Option<&HerdrKey>) {
         if self.visible == Some(id) {
             self.visible = None;
             self.follow_after = None;
         }
         if self.focused == Some(id) {
             self.focused = None;
+        }
+        // A follow to a row the user just closed would respawn its attach
+        // client.  The tick baseline goes too, or a pending reborn from the
+        // same stale entry inherits the gap since the drop and delivers anyway.
+        if key.is_some_and(|key| self.pending.as_ref().is_some_and(|p| &p.key == key)) {
+            self.pending = None;
+            self.ticked_at = None;
         }
     }
 
@@ -94,12 +140,17 @@ impl HerdrViewSync {
 
     /// Record where herdr's focus now is, without proposing anything.  Every
     /// path that moves herdr's focus calls this, so the move alacritree asked
-    /// for is never mistaken for one the user made inside herdr.
+    /// for is never mistaken for one the user made inside herdr, and a
+    /// pending follow on the same side — proposed against a state this
+    /// stamp just superseded — goes with it.
     pub fn moved_focus(&mut self, key: &HerdrKey, at: Instant) {
         self.trail.insert(key.side.clone(), TrailEntry {
             terminal_id: key.terminal_id.clone(),
             stamped_at: at,
         });
+        if self.pending.as_ref().is_some_and(|pending| pending.key.side == key.side) {
+            self.pending = None;
+        }
     }
 
     /// The first side whose focused pane differs from what the trail holds.
@@ -109,6 +160,11 @@ impl HerdrViewSync {
     fn trail_edge(&mut self, inputs: &ViewInputs<'_>) -> Option<HerdrKey> {
         let live: Vec<&Side> = inputs.caches.iter().map(EndpointCache::side).collect();
         self.trail.retain(|side, _| live.contains(&side));
+        // A pending targeting a side that just vanished would follow to an
+        // unreachable pane; its trail entry is gone the same way.
+        if self.pending.as_ref().is_some_and(|pending| !live.contains(&&pending.key.side)) {
+            self.pending = None;
+        }
         let active_key = inputs.active.and_then(|(_, key, _)| key);
         let mut edge = None;
         for cache in inputs.caches {
@@ -139,7 +195,14 @@ impl HerdrViewSync {
     }
 
     pub fn next(&mut self, inputs: ViewInputs<'_>) -> Option<HerdrViewAction> {
+        let elapsed = self.tick(&inputs);
         if let Some(action) = self.shared_view(&inputs) {
+            // The shared-view path outranks the trail.  The trail itself is
+            // untouched, so the tick baseline goes with the pending, or a
+            // reborn one inherits this frame's gap.
+            if self.pending.take().is_some() {
+                self.ticked_at = None;
+            }
             return match action {
                 // The setting governs whether herdr may move alacritree,
                 // never whether alacritree may move herdr: a shared view
@@ -151,8 +214,81 @@ impl HerdrViewSync {
         if inputs.busy || !inputs.attentive {
             return None;
         }
-        let edge = self.trail_edge(&inputs)?;
-        (inputs.follow == FollowFocus::Always).then_some(HerdrViewAction::Follow(edge))
+        if let Some(edge) = self.trail_edge(&inputs) {
+            self.propose(edge, &inputs);
+        }
+        self.deliver(&inputs, elapsed)
+    }
+
+    /// Attentive time since the previous frame.  Counted on every call so a
+    /// busy or inattentive stretch is skipped rather than back-charged to the
+    /// pending follow on the frame after it.  `closed` also forgets this
+    /// baseline on a cancellation, for the same reason.
+    fn tick(&mut self, inputs: &ViewInputs<'_>) -> Duration {
+        let previous = self.ticked_at.replace(inputs.now);
+        if inputs.busy || !inputs.attentive {
+            return Duration::ZERO;
+        }
+        previous.map_or(Duration::ZERO, |previous| inputs.now.saturating_duration_since(previous))
+    }
+
+    /// The newest change wins: a second edge replaces the target and restarts
+    /// the clock.  Re-seeing the same edge, which happens every frame until
+    /// the trail is stamped, changes nothing.  `input_seen` is left for
+    /// `deliver` to reconcile, so a pending born this frame is never credited
+    /// with quiet time that predates its own proposal.
+    fn propose(&mut self, key: HerdrKey, inputs: &ViewInputs<'_>) {
+        if self.pending.as_ref().is_some_and(|pending| pending.key == key) {
+            return;
+        }
+        self.pending = Some(PendingFollow {
+            key,
+            active: inputs.active.map(|(id, ..)| id),
+            quiet: Duration::ZERO,
+            age: Duration::ZERO,
+        });
+    }
+
+    fn deliver(&mut self, inputs: &ViewInputs<'_>, elapsed: Duration) -> Option<HerdrViewAction> {
+        if inputs.follow != FollowFocus::Always {
+            self.pending = None;
+            return None;
+        }
+        let active = inputs.active.map(|(id, ..)| id);
+        // The proposal was made against a situation that no longer holds.
+        if self.pending.as_ref().is_some_and(|pending| pending.active != active) {
+            self.pending = None;
+            return None;
+        }
+        // Owns `input_seen`: a pending `propose` just installed has never
+        // been compared against it, so this frame reconciles the two.
+        let input_moved = self.input_seen != inputs.last_direct_input;
+        if input_moved {
+            self.input_seen = inputs.last_direct_input;
+        }
+        let (expired, ready) = {
+            let pending = self.pending.as_mut()?;
+            pending.quiet = if input_moved { Duration::ZERO } else { pending.quiet + elapsed };
+            pending.age += elapsed;
+            (pending.age >= FOLLOW_EXPIRY, pending.quiet >= FOLLOW_QUIET_GAP)
+        };
+        if expired {
+            let key = self.pending.take()?.key;
+            // Recording the decision not to go, or the same stale change
+            // would be re-proposed on every frame that follows.
+            self.moved_focus(&key, inputs.now);
+            return None;
+        }
+        if !ready {
+            return None;
+        }
+        let key = self.pending.take()?.key;
+        // The target may have become the active pane while this waited.
+        inputs
+            .active
+            .and_then(|(_, active, _)| active)
+            .is_none_or(|active| active != &key)
+            .then_some(HerdrViewAction::Follow(key))
     }
 
     /// The session on screen asking herdr for its own pane, and following
@@ -220,12 +356,22 @@ mod tests {
         caches: &'a [herdr::EndpointCache],
         busy: bool,
     ) -> ViewInputs<'a> {
-        ViewInputs { active, attach, follow: FollowFocus::Herdr, caches, attentive: true, busy }
+        ViewInputs {
+            active,
+            attach,
+            follow: FollowFocus::Herdr,
+            caches,
+            attentive: true,
+            busy,
+            now: Instant::now(),
+            last_direct_input: None,
+        }
     }
 
     fn always<'a>(
         active: Option<(SessionId, Option<&'a HerdrKey>, bool)>,
         caches: &'a [herdr::EndpointCache],
+        now: Instant,
     ) -> ViewInputs<'a> {
         ViewInputs {
             active,
@@ -234,6 +380,8 @@ mod tests {
             caches,
             attentive: true,
             busy: false,
+            now,
+            last_direct_input: None,
         }
     }
 
@@ -258,7 +406,7 @@ mod tests {
         let now = Instant::now();
         let caches = one_focused(&side, "t1", now);
         let mut sync = HerdrViewSync::default();
-        assert_eq!(sync.next(always(Some((1, None, false)), &caches)), None);
+        assert_eq!(sync.next(always(Some((1, None, false)), &caches, now)), None);
     }
 
     #[test]
@@ -267,11 +415,13 @@ mod tests {
         let start = Instant::now();
         let first = one_focused(&side, "t1", start);
         let mut sync = HerdrViewSync::default();
-        assert_eq!(sync.next(always(Some((1, None, false)), &first)), None);
+        assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
         let later = start + Duration::from_millis(1);
         let second = one_focused(&side, "t2", later);
+        assert_eq!(sync.next(always(Some((1, None, false)), &second, later)), None);
+        let quiet = later + FOLLOW_QUIET_GAP + Duration::from_millis(1);
         assert_eq!(
-            sync.next(always(Some((1, None, false)), &second)),
+            sync.next(always(Some((1, None, false)), &second, quiet)),
             Some(HerdrViewAction::Follow(HerdrKey {
                 side: side.clone(),
                 terminal_id: "t2".into(),
@@ -287,12 +437,12 @@ mod tests {
         let start = Instant::now();
         let first = one_focused(&side, "t1", start);
         let mut sync = HerdrViewSync::default();
-        let mut inputs = always(Some((1, None, false)), &first);
+        let mut inputs = always(Some((1, None, false)), &first, start);
         inputs.follow = FollowFocus::Herdr;
         assert_eq!(sync.next(inputs), None);
         let later = start + Duration::from_millis(1);
         let second = one_focused(&side, "t2", later);
-        let mut inputs = always(Some((1, None, false)), &second);
+        let mut inputs = always(Some((1, None, false)), &second, later);
         inputs.follow = FollowFocus::Herdr;
         assert_eq!(sync.next(inputs), None);
     }
@@ -307,12 +457,12 @@ mod tests {
         let start = Instant::now();
         let first = one_focused(&side, "t1", start);
         let mut sync = HerdrViewSync::default();
-        let mut first_inputs = always(Some((1, Some(&key), true)), &first);
+        let mut first_inputs = always(Some((1, Some(&key), true)), &first, start);
         first_inputs.attach = AttachMode::Agent;
         assert_eq!(sync.next(first_inputs), None);
         let later = start + Duration::from_millis(1);
         let second = one_focused(&side, "t2", later);
-        let mut second_inputs = always(Some((1, Some(&key), true)), &second);
+        let mut second_inputs = always(Some((1, Some(&key), true)), &second, later);
         second_inputs.attach = AttachMode::Agent;
         assert_eq!(sync.next(second_inputs), None);
         // The active-pane branch must have updated the entry, not merely
@@ -320,10 +470,14 @@ mod tests {
         // change against the recorded "t2", so it is followed.
         let latest = later + Duration::from_millis(1);
         let third = one_focused(&side, "t1", latest);
-        let mut third_inputs = always(Some((1, Some(&key), true)), &third);
+        let mut third_inputs = always(Some((1, Some(&key), true)), &third, latest);
         third_inputs.attach = AttachMode::Agent;
+        assert_eq!(sync.next(third_inputs), None);
+        let quiet = latest + FOLLOW_QUIET_GAP + Duration::from_millis(1);
+        let mut quiet_inputs = always(Some((1, Some(&key), true)), &third, quiet);
+        quiet_inputs.attach = AttachMode::Agent;
         assert_eq!(
-            sync.next(third_inputs),
+            sync.next(quiet_inputs),
             Some(HerdrViewAction::Follow(HerdrKey {
                 side: side.clone(),
                 terminal_id: "t1".into()
@@ -339,11 +493,14 @@ mod tests {
         let start = Instant::now();
         let mut sync = HerdrViewSync::default();
         let first = one_focused(&side, "t1", start);
-        assert_eq!(sync.next(always(Some((1, None, false)), &first)), None);
+        assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
         let moved = start + Duration::from_millis(5);
         sync.moved_focus(&HerdrKey { side: side.clone(), terminal_id: "t3".into() }, moved);
         let in_flight = one_focused(&side, "t2", start + Duration::from_millis(2));
-        assert_eq!(sync.next(always(Some((1, None, false)), &in_flight)), None);
+        assert_eq!(
+            sync.next(always(Some((1, None, false)), &in_flight, start + Duration::from_millis(2))),
+            None
+        );
     }
 
     /// `attached` stamps the trail, so a pane it just opened is not mistaken
@@ -354,7 +511,7 @@ mod tests {
         let start = Instant::now();
         let mut sync = HerdrViewSync::default();
         let first = one_focused(&side, "t1", start);
-        assert_eq!(sync.next(always(Some((1, None, false)), &first)), None);
+        assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
 
         let attached_at = start + Duration::from_millis(1);
         let key = HerdrKey { side: side.clone(), terminal_id: "t2".into() };
@@ -364,7 +521,7 @@ mod tests {
         // herdr is on the pane the attach just opened.
         let later = attached_at + Duration::from_millis(1);
         let second = one_focused(&side, "t2", later);
-        assert_eq!(sync.next(always(Some((3, None, false)), &second)), None);
+        assert_eq!(sync.next(always(Some((3, None, false)), &second, later)), None);
     }
 
     /// A side that stops answering empties its listing, and a side whose
@@ -375,16 +532,19 @@ mod tests {
         let start = Instant::now();
         let first = one_focused(&side, "t1", start);
         let mut sync = HerdrViewSync::default();
-        assert_eq!(sync.next(always(Some((1, None, false)), &first)), None);
+        assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
         let later = start + Duration::from_millis(1);
         let silent = vec![herdr::EndpointCache::for_test(side.clone(), Vec::new(), later)];
-        assert_eq!(sync.next(always(Some((1, None, false)), &silent)), None);
+        assert_eq!(sync.next(always(Some((1, None, false)), &silent, later)), None);
         let gone: Vec<herdr::EndpointCache> = Vec::new();
-        assert_eq!(sync.next(always(Some((1, None, false)), &gone)), None);
+        assert_eq!(sync.next(always(Some((1, None, false)), &gone, later)), None);
         // The side comes back: its first reading is a baseline again, not the
         // change it looks like against the entry that used to be there.
         let back = one_focused(&side, "t9", later + Duration::from_millis(1));
-        assert_eq!(sync.next(always(Some((1, None, false)), &back)), None);
+        assert_eq!(
+            sync.next(always(Some((1, None, false)), &back, later + Duration::from_millis(1))),
+            None
+        );
     }
 
     /// Following acts on any reachable side, and a side nobody touched is
@@ -397,13 +557,15 @@ mod tests {
         let mut sync = HerdrViewSync::default();
         let mut first = one_focused(&native, "n1", start);
         first.extend(one_focused(&wsl, "w1", start));
-        assert_eq!(sync.next(always(Some((1, None, false)), &first)), None);
+        assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
 
         let later = start + Duration::from_millis(1);
         let mut second = one_focused(&native, "n1", later);
         second.extend(one_focused(&wsl, "w2", later));
+        assert_eq!(sync.next(always(Some((1, None, false)), &second, later)), None);
+        let quiet = later + FOLLOW_QUIET_GAP + Duration::from_millis(1);
         assert_eq!(
-            sync.next(always(Some((1, None, false)), &second)),
+            sync.next(always(Some((1, None, false)), &second, quiet)),
             Some(HerdrViewAction::Follow(HerdrKey { side: wsl.clone(), terminal_id: "w2".into() })),
             "the side that moved is the one to go to"
         );
@@ -419,7 +581,7 @@ mod tests {
         let caches = one_focused(&side, "t2", start);
         let mut sync = HerdrViewSync::default();
         assert_eq!(
-            sync.next(always(Some((1, Some(&key), false)), &caches)),
+            sync.next(always(Some((1, Some(&key), false)), &caches, start)),
             Some(HerdrViewAction::Focus(1))
         );
     }
@@ -679,5 +841,282 @@ mod tests {
     fn an_agentless_pane_asks_herdr_for_its_pane_on_every_side() {
         let key = herdr::HerdrKey { side: herdr::Side::Wsl("d".into()), terminal_id: "t1".into() };
         assert!(needs_view_focus(Some(&key), AttachMode::Agent, false, 1, None));
+    }
+
+    /// A pane a script created can arrive mid-command, and following moves
+    /// the keyboard, so it waits for the typing to stop.
+    #[test]
+    fn a_follow_waits_for_a_gap_in_typing() {
+        let side = herdr::Side::Native;
+        let start = Instant::now();
+        let mut sync = HerdrViewSync::default();
+        let first = one_focused(&side, "t1", start);
+        assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
+
+        let sampled = start + Duration::from_millis(1);
+        let second = one_focused(&side, "t2", sampled);
+        let mut typing = always(Some((1, None, false)), &second, sampled);
+        typing.last_direct_input = Some(sampled);
+        assert_eq!(sync.next(typing), None, "proposed, not delivered");
+
+        // Still typing half a second later.
+        let mut typing =
+            always(Some((1, None, false)), &second, sampled + Duration::from_millis(500));
+        typing.last_direct_input = Some(sampled + Duration::from_millis(500));
+        assert_eq!(sync.next(typing), None);
+
+        // The gap arrives.
+        let mut quiet =
+            always(Some((1, None, false)), &second, sampled + Duration::from_millis(1300));
+        quiet.last_direct_input = Some(sampled + Duration::from_millis(500));
+        assert_eq!(
+            sync.next(quiet),
+            Some(HerdrViewAction::Follow(HerdrKey {
+                side: side.clone(),
+                terminal_id: "t2".into(),
+            }))
+        );
+    }
+
+    /// Moving the user long after the change is worse than not moving them.
+    #[test]
+    fn a_follow_expires_if_the_gap_never_comes() {
+        let side = herdr::Side::Native;
+        let start = Instant::now();
+        let mut sync = HerdrViewSync::default();
+        let first = one_focused(&side, "t1", start);
+        assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
+        let sampled = start + Duration::from_millis(1);
+        let second = one_focused(&side, "t2", sampled);
+        let mut at = sampled;
+        let mut last_typed = at;
+        // Typing without pause, in 200 ms frames, past the expiry.
+        for _ in 0..60 {
+            let mut typing = always(Some((1, None, false)), &second, at);
+            typing.last_direct_input = Some(at);
+            assert_eq!(sync.next(typing), None);
+            last_typed = at;
+            at += Duration::from_millis(200);
+        }
+        // The typing stops, and the change is stale rather than pending.
+        // `last_direct_input` stays at the last keystroke: advancing it with
+        // `now` would return `None` from the reset alone, proving nothing.
+        let mut quiet = always(Some((1, None, false)), &second, at + Duration::from_secs(2));
+        quiet.last_direct_input = Some(last_typed);
+        assert_eq!(sync.next(quiet), None);
+    }
+
+    /// The pane herdr is on now is the only one worth going to.
+    #[test]
+    fn a_second_change_retargets_the_pending_follow_and_restarts_its_clock() {
+        let side = herdr::Side::Native;
+        let start = Instant::now();
+        let mut sync = HerdrViewSync::default();
+        let first = one_focused(&side, "t1", start);
+        assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
+
+        let a = start + Duration::from_millis(1);
+        let second = one_focused(&side, "t2", a);
+        let mut typing = always(Some((1, None, false)), &second, a);
+        typing.last_direct_input = Some(a);
+        assert_eq!(sync.next(typing), None);
+
+        let b = a + Duration::from_millis(600);
+        let third = one_focused(&side, "t3", b);
+        let mut typing = always(Some((1, None, false)), &third, b);
+        typing.last_direct_input = Some(b);
+        assert_eq!(sync.next(typing), None);
+
+        let mut quiet = always(Some((1, None, false)), &third, b + Duration::from_millis(800));
+        quiet.last_direct_input = Some(b);
+        assert_eq!(
+            sync.next(quiet),
+            Some(HerdrViewAction::Follow(HerdrKey {
+                side: side.clone(),
+                terminal_id: "t3".into(),
+            })),
+            "the newest change wins"
+        );
+    }
+
+    /// The proposal was made against a situation that no longer holds.
+    #[test]
+    fn a_pending_follow_is_dropped_when_the_active_session_changes() {
+        let side = herdr::Side::Native;
+        let start = Instant::now();
+        let mut sync = HerdrViewSync::default();
+        let first = one_focused(&side, "t1", start);
+        assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
+        let sampled = start + Duration::from_millis(1);
+        let second = one_focused(&side, "t2", sampled);
+        let mut typing = always(Some((1, None, false)), &second, sampled);
+        typing.last_direct_input = Some(sampled);
+        assert_eq!(sync.next(typing), None);
+        let later = sampled + Duration::from_millis(1300);
+        let mut quiet = always(Some((7, None, false)), &second, later);
+        quiet.last_direct_input = Some(sampled);
+        assert_eq!(sync.next(quiet), None);
+    }
+
+    /// Following a row the user just closed would respawn its attach client.
+    #[test]
+    fn a_pending_follow_is_dropped_when_its_target_closes() {
+        let side = herdr::Side::Native;
+        let target = HerdrKey { side: side.clone(), terminal_id: "t2".into() };
+        let start = Instant::now();
+        let mut sync = HerdrViewSync::default();
+        let first = one_focused(&side, "t1", start);
+        assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
+        let sampled = start + Duration::from_millis(1);
+        let second = one_focused(&side, "t2", sampled);
+        let mut typing = always(Some((1, None, false)), &second, sampled);
+        typing.last_direct_input = Some(sampled);
+        assert_eq!(sync.next(typing), None);
+        sync.closed(9, Some(&target));
+        let mut quiet =
+            always(Some((1, None, false)), &second, sampled + Duration::from_millis(1300));
+        quiet.last_direct_input = Some(sampled);
+        assert_eq!(sync.next(quiet), None);
+    }
+
+    /// The shared-view path outranks the trail, and a pending it leaves
+    /// frozen behind it would otherwise deliver against a situation long
+    /// gone by the time the session on screen returns to the trail.
+    #[test]
+    fn a_pending_follow_is_dropped_when_a_shared_view_takes_over() {
+        let side = herdr::Side::Native;
+        let start = Instant::now();
+        let mut sync = HerdrViewSync::default();
+        let first = one_focused(&side, "t1", start);
+        assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
+        let sampled = start + Duration::from_millis(1);
+        let second = one_focused(&side, "t2", sampled);
+        let mut typing = always(Some((1, None, false)), &second, sampled);
+        typing.last_direct_input = Some(sampled);
+        assert_eq!(sync.next(typing), None);
+
+        // The active session switches to one the shared-view path owns.
+        let shared_key = HerdrKey { side: side.clone(), terminal_id: "shared".into() };
+        let shared_active = Some((9, Some(&shared_key), false));
+        assert_eq!(
+            sync.next(always(shared_active, &second, sampled + Duration::from_millis(2))),
+            Some(HerdrViewAction::Focus(9))
+        );
+
+        // Long enough after the switch that a surviving pending would have
+        // cleared its quiet gap.
+        let mut later =
+            always(Some((1, None, false)), &second, sampled + Duration::from_millis(802));
+        later.last_direct_input = Some(sampled);
+        assert_eq!(sync.next(later), None);
+    }
+
+    /// An attach on Windows can hold busy for seconds, and time the user
+    /// never saw must not spend the follow's budget.
+    #[test]
+    fn a_busy_frame_neither_advances_nor_expires_the_pending_follow() {
+        let side = herdr::Side::Native;
+        let start = Instant::now();
+        let mut sync = HerdrViewSync::default();
+        let first = one_focused(&side, "t1", start);
+        assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
+        let sampled = start + Duration::from_millis(1);
+        let second = one_focused(&side, "t2", sampled);
+        let mut typing = always(Some((1, None, false)), &second, sampled);
+        typing.last_direct_input = Some(sampled);
+        assert_eq!(sync.next(typing), None);
+
+        let mut busy = always(Some((1, None, false)), &second, sampled + Duration::from_secs(30));
+        busy.last_direct_input = Some(sampled);
+        busy.busy = true;
+        assert_eq!(sync.next(busy), None);
+
+        // The quiet gap is measured from the frames the user was present for,
+        // so the follow survives the attach and lands after it.
+        let mut quiet = always(
+            Some((1, None, false)),
+            &second,
+            sampled + Duration::from_secs(30) + Duration::from_millis(800),
+        );
+        quiet.last_direct_input = Some(sampled);
+        assert!(matches!(sync.next(quiet), Some(HerdrViewAction::Follow(_))));
+    }
+
+    /// Time spent in another window is the catch-up-on-return case the trail
+    /// exists to preserve, not time the follow should age through.
+    #[test]
+    fn an_inattentive_frame_neither_advances_nor_expires_the_pending_follow() {
+        let side = herdr::Side::Native;
+        let start = Instant::now();
+        let mut sync = HerdrViewSync::default();
+        let first = one_focused(&side, "t1", start);
+        assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
+        let sampled = start + Duration::from_millis(1);
+        let second = one_focused(&side, "t2", sampled);
+        let mut typing = always(Some((1, None, false)), &second, sampled);
+        typing.last_direct_input = Some(sampled);
+        assert_eq!(sync.next(typing), None);
+
+        let mut away = always(Some((1, None, false)), &second, sampled + Duration::from_secs(60));
+        away.last_direct_input = Some(sampled);
+        away.attentive = false;
+        assert_eq!(sync.next(away), None);
+
+        let mut back = always(
+            Some((1, None, false)),
+            &second,
+            sampled + Duration::from_secs(60) + Duration::from_millis(800),
+        );
+        back.last_direct_input = Some(sampled);
+        assert!(matches!(sync.next(back), Some(HerdrViewAction::Follow(_))));
+    }
+
+    /// A follow the app could not deliver leaves the trail unstamped, so the
+    /// same change is proposed again rather than lost.
+    #[test]
+    fn an_undelivered_follow_is_proposed_again() {
+        let side = herdr::Side::Native;
+        let start = Instant::now();
+        let mut sync = HerdrViewSync::default();
+        let first = one_focused(&side, "t1", start);
+        assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
+        let sampled = start + Duration::from_millis(1);
+        let second = one_focused(&side, "t2", sampled);
+        assert_eq!(sync.next(always(Some((1, None, false)), &second, sampled)), None);
+        let quiet = sampled + Duration::from_millis(800);
+        assert!(matches!(
+            sync.next(always(Some((1, None, false)), &second, quiet)),
+            Some(HerdrViewAction::Follow(_))
+        ));
+        // The app never called `attached`, so nothing stamped the trail.
+        let again = quiet + Duration::from_millis(800);
+        assert!(matches!(
+            sync.next(always(Some((1, None, false)), &second, again)),
+            Some(HerdrViewAction::Follow(_))
+        ));
+    }
+
+    /// Giving up is a decision, and without recording it the same stale
+    /// change would be re-proposed forever.
+    #[test]
+    fn an_expired_follow_stamps_the_trail() {
+        let side = herdr::Side::Native;
+        let start = Instant::now();
+        let mut sync = HerdrViewSync::default();
+        let first = one_focused(&side, "t1", start);
+        assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
+        let sampled = start + Duration::from_millis(1);
+        let second = one_focused(&side, "t2", sampled);
+        let mut at = sampled;
+        for _ in 0..60 {
+            let mut typing = always(Some((1, None, false)), &second, at);
+            typing.last_direct_input = Some(at);
+            assert_eq!(sync.next(typing), None);
+            at += Duration::from_millis(200);
+        }
+        for _ in 0..10 {
+            at += Duration::from_secs(1);
+            assert_eq!(sync.next(always(Some((1, None, false)), &second, at)), None);
+        }
     }
 }

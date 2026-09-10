@@ -1705,6 +1705,8 @@ impl AlacritreeApp {
             caches: self.herdr_endpoints.caches(),
             attentive,
             busy: self.herdr_view_focus.is_some() || !self.pending_herdr_attach.is_empty(),
+            now: Instant::now(),
+            last_direct_input: Some(self.last_input),
         });
         if let Some(pending) = self.herdr_view_focus.take() {
             if !self.sessions.iter().any(|session| session.id == pending.session) {
@@ -2021,13 +2023,14 @@ impl AlacritreeApp {
             return;
         };
         let workspace = self.sessions[idx].working_directory.clone();
-        if let Some(key) = &self.sessions[idx].herdr_key {
+        let herdr_key = self.sessions[idx].herdr_key.clone();
+        if let Some(key) = &herdr_key {
             self.pending_herdr_attach.retain(|pending| &pending.key != key);
         }
         if self.herdr_view_focus.as_ref().is_some_and(|pending| pending.session == id) {
             self.herdr_view_focus = None;
         }
-        self.herdr_focused_view.closed(id);
+        self.herdr_focused_view.closed(id, herdr_key.as_ref());
         if self.pending_session_close == Some(id) {
             self.pending_session_close = None;
         }
