@@ -1672,10 +1672,10 @@ impl AlacritreeApp {
         match self.spawn_session_with_shell(ctx, workspace, Some(shell), None) {
             Ok(id) => {
                 if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
-                    session.bind_herdr(key);
+                    session.bind_herdr(key.clone());
                 }
                 if shared_view {
-                    self.herdr_focused_view.attached(id, Instant::now());
+                    self.herdr_focused_view.attached(id, Some(&key), Instant::now());
                 }
                 true
             },
@@ -1717,6 +1717,9 @@ impl AlacritreeApp {
                     if let Err(e) = result {
                         log::warn!("{e}");
                     }
+                    if succeeded {
+                        self.herdr_focused_view.moved_focus(&pending.key, Instant::now());
+                    }
                     self.herdr_focused_view.settled(pending.session, succeeded, Instant::now());
                 },
                 None if pending.job.failed() => {
@@ -1737,10 +1740,12 @@ impl AlacritreeApp {
                 else {
                     return;
                 };
+                let stamp = key.clone();
                 let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
                     herdr::focus_pane(&key.side, &focus)
                 });
-                self.herdr_view_focus = Some(herdr::HerdrViewFocus { session: id, job });
+                self.herdr_view_focus =
+                    Some(herdr::HerdrViewFocus { session: id, key: stamp, job });
             },
             Some(herdr::HerdrViewAction::Follow(key)) => self.follow_herdr_view(ctx, key),
             None => {},
@@ -1811,7 +1816,7 @@ impl AlacritreeApp {
         self.reveal_search_row(&SidebarRow::Session(id));
         self.set_sidebar_cursor(SidebarRow::Session(id));
         self.focus_terminal();
-        self.herdr_focused_view.attached(id, Instant::now());
+        self.herdr_focused_view.attached(id, Some(&key), Instant::now());
     }
 
     fn toggle_scratchpad_tab(&mut self, ctx: &Context) {
@@ -12292,9 +12297,12 @@ mod tests {
         let other = bind_herdr_fixture(&mut app, side.clone(), "term-other");
         app.active_session.insert(None, gone);
         app.pending_session_close = Some(gone);
-        app.herdr_focused_view.attached(gone, Instant::now());
-        app.herdr_view_focus =
-            Some(herdr::HerdrViewFocus { session: gone, job: jobs::Job::ready(Ok(())) });
+        app.herdr_focused_view.attached(gone, None, Instant::now());
+        app.herdr_view_focus = Some(herdr::HerdrViewFocus {
+            session: gone,
+            key: herdr::HerdrKey { side: side.clone(), terminal_id: "term-gone".into() },
+            job: jobs::Job::ready(Ok(())),
+        });
         app.pending_herdr_attach.push(PendingHerdrAttach {
             key: app.sessions[0].herdr_key.clone().unwrap(),
             focus: Vec::new(),
@@ -12512,9 +12520,12 @@ mod tests {
     #[test]
     fn herdr_focus_completion_for_a_removed_session_is_ignored() {
         let mut app = herdr_lifecycle_app();
-        app.herdr_focused_view.attached(999, Instant::now());
-        app.herdr_view_focus =
-            Some(herdr::HerdrViewFocus { session: 999, job: jobs::Job::ready(Ok(())) });
+        app.herdr_focused_view.attached(999, None, Instant::now());
+        app.herdr_view_focus = Some(herdr::HerdrViewFocus {
+            session: 999,
+            key: herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() },
+            job: jobs::Job::ready(Ok(())),
+        });
 
         app.sync_herdr_view_focus(&Context::default());
 
