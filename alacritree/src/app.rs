@@ -1648,9 +1648,8 @@ impl AlacritreeApp {
     /// the rows the user could have opened one at a time.
     ///
     /// The batch was asked for the whole set rather than for one pane, so it
-    /// leaves the user where it found them: each session files under the
-    /// workspace its own pane belongs to, and `previous` stays the workspace
-    /// on screen, which is where a refusal landing frames later hands back to.
+    /// switches to none of them: each session files under the workspace its
+    /// own pane belongs to and the workspace on screen is left alone.
     fn attach_every_multiplexer_pane(&mut self, ctx: &Context) {
         if !self.config.integrations.herdr.enabled {
             self.error_dialog = Some(HERDR_DISABLED.to_string());
@@ -1665,9 +1664,12 @@ impl AlacritreeApp {
                 (key, agent.pane_id.clone(), workspace)
             })
             .collect();
-        let previous = self.current_workspace.clone();
         for (key, pane_id, workspace) in panes {
-            self.attach_herdr_agent(ctx, key, &pane_id, workspace, previous.clone(), None);
+            // Naming the pane's own workspace as the one to restore makes
+            // both arms of the restore no-ops, so a refusal cannot move a
+            // user who navigated while the gesture was still running.
+            let previous = workspace.clone();
+            self.attach_herdr_agent(ctx, key, &pane_id, workspace, previous, None);
         }
     }
 
@@ -10274,6 +10276,15 @@ impl AlacritreeApp {
         let Some(ids) = self.pending_detach_all.clone() else {
             return;
         };
+        // A session that ended elsewhere while the question was up is no
+        // longer this dialog's to end, and one that took the last of them
+        // leaves nothing to ask about.
+        let ids: Vec<SessionId> =
+            ids.into_iter().filter(|id| self.sessions.iter().any(|s| s.id == *id)).collect();
+        if ids.is_empty() {
+            self.pending_detach_all = None;
+            return;
+        }
         let count = ids.len();
         let title = format!(
             "Detach from {count} multiplexer {}?",
@@ -13492,8 +13503,9 @@ mod tests {
 
     /// The batch was asked for the whole set rather than for one pane, so it
     /// files each session under its own pane's workspace without carrying the
-    /// user along, and a refusal landing frames later hands them back to the
-    /// workspace they are still on.
+    /// user along.  Each attach names its own workspace as the one to
+    /// restore, since a refusal handing back the workspace the batch started
+    /// in would move a user who has navigated since.
     #[test]
     fn attaching_every_pane_leaves_the_user_where_the_batch_was_asked_from() {
         let mut app = herdr_lifecycle_app();
@@ -13512,7 +13524,7 @@ mod tests {
 
         let pending = app.pending_herdr_attach.first().expect("the loose pane queued an attach");
         assert_eq!(pending.workspace, None, "an unmatched pane files under Home");
-        assert_eq!(pending.previous, asked_from);
+        assert_eq!(pending.previous, pending.workspace, "a refusal restores nothing");
         assert_eq!(app.current_workspace, asked_from);
     }
 

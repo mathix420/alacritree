@@ -174,8 +174,8 @@ pub enum NamedAction {
     /// Open a new pane in the multiplexer and a session on it, in the focused
     /// workspace and on the side the focused session's own pane belongs to.
     NewMultiplexerPane,
-    /// Open a session on every detected multiplexer pane that none is
-    /// attached to yet, leaving the panes that already hold one alone.
+    /// Open a session on every multiplexer pane the sidebar lists that none
+    /// is attached to yet, leaving the panes that already hold one alone.
     AttachAllMultiplexerPanes,
     /// End every session attached to a multiplexer pane.  The panes keep
     /// running under the multiplexer and their rows come back unattached.
@@ -368,7 +368,9 @@ impl NamedAction {
             Self::CloseSession => "Close the cursored or active session".into(),
             Self::CloseExitedSession => "Close the session on screen once its child exited".into(),
             Self::NewMultiplexerPane => "Open a new multiplexer pane and a session on it".into(),
-            Self::AttachAllMultiplexerPanes => "Attach every unattached multiplexer pane".into(),
+            Self::AttachAllMultiplexerPanes => {
+                "Attach every unattached multiplexer pane the sidebar lists".into()
+            },
             Self::DetachAllMultiplexerPanes => "Detach every attached multiplexer pane".into(),
             Self::SidebarTop => "Move the sidebar cursor to the first row".into(),
             Self::SidebarBottom => "Move the sidebar cursor to the last row".into(),
