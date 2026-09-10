@@ -28,7 +28,7 @@ use crate::config::{
 use crate::crash_log::{self, ExitReason};
 use crate::git_nav::{self, GitSection, SectionCount};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
-use crate::multiplexer::{Launch, Multiplexer, MultiplexerSession, PaneTarget};
+use crate::multiplexer::{CreatedPane, Herdr, Launch, Multiplexer, MultiplexerSession, PaneTarget};
 use crate::panel_filter::{self, PanelFilter};
 use crate::path_style::PathStyle;
 use crate::pending_spawn::{Finished, PendingSpawns};
@@ -720,6 +720,8 @@ pub struct AlacritreeApp {
     /// Shared-view attaches whose herdr calls are running on the pool,
     /// adopted in `poll_herdr_attach`.
     pending_herdr_attach: Vec<PendingHerdrAttach>,
+    /// Pane creates running on the pool, adopted in `poll_herdr_create`.
+    pending_herdr_create: Vec<PendingHerdrCreate>,
     /// The shared view herdr was last focused for, and the call still on its
     /// way, both owned by `sync_herdr_view_focus`.
     herdr_focused_view: herdr::HerdrViewSync,
@@ -1045,6 +1047,7 @@ impl AlacritreeApp {
             project_refresh_jobs: HashMap::new(),
             pending_spawns: Default::default(),
             pending_herdr_attach: Vec::new(),
+            pending_herdr_create: Vec::new(),
             herdr_focused_view: herdr::HerdrViewSync::default(),
             herdr_view_focus: None,
             wsl_delta_paths: HashMap::new(),
@@ -1632,6 +1635,78 @@ impl AlacritreeApp {
         if let Some(waiter) = self.pending_spawns.watch(id, waiter) {
             let _ = waiter.send(Ok(json!({ "session_id": id })));
         }
+    }
+
+    /// Ask the multiplexer for a pane and open a session on it once it
+    /// answers.  The two halves cannot be one call: herdr is a process, and
+    /// the pane an attach needs does not exist until it answers.
+    fn create_multiplexer_pane(
+        &mut self,
+        ctx: &Context,
+        side: herdr::Side,
+        workspace: WorkspaceKey,
+        waiter: Option<mpsc::Sender<ipc::IpcResult>>,
+    ) {
+        let cwd = multiplexer_cwd(&side, workspace.as_deref());
+        // `Multiplexer::owning` resolves a multiplexer from a pane's key,
+        // and a pane nothing has made yet has no key, so the create names the
+        // one it is asking.
+        let multiplexer = Multiplexer::from(Herdr);
+        let asked = side.clone();
+        let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
+            multiplexer.create_pane(&asked, cwd)
+        });
+        self.pending_herdr_create.push(PendingHerdrCreate { job, side, workspace, waiter });
+        ctx.request_repaint();
+    }
+
+    /// Adopt the creates herdr has answered, handing each pane to the same
+    /// attach a click takes.  The workspace is switched to first, so the
+    /// session and any refusal are both readable where they were asked for.
+    fn poll_herdr_create(&mut self, ctx: &Context) {
+        if self.pending_herdr_create.is_empty() {
+            return;
+        }
+        let pending = self.pending_herdr_create.remove(0);
+        match pending.job.poll() {
+            Some(Ok(pane)) => {
+                let key = herdr::HerdrKey { side: pending.side, terminal_id: pane.terminal_id };
+                let previous =
+                    std::mem::replace(&mut self.current_workspace, pending.workspace.clone());
+                if !self.attach_herdr_agent(
+                    ctx,
+                    key,
+                    &pane.pane_id,
+                    pending.workspace,
+                    previous.clone(),
+                    pending.waiter,
+                ) {
+                    self.current_workspace = previous;
+                }
+            },
+            Some(Err(e)) => self.refuse_herdr_create(pending.waiter, e),
+            None if pending.job.failed() => {
+                self.refuse_herdr_create(
+                    pending.waiter,
+                    "the herdr pane create did not finish".to_string(),
+                );
+            },
+            None => self.pending_herdr_create.insert(0, pending),
+        }
+    }
+
+    /// Report a create the multiplexer refused.  Nothing has switched
+    /// workspace yet, since that waits for the pane to land, so a refusal
+    /// leaves the user where they are and only has to be readable.
+    fn refuse_herdr_create(
+        &mut self,
+        waiter: Option<mpsc::Sender<ipc::IpcResult>>,
+        message: String,
+    ) {
+        if let Some(waiter) = waiter {
+            let _ = waiter.send(Err(message.clone()));
+        }
+        self.error_dialog = Some(message);
     }
 
     /// Adopt the shared-view attaches whose herdr calls have landed.  Each
@@ -9330,6 +9405,19 @@ struct PendingHerdrAttach {
     waiters: Vec<mpsc::Sender<ipc::IpcResult>>,
 }
 
+/// A pane being created.  The attach it turns into is the ordinary one, so
+/// this queue only carries the gesture: `poll_herdr_create` hands the pane it
+/// names to `attach_herdr_agent` and stops there.
+///
+/// One waiter, not a list: nothing merges two creates, since the pane they
+/// would be merged on has no identity until herdr answers.
+struct PendingHerdrCreate {
+    job: jobs::Job<Result<CreatedPane, String>>,
+    side: herdr::Side,
+    workspace: WorkspaceKey,
+    waiter: Option<mpsc::Sender<ipc::IpcResult>>,
+}
+
 /// A pane the listing no longer carries.  Claiming an agent is in it keeps
 /// every caller on the path it took before the pane went, which is what
 /// `herdr_pane_has_agent` answers for the same reason.
@@ -11427,6 +11515,10 @@ impl AlacritreeApp {
                     self.defer_attach_multiplexer_pane(ctx, &side, &terminal_id, reply_tx);
                     continue;
                 },
+                ipc::IpcRequest::CreateMultiplexerPane { side, workspace } => {
+                    self.defer_create_multiplexer_pane(ctx, side.as_deref(), workspace, reply_tx);
+                    continue;
+                },
                 other => other,
             };
             let name = request.name();
@@ -11523,14 +11615,11 @@ impl AlacritreeApp {
         reply_tx: mpsc::Sender<ipc::IpcResult>,
     ) {
         if !self.config.integrations.herdr.enabled {
-            let _ = reply_tx.send(Err("the herdr integration is disabled ([integrations.herdr] \
-                                       enabled)"
-                .to_string()));
+            let _ = reply_tx.send(Err(HERDR_DISABLED.to_string()));
             return;
         }
         let Some(parsed_side) = herdr::Side::parse(side) else {
-            let _ = reply_tx
-                .send(Err(format!("`{side}` is not a side, expected `native` or `wsl:<distro>`")));
+            let _ = reply_tx.send(Err(not_a_side(side)));
             return;
         };
         let Some(agent) = self.find_herdr_agent(&parsed_side, terminal_id) else {
@@ -11549,6 +11638,84 @@ impl AlacritreeApp {
         if !self.attach_herdr_agent(ctx, key, &pane_id, workspace, previous.clone(), Some(reply_tx))
         {
             self.current_workspace = previous;
+        }
+    }
+
+    /// Create a pane and open a session on it.  An omitted side is the one
+    /// the active session's own pane belongs to, since a user asking for
+    /// another pane while looking at one means another like it; with no herdr
+    /// session in front of them there is no such answer, so a machine
+    /// reaching more than one server has to say which.
+    fn defer_create_multiplexer_pane(
+        &mut self,
+        ctx: &Context,
+        side: Option<&str>,
+        workspace: Option<PathBuf>,
+        reply_tx: mpsc::Sender<ipc::IpcResult>,
+    ) {
+        if !self.config.integrations.herdr.enabled {
+            let _ = reply_tx.send(Err(HERDR_DISABLED.to_string()));
+            return;
+        }
+        let side = match side {
+            Some(name) => match herdr::Side::parse(name) {
+                Some(side) => side,
+                None => {
+                    let _ = reply_tx.send(Err(not_a_side(name)));
+                    return;
+                },
+            },
+            None => match self.default_multiplexer_side() {
+                Ok(side) => side,
+                Err(e) => {
+                    let _ = reply_tx.send(Err(e));
+                    return;
+                },
+            },
+        };
+        // Resolved before herdr is asked, so a path naming no worktree never
+        // leaves a pane behind in the multiplexer.
+        let workspace = match workspace {
+            None => self.current_workspace.clone(),
+            Some(p) => match self.known_worktree_path(&p) {
+                Some(known) => Some(known),
+                None => {
+                    let _ = reply_tx.send(Err(unknown_worktree(&p)));
+                    return;
+                },
+            },
+        };
+        self.create_multiplexer_pane(ctx, side, workspace, Some(reply_tx));
+    }
+
+    /// The side a create that named none happens on: the one the active
+    /// session's own pane belongs to, and failing that the one endpoint a
+    /// server is answering on.  `Err` names every side it could have meant,
+    /// so a caller can retry saying which.
+    fn default_multiplexer_side(&self) -> Result<herdr::Side, String> {
+        let focused = self
+            .active_session_index()
+            .and_then(|idx| self.sessions[idx].herdr_key.as_ref())
+            .map(|key| key.side.clone());
+        if let Some(side) = focused {
+            return Ok(side);
+        }
+        // A cache holds a sample time only while its last listing succeeded,
+        // which is the same evidence the sidebar draws that side's rows on.
+        let answering: Vec<&herdr::Side> = self
+            .herdr_endpoints
+            .caches()
+            .iter()
+            .filter(|cache| cache.sampled_at().is_some())
+            .map(herdr::EndpointCache::side)
+            .collect();
+        match answering.as_slice() {
+            [side] => Ok((*side).clone()),
+            [] => Err("no herdr server is answering; start one, or name a side".to_string()),
+            sides => Err(format!(
+                "no herdr session is focused and {} are answering; name one",
+                sides.iter().map(|side| side.name()).collect::<Vec<_>>().join(" and ")
+            )),
         }
     }
 
@@ -11591,6 +11758,12 @@ impl AlacritreeApp {
             // reply channel this method does not have.
             Req::AttachMultiplexerPane { .. } => {
                 Err("attach_multiplexer_pane was not deferred".to_string())
+            },
+            // Claimed by `process_ipc_calls` before dispatch: the reply is
+            // held until the created pane's session can be read, which needs
+            // the reply channel this method does not have.
+            Req::CreateMultiplexerPane { .. } => {
+                Err("create_multiplexer_pane was not deferred".to_string())
             },
             Req::CloseSession { session_id } => {
                 if !self.sessions.iter().any(|s| s.id == session_id) {
@@ -11717,6 +11890,28 @@ fn unknown_worktree(path: &Path) -> String {
     format!("{} is not a worktree in the sidebar — see list_projects", path.display())
 }
 
+/// Why a multiplexer request cannot be served at all.  Alone among the
+/// refusals, this one is worth retrying after a config change.
+const HERDR_DISABLED: &str = "the herdr integration is disabled ([integrations.herdr] enabled)";
+
+/// A name that reaches no server, as opposed to one whose server is down: a
+/// caller retrying this one is retrying a typo.
+fn not_a_side(name: &str) -> String {
+    format!("`{name}` is not a side, expected `native` or `wsl:<distro>`")
+}
+
+/// The directory a new pane opens in, spelled where the multiplexer resolves
+/// it: the distro's own path on a WSL side, the Windows path on the native
+/// one.  `None` leaves the choice to the multiplexer, which is also where a
+/// path with no spelling inside the distro lands.
+fn multiplexer_cwd(side: &herdr::Side, workspace: Option<&Path>) -> Option<String> {
+    let path = workspace?;
+    match side {
+        herdr::Side::Native => Some(path.display().to_string()),
+        herdr::Side::Wsl(_) => wsl::windows_to_linux(path),
+    }
+}
+
 /// Where a herdr pane lives, in the fields an attach takes back.  `pane_id`
 /// and `tab_id` are null when the listing does not carry the pane, which
 /// says the cache does not know right now rather than that the pane is
@@ -11814,6 +12009,7 @@ impl eframe::App for AlacritreeApp {
         }
         self.poll_project_refreshes();
         self.poll_pending_spawns(ctx);
+        self.poll_herdr_create(ctx);
         self.poll_herdr_attach(ctx);
         // Unconditional: either sidebar can be hidden, and a drain hung off one
         // of them would strand every entry the other polled.
@@ -12434,6 +12630,115 @@ mod tests {
         app.defer_attach_multiplexer_pane(&Context::default(), "native", "term-held", reply_tx);
 
         assert_eq!(reply_rx.try_recv().unwrap(), Ok(json!({ "session_id": id })));
+    }
+
+    /// Naming a side that no herdr server answers on is a different failure
+    /// from naming one that is not a side at all, and a caller retrying the
+    /// second is retrying a typo.
+    #[test]
+    fn creating_a_pane_on_a_side_that_names_no_server_is_refused_by_name() {
+        let mut app = test_app();
+        app.config.integrations.herdr.enabled = true;
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        app.defer_create_multiplexer_pane(&Context::default(), Some("bogus"), None, reply_tx);
+
+        assert_eq!(
+            reply_rx.try_recv().unwrap(),
+            Err("`bogus` is not a side, expected `native` or `wsl:<distro>`".to_string())
+        );
+        assert!(app.pending_herdr_create.is_empty(), "a refused side still asked herdr");
+    }
+
+    /// With no herdr session focused and more than one server reachable,
+    /// there is no side the request could have meant, so the refusal names
+    /// the ones it could.
+    #[test]
+    fn creating_a_pane_with_no_side_and_several_servers_names_the_choices() {
+        let mut app = test_app();
+        app.config.integrations.herdr.enabled = true;
+        let listing = r#"{"result":{"panes":[
+            {"terminal_id":"term-a","pane_id":"w1:p1","agent":"claude","agent_status":"idle","cwd":"/repo"}
+        ]}}"#;
+        adopt_herdr_fixture(&mut app, herdr::Side::Native, listing, Instant::now());
+        adopt_herdr_fixture(&mut app, herdr::Side::Wsl("ubuntu".into()), listing, Instant::now());
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        app.defer_create_multiplexer_pane(&Context::default(), None, None, reply_tx);
+
+        assert_eq!(
+            reply_rx.try_recv().unwrap(),
+            Err("no herdr session is focused and native and wsl:ubuntu are answering; name one"
+                .to_string())
+        );
+        assert!(app.pending_herdr_create.is_empty(), "an unresolved side still asked herdr");
+    }
+
+    /// The side of the pane already on screen is what asking for another one
+    /// means, so a focused herdr session answers the question the request
+    /// left open.
+    #[test]
+    fn creating_a_pane_takes_the_side_of_the_focused_herdr_session() {
+        let mut app = test_app();
+        app.config.integrations.herdr.enabled = true;
+        adopt_herdr_fixture(
+            &mut app,
+            herdr::Side::Native,
+            r#"{"result":{"panes":[
+                {"terminal_id":"term-native","pane_id":"w1:p1","agent":"claude","agent_status":"idle","cwd":"/repo"}
+            ]}}"#,
+            Instant::now(),
+        );
+        let side = herdr::Side::Wsl("ubuntu".into());
+        let id = bind_herdr_fixture(&mut app, side.clone(), "term-focused");
+        app.set_active_in_current_workspace(id);
+
+        assert_eq!(app.default_multiplexer_side(), Ok(side));
+    }
+
+    /// A worktree the sidebar does not have is refused before herdr is asked,
+    /// so a typo never leaves a pane behind in the multiplexer.
+    #[test]
+    fn creating_a_pane_in_an_unknown_worktree_is_refused() {
+        let mut app = test_app();
+        app.config.integrations.herdr.enabled = true;
+        let unknown = PathBuf::from("no-such-worktree");
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        app.defer_create_multiplexer_pane(
+            &Context::default(),
+            Some("native"),
+            Some(unknown.clone()),
+            reply_tx,
+        );
+
+        assert_eq!(reply_rx.try_recv().unwrap(), Err(unknown_worktree(&unknown)));
+        assert!(app.pending_herdr_create.is_empty(), "an unknown worktree still asked herdr");
+    }
+
+    /// The multiplexer resolves the directory where it runs, so a WSL side is
+    /// handed the distro's own spelling of the workspace and never the
+    /// Windows path the sidebar holds.
+    #[cfg(windows)]
+    #[test]
+    fn a_new_pane_opens_in_the_workspace_spelled_for_its_own_side() {
+        let workspace = PathBuf::from(r"\\wsl.localhost\ubuntu\home\dev\repo");
+        assert_eq!(
+            multiplexer_cwd(&herdr::Side::Wsl("ubuntu".into()), Some(&workspace)),
+            Some("/home/dev/repo".to_string())
+        );
+        assert_eq!(
+            multiplexer_cwd(&herdr::Side::Native, Some(&workspace)),
+            Some(workspace.display().to_string())
+        );
+    }
+
+    /// The home workspace names no directory, so herdr picks its own default
+    /// rather than being handed an empty path.
+    #[test]
+    fn a_new_pane_in_the_home_workspace_names_no_directory() {
+        assert_eq!(multiplexer_cwd(&herdr::Side::Native, None), None);
+        assert_eq!(multiplexer_cwd(&herdr::Side::Wsl("ubuntu".into()), None), None);
     }
 
     #[test]

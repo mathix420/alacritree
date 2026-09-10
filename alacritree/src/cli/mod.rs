@@ -248,6 +248,16 @@ enum MultiplexerCommand {
         /// changes when a pane moves between workspaces.
         terminal_id: String,
     },
+    /// Open a new pane in the multiplexer and a session on it.
+    Create {
+        /// `native`, or `wsl:<distro>`.  Omit to use the side the active
+        /// session's pane belongs to.
+        #[arg(long)]
+        side: Option<String>,
+        /// Worktree path; omit for the focused workspace.
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -443,6 +453,9 @@ fn to_request(command: Command) -> IpcRequest {
             MultiplexerCommand::List => IpcRequest::ListMultiplexerPanes,
             MultiplexerCommand::Attach { side, terminal_id } => {
                 IpcRequest::AttachMultiplexerPane { side, terminal_id }
+            },
+            MultiplexerCommand::Create { side, workspace } => {
+                IpcRequest::CreateMultiplexerPane { side, workspace: workspace.map(absolute) }
             },
         },
         Command::Workspace { command } => match command {

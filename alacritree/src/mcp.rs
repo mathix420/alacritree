@@ -151,6 +151,17 @@ fn tool_definitions() -> Value {
             },
         },
         {
+            "name": "create_multiplexer_pane",
+            "description": "Open a new pane in the terminal multiplexer (herdr) and an alacritree session on it, and return the session id once the session can be read. Omit side to use the one the active session's pane belongs to, which is what a machine reaching only one herdr server always wants; a machine reaching several must name it when no herdr session is focused. Omit workspace to open the pane in the focused workspace.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "side": { "type": "string", "description": "\"native\" or \"wsl:<distro>\", from list_multiplexer_panes." },
+                    "workspace": { "type": "string", "description": "Worktree path from list_projects; omit for the focused workspace." },
+                },
+            },
+        },
+        {
             "name": "select_workspace",
             "description": "Focus a workspace in the alacritree window, like clicking it in the sidebar. Pass a worktree path from list_projects, or omit path for the home workspace.",
             "inputSchema": {
@@ -326,6 +337,7 @@ mod tests {
             IpcRequest::ListSessions,
             IpcRequest::ListMultiplexerPanes,
             IpcRequest::AttachMultiplexerPane { side: "native".into(), terminal_id: "t1".into() },
+            IpcRequest::CreateMultiplexerPane { side: None, workspace: None },
             IpcRequest::SelectWorkspace { path: None },
             IpcRequest::CreateSession { workspace: None },
             IpcRequest::CloseSession { session_id: 1 },
@@ -349,6 +361,7 @@ mod tests {
             IpcRequest::ListSessions => "list_sessions",
             IpcRequest::ListMultiplexerPanes => "list_multiplexer_panes",
             IpcRequest::AttachMultiplexerPane { .. } => "attach_multiplexer_pane",
+            IpcRequest::CreateMultiplexerPane { .. } => "create_multiplexer_pane",
             IpcRequest::SelectWorkspace { .. } => "select_workspace",
             IpcRequest::CreateSession { .. } => "create_session",
             IpcRequest::CloseSession { .. } => "close_session",

@@ -19,7 +19,7 @@ pub fn human(request: &IpcRequest, value: &Value) {
         },
         IpcRequest::ListSessions => sessions(value),
         IpcRequest::ListMultiplexerPanes => multiplexer_panes(value),
-        IpcRequest::AttachMultiplexerPane { .. } => {
+        IpcRequest::AttachMultiplexerPane { .. } | IpcRequest::CreateMultiplexerPane { .. } => {
             println!("session {}", text(&value["session_id"]));
         },
         IpcRequest::CreateSession { .. } => {

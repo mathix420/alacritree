@@ -9,10 +9,10 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use crate::config::AttachMode;
-use crate::multiplexer::PaneTarget;
+use crate::multiplexer::{CreatedPane, PaneTarget};
 use crate::{command_ext, jobs};
 
-use super::wire::SessionList;
+use super::wire::{CreatedTab, SessionList};
 use super::{Listing, ListingReply, PollError, Side, error_code};
 
 /// The binary every call here runs.  `Side::command` takes it as an argument
@@ -150,6 +150,55 @@ pub fn running_session_name(side: &Side) -> Result<String, String> {
         .unwrap_or_else(fallback))
 }
 
+/// The `herdr` subcommand that opens a tab and brings it to the front, so a
+/// shared view attaching afterwards is already showing the pane it made.
+/// `--cwd` is left off entirely when no directory is chosen, since herdr's
+/// own default is a better answer than an empty path.
+fn create_args(cwd: Option<&str>) -> Vec<String> {
+    let mut args = vec!["tab".into(), "create".into(), "--focus".into()];
+    if let Some(cwd) = cwd {
+        args.push("--cwd".into());
+        args.push(cwd.into());
+    }
+    args
+}
+
+/// Opens a tab in the user's own herdr window and focuses it.  A process
+/// spawn that waits on herdr starting up, so it only ever runs on the pool.
+///
+/// `cwd` is spelled in the side's own terms: a Windows path on the native
+/// side, and a path inside the distro on a WSL one, since herdr resolves it
+/// where it runs.
+pub fn create_pane(side: &Side, cwd: Option<String>) -> Result<CreatedPane, String> {
+    let create = create_args(cwd.as_deref());
+    let borrowed: Vec<&str> = create.iter().map(String::as_str).collect();
+    let (program, args) = side.command(PROGRAM, &borrowed);
+    #[allow(clippy::disallowed_methods)] // Running herdr is this function's job.
+    let run = move || {
+        command_ext::hidden(program)
+            .args(args)
+            .env("WSL_UTF8", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+    };
+    let Some(output) = bounded(run) else {
+        return Err("herdr did not answer while creating the pane".to_string());
+    };
+    let output = output.map_err(|e| format!("failed to create a herdr pane: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("herdr refused to create the pane: {stderr}"));
+    }
+    let created = serde_json::from_slice::<CreatedTab>(&output.stdout)
+        .map_err(|_| "herdr answered with no pane".to_string())?;
+    Ok(CreatedPane {
+        terminal_id: created.result.root_pane.terminal_id,
+        pane_id: created.result.root_pane.pane_id,
+    })
+}
+
 /// Runs one of herdr's listings on one side.  Success is on stdout, errors
 /// are on stderr, so both are captured; the exit status decides which to read.
 ///
@@ -253,6 +302,21 @@ mod tests {
         assert!(!attaches_directly(&wsl, AttachMode::Session, true));
         assert!(!attaches_directly(&Side::Native, AttachMode::Session, true));
         assert_eq!(attaches_directly(&Side::Native, AttachMode::Agent, true), !cfg!(windows));
+    }
+
+    /// Every herdr app client draws whatever herdr has focused, so a pane
+    /// created without `--focus` would be attached to while the window still
+    /// showed the pane before it.
+    #[test]
+    fn a_created_pane_is_focused_and_takes_a_cwd_only_when_one_is_chosen() {
+        assert_eq!(create_args(None), vec!["tab", "create", "--focus"]);
+        assert_eq!(create_args(Some("/tmp/review")), vec![
+            "tab",
+            "create",
+            "--focus",
+            "--cwd",
+            "/tmp/review"
+        ]);
     }
 
     #[test]

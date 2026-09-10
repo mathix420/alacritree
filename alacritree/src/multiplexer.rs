@@ -1,9 +1,10 @@
 //! Which terminal multiplexer owns a pane, and what alacritree asks it in
 //! order to host one.
 //!
-//! Only two of those questions have answers that differ between multiplexers,
-//! and they go behind [`MultiplexerSession`], so a second multiplexer is a new
-//! [`Multiplexer`] variant rather than a new branch at every call site.
+//! Only three of those questions have answers that differ between
+//! multiplexers, and they go behind [`MultiplexerSession`], so a second
+//! multiplexer is a new [`Multiplexer`] variant rather than a new branch at
+//! every call site.
 //! Everything else stays in that multiplexer's own module, where its shape is
 //! honest about having exactly one example.
 
@@ -107,6 +108,16 @@ pub struct Launch {
     pub argv: Vec<String>,
 }
 
+/// A pane a multiplexer has just made.  Both ids come back because the two
+/// answer different questions: `terminal_id` is the identity a session is
+/// keyed on and survives the pane moving, `pane_id` is what an attach is
+/// pointed at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedPane {
+    pub terminal_id: String,
+    pub pane_id: String,
+}
+
 /// What a multiplexer answers so alacritree can host one of its panes.
 #[enum_dispatch]
 pub trait MultiplexerSession {
@@ -128,6 +139,16 @@ pub trait MultiplexerSession {
         target: &PaneTarget,
         cached_name: Option<String>,
     ) -> Result<Launch, String>;
+
+    /// Open a pane on `side` and focus it, so a shared view attaching
+    /// afterwards is already showing the pane this names.  A process call,
+    /// so this only ever runs off the UI thread.
+    ///
+    /// `cwd` is spelled in the side's own terms: a Windows path on the native
+    /// side, a path inside the distro on a WSL one, since the multiplexer
+    /// resolves it where it runs.  `None` leaves the directory to the
+    /// multiplexer's own default.
+    fn create_pane(&self, side: &Side, cwd: Option<String>) -> Result<CreatedPane, String>;
 }
 
 /// herdr, reached through the free functions in [`crate::herdr`].
@@ -156,6 +177,10 @@ impl MultiplexerSession for Herdr {
         let focus = herdr::focus_args(target);
         let (program, argv) = herdr::herdr_attach_gesture(&target.side, &focus, cached_name)?;
         Ok(Launch { program, argv })
+    }
+
+    fn create_pane(&self, side: &Side, cwd: Option<String>) -> Result<CreatedPane, String> {
+        herdr::create_pane(side, cwd)
     }
 }
 

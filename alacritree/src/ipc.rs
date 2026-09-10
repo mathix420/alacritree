@@ -132,6 +132,16 @@ pub enum IpcRequest {
         side: String,
         terminal_id: String,
     },
+    /// Open a new pane in the multiplexer and a session on it.  `side` and
+    /// `workspace` both default: an omitted side picks the one the active
+    /// session already belongs to, and an omitted workspace opens the pane
+    /// in the focused one.
+    CreateMultiplexerPane {
+        #[serde(default)]
+        side: Option<String>,
+        #[serde(default)]
+        workspace: Option<PathBuf>,
+    },
     /// Run a named key-binding action (`FocusLeft`, `ToggleLeftSidebar`, …)
     /// as if its key had been pressed.  `bindings::parse_action` defines the
     /// accepted names, so every action a key can be bound to is reachable
@@ -163,6 +173,7 @@ impl IpcRequest {
             Self::CreateWorktree { .. } => "CreateWorktree",
             Self::ListMultiplexerPanes => "ListMultiplexerPanes",
             Self::AttachMultiplexerPane { .. } => "AttachMultiplexerPane",
+            Self::CreateMultiplexerPane { .. } => "CreateMultiplexerPane",
             Self::RunAction { .. } => "RunAction",
         }
     }

@@ -20,8 +20,8 @@ pub(in crate::herdr) use poll::ListingReply;
 /// runs under; herdr names it here for the convenience of its own callers.
 pub use crate::multiplexer::Side;
 pub use cli::{
-    PROGRAM, attach_args, attaches_directly, focus_args, focus_pane, herdr_attach_gesture,
-    running_session_name,
+    PROGRAM, attach_args, attaches_directly, create_pane, focus_args, focus_pane,
+    herdr_attach_gesture, running_session_name,
 };
 pub use model::{
     Agent, HerdrKey, Indicators, Listing, PollError, Settings, Status, match_workspace, unattached,

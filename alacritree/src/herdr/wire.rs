@@ -113,6 +113,28 @@ pub(super) struct RawSession {
     pub(super) running: bool,
 }
 
+/// What `tab create` answers.  Only the two ids an attach needs are read;
+/// the tab block and the pane's own metadata arrive on the next listing
+/// poll like every other pane's.
+#[derive(Deserialize)]
+pub(super) struct CreatedTab {
+    pub(super) result: CreatedTabResult,
+}
+
+#[derive(Deserialize)]
+pub(super) struct CreatedTabResult {
+    pub(super) root_pane: CreatedPaneIds,
+}
+
+/// The two ids herdr names a new pane by.  Neither is optional: an empty
+/// pane id would be sent back to herdr as an attach target, so a reply that
+/// carries no pane is a parse failure rather than a pane with no name.
+#[derive(Deserialize)]
+pub(super) struct CreatedPaneIds {
+    pub(super) terminal_id: String,
+    pub(super) pane_id: String,
+}
+
 #[cfg(test)]
 /// Captured from a native Windows server.  The second pane runs a plain
 /// shell: herdr carries no `agent` key for it and calls its status
@@ -127,6 +149,12 @@ pub(super) const PANES: &str = r#"{"id":"cli:pane:list","result":{"panes":[
      "terminal_id":"term_b","cwd":"C:\\projects\\alacritree","focused":false,
      "terminal_title":"~/p/alacritree","terminal_title_stripped":"~/p/alacritree",
      "scroll":{"offset_from_bottom":0},"workspace_id":"w1"}],"type":"pane_list"}}"#;
+
+#[cfg(test)]
+/// Captured from `herdr tab create --focus`.  The tab block and the rest of
+/// the pane's fields are kept as herdr sent them, so a reader that starts
+/// depending on one has a real sample to read it out of.
+pub(super) const CREATED_TAB: &str = r#"{"id":"cli:tab:create","result":{"type":"tab_created","tab":{"tab_id":"w_1:2","workspace_id":"w_1","number":2,"label":"review","focused":true,"pane_count":1,"agent_status":"unknown"},"root_pane":{"pane_id":"w_1-3","terminal_id":"term_example","workspace_id":"w_1","tab_id":"w_1:2","focused":true,"cwd":"/tmp/review","agent_status":"unknown"}}}"#;
 
 #[cfg(test)]
 mod tests {
@@ -257,6 +285,26 @@ mod tests {
     fn showing_panes_swaps_the_listing_rather_than_adding_one() {
         assert_eq!(Listing::wanted(false).args(), ["agent", "list"]);
         assert_eq!(Listing::wanted(true).args(), ["pane", "list"]);
+    }
+
+    /// An attach is pointed at the pane id this reply names, so both ids have
+    /// to survive the round trip out of the envelope herdr wraps them in.
+    #[test]
+    fn a_created_tab_names_the_pane_an_attach_targets() {
+        let created =
+            serde_json::from_str::<CreatedTab>(CREATED_TAB).expect("the captured reply parses");
+        assert_eq!(created.result.root_pane.terminal_id, "term_example");
+        assert_eq!(created.result.root_pane.pane_id, "w_1-3");
+    }
+
+    /// A create that answered with no pane has nothing to attach to, and an
+    /// empty pane id would be sent to herdr as a target, so the reply is
+    /// refused rather than read as a pane without a name.
+    #[test]
+    fn a_created_tab_with_no_pane_does_not_parse() {
+        let reply =
+            r#"{"id":"cli:tab:create","result":{"type":"tab_created","tab":{"tab_id":"w_1:2"}}}"#;
+        assert!(serde_json::from_str::<CreatedTab>(reply).is_err());
     }
 
     /// `herdr agent focus` answers `agent_not_found` for a pane with no agent
