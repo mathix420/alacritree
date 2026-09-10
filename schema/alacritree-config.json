@@ -532,6 +532,16 @@
           "description": "Discover herdr servers and list their agents in the sidebar.  Inert\nwhen no herdr binary or server is present.",
           "type": "boolean"
         },
+        "follow_focus": {
+          "default": "herdr",
+          "description": "Whether a focus change made inside herdr moves alacritree to the\nmatching session.\n\n\"off\" never moves it.  \"herdr\" (default) moves it only while the\nactive session is already showing herdr's view, which is what an\nunmodified config has always done.  \"always\" additionally moves it\nfrom a plain native session, on any reachable side, after a gap in\ntyping.",
+          "enum": [
+            "off",
+            "herdr",
+            "always"
+          ],
+          "type": "string"
+        },
         "poll_interval_ms": {
           "default": 2000,
           "description": "How often a reachable herdr server is re-polled for agent state.",

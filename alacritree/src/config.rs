@@ -574,6 +574,34 @@ fn parse_attach_mode(raw: &str) -> AttachMode {
     }
 }
 
+/// Whether a focus change made inside herdr may move alacritree, and from
+/// which sessions.  Following moves the keyboard, so the default is the
+/// narrower rule: only a session that is already showing herdr's view
+/// follows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub enum FollowFocus {
+    /// herdr never moves alacritree.  alacritree still tells herdr where to
+    /// point when the user picks a row.
+    Off,
+    /// Follow only while the active session is herdr-backed.
+    #[default]
+    Herdr,
+    /// Follow from a native session too, on any reachable side.
+    Always,
+}
+
+fn parse_follow_focus(raw: &str) -> FollowFocus {
+    match raw {
+        "off" => FollowFocus::Off,
+        "herdr" => FollowFocus::Herdr,
+        "always" => FollowFocus::Always,
+        other => {
+            log::warn!("unknown integrations.herdr.follow_focus value {other:?}, using \"herdr\"");
+            FollowFocus::default()
+        },
+    }
+}
+
 /// `[integrations.herdr]`: whether alacritree lists agents running under a
 /// herdr server in the sidebar, and what opening one attaches to.  On by
 /// default; a probe with no herdr binary or server present costs nothing, so
@@ -592,6 +620,9 @@ pub struct HerdrConfig {
     /// What a row opens.  Honoured per side; the native side of a Windows
     /// host attaches to the session whatever this says.
     pub attach: AttachMode,
+    /// Whether a focus change inside herdr moves alacritree, and from which
+    /// sessions.
+    pub follow_focus: FollowFocus,
 }
 
 impl Default for HerdrConfig {
@@ -2823,6 +2854,15 @@ struct RawHerdr {
     /// there.
     #[schemars(extend("enum" = ["agent", "session"]))]
     attach: String,
+    /// Whether a focus change made inside herdr moves alacritree to the
+    /// matching session.
+    ///
+    /// "off" never moves it.  "herdr" moves it only while the active session
+    /// is already showing herdr's view, which is what an unmodified config
+    /// has always done.  "always" also moves it from a plain native session,
+    /// on any reachable side, after a gap in typing.
+    #[schemars(extend("enum" = ["off", "herdr", "always"]))]
+    follow_focus: String,
 }
 
 impl Default for RawHerdr {
@@ -2833,6 +2873,7 @@ impl Default for RawHerdr {
             show_unmatched: true,
             show_panes: false,
             attach: "agent".to_string(),
+            follow_focus: "herdr".to_string(),
         }
     }
 }
@@ -2845,6 +2886,7 @@ impl RawHerdr {
             show_unmatched: self.show_unmatched,
             show_panes: self.show_panes,
             attach: parse_attach_mode(&self.attach),
+            follow_focus: parse_follow_focus(&self.follow_focus),
         }
     }
 }
@@ -3821,6 +3863,34 @@ show_panes = true
         let resolved = toml::from_str::<RawConfig>("").unwrap().into_config();
         assert_eq!(resolved.palette.bright, Palette::default().bright);
         assert_eq!(resolved.palette.normal, Palette::default().normal);
+    }
+
+    #[test]
+    fn herdr_follow_focus_defaults_to_the_shipped_behavior() {
+        let config = Config::default();
+        assert_eq!(config.integrations.herdr.follow_focus, FollowFocus::Herdr);
+    }
+
+    #[test]
+    fn herdr_follow_focus_reads_each_accepted_word() {
+        for (word, expected) in [
+            ("off", FollowFocus::Off),
+            ("herdr", FollowFocus::Herdr),
+            ("always", FollowFocus::Always),
+        ] {
+            assert_eq!(parse_follow_focus(word), expected);
+        }
+    }
+
+    #[test]
+    fn herdr_follow_focus_falls_back_on_an_unknown_word() {
+        assert_eq!(parse_follow_focus("sideways"), FollowFocus::Herdr);
+    }
+
+    #[test]
+    fn herdr_follow_focus_parses_from_toml() {
+        let config = config_from("[integrations.herdr]\nfollow_focus = \"always\"\n");
+        assert_eq!(config.integrations.herdr.follow_focus, FollowFocus::Always);
     }
 
     fn ui_from_toml(input: &str) -> UiTheme {
