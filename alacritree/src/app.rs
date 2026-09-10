@@ -1729,7 +1729,7 @@ impl AlacritreeApp {
         match self.spawn_session_with_shell(ctx, workspace, Some(shell), None) {
             Ok(id) => {
                 if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
-                    session.bind_herdr(key.clone());
+                    session.bind_herdr(key.clone(), shared_view);
                 }
                 if shared_view {
                     self.herdr_focused_view.attached(id, Some(&key), Instant::now());
@@ -1749,15 +1749,13 @@ impl AlacritreeApp {
     fn sync_herdr_view_focus(&mut self, ctx: &Context) {
         let active = self.active_session_index().map(|index| &self.sessions[index]);
         let key = active.and_then(|session| session.herdr_key.clone());
-        let selection = active
-            .map(|session| (session.id, key.as_ref(), self.herdr_pane_has_agent(key.as_ref())));
+        let selection = active.map(|session| (session.id, key.as_ref(), session.herdr_shared_view));
         let attentive = self.focus == PaneFocus::Terminal
             && !self.is_modal_open()
             && !self.palette.is_open()
             && ctx.input(|input| input.viewport().focused).unwrap_or(true);
         let action = self.herdr_focused_view.next(herdr::ViewInputs {
             active: selection,
-            attach: self.config.integrations.herdr.attach,
             follow: self.config.integrations.herdr.follow_focus,
             caches: self.herdr_endpoints.caches(),
             attentive,
@@ -12177,7 +12175,7 @@ mod tests {
             None,
             None,
         );
-        session.bind_herdr(herdr::HerdrKey { side, terminal_id: terminal.into() });
+        session.bind_herdr(herdr::HerdrKey { side, terminal_id: terminal.into() }, true);
         let id = session.id;
         app.sessions.push(session);
         id
@@ -12281,7 +12279,7 @@ mod tests {
         let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t7".into() };
         let id = app.sessions.first().expect("a session").id;
         if let Some(session) = app.sessions.iter_mut().find(|s| s.id == id) {
-            session.bind_herdr(key);
+            session.bind_herdr(key, true);
         }
         let session = app.sessions.iter().find(|s| s.id == id).expect("a session");
         let json = app.session_json(session, true);
@@ -12300,7 +12298,7 @@ mod tests {
             herdr::HerdrKey { side: herdr::Side::Wsl("ubuntu".into()), terminal_id: "t1".into() };
         let id = app.sessions.first().expect("a session").id;
         if let Some(session) = app.sessions.iter_mut().find(|s| s.id == id) {
-            session.bind_herdr(key);
+            session.bind_herdr(key, true);
         }
         let session = app.sessions.iter().find(|s| s.id == id).expect("a session");
         assert_eq!(app.session_json(session, true)["multiplexer"]["side"], "wsl:ubuntu");
@@ -12860,6 +12858,30 @@ mod tests {
         assert_eq!(reply_rx.try_recv().unwrap(), Err("failed to attach the pane".to_string()));
     }
 
+    /// herdr reporting an agent in a pane says nothing about what the client
+    /// already attached to that pane draws, so the focus a row is owed cannot
+    /// be recomputed from the listing: a shared view whose pane picked up an
+    /// agent would stop asking, and switching to its row would leave the user
+    /// on whatever pane herdr happened to be showing.
+    #[test]
+    fn a_row_whose_pane_reports_an_agent_still_asks_herdr_for_focus() {
+        let mut app = herdr_lifecycle_app();
+        // The mode that hands a pane over directly, which is the one the
+        // recomputed answer used to suppress the focus call under.
+        app.config.integrations.herdr.attach = AttachMode::Agent;
+        let side = herdr::Side::Wsl("ubuntu".into());
+        let id = bind_herdr_fixture(&mut app, side, "term-agent");
+        app.activate_session_by_id(id);
+
+        // No listing carries this pane, which is the reading that defaults it
+        // to holding an agent, and which also keeps the focus call itself
+        // from reaching herdr.
+        app.sync_herdr_view_focus(&Context::default());
+
+        assert_eq!(app.herdr_focused_view.visible, Some(id));
+        assert!(app.herdr_view_focus.is_none());
+    }
+
     /// `park_attach_reply` builds the `Ok` reply itself when nothing is
     /// opening for the id; `pending_spawn.rs` proves `watch` hands the
     /// channel back in that case, but nothing there asserts what this
@@ -13019,7 +13041,7 @@ mod tests {
 
         let before_rebind = Instant::now();
         let key = app.sessions[0].herdr_key.clone().unwrap();
-        app.sessions[0].bind_herdr(key);
+        app.sessions[0].bind_herdr(key, true);
         adopt_herdr_fixture(&mut app, side, r#"{"result":{"panes":[]}}"#, before_rebind);
         app.reconcile_herdr_sessions(&Context::default());
         assert_eq!(app.sessions[0].id, id);

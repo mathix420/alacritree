@@ -1,18 +1,18 @@
 //! Which herdr pane alacritree is showing, and when to tell herdr to move.
 //!
-//! Every herdr client draws the one pane herdr has focused, so a session
-//! sharing herdr's view has to ask for its own pane before its client can
-//! start, and follows herdr afterwards.
+//! Every herdr client draws the one pane herdr has focused, so activating a
+//! row is what puts herdr on that row's pane.  A session sharing herdr's
+//! whole view follows herdr afterwards too, since that is what it is drawing.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::config::{AttachMode, FollowFocus};
+use crate::config::FollowFocus;
 use crate::herdr::EndpointCache;
 use crate::jobs;
 use crate::session::SessionId;
 
-use super::{HerdrKey, Side, attaches_directly};
+use super::{HerdrKey, Side};
 
 /// Where a side's focus was last established, and when.  The stamp is a
 /// watermark: a listing sampled at or before it cannot form an edge, so one
@@ -83,12 +83,11 @@ pub enum HerdrViewAction {
 /// Everything `next` decides from, in one struct because there are more of
 /// them than a positional call can carry legibly and clippy allows.
 pub struct ViewInputs<'a> {
-    /// The active session and its herdr key, before any direct-attach filter.
-    /// The filter belongs to the shared-view path: a session that attaches
-    /// directly still occupies a pane, and a trail blind to its key would
-    /// follow the user to the pane they are already on.
+    /// The active session, its herdr key, and whether that session shares
+    /// herdr's whole view rather than drawing one pane of its own.  The last
+    /// is settled when the session attaches: a pane that gains or loses an
+    /// agent afterwards does not change what its client is already drawing.
     pub active: Option<(SessionId, Option<&'a HerdrKey>, bool)>,
-    pub attach: AttachMode,
     pub follow: FollowFocus,
     pub caches: &'a [EndpointCache],
     /// The window is focused, the terminal has pane focus, and neither a
@@ -313,11 +312,13 @@ impl HerdrViewSync {
     /// The session on screen asking herdr for its own pane, and following
     /// herdr afterwards.  Watermarked against listings that were already in
     /// flight when our own focus call landed.
+    ///
+    /// Every row asks.  A row that did not would leave the user looking at
+    /// whichever pane herdr was already on, which is that row's own pane only
+    /// by luck.  Only a shared view follows, because a client wired to one
+    /// pane keeps drawing it wherever herdr looks.
     fn shared_view(&mut self, inputs: &ViewInputs<'_>) -> Option<HerdrViewAction> {
-        let active = inputs
-            .active
-            .and_then(|(id, key, has_agent)| Some((id, key?, has_agent)))
-            .filter(|(_, key, has_agent)| !attaches_directly(&key.side, inputs.attach, *has_agent));
+        let active = inputs.active.and_then(|(id, key, shares)| Some((id, key?, shares)));
         let visible = active.map(|(id, ..)| id);
         if self.visible != visible {
             self.visible = visible;
@@ -327,9 +328,12 @@ impl HerdrViewSync {
         if inputs.busy {
             return None;
         }
-        let (id, key, has_agent) = active?;
-        if needs_view_focus(Some(key), inputs.attach, has_agent, id, self.focused) {
+        let (id, key, shares) = active?;
+        if needs_view_focus(Some(key), id, self.focused) {
             return Some(HerdrViewAction::Focus(id));
+        }
+        if !shares {
+            return None;
         }
         let cache = inputs.caches.iter().find(|cache| cache.side() == &key.side)?;
         let sampled_at = cache.sampled_at()?;
@@ -347,18 +351,16 @@ impl HerdrViewSync {
     }
 }
 
-/// Whether the session on screen still owes herdr a focus call.  A direct
-/// attach draws its own pane whatever herdr focuses, and an ordinary shell
-/// has no pane at all, so neither ever asks.
+/// Whether the session on screen still owes herdr a focus call.  An ordinary
+/// shell holds no pane and never asks; every session that does hold one asks
+/// once per switch onto it, so activating a row always points herdr at that
+/// row's pane.
 pub fn needs_view_focus(
     key: Option<&HerdrKey>,
-    attach: AttachMode,
-    has_agent: bool,
     active: SessionId,
     focused: Option<SessionId>,
 ) -> bool {
-    key.is_some_and(|key| !attaches_directly(&key.side, attach, has_agent))
-        && focused != Some(active)
+    key.is_some() && focused != Some(active)
 }
 
 #[cfg(test)]
@@ -371,13 +373,11 @@ mod tests {
 
     fn inputs<'a>(
         active: Option<(SessionId, Option<&'a HerdrKey>, bool)>,
-        attach: AttachMode,
         caches: &'a [herdr::EndpointCache],
         busy: bool,
     ) -> ViewInputs<'a> {
         ViewInputs {
             active,
-            attach,
             follow: FollowFocus::Herdr,
             caches,
             attentive: true,
@@ -394,7 +394,6 @@ mod tests {
     ) -> ViewInputs<'a> {
         ViewInputs {
             active,
-            attach: AttachMode::Session,
             follow: FollowFocus::Always,
             caches,
             attentive: true,
@@ -481,34 +480,29 @@ mod tests {
     /// A change the user is already looking at is not somewhere to go.
     #[test]
     fn a_change_onto_the_active_pane_records_without_following() {
-        // A direct attach, so the shared-view path filters this session out
-        // and leaves the active-pane question to the trail.
+        // A session drawing its own pane, so the shared-view path stops after
+        // the focus call and leaves the active-pane question to the trail.
         let side = herdr::Side::Wsl("ubuntu".into());
         let key = HerdrKey { side: side.clone(), terminal_id: "t2".into() };
         let start = Instant::now();
         let first = one_focused(&side, "t1", start);
+        let own_pane = Some((1, Some(&key), false));
         let mut sync = HerdrViewSync::default();
-        let mut first_inputs = always(Some((1, Some(&key), true)), &first, start);
-        first_inputs.attach = AttachMode::Agent;
-        assert_eq!(sync.next(first_inputs), None);
+        assert_eq!(sync.next(always(own_pane, &first, start)), Some(HerdrViewAction::Focus(1)));
+        sync.settled(1, true, start);
+        assert_eq!(sync.next(always(own_pane, &first, start)), None);
         let later = start + Duration::from_millis(1);
         let second = one_focused(&side, "t2", later);
-        let mut second_inputs = always(Some((1, Some(&key), true)), &second, later);
-        second_inputs.attach = AttachMode::Agent;
-        assert_eq!(sync.next(second_inputs), None);
+        assert_eq!(sync.next(always(own_pane, &second, later)), None);
         // The active-pane branch must have updated the entry, not merely
         // skipped the edge: a third sample back on the old pane is a real
         // change against the recorded "t2", so it is followed.
         let latest = later + Duration::from_millis(1);
         let third = one_focused(&side, "t1", latest);
-        let mut third_inputs = always(Some((1, Some(&key), true)), &third, latest);
-        third_inputs.attach = AttachMode::Agent;
-        assert_eq!(sync.next(third_inputs), None);
+        assert_eq!(sync.next(always(own_pane, &third, latest)), None);
         let quiet = latest + FOLLOW_QUIET_GAP + Duration::from_millis(1);
-        let mut quiet_inputs = always(Some((1, Some(&key), true)), &third, quiet);
-        quiet_inputs.attach = AttachMode::Agent;
         assert_eq!(
-            sync.next(quiet_inputs),
+            sync.next(always(own_pane, &third, quiet)),
             Some(HerdrViewAction::Follow(HerdrKey {
                 side: side.clone(),
                 terminal_id: "t1".into()
@@ -624,7 +618,7 @@ mod tests {
         let caches = one_focused(&side, "t2", start);
         let mut sync = HerdrViewSync::default();
         assert_eq!(
-            sync.next(always(Some((1, Some(&key), false)), &caches, start)),
+            sync.next(always(Some((1, Some(&key), true)), &caches, start)),
             Some(HerdrViewAction::Focus(1))
         );
     }
@@ -641,12 +635,9 @@ mod tests {
             ]}}"#,
         );
         let mut sync = HerdrViewSync::default();
-        let active = Some((1, Some(&t1), false));
+        let active = Some((1, Some(&t1), true));
         let no_caches: Vec<herdr::EndpointCache> = Vec::new();
-        assert_eq!(
-            sync.next(inputs(active, AttachMode::Session, &no_caches, false)),
-            Some(HerdrViewAction::Focus(1))
-        );
+        assert_eq!(sync.next(inputs(active, &no_caches, false)), Some(HerdrViewAction::Focus(1)));
         let focused_at = Instant::now();
         sync.settled(1, true, focused_at);
         let caches = vec![herdr::EndpointCache::for_test(
@@ -655,19 +646,13 @@ mod tests {
             focused_at + Duration::from_millis(1),
         )];
         assert_eq!(
-            sync.next(inputs(active, AttachMode::Session, &caches, false)),
+            sync.next(inputs(active, &caches, false)),
             Some(HerdrViewAction::Follow(t2.clone()))
         );
         sync.attached(2, None, focused_at + Duration::from_millis(2));
-        assert_eq!(
-            sync.next(inputs(Some((2, Some(&t2), false)), AttachMode::Session, &caches, false)),
-            None
-        );
-        assert_eq!(sync.next(inputs(None, AttachMode::Session, &caches, false)), None);
-        assert_eq!(
-            sync.next(inputs(active, AttachMode::Session, &caches, false)),
-            Some(HerdrViewAction::Focus(1))
-        );
+        assert_eq!(sync.next(inputs(Some((2, Some(&t2), true)), &caches, false)), None);
+        assert_eq!(sync.next(inputs(None, &caches, false)), None);
+        assert_eq!(sync.next(inputs(active, &caches, false)), Some(HerdrViewAction::Focus(1)));
     }
 
     #[test]
@@ -676,9 +661,9 @@ mod tests {
         let mut sync = HerdrViewSync::default();
         sync.attached(1, None, Instant::now());
         let no_caches: Vec<herdr::EndpointCache> = Vec::new();
-        assert_eq!(sync.next(inputs(None, AttachMode::Session, &no_caches, false)), None);
+        assert_eq!(sync.next(inputs(None, &no_caches, false)), None);
         assert_eq!(
-            sync.next(inputs(Some((1, Some(&key), false)), AttachMode::Session, &no_caches, false)),
+            sync.next(inputs(Some((1, Some(&key), true)), &no_caches, false)),
             Some(HerdrViewAction::Focus(1))
         );
     }
@@ -695,24 +680,24 @@ mod tests {
         let mut sync = HerdrViewSync::default();
         let focused_at = Instant::now();
         sync.attached(1, None, focused_at);
-        let active = Some((1, Some(&key), false));
+        let active = Some((1, Some(&key), true));
         let caches = vec![herdr::EndpointCache::for_test(
             side.clone(),
             panes.clone(),
             focused_at + Duration::from_millis(1),
         )];
         assert!(matches!(
-            sync.next(inputs(active, AttachMode::Session, &caches, false)),
+            sync.next(inputs(active, &caches, false)),
             Some(HerdrViewAction::Follow(_))
         ));
-        assert_eq!(sync.next(inputs(active, AttachMode::Session, &caches, false)), None);
+        assert_eq!(sync.next(inputs(active, &caches, false)), None);
         let caches = vec![herdr::EndpointCache::for_test(
             side.clone(),
             panes.clone(),
             focused_at + Duration::from_millis(2),
         )];
         assert!(matches!(
-            sync.next(inputs(active, AttachMode::Session, &caches, false)),
+            sync.next(inputs(active, &caches, false)),
             Some(HerdrViewAction::Follow(_))
         ));
         sync.settled(1, false, focused_at + Duration::from_millis(3));
@@ -721,7 +706,7 @@ mod tests {
             panes.clone(),
             focused_at + Duration::from_millis(4),
         )];
-        assert_eq!(sync.next(inputs(active, AttachMode::Session, &caches, false)), None);
+        assert_eq!(sync.next(inputs(active, &caches, false)), None);
     }
 
     #[test]
@@ -735,52 +720,37 @@ mod tests {
             ]}}"#,
         );
         let mut sync = HerdrViewSync::default();
-        let active = Some((1, Some(&key), false));
+        let active = Some((1, Some(&key), true));
         let no_caches: Vec<herdr::EndpointCache> = Vec::new();
         let started = Instant::now();
-        assert_eq!(
-            sync.next(inputs(active, AttachMode::Agent, &no_caches, false)),
-            Some(HerdrViewAction::Focus(1))
-        );
-        assert_eq!(sync.next(inputs(active, AttachMode::Agent, &no_caches, true)), None);
+        assert_eq!(sync.next(inputs(active, &no_caches, false)), Some(HerdrViewAction::Focus(1)));
+        assert_eq!(sync.next(inputs(active, &no_caches, true)), None);
         let settled = started + Duration::from_millis(1);
         sync.settled(1, true, settled);
         let stale = vec![herdr::EndpointCache::for_test(side.clone(), panes.clone(), started)];
-        assert_eq!(sync.next(inputs(active, AttachMode::Agent, &stale, false)), None);
+        assert_eq!(sync.next(inputs(active, &stale, false)), None);
         let fresh_at = settled + Duration::from_millis(1);
         let foreign =
             vec![herdr::EndpointCache::for_test(other_side.clone(), panes.clone(), fresh_at)];
-        assert_eq!(sync.next(inputs(active, AttachMode::Agent, &foreign, false)), None);
+        assert_eq!(sync.next(inputs(active, &foreign, false)), None);
         let fresh = vec![herdr::EndpointCache::for_test(side.clone(), panes.clone(), fresh_at)];
-        assert_eq!(sync.next(inputs(active, AttachMode::Agent, &fresh, true)), None);
-        assert_eq!(
-            sync.next(inputs(Some((1, Some(&key), true)), AttachMode::Agent, &fresh, false)),
-            None
-        );
-        assert_eq!(
-            sync.next(inputs(active, AttachMode::Agent, &fresh, false)),
-            Some(HerdrViewAction::Focus(1))
-        );
+        assert_eq!(sync.next(inputs(active, &fresh, true)), None);
+        assert_eq!(sync.next(inputs(Some((2, None, false)), &fresh, false)), None);
+        assert_eq!(sync.next(inputs(active, &fresh, false)), Some(HerdrViewAction::Focus(1)));
     }
 
     #[test]
     fn herdr_focus_completion_cannot_restore_a_view_left_while_pending() {
         let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
-        let active = Some((1, Some(&key), false));
+        let active = Some((1, Some(&key), true));
         let mut sync = HerdrViewSync::default();
         let no_caches: Vec<herdr::EndpointCache> = Vec::new();
-        assert_eq!(
-            sync.next(inputs(active, AttachMode::Session, &no_caches, false)),
-            Some(HerdrViewAction::Focus(1))
-        );
-        assert_eq!(sync.next(inputs(None, AttachMode::Session, &no_caches, true)), None);
+        assert_eq!(sync.next(inputs(active, &no_caches, false)), Some(HerdrViewAction::Focus(1)));
+        assert_eq!(sync.next(inputs(None, &no_caches, true)), None);
         sync.settled(1, true, Instant::now());
-        assert_eq!(
-            sync.next(inputs(active, AttachMode::Session, &no_caches, false)),
-            Some(HerdrViewAction::Focus(1))
-        );
+        assert_eq!(sync.next(inputs(active, &no_caches, false)), Some(HerdrViewAction::Focus(1)));
         sync.settled(1, false, Instant::now());
-        assert_eq!(sync.next(inputs(active, AttachMode::Session, &no_caches, false)), None);
+        assert_eq!(sync.next(inputs(active, &no_caches, false)), None);
     }
 
     /// The setting governs whether herdr may move alacritree.  A shared view
@@ -790,7 +760,7 @@ mod tests {
         let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
         let caches: Vec<herdr::EndpointCache> = Vec::new();
         let mut sync = HerdrViewSync::default();
-        let mut off = inputs(Some((1, Some(&key), false)), AttachMode::Session, &caches, false);
+        let mut off = inputs(Some((1, Some(&key), true)), &caches, false);
         off.follow = FollowFocus::Off;
         assert_eq!(sync.next(off), Some(HerdrViewAction::Focus(1)));
     }
@@ -816,7 +786,7 @@ mod tests {
                 panes.clone(),
                 focused_at + Duration::from_millis(1),
             )];
-            let mut at = inputs(Some((1, Some(&t1), false)), AttachMode::Session, &caches, false);
+            let mut at = inputs(Some((1, Some(&t1), true)), &caches, false);
             at.follow = mode;
             assert_eq!(
                 sync.next(at),
@@ -845,45 +815,35 @@ mod tests {
             panes.clone(),
             focused_at + Duration::from_millis(1),
         )];
-        let mut off = inputs(Some((1, Some(&t1), false)), AttachMode::Session, &caches, false);
+        let mut off = inputs(Some((1, Some(&t1), true)), &caches, false);
         off.follow = FollowFocus::Off;
         assert_eq!(sync.next(off), None);
     }
 
-    /// A shared view shows whatever pane herdr has focused, so the one on
-    /// screen has to keep asking for its own.
+    /// Activating a row is what puts herdr on that row's pane, so every row
+    /// asks on the way in, on every side and whatever herdr was showing.
     #[test]
-    fn a_shared_view_asks_herdr_for_its_pane() {
-        let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
-        let asks = needs_view_focus(Some(&key), AttachMode::Agent, true, 1, None);
-        assert_eq!(asks, cfg!(windows));
+    fn every_row_holding_a_pane_asks_herdr_for_it() {
+        for side in [herdr::Side::Native, herdr::Side::Wsl("d".into())] {
+            let key = herdr::HerdrKey { side, terminal_id: "t1".into() };
+            assert!(needs_view_focus(Some(&key), 1, None));
+        }
     }
 
-    /// A direct attach is wired to one pane, so herdr's focus decides nothing
-    /// about what it draws.
+    /// A session running an ordinary shell holds no pane, so there is nothing
+    /// to point herdr at.
     #[test]
-    fn a_direct_attach_never_asks_herdr_for_its_pane() {
-        let key = herdr::HerdrKey { side: herdr::Side::Wsl("d".into()), terminal_id: "t1".into() };
-        assert!(!needs_view_focus(Some(&key), AttachMode::Agent, true, 1, None));
-        assert!(!needs_view_focus(None, AttachMode::Agent, true, 1, None));
+    fn a_session_holding_no_pane_never_asks() {
+        assert!(!needs_view_focus(None, 1, None));
     }
 
     /// The pane herdr was last pointed at is where it still is, and asking
     /// again every frame would spawn a herdr per frame.
     #[test]
-    fn a_shared_view_asks_once_per_switch() {
+    fn a_row_asks_once_per_switch() {
         let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
-        assert!(!needs_view_focus(Some(&key), AttachMode::Agent, true, 1, Some(1)));
-        let asks = needs_view_focus(Some(&key), AttachMode::Agent, true, 2, Some(1));
-        assert_eq!(asks, cfg!(windows));
-    }
-
-    /// A pane with no agent in it has no direct attach on any side, so its
-    /// session is a shared view and keeps asking for its own pane.
-    #[test]
-    fn an_agentless_pane_asks_herdr_for_its_pane_on_every_side() {
-        let key = herdr::HerdrKey { side: herdr::Side::Wsl("d".into()), terminal_id: "t1".into() };
-        assert!(needs_view_focus(Some(&key), AttachMode::Agent, false, 1, None));
+        assert!(!needs_view_focus(Some(&key), 1, Some(1)));
+        assert!(needs_view_focus(Some(&key), 2, Some(1)));
     }
 
     /// A pane a script created can arrive mid-command, and following moves

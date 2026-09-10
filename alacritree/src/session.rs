@@ -295,6 +295,12 @@ pub struct Session {
     pub herdr_key: Option<herdr::HerdrKey>,
     /// Inventories started before this binding cannot establish its absence.
     pub herdr_bound_at: Option<Instant>,
+    /// Whether this session shares the multiplexer's whole view rather than
+    /// drawing one pane of its own.  Settled when the attach chose its client
+    /// and recorded rather than recomputed, because a pane that gains or
+    /// loses an agent afterwards does not change what the running client
+    /// draws.
+    pub herdr_shared_view: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1260,16 +1266,18 @@ pub fn open(request: OpenRequest) -> std::io::Result<Attachment> {
 }
 
 impl Session {
-    pub fn bind_herdr(&mut self, key: herdr::HerdrKey) {
+    pub fn bind_herdr(&mut self, key: herdr::HerdrKey, shared_view: bool) {
         let bound_at = Instant::now();
         log::debug!(
-            "herdr binding session={} side={:?} terminal_id={} bound_at={:?}",
+            "herdr binding session={} side={:?} terminal_id={} shared_view={} bound_at={:?}",
             self.id,
             key.side,
             key.terminal_id,
+            shared_view,
             bound_at
         );
         self.herdr_bound_at = Some(bound_at);
+        self.herdr_shared_view = shared_view;
         self.herdr_key = Some(key);
     }
 
@@ -1309,6 +1317,7 @@ impl Session {
             exit_status: None,
             herdr_key: None,
             herdr_bound_at: None,
+            herdr_shared_view: false,
         })
     }
 
@@ -1483,6 +1492,7 @@ impl Session {
             exit_status: None,
             herdr_key: None,
             herdr_bound_at: None,
+            herdr_shared_view: false,
         };
 
         let request = OpenRequest {
@@ -2311,6 +2321,7 @@ mod tests {
             exit_status: None,
             herdr_key: None,
             herdr_bound_at: None,
+            herdr_shared_view: false,
         }
     }
 

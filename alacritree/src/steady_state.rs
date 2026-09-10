@@ -194,7 +194,7 @@ mod tests {
     fn a_mode_that_ignores_the_trail_allocates_nothing() {
         use std::time::Instant;
 
-        use crate::config::{AttachMode, FollowFocus};
+        use crate::config::FollowFocus;
         use crate::herdr;
 
         let panes = herdr::Listing::Panes.parse(
@@ -210,7 +210,6 @@ mod tests {
             let (action, counts) = measure(|| {
                 sync.next(herdr::ViewInputs {
                     active: Some((1, None, false)),
-                    attach: AttachMode::Session,
                     follow,
                     caches: &caches,
                     attentive: true,
