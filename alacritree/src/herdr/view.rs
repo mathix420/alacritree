@@ -157,11 +157,11 @@ impl HerdrViewSync {
     /// a deliberate tiebreak would be inventing a rule nobody can observe,
     /// and the other side's change is still a change on the next frame.
     fn trail_edge(&mut self, inputs: &ViewInputs<'_>) -> Option<HerdrKey> {
-        let live: Vec<&Side> = inputs.caches.iter().map(EndpointCache::side).collect();
-        self.trail.retain(|side, _| live.contains(&side));
         // A pending targeting a side that just vanished would follow to an
         // unreachable pane; its trail entry is gone the same way.
-        if self.pending.as_ref().is_some_and(|pending| !live.contains(&&pending.key.side)) {
+        let live = |side: &Side| inputs.caches.iter().any(|cache| cache.side() == side);
+        self.trail.retain(|side, _| live(side));
+        if self.pending.as_ref().is_some_and(|pending| !live(&pending.key.side)) {
             self.pending = None;
         }
         let active_key = inputs.active.and_then(|(_, key, _)| key);
@@ -231,20 +231,24 @@ impl HerdrViewSync {
         if inputs.busy || !inputs.attentive {
             return None;
         }
+        // The trail serves `always` alone, and the mode is read once at
+        // startup, so nothing recorded here in another mode could ever be
+        // wanted later.  A user who did not opt in pays for none of it.
+        if inputs.follow != FollowFocus::Always {
+            return None;
+        }
         if let Some(edge) = self.trail_edge(&inputs) {
             self.propose(edge, &inputs);
         }
         self.deliver(&inputs, elapsed)
     }
 
-    /// Attentive time since the previous frame.  Counted on every call so a
-    /// busy or inattentive stretch is skipped rather than back-charged to the
-    /// pending follow on the frame after it.
+    /// Attentive time since the previous frame.  The baseline is replaced on
+    /// every call, including the busy and inattentive frames that return
+    /// before `deliver`, so the stretch they cover is charged to a frame that
+    /// discards it rather than to the pending follow afterwards.
     fn tick(&mut self, inputs: &ViewInputs<'_>) -> Duration {
         let previous = self.ticked_at.replace(inputs.now);
-        if inputs.busy || !inputs.attentive {
-            return Duration::ZERO;
-        }
         previous.map_or(Duration::ZERO, |previous| inputs.now.saturating_duration_since(previous))
     }
 
@@ -267,10 +271,6 @@ impl HerdrViewSync {
     }
 
     fn deliver(&mut self, inputs: &ViewInputs<'_>, elapsed: Duration) -> Option<HerdrViewAction> {
-        if inputs.follow != FollowFocus::Always {
-            self.pending = None;
-            return None;
-        }
         let active = inputs.active.map(|(id, ..)| id);
         // The proposal was made against a situation that no longer holds.
         if self.pending.as_ref().is_some_and(|pending| pending.active != active) {
@@ -446,22 +446,30 @@ mod tests {
         );
     }
 
-    /// The default mode is what ships, and it must stay blind to a change
-    /// made while a native session is active.
+    /// The modes that ship must stay blind to a change made while a native
+    /// session is active, right through the gap where `always` would follow.
     #[test]
-    fn the_default_mode_ignores_the_trail() {
-        let side = herdr::Side::Native;
-        let start = Instant::now();
-        let first = one_focused(&side, "t1", start);
-        let mut sync = HerdrViewSync::default();
-        let mut inputs = always(Some((1, None, false)), &first, start);
-        inputs.follow = FollowFocus::Herdr;
-        assert_eq!(sync.next(inputs), None);
-        let later = start + Duration::from_millis(1);
-        let second = one_focused(&side, "t2", later);
-        let mut inputs = always(Some((1, None, false)), &second, later);
-        inputs.follow = FollowFocus::Herdr;
-        assert_eq!(sync.next(inputs), None);
+    fn the_modes_that_are_not_always_ignore_the_trail() {
+        for mode in [FollowFocus::Herdr, FollowFocus::Off] {
+            let side = herdr::Side::Native;
+            let start = Instant::now();
+            let first = one_focused(&side, "t1", start);
+            let mut sync = HerdrViewSync::default();
+            let mut inputs = always(Some((1, None, false)), &first, start);
+            inputs.follow = mode;
+            assert_eq!(sync.next(inputs), None);
+
+            let later = start + Duration::from_millis(1);
+            let second = one_focused(&side, "t2", later);
+            let mut inputs = always(Some((1, None, false)), &second, later);
+            inputs.follow = mode;
+            assert_eq!(sync.next(inputs), None);
+
+            let quiet = later + FOLLOW_QUIET_GAP + Duration::from_millis(1);
+            let mut inputs = always(Some((1, None, false)), &second, quiet);
+            inputs.follow = mode;
+            assert_eq!(sync.next(inputs), None, "mode {mode:?} followed a change from the trail");
+        }
     }
 
     /// A change the user is already looking at is not somewhere to go.

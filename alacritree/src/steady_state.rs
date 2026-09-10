@@ -1,10 +1,10 @@
-//! Cost gate for the sidebar reconciler's per-frame path.
+//! Cost gate for the paths that run on every frame.
 //!
-//! The reconciler runs on every frame with no setting that disables it, so
-//! "an unchanged frame allocates nothing" is a property the app depends on
-//! rather than a target to aim at.  A counting allocator is the only way to
-//! observe it: a timing threshold on a shared runner is either flaky or too
-//! loose to detect anything.
+//! They run whatever the user is doing, and the sidebar reconciler runs with
+//! no setting that disables it at all, so "an unchanged frame allocates
+//! nothing" is a property the app depends on rather than a target to aim at.
+//! A counting allocator is the only way to observe it: a timing threshold on
+//! a shared runner is either flaky or too loose to detect anything.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -186,6 +186,47 @@ mod tests {
             "a frame with no PTY opening allocated {} times ({} bytes) polling for one",
             counts.allocs, counts.bytes
         );
+    }
+
+    /// Every mode but `always` discards whatever the trail records, and the
+    /// mode is read once at startup, so those users must pay nothing for it.
+    #[test]
+    fn a_mode_that_ignores_the_trail_allocates_nothing() {
+        use std::time::Instant;
+
+        use crate::config::{AttachMode, FollowFocus};
+        use crate::herdr;
+
+        let panes = herdr::Listing::Panes.parse(
+            r#"{"result":{"panes":[
+                {"terminal_id":"t1","pane_id":"w1:p1","tab_id":"w1:t1","focused":true}
+            ]}}"#,
+        );
+        let caches =
+            vec![herdr::EndpointCache::for_test(herdr::Side::Native, panes, Instant::now())];
+
+        for follow in [FollowFocus::Herdr, FollowFocus::Off] {
+            let mut sync = herdr::HerdrViewSync::default();
+            let (action, counts) = measure(|| {
+                sync.next(herdr::ViewInputs {
+                    active: Some((1, None, false)),
+                    attach: AttachMode::Session,
+                    follow,
+                    caches: &caches,
+                    attentive: true,
+                    busy: false,
+                    now: Instant::now(),
+                    last_direct_input: None,
+                })
+            });
+
+            assert!(action.is_none(), "mode {follow:?} acted on the trail");
+            assert_eq!(
+                counts.allocs, 0,
+                "mode {follow:?} allocated {} times ({} bytes) recording a trail it discards",
+                counts.allocs, counts.bytes
+            );
+        }
     }
 
     #[test]
