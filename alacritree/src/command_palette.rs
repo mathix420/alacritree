@@ -99,6 +99,7 @@ fn section_of(a: NamedAction) -> PaletteSection {
         ClearHistory => Scrollback,
         SpawnNewInstance | SpawnProfile(_) | CloseSession | CloseExitedSession
         | NewMultiplexerPane => Sessions,
+        AttachAllMultiplexerPanes | DetachAllMultiplexerPanes => Sessions,
         SelectNextTab | SelectPreviousTab | SelectTab(_) | SelectLastTab => Sessions,
         SelectNextSession | SelectPreviousSession => Sessions,
         ToggleSessionRows | ToggleSessionTabs | ToggleSessionDrag => Sessions,
@@ -514,6 +515,16 @@ mod tests {
         let row = find(&items, "NewMultiplexerPane").expect("NewMultiplexerPane missing");
         assert_eq!(row.section, PaletteSection::Sessions);
         assert!(row.keys.is_empty(), "NewMultiplexerPane ships with no default key");
+    }
+
+    #[test]
+    fn palette_lists_the_whole_set_multiplexer_actions_among_sessions() {
+        let items = action_items(&parse_bindings(vec![]));
+        for name in ["AttachAllMultiplexerPanes", "DetachAllMultiplexerPanes"] {
+            let row = find(&items, name).unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(row.section, PaletteSection::Sessions);
+            assert!(row.keys.is_empty(), "{name} ships with no default key");
+        }
     }
 
     #[test]

@@ -81,6 +81,8 @@
                 "CloseSession",
                 "CloseExitedSession",
                 "NewMultiplexerPane",
+                "AttachAllMultiplexerPanes",
+                "DetachAllMultiplexerPanes",
                 "SidebarTop",
                 "SidebarBottom",
                 "SidebarNextProject",

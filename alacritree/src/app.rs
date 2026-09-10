@@ -674,6 +674,11 @@ pub struct AlacritreeApp {
     /// by drop would race the pool for nothing.  Drained once a frame.
     detached_jobs: Vec<jobs::Job<()>>,
     pending_session_close: Option<SessionId>,
+    /// The sessions a whole-set detach is waiting to be confirmed for.  The
+    /// set is fixed when the question is asked, so the dialog detaches what
+    /// it counted rather than whatever is attached by the time it is
+    /// answered.
+    pending_detach_all: Option<Vec<SessionId>>,
     notify_rx: Receiver<SessionId>,
     /// Requests from IPC connection threads, drained once per frame.
     ipc_rx: Option<Receiver<ipc::AppCall>>,
@@ -1026,6 +1031,7 @@ impl AlacritreeApp {
             doppler_synced: HashSet::new(),
             detached_jobs: Vec::new(),
             pending_session_close: None,
+            pending_detach_all: None,
             notify_rx,
             ipc_rx,
             _ipc_socket: ipc_socket,
@@ -1634,6 +1640,68 @@ impl AlacritreeApp {
         let Some(waiter) = waiter else { return };
         if let Some(waiter) = self.pending_spawns.watch(id, waiter) {
             let _ = waiter.send(Ok(json!({ "session_id": id })));
+        }
+    }
+
+    /// Open a session on every listed pane no session holds yet.  The listing
+    /// is the one the sidebar and the palette both draw, so this opens exactly
+    /// the rows the user could have opened one at a time.
+    ///
+    /// The batch was asked for the whole set rather than for one pane, so it
+    /// leaves the user where it found them: each session files under the
+    /// workspace its own pane belongs to, and `previous` stays the workspace
+    /// on screen, which is where a refusal landing frames later hands back to.
+    fn attach_every_multiplexer_pane(&mut self, ctx: &Context) {
+        if !self.config.integrations.herdr.enabled {
+            self.error_dialog = Some(HERDR_DISABLED.to_string());
+            return;
+        }
+        let panes: Vec<(herdr::HerdrKey, String, WorkspaceKey)> = self
+            .herdr_agent_listing()
+            .into_iter()
+            .map(|(workspace, side, agent)| {
+                let key =
+                    herdr::HerdrKey { side: side.clone(), terminal_id: agent.terminal_id.clone() };
+                (key, agent.pane_id.clone(), workspace)
+            })
+            .collect();
+        let previous = self.current_workspace.clone();
+        for (key, pane_id, workspace) in panes {
+            self.attach_herdr_agent(ctx, key, &pane_id, workspace, previous.clone(), None);
+        }
+    }
+
+    /// End every session attached to a multiplexer pane.  The panes keep
+    /// running and their rows come back unattached, so this destroys nothing.
+    fn detach_every_multiplexer_pane(&mut self, ctx: &Context) {
+        if !self.config.integrations.herdr.enabled {
+            self.error_dialog = Some(HERDR_DISABLED.to_string());
+            return;
+        }
+        let ids = self.multiplexer_session_ids();
+        if ids.is_empty() {
+            return;
+        }
+        // `confirm_session_detach` governs one detach, and asking it per
+        // session would put the same dialog in front of the user once per
+        // row; the batch is one gesture and asks once.
+        if self.config.ui.confirm_session_detach {
+            self.pending_detach_all = Some(ids);
+        } else {
+            self.detach_sessions(ctx, &ids);
+        }
+    }
+
+    /// Every session holding a multiplexer pane, as ids: closing mutates
+    /// `self.sessions`, so the set a detach acts on has to be taken before
+    /// the first close rather than walked as it shrinks.
+    fn multiplexer_session_ids(&self) -> Vec<SessionId> {
+        self.sessions.iter().filter(|s| s.herdr_key.is_some()).map(|s| s.id).collect()
+    }
+
+    fn detach_sessions(&mut self, ctx: &Context, ids: &[SessionId]) {
+        for id in ids {
+            self.close_session(ctx, *id);
         }
     }
 
@@ -2880,6 +2948,7 @@ impl AlacritreeApp {
             || self.pending_delete.is_some()
             || self.pending_create.is_some()
             || self.pending_session_close.is_some()
+            || self.pending_detach_all.is_some()
             || self.pending_rename.is_some()
             || self.pending_base_branch.is_some()
             || self.pending_project_remove.is_some()
@@ -3883,6 +3952,12 @@ impl AlacritreeApp {
                         Err(e) => self.error_dialog = Some(e),
                     }
                 }
+            },
+            BindingAction::Named(NamedAction::AttachAllMultiplexerPanes) => {
+                self.attach_every_multiplexer_pane(ctx);
+            },
+            BindingAction::Named(NamedAction::DetachAllMultiplexerPanes) => {
+                self.detach_every_multiplexer_pane(ctx);
             },
             BindingAction::Named(NamedAction::SelectNextWorkspace) => {
                 self.cycle_workspaces(ctx, 1);
@@ -10191,6 +10266,62 @@ impl AlacritreeApp {
         }
     }
 
+    /// The one question a whole-set detach asks.  Every session in the set is
+    /// managed, so the busy warning a close carries has nothing to warn
+    /// about: the panes keep running and their rows come back.
+    fn show_detach_all_dialog(&mut self, ctx: &Context) {
+        let theme = self.theme;
+        let Some(ids) = self.pending_detach_all.clone() else {
+            return;
+        };
+        let count = ids.len();
+        let title = format!(
+            "Detach from {count} multiplexer {}?",
+            if count == 1 { "pane" } else { "panes" }
+        );
+
+        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let frame = modal_frame(&theme);
+        let mut confirmed = false;
+        let mut cancelled = false;
+
+        let s = theme.ui_scale;
+        let modal = egui::Modal::new(egui::Id::new("alacritree_detach_all_dialog"))
+            .frame(frame)
+            .show(ctx, |ui| {
+                ui.set_width(320.0 * s);
+                ui.spacing_mut().item_spacing.y = 6.0 * s;
+                ui.label(RichText::new(title).color(theme.text).strong());
+                ui.add_space(4.0 * s);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Enter to detach · Esc to cancel")
+                            .color(theme.text_muted)
+                            .small(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let detach_btn = modal_button(ui, &theme, "Detach", theme.text);
+                        if detach_btn.clicked() {
+                            confirmed = true;
+                        }
+                        if modal_button(ui, &theme, "Cancel", theme.text_dim).clicked() {
+                            cancelled = true;
+                        }
+                        focus_default(ui.ctx(), detach_btn.id);
+                    });
+                });
+            });
+
+        if confirm_via_key || confirmed {
+            self.pending_detach_all = None;
+            self.detach_sessions(ctx, &ids);
+            return;
+        }
+        if cancel_via_key || cancelled || modal.should_close() {
+            self.pending_detach_all = None;
+        }
+    }
+
     fn show_remove_project_dialog(&mut self, ctx: &Context) {
         let theme = self.theme;
         let danger = rgb_to_color32(self.config.palette.normal[1]);
@@ -12192,6 +12323,9 @@ impl eframe::App for AlacritreeApp {
         if self.pending_session_close.is_some() {
             self.show_close_session_dialog(ctx);
         }
+        if self.pending_detach_all.is_some() {
+            self.show_detach_all_dialog(ctx);
+        }
         if self.pending_rename.is_some() {
             self.show_rename_dialog(ctx);
         }
@@ -13321,6 +13455,140 @@ mod tests {
 
         assert!(!opened);
         assert_eq!(reply_rx.try_recv().unwrap(), Err("failed to attach the pane".to_string()));
+    }
+
+    /// A pane a session already holds is not a second session's to open, or
+    /// a batch attach would double every row it ran on.
+    #[test]
+    fn attaching_every_pane_skips_the_ones_already_attached() {
+        let mut app = herdr_lifecycle_app();
+        // The mode every side shares a view under, so each pane queues a
+        // gesture rather than opening a PTY of its own.
+        app.config.integrations.herdr.attach = AttachMode::Session;
+        let side = herdr::Side::Native;
+        adopt_herdr_fixture(
+            &mut app,
+            side.clone(),
+            r#"{"result":{"panes":[
+                {"terminal_id":"term-held","pane_id":"w1:p1","agent":"claude","agent_status":"working","cwd":"/repo"},
+                {"terminal_id":"term-loose","pane_id":"w1:p2","agent":"claude","agent_status":"working","cwd":"/repo"}
+            ]}}"#,
+            Instant::now(),
+        );
+        let held = bind_herdr_fixture(&mut app, side.clone(), "term-held");
+
+        app.attach_every_multiplexer_pane(&Context::default());
+
+        let queued: Vec<&str> = app
+            .pending_herdr_attach
+            .iter()
+            .map(|pending| pending.key.terminal_id.as_str())
+            .collect();
+        assert_eq!(queued, ["term-loose"]);
+        let key = herdr::HerdrKey { side, terminal_id: "term-held".into() };
+        assert_eq!(app.herdr_session_for(&key), Some(held));
+        assert_eq!(app.sessions.len(), 1, "the held pane opened no second session");
+    }
+
+    /// The batch was asked for the whole set rather than for one pane, so it
+    /// files each session under its own pane's workspace without carrying the
+    /// user along, and a refusal landing frames later hands them back to the
+    /// workspace they are still on.
+    #[test]
+    fn attaching_every_pane_leaves_the_user_where_the_batch_was_asked_from() {
+        let mut app = herdr_lifecycle_app();
+        app.config.integrations.herdr.attach = AttachMode::Session;
+        adopt_herdr_fixture(
+            &mut app,
+            herdr::Side::Native,
+            r#"{"result":{"panes":[
+                {"terminal_id":"term-loose","pane_id":"w1:p1","agent":"claude","agent_status":"working","cwd":"/repo"}
+            ]}}"#,
+            Instant::now(),
+        );
+        let asked_from = app.current_workspace.clone();
+
+        app.attach_every_multiplexer_pane(&Context::default());
+
+        let pending = app.pending_herdr_attach.first().expect("the loose pane queued an attach");
+        assert_eq!(pending.workspace, None, "an unmatched pane files under Home");
+        assert_eq!(pending.previous, asked_from);
+        assert_eq!(app.current_workspace, asked_from);
+    }
+
+    /// An empty listing is not a failure: a machine with no herdr running
+    /// must not put a dialog in front of the user for pressing a key.
+    #[test]
+    fn attaching_every_pane_with_no_panes_detected_reports_nothing() {
+        let mut app = test_app();
+        assert!(app.config.integrations.herdr.enabled, "else the gate explains the silence");
+
+        app.attach_every_multiplexer_pane(&Context::default());
+
+        assert!(app.error_dialog.is_none());
+        assert!(app.pending_herdr_attach.is_empty());
+        assert_eq!(app.sessions.len(), 1);
+    }
+
+    /// Closing walks the same list it mutates, so the ids have to be taken
+    /// before the first close or the walk steps over its own removals.
+    #[test]
+    fn detaching_every_pane_ends_every_herdr_session_and_no_other() {
+        let mut app = test_app();
+        app.config.ui.confirm_session_detach = false;
+        let shell = app.sessions.first().expect("a session").id;
+        let side = herdr::Side::Native;
+        bind_herdr_fixture(&mut app, side.clone(), "term-one");
+        bind_herdr_fixture(&mut app, side, "term-two");
+
+        app.detach_every_multiplexer_pane(&Context::default());
+
+        assert_eq!(app.sessions.iter().map(|session| session.id).collect::<Vec<_>>(), [shell]);
+    }
+
+    /// One question for the batch: asking per session would put the same
+    /// dialog in front of the user once per row, and nothing ends until it
+    /// is answered.
+    #[test]
+    fn detaching_every_pane_asks_once_for_the_whole_batch() {
+        let mut app = test_app();
+        assert!(app.config.ui.confirm_session_detach, "the default is to ask");
+        let side = herdr::Side::Native;
+        bind_herdr_fixture(&mut app, side.clone(), "term-one");
+        bind_herdr_fixture(&mut app, side, "term-two");
+
+        app.detach_every_multiplexer_pane(&Context::default());
+
+        assert_eq!(app.pending_detach_all.as_deref().map(<[SessionId]>::len), Some(2));
+        assert_eq!(app.sessions.len(), 3);
+    }
+
+    /// A disabled integration is why the whole-set actions found nothing, and
+    /// silence there reads as a broken key rather than as a config the user
+    /// can change.
+    #[test]
+    fn dispatching_the_whole_set_actions_while_disabled_names_the_integration() {
+        let mut app = test_app();
+        app.config.integrations.herdr.enabled = false;
+        bind_herdr_fixture(&mut app, herdr::Side::Native, "term-one");
+
+        app.dispatch_action(
+            &Context::default(),
+            BindingAction::Named(NamedAction::AttachAllMultiplexerPanes),
+            ActionOrigin::Keyboard,
+        );
+        assert_eq!(app.error_dialog.as_deref(), Some(HERDR_DISABLED));
+        assert!(app.pending_herdr_attach.is_empty());
+
+        app.error_dialog = None;
+        app.dispatch_action(
+            &Context::default(),
+            BindingAction::Named(NamedAction::DetachAllMultiplexerPanes),
+            ActionOrigin::Keyboard,
+        );
+        assert_eq!(app.error_dialog.as_deref(), Some(HERDR_DISABLED));
+        assert!(app.pending_detach_all.is_none());
+        assert_eq!(app.sessions.len(), 2, "a refused detach ends nothing");
     }
 
     /// herdr reporting an agent in a pane says nothing about what the client
