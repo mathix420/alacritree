@@ -97,7 +97,8 @@ fn section_of(a: NamedAction) -> PaletteSection {
         ScrollPageUp | ScrollPageDown | ScrollHalfPageUp | ScrollHalfPageDown => Scrollback,
         ScrollLineUp | ScrollLineDown | ScrollToTop | ScrollToBottom => Scrollback,
         ClearHistory => Scrollback,
-        SpawnNewInstance | SpawnProfile(_) | CloseSession | CloseExitedSession => Sessions,
+        SpawnNewInstance | SpawnProfile(_) | CloseSession | CloseExitedSession
+        | NewMultiplexerPane => Sessions,
         SelectNextTab | SelectPreviousTab | SelectTab(_) | SelectLastTab => Sessions,
         SelectNextSession | SelectPreviousSession => Sessions,
         ToggleSessionRows | ToggleSessionTabs | ToggleSessionDrag => Sessions,
@@ -505,6 +506,14 @@ mod tests {
         // FocusTerminal has no default binding: present, discoverable, keyless.
         let focus = find(&items, "FocusTerminal").expect("FocusTerminal missing");
         assert!(focus.keys.is_empty());
+    }
+
+    #[test]
+    fn palette_lists_the_new_multiplexer_pane_action_among_sessions() {
+        let items = action_items(&parse_bindings(vec![]));
+        let row = find(&items, "NewMultiplexerPane").expect("NewMultiplexerPane missing");
+        assert_eq!(row.section, PaletteSection::Sessions);
+        assert!(row.keys.is_empty(), "NewMultiplexerPane ships with no default key");
     }
 
     #[test]

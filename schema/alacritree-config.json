@@ -80,6 +80,7 @@
                 "ToggleSidebarFocus",
                 "CloseSession",
                 "CloseExitedSession",
+                "NewMultiplexerPane",
                 "SidebarTop",
                 "SidebarBottom",
                 "SidebarNextProject",

@@ -3871,6 +3871,15 @@ impl AlacritreeApp {
             BindingAction::Named(NamedAction::ToggleDetachedSessionsFilter) => {
                 self.sessions_filter_counts_detached = !self.sessions_filter_counts_detached;
             },
+            BindingAction::Named(NamedAction::NewMultiplexerPane) => {
+                match self.default_multiplexer_side() {
+                    Ok(side) => {
+                        let workspace = self.current_workspace.clone();
+                        self.create_multiplexer_pane(ctx, side, workspace, None);
+                    },
+                    Err(e) => self.error_dialog = Some(e),
+                }
+            },
             BindingAction::Named(NamedAction::SelectNextWorkspace) => {
                 self.cycle_workspaces(ctx, 1);
             },
@@ -12670,6 +12679,26 @@ mod tests {
             reply_rx.try_recv().unwrap(),
             Err("no herdr session is focused and native and wsl:ubuntu are answering; name one"
                 .to_string())
+        );
+        assert!(app.pending_herdr_create.is_empty(), "an unresolved side still asked herdr");
+    }
+
+    /// A key or palette gesture carries no side to name, so a request with
+    /// nowhere to land must still tell the user rather than doing nothing.
+    /// A key press that resolves to nothing looks like a broken binding.
+    #[test]
+    fn dispatching_new_multiplexer_pane_with_no_herdr_server_shows_an_error_dialog() {
+        let mut app = test_app();
+
+        app.dispatch_action(
+            &Context::default(),
+            BindingAction::Named(NamedAction::NewMultiplexerPane),
+            ActionOrigin::Keyboard,
+        );
+
+        assert_eq!(
+            app.error_dialog.as_deref(),
+            Some("no herdr server is answering; start one, or name a side")
         );
         assert!(app.pending_herdr_create.is_empty(), "an unresolved side still asked herdr");
     }

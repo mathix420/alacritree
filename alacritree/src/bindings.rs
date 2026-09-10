@@ -171,6 +171,9 @@ pub enum NamedAction {
     /// `ToggleSessionRows`: it flips a preference rather than a panel toggle,
     /// so it is not scoped to the sidebar owning focus.
     ToggleDetachedSessionsFilter,
+    /// Open a new pane in the multiplexer and a session on it, in the focused
+    /// workspace and on the side the focused session's own pane belongs to.
+    NewMultiplexerPane,
     /// Narrow the projects sidebar to workspaces whose session wants attention.
     ToggleAttentionFilter,
     /// PR-state filters.  One dimension: the active states union, and the
@@ -358,6 +361,7 @@ impl NamedAction {
             Self::ToggleSidebarFocus => "Toggle keyboard focus between terminal and sidebar".into(),
             Self::CloseSession => "Close the cursored or active session".into(),
             Self::CloseExitedSession => "Close the session on screen once its child exited".into(),
+            Self::NewMultiplexerPane => "Open a new multiplexer pane and a session on it".into(),
             Self::SidebarTop => "Move the sidebar cursor to the first row".into(),
             Self::SidebarBottom => "Move the sidebar cursor to the last row".into(),
             Self::SidebarNextProject => "Jump the sidebar cursor to the next project".into(),
@@ -999,7 +1003,7 @@ fn parse_mods(s: &str) -> Option<Modifiers> {
 /// Every simple (non-parametrized) `NamedAction`, kept in sync with the enum by
 /// hand. Mirrors the old shortcuts window's bindable list; `SelectTab`/
 /// `SpawnProfile` are excluded here because they carry an index.
-pub fn bindable_actions() -> [NamedAction; 68] {
+pub fn bindable_actions() -> [NamedAction; 69] {
     use NamedAction::*;
     [
         Paste,
@@ -1036,6 +1040,7 @@ pub fn bindable_actions() -> [NamedAction; 68] {
         ToggleSidebarFocus,
         CloseSession,
         CloseExitedSession,
+        NewMultiplexerPane,
         SidebarTop,
         SidebarBottom,
         SidebarNextProject,
@@ -1145,6 +1150,7 @@ pub fn parse_action(name: &str) -> BindingAction {
         "ToggleSidebarFocus" => BindingAction::Named(ToggleSidebarFocus),
         "CloseSession" => BindingAction::Named(CloseSession),
         "CloseExitedSession" => BindingAction::Named(CloseExitedSession),
+        "NewMultiplexerPane" => BindingAction::Named(NewMultiplexerPane),
         "SidebarTop" => BindingAction::Named(SidebarTop),
         "SidebarBottom" => BindingAction::Named(SidebarBottom),
         "SidebarNextProject" => BindingAction::Named(SidebarNextProject),
@@ -1911,6 +1917,7 @@ mod tests {
         all.push(NamedAction::ToggleSearchScope);
         all.push(NamedAction::RefreshPrStatus);
         all.push(NamedAction::CloseExitedSession);
+        all.push(NamedAction::NewMultiplexerPane);
         for a in all {
             let name = a.config_name();
             assert!(
