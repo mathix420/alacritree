@@ -108,14 +108,15 @@ pub struct Launch {
     pub argv: Vec<String>,
 }
 
-/// A pane a multiplexer has just made.  Both ids come back because the two
-/// answer different questions: `terminal_id` is the identity a session is
+/// A pane a multiplexer has just made.  Every id comes back because each
+/// answers a different question: `terminal_id` is the identity a session is
 /// keyed on and survives the pane moving, `pane_id` is what an attach is
-/// pointed at.
+/// pointed at, and `tab_id` is how a pane with no agent in it is reached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedPane {
     pub terminal_id: String,
     pub pane_id: String,
+    pub tab_id: String,
 }
 
 /// What a multiplexer answers so alacritree can host one of its panes.

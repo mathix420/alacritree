@@ -1570,12 +1570,13 @@ impl AlacritreeApp {
     /// `current_workspace` to `workspace` first and restore it on failure —
     /// the same replace-and-restore shape `spawn_shell_request` uses, needed
     /// here for the same reason: a refusal is only readable in the
-    /// workspace it happened in.
+    /// workspace it happened in.  `unlisted` stands in for a pane the
+    /// listing does not carry.
     fn attach_herdr_agent(
         &mut self,
         ctx: &Context,
         key: herdr::HerdrKey,
-        pane_id: &str,
+        unlisted: PaneTarget,
         workspace: WorkspaceKey,
         previous: WorkspaceKey,
         waiter: Option<mpsc::Sender<ipc::IpcResult>>,
@@ -1589,13 +1590,15 @@ impl AlacritreeApp {
         }
         let target = self
             .find_herdr_agent(&key.side, &key.terminal_id)
-            .map_or_else(|| unlisted_pane_target(&key, pane_id), |agent| agent.target(&key.side));
+            .map_or(unlisted, |agent| agent.target(&key.side));
         let multiplexer = Multiplexer::owning(&key);
         let attach = self.config.integrations.herdr.attach;
         if let Some(launch) = multiplexer.open_multiplexer_session(&target, attach) {
             // Nothing to ask herdr first: the pane id is the whole target,
             // and the client attaches to it directly.
-            return match self.open_herdr_session(ctx, key, workspace, launch.program, launch.argv) {
+            let opened =
+                self.open_herdr_session(ctx, key, workspace, launch.program, launch.argv, false);
+            return match opened {
                 Some(id) => {
                     self.park_attach_reply(id, waiter);
                     true
@@ -1669,7 +1672,8 @@ impl AlacritreeApp {
             // both arms of the restore no-ops, so a refusal cannot move a
             // user who navigated while the gesture was still running.
             let previous = workspace.clone();
-            self.attach_herdr_agent(ctx, key, &pane_id, workspace, previous, None);
+            let unlisted = unlisted_pane_target(&key, &pane_id);
+            self.attach_herdr_agent(ctx, key, unlisted, workspace, previous, None);
         }
     }
 
@@ -1740,13 +1744,22 @@ impl AlacritreeApp {
         let pending = self.pending_herdr_create.remove(0);
         match pending.job.poll() {
             Some(Ok(pane)) => {
+                // `tab create` starts a shell, so nothing is in the pane for
+                // herdr's agent registry to resolve until an agent starts
+                // there, and until then the tab is its only handle.
+                let unlisted = PaneTarget {
+                    side: pending.side.clone(),
+                    pane_id: pane.pane_id,
+                    tab_id: Some(pane.tab_id),
+                    has_agent: false,
+                };
                 let key = herdr::HerdrKey { side: pending.side, terminal_id: pane.terminal_id };
                 let previous =
                     std::mem::replace(&mut self.current_workspace, pending.workspace.clone());
                 if !self.attach_herdr_agent(
                     ctx,
                     key,
-                    &pane.pane_id,
+                    unlisted,
                     pending.workspace,
                     previous.clone(),
                     pending.waiter,
@@ -1802,6 +1815,7 @@ impl AlacritreeApp {
                         pending.workspace,
                         launch.program,
                         launch.argv,
+                        true,
                     ) {
                         Some(id) => {
                             for waiter in waiters {
@@ -1859,6 +1873,10 @@ impl AlacritreeApp {
     /// Open the session that runs an attach client.  A shared view starts on
     /// the pane the gesture just focused, so herdr is already where the new
     /// session's row says it is and no second focus is owed.
+    ///
+    /// `shared_view` is the caller's to say, since it chose the client: the
+    /// listing may no longer say what it said then, or may not carry the pane
+    /// at all.
     fn open_herdr_session(
         &mut self,
         ctx: &Context,
@@ -1866,8 +1884,8 @@ impl AlacritreeApp {
         workspace: WorkspaceKey,
         program: String,
         argv: Vec<String>,
+        shared_view: bool,
     ) -> Option<SessionId> {
-        let shared_view = !self.herdr_attaches_directly(&key);
         // `alacritty_terminal::tty::Shell`'s fields are crate-private, so
         // this goes through the constructor rather than a struct literal.
         let shell = Shell::new(program, argv);
@@ -2012,7 +2030,8 @@ impl AlacritreeApp {
             return Some(id);
         }
         let workspace = self.herdr_row_workspace(&key.side, &key.terminal_id)?;
-        let (program, argv) = if self.herdr_attaches_directly(key) {
+        let shared_view = !self.herdr_attaches_directly(key);
+        let (program, argv) = if !shared_view {
             let agent = self.find_herdr_agent(&key.side, &key.terminal_id)?;
             let attach = self.config.integrations.herdr.attach;
             // The branch already asked the question the multiplexer answers
@@ -2025,7 +2044,7 @@ impl AlacritreeApp {
             let name = self.herdr_session_name(&key.side)?;
             key.side.command(herdr::PROGRAM, &["session", "attach", &name])
         };
-        self.open_herdr_session(ctx, key.clone(), workspace, program, argv)?;
+        self.open_herdr_session(ctx, key.clone(), workspace, program, argv, shared_view)?;
         self.herdr_session_for(key)
     }
 
@@ -3586,6 +3605,7 @@ impl AlacritreeApp {
                 let workspace = self.herdr_row_workspace(&side, &terminal_id);
                 if let (Some(pane_id), Some(workspace)) = (pane_id, workspace) {
                     let key = herdr::HerdrKey { side, terminal_id };
+                    let unlisted = unlisted_pane_target(&key, &pane_id);
                     // Switches first, same as the click path: a refusal is
                     // only visible if the workspace it happened in is on
                     // screen.
@@ -3594,7 +3614,7 @@ impl AlacritreeApp {
                     if self.attach_herdr_agent(
                         ctx,
                         key,
-                        &pane_id,
+                        unlisted,
                         workspace,
                         previous.clone(),
                         None,
@@ -5426,7 +5446,8 @@ impl AlacritreeApp {
             // Switches first, same as `spawn_shell_request` below: a refusal
             // is only visible if the workspace it happened in is on screen.
             let previous = std::mem::replace(&mut self.current_workspace, ws.clone());
-            if self.attach_herdr_agent(ctx, key, &pane_id, ws, previous.clone(), None) {
+            let unlisted = unlisted_pane_target(&key, &pane_id);
+            if self.attach_herdr_agent(ctx, key, unlisted, ws, previous.clone(), None) {
                 workspace_activated = true;
             } else {
                 self.current_workspace = previous;
@@ -10875,10 +10896,11 @@ impl AlacritreeApp {
                 // Switches first, same as both sidebar paths: a refusal is only
                 // visible if the workspace it happened in is on screen.
                 let previous = std::mem::replace(&mut self.current_workspace, a.workspace.clone());
+                let unlisted = unlisted_pane_target(&a.key, &a.pane_id);
                 if self.attach_herdr_agent(
                     ctx,
                     a.key,
-                    &a.pane_id,
+                    unlisted,
                     a.workspace,
                     previous.clone(),
                     None,
@@ -11790,7 +11812,8 @@ impl AlacritreeApp {
         let workspace = herdr::match_workspace(agent, &parsed_side, &workspaces);
 
         let previous = std::mem::replace(&mut self.current_workspace, workspace.clone());
-        if !self.attach_herdr_agent(ctx, key, &pane_id, workspace, previous.clone(), Some(reply_tx))
+        let unlisted = unlisted_pane_target(&key, &pane_id);
+        if !self.attach_herdr_agent(ctx, key, unlisted, workspace, previous.clone(), Some(reply_tx))
         {
             self.current_workspace = previous;
         }
@@ -12979,61 +13002,105 @@ mod tests {
         );
     }
 
-    /// The pane herdr just made is what the attach is pointed at: its
-    /// terminal id becomes the session's key and its pane id the target, in
-    /// the workspace the create was asked for.
-    #[test]
-    fn poll_herdr_create_hands_the_new_pane_to_the_attach() {
-        let mut app = test_app();
-        // Asking for a shared view never opens a pane directly, so the attach
-        // queues on every platform instead of branching on `can_attach`.
-        app.config.integrations.herdr.attach = AttachMode::Session;
-        let side = herdr::Side::Wsl("distro".into());
-        let workspace = Some(PathBuf::from("some/workspace"));
-        app.pending_herdr_create.push(PendingHerdrCreate {
+    /// A create herdr answered, for the tests that follow the pane into its
+    /// attach.  A WSL side is one where a pane holding an agent would be
+    /// handed over directly under the default mode.
+    fn created_pane_fixture(
+        workspace: WorkspaceKey,
+        waiter: Option<mpsc::Sender<ipc::IpcResult>>,
+    ) -> PendingHerdrCreate {
+        PendingHerdrCreate {
             job: jobs::Job::ready(Ok(CreatedPane {
                 terminal_id: "term-new".into(),
                 pane_id: "w1:p2".into(),
+                tab_id: "w1:t2".into(),
             })),
-            side: side.clone(),
-            workspace: workspace.clone(),
-            waiter: None,
-        });
+            side: herdr::Side::Wsl("distro".into()),
+            workspace,
+            waiter,
+        }
+    }
+
+    /// `tab create` starts a shell, and every `herdr agent` subcommand
+    /// refuses a pane with no agent in it, so the pane a create just made is
+    /// reached through its tab even where an agent's pane would be handed
+    /// over directly.
+    #[test]
+    fn poll_herdr_create_attaches_the_new_pane_through_its_tab() {
+        let mut app = test_app();
+        assert_eq!(app.config.integrations.herdr.attach, AttachMode::Agent, "the default mode");
+        // Not on disk, so an attach that took the direct branch is refused
+        // before it can start a PTY.
+        let workspace = Some(PathBuf::from("this/path/does/not/exist"));
+        app.pending_herdr_create.push(created_pane_fixture(workspace.clone(), None));
 
         app.poll_herdr_create(&Context::default());
 
-        let queued = app.pending_herdr_attach.first().expect("the create queued an attach");
-        assert_eq!(queued.key, herdr::HerdrKey { side, terminal_id: "term-new".into() });
-        assert_eq!(queued.target.pane_id, "w1:p2");
+        let queued = app.pending_herdr_attach.first().expect("the create queued a shared view");
+        let side = herdr::Side::Wsl("distro".into());
+        assert_eq!(queued.key, herdr::HerdrKey {
+            side: side.clone(),
+            terminal_id: "term-new".into()
+        });
+        assert_eq!(queued.target, PaneTarget {
+            side,
+            pane_id: "w1:p2".into(),
+            tab_id: Some("w1:t2".into()),
+            has_agent: false,
+        });
+        assert_eq!(herdr::focus_args(&queued.target), ["tab", "focus", "w1:t2"]);
         assert_eq!(queued.workspace, workspace);
         assert_eq!(app.current_workspace, workspace);
         assert!(app.pending_herdr_create.is_empty());
     }
 
-    /// An attach that refuses before any PTY leaves the user in the workspace
-    /// they were in, not the one the create switched to on its way.
+    /// A created pane whose gesture herdr refuses leaves the user in the
+    /// workspace they were in, not the one the create switched to on its
+    /// way, and tells whoever asked for the pane why.
     #[test]
-    fn poll_herdr_create_restores_the_workspace_when_the_attach_refuses() {
+    fn poll_herdr_create_restores_the_workspace_when_the_gesture_is_refused() {
         let mut app = test_app();
-        // A WSL side with no cache entry takes the direct-attach branch, where
-        // `spawn_session_with_shell` refuses a workspace that is not on disk
-        // before it touches a PTY.
-        let workspace = PathBuf::from("this/path/does/not/exist");
         let (reply_tx, reply_rx) = mpsc::channel();
-        app.pending_herdr_create.push(PendingHerdrCreate {
-            job: jobs::Job::ready(Ok(CreatedPane {
-                terminal_id: "term-new".into(),
-                pane_id: "w1:p2".into(),
-            })),
-            side: herdr::Side::Wsl("distro".into()),
-            workspace: Some(workspace),
-            waiter: Some(reply_tx),
-        });
-
+        app.pending_herdr_create
+            .push(created_pane_fixture(Some(PathBuf::from("some/workspace")), Some(reply_tx)));
         app.poll_herdr_create(&Context::default());
+        let queued = app.pending_herdr_attach.first_mut().expect("the create queued a shared view");
+        let refusal = "herdr refused to focus the pane: no such tab".to_string();
+        queued.job = Some(jobs::Job::ready(Err(refusal.clone())));
 
-        assert_eq!(reply_rx.try_recv().unwrap(), Err("failed to attach the pane".to_string()));
+        app.poll_herdr_attach(&Context::default());
+
+        assert_eq!(reply_rx.try_recv().unwrap(), Err(refusal));
         assert_eq!(app.current_workspace, None, "a refused attach left the user moved");
+    }
+
+    /// The pane a create made is still unlisted when its session opens, and
+    /// an unlisted pane reads as holding an agent, so a session that worked
+    /// out its own kind there would record a direct attach and never follow
+    /// herdr's focus.
+    #[test]
+    fn a_created_pane_opens_a_session_that_shares_the_view() {
+        let mut app = test_app();
+        // The PTY opens on the pool, so the session's record and binding land
+        // here without a client having to start.
+        app.config.ui.async_session_spawn = true;
+        app.pending_herdr_create.push(created_pane_fixture(None, None));
+        app.poll_herdr_create(&Context::default());
+        let queued = app.pending_herdr_attach.first_mut().expect("the create queued a shared view");
+        queued.job = Some(jobs::Job::ready(Ok(Launch {
+            program: "alacritree-test-no-such-client".into(),
+            argv: Vec::new(),
+        })));
+
+        app.poll_herdr_attach(&Context::default());
+
+        let key = herdr::HerdrKey {
+            side: herdr::Side::Wsl("distro".into()),
+            terminal_id: "term-new".into(),
+        };
+        let id = app.herdr_session_for(&key).expect("the gesture opened a session");
+        let session = app.sessions.iter().find(|session| session.id == id).unwrap();
+        assert!(session.herdr_shared_view, "the created pane's session was recorded as direct");
     }
 
     #[test]
@@ -13486,10 +13553,11 @@ mod tests {
         let workspace = PathBuf::from("this/path/does/not/exist");
         let (reply_tx, reply_rx) = mpsc::channel();
 
+        let unlisted = unlisted_pane_target(&key, "w1:p1");
         let opened = app.attach_herdr_agent(
             &Context::default(),
             key,
-            "w1:p1",
+            unlisted,
             Some(workspace),
             None,
             Some(reply_tx),

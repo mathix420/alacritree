@@ -193,10 +193,8 @@ pub fn create_pane(side: &Side, cwd: Option<String>) -> Result<CreatedPane, Stri
     }
     let created = serde_json::from_slice::<CreatedTab>(&output.stdout)
         .map_err(|_| "herdr answered with no pane".to_string())?;
-    Ok(CreatedPane {
-        terminal_id: created.result.root_pane.terminal_id,
-        pane_id: created.result.root_pane.pane_id,
-    })
+    let root = created.result.root_pane;
+    Ok(CreatedPane { terminal_id: root.terminal_id, pane_id: root.pane_id, tab_id: root.tab_id })
 }
 
 /// Runs one of herdr's listings on one side.  Success is on stdout, errors

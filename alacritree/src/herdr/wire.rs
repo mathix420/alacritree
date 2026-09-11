@@ -113,9 +113,9 @@ pub(super) struct RawSession {
     pub(super) running: bool,
 }
 
-/// What `tab create` answers.  Only the two ids an attach needs are read;
-/// the tab block and the pane's own metadata arrive on the next listing
-/// poll like every other pane's.
+/// What `tab create` answers.  Only the ids an attach needs are read; the
+/// tab block and the pane's own metadata arrive on the next listing poll
+/// like every other pane's.
 #[derive(Deserialize)]
 pub(super) struct CreatedTab {
     pub(super) result: CreatedTabResult,
@@ -126,13 +126,16 @@ pub(super) struct CreatedTabResult {
     pub(super) root_pane: CreatedPaneIds,
 }
 
-/// The two ids herdr names a new pane by.  Neither is optional: an empty
-/// pane id would be sent back to herdr as an attach target, so a reply that
-/// carries no pane is a parse failure rather than a pane with no name.
+/// The ids herdr names a new pane by.  None is optional: an empty pane id
+/// would be sent back to herdr as an attach target, so a reply that carries
+/// no pane is a parse failure rather than a pane with no name.  The tab id is
+/// the only handle a pane running a shell has, since `agent focus` resolves
+/// through a registry that holds nothing for it.
 #[derive(Deserialize)]
 pub(super) struct CreatedPaneIds {
     pub(super) terminal_id: String,
     pub(super) pane_id: String,
+    pub(super) tab_id: String,
 }
 
 #[cfg(test)]
@@ -287,14 +290,15 @@ mod tests {
         assert_eq!(Listing::wanted(true).args(), ["pane", "list"]);
     }
 
-    /// An attach is pointed at the pane id this reply names, so both ids have
-    /// to survive the round trip out of the envelope herdr wraps them in.
+    /// An attach is pointed at the pane this reply names, so every id has to
+    /// survive the round trip out of the envelope herdr wraps them in.
     #[test]
     fn a_created_tab_names_the_pane_an_attach_targets() {
         let created =
             serde_json::from_str::<CreatedTab>(CREATED_TAB).expect("the captured reply parses");
         assert_eq!(created.result.root_pane.terminal_id, "term_example");
         assert_eq!(created.result.root_pane.pane_id, "w_1-3");
+        assert_eq!(created.result.root_pane.tab_id, "w_1:2");
     }
 
     /// A create that answered with no pane has nothing to attach to, and an
