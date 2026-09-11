@@ -1304,7 +1304,8 @@ pub struct UiTheme {
     pub attention_grace: Duration,
     /// Ask before the sidebar's per-session `×` kills the PTY.
     pub confirm_session_close: ConfirmSessionClose,
-    /// Ask before the sidebar's `×` detaches from a harness-managed pane.
+    /// Ask before the sidebar's `×` detaches from a harness-managed pane, and
+    /// once before `DetachAllMultiplexerPanes` detaches from all of them.
     /// Its own switch rather than a mode of [`Self::confirm_session_close`]:
     /// a detach destroys nothing — the pane keeps running under its harness
     /// and its row comes back — so the busy question a close asks has no
@@ -2916,7 +2917,8 @@ struct RawUi {
     /// "never" | "busy" | "always".
     #[schemars(extend("enum" = ["never", "busy", "always"]))]
     confirm_session_close: String,
-    /// Whether the sidebar × on a harness-managed row asks before detaching.
+    /// Whether the sidebar × on a harness-managed row asks before detaching,
+    /// and whether DetachAllMultiplexerPanes asks once for the whole batch.
     /// Separate from `confirm_session_close` because a detach leaves the
     /// pane running and its row listed again.
     confirm_session_detach: bool,

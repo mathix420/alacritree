@@ -537,7 +537,7 @@
         },
         "follow_focus": {
           "default": "herdr",
-          "description": "Whether a focus change made inside herdr moves alacritree to the\nmatching session.\n\n\"off\" never moves it.  \"herdr\" (default) moves it only while the\nactive session is already showing herdr's view, which is what an\nunmodified config has always done.  \"always\" additionally moves it\nfrom a plain native session, on any reachable side, after a gap in\ntyping.",
+          "description": "Whether a focus change made inside herdr moves alacritree to the\nmatching session.\n\n\"off\" never moves it.  \"herdr\" moves it only while the active session\nis already showing herdr's view, which is what an unmodified config\nhas always done.  \"always\" also moves it from a plain native session,\non any reachable side, after a gap in typing.",
           "enum": [
             "off",
             "herdr",
@@ -1204,7 +1204,7 @@
         },
         "confirm_session_detach": {
           "default": true,
-          "description": "Whether the sidebar × on a harness-managed row asks before detaching.\nSeparate from `confirm_session_close` because a detach leaves the\npane running and its row listed again.",
+          "description": "Whether the sidebar × on a harness-managed row asks before detaching,\nand whether DetachAllMultiplexerPanes asks once for the whole batch.\nSeparate from `confirm_session_close` because a detach leaves the\npane running and its row listed again.",
           "type": "boolean"
         },
         "decorations": {
@@ -1374,7 +1374,8 @@
           "description": "Whether session rows can be dragged, and how far a reorder may carry\na session."
         },
         "sessions_filter_counts_detached": {
-          "description": "Whether the sidebar's sessions toggle counts an unattached herdr row\nthe same as a live session — an agent nothing is attached to, and,\nonce `show_panes` is on, an agentless pane.  Default false: an\nexisting config keeps the toggle's original session-only behavior.",
+          "default": false,
+          "description": "Whether the sidebar's sessions toggle counts an unattached herdr row\nthe same as a live session: an agent nothing is attached to, and,\nonce `show_panes` is on, an agentless pane.  Off keeps the toggle's\noriginal session-only behavior.",
           "type": "boolean"
         },
         "sidebar_accent": {
