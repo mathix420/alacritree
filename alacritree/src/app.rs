@@ -13776,8 +13776,8 @@ mod tests {
     #[test]
     fn a_row_whose_pane_reports_an_agent_still_asks_herdr_for_focus() {
         let mut app = herdr_lifecycle_app();
-        // The mode that hands a pane over directly, which is the one the
-        // recomputed answer used to suppress the focus call under.
+        // The mode under which a pane with an agent gets a client of its
+        // own, so the listing alone would say this row owes herdr no focus.
         app.config.integrations.herdr.attach = AttachMode::Agent;
         let side = herdr::Side::Wsl("ubuntu".into());
         let id = bind_herdr_fixture(&mut app, side, "term-agent");
