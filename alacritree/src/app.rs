@@ -10045,12 +10045,16 @@ impl AlacritreeApp {
     fn session_managed(&self, session: &Session) -> Option<Managed> {
         let key = session.herdr_key.as_ref()?;
         let agent = self.session_herdr_agent(session);
-        Some(Managed::herdr(
+        let mut managed = Managed::herdr(
             &key.side,
             &self.herdr_settings(&key.side),
             self.config.integrations.herdr.attach,
             agent,
-        ))
+        );
+        // The listing answers what opening the pane now would give; this
+        // session's client was settled when it attached.
+        managed.shared_view = session.herdr_shared_view;
+        Some(managed)
     }
 
     /// One number standing for every endpoint's rendered state, so the
@@ -13832,6 +13836,21 @@ mod tests {
         let target = app.herdr_focus_target(&key).expect("a bound shell pane has nowhere to focus");
 
         assert_eq!(herdr::focus_args(&target), ["tab", "focus", "w1:t2"]);
+    }
+
+    /// A session's client was settled when it attached, so the tooltip that
+    /// calls it a shared view reads that record.  The listing says only what
+    /// opening the pane now would give, and a created pane reads as an
+    /// agent's until herdr lists it.
+    #[test]
+    fn a_shared_view_session_says_so_before_herdr_lists_its_pane() {
+        let mut app = herdr_lifecycle_app();
+        app.config.integrations.herdr.attach = AttachMode::Agent;
+        bind_herdr_fixture(&mut app, herdr::Side::Wsl("ubuntu".into()), "term-new");
+
+        let managed = app.session_managed(&app.sessions[0]).expect("a bound session is managed");
+
+        assert!(managed.shared_view, "the tooltip hides the shared view");
     }
 
     /// `park_attach_reply` builds the `Ok` reply itself when nothing is
