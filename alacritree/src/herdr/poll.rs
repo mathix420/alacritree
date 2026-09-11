@@ -13,9 +13,11 @@ use super::{Agent, Listing, PollError, Settings, Side, running_session_name, set
 /// How long an endpoint known to have a herdr waits before being retried.
 const RECOVERY_RETRY: Duration = Duration::from_secs(30);
 
-/// How many polls in a row a side may fail before what it last reported is
-/// dropped.  Counted in polls rather than in seconds so a slower cadence waits
-/// proportionally longer, rather than giving its rows up on one missed turn.
+/// How long a run of failed polls may last before what the side last
+/// reported is dropped, in configured poll intervals of wall-clock time from
+/// the first failure.  A side polled at that interval rides out this many
+/// misses; one retried on the slower [`RECOVERY_RETRY`] backoff rides out
+/// fewer, a single one at the default interval.
 const GRACE_POLLS: u32 = 3;
 
 /// Whether an endpoint is worth talking to.  A side with no herdr on it is
@@ -458,7 +460,7 @@ impl EndpointCache {
     /// Records a listing that never answered.  A poll that could not run is no
     /// evidence about the agents, since herdr's own state is untouched by a
     /// process that failed to spawn, so what it last said stands until the
-    /// failures outlast [`GRACE_POLLS`] of them.  Giving the rows up on the
+    /// failures outlast the [`GRACE_POLLS`] grace.  Giving the rows up on the
     /// first trades a rare stale status for a certain blank whenever a spawn
     /// hiccups, which on a loaded machine is the common case.
     fn note_missing_listing(&mut self, error: &PollError, interval: Duration) {
