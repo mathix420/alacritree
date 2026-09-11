@@ -185,11 +185,16 @@ impl HerdrViewSync {
                 continue;
             }
             let trailed = entry.terminal_id == focused.terminal_id;
+            // herdr picks another pane itself when the one it was on closes,
+            // and that pick is not somewhere the user went.
+            let fell_back = cache
+                .inventory()
+                .is_some_and(|inventory| !inventory.terminal_ids.contains(&entry.terminal_id));
             self.void_pending(&key);
             if trailed {
                 continue;
             }
-            if active_key == Some(&key) {
+            if fell_back || active_key == Some(&key) {
                 self.moved_focus(&key, sampled_at);
                 continue;
             }
@@ -414,6 +419,19 @@ mod tests {
             ]}}}}"#
         ));
         vec![herdr::EndpointCache::for_test(side.clone(), panes, at)]
+    }
+
+    /// A side whose listing also carries herdr's full pane membership, as an
+    /// attached side's does.
+    fn inventoried(side: &herdr::Side, panes: &str, at: Instant) -> Vec<herdr::EndpointCache> {
+        let mut cache = herdr::EndpointCache::new(side.clone());
+        cache.complete_listing_for_test(
+            Ok(&format!(r#"{{"result":{{"panes":[{panes}]}}}}"#)),
+            herdr::Listing::Panes,
+            herdr::Listing::Panes,
+            at,
+        );
+        vec![cache]
     }
 
     /// Starting alacritree must never yank the user somewhere, so the first
@@ -988,6 +1006,62 @@ mod tests {
             quiet.last_direct_input = Some(sampled);
             assert_eq!(sync.next(quiet), None, "the closed row was followed {step} ms in");
         }
+    }
+
+    /// herdr picks another pane itself when the one it was on closes.  The
+    /// close already landed the user somewhere, and following herdr's pick
+    /// afterwards moves them a second time, to a pane they never chose.
+    #[test]
+    fn the_pane_herdr_falls_back_to_after_a_close_is_not_followed() {
+        let side = herdr::Side::Native;
+        let gone = HerdrKey { side: side.clone(), terminal_id: "t1".into() };
+        let start = Instant::now();
+        let mut sync = HerdrViewSync::default();
+        sync.attached(1, Some(&gone), start);
+        sync.closed(1, Some(&gone), start + Duration::from_millis(1));
+
+        let landed = Some((2, None, false));
+        let sampled = start + Duration::from_millis(2);
+        let survivor = inventoried(
+            &side,
+            r#"{"terminal_id":"t2","pane_id":"w1:p2","tab_id":"w1:t2","focused":true}"#,
+            sampled,
+        );
+        assert_eq!(sync.next(always(landed, &survivor, sampled)), None);
+        let quiet = sampled + FOLLOW_QUIET_GAP + Duration::from_millis(1);
+        assert_eq!(sync.next(always(landed, &survivor, quiet)), None);
+    }
+
+    /// Leaving a pane that is still there is a move the user made in herdr.
+    #[test]
+    fn a_move_off_a_pane_that_still_exists_is_followed() {
+        let side = herdr::Side::Native;
+        let start = Instant::now();
+        let mut sync = HerdrViewSync::default();
+        let first = inventoried(
+            &side,
+            r#"{"terminal_id":"t1","pane_id":"w1:p1","tab_id":"w1:t1","focused":true},
+               {"terminal_id":"t2","pane_id":"w1:p2","tab_id":"w1:t2","focused":false}"#,
+            start,
+        );
+        assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
+
+        let moved = start + Duration::from_millis(1);
+        let second = inventoried(
+            &side,
+            r#"{"terminal_id":"t1","pane_id":"w1:p1","tab_id":"w1:t1","focused":false},
+               {"terminal_id":"t2","pane_id":"w1:p2","tab_id":"w1:t2","focused":true}"#,
+            moved,
+        );
+        assert_eq!(sync.next(always(Some((1, None, false)), &second, moved)), None);
+        let quiet = moved + FOLLOW_QUIET_GAP + Duration::from_millis(1);
+        assert_eq!(
+            sync.next(always(Some((1, None, false)), &second, quiet)),
+            Some(HerdrViewAction::Follow(HerdrKey {
+                side: side.clone(),
+                terminal_id: "t2".into()
+            }))
+        );
     }
 
     /// A pending proposes going where herdr went.  herdr going back before
