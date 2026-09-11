@@ -11878,9 +11878,8 @@ impl AlacritreeApp {
         if let Some(side) = focused {
             return Ok(side);
         }
-        // A cache holds a sample time only while its last listing succeeded,
-        // so a side that has never answered is not offered as the one a create
-        // must have meant.
+        // A cache holds a sample time only while it still holds a listing, so
+        // a side whose rows are gone is not offered as the one a create meant.
         let answering: Vec<&herdr::Side> = self
             .herdr_endpoints
             .caches()
@@ -12914,6 +12913,29 @@ mod tests {
         app.set_active_in_current_workspace(id);
 
         assert_eq!(app.default_multiplexer_side(), Ok(side));
+    }
+
+    /// A side whose rows are still drawn through one missed poll is still
+    /// the side answering, or a create would tell the user to start a server
+    /// the sidebar shows running.
+    #[test]
+    fn a_side_that_missed_one_poll_is_still_the_one_a_create_means() {
+        let mut app = test_app();
+        adopt_herdr_fixture(
+            &mut app,
+            herdr::Side::Native,
+            r#"{"result":{"panes":[
+                {"terminal_id":"term-native","pane_id":"w1:p1","agent":"claude","agent_status":"idle","cwd":"/repo"}
+            ]}}"#,
+            Instant::now(),
+        );
+
+        app.herdr_endpoints.caches_mut_for_test()[0].fail_listing_for_test(
+            herdr::PollError::Absent("spawn_failed"),
+            Duration::from_secs(2),
+        );
+
+        assert_eq!(app.default_multiplexer_side(), Ok(herdr::Side::Native));
     }
 
     /// A worktree the sidebar does not have is refused before herdr is asked,

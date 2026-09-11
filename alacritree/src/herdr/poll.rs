@@ -287,10 +287,7 @@ impl EndpointCache {
                     self.inventory =
                         Some(PaneInventory { sampled_at: reply.sampled_at, terminal_ids });
                 },
-                Err(error) => {
-                    self.sampled_at = None;
-                    self.note_failure(&error);
-                },
+                Err(error) => self.note_failure(&error),
             }
         } else {
             self.note_success();
@@ -413,7 +410,6 @@ impl EndpointCache {
                     self.pending = None;
                 },
                 Some(Err(error)) => {
-                    self.sampled_at = None;
                     self.note_missing_listing(&error, interval);
                     // herdr restarting may name its session differently, and
                     // attaching to the old name reaches nothing.
@@ -423,7 +419,6 @@ impl EndpointCache {
                 // A worker panic supplies no membership evidence. Attached
                 // sessions still need retries on the configured cadence.
                 None if job.failed() => {
-                    self.sampled_at = None;
                     self.note_missing_listing(&PollError::Absent("poll_panicked"), interval);
                     self.pending = None;
                 },
@@ -484,8 +479,10 @@ impl EndpointCache {
 
     /// Drops the live half of what herdr last said about this side's panes.
     /// A status nothing is refreshing still reads as current, which is worse
-    /// than showing none at all.
+    /// than showing none at all.  The sample time goes with it, since a
+    /// reader takes one as proof the side is answering.
     fn forget_listing(&mut self) {
+        self.sampled_at = None;
         for pane in &mut self.attachment_panes {
             pane.current = false;
             pane.agent.status = None;
@@ -754,6 +751,9 @@ mod tests {
         let pane = cache.attachment_pane("agent").expect("the pane keeps its row");
         assert_eq!(pane.agent.status, Some(Status::Working));
         assert!(pane.current);
+        // The listing and when it was taken are one fact, so a reader asking
+        // whether the side is answering agrees with the rows still drawn.
+        assert!(cache.sampled_at().is_some());
         // Membership is not held back: a failure may never remove a pane, and
         // holding the last listing as evidence would let it.
         assert!(cache.inventory().is_none());
@@ -778,6 +778,7 @@ mod tests {
         cache.fail_listing_for_test(PollError::Absent("spawn_failed"), interval);
 
         assert!(cache.agents().is_empty());
+        assert!(cache.sampled_at().is_none());
         let pane = cache.attachment_pane("agent").expect("the bound pane keeps its row");
         assert!(pane.agent.status.is_none());
         assert!(!pane.current);
@@ -885,7 +886,9 @@ mod tests {
         cache.poll(Duration::from_secs(60), Listing::Panes, true);
 
         assert!(cache.inventory().is_none());
-        assert!(cache.sampled_at().is_none());
+        // One panicked poll sits inside the grace, so the listing it did not
+        // replace still stands.
+        assert!(cache.sampled_at().is_some());
         assert!(cache.pending.is_none());
         cache.last_attempt = Some(Instant::now() - Duration::from_secs(2));
         assert!(cache.poll_due(Duration::from_secs(2), true));
