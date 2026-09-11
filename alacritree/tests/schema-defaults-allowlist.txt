@@ -15,7 +15,6 @@ RawBinding.command
 RawBinding.key
 RawBinding.mode
 RawBinding.mods
-RawColors.indexed_colors
 RawCursor.blink_interval
 RawCursor.blink_timeout
 RawCursor.style
@@ -56,7 +55,6 @@ RawTextEmphasis.color
 RawUi.default_profile
 RawUi.delta_path
 RawUi.pr_status_concurrency
-RawUi.profiles
 RawUi.project_name
 RawUi.sidebar_accent
 RawUi.sidebar_attention
@@ -71,7 +69,6 @@ RawUiFont.italic_family
 RawUiFont.size
 RawUiPaste.image_dir
 RawUiWsl.automount_root
-RawWorkspace.overrides
 RawWorkspace.worktree_dir
 RawWorktreeOverride.project
 RawWorktreeOverride.worktree_dir

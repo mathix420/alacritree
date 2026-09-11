@@ -49,10 +49,12 @@
     "herdr": {
       "attach": "Agent",
       "enabled": true,
+      "follow_focus": "Herdr",
       "poll_interval": {
         "nanos": 0,
         "secs": 2
       },
+      "show_panes": false,
       "show_unmatched": true
     }
   },
@@ -214,6 +216,7 @@
     },
     "focus_priority_boost": false,
     "gpu_grid": false,
+    "hold_exited_sessions": "Never",
     "icon_tooltips": true,
     "icons": {
       "add_project": {
@@ -413,8 +416,10 @@
     "project_name": null,
     "reap_descendants_on_close": false,
     "scrollbar": "Floating",
+    "search_depth": "Workspaces",
     "search_scope": "Filtered",
     "session_display": {
+      "palette_marks": false,
       "sidebar_always": false,
       "tabs_always": false
     },
@@ -422,6 +427,7 @@
       "drag": false,
       "scope": "Workspace"
     },
+    "sessions_filter_counts_detached": false,
     "sidebar_accent": null,
     "sidebar_attention": null,
     "sidebar_background": null,
