@@ -1721,7 +1721,13 @@ impl AlacritreeApp {
         workspace: WorkspaceKey,
         waiter: Option<mpsc::Sender<ipc::IpcResult>>,
     ) {
-        let cwd = multiplexer_cwd(&side, workspace.as_deref());
+        let cwd = match multiplexer_cwd(&side, workspace.as_deref()) {
+            Ok(cwd) => cwd,
+            Err(e) => {
+                self.refuse_herdr_create(waiter, e);
+                return;
+            },
+        };
         // `Multiplexer::owning` resolves a multiplexer from a pane's key,
         // and a pane nothing has made yet has no key, so the create names the
         // one it is asking.
@@ -1778,9 +1784,10 @@ impl AlacritreeApp {
         }
     }
 
-    /// Report a create the multiplexer refused.  Nothing has switched
-    /// workspace yet, since that waits for the pane to land, so a refusal
-    /// leaves the user where they are and only has to be readable.
+    /// Report a create that made no pane, whether the multiplexer refused it
+    /// or it was refused before the multiplexer was asked.  Nothing has
+    /// switched workspace yet, since that waits for the pane to land, so a
+    /// refusal leaves the user where they are and only has to be readable.
     fn refuse_herdr_create(
         &mut self,
         waiter: Option<mpsc::Sender<ipc::IpcResult>>,
@@ -12080,13 +12087,16 @@ fn not_a_side(name: &str) -> String {
 
 /// The directory a new pane opens in, spelled where the multiplexer resolves
 /// it: the distro's own path on a WSL side, the Windows path on the native
-/// one.  `None` leaves the choice to the multiplexer, which is also where a
-/// path with no spelling inside the distro lands.
-fn multiplexer_cwd(side: &herdr::Side, workspace: Option<&Path>) -> Option<String> {
-    let path = workspace?;
+/// one.  `None` leaves the choice to the multiplexer.  A workspace with no
+/// spelling inside the distro is an `Err`, since a pane opened anywhere else
+/// would still have its session filed under that workspace.
+fn multiplexer_cwd(side: &herdr::Side, workspace: Option<&Path>) -> Result<Option<String>, String> {
+    let Some(path) = workspace else { return Ok(None) };
     match side {
-        herdr::Side::Native => Some(path.display().to_string()),
-        herdr::Side::Wsl(_) => wsl::windows_to_linux(path),
+        herdr::Side::Native => Ok(Some(path.display().to_string())),
+        herdr::Side::Wsl(distro) => wsl::windows_to_linux(path)
+            .map(Some)
+            .ok_or_else(|| format!("{} has no path inside the {distro} distro", path.display())),
     }
 }
 
@@ -12967,11 +12977,11 @@ mod tests {
         let workspace = PathBuf::from(r"\\wsl.localhost\ubuntu\home\dev\repo");
         assert_eq!(
             multiplexer_cwd(&herdr::Side::Wsl("ubuntu".into()), Some(&workspace)),
-            Some("/home/dev/repo".to_string())
+            Ok(Some("/home/dev/repo".to_string()))
         );
         assert_eq!(
             multiplexer_cwd(&herdr::Side::Native, Some(&workspace)),
-            Some(workspace.display().to_string())
+            Ok(Some(workspace.display().to_string()))
         );
     }
 
@@ -12979,8 +12989,33 @@ mod tests {
     /// rather than being handed an empty path.
     #[test]
     fn a_new_pane_in_the_home_workspace_names_no_directory() {
-        assert_eq!(multiplexer_cwd(&herdr::Side::Native, None), None);
-        assert_eq!(multiplexer_cwd(&herdr::Side::Wsl("ubuntu".into()), None), None);
+        assert_eq!(multiplexer_cwd(&herdr::Side::Native, None), Ok(None));
+        assert_eq!(multiplexer_cwd(&herdr::Side::Wsl("ubuntu".into()), None), Ok(None));
+    }
+
+    /// A pane opened somewhere other than the workspace would still have its
+    /// session filed under that workspace, so a workspace the distro has no
+    /// path for is refused before herdr is asked and no pane is left behind.
+    #[test]
+    fn creating_a_pane_in_a_workspace_the_distro_cannot_see_is_refused() {
+        let mut app = test_app();
+        let share = PathBuf::from(r"\\fileserver\share\repo");
+        app.current_workspace = Some(share.clone());
+        let id = bind_herdr_fixture(&mut app, herdr::Side::Wsl("no-such-distro".into()), "term");
+        app.set_active_in_current_workspace(id);
+
+        app.dispatch_action(
+            &Context::default(),
+            BindingAction::Named(NamedAction::NewMultiplexerPane),
+            ActionOrigin::Keyboard,
+        );
+
+        let expected = format!("{} has no path inside the no-such-distro distro", share.display());
+        assert_eq!(app.error_dialog.as_deref(), Some(expected.as_str()));
+        assert!(
+            app.pending_herdr_create.is_empty(),
+            "an untranslatable workspace still asked herdr"
+        );
     }
 
     /// A create herdr refused must answer whoever asked for the pane, not
