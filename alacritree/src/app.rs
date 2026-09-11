@@ -1605,7 +1605,11 @@ impl AlacritreeApp {
                 },
                 None => {
                     if let Some(waiter) = waiter {
-                        let _ = waiter.send(Err("failed to attach the pane".to_string()));
+                        let message = self
+                            .error_dialog
+                            .clone()
+                            .unwrap_or_else(|| "failed to attach the pane".to_string());
+                        let _ = waiter.send(Err(message));
                     }
                     false
                 },
@@ -13598,16 +13602,21 @@ mod tests {
 
     /// The direct-attach branch of `attach_herdr_agent` hits the same
     /// synchronous refusal as the shared-view path above, without ever
-    /// reaching `poll_herdr_attach`.
+    /// reaching `poll_herdr_attach`, and owes its waiter the same reason: a
+    /// client has no window to read the dialog in.
     #[test]
     fn attach_herdr_agent_direct_attach_answers_a_synchronous_open_failure() {
         let mut app = test_app();
-        // A WSL side with no cache entry: `herdr_pane_has_agent` defaults an
-        // unknown pane to "has one", so this takes the direct-attach branch
-        // with no fixture setup, unlike native on this platform.
+        // A WSL side with no cache entry: the unlisted target claims an agent,
+        // so this takes the direct-attach branch with no fixture setup,
+        // unlike native on this platform.
         let key =
             herdr::HerdrKey { side: herdr::Side::Wsl("distro".into()), terminal_id: "t1".into() };
         let workspace = PathBuf::from("this/path/does/not/exist");
+        let expected = format!(
+            "failed to attach herdr agent: worktree is no longer checked out: {}",
+            workspace.display()
+        );
         let (reply_tx, reply_rx) = mpsc::channel();
 
         let unlisted = unlisted_pane_target(&key, "w1:p1");
@@ -13621,7 +13630,7 @@ mod tests {
         );
 
         assert!(!opened);
-        assert_eq!(reply_rx.try_recv().unwrap(), Err("failed to attach the pane".to_string()));
+        assert_eq!(reply_rx.try_recv().unwrap(), Err(expected));
     }
 
     /// A pane a session already holds is not a second session's to open, or
