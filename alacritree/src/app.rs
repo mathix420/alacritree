@@ -1966,9 +1966,8 @@ impl AlacritreeApp {
         match action {
             Some(herdr::HerdrViewAction::Focus(id)) => {
                 let Some(key) = key else { return };
-                let Some(focus) = self
-                    .find_herdr_agent(&key.side, &key.terminal_id)
-                    .map(|agent| herdr::focus_args(&agent.target(&key.side)))
+                let Some(focus) =
+                    self.herdr_focus_target(&key).map(|target| herdr::focus_args(&target))
                 else {
                     return;
                 };
@@ -9884,6 +9883,20 @@ impl AlacritreeApp {
             .map(|(ws, _)| ws)
     }
 
+    /// Where herdr's focus goes for the pane a session is bound to.  The
+    /// displayed listing drops a pane with no agent in it unless panes are
+    /// shown, so a bound shell pane is found through what the side's full
+    /// listing last said about it.
+    fn herdr_focus_target(&self, key: &herdr::HerdrKey) -> Option<PaneTarget> {
+        let cache = self.herdr_endpoints.caches().iter().find(|cache| cache.side() == &key.side)?;
+        cache
+            .agents()
+            .iter()
+            .find(|agent| agent.terminal_id == key.terminal_id)
+            .or_else(|| cache.attachment_pane(&key.terminal_id).map(|pane| &pane.agent))
+            .map(|agent| agent.target(&key.side))
+    }
+
     /// The agent behind `(side, terminal_id)`, if its endpoint still has it
     /// cached.  A stale key (the agent exited between poll and paint, or an
     /// Enter that outraced this frame's own listing) yields no row rather
@@ -13790,6 +13803,35 @@ mod tests {
 
         assert_eq!(app.herdr_focused_view.visible, Some(id));
         assert!(app.herdr_view_focus.is_none());
+    }
+
+    /// A created pane runs a shell, and the listing the sidebar draws drops a
+    /// pane with no agent in it unless panes are shown.  Coming back to that
+    /// pane's session has to find its tab through the side's full listing,
+    /// or herdr goes on showing whatever it last focused.
+    #[test]
+    fn a_bound_shell_pane_is_refocused_through_its_tab() {
+        let mut app = herdr_lifecycle_app();
+        assert!(!app.config.integrations.herdr.show_panes, "the default display");
+        let side = herdr::Side::Native;
+        bind_herdr_fixture(&mut app, side.clone(), "term-shell");
+        adopt_herdr_fixture(
+            &mut app,
+            side.clone(),
+            r#"{"result":{"panes":[
+            {"terminal_id":"term-shell","pane_id":"w1:p2","tab_id":"w1:t2","agent_status":"unknown"}
+        ]}}"#,
+            Instant::now(),
+        );
+        let key = herdr::HerdrKey { side, terminal_id: "term-shell".into() };
+        assert!(
+            app.find_herdr_agent(&key.side, &key.terminal_id).is_none(),
+            "the displayed listing carries the shell pane"
+        );
+
+        let target = app.herdr_focus_target(&key).expect("a bound shell pane has nowhere to focus");
+
+        assert_eq!(herdr::focus_args(&target), ["tab", "focus", "w1:t2"]);
     }
 
     /// `park_attach_reply` builds the `Ok` reply itself when nothing is
