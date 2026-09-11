@@ -471,7 +471,8 @@ icon_tooltips      = true        # whether a sidebar icon explains itself on
                                  # icon's hint never depends on panel width
 confirm_session_close = "never"  # when the sidebar × asks before killing a PTY:
                                  # "never" (default) | "busy" | "always"
-confirm_session_detach = true    # whether the × on a harness-managed row asks
+confirm_session_detach = true    # whether the × on a harness-managed row, or
+                                 # detaching every multiplexer pane, asks
                                  # before detaching. Its own switch, since a
                                  # detach leaves the pane running under its
                                  # harness and lists its row again
