@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.12.0](https://github.com/mathix420/alacritree/compare/v0.11.0...v0.12.0) (2026-09-12)
+
+
+### Features
+
+* **config,cli:** point alacritree at its config, logs and state [12] ([#214](https://github.com/mathix420/alacritree/issues/214)) ([a2ffe1e](https://github.com/mathix420/alacritree/commit/a2ffe1efbe61f6b2a75ca90d1be3f97e6fd2dfe8))
+* **palette,sidebar:** reach a herdr agent by typing its name [15] ([#217](https://github.com/mathix420/alacritree/issues/217)) ([1cbe828](https://github.com/mathix420/alacritree/commit/1cbe82862a067496ab5e05280144cdcc534749d2))
+* **render:** GPU grid with decorations from font metrics [2] ([#203](https://github.com/mathix420/alacritree/issues/203)) ([d211b6c](https://github.com/mathix420/alacritree/commit/d211b6ce270c05df97a2114cdf4aef199a519030))
+* **schema:** publish a default value for every config key [14] ([#216](https://github.com/mathix420/alacritree/issues/216)) ([690daff](https://github.com/mathix420/alacritree/commit/690daff8db6ef726804a52c8c4dd5bd71f75156e))
+* **schema:** suggest binding action names in editors [3] ([#205](https://github.com/mathix420/alacritree/issues/205)) ([1ce6dc3](https://github.com/mathix420/alacritree/commit/1ce6dc3684cb6b2cc9d40d18b578b3789ba0154a))
+* **sidebar:** land closes on the ring and follow the active row [10] ([#212](https://github.com/mathix420/alacritree/issues/212)) ([85a0b44](https://github.com/mathix420/alacritree/commit/85a0b44345673c4bea63e0167368c67724c1e005))
+* **sidebar:** list and attach herdr agents [13] ([#215](https://github.com/mathix420/alacritree/issues/215)) ([b0f5bfb](https://github.com/mathix420/alacritree/commit/b0f5bfb7cae3ffdc0b48e19e36ceac43d16d8132))
+* **sidebar:** reorder sessions by drag or by key [9] ([#211](https://github.com/mathix420/alacritree/issues/211)) ([8d05d70](https://github.com/mathix420/alacritree/commit/8d05d705793a816862eef3f6a502ae3227b8c279))
+
+
+### Bug Fixes
+
+* **select:** keep the edge columns when dragging off the grid [4] ([#206](https://github.com/mathix420/alacritree/issues/206)) ([efce9f3](https://github.com/mathix420/alacritree/commit/efce9f3938a1a06b7e731a73921299bb5a5bf5d5))
+* **sidebar:** use Codex Braille spinner ([#218](https://github.com/mathix420/alacritree/issues/218)) ([6dfd275](https://github.com/mathix420/alacritree/commit/6dfd275d86353ae10fbfa6f448d3f660ea24aa23))
+* **wsl:** tear down a helper that stopped answering [8] ([#210](https://github.com/mathix420/alacritree/issues/210)) ([5045089](https://github.com/mathix420/alacritree/commit/50450891a3a238daed045acdc5667b75d787b7a7))
+
+
+### Performance Improvements
+
+* **fonts:** scan face coverage in parallel without sorting [11] ([#213](https://github.com/mathix420/alacritree/issues/213)) ([da88744](https://github.com/mathix420/alacritree/commit/da887447c5f861d3490ee8791f9b4e31cfe463e1))
+* **session:** open the shell off the UI thread [7] ([#209](https://github.com/mathix420/alacritree/issues/209)) ([6b66d25](https://github.com/mathix420/alacritree/commit/6b66d2553c59815a6195f4dfee9f4fd1da10994e))
+* **session:** stop background load starving the focused shell [1] ([#202](https://github.com/mathix420/alacritree/issues/202)) ([247767c](https://github.com/mathix420/alacritree/commit/247767ca9bcbd85d03e027e40e6ccacc8757bc20))
+* **ui:** move blocking work onto a job pool [5] ([#207](https://github.com/mathix420/alacritree/issues/207)) ([60a0808](https://github.com/mathix420/alacritree/commit/60a0808fcfd78490b8c42135958c5cc346c91c26))
+
 ## [0.11.0](https://github.com/mathix420/alacritree/compare/v0.10.0...v0.11.0) (2026-08-31)
 
 
