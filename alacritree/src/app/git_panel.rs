@@ -1282,6 +1282,34 @@ pub(super) fn base_branch_target(
     current.clone()
 }
 
+/// Extend a row's bounding rect to its parent's full width so the response
+/// covers the empty space past short labels, instead of just the content.
+fn fill_row(ui: &mut egui::Ui) {
+    let remaining = ui.available_width();
+    if remaining > 0.0 {
+        ui.allocate_space(egui::vec2(remaining, 0.0));
+    }
+}
+
+fn paint_row_bg(
+    ui: &mut egui::Ui,
+    resp: &egui::Response,
+    bg_idx: egui::layers::ShapeIdx,
+    panel_x: egui::Rangef,
+    theme: &Theme,
+    is_active: bool,
+) {
+    let bg = if is_active {
+        theme.row_active_bg
+    } else if resp.hovered() {
+        theme.row_hover_bg
+    } else {
+        return;
+    };
+    let rect = egui::Rect::from_x_y_ranges(panel_x, resp.rect.y_range());
+    ui.painter().set(bg_idx, egui::Shape::rect_filled(rect, 0.0, bg));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

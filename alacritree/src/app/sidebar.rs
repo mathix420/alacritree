@@ -2362,6 +2362,44 @@ pub(super) fn close_button_hint(managed: bool) -> &'static str {
     if managed { "detach session" } else { "close session" }
 }
 
+/// The weight and colour every reorder drop line is drawn with, shared so the
+/// project and session drags cannot drift apart.
+fn drop_indicator_stroke(theme: &Theme) -> Stroke {
+    Stroke::new(2.0 * theme.ui_scale, theme.accent)
+}
+
+/// Paint the line a reorder drop would land on, at the row edge nearest the
+/// pointer, and report whether that edge is the top — which is what "insert
+/// before this row" means for both the project and the session drag.
+fn draw_drop_indicator(
+    ui: &egui::Ui,
+    row_rect: egui::Rect,
+    pointer: egui::Pos2,
+    theme: &Theme,
+) -> bool {
+    let before = pointer.y < row_rect.center().y;
+    let y = if before { row_rect.top() } else { row_rect.bottom() };
+    ui.painter().hline(row_rect.x_range(), y, drop_indicator_stroke(theme));
+    before
+}
+
+/// A grip that a project row can be dragged by to reorder it.  Drag-sensing
+/// only, so a plain click still falls through to the row's other controls.
+fn drag_handle(ui: &mut egui::Ui, theme: &Theme) -> egui::Response {
+    let s = theme.ui_scale;
+    let size = egui::vec2(12.0 * s, 16.0 * s);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::drag());
+    let color = if resp.hovered() || resp.dragged() { theme.text_dim } else { theme.text_muted };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "⠿",
+        egui::FontId::proportional(12.0 * s),
+        color,
+    );
+    resp.on_hover_cursor(egui::CursorIcon::Grab)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
