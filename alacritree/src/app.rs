@@ -10,7 +10,7 @@ use egui::{Color32, Context, Frame, Margin, RichText, ScrollArea, SidePanel, Str
 
 use serde_json::{Value, json};
 
-use crate::bindings::{self, BindingAction, KeyBinding, NamedAction};
+use crate::bindings::{BindingAction, NamedAction};
 use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
@@ -22,8 +22,8 @@ use crate::config::{
     DEFAULT_REORDER_ICON, DEFAULT_SEARCH_ICON, DEFAULT_SESSION_ICON,
     DEFAULT_UPSTREAM_DIVERGED_ICON, DEFAULT_UPSTREAM_GONE_ICON, DEFAULT_UPSTREAM_LEVEL_ICON,
     DEFAULT_UPSTREAM_UNTRACKED_ICON, DEFAULT_WORKTREE_ICON, DEFAULT_WORKTREE_MAIN_ICON, FontConfig,
-    IconStyle, Icons, LastSessionClose, PathStyleConfig, ScrollbarStyle, SearchDepth, SearchScope,
-    SidebarFocus, SidebarTooltips, TextEmphasis, UiFont, UiTheme, profile_command,
+    IconStyle, Icons, LastSessionClose, PathStyleConfig, ScrollAlign, ScrollbarStyle, SearchDepth,
+    SearchScope, SidebarFocus, SidebarTooltips, TextEmphasis, UiFont, UiTheme, profile_command,
 };
 use crate::crash_log::{self, ExitReason};
 use crate::git_nav::{self, GitSection, SectionCount};
@@ -119,7 +119,7 @@ struct Theme {
     focus_outline: FocusOutlineTheme,
     /// Per-site path abbreviation, so free-standing row painters can spell a
     /// path without taking a `&Config`.
-    path_style: PathStyleConfig,
+    path_style: PathStyleConfig<Color32>,
     /// When a row spells its full name out on hover.
     sidebar_tooltips: SidebarTooltips,
     /// Whether a sidebar button says what it does on hover.
@@ -127,6 +127,23 @@ struct Theme {
     /// Where a row a sidebar scrolled to is parked; `None` is egui's own
     /// minimal scroll.
     scroll_align: Option<egui::Align>,
+    /// Error and success text, the palette's red and green.
+    error: Color32,
+    ok: Color32,
+    /// The scratchpad editor's text and its placeholder hint.
+    editor_text: Color32,
+    editor_hint: Color32,
+    git: GitColors,
+}
+
+/// One color per git change kind, taken from the terminal palette.
+#[derive(Debug, Clone, Copy)]
+struct GitColors {
+    added: Color32,
+    modified: Color32,
+    deleted: Color32,
+    renamed: Color32,
+    conflicted: Color32,
 }
 
 /// One color per [`StateTone`], since a harness names its states rather than
@@ -155,14 +172,14 @@ impl StateColors {
 impl Theme {
     fn from_config(config: &Config) -> Self {
         let terminal_bg = rgb_to_color32(config.palette.bg);
-        let sidebar_bg = config.ui.sidebar_background.unwrap_or(terminal_bg);
-        let text =
-            config.ui.sidebar_foreground.unwrap_or_else(|| rgb_to_color32(config.palette.fg));
-        let accent =
-            config.ui.sidebar_accent.unwrap_or_else(|| rgb_to_color32(config.palette.normal[4])); // ANSI blue
+        let editor_text = rgb_to_color32(config.palette.fg);
+        let sidebar_bg = config.ui.sidebar_background.map_or(terminal_bg, rgb_to_color32);
+        let text = rgb_to_color32(config.ui.sidebar_foreground.unwrap_or(config.palette.fg));
+        let accent = rgb_to_color32(config.ui.sidebar_accent.unwrap_or(config.palette.normal[4])); // ANSI blue
         let attention =
-            config.ui.sidebar_attention.unwrap_or_else(|| rgb_to_color32(config.palette.normal[3])); // ANSI yellow
-        let border = config.ui.sidebar_border.unwrap_or_else(|| lighten(sidebar_bg, 0.10));
+            rgb_to_color32(config.ui.sidebar_attention.unwrap_or(config.palette.normal[3])); // ANSI yellow
+        let border =
+            config.ui.sidebar_border.map_or_else(|| lighten(sidebar_bg, 0.10), rgb_to_color32);
         let text_muted = blend_toward(text, sidebar_bg, 0.55);
         let (font_normal, font_heading) = ui_text_px(&config.font, &config.ui_font);
         Self {
@@ -197,14 +214,32 @@ impl Theme {
             focus_outline: FocusOutlineTheme {
                 sidebar: config.ui.focus_outline.sidebar,
                 terminal: config.ui.focus_outline.terminal,
-                color: config.ui.focus_outline.color.unwrap_or(accent),
+                color: config.ui.focus_outline.color.map_or(accent, rgb_to_color32),
                 thickness: config.ui.focus_outline.thickness,
             },
-            path_style: config.ui.path_style,
+            path_style: config.ui.path_style.map_colors(rgb_to_color32),
             sidebar_tooltips: config.ui.sidebar_tooltips,
             icon_tooltips: config.ui.icon_tooltips,
-            scroll_align: config.ui.sidebar_scroll_align.align(),
+            scroll_align: egui_scroll_align(config.ui.sidebar_scroll_align),
+            error: rgb_to_color32(config.palette.normal[1]),
+            ok: rgb_to_color32(config.palette.normal[2]),
+            editor_text,
+            editor_hint: blend_toward(editor_text, terminal_bg, 0.55),
+            git: GitColors {
+                added: rgb_to_color32(config.palette.normal[2]),
+                modified: rgb_to_color32(config.palette.normal[3]),
+                deleted: rgb_to_color32(config.palette.normal[1]),
+                renamed: rgb_to_color32(config.palette.normal[4]),
+                conflicted: rgb_to_color32(config.palette.bright[1]),
+            },
         }
+    }
+}
+
+fn egui_scroll_align(align: ScrollAlign) -> Option<egui::Align> {
+    match align {
+        ScrollAlign::Minimal => None,
+        ScrollAlign::Center => Some(egui::Align::Center),
     }
 }
 
@@ -334,6 +369,10 @@ pub struct AlacritreeApp {
     row_labels: crate::row_label::LabelTemplates,
     config: Config,
     theme: Theme,
+    /// `config.ui.icons` with its colors converted for painting.
+    icons: Icons<Color32>,
+    /// `config.bindings` with its keys converted for matching.
+    shortcuts: crate::shortcut::Shortcuts,
     modals: modals::Modals,
     /// Worktrees already given a Doppler scope pass this app run, so opening
     /// more shells there doesn't re-invoke the doppler CLI.
@@ -405,15 +444,16 @@ pub struct AlacritreeApp {
 impl AlacritreeApp {
     fn from_parts(
         config: Config,
+        theme: Theme,
         persisted: state::PersistedState,
         projects: Vec<Project>,
-        font_chain: Vec<crate::fonts::ChainFace>,
-        face_metrics: crate::fonts::FaceMetrics,
+        fonts: (Vec<crate::fonts::ChainFace>, crate::fonts::FaceMetrics),
         notify_rx: Receiver<SessionId>,
         ipc: (Option<ipc::SocketHandle>, Option<Receiver<ipc::AppCall>>),
     ) -> Self {
-        let theme = Theme::from_config(&config);
+        let (font_chain, face_metrics) = fonts;
         let color_glyph_budget_mb = config.font.color_glyph_cache_mb;
+        let grid_snapshot = crate::terminal_view::GridSnapshot::new(&config.palette);
         let (ipc_socket, ipc_rx) = ipc;
         let row_labels = crate::row_label::LabelTemplates::new(
             config.ui.worktree_name.clone(),
@@ -449,6 +489,8 @@ impl AlacritreeApp {
             projects,
             pr_cache: PrCache::new(),
             row_labels,
+            icons: config.ui.icons.map_colors(rgb_to_color32),
+            shortcuts: crate::shortcut::Shortcuts::new(&config.bindings),
             config,
             theme,
             modals: modals::Modals::default(),
@@ -465,7 +507,7 @@ impl AlacritreeApp {
             ),
             face_metrics,
             glyph_cache: crate::glyph_cache::GlyphCache::new(),
-            grid_snapshot: crate::terminal_view::GridSnapshot::new(),
+            grid_snapshot,
             gpu_grid: crate::grid_gl::GpuGrid::new(),
             frame_log: crate::frame_log::FrameLog::start(),
             phases: crate::frame_log::Phases::new(),
@@ -485,13 +527,12 @@ impl AlacritreeApp {
     fn configure_context(
         ctx: &Context,
         config: &Config,
+        theme: &Theme,
     ) -> (Vec<crate::fonts::ChainFace>, crate::fonts::FaceMetrics) {
         // A job's own closure cannot wake the loop when it unwinds, and the
         // failure it reports is only ever read from a frame.
         let waker_ctx = ctx.clone();
         jobs::pool().set_waker(move || waker_ctx.request_repaint());
-
-        let theme = Theme::from_config(config);
 
         let (font_chain, face_metrics) =
             crate::fonts::install_terminal_fonts(ctx, &config.font, &config.ui_font);
@@ -597,7 +638,8 @@ impl AlacritreeApp {
     }
 
     pub fn new(cc: &CreationContext<'_>, config: Config) -> Self {
-        let (font_chain, face_metrics) = Self::configure_context(&cc.egui_ctx, &config);
+        let theme = Theme::from_config(&config);
+        let fonts = Self::configure_context(&cc.egui_ctx, &config, &theme);
         let (ipc_socket, ipc_rx) = Self::start_ipc(&cc.egui_ctx, config.ipc_socket);
         let (persisted, projects) = Self::load_projects(&config);
 
@@ -614,10 +656,10 @@ impl AlacritreeApp {
         let pr_status_concurrency = config.ui.pr_status_concurrency;
         let mut app = Self::from_parts(
             config,
+            theme,
             persisted,
             projects,
-            font_chain,
-            face_metrics,
+            fonts,
             notify_rx,
             (ipc_socket, ipc_rx),
         );
@@ -1964,10 +2006,8 @@ impl AlacritreeApp {
             let mut actions = Vec::new();
             i.events.retain(|ev| {
                 if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
-                    let matched = dispatched_actions(
-                        crate::bindings::all_matches(&self.config.bindings, *key, *modifiers),
-                        scope,
-                    );
+                    let matched =
+                        dispatched_actions(self.shortcuts.matches(*key, *modifiers), scope);
                     if !matched.is_empty() {
                         let suppress_chars = matched
                             .iter()
@@ -1995,7 +2035,7 @@ impl AlacritreeApp {
     /// app shortcuts still match in `handle_shortcuts` afterwards.
     fn handle_sidebar_nav(&mut self, ctx: &Context) {
         let filter = &mut self.sidebar.filter;
-        let bindings = &self.config.bindings;
+        let shortcuts = &self.shortcuts;
         let steps: Vec<SidebarNavStep> = ctx.input_mut(|i| {
             let mut steps = Vec::new();
             let text_keys = keys_paired_with_text(&i.events);
@@ -2014,7 +2054,7 @@ impl AlacritreeApp {
                     egui::Event::Key { key, pressed: true, modifiers, .. } => drain_search_or_nav(
                         &mut steps,
                         filter,
-                        bindings,
+                        shortcuts,
                         *key,
                         *modifiers,
                         produced_text,
@@ -2488,14 +2528,15 @@ fn modal_frame(theme: &Theme) -> Frame {
 /// rebinds.  The palette owns these keys only while it is up, which is why they
 /// are read here rather than dispatched like an ordinary action — and why they
 /// can share the sidebar's unmodified Home/End/PageUp/PageDown.
-fn consume_palette_keys(ctx: &Context, bindings: &[KeyBinding]) -> Vec<NamedAction> {
+fn consume_palette_keys(ctx: &Context, shortcuts: &crate::shortcut::Shortcuts) -> Vec<NamedAction> {
     ctx.input_mut(|i| {
         let mut jumps = Vec::new();
         i.events.retain(|ev| {
             let egui::Event::Key { key, pressed: true, modifiers, .. } = ev else {
                 return true;
             };
-            let matched: Vec<NamedAction> = bindings::all_matches(bindings, *key, *modifiers)
+            let matched: Vec<NamedAction> = shortcuts
+                .matches(*key, *modifiers)
                 .into_iter()
                 .filter_map(|a| match a {
                     BindingAction::Named(n) if n.is_palette_scoped() => Some(*n),
@@ -2785,7 +2826,7 @@ fn paint_palette_row(
 /// Bold and italic are real faces rather than a colour swap, but only the
 /// terminal font registers them — an emphasized span at a proportional site
 /// keeps the weight and shifts family rather than losing the weight.
-fn emphasis_family(e: &TextEmphasis, base: &egui::FontFamily) -> egui::FontFamily {
+fn emphasis_family(e: &TextEmphasis<Color32>, base: &egui::FontFamily) -> egui::FontFamily {
     match (e.bold, e.italic) {
         (true, true) => egui::FontFamily::Name(crate::fonts::BOLD_ITALIC_FAMILY.into()),
         (true, false) => egui::FontFamily::Name(crate::fonts::BOLD_FAMILY.into()),
@@ -2909,7 +2950,7 @@ fn path_text(
     let valign = ui.text_valign();
     let parts = path_style::split(path, style, home);
     let mut job = egui::text::LayoutJob::default();
-    let mut push = |text: String, e: &TextEmphasis| {
+    let mut push = |text: String, e: &TextEmphasis<Color32>| {
         if text.is_empty() {
             return;
         }
@@ -3069,7 +3110,7 @@ fn paint_row_status_icon(
     ui: &mut egui::Ui,
     theme: &Theme,
     status: RowStatus<'_>,
-    style: &IconStyle,
+    style: &IconStyle<Color32>,
     default_glyph: BakedGlyph,
     is_active: bool,
 ) -> Option<(egui::Rect, String)> {
@@ -3117,7 +3158,7 @@ const ICON_CLUSTER_SPACING: f32 = 2.0;
 /// while painter text draws into preallocated geometry, so each site keeps
 /// its own drawing call.
 fn resolve_icon<'a>(
-    style: &'a IconStyle,
+    style: &'a IconStyle<Color32>,
     default_glyph: BakedGlyph,
     default_color: Color32,
     default_px: f32,
@@ -3137,7 +3178,7 @@ fn resolve_icon<'a>(
 /// colour come from config, with the built-in glyph as the fallback.
 fn styled_icon_button(
     ui: &mut egui::Ui,
-    style: &IconStyle,
+    style: &IconStyle<Color32>,
     default_glyph: BakedGlyph,
     color: Color32,
     theme: &Theme,
@@ -3271,7 +3312,7 @@ fn panel_header_filter_ui(
     ui: &mut egui::Ui,
     title: &str,
     filter: &PanelFilter,
-    search_icon: &IconStyle,
+    search_icon: &IconStyle<Color32>,
     theme: &Theme,
     toggles_apply: bool,
 ) {
@@ -3344,7 +3385,7 @@ fn keys_paired_with_text(events: &[egui::Event]) -> Vec<bool> {
 fn drain_search_or_nav(
     steps: &mut Vec<SidebarNavStep>,
     filter: &mut PanelFilter,
-    bindings: &[crate::bindings::KeyBinding],
+    shortcuts: &crate::shortcut::Shortcuts,
     key: egui::Key,
     modifiers: egui::Modifiers,
     produced_text: bool,
@@ -3355,7 +3396,7 @@ fn drain_search_or_nav(
     }
     if searching {
         let mut matched = false;
-        for a in crate::bindings::all_matches(bindings, key, modifiers) {
+        for a in shortcuts.matches(key, modifiers) {
             if let BindingAction::Named(n) = a {
                 if n.is_search_scoped() {
                     steps.push(SidebarNavStep::SearchAction(*n));
@@ -3495,10 +3536,8 @@ impl AlacritreeApp {
             // session that survives it says here how to dismiss it — nothing
             // else on screen would.
             if outcome.exited && !self.sessions[idx].should_reap(hold) {
-                let chord = command_palette::first_key(
-                    &self.config.bindings,
-                    NamedAction::CloseExitedSession,
-                );
+                let chord =
+                    command_palette::first_key(&self.shortcuts, NamedAction::CloseExitedSession);
                 self.sessions[idx].write_hold_notice(chord.as_deref());
             }
             let is_visible_to_user = Some(idx) == visible_idx && focused;
@@ -3724,12 +3763,12 @@ impl AlacritreeApp {
                 i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
             )
         });
-        let jumps = consume_palette_keys(ctx, &self.config.bindings);
+        let jumps = consume_palette_keys(ctx, &self.shortcuts);
         let toggle = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::K));
 
         let items = self.palette_items();
         let marks = self.palette_marks(&items);
-        let hint = palette_hint(&self.config.bindings);
+        let hint = palette_hint(&self.shortcuts);
         let content_w = palette_content_width(s, ctx.screen_rect().width());
         let mut chosen: Option<PaletteAction> = None;
 
@@ -3851,7 +3890,7 @@ impl AlacritreeApp {
     /// then each switchable workspace.  Rebuilt each frame — cheap beside
     /// ranking, and always current as sessions and worktrees come and go.
     fn palette_items(&self) -> Vec<PaletteItem> {
-        let mut items = command_palette::action_items(&self.config.bindings);
+        let mut items = command_palette::action_items(&self.shortcuts);
         let herdr_glyph = self.config.ui.icons.herdr.or_glyph(DEFAULT_HERDR_ICON.as_str());
         for (i, profile) in self.config.profiles.iter().enumerate() {
             let index = i + 1;
@@ -3860,7 +3899,7 @@ impl AlacritreeApp {
             let config_name =
                 if index <= 9 { format!("SpawnProfile{index}") } else { String::new() };
             let command = profile_command(profile);
-            let keys = command_palette::profile_keys(&self.config.bindings, index as u8);
+            let keys = command_palette::profile_keys(&self.shortcuts, index as u8);
             items.push(PaletteItem::profile(profile.name.clone(), command, keys, &config_name));
         }
         for session in &self.sessions {
@@ -4557,7 +4596,7 @@ impl AlacritreeApp {
         let sidebar_fill = if translucent { Color32::TRANSPARENT } else { theme.sidebar_bg };
         // Opaque, this fill is what a collapsed cell shows, so it tracks the
         // terminal's background for the same reason the clear does.
-        let terminal_bg = self.grid_snapshot.default_bg(&self.config.palette);
+        let terminal_bg = self.grid_snapshot.default_bg();
         let central_fill = if translucent { Color32::TRANSPARENT } else { terminal_bg };
 
         FramePaintView { theme, modal_open, sidebar_fill, central_fill }
@@ -4620,9 +4659,9 @@ impl AlacritreeApp {
                     );
                     return;
                 };
-                let editor_text = rgb_to_color32(self.config.palette.fg);
-                let editor_hint = blend_toward(editor_text, theme.terminal_bg, 0.55);
-                let editor_error = rgb_to_color32(self.config.palette.normal[1]);
+                let editor_text = theme.editor_text;
+                let editor_hint = theme.editor_hint;
+                let editor_error = theme.error;
                 let session = &mut self.sessions[idx];
                 let allow_focus =
                     !modal_open && !self.palette.is_open() && self.focus == PaneFocus::Terminal;
@@ -4745,7 +4784,7 @@ impl eframe::App for AlacritreeApp {
         // configured one.  eframe reads it before `update`, so a colour OSC 11
         // moved this frame lands next frame; terminal output requests a repaint
         // of its own, so the stale frame is replaced rather than left up.
-        let bg = self.grid_snapshot.default_bg(&self.config.palette);
+        let bg = self.grid_snapshot.default_bg();
         // Deliberately not premultiplied, where alacritty's `renderer::clear`
         // writes `(rgb * alpha, alpha)`.  `egui_glow::clear` hands these to
         // `glClearColor` untouched and the compositor reads the framebuffer as
@@ -4770,7 +4809,7 @@ impl eframe::App for AlacritreeApp {
 
 /// Logical-pixel (normal, heading) sizes for UI text.  `[ui.font] size`
 /// overrides the normal size directly (same pt→px conversion as
-/// `FontConfig::egui_size`); the heading keeps its existing ratio to normal
+/// `FontConfig::logical_size`); the heading keeps its existing ratio to normal
 /// text.  Unset, both fall back to the `[font]`-derived values unchanged.
 fn ui_text_px(font: &FontConfig, ui_font: &UiFont) -> (f32, f32) {
     match ui_font.size {
@@ -5055,7 +5094,7 @@ fn modal_pad_x(scale: f32) -> f32 {
 
 /// The palette's footer, naming the keys actually bound to its cursor moves so
 /// a rebind shows up here instead of the hint quietly going stale.
-fn palette_hint(bindings: &[KeyBinding]) -> String {
+fn palette_hint(shortcuts: &crate::shortcut::Shortcuts) -> String {
     let mut parts = vec!["↑↓ move".to_string()];
     for (action, label) in [
         (NamedAction::PaletteTop, "top"),
@@ -5063,7 +5102,7 @@ fn palette_hint(bindings: &[KeyBinding]) -> String {
         (NamedAction::PalettePageUp, "page up"),
         (NamedAction::PalettePageDown, "page down"),
     ] {
-        if let Some(key) = command_palette::first_key(bindings, action) {
+        if let Some(key) = command_palette::first_key(shortcuts, action) {
             parts.push(format!("{key} {label}"));
         }
     }
@@ -5868,7 +5907,7 @@ mod tests {
 
     fn plain_worktree_row<'a>(
         wt: &'a crate::projects::Worktree,
-        icons: &'a crate::config::Icons,
+        icons: &'a crate::config::Icons<Color32>,
         theme: &'a Theme,
     ) -> WorktreeRowView<'a> {
         WorktreeRowView {
@@ -5893,12 +5932,13 @@ mod tests {
         config.integrations.herdr.enabled = true;
         config.integrations.herdr.show_unmatched = true;
         let (_, notify_rx) = mpsc::channel();
+        let theme = Theme::from_config(&config);
         let mut app = AlacritreeApp::from_parts(
             config,
+            theme,
             state::PersistedState::default(),
             Vec::new(),
-            Vec::new(),
-            crate::fonts::FaceMetrics::default(),
+            (Vec::new(), crate::fonts::FaceMetrics::default()),
             notify_rx,
             (None, None),
         );
@@ -5912,10 +5952,10 @@ mod tests {
         let (_, notify_rx) = mpsc::channel();
         let mut app = AlacritreeApp::from_parts(
             Config::default(),
+            Theme::from_config(&Config::default()),
             state::PersistedState::default(),
             Vec::new(),
-            Vec::new(),
-            crate::fonts::FaceMetrics::default(),
+            (Vec::new(), crate::fonts::FaceMetrics::default()),
             notify_rx,
             (None, None),
         );
@@ -7539,7 +7579,7 @@ mod tests {
         let retain = drain_search_or_nav(
             &mut steps,
             &mut f,
-            &binds,
+            &crate::shortcut::Shortcuts::new(&binds),
             egui::Key::Enter,
             egui::Modifiers::NONE,
             false,
@@ -7556,7 +7596,7 @@ mod tests {
         drain_search_or_nav(
             &mut steps,
             &mut f,
-            &binds,
+            &crate::shortcut::Shortcuts::new(&binds),
             egui::Key::Escape,
             egui::Modifiers::NONE,
             false,
@@ -7569,7 +7609,7 @@ mod tests {
         drain_search_or_nav(
             &mut steps,
             &mut f,
-            &binds,
+            &crate::shortcut::Shortcuts::new(&binds),
             egui::Key::Escape,
             egui::Modifiers::SHIFT,
             false,
@@ -7591,7 +7631,7 @@ mod tests {
         drain_search_or_nav(
             &mut steps,
             &mut f,
-            &binds,
+            &crate::shortcut::Shortcuts::new(&binds),
             egui::Key::ArrowDown,
             egui::Modifiers::NONE,
             false,
@@ -7605,7 +7645,7 @@ mod tests {
         let retain = drain_search_or_nav(
             &mut steps,
             &mut f,
-            &binds,
+            &crate::shortcut::Shortcuts::new(&binds),
             egui::Key::Space,
             egui::Modifiers::NONE,
             false,
@@ -7623,7 +7663,7 @@ mod tests {
         let retain = drain_search_or_nav(
             &mut steps,
             &mut f,
-            &binds,
+            &crate::shortcut::Shortcuts::new(&binds),
             egui::Key::Enter,
             egui::Modifiers::NONE,
             false,
@@ -7636,7 +7676,7 @@ mod tests {
         let retain = drain_search_or_nav(
             &mut steps,
             &mut f,
-            &binds,
+            &crate::shortcut::Shortcuts::new(&binds),
             egui::Key::Enter,
             egui::Modifiers::CTRL,
             false,
@@ -7656,7 +7696,7 @@ mod tests {
         let retain = drain_search_or_nav(
             &mut steps,
             &mut f,
-            &binds,
+            &crate::shortcut::Shortcuts::new(&binds),
             egui::Key::Enter,
             egui::Modifiers::NONE,
             false,
@@ -7684,7 +7724,7 @@ mod tests {
         let retain = drain_search_or_nav(
             &mut steps,
             &mut f,
-            &binds,
+            &crate::shortcut::Shortcuts::new(&binds),
             egui::Key::G,
             egui::Modifiers::NONE,
             true,
@@ -7705,7 +7745,7 @@ mod tests {
         let retain = drain_search_or_nav(
             &mut steps,
             &mut f,
-            &binds,
+            &crate::shortcut::Shortcuts::new(&binds),
             egui::Key::R,
             egui::Modifiers::SHIFT,
             true,
@@ -7728,7 +7768,7 @@ mod tests {
         let retain = drain_search_or_nav(
             &mut steps,
             &mut f,
-            &binds,
+            &crate::shortcut::Shortcuts::new(&binds),
             egui::Key::Delete,
             egui::Modifiers::NONE,
             false,
@@ -7750,8 +7790,14 @@ mod tests {
         for key in [egui::Key::ArrowLeft, egui::Key::ArrowRight, egui::Key::Tab, egui::Key::Home] {
             let mut f = searching_filter();
             let mut steps = Vec::new();
-            let retain =
-                drain_search_or_nav(&mut steps, &mut f, &binds, key, egui::Modifiers::NONE, false);
+            let retain = drain_search_or_nav(
+                &mut steps,
+                &mut f,
+                &crate::shortcut::Shortcuts::new(&binds),
+                key,
+                egui::Modifiers::NONE,
+                false,
+            );
             assert!(retain, "{key:?} produces no query text and must reach the binding table");
         }
     }
@@ -7767,7 +7813,7 @@ mod tests {
         let retain = drain_search_or_nav(
             &mut steps,
             &mut f,
-            &binds,
+            &crate::shortcut::Shortcuts::new(&binds),
             egui::Key::C,
             egui::Modifiers::CTRL,
             false,
@@ -7790,7 +7836,7 @@ mod tests {
         let retain = drain_search_or_nav(
             &mut steps,
             &mut f,
-            &binds,
+            &crate::shortcut::Shortcuts::new(&binds),
             egui::Key::S,
             egui::Modifiers::NONE,
             true,
@@ -8907,7 +8953,8 @@ mod tests {
         assert_eq!(default_theme.attention, rgb_to_color32(Config::default().palette.normal[3]));
 
         let mut config = Config::default();
-        config.ui.sidebar_attention = Some(Color32::from_rgb(0xff, 0xb8, 0x6c));
+        config.ui.sidebar_attention =
+            Some(alacritty_terminal::vte::ansi::Rgb { r: 0xff, g: 0xb8, b: 0x6c });
         let theme = Theme::from_config(&config);
         assert_eq!(theme.attention, Color32::from_rgb(0xff, 0xb8, 0x6c));
     }
@@ -9190,7 +9237,7 @@ mod tests {
     #[test]
     fn hovering_an_elided_worktree_row_reveals_the_full_name() {
         let theme = Theme::from_config(&Config::default());
-        let icons = crate::config::Icons::default();
+        let icons = crate::config::Icons::default().map_colors(rgb_to_color32);
         let wt = crate::projects::Worktree {
             name: "feature/a-branch-name-far-too-long-for-the-sidebar".to_owned(),
             path: PathBuf::from("/repo/wt"),
@@ -9334,7 +9381,7 @@ mod tests {
     fn a_styled_upstream_badge_paints_its_configured_glyph_color_and_weight() {
         let theme = Theme::from_config(&Config::default());
         let ctx = ctx_with_ui_variant_faces();
-        let mut icons = crate::config::Icons::default();
+        let mut icons = crate::config::Icons::default().map_colors(rgb_to_color32);
         icons.upstream_gone = IconStyle {
             glyph: Some("✕".to_string()),
             color: Some(Color32::RED),
@@ -9388,7 +9435,7 @@ mod tests {
         let theme = Theme::from_config(&Config::default());
         let mut filter = PanelFilter::new(&[]);
         filter.on_text("/");
-        let icons = crate::config::Icons::default();
+        let icons = crate::config::Icons::default().map_colors(rgb_to_color32);
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -9462,7 +9509,7 @@ mod tests {
     /// Rest the pointer on the worktree-row badge that painted `glyph` and
     /// report every text drawn while it lingers there.
     fn texts_while_hovering_badge(theme: &Theme, glyph: &str) -> Vec<Vec<(String, bool)>> {
-        let icons = crate::config::Icons::default();
+        let icons = crate::config::Icons::default().map_colors(rgb_to_color32);
         let wt = crate::projects::Worktree {
             name: "wt".to_owned(),
             path: PathBuf::from("/repo/wt"),
@@ -9539,7 +9586,7 @@ mod tests {
     /// buttons need the same recovery as the worktree row's.
     #[test]
     fn icon_tooltips_reach_the_session_and_home_row_buttons() {
-        let icons = crate::config::Icons::default();
+        let icons = crate::config::Icons::default().map_colors(rgb_to_color32);
         for (icon_tooltips, want) in [(true, true), (false, false)] {
             let mut config = Config::default();
             config.ui.icon_tooltips = icon_tooltips;
@@ -9613,7 +9660,6 @@ mod tests {
             config.ui.icon_tooltips = icon_tooltips;
             config.ui.sidebar_tooltips = SidebarTooltips::Off;
             let theme = Theme::from_config(&config);
-            let palette = config.palette.clone();
 
             for (kind, glyph, hint) in [
                 (ChangeKind::Modified, "M", "modified"),
@@ -9622,7 +9668,7 @@ mod tests {
             ] {
                 let change = FileChange { path: "README.md".to_owned(), kind };
                 let mut row = |ui: &mut egui::Ui| {
-                    let _ = file_row(ui, &change, &theme, &palette, false);
+                    let _ = file_row(ui, &change, &theme, false);
                 };
                 assert_eq!(
                     hint_painted_over(&mut row, glyph, hint),
@@ -9641,7 +9687,7 @@ mod tests {
     #[test]
     fn icon_tooltips_gate_the_status_slot_hint() {
         const WIDTH: f32 = 220.0;
-        let icons = crate::config::Icons::default();
+        let icons = crate::config::Icons::default().map_colors(rgb_to_color32);
         let session = |attention, activity| SessionRowData {
             id: 1,
             name: RowName::plain("zsh".to_owned()),
@@ -9702,7 +9748,7 @@ mod tests {
     #[test]
     fn an_unconfigured_action_button_is_unchanged() {
         let theme = Theme::from_config(&Config::default());
-        let icons = Icons::default();
+        let icons = Icons::default().map_colors(rgb_to_color32);
         let (glyph, font, color) = resolve_icon(
             &icons.delete_worktree,
             DEFAULT_CLOSE_ICON,
@@ -9721,7 +9767,7 @@ mod tests {
     #[test]
     fn styling_the_destructive_button_leaves_its_siblings_alone() {
         let theme = Theme::from_config(&Config::default());
-        let mut icons = Icons::default();
+        let mut icons = Icons::default().map_colors(rgb_to_color32);
         icons.delete_worktree = IconStyle {
             glyph: Some("✖".into()),
             color: Some(Color32::RED),
@@ -9779,7 +9825,7 @@ mod tests {
     fn the_delete_worktree_button_paints_its_own_key_not_its_siblings() {
         let theme = Theme::from_config(&Config::default());
         let ctx = ctx_with_ui_variant_faces();
-        let mut icons = crate::config::Icons::default();
+        let mut icons = crate::config::Icons::default().map_colors(rgb_to_color32);
         let distinctive = Color32::from_rgb(200, 30, 220);
         icons.delete_worktree =
             IconStyle { color: Some(distinctive), bold: true, ..Default::default() };
@@ -9827,7 +9873,7 @@ mod tests {
     /// egui's instant-reopen grace every time a short name goes by.
     #[test]
     fn sidebar_tooltips_modes_bound_the_row_tooltip() {
-        let icons = crate::config::Icons::default();
+        let icons = crate::config::Icons::default().map_colors(rgb_to_color32);
         let long = "feature/a-branch-name-far-too-long-for-the-sidebar";
         let short = "main";
 
@@ -9868,7 +9914,7 @@ mod tests {
 
     #[test]
     fn the_upstream_tooltip_names_the_upstream_ref() {
-        let icons = crate::config::Icons::default();
+        let icons = crate::config::Icons::default().map_colors(rgb_to_color32);
         let theme = Theme::from_config(&Config::default());
         let (_, _, _, tip) = upstream_badge(&icons, &theme, &UpstreamState::Diverged {
             upstream: "origin/x".into(),
@@ -9886,7 +9932,7 @@ mod tests {
     /// buttons.
     fn render_worktree_row_with_badges() -> Vec<egui::epaint::ClippedShape> {
         let theme = Theme::from_config(&Config::default());
-        let icons = crate::config::Icons::default();
+        let icons = crate::config::Icons::default().map_colors(rgb_to_color32);
         let wt = crate::projects::Worktree {
             name: "feature/x".to_owned(),
             path: PathBuf::from("/repo/wt"),
@@ -9938,7 +9984,7 @@ mod tests {
     #[test]
     fn hovering_an_elided_session_row_reveals_the_full_title() {
         let theme = Theme::from_config(&Config::default());
-        let icons = crate::config::Icons::default();
+        let icons = crate::config::Icons::default().map_colors(rgb_to_color32);
         let row = SessionRowData {
             id: 1,
             name: RowName::plain("cargo test --workspace --all-features -- --nocapture".to_owned()),
@@ -9983,7 +10029,6 @@ mod tests {
             let mut config = Config::default();
             config.ui.sidebar_tooltips = mode;
             let theme = Theme::from_config(&config);
-            let palette = config.palette.clone();
             let change = crate::git_status::FileChange {
                 path: path.to_owned(),
                 kind: crate::git_status::ChangeKind::Modified,
@@ -9994,9 +10039,9 @@ mod tests {
             for (kind, is_diff) in [("file", false), ("diff", true)] {
                 let texts = texts_while_hovering(140.0, |ui| {
                     if is_diff {
-                        let _ = branch_diff_row(ui, &stat, &theme, &palette, false);
+                        let _ = branch_diff_row(ui, &stat, &theme, false);
                     } else {
-                        let _ = file_row(ui, &change, &theme, &palette, false);
+                        let _ = file_row(ui, &change, &theme, false);
                     }
                 });
 
@@ -11125,8 +11170,8 @@ mod tests {
     #[test]
     fn a_live_session_keeps_its_enter() {
         let bindings = crate::bindings::parse_bindings(Vec::new());
-        let matched =
-            crate::bindings::all_matches(&bindings, egui::Key::Enter, egui::Modifiers::NONE);
+        let shortcuts = crate::shortcut::Shortcuts::new(&bindings);
+        let matched = shortcuts.matches(egui::Key::Enter, egui::Modifiers::NONE);
         assert!(
             matched
                 .iter()
@@ -11143,8 +11188,8 @@ mod tests {
     #[test]
     fn an_exited_session_dispatches_enter_to_the_close_action() {
         let bindings = crate::bindings::parse_bindings(Vec::new());
-        let matched =
-            crate::bindings::all_matches(&bindings, egui::Key::Enter, egui::Modifiers::NONE);
+        let shortcuts = crate::shortcut::Shortcuts::new(&bindings);
+        let matched = shortcuts.matches(egui::Key::Enter, egui::Modifiers::NONE);
         let scope = BindingScope { exited_session_focused: true, ..scope() };
         let dispatched = dispatched_actions(matched, scope);
         assert_eq!(dispatched.len(), 1, "{dispatched:?}");

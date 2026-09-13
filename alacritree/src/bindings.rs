@@ -1,9 +1,147 @@
 //! Parse `[[keyboard.bindings]]` from alacritty's config and match them
-//! against egui input events.
+//! against key presses. Keys and modifiers are this module's own types so the
+//! parser links no GUI framework. `shortcut` converts each binding's key to
+//! egui's once, when the app is built, and converts only a press's modifiers.
 
-use egui::{Key, Modifiers};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use strum::EnumIter;
+
+/// A key a binding can name. Variant names follow egui's, and `shortcut` maps
+/// each one to the egui key of the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, EnumIter)]
+pub enum Key {
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    ArrowUp,
+    Escape,
+    Tab,
+    Backspace,
+    Enter,
+    Space,
+    Insert,
+    Delete,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Colon,
+    Comma,
+    Backslash,
+    Slash,
+    OpenBracket,
+    CloseBracket,
+    Backtick,
+    Minus,
+    Period,
+    Plus,
+    Equals,
+    Semicolon,
+    Quote,
+    Num0,
+    Num1,
+    Num2,
+    Num3,
+    Num4,
+    Num5,
+    Num6,
+    Num7,
+    Num8,
+    Num9,
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+    G,
+    H,
+    I,
+    J,
+    K,
+    L,
+    M,
+    N,
+    O,
+    P,
+    Q,
+    R,
+    S,
+    T,
+    U,
+    V,
+    W,
+    X,
+    Y,
+    Z,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
+    F13,
+    F14,
+    F15,
+    F16,
+    F17,
+    F18,
+    F19,
+    F20,
+}
+
+/// The modifiers a binding requires, or that a key press carried.  `command`
+/// is Super on macOS; off macOS the input side raises it with every Ctrl.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub struct Modifiers {
+    pub alt: bool,
+    pub ctrl: bool,
+    pub shift: bool,
+    pub command: bool,
+}
+
+impl Modifiers {
+    pub const ALT: Self = Self { alt: true, ..Self::NONE };
+    #[cfg(target_os = "macos")]
+    pub const COMMAND: Self = Self { command: true, ..Self::NONE };
+    pub const CTRL: Self = Self { ctrl: true, ..Self::NONE };
+    pub const NONE: Self = Self { alt: false, ctrl: false, shift: false, command: false };
+    pub const SHIFT: Self = Self { shift: true, ..Self::NONE };
+
+    /// Alacritty semantics: `Control|Shift` does not fire on Ctrl alone, so alt
+    /// and shift match exactly.  Ctrl and command are only required when the
+    /// binding names them, because one Ctrl press can carry both; a binding
+    /// naming neither refuses either.
+    pub fn fires(self, required: Self) -> bool {
+        if self.alt != required.alt || self.shift != required.shift {
+            return false;
+        }
+        if !required.ctrl && !required.command {
+            return !self.ctrl && !self.command;
+        }
+        (self.ctrl || !required.ctrl) && (self.command || !required.command)
+    }
+}
+
+impl std::ops::BitOr for Modifiers {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        Self {
+            alt: self.alt || rhs.alt,
+            ctrl: self.ctrl || rhs.ctrl,
+            shift: self.shift || rhs.shift,
+            command: self.command || rhs.command,
+        }
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct KeyBinding {
@@ -791,27 +929,6 @@ fn default_bindings() -> Vec<KeyBinding> {
     b
 }
 
-/// Every binding that fires for `(key, mods)`.  Alacritty runs *all* matching
-/// bindings (see `Processor::process_key_bindings`), so the user's typical
-/// pattern of stacking `ClearLogNotice` + `chars = "\f"` on Ctrl+L works:
-/// the first action is our `Unsupported` no-op, the second writes 0x0c.
-pub fn all_matches(bindings: &[KeyBinding], key: Key, mods: Modifiers) -> Vec<&BindingAction> {
-    bindings
-        .iter()
-        .filter(|b| b.key == key && mods_match(b.mods, mods))
-        .map(|b| &b.action)
-        .collect()
-}
-
-/// Alacritty semantics: `Control|Shift` does not fire on Ctrl alone even though
-/// the modifier sets overlap.  Use egui's `matches_exact`, which requires
-/// alt/shift to match the pattern exactly while doing the platform-aware
-/// ctrl/cmd dance — egui-winit on Linux populates both `ctrl` and `command` on
-/// every Ctrl press, so a naive field-by-field eq would never match.
-fn mods_match(required: Modifiers, pressed: Modifiers) -> bool {
-    pressed.matches_exact(required)
-}
-
 fn parse_key(name: &str) -> Option<Key> {
     let n = name.trim();
     if n.len() == 1 {
@@ -824,7 +941,7 @@ fn parse_key(name: &str) -> Option<Key> {
         // key, ...), so a numpad binding can't be told apart from the main
         // key.  Aliasing would silently fire it on the standard key — drop
         // the binding instead.
-        log::warn!("ignoring {n} binding: egui cannot distinguish numpad keys");
+        log::warn!("ignoring {n} binding: numpad keys cannot be told apart from the main keys");
         return None;
     }
     Some(match n {
@@ -1266,6 +1383,10 @@ fn unescape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn all_matches(bindings: &[KeyBinding], key: Key, mods: Modifiers) -> Vec<&BindingAction> {
+        bindings.iter().filter(|b| b.key == key && mods.fires(b.mods)).map(|b| &b.action).collect()
+    }
 
     fn raw_action(key: &str, mods: Option<&str>, action: &str) -> RawBinding {
         RawBinding {

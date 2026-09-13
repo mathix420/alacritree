@@ -57,7 +57,6 @@ impl GitPanel {
 
 struct GitSidebarView {
     theme: Theme,
-    palette: crate::config::Palette,
     path: PathBuf,
     workspace_home: Option<String>,
     status: GitStatus,
@@ -88,7 +87,7 @@ impl AlacritreeApp {
     /// `handle_shortcuts`.
     pub(super) fn handle_git_sidebar_nav(&mut self, ctx: &Context) {
         let filter = &mut self.git_panel.filter;
-        let bindings = &self.config.bindings;
+        let shortcuts = &self.shortcuts;
         let steps: Vec<SidebarNavStep> = ctx.input_mut(|i| {
             let mut steps = Vec::new();
             let text_keys = keys_paired_with_text(&i.events);
@@ -107,7 +106,7 @@ impl AlacritreeApp {
                     egui::Event::Key { key, pressed: true, modifiers, .. } => drain_search_or_nav(
                         &mut steps,
                         filter,
-                        bindings,
+                        shortcuts,
                         *key,
                         *modifiers,
                         produced_text,
@@ -289,7 +288,6 @@ impl AlacritreeApp {
 
     fn git_sidebar_view(&mut self, ctx: &Context) -> Option<GitSidebarView> {
         let theme = self.theme;
-        let palette = self.config.palette.clone();
         let active_diff_key = self.active_diff_key();
         let path = match self.active_session_path() {
             Some(p) => p,
@@ -373,7 +371,6 @@ impl AlacritreeApp {
 
         Some(GitSidebarView {
             theme,
-            palette,
             path,
             workspace_home,
             status,
@@ -411,7 +408,7 @@ impl AlacritreeApp {
                         ui,
                         "Git",
                         &self.git_panel.filter,
-                        &self.config.ui.icons.search,
+                        &self.icons.search,
                         &theme,
                         self.git_panel.filter.toggles_apply(self.sidebar_focus_state.search_scope),
                     );
@@ -583,7 +580,7 @@ fn paint_git_sidebar_status(
     let status = &view.status;
     ScrollArea::vertical().show(ui, |ui| {
         if let Some(err) = &status.error {
-            ui.label(RichText::new(err).color(rgb_to_color32(view.palette.normal[1])).small());
+            ui.label(RichText::new(err).color(view.theme.error).small());
             return;
         }
 
@@ -663,7 +660,7 @@ fn paint_staged_section(
             }
             let request = DiffRequest { file: file.path.clone(), source: DiffSource::Staged };
             let is_active = view.active_diff_key.as_deref() == Some(&diff_key(&request));
-            let response = file_row(ui, file, &view.theme, &view.palette, is_active);
+            let response = file_row(ui, file, &view.theme, is_active);
             if response.clicked() {
                 requests.diff = Some(request);
             }
@@ -694,7 +691,7 @@ fn paint_unstaged_section(
             let source = unstaged_diff_source(Some(file.kind));
             let request = DiffRequest { file: file.path.clone(), source };
             let is_active = view.active_diff_key.as_deref() == Some(&diff_key(&request));
-            let response = file_row(ui, file, &view.theme, &view.palette, is_active);
+            let response = file_row(ui, file, &view.theme, is_active);
             if response.clicked() {
                 requests.diff = Some(request);
             }
@@ -749,7 +746,7 @@ fn paint_branch_section(
             continue;
         }
         let Some(source) = branch_diff_source(view.branch_base.as_deref()) else {
-            let response = branch_diff_row(ui, stat, &view.theme, &view.palette, false);
+            let response = branch_diff_row(ui, stat, &view.theme, false);
             paint_git_row_cursor(
                 ui,
                 &response,
@@ -763,7 +760,7 @@ fn paint_branch_section(
         };
         let request = DiffRequest { file: stat.path.clone(), source };
         let is_active = view.active_diff_key.as_deref() == Some(&diff_key(&request));
-        let response = branch_diff_row(ui, stat, &view.theme, &view.palette, is_active);
+        let response = branch_diff_row(ui, stat, &view.theme, is_active);
         if response.clicked() {
             requests.diff = Some(request);
         }
@@ -816,18 +813,17 @@ pub(super) fn file_row(
     ui: &mut egui::Ui,
     change: &FileChange,
     theme: &Theme,
-    palette: &crate::config::Palette,
     is_active: bool,
 ) -> egui::Response {
     let bg_idx = ui.painter().add(egui::Shape::Noop);
     let panel_x = ui.max_rect().x_range();
     let row_h = ui.spacing().interact_size.y;
     let color = match change.kind {
-        ChangeKind::Added | ChangeKind::Untracked => rgb_to_color32(palette.normal[2]),
-        ChangeKind::Modified => rgb_to_color32(palette.normal[3]),
-        ChangeKind::Deleted => rgb_to_color32(palette.normal[1]),
-        ChangeKind::Renamed => rgb_to_color32(palette.normal[4]),
-        ChangeKind::Conflicted => rgb_to_color32(palette.bright[1]),
+        ChangeKind::Added | ChangeKind::Untracked => theme.git.added,
+        ChangeKind::Modified => theme.git.modified,
+        ChangeKind::Deleted => theme.git.deleted,
+        ChangeKind::Renamed => theme.git.renamed,
+        ChangeKind::Conflicted => theme.git.conflicted,
     };
     let path_color = if is_active { theme.text } else { theme.text_dim };
     let mut path_galley = None;
@@ -873,14 +869,13 @@ pub(super) fn branch_diff_row(
     ui: &mut egui::Ui,
     stat: &crate::git_status::DiffStat,
     theme: &Theme,
-    palette: &crate::config::Palette,
     is_active: bool,
 ) -> egui::Response {
     let bg_idx = ui.painter().add(egui::Shape::Noop);
     let panel_x = ui.max_rect().x_range();
     let row_h = ui.spacing().interact_size.y;
-    let added = rgb_to_color32(palette.normal[2]);
-    let removed = rgb_to_color32(palette.normal[1]);
+    let added = theme.git.added;
+    let removed = theme.git.deleted;
     let path_color = if is_active { theme.text } else { theme.text_dim };
     let mut path_galley = None;
 
