@@ -370,15 +370,16 @@ fn agent_name_by_name(names: impl IntoIterator<Item = impl AsRef<str>>) -> Optio
 }
 
 /// TUIs that manage their own splits and cooperate with FocusLeft/
-/// FocusRight: the key is forwarded while one runs, and the TUI calls
-/// `alacritree action Focus…` over IPC once it has no window left in that
-/// direction.  Matches Linux `comm` values (`tmux: client`) and Windows
-/// image names (`nvim.exe`) alike; gvim stays out — it owns its own
-/// window and never runs inside the terminal.
+/// FocusRight (vim, nvim, tmux, zellij, herdr): the key is forwarded while
+/// one runs, and the TUI calls `alacritree action FocusLeft` or `FocusRight`
+/// over IPC once it has no split left in that direction.  Matches Linux
+/// `comm` values (`tmux: client`) and Windows image names (`nvim.exe`)
+/// alike.  gvim stays out because it owns its own window.  The WSL helper's
+/// `PROBE` script carries the same list.
 #[cfg(any(test, target_os = "linux", target_os = "macos", windows))]
 fn is_nav_tui_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    n.starts_with("nvim") || n.starts_with("vim") || n.starts_with("tmux")
+    ["nvim", "vim", "tmux", "zellij", "herdr"].iter().any(|tui| n.starts_with(tui))
 }
 
 /// FocusLeft/FocusRight passthrough decision for a shimmed WSL session: the
@@ -1711,9 +1712,10 @@ impl<R: Repaint> Session<R> {
     /// signal needs every cooperating program to publish a recognizable
     /// value, and Windows' ConPTY interleaves the console title into the
     /// stream, so a launcher touching it after vim starts clobbers vim's
-    /// own title until vim re-emits it.
+    /// own title until vim re-emits it.  A direct herdr attach is excluded:
+    /// it runs as `herdr` but draws one agent with no splits to hand back.
     pub fn nav_tui_running(&self) -> bool {
-        if self.scratchpad.is_some() {
+        if self.scratchpad.is_some() || (self.herdr_key.is_some() && !self.herdr_shared_view) {
             return false;
         }
         self.process_probe().2
@@ -3132,11 +3134,32 @@ mod tests {
         assert!(wsl_nav_tui(Some("nvim")));
         assert!(wsl_nav_tui(Some("vim")));
         assert!(wsl_nav_tui(Some("tmux: client")));
+        assert!(wsl_nav_tui(Some("zellij")));
+        assert!(wsl_nav_tui(Some("herdr")));
         // A shell, an agent, or an unknown probe must move panel focus —
         // losing passthrough beats losing the keys.
         assert!(!wsl_nav_tui(Some("bash")));
         assert!(!wsl_nav_tui(Some("claude")));
         assert!(!wsl_nav_tui(None));
+    }
+
+    /// `herdr agent attach` runs as a process named `herdr` but draws one
+    /// agent with no splits, so nothing inside it would ever hand focus back.
+    #[test]
+    fn a_direct_herdr_attach_never_takes_the_focus_keys() {
+        let mut session = pty_less_probe(SessionKind::Shell, "shell");
+        session.agent_cache.set(AgentCache {
+            polled_at: Some(Instant::now()),
+            nav_tui: true,
+            ..AgentCache::default()
+        });
+        let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
+
+        session.bind_herdr(key.clone(), false);
+        assert!(!session.nav_tui_running());
+
+        session.bind_herdr(key, true);
+        assert!(session.nav_tui_running(), "a shared view shows herdr's own splits");
     }
 
     #[test]
@@ -3145,9 +3168,13 @@ mod tests {
         assert!(is_nav_tui_name("nvim.exe"));
         assert!(is_nav_tui_name("NVIM.EXE"));
         assert!(is_nav_tui_name("vim.exe"));
+        assert!(is_nav_tui_name("herdr.exe"));
+        assert!(is_nav_tui_name("ZELLIJ.EXE"));
         // Linux comm values.
         assert!(is_nav_tui_name("nvim"));
         assert!(is_nav_tui_name("tmux: client"));
+        assert!(is_nav_tui_name("zellij"));
+        assert!(is_nav_tui_name("herdr"));
         // gvim owns its own window — it never runs inside the terminal.
         assert!(!is_nav_tui_name("gvim.exe"));
         assert!(!is_nav_tui_name("chezmoi.exe"));

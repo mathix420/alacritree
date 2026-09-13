@@ -255,8 +255,13 @@ caret there; bind them elsewhere if you want the caret back.
 - `FocusProjectsSidebar` / `FocusGitSidebar` / `FocusTerminal` — move focus to
   one specific panel. `FocusGitSidebar` defaults to `Ctrl+Shift+G`; the other
   two have no default key.
-- `FocusLeft` / `FocusRight` — directional focus moves between panels. A TUI
-  that wants the keys itself still receives them. No default keys.
+- `FocusLeft` / `FocusRight`: directional focus moves between panels. While
+  vim, nvim, tmux, zellij or herdr runs in the terminal, the terminal gets
+  `Ctrl+Left` / `Ctrl+Right` instead, so it can move between its own splits.
+  Each of them needs a binding that runs `alacritree action FocusLeft` or
+  `alacritree action FocusRight` when it has no split left in that direction.
+  Without one, focus stays inside it. A session attached to a single herdr
+  agent moves panel focus directly. No default keys.
 
 While the sidebar has focus: `Up`/`Down` move between rows, `Right`/`Left`
 expand/collapse a project (`Left` on a worktree jumps to its project),

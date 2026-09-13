@@ -236,14 +236,14 @@ while IFS=$TAB read -r id kind rest; do
         # the editor it spawned shares its group; when the leader is not itself
         # a nav TUI, scan the group so the nvim on screen is still recognized.
         case $comm in
-        nvim*|vim*|tmux*) ;;
+        nvim*|vim*|tmux*|zellij*|herdr*) ;;
         *)
           for sf in /proc/[0-9]*/stat; do
             gs=$(cat "$sf" 2>/dev/null) || continue
             set -- ${gs##*')'}
             [ "${3:-}" = "$tpgid" ] || continue
             m=$(cat "${sf%/stat}/comm" 2>/dev/null)
-            case $m in nvim*|vim*|tmux*) comm=$m; break;; esac
+            case $m in nvim*|vim*|tmux*|zellij*|herdr*) comm=$m; break;; esac
           done
           ;;
         esac
