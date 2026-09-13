@@ -30,7 +30,7 @@ impl AlacritreeApp {
     /// `multiplexer` are nullable because a plain shell has no agent, a
     /// multiplexer-backed session has no foreground job of its own to probe,
     /// and a session owning its PTY belongs to no multiplexer.
-    pub(super) fn session_json(&self, session: &Session, is_active_tab: bool) -> Value {
+    pub(super) fn session_json(&self, session: &AppSession, is_active_tab: bool) -> Value {
         let key = session.herdr_key.as_ref();
         let activity =
             herdr_backed_activity(session.activity(), self.session_herdr_status(session));

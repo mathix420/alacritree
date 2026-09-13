@@ -18,6 +18,7 @@ pub(crate) mod macos;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 
+use crate::repaint::Repaint;
 use crate::session::{Session, SessionId};
 
 /// Channel from notification-worker threads back to the app.  Set once by
@@ -50,9 +51,9 @@ pub fn latest_click(rx: &Receiver<SessionId>) -> Option<SessionId> {
 }
 
 /// Spawn a throwaway thread so the platform notifier's synchronous calls
-/// don't stall the egui paint loop.  The thread posts the session's id back
+/// don't stall the paint loop.  The thread posts the session's id back
 /// through `NOTIFY_TX` when the user clicks the notification.
-pub fn attention(session: &Session, ctx: &egui::Context) {
+pub fn attention(session: &Session<impl Repaint>, repaint: &impl Repaint) {
     let where_label = session
         .working_directory
         .as_ref()
@@ -65,25 +66,25 @@ pub fn attention(session: &Session, ctx: &egui::Context) {
         format!("{where_label} is waiting for input")
     };
     let id = session.id;
-    let ctx = ctx.clone();
+    let repaint = repaint.clone();
     std::thread::Builder::new()
         .name("alacritree-notify".into())
-        .spawn(move || worker(body, id, ctx))
+        .spawn(move || worker(body, id, repaint))
         .ok();
 }
 
 /// Deliver a clicked notification's session id to the UI thread.
-pub(crate) fn click(id: SessionId, ctx: &egui::Context) {
+pub(crate) fn click(id: SessionId, repaint: &impl Repaint) {
     if let Some(lock) = NOTIFY_TX.get() {
         if let Ok(tx) = lock.lock() {
             let _ = tx.send(id);
-            ctx.request_repaint();
+            repaint.wake();
         }
     }
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn worker(body: String, id: SessionId, ctx: egui::Context) {
+fn worker(body: String, id: SessionId, repaint: impl Repaint) {
     // `default` is the action id freedesktop notifiers fire on body-click.
     let result = notify_rust::Notification::new()
         .summary("alacritree")
@@ -101,12 +102,12 @@ fn worker(body: String, id: SessionId, ctx: egui::Context) {
         if action == "__closed" {
             return;
         }
-        click(id, &ctx);
+        click(id, &repaint);
     });
 }
 
 #[cfg(windows)]
-fn worker(body: String, id: SessionId, ctx: egui::Context) {
+fn worker(body: String, id: SessionId, repaint: impl Repaint) {
     use tauri_winrt_notification::Toast;
     // notify-rust doesn't surface WinRT activation, so drive its own backend
     // crate directly.  `show` returns immediately; the WinRT runtime holds
@@ -115,7 +116,7 @@ fn worker(body: String, id: SessionId, ctx: egui::Context) {
         .title("alacritree")
         .text1(&body)
         .on_activated(move |_action| {
-            click(id, &ctx);
+            click(id, &repaint);
             Ok(())
         })
         .show();
@@ -125,7 +126,7 @@ fn worker(body: String, id: SessionId, ctx: egui::Context) {
 }
 
 #[cfg(target_os = "macos")]
-fn worker(body: String, id: SessionId, _ctx: egui::Context) {
+fn worker(body: String, id: SessionId, _repaint: impl Repaint) {
     // Clicks come back through the UNUserNotificationCenter delegate that
     // `macos::init` installed, not through this worker.
     macos::notify(&body, id);

@@ -18,22 +18,23 @@ use alacritty_terminal::vte::ansi::{Processor, Rgb, StdSyncHandler};
 
 use crate::clipboard::Target;
 use crate::config::{Config, HoldExitedSessions, Palette};
+use crate::repaint::Repaint;
 use crate::wsl_helper::{self, WslProbe};
 use crate::{colors, herdr, scratchpad};
 
 #[derive(Clone)]
-pub struct EventProxy {
-    ctx: egui::Context,
+pub struct EventProxy<R> {
+    repaint: R,
     sender: mpsc::Sender<TermEvent>,
     /// Whether this session's grid is the one on screen.  Read from the PTY
     /// thread on every event, written by the UI thread once per frame.
     visible: Arc<AtomicBool>,
 }
 
-impl EventProxy {
-    pub fn new(ctx: egui::Context) -> (Self, mpsc::Receiver<TermEvent>) {
+impl<R: Repaint> EventProxy<R> {
+    pub fn new(repaint: R) -> (Self, mpsc::Receiver<TermEvent>) {
         let (sender, receiver) = mpsc::channel();
-        (Self { ctx, sender, visible: Arc::new(AtomicBool::new(true)) }, receiver)
+        (Self { repaint, sender, visible: Arc::new(AtomicBool::new(true)) }, receiver)
     }
 
     pub fn set_visible(&self, visible: bool) {
@@ -63,7 +64,7 @@ fn carries_payload(event: &TermEvent) -> bool {
 /// surfacing the loading transition promptly.
 const SPINNER_COALESCE: Duration = Duration::from_millis(120);
 
-impl EventListener for EventProxy {
+impl<R: Repaint> EventListener for EventProxy<R> {
     fn send_event(&self, event: TermEvent) {
         // A hidden session's grid is not on screen, so a repaint for it would
         // redraw the *visible* session to the same pixels.  Nothing then
@@ -73,7 +74,7 @@ impl EventListener for EventProxy {
         if !carries_payload(&event) {
             if self.visible.load(Ordering::Relaxed) {
                 crate::frame_log::output_arrived();
-                self.ctx.request_repaint();
+                self.repaint.wake();
             }
             return;
         }
@@ -84,9 +85,9 @@ impl EventListener for EventProxy {
             && matches!(&event, TermEvent::Title(title) if is_spinner_title(title));
         let _ = self.sender.send(event);
         if spinner_frame {
-            self.ctx.request_repaint_after(SPINNER_COALESCE);
+            self.repaint.wake_after(SPINNER_COALESCE);
         } else {
-            self.ctx.request_repaint();
+            self.repaint.wake();
         }
     }
 }
@@ -239,14 +240,14 @@ impl SessionActivity {
 /// One tab in a workspace. Shell/diff tabs own a PTY and parsed terminal;
 /// scratchpad tabs retain the same lightweight terminal allocation so the tab
 /// model stays uniform, but own no child process or event-loop thread.
-pub struct Session {
+pub struct Session<R: Repaint> {
     pub id: SessionId,
     pub title: String,
     pub working_directory: Option<PathBuf>,
     pub kind: SessionKind,
     pub size: TermSize,
     pub cell_size: (f32, f32),
-    pub term: Arc<FairMutex<Term<EventProxy>>>,
+    pub term: Arc<FairMutex<Term<EventProxy<R>>>>,
     pub events: mpsc::Receiver<TermEvent>,
     pub scratchpad: Option<scratchpad::Editor>,
     /// Latched attention flag, cleared when the user views this session.
@@ -287,7 +288,7 @@ pub struct Session {
     pending_writes: Option<Vec<u8>>,
     /// Shares this session's on-screen flag with the `EventProxy` its PTY
     /// thread posts events through.
-    proxy: EventProxy,
+    proxy: EventProxy<R>,
     exit_status: Option<ExitStatus>,
     /// Set when this session is a shell attached to a herdr agent, so the
     /// sidebar draws one row for that agent rather than two.  Dies with the
@@ -1182,13 +1183,13 @@ fn session_env(
 
 /// Everything opening a PTY needs, and nothing that has to stay on the UI
 /// thread.  Built by [`Session::pending`], consumed by [`open`].
-pub struct OpenRequest {
+pub struct OpenRequest<R> {
     id: SessionId,
     window_id: u64,
     pty_options: PtyOptions,
     window_size: WindowSize,
-    term: Arc<FairMutex<Term<EventProxy>>>,
-    proxy: EventProxy,
+    term: Arc<FairMutex<Term<EventProxy<R>>>>,
+    proxy: EventProxy<R>,
     boost: bool,
     reap: bool,
 }
@@ -1231,7 +1232,7 @@ impl Drop for Attachment {
 /// it, and the event loop that drains it.  This is the part that costs
 /// milliseconds, which is why it is a free function rather than a method —
 /// it must be callable from a thread that holds no `Session`.
-pub fn open(request: OpenRequest) -> std::io::Result<Attachment> {
+pub fn open<R: Repaint>(request: OpenRequest<R>) -> std::io::Result<Attachment> {
     let started = std::time::Instant::now();
     let OpenRequest { id, window_id, pty_options, window_size, term, proxy, boost, reap } = request;
 
@@ -1265,7 +1266,7 @@ pub fn open(request: OpenRequest) -> std::io::Result<Attachment> {
     Ok(Attachment { shell_pid, priority_job, sender: Some(sender) })
 }
 
-impl Session {
+impl<R: Repaint> Session<R> {
     pub fn bind_herdr(&mut self, key: herdr::HerdrKey, shared_view: bool) {
         let bound_at = Instant::now();
         log::debug!(
@@ -1282,7 +1283,7 @@ impl Session {
     }
 
     pub fn spawn_scratchpad(
-        ctx: egui::Context,
+        repaint: R,
         config: &Config,
         working_directory: Option<PathBuf>,
         size: TermSize,
@@ -1290,7 +1291,7 @@ impl Session {
         path: PathBuf,
     ) -> std::io::Result<Self> {
         let editor = scratchpad::Editor::open(path.clone())?;
-        let (proxy, events) = EventProxy::new(ctx);
+        let (proxy, events) = EventProxy::new(repaint);
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, proxy.clone())));
         Ok(Self {
             id: next_session_id(),
@@ -1326,7 +1327,7 @@ impl Session {
     /// through `pending_command`, so that a slow open cannot cost a frame.
     #[cfg(test)]
     pub fn spawn_command(
-        ctx: egui::Context,
+        repaint: R,
         config: &Config,
         working_directory: Option<PathBuf>,
         size: TermSize,
@@ -1337,7 +1338,7 @@ impl Session {
         kind: SessionKind,
     ) -> std::io::Result<Self> {
         let (mut session, request) = Self::pending_command(
-            ctx,
+            repaint,
             config,
             working_directory,
             size,
@@ -1354,14 +1355,14 @@ impl Session {
     /// A pending shell session plus what its PTY will need, without opening
     /// it: the shell resolution and the title, and nothing that costs a frame.
     pub fn pending_shell(
-        ctx: egui::Context,
+        repaint: R,
         config: &Config,
         working_directory: Option<PathBuf>,
         size: TermSize,
         cell_size: (f32, f32),
         shell_override: Option<Shell>,
         wsl_probe: Option<WslProbe>,
-    ) -> (Self, OpenRequest) {
+    ) -> (Self, OpenRequest<R>) {
         // Overrides are argv built in code (`wsl.exe -d <distro> --cd <dir>`),
         // so their args need Windows quoting like diff-pane argv; config
         // shells stay raw to match upstream alacritty.
@@ -1374,7 +1375,7 @@ impl Session {
             .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "shell".to_string());
         Self::pending(
-            ctx,
+            repaint,
             config,
             working_directory,
             size,
@@ -1392,7 +1393,7 @@ impl Session {
     /// for an inline diff view; once the command exits, `reap_exited_sessions`
     /// removes the tab.
     pub fn pending_command(
-        ctx: egui::Context,
+        repaint: R,
         config: &Config,
         working_directory: Option<PathBuf>,
         size: TermSize,
@@ -1401,9 +1402,9 @@ impl Session {
         args: Vec<String>,
         title: String,
         kind: SessionKind,
-    ) -> (Self, OpenRequest) {
+    ) -> (Self, OpenRequest<R>) {
         Self::pending(
-            ctx,
+            repaint,
             config,
             working_directory,
             size,
@@ -1420,7 +1421,7 @@ impl Session {
     /// channel and the arguments its PTY will be opened with.  Cheap enough
     /// for a frame, which is the whole point of the split.
     fn pending(
-        ctx: egui::Context,
+        repaint: R,
         config: &Config,
         working_directory: Option<PathBuf>,
         size: TermSize,
@@ -1430,11 +1431,11 @@ impl Session {
         kind: SessionKind,
         escape_args: bool,
         wsl_probe: Option<WslProbe>,
-    ) -> (Self, OpenRequest) {
+    ) -> (Self, OpenRequest<R>) {
         let pty_cwd = pty_working_directory(working_directory.clone(), config);
         let window_size = window_size(size, cell_size);
 
-        let (proxy, events) = EventProxy::new(ctx);
+        let (proxy, events) = EventProxy::new(repaint);
 
         let term = Term::new(term_config(config), &size, proxy.clone());
         let term = Arc::new(FairMutex::new(term));
@@ -1533,7 +1534,7 @@ impl Session {
     }
 
     /// Mark whether this session's grid is the one being painted.  Output from
-    /// a session that isn't stops waking the egui loop, so a busy agent in a
+    /// a session that isn't stops waking the UI loop, so a busy agent in a
     /// background tab no longer costs a full repaint per chunk of output.
     pub fn set_visible(&self, visible: bool) {
         self.proxy.set_visible(visible);
@@ -1806,7 +1807,7 @@ impl Session {
     }
 }
 
-impl Drop for Session {
+impl<R: Repaint> Drop for Session<R> {
     fn drop(&mut self) {
         if let Some(probe) = &self.wsl_probe {
             wsl_helper::unregister_probe(&probe.distro, &probe.key);
@@ -1922,6 +1923,7 @@ mod tests {
     use alacritty_terminal::Term;
 
     use super::*;
+    use crate::repaint::Recorder;
 
     /// A repainted frame costs a full grid paint of whatever session is on
     /// screen — milliseconds, at a maximized window.  Output from a session
@@ -1931,26 +1933,27 @@ mod tests {
     /// is what typing then queues behind.
     #[test]
     fn a_hidden_sessions_output_does_not_wake_the_ui() {
-        let ctx = egui::Context::default();
-        let (proxy, _events) = EventProxy::new(ctx.clone());
+        let repaint = Recorder::default();
+        let (proxy, _events) = EventProxy::new(repaint.clone());
         proxy.set_visible(false);
 
         proxy.send_event(TermEvent::Wakeup);
 
-        assert!(
-            !ctx.has_requested_repaint(),
+        assert_eq!(
+            repaint.wakes(),
+            0,
             "output from an off-screen session repainted the visible grid"
         );
     }
 
     #[test]
     fn a_visible_sessions_output_wakes_the_ui() {
-        let ctx = egui::Context::default();
-        let (proxy, _events) = EventProxy::new(ctx.clone());
+        let repaint = Recorder::default();
+        let (proxy, _events) = EventProxy::new(repaint.clone());
 
         proxy.send_event(TermEvent::Wakeup);
 
-        assert!(ctx.has_requested_repaint(), "the on-screen grid must repaint when it changes");
+        assert_eq!(repaint.wakes(), 1, "the on-screen grid must repaint when it changes");
     }
 
     /// An agent animating a Braille spinner in its title emits one of these
@@ -1959,26 +1962,21 @@ mod tests {
     /// — with a few agents running, that alone saturates the UI thread.
     #[test]
     fn a_hidden_sessions_spinner_frame_does_not_force_a_repaint() {
-        let ctx = egui::Context::default();
-        let (proxy, events) = EventProxy::new(ctx.clone());
+        let repaint = Recorder::default();
+        let (proxy, events) = EventProxy::new(repaint.clone());
         proxy.set_visible(false);
-
-        // The delay egui hands its repaint callback is what winit schedules
-        // the wakeup on, so it is the difference between "draw now" and "draw
-        // when convenient".  `has_requested_repaint` reports both alike.
-        let delays = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen = Arc::clone(&delays);
-        ctx.set_request_repaint_callback(move |info| {
-            seen.lock().expect("delays").push(info.delay);
-        });
 
         proxy.send_event(TermEvent::Title("⠋ claude".into()));
 
-        let delays = delays.lock().expect("delays");
-        assert_eq!(delays.len(), 1, "a spinner frame asked for more than one repaint");
-        assert!(
-            delays[0] > Duration::ZERO,
+        assert_eq!(
+            repaint.wakes(),
+            0,
             "a background spinner frame repainted the visible grid immediately"
+        );
+        assert_eq!(
+            repaint.delayed_wakes(),
+            [SPINNER_COALESCE],
+            "a spinner frame asks for exactly one deferred repaint"
         );
         assert!(
             matches!(events.try_recv(), Ok(TermEvent::Title(_))),
@@ -1993,25 +1991,26 @@ mod tests {
     /// done, so that transition is exactly the one that must not be held back.
     #[test]
     fn a_hidden_sessions_title_still_wakes_the_ui() {
-        let ctx = egui::Context::default();
-        let (proxy, _events) = EventProxy::new(ctx.clone());
+        let repaint = Recorder::default();
+        let (proxy, _events) = EventProxy::new(repaint.clone());
         proxy.set_visible(false);
 
         proxy.send_event(TermEvent::Title("claude: thinking".into()));
 
-        assert!(ctx.has_requested_repaint(), "a background title change must reach the sidebar");
+        assert_eq!(repaint.wakes(), 1, "a background title change must reach the sidebar");
     }
 
     #[test]
     fn a_hidden_sessions_pty_reply_still_wakes_the_ui() {
-        let ctx = egui::Context::default();
-        let (proxy, _events) = EventProxy::new(ctx.clone());
+        let repaint = Recorder::default();
+        let (proxy, _events) = EventProxy::new(repaint.clone());
         proxy.set_visible(false);
 
         proxy.send_event(TermEvent::TextAreaSizeRequest(Arc::new(|_| String::new())));
 
-        assert!(
-            ctx.has_requested_repaint(),
+        assert_eq!(
+            repaint.wakes(),
+            1,
             "a program blocked on a terminal reply must not wait for unrelated input"
         );
     }
@@ -2021,8 +2020,7 @@ mod tests {
     /// something else draws a frame.
     #[test]
     fn a_hidden_sessions_events_are_still_queued() {
-        let ctx = egui::Context::default();
-        let (proxy, events) = EventProxy::new(ctx);
+        let (proxy, events) = EventProxy::new(Recorder::default());
         proxy.set_visible(false);
 
         proxy.send_event(TermEvent::Title("claude: thinking".into()));
@@ -2164,7 +2162,7 @@ mod tests {
     /// stays idle, and the next frame would have to pop all of it.
     #[test]
     fn a_hidden_sessions_wakeups_do_not_accumulate() {
-        let (proxy, events) = EventProxy::new(egui::Context::default());
+        let (proxy, events) = EventProxy::new(Recorder::default());
         proxy.set_visible(false);
 
         for _ in 0..10_000 {
@@ -2222,7 +2220,7 @@ mod tests {
         config.env.insert("TERM".to_string(), "xterm-256color".to_string());
 
         let mut session = Session::spawn_command(
-            egui::Context::default(),
+            Recorder::default(),
             &config,
             std::env::current_dir().ok(),
             TermSize::new(80, 24),
@@ -2271,7 +2269,7 @@ mod tests {
     /// the real sequence through a real terminal into the real drain.
     #[test]
     fn osc52_copy_is_carried_out_to_the_clipboard() {
-        let (proxy, events) = EventProxy::new(egui::Context::default());
+        let (proxy, events) = EventProxy::new(Recorder::default());
         let size = TermSize::new(80, 24);
         let mut term = Term::new(TermConfig::default(), &size, proxy);
 
@@ -2291,9 +2289,9 @@ mod tests {
     /// event there is to drain.  A real child has to be waited out first, and
     /// on Windows its ConPTY publishes a startup title of its own that would
     /// race the injected one.
-    fn pty_less_probe(kind: SessionKind, title: &str) -> Session {
+    fn pty_less_probe(kind: SessionKind, title: &str) -> Session<Recorder> {
         let size = TermSize::new(80, 24);
-        let (proxy, events) = EventProxy::new(egui::Context::default());
+        let (proxy, events) = EventProxy::new(Recorder::default());
         let term = Arc::new(FairMutex::new(Term::new(TermConfig::default(), &size, proxy.clone())));
 
         Session {
@@ -2327,7 +2325,7 @@ mod tests {
 
     /// Drive a real OSC 0 through the real VT parser into the real drain, the
     /// way ConPTY delivers its startup title.
-    fn title_after_osc(mut session: Session, osc_title: &str) -> String {
+    fn title_after_osc(mut session: Session<Recorder>, osc_title: &str) -> String {
         let sequence = format!("\x1b]0;{osc_title}\x07");
         {
             let mut term = session.term.lock();
@@ -2434,7 +2432,7 @@ mod tests {
         return ExitStatus::from_raw(1 << 8);
     }
 
-    fn exited(status: ExitStatus, herdr_keyed: bool) -> Session {
+    fn exited(status: ExitStatus, herdr_keyed: bool) -> Session<Recorder> {
         let mut session = pty_less_probe(SessionKind::Shell, "shell");
         session.exit_status = Some(status);
         if herdr_keyed {
@@ -2620,7 +2618,7 @@ mod tests {
         config.env.insert("TERM".to_string(), "xterm-256color".to_string());
 
         let session = Session::spawn_command(
-            egui::Context::default(),
+            Recorder::default(),
             &config,
             std::env::current_dir().ok(),
             TermSize::new(80, 24),
@@ -2687,7 +2685,7 @@ mod tests {
         // the read loop through its own watcher, which is exactly the
         // unrelated event this has to do without.
         let session = Session::spawn_command(
-            egui::Context::default(),
+            Recorder::default(),
             &Config::default(),
             std::env::current_dir().ok(),
             TermSize::new(80, 24),
@@ -2821,7 +2819,7 @@ mod tests {
         let (program, args) = ("sh", vec!["-c", "pwd > cwd-probe.txt"]);
 
         let session = Session::spawn_command(
-            egui::Context::default(),
+            Recorder::default(),
             &config,
             None,
             TermSize::new(80, 24),
@@ -3189,14 +3187,14 @@ mod tests {
     #[test]
     fn an_open_request_can_move_to_the_thread_that_opens_the_pty() {
         fn assert_send<T: Send>() {}
-        assert_send::<OpenRequest>();
+        assert_send::<OpenRequest<Recorder>>();
     }
 
     /// Poll the grid until `needle` appears, or fail saying what was there
     /// instead.  A deadline rather than a sleep: the shells these tests drive
     /// take wildly different times to come up on a loaded runner.
     #[cfg(windows)]
-    fn grid_contains(session: &Session, needle: &str, patience: Duration) -> bool {
+    fn grid_contains(session: &Session<impl Repaint>, needle: &str, patience: Duration) -> bool {
         let deadline = Instant::now() + patience;
         while Instant::now() < deadline {
             let text: String = {
@@ -3219,7 +3217,7 @@ mod tests {
         let mut config = Config::default();
         config.env.insert("TERM".to_string(), "xterm-256color".to_string());
         let (mut session, request) = Session::pending_command(
-            egui::Context::default(),
+            Recorder::default(),
             &config,
             std::env::current_dir().ok(),
             TermSize::new(80, 24),
@@ -3250,7 +3248,7 @@ mod tests {
     #[test]
     fn a_resize_before_attach_reaches_the_grid() {
         let (mut session, _request) = Session::pending_command(
-            egui::Context::default(),
+            Recorder::default(),
             &Config::default(),
             None,
             TermSize::new(80, 24),

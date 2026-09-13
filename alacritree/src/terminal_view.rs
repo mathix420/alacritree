@@ -21,13 +21,14 @@ use crate::grid_gl::{Frame as GridFrame, GpuGrid};
 use crate::grid_instances::RunView;
 use crate::input::{associated_text, event_to_bytes};
 use crate::links::{self, Link};
+use crate::repaint::Repaint;
 use crate::session::{EventProxy, Session, SessionId, SessionKind, TermSize};
 use crate::{decoration_sprites, jobs, mouse, paste};
 
 #[allow(clippy::too_many_arguments)]
 pub fn show(
     ui: &mut Ui,
-    session: &mut Session,
+    session: &mut Session<impl Repaint>,
     config: &Config,
     face_metrics: &crate::fonts::FaceMetrics,
     allow_focus: bool,
@@ -222,7 +223,7 @@ pub fn show(
 fn dispatch_input(
     ui: &Ui,
     response: &Response,
-    session: &mut Session,
+    session: &mut Session<impl Repaint>,
     ime: &mut crate::ime::Ime,
     allow_focus: bool,
     mode: TermMode,
@@ -325,7 +326,7 @@ struct TermPeek {
 fn peek_term(
     ui: &Ui,
     response: &Response,
-    session: &Session,
+    session: &Session<impl Repaint>,
     rect: Rect,
     cell_w: f32,
     cell_h: f32,
@@ -352,7 +353,7 @@ fn peek_term(
 fn handle_selection(
     ui: &Ui,
     response: &Response,
-    session: &mut Session,
+    session: &mut Session<impl Repaint>,
     config: &Config,
     rect: Rect,
     cell_w: f32,
@@ -479,7 +480,7 @@ fn handle_selection(
 #[allow(clippy::too_many_arguments)]
 fn handle_mouse_reporting(
     ui: &Ui,
-    session: &mut Session,
+    session: &mut Session<impl Repaint>,
     rect: Rect,
     cell_w: f32,
     cell_h: f32,
@@ -585,7 +586,7 @@ fn button_code(button: PointerButton) -> Option<u8> {
 fn handle_wheel_scroll(
     ui: &Ui,
     response: &Response,
-    session: &mut Session,
+    session: &mut Session<impl Repaint>,
     config: &Config,
     rect: Rect,
     cell_w: f32,
@@ -640,7 +641,7 @@ fn handle_wheel_scroll(
 
 #[allow(clippy::too_many_arguments)]
 fn apply_scroll(
-    session: &mut Session,
+    session: &mut Session<impl Repaint>,
     config: &Config,
     dx_pt: f64,
     dy_pt: f64,
@@ -721,7 +722,7 @@ fn apply_scroll(
 
 #[allow(clippy::too_many_arguments)]
 fn start_selection_at(
-    session: &Session,
+    session: &Session<impl Repaint>,
     config: &Config,
     rect: Rect,
     cell_w: f32,
@@ -988,7 +989,7 @@ impl GridSnapshot {
     /// capture — comes back as the full range.
     fn collect_damage(
         &mut self,
-        term: &mut Term<EventProxy>,
+        term: &mut Term<EventProxy<impl Repaint>>,
         session: SessionId,
         link_bounds: Option<&Match>,
         selection: Option<SelectionRange>,
@@ -1060,7 +1061,7 @@ impl GridSnapshot {
 
     fn capture(
         &mut self,
-        term: &mut Term<EventProxy>,
+        term: &mut Term<EventProxy<impl Repaint>>,
         config: &Config,
         session: SessionId,
         link_bounds: Option<&Match>,
@@ -1459,7 +1460,7 @@ fn paint_grid(
 /// hide the cursor while they repaint and leave it parked wherever their last
 /// write landed, and drawing it regardless puts a block in an arbitrary spot
 /// on top of their UI.
-fn cursor_shape(term: &Term<EventProxy>) -> CursorShape {
+fn cursor_shape(term: &Term<EventProxy<impl Repaint>>) -> CursorShape {
     if term.mode().contains(TermMode::SHOW_CURSOR) {
         term.cursor_style().shape
     } else {
@@ -1661,7 +1662,7 @@ fn paint_cursor(
 fn paint_preedit(
     painter: &egui::Painter,
     rect: Rect,
-    session: &Session,
+    session: &Session<impl Repaint>,
     colors: &TerminalColors,
     font_id: &FontId,
     cell_w: f32,
@@ -1770,9 +1771,10 @@ mod tests {
     use egui::Key;
 
     use super::*;
+    use crate::repaint::Recorder;
 
-    fn term_running(output: &[u8]) -> Term<EventProxy> {
-        let (proxy, _events) = EventProxy::new(egui::Context::default());
+    fn term_running(output: &[u8]) -> Term<EventProxy<Recorder>> {
+        let (proxy, _events) = EventProxy::new(Recorder::default());
         let mut term = Term::new(TermConfig::default(), &TermSize::new(80, 24), proxy);
         Processor::<StdSyncHandler>::new().advance(&mut term, output);
         term
@@ -1782,7 +1784,10 @@ mod tests {
     /// stream.  `spawn_scratchpad` is the only constructor that builds a
     /// `Session` without a child process; dropping the editor afterwards
     /// leaves a plain terminal session behind.
-    fn headless_session(ctx: &egui::Context, config: &Config) -> (Session, tempfile::TempDir) {
+    fn headless_session(
+        ctx: &egui::Context,
+        config: &Config,
+    ) -> (Session<egui::Context>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("scratch.md");
         std::fs::write(&path, "").expect("write scratch file");
@@ -1826,7 +1831,7 @@ mod tests {
     /// everything between a PTY wakeup and the vertex buffer the GPU gets.
     fn paint_one_frame(
         ctx: &egui::Context,
-        session: &mut Session,
+        session: &mut Session<impl Repaint>,
         config: &Config,
         caches: &mut Caches,
         screen: Vec2,
@@ -1840,7 +1845,7 @@ mod tests {
     /// keystroke.
     fn paint_one_frame_on(
         ctx: &egui::Context,
-        session: &mut Session,
+        session: &mut Session<impl Repaint>,
         config: &Config,
         caches: &mut Caches,
         screen: Vec2,
@@ -1890,7 +1895,7 @@ mod tests {
     /// the end of it.
     fn painted_text(
         ctx: &egui::Context,
-        session: &mut Session,
+        session: &mut Session<impl Repaint>,
         config: &Config,
         caches: &mut Caches,
         screen: Vec2,
@@ -1967,7 +1972,7 @@ mod tests {
     /// this is where a mistake in that resolution becomes visible.
     fn painted_cells(
         ctx: &egui::Context,
-        session: &mut Session,
+        session: &mut Session<impl Repaint>,
         config: &Config,
         caches: &mut Caches,
         screen: Vec2,
@@ -2245,7 +2250,7 @@ mod tests {
     /// Where each glyph of a painted frame was placed.
     fn painted_at(
         ctx: &egui::Context,
-        session: &mut Session,
+        session: &mut Session<impl Repaint>,
         config: &Config,
         caches: &mut Caches,
         screen: Vec2,
@@ -2417,7 +2422,7 @@ mod tests {
     /// Everything a frame painted, in paint order.
     fn painted_order(
         ctx: &egui::Context,
-        session: &mut Session,
+        session: &mut Session<impl Repaint>,
         config: &Config,
         caches: &mut Caches,
         screen: Vec2,
@@ -2663,7 +2668,7 @@ mod tests {
 
     /// How much of the grid `Term` reports as damaged, as a renderer that
     /// wanted to repaint only what changed would see it.
-    fn damage_extent(term: &mut Term<EventProxy>) -> String {
+    fn damage_extent(term: &mut Term<EventProxy<impl Repaint>>) -> String {
         let extent = match term.damage() {
             alacritty_terminal::term::TermDamage::Full => "FULL".to_string(),
             alacritty_terminal::term::TermDamage::Partial(lines) => {
@@ -2684,7 +2689,7 @@ mod tests {
     #[test]
     #[ignore = "reporting harness, not an assertion"]
     fn report_damage_under_output() {
-        let (proxy, _events) = EventProxy::new(egui::Context::default());
+        let (proxy, _events) = EventProxy::new(Recorder::default());
         let mut term = Term::new(TermConfig::default(), &TermSize::new(80, 24), proxy);
         let mut parser = Processor::<StdSyncHandler>::new();
 
@@ -3120,7 +3125,7 @@ mod tests {
         gpu: Option<&'a crate::grid_gl::GpuGrid>,
         config: Config,
         ctx: egui::Context,
-        session: Session,
+        session: Session<egui::Context>,
         _dir: tempfile::TempDir,
         caches: Caches,
         parser: Processor<StdSyncHandler>,
@@ -3340,7 +3345,7 @@ mod tests {
 
     /// Text of the topmost visible grid line, as the painter would render it.
     #[cfg(windows)]
-    fn top_screen_line(session: &Session) -> String {
+    fn top_screen_line(session: &Session<impl Repaint>) -> String {
         let term = session.term.lock();
         let grid = term.grid();
         (0..grid.columns())
@@ -3354,7 +3359,7 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn wait_for_top_line(session: &Session, wanted: &str) -> Result<(), String> {
+    fn wait_for_top_line(session: &Session<impl Repaint>, wanted: &str) -> Result<(), String> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let top = top_screen_line(session);
@@ -3387,7 +3392,7 @@ mod tests {
         drop(file);
 
         let mut session = match Session::spawn_command(
-            egui::Context::default(),
+            Recorder::default(),
             &Config::default(),
             Some(dir.path().to_path_buf()),
             TermSize::new(80, 24),

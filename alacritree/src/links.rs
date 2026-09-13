@@ -12,6 +12,7 @@ use alacritty_terminal::index::{Direction, Point};
 use alacritty_terminal::term::Term;
 use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 
+use crate::repaint::Repaint;
 use crate::session::EventProxy;
 use crate::{command_ext, jobs};
 
@@ -40,7 +41,7 @@ pub struct Link {
 ///
 /// OSC 8 hyperlinks take priority over regex matches because they carry an
 /// explicit URI that may differ from the visible text.
-pub fn link_at(term: &Term<EventProxy>, point: Point) -> Option<Link> {
+pub fn link_at(term: &Term<EventProxy<impl Repaint>>, point: Point) -> Option<Link> {
     if let Some(link) = hyperlink_at(term, point) {
         return Some(link);
     }
@@ -53,7 +54,7 @@ pub fn link_at(term: &Term<EventProxy>, point: Point) -> Option<Link> {
     })
 }
 
-fn hyperlink_at(term: &Term<EventProxy>, point: Point) -> Option<Link> {
+fn hyperlink_at(term: &Term<EventProxy<impl Repaint>>, point: Point) -> Option<Link> {
     let hyperlink = term.grid()[point].hyperlink()?;
     let grid = term.grid();
 
@@ -79,7 +80,11 @@ fn hyperlink_at(term: &Term<EventProxy>, point: Point) -> Option<Link> {
     Some(Link { bounds: start..=end, uri: hyperlink.uri().to_owned() })
 }
 
-fn url_match_at(term: &Term<EventProxy>, point: Point, regex: &mut RegexSearch) -> Option<Match> {
+fn url_match_at(
+    term: &Term<EventProxy<impl Repaint>>,
+    point: Point,
+    regex: &mut RegexSearch,
+) -> Option<Match> {
     // URLs can wrap, so the scan range is the full logical line that contains
     // `point` — `line_search_left/right` follow WRAPLINE flags to cover that.
     let line_start = term.line_search_left(point);
@@ -94,7 +99,11 @@ fn url_match_at(term: &Term<EventProxy>, point: Point, regex: &mut RegexSearch) 
 /// Strip trailing punctuation and unbalanced brackets that the regex greedily
 /// includes.  Same heuristic alacritty's `HintPostProcessor` uses so a URL
 /// embedded in prose (`see (https://example.com).`) opens at the right bound.
-fn post_process(term: &Term<EventProxy>, regex_match: Match, point: Point) -> Option<Match> {
+fn post_process(
+    term: &Term<EventProxy<impl Repaint>>,
+    regex_match: Match,
+    point: Point,
+) -> Option<Match> {
     let mut iter = term.grid().iter_from(*regex_match.start());
     let end = *regex_match.end();
     let mut c = iter.cell().c;
