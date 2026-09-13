@@ -21,10 +21,11 @@ use serde_json::{Value, json};
 
 use crate::config::{self, Config, ConfigDiagnosis, ConfigFile, Profile, ShellConfig};
 use crate::crash_log::{Verdict, classify};
+use crate::diff_viewer::{Program, Viewer};
 use crate::ipc::protocol::{self, IpcRequest, SendError};
 use crate::shell_decision::{ShellDecision, shell_decision};
 use crate::wsl::{self, ShellChoice};
-use crate::{command_ext, jobs, state};
+use crate::{command_ext, jobs, state, tools};
 
 /// An instance that is wedged should not wedge the report too.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -103,11 +104,13 @@ fn report(
     overrides: &[toml::Value],
 ) -> Vec<Check> {
     let (config, _) = config::load(config_dir, overrides);
+    tools::configure(config.integrations.tool_paths());
 
     // Rows are grouped by section on the way out, so each section has to be
     // added in one run — a section split in two prints its header twice.
     let mut checks = binary_checks();
     checks.extend(gh_auth_check());
+    checks.extend(diff_viewer_check(&config.integrations.diff_viewer.viewer));
     checks.push(shell_check(config.shell.as_ref()));
     checks.extend(wsl_checks(&wsl::distros()));
     checks.extend(config_checks(&config::diagnose(config_dir, overrides)));
@@ -148,7 +151,34 @@ fn tools() -> Vec<Tool> {
 }
 
 fn binary_checks() -> Vec<Check> {
-    tools().iter().map(|tool| tool_check(tool, find(tool.program))).collect()
+    tools().iter().map(|tool| tool_check(tool, find(&configured_program(tool.program)))).collect()
+}
+
+/// The program the configured diff viewer runs. A custom pager is a shell
+/// command line git hands to a shell, not a program to look up.
+fn diff_viewer_check(viewer: &Viewer) -> Option<Check> {
+    let program = match viewer {
+        Viewer::Pager { pager: Program::Custom { .. }, .. } => return None,
+        _ => match viewer.program() {
+            Program::Tool(tool) => tools::program(*tool),
+            Program::Custom { path, .. } => path.clone(),
+        },
+    };
+    let tool = Tool {
+        program: "diff viewer",
+        consequence: "the git panel's diff pane opens an error instead of a diff",
+        need: Need::Optional,
+    };
+    Some(tool_check(&tool, find(&program)))
+}
+
+/// A registry tool's configured path, which `locate` resolves as a path when
+/// it is one; other programs are looked up by their own name.
+fn configured_program(program: &str) -> String {
+    tools::Tool::ALL
+        .into_iter()
+        .find(|tool| tool.name() == program)
+        .map_or_else(|| program.to_string(), tools::program)
 }
 
 fn tool_check(tool: &Tool, found: Option<Found>) -> Check {
@@ -185,8 +215,9 @@ fn doppler_configured() -> bool {
 // window to stall.
 #[allow(clippy::disallowed_methods)]
 fn gh_auth_check() -> Option<Check> {
-    locate("gh")?;
-    let authenticated = command_ext::hidden("gh")
+    let gh = tools::program(tools::Tool::Gh);
+    locate(&gh)?;
+    let authenticated = command_ext::hidden(&gh)
         .args(["auth", "status"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -202,18 +233,13 @@ fn gh_auth_check() -> Option<Check> {
     })
 }
 
-/// The tools alacritree resolves inside a distro, and the order a probe
-/// answers in.  `doppler` is here even though nothing runs it there yet,
-/// because [`wsl_doppler_check`] is the only place that says so.
-const WSL_TOOLS: [&str; 4] = ["git", "gh", "delta", "doppler"];
-
 /// One wsl.exe round trip per distro, in parallel and on a deadline: a distro
 /// whose VM is cold takes seconds to answer and one that is wedged never
 /// does, and a report that hangs is worse than one that says it could not
 /// tell.
 const WSL_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// What a probe of one distro found — a path per entry of [`WSL_TOOLS`] — or
+/// What a probe of one distro found. It has a path per entry of [`tools::Tool::ALL`], or
 /// why the distro could not be asked.
 type Probe = Result<Vec<Option<String>>, String>;
 
@@ -238,14 +264,17 @@ fn wsl_checks(distros: &[wsl::WslDistro]) -> Vec<Check> {
     checks
 }
 
+/// Probes every registry tool. doppler is among them even though nothing runs
+/// it inside a distro, because [`wsl_doppler_check`] is the only place that says so.
 fn probe_distros(distros: &[wsl::WslDistro]) -> Vec<(String, Probe)> {
     let (tx, rx) = std::sync::mpsc::channel();
+    let names = tools::Tool::ALL.map(tools::Tool::name);
     for distro in distros {
         let tx = tx.clone();
         let name = distro.name.clone();
+        let names = names;
         std::thread::spawn(move || {
-            let probe =
-                jobs::on_this_thread(|blocking| wsl::probe_tools(&name, &WSL_TOOLS, blocking));
+            let probe = jobs::on_this_thread(|blocking| wsl::probe_tools(&name, &names, blocking));
             let _ = tx.send((name, probe));
         });
     }
@@ -283,10 +312,10 @@ fn wsl_distro_check(name: &str, probe: &Probe) -> Check {
 
     let mut present = Vec::new();
     let mut missing = Vec::new();
-    for tool in WSL_TOOLS {
+    for tool in tools::Tool::ALL {
         match tool_path(found, tool) {
-            Some(path) => present.push(format!("{tool} {path}")),
-            None => missing.push(tool),
+            Some(path) => present.push(format!("{} {path}", tool.name())),
+            None => missing.push(tool.name()),
         }
     }
     let mut detail =
@@ -297,7 +326,8 @@ fn wsl_distro_check(name: &str, probe: &Probe) -> Check {
 
     // git is what reads a project that lives in the distro; without it the
     // sidebar lists the worktree and can say nothing else about it.
-    let status = if tool_path(found, "git").is_some() { Status::Ok } else { Status::Warn };
+    let status =
+        if tool_path(found, tools::Tool::Git).is_some() { Status::Ok } else { Status::Warn };
     check("wsl", name, status, detail)
 }
 
@@ -309,7 +339,7 @@ fn wsl_doppler_check(probes: &[(String, Probe)]) -> Option<Check> {
     let distros: Vec<&str> = probes
         .iter()
         .filter(|(_, probe)| {
-            probe.as_ref().is_ok_and(|found| tool_path(found, "doppler").is_some())
+            probe.as_ref().is_ok_and(|found| tool_path(found, tools::Tool::Doppler).is_some())
         })
         .map(|(name, _)| name.as_str())
         .collect();
@@ -324,10 +354,11 @@ fn wsl_doppler_check(probes: &[(String, Probe)]) -> Option<Check> {
     Some(check("wsl", "doppler", Status::Warn, detail))
 }
 
-/// Where a probe put `tool`, by name rather than by index, so [`WSL_TOOLS`]
-/// can be reordered without silently renaming everyone's results.
-fn tool_path<'a>(found: &'a [Option<String>], tool: &str) -> Option<&'a str> {
-    let slot = WSL_TOOLS.iter().position(|t| *t == tool)?;
+/// Where a probe put `tool`, by tool rather than by index, so
+/// [`tools::Tool::ALL`] can be reordered without silently renaming
+/// everyone's results.
+fn tool_path(found: &[Option<String>], tool: tools::Tool) -> Option<&str> {
+    let slot = tools::Tool::ALL.iter().position(|t| *t == tool)?;
     found.get(slot)?.as_deref()
 }
 
@@ -714,6 +745,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::diff_viewer::{Program, Templates, Viewer};
     use crate::state::{PersistedProject, PersistedState};
 
     const GIT: Tool =
@@ -753,6 +785,27 @@ mod tests {
         assert_eq!(tool_check(&GH, None).status, Status::Warn);
     }
 
+    /// A custom pager is a shell command line, not a program to look up.
+    #[test]
+    fn the_diff_viewer_check_looks_up_programs_only() {
+        let pager = Viewer::Pager {
+            pager: Program::Custom { path: "delta -s".to_string(), wsl_path: None },
+            args: Vec::new(),
+        };
+        assert!(diff_viewer_check(&pager).is_none());
+
+        let missing = Viewer::Direct {
+            program: Program::Custom {
+                path: "/definitely/not/here/tuicr".to_string(),
+                wsl_path: None,
+            },
+            templates: Templates::default(),
+        };
+        let check = diff_viewer_check(&missing).expect("a direct viewer is checked");
+        assert_eq!(check.name, "diff viewer");
+        assert_eq!(check.status, Status::Warn);
+    }
+
     /// Doppler drives one optional feature, and most people have never wanted
     /// it.  Warning that it is absent would put a permanent warning on every
     /// machine that simply does not use Doppler — and a report that always has
@@ -787,11 +840,19 @@ mod tests {
     /// the distro and nothing else ever names the paths they resolved to.
     #[test]
     fn a_distro_reports_where_each_tool_resolved() {
-        let found = probe(&[Some("/usr/bin/git"), Some("/home/lev/.local/bin/gh"), None, None]);
+        let found = probe(&[
+            Some("/usr/bin/git"),
+            Some("/home/lev/.local/bin/gh"),
+            None,
+            None,
+            None,
+            Some("/home/lev/.cargo/bin/tuicr"),
+        ]);
         let detail = wsl_distro_check("Ubuntu", &found).detail;
         assert!(detail.contains("git /usr/bin/git"), "{detail:?}");
         assert!(detail.contains("gh /home/lev/.local/bin/gh"), "{detail:?}");
-        assert!(detail.contains("no delta, doppler"), "{detail:?}");
+        assert!(detail.contains("tuicr /home/lev/.cargo/bin/tuicr"), "{detail:?}");
+        assert!(detail.contains("no delta, doppler, herdr"), "{detail:?}");
     }
 
     /// A distro without git reads as a repository with nothing to report:
@@ -799,11 +860,9 @@ mod tests {
     /// error is ever shown.
     #[test]
     fn a_distro_without_git_warns() {
-        assert_eq!(wsl_distro_check("Ubuntu", &probe(&[None; 4])).status, Status::Warn);
-        assert_eq!(
-            wsl_distro_check("Ubuntu", &probe(&[Some("/usr/bin/git"), None, None, None])).status,
-            Status::Ok
-        );
+        assert_eq!(wsl_distro_check("Ubuntu", &probe(&[None; 6])).status, Status::Warn);
+        let git_only = probe(&[Some("/usr/bin/git"), None, None, None, None, None]);
+        assert_eq!(wsl_distro_check("Ubuntu", &git_only).status, Status::Ok);
     }
 
     #[test]
@@ -819,8 +878,11 @@ mod tests {
     #[test]
     fn doppler_inside_a_distro_is_reported_as_unused() {
         let probes = vec![
-            ("Ubuntu".to_string(), probe(&[None, None, None, Some("/usr/bin/doppler")])),
-            ("kali-linux".to_string(), probe(&[None; 4])),
+            (
+                "Ubuntu".to_string(),
+                probe(&[None, None, None, Some("/usr/bin/doppler"), None, None]),
+            ),
+            ("kali-linux".to_string(), probe(&[None; 6])),
         ];
         let check = wsl_doppler_check(&probes).expect("a warning about the unused doppler");
         assert_eq!(check.status, Status::Warn);
@@ -830,7 +892,7 @@ mod tests {
 
     #[test]
     fn no_distro_has_doppler_and_nothing_is_said() {
-        let probes = vec![("Ubuntu".to_string(), probe(&[None; 4]))];
+        let probes = vec![("Ubuntu".to_string(), probe(&[None; 6]))];
         assert!(wsl_doppler_check(&probes).is_none());
     }
 

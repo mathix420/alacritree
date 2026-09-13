@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::projects::Worktree;
 use crate::repaint::Repaint;
+use crate::tools::{self, Tool};
 use crate::{command_ext, jobs, pr_query, wsl};
 
 /// Re-query at most this often.  PR base branches rarely change, and a stale
@@ -573,7 +574,7 @@ fn query_group(
 /// group has no slug and never reaches here.
 #[allow(clippy::disallowed_methods)] // Running `gh` is this function's job.
 fn run_graphql(cwd: &Path, query: &str, _blocking: &jobs::Blocking) -> Option<Vec<u8>> {
-    let mut child = command_ext::hidden("gh")
+    let mut child = command_ext::hidden(tools::program(Tool::Gh))
         .current_dir(cwd)
         .args(["api", "graphql", "--input", "-"])
         .stdin(Stdio::piped())
@@ -634,7 +635,7 @@ fn query_gh(path: &Path, branch: &str, blocking: &jobs::Blocking) -> Option<PrIn
     match wsl::classify(path) {
         wsl::Location::Windows(p) => {
             let owner = origin_slug(&p).map(|(owner, _)| owner);
-            let output = command_ext::hidden("gh")
+            let output = command_ext::hidden(tools::program(Tool::Gh))
                 .current_dir(p)
                 .args([
                     "pr",
@@ -658,14 +659,10 @@ fn query_gh(path: &Path, branch: &str, blocking: &jobs::Blocking) -> Option<PrIn
             }
             parse_gh_output(&output.stdout, owner.as_deref())
         },
-        // `gh` must be installed and authenticated *inside* the distro; any
-        // failure falls back to the default branch, same as a missing
-        // Windows gh.  The batch script rides the resident helper when it
-        // is up (a one-shot spawn otherwise); the capability path from the
-        // helper's hello honors per-user install dirs that the default
-        // `--exec` PATH lacks.
+        // WSL gh needs distro-local auth; the registry keeps helper-resolved
+        // per-user installs that the default `--exec` PATH cannot find.
         wsl::Location::Wsl { distro, linux_path } => {
-            let gh = crate::wsl_helper::capability_gh(&distro).unwrap_or_else(|| "gh".to_string());
+            let gh = tools::wsl_in_job(Tool::Gh, &distro, blocking);
             // The `origin` URL rides along on the first line: git2 cannot read
             // a repository that lives inside the distro, and a second round
             // trip would double the cost of a badge that already forks `gh`.
@@ -710,7 +707,7 @@ fn split_origin_url_line(stdout: &[u8]) -> (Option<&str>, &[u8]) {
 /// leaves the group on the per-branch path.
 #[allow(clippy::disallowed_methods)] // Running `gh` is this function's job.
 fn resolve_repo(cwd: &Path, _blocking: &jobs::Blocking) -> Option<(String, String)> {
-    let output = command_ext::hidden("gh")
+    let output = command_ext::hidden(tools::program(Tool::Gh))
         .current_dir(cwd)
         .args(["repo", "view", "--json", "nameWithOwner"])
         .stdout(Stdio::piped())

@@ -13,6 +13,7 @@ mod command_palette;
 mod config;
 mod crash_log;
 mod decoration_sprites;
+mod diff_viewer;
 mod digest;
 mod dll_search;
 mod doppler;
@@ -64,6 +65,7 @@ mod steady_state;
 mod terminal_view;
 #[cfg(test)]
 mod test_util;
+mod tools;
 mod upstream;
 #[cfg(windows)]
 mod win_session;
@@ -171,6 +173,7 @@ fn main() -> eframe::Result<()> {
     }
     wsl::set_automount_root(config.wsl_automount_root.clone());
     wsl_helper::set_enabled(config.wsl_resident_helper);
+    tools::configure(config.integrations.tool_paths());
     let translucent = config.window.opacity < 1.0;
 
     let mut viewport = egui::ViewportBuilder::default()

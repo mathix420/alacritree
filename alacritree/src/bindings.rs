@@ -339,6 +339,13 @@ pub enum NamedAction {
     ToggleSearchScope,
     /// Re-query `gh` for every cached worktree.
     RefreshPrStatus,
+    /// Open the git panel's Staged section in the diff viewer, or close the
+    /// pane when that section is already open.
+    ReviewStaged,
+    /// The same for the Unstaged section.
+    ReviewUnstaged,
+    /// The same for the `Changes vs` section.
+    ReviewBranch,
 }
 
 impl NamedAction {
@@ -575,6 +582,9 @@ impl NamedAction {
                 "Search inside the active filters or across every row".into()
             },
             Self::RefreshPrStatus => "Re-query GitHub for every worktree's PR".into(),
+            Self::ReviewStaged => "Review every staged change in the diff viewer".into(),
+            Self::ReviewUnstaged => "Review every unstaged change in the diff viewer".into(),
+            Self::ReviewBranch => "Review the branch against its base in the diff viewer".into(),
             Self::NoOp | Self::ReceiveChar => String::new(),
         }
     }
@@ -1130,7 +1140,7 @@ fn parse_mods(s: &str) -> Option<Modifiers> {
 /// Every simple (non-parametrized) `NamedAction`, kept in sync with the enum by
 /// hand. Mirrors the old shortcuts window's bindable list; `SelectTab`/
 /// `SpawnProfile` are excluded here because they carry an index.
-pub fn bindable_actions() -> [NamedAction; 71] {
+pub fn bindable_actions() -> [NamedAction; 74] {
     use NamedAction::*;
     [
         Paste,
@@ -1204,6 +1214,9 @@ pub fn bindable_actions() -> [NamedAction; 71] {
         ClearGitFilters,
         ToggleSearchScope,
         RefreshPrStatus,
+        ReviewStaged,
+        ReviewUnstaged,
+        ReviewBranch,
     ]
 }
 
@@ -1336,6 +1349,9 @@ pub fn parse_action(name: &str) -> BindingAction {
         "ClearGitFilters" => BindingAction::Named(ClearGitFilters),
         "ToggleSearchScope" => BindingAction::Named(ToggleSearchScope),
         "RefreshPrStatus" => BindingAction::Named(RefreshPrStatus),
+        "ReviewStaged" => BindingAction::Named(ReviewStaged),
+        "ReviewUnstaged" => BindingAction::Named(ReviewUnstaged),
+        "ReviewBranch" => BindingAction::Named(ReviewBranch),
         other => BindingAction::Unsupported(other.to_string()),
     }
 }
@@ -2051,6 +2067,9 @@ mod tests {
         all.extend(GIT_FILTER_ACTIONS);
         all.push(NamedAction::ToggleSearchScope);
         all.push(NamedAction::RefreshPrStatus);
+        all.push(NamedAction::ReviewStaged);
+        all.push(NamedAction::ReviewUnstaged);
+        all.push(NamedAction::ReviewBranch);
         all.push(NamedAction::CloseExitedSession);
         all.push(NamedAction::NewMultiplexerPane);
         all.push(NamedAction::AttachAllMultiplexerPanes);
@@ -2125,6 +2144,9 @@ mod tests {
             NamedAction::TogglePrMergedFilter,
             NamedAction::TogglePrClosedFilter,
             NamedAction::RefreshPrStatus,
+            NamedAction::ReviewStaged,
+            NamedAction::ReviewUnstaged,
+            NamedAction::ReviewBranch,
             NamedAction::ToggleSearchScope,
             NamedAction::ToggleDetachedSessionsFilter,
         ] {

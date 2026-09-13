@@ -106,7 +106,8 @@ fn section_of(a: NamedAction) -> PaletteSection {
         ToggleSessionRows | ToggleSessionTabs | ToggleSessionDrag => Sessions,
         MoveSessionUp | MoveSessionDown => Sessions,
         SelectNextWorkspace | SelectPreviousWorkspace => Workspaces,
-        AddProject | RefreshProjects | SetBaseBranch => Workspaces,
+        AddProject | RefreshProjects | SetBaseBranch | ReviewStaged | ReviewUnstaged
+        | ReviewBranch => Workspaces,
         ToggleLeftSidebar | ToggleRightSidebar | ToggleSidebarFocus => Sidebar,
         SidebarTop | SidebarBottom | SidebarNextProject | SidebarPreviousProject => Sidebar,
         DeleteSelected | RenameSelected | ToggleProjectExpanded => Sidebar,

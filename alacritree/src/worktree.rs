@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 
 use crate::repaint::Repaint;
+use crate::tools::{self, Tool};
 use crate::{command_ext, jobs, wsl};
 
 #[derive(Debug, Clone)]
@@ -186,13 +187,13 @@ fn enable_claude_terminal_bell(worktree_root: &Path) -> std::io::Result<()> {
 fn git_command(cwd: &Path) -> Command {
     match wsl::classify(cwd) {
         wsl::Location::Windows(path) => {
-            let mut cmd = command_ext::hidden("git");
+            let mut cmd = command_ext::hidden(tools::program(Tool::Git));
             cmd.arg("-C").arg(path);
             cmd
         },
         wsl::Location::Wsl { distro, linux_path } => {
             let mut cmd = wsl::command(&distro, None);
-            cmd.arg("git").arg("-C").arg(linux_path);
+            cmd.arg(tools::wsl_program(Tool::Git)).arg("-C").arg(linux_path);
             cmd
         },
     }

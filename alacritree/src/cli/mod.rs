@@ -481,7 +481,9 @@ fn dispatch(
             // state_dir` the way the window does, or we answer from a file
             // nothing is writing.  Resolved here rather than in `run` because
             // a request a running instance answers never needs the config.
-            if let Some(dir) = crate::config::load(config.dir, config.overrides).0.state_dir {
+            let resolved = crate::config::load(config.dir, config.overrides).0;
+            crate::tools::configure(resolved.integrations.tool_paths());
+            if let Some(dir) = resolved.state_dir {
                 crate::state::set_dir(dir);
             }
             offline::handle(request).map_err(SendError::Failed)
