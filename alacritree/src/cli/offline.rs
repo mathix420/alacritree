@@ -13,11 +13,11 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use crate::ipc::{IpcRequest, IpcResult};
+use crate::ipc::protocol::{self, IpcRequest, IpcResult};
 use crate::projects::{self, Project, project_json};
 use crate::state::{self, PersistedProject, PersistedState};
 use crate::worktree::{self as wt, CreateRequest};
-use crate::{git_status, ipc, jobs, scratchpad};
+use crate::{git_status, jobs, scratchpad};
 
 pub fn handle(request: &IpcRequest) -> IpcResult {
     let Some(path) = state::config_path() else {
@@ -58,7 +58,7 @@ fn handle_at(state_path: &Path, request: &IpcRequest) -> IpcResult {
             Ok(project_json(&known))
         },
         IpcRequest::GitStatus { path } => {
-            Ok(ipc::git_status_json(&jobs::on_this_thread(|blocking| {
+            Ok(protocol::git_status_json(&jobs::on_this_thread(|blocking| {
                 git_status::compute(path, None, blocking)
             })))
         },

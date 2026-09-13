@@ -68,7 +68,7 @@ impl AlacritreeApp {
         unlisted: PaneTarget,
         workspace: WorkspaceKey,
         previous: WorkspaceKey,
-        waiter: Option<mpsc::Sender<ipc::IpcResult>>,
+        waiter: Option<mpsc::Sender<ipc::protocol::IpcResult>>,
     ) -> bool {
         if let Some(id) = self.herdr_session_for(&key) {
             self.activate_session_by_id(id);
@@ -136,7 +136,7 @@ impl AlacritreeApp {
     pub(super) fn park_attach_reply(
         &mut self,
         id: SessionId,
-        waiter: Option<mpsc::Sender<ipc::IpcResult>>,
+        waiter: Option<mpsc::Sender<ipc::protocol::IpcResult>>,
     ) {
         let Some(waiter) = waiter else { return };
         if let Some(waiter) = self.pending_spawns.watch(id, waiter) {
@@ -217,7 +217,7 @@ impl AlacritreeApp {
         ctx: &Context,
         side: herdr::Side,
         workspace: WorkspaceKey,
-        waiter: Option<mpsc::Sender<ipc::IpcResult>>,
+        waiter: Option<mpsc::Sender<ipc::protocol::IpcResult>>,
     ) {
         let cwd = match multiplexer_cwd(&side, workspace.as_deref()) {
             Ok(cwd) => cwd,
@@ -288,7 +288,7 @@ impl AlacritreeApp {
     /// refusal leaves the user where they are and only has to be readable.
     pub(super) fn refuse_herdr_create(
         &mut self,
-        waiter: Option<mpsc::Sender<ipc::IpcResult>>,
+        waiter: Option<mpsc::Sender<ipc::protocol::IpcResult>>,
         message: String,
     ) {
         if let Some(waiter) = waiter {
@@ -797,7 +797,7 @@ impl AlacritreeApp {
         ctx: &Context,
         side: &str,
         terminal_id: &str,
-        reply_tx: mpsc::Sender<ipc::IpcResult>,
+        reply_tx: mpsc::Sender<ipc::protocol::IpcResult>,
     ) {
         if !self.config.integrations.herdr.enabled {
             let _ = reply_tx.send(Err(HERDR_DISABLED.to_string()));
@@ -837,7 +837,7 @@ impl AlacritreeApp {
         ctx: &Context,
         side: Option<&str>,
         workspace: Option<PathBuf>,
-        reply_tx: mpsc::Sender<ipc::IpcResult>,
+        reply_tx: mpsc::Sender<ipc::protocol::IpcResult>,
     ) {
         if !self.config.integrations.herdr.enabled {
             let _ = reply_tx.send(Err(HERDR_DISABLED.to_string()));
@@ -1128,7 +1128,7 @@ pub(super) struct PendingHerdrAttach {
     /// Clients parked on this attach.  A shared-view attach opens its session
     /// frames after the request that asked for it, so there is nothing to
     /// answer with until `poll_herdr_attach` resolves.
-    pub(super) waiters: Vec<mpsc::Sender<ipc::IpcResult>>,
+    pub(super) waiters: Vec<mpsc::Sender<ipc::protocol::IpcResult>>,
 }
 
 /// A pane being created.  The attach it turns into is the ordinary one, so
@@ -1141,7 +1141,7 @@ pub(super) struct PendingHerdrCreate {
     pub(super) job: jobs::Job<Result<CreatedPane, String>>,
     pub(super) side: herdr::Side,
     pub(super) workspace: WorkspaceKey,
-    pub(super) waiter: Option<mpsc::Sender<ipc::IpcResult>>,
+    pub(super) waiter: Option<mpsc::Sender<ipc::protocol::IpcResult>>,
 }
 
 /// A pane the listing no longer carries.  Claiming an agent is in it keeps

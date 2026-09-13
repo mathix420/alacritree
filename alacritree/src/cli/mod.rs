@@ -22,7 +22,7 @@ use std::time::Duration;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 
-use crate::ipc::{self, IpcRequest, SendError};
+use crate::ipc::protocol::{IpcRequest, LocalSocket, SendError, Transport};
 
 /// Redistributing the embedded subset obliges us to carry its notice, and
 /// installation copies only the executable — so the text ships inside it.
@@ -356,7 +356,8 @@ fn refresh(
     as_json: bool,
     config: ConfigSource<'_>,
 ) -> i32 {
-    let listed = match dispatch(&IpcRequest::ListProjects, socket, config) {
+    let transport = LocalSocket(socket);
+    let listed = match dispatch(&IpcRequest::ListProjects, &transport, config) {
         Ok(listed) => listed,
         Err(e) => return fail(&e.to_string(), as_json),
     };
@@ -366,7 +367,9 @@ fn refresh(
         let refreshed = projects
             .iter()
             .filter_map(|p| p["root"].as_str())
-            .map(|root| dispatch(&IpcRequest::RefreshProject { root: root.into() }, socket, config))
+            .map(|root| {
+                dispatch(&IpcRequest::RefreshProject { root: root.into() }, &transport, config)
+            })
             .collect::<Result<Vec<_>, _>>()
             .map(|projects| serde_json::json!({ "projects": projects }))
             .map_err(|e| e.to_string());
@@ -437,7 +440,8 @@ fn execute(
     as_json: bool,
     config: ConfigSource<'_>,
 ) -> i32 {
-    report(request, dispatch(request, socket, config).map_err(|e| e.to_string()), as_json)
+    let result = dispatch(request, &LocalSocket(socket), config).map_err(|e| e.to_string());
+    report(request, result, as_json)
 }
 
 fn report(request: &IpcRequest, result: Result<serde_json::Value, String>, as_json: bool) -> i32 {
@@ -468,10 +472,10 @@ fn fail(error: &str, as_json: bool) -> i32 {
 /// Ask a running alacritree, falling back to serving the request ourselves.
 fn dispatch(
     request: &IpcRequest,
-    socket: Option<&Path>,
+    transport: &impl Transport,
     config: ConfigSource<'_>,
 ) -> Result<serde_json::Value, SendError> {
-    match ipc::send_request(socket, request, timeout_for(request)) {
+    match transport.send(request, timeout_for(request)) {
         Err(SendError::NoInstance) => {
             // Serving the request ourselves means resolving `[general]
             // state_dir` the way the window does, or we answer from a file
@@ -806,9 +810,8 @@ mod tests {
     /// with a mutating request would edit the config of whoever ran the suite.
     #[test]
     fn a_running_app_answers_instead_of_the_offline_path() {
-        let (socket, requests) =
-            ipc::listen_for_test("cli-online", crate::repaint::Recorder::default())
-                .expect("listener");
+        let (transport, requests) =
+            crate::ipc::server::InMemory::new(crate::repaint::Recorder::default());
 
         let app = std::thread::spawn(move || {
             let call = requests.recv().expect("the request reached the app");
@@ -818,11 +821,10 @@ mod tests {
         });
 
         let config = ConfigSource { dir: None, overrides: &[] };
-        let reply =
-            dispatch(&IpcRequest::ListProjects, Some(socket.path()), config).expect("a reply");
+        let reply = dispatch(&IpcRequest::ListProjects, &transport, config).expect("a reply");
 
         // The offline path would answer with the real project list, so this
-        // sentinel is only reachable through the socket.
+        // sentinel is only reachable through the app.
         assert_eq!(reply["projects"], "answered by the app");
         app.join().unwrap();
     }
@@ -834,7 +836,7 @@ mod tests {
         let dead = std::env::temp_dir().join("alacritree-not-listening.sock");
 
         let result =
-            ipc::send_request(Some(&dead), &IpcRequest::ListProjects, Duration::from_secs(5));
+            LocalSocket(Some(&dead)).send(&IpcRequest::ListProjects, Duration::from_secs(5));
 
         assert_eq!(result, Err(SendError::NoInstance));
     }

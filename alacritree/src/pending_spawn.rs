@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 
-use crate::ipc::IpcResult;
+use crate::ipc::protocol::IpcResult;
 use crate::jobs::Job;
 use crate::session::{Attachment, SessionId};
 

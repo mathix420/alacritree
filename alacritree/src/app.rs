@@ -397,9 +397,9 @@ pub struct AlacritreeApp {
     detached_jobs: Vec<jobs::Job<()>>,
     notify_rx: Receiver<SessionId>,
     /// Requests from IPC connection threads, drained once per frame.
-    ipc_rx: Option<Receiver<ipc::AppCall>>,
+    ipc_rx: Option<Receiver<ipc::server::AppCall>>,
     /// Held for its Drop: unlinks the socket file on shutdown.
-    _ipc_socket: Option<ipc::SocketHandle>,
+    _ipc_socket: Option<ipc::server::SocketHandle>,
     /// Shared across sessions; auto-invalidated when cell size changes.
     builtin_glyphs: crate::builtin_font::BuiltinGlyphCache,
     ime: crate::ime::Ime,
@@ -462,7 +462,7 @@ impl AlacritreeApp {
         projects: Vec<Project>,
         fonts: (Vec<crate::fonts::ChainFace>, crate::fonts::FaceMetrics),
         notify_rx: Receiver<SessionId>,
-        ipc: (Option<ipc::SocketHandle>, Option<Receiver<ipc::AppCall>>),
+        ipc: (Option<ipc::server::SocketHandle>, Option<Receiver<ipc::server::AppCall>>),
     ) -> Self {
         let (font_chain, face_metrics) = fonts;
         let color_glyph_budget_mb = config.font.color_glyph_cache_mb;
@@ -4570,7 +4570,7 @@ mod tests {
     /// handed over directly under the default mode.
     fn created_pane_fixture(
         workspace: WorkspaceKey,
-        waiter: Option<mpsc::Sender<ipc::IpcResult>>,
+        waiter: Option<mpsc::Sender<ipc::protocol::IpcResult>>,
     ) -> PendingHerdrCreate {
         PendingHerdrCreate {
             job: jobs::Job::ready(Ok(CreatedPane {

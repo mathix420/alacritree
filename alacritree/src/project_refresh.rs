@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
-use crate::ipc::IpcResult;
+use crate::ipc::protocol::IpcResult;
 use crate::projects::Discovered;
 
 struct Pending {
