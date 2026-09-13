@@ -3,6 +3,10 @@
 //! its rows open.
 
 use super::*;
+use crate::diff_viewer::{
+    self, DiffRequest, DiffSource, Launch, Program, Section, Target, diff_key,
+};
+use crate::tools::{self, Tool};
 
 /// The toggle identities the git panel accepts: modified, deleted, untracked.
 pub(super) const GIT_FILTER_TOGGLES: &[char] = &['m', 'd', 'u'];
@@ -28,14 +32,6 @@ pub(super) struct GitPanel {
     /// Per-worktree override of the git panel's diff base, keyed by worktree
     /// path.  Mirrors `state.toml`; written through `state::set_base_branch`.
     pub(super) base_branch_overrides: HashMap<PathBuf, String>,
-    /// Resolved absolute path of `delta` inside each WSL distro, so diff panes
-    /// stop re-sourcing a login profile on every open.  Successes only: a miss
-    /// is never stored, so installing delta mid-session is picked up later.
-    pub(super) wsl_delta_paths: HashMap<String, String>,
-    /// In-flight delta discoveries, keyed by distro, mirroring
-    /// `pending_project_refresh` — resolved off the UI thread, adopted in
-    /// `wsl_delta_path`.
-    pub(super) pending_delta: HashMap<String, jobs::Job<Option<String>>>,
 }
 
 impl GitPanel {
@@ -49,8 +45,6 @@ impl GitPanel {
             branch_base: None,
             auto_shown: false,
             base_branch_overrides,
-            wsl_delta_paths: HashMap::new(),
-            pending_delta: HashMap::new(),
         }
     }
 }
@@ -70,13 +64,19 @@ struct GitSidebarView {
     staged_visible: HashSet<String>,
     unstaged_visible: HashSet<String>,
     branch_visible: HashSet<String>,
+    /// The section header button's label.
+    review_label: String,
+    /// The whole-section review each header offers, when enabled and available.
+    staged_review: Option<Target>,
+    unstaged_review: Option<Target>,
+    branch_review: Option<Target>,
     cursor_row: Option<git_nav::GitRow>,
     cursor_moved: bool,
 }
 
 #[derive(Default)]
 struct GitSidebarRequests {
-    diff: Option<DiffRequest>,
+    diff: Option<Target>,
     open_picker: Option<PathBuf>,
 }
 
@@ -230,7 +230,7 @@ impl AlacritreeApp {
                 if let Some(req) =
                     git_row_diff_request(&cursor, self.git_panel.branch_base.as_deref())
                 {
-                    self.open_diff(ctx, req);
+                    self.open_diff(ctx, Target::Row(req));
                 }
             },
             Key::Escape => self.focus_terminal(),
@@ -318,17 +318,24 @@ impl AlacritreeApp {
             pr_info.as_ref().map(|p| p.base_branch.as_str()),
             project_default.as_deref(),
         );
-        // Single non-blocking poll: returns the last known status and
-        // kicks off a background refresh if stale or if the hint
-        // changed since the last completed compute.  Cloned so the
-        // `self.git_panel.status` borrow ends before the cursor repair below
-        // mutates other `self` fields.
+        // Clone the non-blocking poll result before cursor repair mutates `self`.
         let status = cache.poll(effective_default.as_deref(), ctx).clone();
 
         // Prefer the resolved ref (e.g. `refs/remotes/origin/main`) so
         // the cursor's Enter-to-diff matches the branch section's rows.
         let git_branch_base =
             status.default_branch_resolved.clone().or_else(|| status.default_branch.clone());
+        let diff_viewer = &self.config.integrations.diff_viewer;
+        let review = |section: Section| {
+            let target = Target::Section(section);
+            (diff_viewer.section_buttons && diff_viewer::opens(&diff_viewer.viewer, &target))
+                .then_some(target)
+        };
+        let staged_review = review(Section::Staged);
+        let unstaged_review = review(Section::Unstaged);
+        let branch_review =
+            git_branch_base.clone().and_then(|base| review(Section::Branch { base }));
+        let review_label = diff_viewer.button_icon.clone();
         let filtering = self.git_panel.filter.is_filtering();
         let filtered = self.filtered_git_rows(&status);
         let staged_count = filtered.staged;
@@ -384,6 +391,10 @@ impl AlacritreeApp {
             staged_visible,
             unstaged_visible,
             branch_visible,
+            review_label,
+            staged_review,
+            unstaged_review,
+            branch_review,
             cursor_row,
             cursor_moved,
         })
@@ -451,52 +462,45 @@ impl AlacritreeApp {
         }
     }
 
-    /// Clicking a sidebar row either opens, replaces, or closes the workspace's
-    /// single diff pane:
-    /// - row matches the active diff → toggle off (close)
-    /// - row matches a different diff → drop the old pane, open this one
-    /// - no active diff → open a new pane
-    /// Dropping the old `Session` runs `Drop`, which sends `Msg::Shutdown` to
-    /// the event loop and exits delta cleanly.
-    fn open_diff(&mut self, ctx: &Context, req: DiffRequest) {
+    /// Choosing a row or section either opens, replaces, or closes the
+    /// workspace's single diff pane. Dropping the old `Session` sends
+    /// `Msg::Shutdown` to the event loop and exits the viewer cleanly.
+    fn open_diff(&mut self, ctx: &Context, target: Target) {
         let Some(workspace) = self.current_workspace.clone() else {
             return;
         };
-        let new_key = diff_key(&req);
-        let existing = self.sessions.iter().find(|s| {
-            s.working_directory.as_deref() == Some(&workspace)
-                && matches!(&s.kind, SessionKind::Diff { .. })
-        });
-        if let Some(session) = existing {
-            let id = session.id;
-            if matches!(&session.kind, SessionKind::Diff { key } if key == &new_key) {
-                // Routing through close_session applies the same
-                // sibling-promotion and fallback navigation as any other
-                // close, so toggling off the diff pane never strands the
-                // workspace on an empty view.
-                self.close_session(ctx, id);
-                return;
-            }
+        let new_key = target.key();
+        let existing = self
+            .sessions
+            .iter()
+            .find(|s| {
+                s.working_directory.as_deref() == Some(&workspace)
+                    && matches!(&s.kind, SessionKind::Diff { .. })
+            })
+            .map(|s| (s.id, matches!(&s.kind, SessionKind::Diff { key } if key == &new_key)));
+        if let Some((id, true)) = existing {
+            self.close_session(ctx, id);
+            return;
+        }
+        let Some(launch) = diff_viewer::plan(&self.config.integrations.diff_viewer.viewer, &target)
+        else {
+            return;
+        };
+        if let Some((id, _)) = existing {
             self.sessions.retain(|s| s.id != id);
         }
 
-        let delta_override = self.config.delta_path.clone();
         let (program, args) = match wsl::classify(&workspace) {
-            wsl::Location::Wsl { distro, .. } => match delta_override {
-                Some(delta) => build_wsl_diff_command_direct(&distro, &workspace, &req, &delta),
-                None => match self.wsl_delta_path(&distro, ctx) {
-                    Some(delta) => build_wsl_diff_command_direct(&distro, &workspace, &req, &delta),
-                    None => build_wsl_diff_command_login(&distro, &workspace, &req),
-                },
-            },
-            wsl::Location::Windows(_) => {
-                build_diff_command(delta_override.as_deref().unwrap_or("delta"), &req)
-            },
+            wsl::Location::Wsl { distro, .. } => wsl_diff_command(ctx, &distro, &workspace, launch),
+            wsl::Location::Windows(_) => native_diff_command(launch),
         };
-        let title = format!(
-            "diff: {}",
-            path_style::render(&req.file, self.config.ui.path_style.diff_title, None)
-        );
+        let title = match &target {
+            Target::Row(req) => format!(
+                "diff: {}",
+                path_style::render(&req.file, self.config.ui.path_style.diff_title, None)
+            ),
+            Target::Section(section) => format!("diff: {}", section.label()),
+        };
         let (size, cell_size) = self.next_spawn_geometry();
         let (session, request) = Session::pending_command(
             ctx.clone(),
@@ -519,45 +523,6 @@ impl AlacritreeApp {
         }
     }
 
-    /// Cached absolute path of `delta` inside `distro`, if known.  Adopts a
-    /// finished background discovery, then spawns one when the path is neither
-    /// cached nor already in flight.  Returns `None` until the first discovery
-    /// lands — callers fall back to the login-shell command meanwhile.  A miss
-    /// is never cached, so the discovery re-runs and a mid-session install is
-    /// picked up on a later open.
-    fn wsl_delta_path(&mut self, distro: &str, ctx: &Context) -> Option<String> {
-        match self.git_panel.pending_delta.get(distro).map(|job| (job.poll(), job.failed())) {
-            Some((Some(Some(path)), _)) => {
-                self.git_panel.pending_delta.remove(distro);
-                self.git_panel.wsl_delta_paths.insert(distro.to_string(), path);
-            },
-            // A found-nothing landing and a panicked lookup both clear the
-            // pending entry: the former banked its answer, the latter has
-            // none to bank, and either way it must not wedge this distro out
-            // of ever being retried.
-            Some((Some(None), _)) | Some((None, true)) => {
-                self.git_panel.pending_delta.remove(distro);
-            },
-            _ => {},
-        }
-
-        if let Some(path) = self.git_panel.wsl_delta_paths.get(distro) {
-            return Some(path.clone());
-        }
-
-        if !self.git_panel.pending_delta.contains_key(distro) {
-            let distro_owned = distro.to_string();
-            let ctx = ctx.clone();
-            let job = jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
-                let found = wsl::discover_delta(&distro_owned, blocking);
-                ctx.request_repaint();
-                found
-            });
-            self.git_panel.pending_delta.insert(distro.to_string(), job);
-        }
-        None
-    }
-
     /// Key of the diff currently displayed in this workspace, if any.  Used by
     /// the sidebar to highlight the originating row so the toggle-on-reclick
     /// behavior is discoverable.
@@ -568,6 +533,85 @@ impl AlacritreeApp {
             }
             if let SessionKind::Diff { key } = &s.kind { Some(key.clone()) } else { None }
         })
+    }
+}
+
+fn native_program(program: &Program) -> String {
+    match program {
+        Program::Tool(tool) => tools::program(*tool),
+        Program::Custom { path, .. } => path.clone(),
+    }
+}
+
+fn native_pager_value(program: &Program, args: &[String]) -> String {
+    match program {
+        Program::Tool(tool) => diff_viewer::executable_pager_command(&tools::program(*tool), args),
+        Program::Custom { path, .. } => diff_viewer::pager_command(path, args),
+    }
+}
+
+fn native_diff_command(launch: Launch) -> (String, Vec<String>) {
+    match launch {
+        Launch::Pager { pager, pager_args, git_args } => diff_viewer::native_pager_command(
+            &tools::program(Tool::Git),
+            &native_pager_value(&pager, &pager_args),
+            &git_args,
+        ),
+        Launch::Direct { program, args } => (native_program(&program), args),
+    }
+}
+
+fn wsl_program(ctx: &Context, distro: &str, program: &Program) -> Option<String> {
+    match program {
+        Program::Tool(tool) => {
+            let repaint = ctx.clone();
+            tools::wsl_resolved(*tool, distro, move || repaint.request_repaint())
+        },
+        Program::Custom { wsl_path, .. } => wsl_path.clone(),
+    }
+}
+
+fn program_name(program: &Program) -> &str {
+    match program {
+        Program::Tool(tool) => tool.name(),
+        Program::Custom { path, .. } => path,
+    }
+}
+
+fn wsl_pager_value(program: &Program, path: &str, args: &[String]) -> String {
+    match program {
+        Program::Tool(_) => diff_viewer::executable_pager_command(path, args),
+        Program::Custom { .. } => diff_viewer::pager_command(path, args),
+    }
+}
+
+fn wsl_diff_command(
+    ctx: &Context,
+    distro: &str,
+    workspace: &Path,
+    launch: Launch,
+) -> (String, Vec<String>) {
+    let git = tools::wsl_program(Tool::Git);
+    match launch {
+        Launch::Pager { pager, pager_args, git_args } => match wsl_program(ctx, distro, &pager) {
+            Some(path) => {
+                let pager = wsl_pager_value(&pager, &path, &pager_args);
+                diff_viewer::wsl_pager_command(distro, workspace, &git, &pager, &git_args)
+            },
+            None => {
+                let pager = diff_viewer::pager_command(program_name(&pager), &pager_args);
+                diff_viewer::wsl_pager_command_login(distro, workspace, &git, &pager, &git_args)
+            },
+        },
+        Launch::Direct { program, args } => match wsl_program(ctx, distro, &program) {
+            Some(path) => diff_viewer::wsl_direct_command(distro, workspace, &path, &args),
+            None => diff_viewer::wsl_direct_command_login(
+                distro,
+                workspace,
+                program_name(&program),
+                &args,
+            ),
+        },
     }
 }
 
@@ -607,13 +651,7 @@ fn paint_git_branch_header(
 ) {
     let theme = &view.theme;
     let Some(branch) = &view.status.branch else { return };
-    // A greedy `truncate()` label in a plain `horizontal` row
-    // consumes all the width, shoving any trailing widgets past
-    // the panel edge. Since the right sidebar's `ScrollArea`
-    // grows to fit its content, that overflow ratchets the whole
-    // panel wider every frame until the full branch name fits.
-    // Pin `vs <default>` to the right and let the current branch
-    // truncate in the space that's left, so the row can't overflow.
+    // Pin the base label so a long branch cannot widen the sidebar.
     let default =
         view.status.default_branch.as_deref().filter(|default| *default != branch.as_str());
     row_with_trailing(
@@ -653,28 +691,41 @@ fn paint_staged_section(
     requests: &mut GitSidebarRequests,
     section_gap: &mut f32,
 ) {
-    section(ui, &view.theme, "Staged", &view.staged_count, view.filtering, section_gap, |ui| {
-        for file in &view.status.staged {
-            if !view.staged_visible.contains(&file.path) {
-                continue;
+    let review = ReviewButton::for_target(view, view.staged_review.as_ref());
+    let clicked = section(
+        ui,
+        &view.theme,
+        "Staged",
+        &view.staged_count,
+        view.filtering,
+        section_gap,
+        review,
+        |ui| {
+            for file in &view.status.staged {
+                if !view.staged_visible.contains(&file.path) {
+                    continue;
+                }
+                let request = DiffRequest { file: file.path.clone(), source: DiffSource::Staged };
+                let is_active = view.active_diff_key.as_deref() == Some(&diff_key(&request));
+                let response = file_row(ui, file, &view.theme, is_active);
+                if response.clicked() {
+                    requests.diff = Some(Target::Row(request));
+                }
+                paint_git_row_cursor(
+                    ui,
+                    &response,
+                    &view.cursor_row,
+                    GitSection::Staged,
+                    &file.path,
+                    view.cursor_moved,
+                    &view.theme,
+                );
             }
-            let request = DiffRequest { file: file.path.clone(), source: DiffSource::Staged };
-            let is_active = view.active_diff_key.as_deref() == Some(&diff_key(&request));
-            let response = file_row(ui, file, &view.theme, is_active);
-            if response.clicked() {
-                requests.diff = Some(request);
-            }
-            paint_git_row_cursor(
-                ui,
-                &response,
-                &view.cursor_row,
-                GitSection::Staged,
-                &file.path,
-                view.cursor_moved,
-                &view.theme,
-            );
-        }
-    });
+        },
+    );
+    if clicked {
+        requests.diff = view.staged_review.clone();
+    }
 }
 
 fn paint_unstaged_section(
@@ -683,29 +734,42 @@ fn paint_unstaged_section(
     requests: &mut GitSidebarRequests,
     section_gap: &mut f32,
 ) {
-    section(ui, &view.theme, "Unstaged", &view.unstaged_count, view.filtering, section_gap, |ui| {
-        for file in &view.status.unstaged {
-            if !view.unstaged_visible.contains(&file.path) {
-                continue;
+    let review = ReviewButton::for_target(view, view.unstaged_review.as_ref());
+    let clicked = section(
+        ui,
+        &view.theme,
+        "Unstaged",
+        &view.unstaged_count,
+        view.filtering,
+        section_gap,
+        review,
+        |ui| {
+            for file in &view.status.unstaged {
+                if !view.unstaged_visible.contains(&file.path) {
+                    continue;
+                }
+                let source = unstaged_diff_source(Some(file.kind));
+                let request = DiffRequest { file: file.path.clone(), source };
+                let is_active = view.active_diff_key.as_deref() == Some(&diff_key(&request));
+                let response = file_row(ui, file, &view.theme, is_active);
+                if response.clicked() {
+                    requests.diff = Some(Target::Row(request));
+                }
+                paint_git_row_cursor(
+                    ui,
+                    &response,
+                    &view.cursor_row,
+                    GitSection::Unstaged,
+                    &file.path,
+                    view.cursor_moved,
+                    &view.theme,
+                );
             }
-            let source = unstaged_diff_source(Some(file.kind));
-            let request = DiffRequest { file: file.path.clone(), source };
-            let is_active = view.active_diff_key.as_deref() == Some(&diff_key(&request));
-            let response = file_row(ui, file, &view.theme, is_active);
-            if response.clicked() {
-                requests.diff = Some(request);
-            }
-            paint_git_row_cursor(
-                ui,
-                &response,
-                &view.cursor_row,
-                GitSection::Unstaged,
-                &file.path,
-                view.cursor_moved,
-                &view.theme,
-            );
-        }
-    });
+        },
+    );
+    if clicked {
+        requests.diff = view.unstaged_review.clone();
+    }
 }
 
 fn paint_branch_section(
@@ -724,9 +788,8 @@ fn paint_branch_section(
     let count_label = section_count_label(&view.branch_count, view.filtering);
 
     ui.add_space(std::mem::take(section_gap));
-    // Open-coded section header so the PR number can be a
-    // hyperlink while the rest stays plain text.
-    ui.horizontal(|ui| {
+    let review = ReviewButton::for_target(view, view.branch_review.as_ref());
+    let clicked = section_header(ui, &view.theme, review, |ui| {
         ui.label(RichText::new(&base_label).color(view.theme.text).strong().small());
         if let Some(pr) = &view.pr_info {
             ui.label(RichText::new("·").color(view.theme.text_muted).small());
@@ -740,6 +803,9 @@ fn paint_branch_section(
         }
         ui.label(RichText::new(count_label).color(view.theme.text_muted).small());
     });
+    if clicked {
+        requests.diff = view.branch_review.clone();
+    }
     ui.add_space(2.0);
     for stat in &view.status.branch_diff {
         if !view.branch_visible.contains(&stat.path) {
@@ -762,7 +828,7 @@ fn paint_branch_section(
         let is_active = view.active_diff_key.as_deref() == Some(&diff_key(&request));
         let response = branch_diff_row(ui, stat, &view.theme, is_active);
         if response.clicked() {
-            requests.diff = Some(request);
+            requests.diff = Some(Target::Row(request));
         }
         paint_git_row_cursor(
             ui,
@@ -776,16 +842,49 @@ fn paint_branch_section(
     }
 }
 
-/// Render a collapsed-when-empty git section.
-///
-/// Empty sections are skipped entirely — a placeholder glyph for "no files
-/// here" added visual noise without communicating anything the count badge
-/// didn't already say.
-///
-/// `gap` carries the inter-section spacing: consumed above a section that
-/// renders and re-armed below it, so spacing lands between sections but never
-/// after the last one — trailing padding would make the content overflow the
-/// panel and show a scrollbar with nothing to scroll.
+struct ReviewButton<'a> {
+    label: &'a str,
+    active: bool,
+}
+
+impl<'a> ReviewButton<'a> {
+    fn for_target(view: &'a GitSidebarView, target: Option<&Target>) -> Option<Self> {
+        let target = target?;
+        let active = view.active_diff_key.as_deref() == Some(target.key().as_str());
+        Some(Self { label: &view.review_label, active })
+    }
+}
+
+fn section_header(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    review: Option<ReviewButton>,
+    leading: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let Some(button) = review else {
+        ui.horizontal(leading);
+        return false;
+    };
+    let mut clicked = false;
+    row_with_trailing(ui, leading, |ui| {
+        let color = if button.active { theme.text } else { theme.text_muted };
+        let response = icon_tooltip(
+            ui.add(
+                egui::Label::new(RichText::new(button.label).color(color).small())
+                    .selectable(false)
+                    .sense(egui::Sense::click()),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand),
+            "Review this section in the diff viewer",
+            theme.icon_tooltips,
+        );
+        clicked = response.clicked();
+    });
+    clicked
+}
+
+/// Render a git section, skipping empty content and avoiding trailing spacing.
+#[allow(clippy::too_many_arguments)]
 fn section<R>(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -793,20 +892,22 @@ fn section<R>(
     count: &SectionCount,
     filtering: bool,
     gap: &mut f32,
+    review: Option<ReviewButton>,
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
-) {
+) -> bool {
     if count.total == 0 {
-        return;
+        return false;
     }
     ui.add_space(std::mem::take(gap));
     let label = section_count_label(count, filtering);
-    ui.horizontal(|ui| {
+    let clicked = section_header(ui, theme, review, |ui| {
         ui.label(RichText::new(title).color(theme.text).strong().small());
         ui.label(RichText::new(label).color(theme.text_muted).small());
     });
     ui.add_space(2.0);
     add_contents(ui);
     *gap = 10.0;
+    clicked
 }
 
 pub(super) fn file_row(
@@ -828,11 +929,7 @@ pub(super) fn file_row(
     let path_color = if is_active { theme.text } else { theme.text_dim };
     let mut path_galley = None;
     let mut hints = IconHints::default();
-    // `ui.horizontal` sizes its response rect to the (often short) path text,
-    // leaving most of the row's width as a dead zone — and short labels make
-    // the row barely taller than the text, so vertical misses are easy too.
-    // Allocate an explicit interact-sized row and pad it out so the click hit
-    // box spans the full panel width and the row's full height.
+    // Reserve the full row so short paths do not shrink the click target.
     let resp = ui
         .allocate_ui_with_layout(
             egui::vec2(ui.available_width(), row_h),
@@ -842,7 +939,7 @@ pub(super) fn file_row(
                 // Labels default to `Sense::click_and_drag` for text selection;
                 // hit testing picks the smallest covering widget, so a clickable
                 // label inside our row would eat clicks before the row sees
-                // them.  Opt out of selection on every label that lives inside
+                // them. Opt out of selection on every label that lives inside
                 // a clickable row so the click falls through.
                 let badge = ui.add(
                     egui::Label::new(
@@ -1053,9 +1150,23 @@ impl AlacritreeApp {
                 // wait for whatever repaint happened to come next.
                 ctx.request_repaint();
             },
+            NamedAction::ReviewStaged | NamedAction::ReviewUnstaged | NamedAction::ReviewBranch => {
+                if let Some(section) = review_section(action, self.cached_branch_base().as_deref())
+                {
+                    self.open_diff(ctx, Target::Section(section));
+                }
+            },
             _ => return false,
         }
         true
+    }
+
+    /// The base resolved by the latest status, so ReviewBranch works while the
+    /// git sidebar is hidden.
+    fn cached_branch_base(&self) -> Option<String> {
+        let path = self.active_session_path()?;
+        let status = self.git_panel.status.get(&path)?.last();
+        status.default_branch_resolved.clone().or_else(|| status.default_branch.clone())
     }
 
     pub(super) fn dispatch_git_filter(&mut self, action: NamedAction) -> bool {
@@ -1077,6 +1188,16 @@ pub(super) fn git_filter_identity(action: NamedAction) -> Option<char> {
     }
 }
 
+/// The section a Review action opens. The branch section needs a known base.
+pub(super) fn review_section(action: NamedAction, base: Option<&str>) -> Option<Section> {
+    match action {
+        NamedAction::ReviewStaged => Some(Section::Staged),
+        NamedAction::ReviewUnstaged => Some(Section::Unstaged),
+        NamedAction::ReviewBranch => Some(Section::Branch { base: base?.to_string() }),
+        _ => None,
+    }
+}
+
 /// Whether a git-status row survives the git panel's toggle dimension. Unlike
 /// `project_toggles_pass`, standing this down needs no separate `apply` flag:
 /// forcing all three toggles to `false` already makes `!any` admit every row.
@@ -1085,36 +1206,6 @@ pub(super) fn git_toggles_pass(m: bool, d: bool, u: bool, kind: ChangeKind) -> b
     !any || (m && matches!(kind, ChangeKind::Modified | ChangeKind::Renamed))
         || (d && kind == ChangeKind::Deleted)
         || (u && matches!(kind, ChangeKind::Untracked | ChangeKind::Added))
-}
-
-/// Which `git diff` flavor a sidebar click should open in delta.
-pub(super) enum DiffSource {
-    Staged,
-    Worktree,
-    Untracked,
-    /// Triple-dot diff against this base ref (merge-base, matching the
-    /// `Changes vs <branch>` sidebar section).
-    Branch {
-        base: String,
-    },
-}
-
-pub(super) struct DiffRequest {
-    pub(super) file: String,
-    pub(super) source: DiffSource,
-}
-
-/// Stable identifier for "the diff this click would open" — matched against
-/// the active diff session's `SessionKind::Diff { key }` to highlight the
-/// originating row and toggle the pane off when clicked again.
-pub(super) fn diff_key(req: &DiffRequest) -> String {
-    let tag = match &req.source {
-        DiffSource::Staged => "staged",
-        DiffSource::Worktree => "worktree",
-        DiffSource::Untracked => "untracked",
-        DiffSource::Branch { .. } => "branch",
-    };
-    format!("{tag}:{}", req.file)
 }
 
 /// The diff a git-panel cursor row would open, mirroring the render pass's
@@ -1142,103 +1233,6 @@ fn branch_diff_source(base: Option<&str>) -> Option<DiffSource> {
 /// pure addition.
 fn unstaged_diff_source(kind: Option<ChangeKind>) -> DiffSource {
     if kind == Some(ChangeKind::Untracked) { DiffSource::Untracked } else { DiffSource::Worktree }
-}
-
-/// git arguments (everything after `git`) for the requested diff — shared
-/// by the Windows and WSL pane commands.
-pub(super) fn diff_args(req: &DiffRequest) -> Vec<String> {
-    let mut args = vec!["diff".to_string()];
-    match &req.source {
-        DiffSource::Staged => args.push("--cached".to_string()),
-        DiffSource::Worktree => {},
-        // `--no-index` against /dev/null shows the untracked file as a pure
-        // addition; git special-cases "/dev/null" on every platform. Exits
-        // non-zero by design.
-        DiffSource::Untracked => args.push("--no-index".to_string()),
-        // Triple-dot diff = "from merge-base to HEAD" — matches the sidebar's
-        // `Changes vs <branch>` stat semantics in git_status.rs.
-        DiffSource::Branch { base } => args.push(format!("{base}...")),
-    }
-    args.push("--".to_string());
-    if matches!(req.source, DiffSource::Untracked) {
-        args.push("/dev/null".to_string());
-    }
-    args.push(req.file.clone());
-    args
-}
-
-/// Show the clicked file's `git diff` in `delta`, wired in as git's pager so
-/// git drives the pipe itself.  This drops the POSIX-`sh` dependency the old
-/// `sh -c '… | delta'` had — which had no equivalent on Windows, so diffs never
-/// opened there.  Paths/branches stay in argv, so no file name is shell-parsed.
-/// `delta` is the resolved program (bare `delta` from PATH, or a user override).
-pub(super) fn build_diff_command(delta: &str, req: &DiffRequest) -> (String, Vec<String>) {
-    let mut args = vec!["-c".to_string(), format!("core.pager={delta} --paging=always")];
-    args.extend(diff_args(req));
-    ("git".to_string(), args)
-}
-
-/// The distro-side diff when `delta`'s absolute path is known (autodiscovered
-/// or a user override): a plain `sh` finds it without sourcing a login profile,
-/// so this avoids the per-open profile cost of the login fallback.
-///
-/// The `LESS=R` the diff pane puts in the child's environment stays on the
-/// Windows side of the wsl.exe boundary (only `WSLENV`-listed variables
-/// cross), so git in the distro would hand its pager `LESS=FRX` and `F`
-/// (quit-if-one-screen) would reap short diffs on open.  The script exports
-/// `LESS` itself where git runs.  Diff arguments travel as positional
-/// parameters, so no file name is shell-parsed.
-pub(super) fn build_wsl_diff_command_direct(
-    distro: &str,
-    workspace: &Path,
-    req: &DiffRequest,
-    delta: &str,
-) -> (String, Vec<String>) {
-    let script = format!(
-        r#"export LESS="${{LESS-R}}"; exec git -c "core.pager={delta} --paging=always" "$@""#
-    );
-    let mut args = vec![
-        "-d".to_string(),
-        distro.to_string(),
-        "--cd".to_string(),
-        workspace.to_string_lossy().into_owned(),
-        "--exec".to_string(),
-        "sh".to_string(),
-        "-c".to_string(),
-        script,
-        "sh".to_string(),
-    ];
-    args.extend(diff_args(req));
-    ("wsl.exe".to_string(), args)
-}
-
-/// The distro-side diff before `delta`'s path is known: resolve the user's
-/// login shell (`getent passwd`) and re-exec through it so `delta` resolves
-/// from their real PATH — `--exec sh` alone only sees the default system PATH,
-/// which omits per-user install dirs like `~/.cargo/bin`.  The `LESS` export
-/// happens inside the login shell's script, after the profile is sourced, so
-/// a profile-set `LESS` wins — mirroring the `[env]` precedence on the
-/// Windows side.  Diff arguments travel as positional parameters through both
-/// shells, so no file name is shell-parsed.
-pub(super) fn build_wsl_diff_command_login(
-    distro: &str,
-    workspace: &Path,
-    req: &DiffRequest,
-) -> (String, Vec<String>) {
-    let script = r#"s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=${SHELL:-/bin/sh}; exec "$s" -lc 'export LESS="${LESS-R}"; exec git -c "core.pager=delta --paging=always" "$@"' "$s" "$@""#;
-    let mut args = vec![
-        "-d".to_string(),
-        distro.to_string(),
-        "--cd".to_string(),
-        workspace.to_string_lossy().into_owned(),
-        "--exec".to_string(),
-        "sh".to_string(),
-        "-c".to_string(),
-        script.to_string(),
-        "sh".to_string(),
-    ];
-    args.extend(diff_args(req));
-    ("wsl.exe".to_string(), args)
 }
 
 /// Section header count: `visible of total` while a filter narrows the panel,
@@ -1313,6 +1307,125 @@ fn paint_row_bg(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff_viewer::{Section, Templates, Viewer};
+
+    #[test]
+    fn a_review_action_names_its_section_and_the_branch_needs_a_base() {
+        assert_eq!(review_section(NamedAction::ReviewStaged, None), Some(Section::Staged));
+        assert_eq!(review_section(NamedAction::ReviewUnstaged, None), Some(Section::Unstaged));
+        assert_eq!(review_section(NamedAction::ReviewBranch, None), None);
+        assert_eq!(
+            review_section(NamedAction::ReviewBranch, Some("main")),
+            Some(Section::Branch { base: "main".to_string() })
+        );
+        assert_eq!(review_section(NamedAction::Paste, Some("main")), None);
+    }
+
+    /// An app whose current workspace shows a diff pane under `key`. The
+    /// session is never spawned, so no viewer runs.
+    fn app_with_diff_pane(key: &str) -> (AlacritreeApp, SessionId) {
+        let workspace = PathBuf::from("C:/repo/wt");
+        let (_, notify_rx) = std::sync::mpsc::channel();
+        let mut app = AlacritreeApp::from_parts(
+            Config::default(),
+            Theme::from_config(&Config::default()),
+            crate::state::PersistedState::default(),
+            Vec::new(),
+            (Vec::new(), crate::fonts::FaceMetrics::default()),
+            notify_rx,
+            (None, None),
+        );
+        app.config.ui.last_session_close = crate::config::LastSessionClose::Navigate;
+        let (survivor, _) = Session::pending_command(
+            Context::default(),
+            &app.config,
+            Some(workspace.clone()),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            "inert".to_string(),
+            Vec::new(),
+            "survivor".to_string(),
+            SessionKind::Shell,
+        );
+        let survivor_id = survivor.id;
+        app.sessions.push(survivor);
+        let (session, _) = Session::pending_command(
+            Context::default(),
+            &app.config,
+            Some(workspace.clone()),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            "git".to_string(),
+            Vec::new(),
+            "diff".to_string(),
+            SessionKind::Diff { key: key.to_string() },
+        );
+        app.sessions.push(session);
+        app.current_workspace = Some(workspace);
+        (app, survivor_id)
+    }
+
+    fn has_diff_pane(app: &AlacritreeApp) -> bool {
+        app.sessions.iter().any(|s| matches!(s.kind, SessionKind::Diff { .. }))
+    }
+
+    #[test]
+    fn choosing_the_open_section_again_closes_its_pane() {
+        let (mut app, survivor_id) = app_with_diff_pane("section:staged");
+        let before = app.sessions.len();
+        app.open_diff(&Context::default(), Target::Section(Section::Staged));
+        assert_eq!(app.sessions.len(), before - 1);
+        assert!(!has_diff_pane(&app));
+        assert!(app.sessions.iter().any(|session| session.id == survivor_id));
+        assert!(app.modals.error_dialog.is_none());
+    }
+
+    #[test]
+    fn a_section_the_viewer_cannot_open_leaves_the_open_pane_alone() {
+        let (mut app, _) = app_with_diff_pane("staged:a.rs");
+        app.config.integrations.diff_viewer.viewer = Viewer::Direct {
+            program: Program::Custom { path: "difft".to_string(), wsl_path: None },
+            templates: Templates::default(),
+        };
+        app.open_diff(&Context::default(), Target::Section(Section::Staged));
+        assert!(has_diff_pane(&app));
+    }
+
+    #[test]
+    fn a_wsl_diff_uses_the_configured_wsl_git_not_the_native_git() {
+        let _lock = crate::tools::test_configuration_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        struct RestoreToolConfiguration([crate::tools::ToolPaths; 6]);
+        impl Drop for RestoreToolConfiguration {
+            fn drop(&mut self) {
+                crate::tools::configure(self.0.clone());
+            }
+        }
+        let _restore = RestoreToolConfiguration(crate::tools::test_configuration());
+        let mut configured = crate::tools::Tool::ALL.map(crate::tools::ToolPaths::named);
+        configured[crate::tools::Tool::Git as usize] = crate::tools::ToolPaths {
+            native: "C:/native/git.exe".to_string(),
+            wsl: Some("/opt/wsl/bin/git".to_string()),
+        };
+        crate::tools::configure(configured);
+        let launch = Launch::Pager {
+            pager: Program::Custom {
+                path: "delta --side-by-side".to_string(),
+                wsl_path: Some("/opt/delta".to_string()),
+            },
+            pager_args: Vec::new(),
+            git_args: vec!["diff".to_string()],
+        };
+        let (_, args) = wsl_diff_command(
+            &Context::default(),
+            "kali-linux",
+            Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj"),
+            launch,
+        );
+        assert_eq!(args[9], "/opt/wsl/bin/git");
+        assert!(!args[9..].iter().any(|arg| arg == "C:/native/git.exe"));
+    }
 
     #[test]
     fn base_branch_precedence_is_override_then_pr_then_default() {
@@ -1343,104 +1456,6 @@ mod tests {
         assert!(git_row_diff_request(&row, None).is_none());
         let request = git_row_diff_request(&row, Some("main")).expect("a base makes it clickable");
         assert!(matches!(request.source, DiffSource::Branch { base } if base == "main"));
-    }
-
-    fn req(file: &str, source: DiffSource) -> DiffRequest {
-        DiffRequest { file: file.to_string(), source }
-    }
-
-    #[test]
-    fn diff_args_staged() {
-        let args = diff_args(&req("a.rs", DiffSource::Staged));
-        assert_eq!(args, vec!["diff", "--cached", "--", "a.rs"]);
-    }
-
-    #[test]
-    fn diff_args_worktree() {
-        let args = diff_args(&req("a.rs", DiffSource::Worktree));
-        assert_eq!(args, vec!["diff", "--", "a.rs"]);
-    }
-
-    #[test]
-    fn diff_args_untracked() {
-        let args = diff_args(&req("a.rs", DiffSource::Untracked));
-        assert_eq!(args, vec!["diff", "--no-index", "--", "/dev/null", "a.rs"]);
-    }
-
-    #[test]
-    fn diff_args_branch() {
-        let args = diff_args(&req("a.rs", DiffSource::Branch { base: "main".to_string() }));
-        assert_eq!(args, vec!["diff", "main...", "--", "a.rs"]);
-    }
-
-    #[test]
-    fn diff_command_uses_given_delta_program() {
-        let (program, args) = build_diff_command("delta", &req("a.rs", DiffSource::Staged));
-        assert_eq!(program, "git");
-        assert_eq!(args[0], "-c");
-        assert_eq!(args[1], "core.pager=delta --paging=always");
-        assert_eq!(&args[2..], diff_args(&req("a.rs", DiffSource::Staged)).as_slice());
-    }
-
-    #[test]
-    fn diff_command_honors_delta_override_path() {
-        let (_, args) =
-            build_diff_command(r"C:\tools\delta.exe", &req("a.rs", DiffSource::Worktree));
-        assert_eq!(args[1], r"core.pager=C:\tools\delta.exe --paging=always");
-    }
-
-    #[test]
-    fn wsl_diff_direct_uses_resolved_delta_and_keeps_pager_open() {
-        let (program, args) = build_wsl_diff_command_direct(
-            "kali-linux",
-            Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj"),
-            &req("a.rs", DiffSource::Staged),
-            "/home/lev/.cargo/bin/delta",
-        );
-        assert_eq!(program, "wsl.exe");
-        assert_eq!(args[..8], [
-            "-d",
-            "kali-linux",
-            "--cd",
-            r"\\wsl.localhost\kali-linux\home\lev\proj",
-            "--exec",
-            "sh",
-            "-c",
-            r#"export LESS="${LESS-R}"; exec git -c "core.pager=/home/lev/.cargo/bin/delta --paging=always" "$@""#,
-        ]);
-        assert_eq!(args[8], "sh");
-        assert_eq!(&args[9..], diff_args(&req("a.rs", DiffSource::Staged)).as_slice());
-    }
-
-    #[test]
-    fn wsl_diff_login_resolves_shell_and_keeps_pager_open() {
-        let (program, args) = build_wsl_diff_command_login(
-            "kali-linux",
-            Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj"),
-            &req("a.rs", DiffSource::Staged),
-        );
-        assert_eq!(program, "wsl.exe");
-        assert_eq!(args[..7], [
-            "-d",
-            "kali-linux",
-            "--cd",
-            r"\\wsl.localhost\kali-linux\home\lev\proj",
-            "--exec",
-            "sh",
-            "-c"
-        ]);
-        let script = &args[7];
-        assert!(script.contains("getent passwd"), "resolves login shell: {script}");
-        // The LESS export lives inside the login shell's script so a LESS
-        // sourced from the profile still wins.
-        assert!(
-            script.contains(
-                r#"-lc 'export LESS="${LESS-R}"; exec git -c "core.pager=delta --paging=always" "$@"'"#
-            ),
-            "keeps pager open after profile sourcing: {script}"
-        );
-        assert_eq!(args[8], "sh");
-        assert_eq!(&args[9..], diff_args(&req("a.rs", DiffSource::Staged)).as_slice());
     }
 
     #[test]

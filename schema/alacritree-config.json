@@ -117,6 +117,9 @@
                 "ClearGitFilters",
                 "ToggleSearchScope",
                 "RefreshPrStatus",
+                "ReviewStaged",
+                "ReviewUnstaged",
+                "ReviewBranch",
                 "SelectTab1",
                 "SelectTab2",
                 "SelectTab3",
@@ -317,6 +320,87 @@
         }
       ]
     },
+    "RawCustomDiffViewer": {
+      "properties": {
+        "branch": {
+          "default": [],
+          "description": "Arguments for a `Changes vs` row. `{file}` is the row's path and\n`{base}` the branch it diffs against.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "branch_scope": {
+          "default": [],
+          "description": "Arguments for the `Changes vs` section header. `{base}` is the branch\nit diffs against.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "pager": {
+          "default": "",
+          "description": "Pager mode: a command git runs as `core.pager` for the panel's own\n`git diff`. Set this or `path`, never both.",
+          "type": "string"
+        },
+        "path": {
+          "default": "",
+          "description": "Direct mode: a program that renders the diff itself, run with the\nargument list below that matches what was chosen. An empty list makes\nthat row kind or section open nothing.",
+          "type": "string"
+        },
+        "staged": {
+          "default": [],
+          "description": "Arguments for a staged row. `{file}` is the row's path.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "staged_scope": {
+          "default": [],
+          "description": "Arguments for the Staged section header.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "unstaged": {
+          "default": [],
+          "description": "Arguments for an unstaged row. `{file}` is the row's path.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "unstaged_scope": {
+          "default": [],
+          "description": "Arguments for the Unstaged section header.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "untracked": {
+          "default": [],
+          "description": "Arguments for an untracked row. `{file}` is the row's path.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "wsl_pager": {
+          "default": "",
+          "description": "Pager mode inside WSL: the command git runs as `core.pager` there.\nEmpty runs `pager` through the distro's login shell.",
+          "type": "string"
+        },
+        "wsl_path": {
+          "default": "",
+          "description": "Direct mode inside WSL: the program to run there, as written. Empty\nruns `path` through the distro's login shell, which finds a bare name.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "RawDebug": {
       "description": "alacritty's `[debug]` section, plus one alacritree-only key.",
       "properties": {
@@ -372,6 +456,65 @@
           "default": "0px",
           "description": "Shift or scale of the underline's stroke weight.  Every style draws\nwith this value, including double and curly.",
           "pattern": "^(-?[0-9]*\\.?[0-9]+(px|pt)?|[0-9]*\\.?[0-9]+%)$",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "RawDelta": {
+      "properties": {
+        "path": {
+          "default": "delta",
+          "description": "The program to run on Windows or natively. Its own name is\nlooked up on PATH; any other value runs as written.",
+          "type": "string"
+        },
+        "wsl_path": {
+          "default": "",
+          "description": "The program to run inside every WSL distro, as written. Empty\nfinds it by name through the distro's login shell.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "RawDiffViewer": {
+      "properties": {
+        "button_icon": {
+          "default": "review",
+          "description": "The glyph or word the section header button shows.",
+          "type": "string"
+        },
+        "custom": {
+          "$ref": "#/$defs/RawCustomDiffViewer",
+          "description": "The viewer `preset = \"custom\"` runs."
+        },
+        "preset": {
+          "default": "delta",
+          "description": "\"delta\" pipes git's diff through delta. \"tuicr\" opens tuicr's review\nTUI, which saves each comment for agents to read. \"custom\" runs\n`[integrations.diff_viewer.custom]`.",
+          "enum": [
+            "delta",
+            "tuicr",
+            "custom"
+          ],
+          "type": "string"
+        },
+        "section_buttons": {
+          "default": false,
+          "description": "Draw a button on each git panel section header that opens the whole\nsection in the viewer. The ReviewStaged, ReviewUnstaged and\nReviewBranch actions work either way.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "RawDoppler": {
+      "properties": {
+        "path": {
+          "default": "doppler",
+          "description": "The program to run on Windows or natively. Its own name is\nlooked up on PATH; any other value runs as written.",
+          "type": "string"
+        },
+        "wsl_path": {
+          "default": "",
+          "description": "The program to run inside every WSL distro, as written. Empty\nfinds it by name through the distro's login shell.",
           "type": "string"
         }
       },
@@ -519,6 +662,36 @@
       },
       "type": "object"
     },
+    "RawGh": {
+      "properties": {
+        "path": {
+          "default": "gh",
+          "description": "The program to run on Windows or natively. Its own name is\nlooked up on PATH; any other value runs as written.",
+          "type": "string"
+        },
+        "wsl_path": {
+          "default": "",
+          "description": "The program to run inside every WSL distro, as written. Empty\nfinds it by name through the distro's login shell.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "RawGit": {
+      "properties": {
+        "path": {
+          "default": "git",
+          "description": "The program to run on Windows or natively. Its own name is\nlooked up on PATH; any other value runs as written.",
+          "type": "string"
+        },
+        "wsl_path": {
+          "default": "",
+          "description": "The program to run inside every WSL distro, as written. Empty\nfinds it by name through the distro's login shell.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "RawHerdr": {
       "properties": {
         "attach": {
@@ -545,6 +718,11 @@
           ],
           "type": "string"
         },
+        "path": {
+          "default": "herdr",
+          "description": "The program to run on Windows or natively. Its own name is looked up\non PATH; any other value runs as written.",
+          "type": "string"
+        },
         "poll_interval_ms": {
           "default": 2000,
           "description": "How often a reachable herdr server is re-polled for agent state.",
@@ -561,6 +739,11 @@
           "default": true,
           "description": "List panes whose working directory matches no worktree, under Home.",
           "type": "boolean"
+        },
+        "wsl_path": {
+          "default": "",
+          "description": "The program to run inside every WSL distro, as written. Empty finds it\nby name through the distro's login shell.",
+          "type": "string"
         }
       },
       "type": "object"
@@ -755,9 +938,33 @@
     },
     "RawIntegrations": {
       "properties": {
+        "delta": {
+          "$ref": "#/$defs/RawDelta",
+          "description": "The pager the delta diff viewer runs."
+        },
+        "diff_viewer": {
+          "$ref": "#/$defs/RawDiffViewer",
+          "description": "What the git panel's diff pane runs."
+        },
+        "doppler": {
+          "$ref": "#/$defs/RawDoppler",
+          "description": "The Doppler CLI behind scope mirroring for new worktrees."
+        },
+        "gh": {
+          "$ref": "#/$defs/RawGh",
+          "description": "The GitHub CLI behind PR badges and diff base branches."
+        },
+        "git": {
+          "$ref": "#/$defs/RawGit",
+          "description": "The git CLI, for the commands alacritree spawns. Repository reads go\nthrough libgit2, and scripts inside WSL find git on that distro's PATH."
+        },
         "herdr": {
           "$ref": "#/$defs/RawHerdr",
           "description": "Agents running under a herdr server."
+        },
+        "tuicr": {
+          "$ref": "#/$defs/RawTuicr",
+          "description": "The review TUI the tuicr diff viewer runs."
         }
       },
       "type": "object"
@@ -1178,6 +1385,21 @@
       },
       "type": "object"
     },
+    "RawTuicr": {
+      "properties": {
+        "path": {
+          "default": "tuicr",
+          "description": "The program to run on Windows or natively. Its own name is\nlooked up on PATH; any other value runs as written.",
+          "type": "string"
+        },
+        "wsl_path": {
+          "default": "",
+          "description": "The program to run inside every WSL distro, as written. Empty\nfinds it by name through the distro's login shell.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
     "RawUi": {
       "properties": {
         "async_session_spawn": {
@@ -1216,7 +1438,7 @@
           "type": "string"
         },
         "delta_path": {
-          "description": "Explicit `delta` program for the diff pane.  Set, it is used verbatim\nin git's `core.pager` and skips WSL delta autodiscovery; unset, native\ndiffs run bare `delta` from PATH.",
+          "description": "Deprecated location: `[integrations.delta] path` and `wsl_path`\nsupersede this, and each wins on its own side once set.",
           "type": "string"
         },
         "drop": {

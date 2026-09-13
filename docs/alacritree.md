@@ -140,6 +140,13 @@ so the panel stays responsive even on large repos. A faster cheap path
 (`dirty_counts`) is used by the delete modal — it skips the branch-diff work
 and just counts what `git worktree remove` would reject.
 
+Clicking a file opens its diff in a pane, and clicking it again closes the
+pane. `[integrations.diff_viewer]` picks what that pane runs: delta by default,
+tuicr for a review whose comments agents can read, or a custom command. With
+`section_buttons = true` each section header also gets a button that opens the
+whole section at once; the `ReviewStaged`, `ReviewUnstaged` and `ReviewBranch`
+actions do the same from the palette or a key binding.
+
 ### Per-worktree base branch
 
 The git panel diffs each worktree against an automatically picked base: the
@@ -519,8 +526,6 @@ upstream_status    = false  # paint a badge on each worktree row for its
                             # linked worktree that overrides branch.* in its
                             # own config.worktree is read from the project
                             # root instead, so that override is not seen.
-delta_path         = "delta"     # explicit delta binary for the diff pane;
-                                 # unset discovers it on PATH
 worktree_name      = "$name ${pr: }"  # template for worktree row labels:
                             # $name, $branch, $path, $pr (as #123, needs
                             # pr_status), and ${var:fallback}. Unset keeps the
@@ -625,9 +630,52 @@ image_keep  = 20            # how many PNGs the default directory keeps.
                             # Minimum 1 — the image a paste just handed to the
                             # shell always survives the sweep
 
+[integrations.git]          # one table per external program alacritree runs:
+path     = "git"            # git, gh, doppler, herdr, delta and tuicr. path is
+                            # the Windows or native program: the bare name is
+                            # looked up on PATH, anything else runs as written
+wsl_path = ""               # the program inside every WSL distro, run as
+                            # written; empty finds it by name through the
+                            # distro's login shell
+
+[integrations.delta]
+path     = "delta"          # the pager the delta diff viewer runs. These
+wsl_path = ""               # supersede the deprecated [ui] delta_path, which
+                            # still fills whichever of them is left at its
+                            # default
+
+[integrations.diff_viewer]  # what the git panel's diff pane runs
+preset          = "delta"   # "delta" pipes git's diff through delta; "tuicr"
+                            # opens tuicr's review TUI on the clicked file,
+                            # and agents read its comments with
+                            # `tuicr review comments`; "custom" runs the table
+                            # below
+section_buttons = false     # draw a button on each git section header that
+                            # opens the whole section in the viewer
+button_icon     = "review"  # the glyph or word that button shows
+
+[integrations.diff_viewer.custom]   # used when preset = "custom"
+pager     = ""              # pager mode: a command git runs as core.pager.
+                            # Set this or path, never both
+wsl_pager = ""              # the same inside WSL; empty runs pager through
+                            # the distro's login shell
+path      = ""              # direct mode: a program that renders the diff
+                            # itself, run with one argument list per target
+wsl_path  = ""              # the same inside WSL, run as written; empty runs
+                            # path through the distro's login shell
+staged         = []         # rows: {file} is the row's path, and branch rows
+unstaged       = []         # also get {base}, the branch the panel diffs
+untracked      = []         # against
+branch         = []
+staged_scope   = []         # section headers: no {file}; branch_scope gets
+unstaged_scope = []         # {base}. An empty list makes that row kind or
+branch_scope   = []         # section open nothing
+
 [integrations.herdr]        # agents running under a herdr server, listed in
                             # the sidebar under the worktree each agent's
                             # working directory matches
+path             = "herdr"  # the herdr binary on each side, set like the tables above
+wsl_path         = ""
 enabled          = true     # false does no herdr work at all: no polling,
                             # no rows
 poll_interval_ms = 2000     # how often a reachable server is asked for its

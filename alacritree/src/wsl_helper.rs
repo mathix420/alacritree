@@ -10,17 +10,27 @@ use base64::engine::general_purpose::STANDARD as B64;
 /// Bumped only when the request/response framing changes incompatibly; a
 /// client seeing any other version treats the helper as unusable and stays
 /// on one-shot spawns.
-pub const PROTOCOL_VERSION: &str = "1";
+pub const PROTOCOL_VERSION: &str = "2";
+
+/// The programs the hello resolves, in the order its fields carry them.
+/// `HELPER_SCRIPT` spells the same list.
+pub const HELLO_TOOLS: [&str; 6] = ["git", "gh", "delta", "doppler", "herdr", "tuicr"];
 
 /// Login-shell-resolved tool paths and the distro-side runtime dir, from
-/// the helper's hello line.  `None` means the tool wasn't on the login
-/// shell's PATH at helper start.
+/// the helper's hello line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
-    pub git: Option<String>,
-    pub delta: Option<String>,
-    pub gh: Option<String>,
+    /// One entry per [`HELLO_TOOLS`] name, `None` where the tool wasn't on
+    /// the login shell's PATH at helper start.
+    paths: Vec<Option<String>>,
     pub runtime_dir: String,
+}
+
+impl Capabilities {
+    pub fn path(&self, program: &str) -> Option<&str> {
+        let slot = HELLO_TOOLS.iter().position(|p| *p == program)?;
+        self.paths.get(slot)?.as_deref()
+    }
 }
 
 /// A request-side payload field: base64, or `-` for the empty payload.
@@ -46,8 +56,8 @@ pub fn encode_probe(id: u64, key: &str) -> String {
 }
 
 pub fn parse_hello(line: &str) -> Option<Capabilities> {
-    // Strip only line terminators — trim_end() would also eat the tab
-    // before a legitimately empty trailing field.
+    // Strip only line terminators. trim_end() would also eat the tab before
+    // a legitimately empty trailing field.
     let mut fields = line.trim_end_matches(['\r', '\n']).split('\t');
     if fields.next()? != "hello" || fields.next()? != PROTOCOL_VERSION {
         return None;
@@ -56,12 +66,12 @@ pub fn parse_hello(line: &str) -> Option<Capabilities> {
         let raw = B64.decode(fields.next()?).ok()?;
         Some(String::from_utf8_lossy(&raw).trim().to_string())
     };
-    let git = decode()?;
-    let delta = decode()?;
-    let gh = decode()?;
+    let paths = HELLO_TOOLS
+        .iter()
+        .map(|_| decode().map(|path| (!path.is_empty()).then_some(path)))
+        .collect::<Option<Vec<_>>>()?;
     let runtime_dir = decode()?;
-    let some = |s: String| (!s.is_empty()).then_some(s);
-    Some(Capabilities { git: some(git), delta: some(delta), gh: some(gh), runtime_dir })
+    Some(Capabilities { paths, runtime_dir })
 }
 
 /// One response off the helper's stdout: `<id>\t<exit>\t<len>\n` followed
@@ -156,13 +166,15 @@ set -u
 b64() { printf %s "$1" | base64 | tr -d '\n'; }
 s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)
 [ -x "$s" ] || s=${SHELL:-/bin/sh}
-caps=$("$s" -lc 'command -v git || echo; command -v delta || echo; command -v gh || echo' 2>/dev/null)
+caps=$("$s" -lc 'command -v git || echo; command -v gh || echo; command -v delta || echo; command -v doppler || echo; command -v herdr || echo; command -v tuicr || echo' 2>/dev/null)
 rt=${XDG_RUNTIME_DIR:-/tmp}/alacritree
-printf 'hello\t1\t%s\t%s\t%s\t%s\n' \
-  "$(b64 "$(printf %s "$caps" | sed -n 1p)")" \
-  "$(b64 "$(printf %s "$caps" | sed -n 2p)")" \
-  "$(b64 "$(printf %s "$caps" | sed -n 3p)")" \
-  "$(b64 "$rt")"
+printf 'hello\t2'
+i=1
+while [ "$i" -le 6 ]; do
+  printf '\t%s' "$(b64 "$(printf %s "$caps" | sed -n "${i}p")")"
+  i=$((i + 1))
+done
+printf '\t%s\n' "$(b64 "$rt")"
 mkdir -m 700 -p "$rt"
 for f in "$rt"/session-*.pid; do
   [ -e "$f" ] || continue
@@ -762,12 +774,9 @@ pub fn try_run(distro: &str, script: &str, args: &[&str]) -> Option<Result<Vec<u
     }
 }
 
-pub fn capability_delta(distro: &str) -> Option<String> {
-    client(distro)?.capabilities()?.delta.clone()
-}
-
-pub fn capability_gh(distro: &str) -> Option<String> {
-    client(distro)?.capabilities()?.gh.clone()
+/// Where the helper's hello found `program`, one of [`HELLO_TOOLS`].
+pub fn capability(distro: &str, program: &str) -> Option<String> {
+    client(distro)?.capabilities()?.path(program).map(str::to_string)
 }
 
 /// Identity of a shimmed WSL session for the foreground probe.
@@ -860,9 +869,9 @@ fn ensure_poller() {
 mod tests {
     use super::*;
 
-    /// A hello `parse_hello` accepts: protocol 1, all four capability
-    /// fields empty.
-    const HELLO_LINE: &str = "hello\t1\t\t\t\t\n";
+    /// A hello `parse_hello` accepts: protocol 2, every tool field and the
+    /// runtime dir empty.
+    const HELLO_LINE: &str = "hello\t2\t\t\t\t\t\t\t\n";
 
     /// One end of a pipe pair standing in for the helper's stdio.
     struct FakePipe {
@@ -954,27 +963,39 @@ mod tests {
 
     #[test]
     fn parses_hello_with_missing_tools() {
-        // git and runtime dir present, delta and gh absent (empty fields).
-        let line = "hello\t1\tL3Vzci9iaW4vZ2l0\t\t\tL3J1bi91c2VyLzEwMDAvYWxhY3JpdHJlZQ==\n";
+        // git and runtime dir present, every other tool absent.
+        let line = "hello\t2\tL3Vzci9iaW4vZ2l0\t\t\t\t\t\tL3J1bi91c2VyLzEwMDAvYWxhY3JpdHJlZQ==\n";
         let caps = parse_hello(line).unwrap();
-        assert_eq!(caps.git.as_deref(), Some("/usr/bin/git"));
-        assert_eq!(caps.delta, None);
-        assert_eq!(caps.gh, None);
+        assert_eq!(caps.path("git"), Some("/usr/bin/git"));
+        assert_eq!(caps.path("delta"), None);
+        assert_eq!(caps.path("tuicr"), None);
+        assert_eq!(caps.path("not-a-tool"), None);
         assert_eq!(caps.runtime_dir, "/run/user/1000/alacritree");
     }
 
     #[test]
     fn rejects_unknown_hello_version() {
+        assert!(parse_hello("hello\t1\t\t\t\t\t\t\t\n").is_none());
+        assert!(parse_hello("goodbye\t2\t\t\t\t\t\t\t\n").is_none());
         assert!(parse_hello("hello\t2\t\t\t\t\n").is_none());
-        assert!(parse_hello("goodbye\t1\t\t\t\t\n").is_none());
-        assert!(parse_hello("hello\t1\t\t\n").is_none());
     }
 
     #[test]
     fn hello_with_empty_trailing_field_still_parses() {
-        let caps = parse_hello("hello\t1\t\t\t\t\n").expect("empty fields are valid");
-        assert_eq!(caps.git, None);
+        let caps = parse_hello(HELLO_LINE).expect("empty fields are valid");
+        assert_eq!(caps.path("git"), None);
         assert_eq!(caps.runtime_dir, "");
+    }
+
+    /// The script's probe list and the parser's field list are two spellings
+    /// of one order; a tool added to one and not the other shifts every path
+    /// after it onto the wrong name.
+    #[test]
+    fn the_hello_probes_every_tool_it_reports_in_order() {
+        let probes: Vec<String> =
+            HELLO_TOOLS.iter().map(|p| format!("command -v {p} || echo")).collect();
+        assert!(HELPER_SCRIPT.contains(&format!("-lc '{}'", probes.join("; "))));
+        assert!(HELPER_SCRIPT.contains(&format!("[ \"$i\" -le {} ]", HELLO_TOOLS.len())));
     }
 
     #[test]
@@ -1410,7 +1431,7 @@ mod tests {
         };
 
         let caps = client.capabilities().expect("capabilities after ready");
-        assert!(caps.git.is_some(), "test distros are expected to have git");
+        assert!(caps.path("git").is_some(), "test distros are expected to have git");
         assert!(caps.runtime_dir.ends_with("/alacritree"));
 
         let (exit, out) = client.run(r#"printf '%s' "$1""#, &["hello"]).expect("run");

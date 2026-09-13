@@ -166,7 +166,7 @@ impl MultiplexerSession for Herdr {
         }
         let args = herdr::attach_args(&target.pane_id);
         let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-        let (program, argv) = target.side.command(herdr::PROGRAM, &borrowed);
+        let (program, argv) = target.side.command(&herdr::program(&target.side), &borrowed);
         Some(Launch { program, argv })
     }
 
@@ -247,7 +247,8 @@ mod tests {
 
     #[test]
     fn native_runs_herdr_directly() {
-        let (program, args) = Side::Native.command(herdr::PROGRAM, &["agent", "list"]);
+        let side = Side::Native;
+        let (program, args) = side.command(&herdr::program(&side), &["agent", "list"]);
         assert_eq!(program, "herdr");
         assert_eq!(args, vec!["agent", "list"]);
     }
@@ -256,16 +257,16 @@ mod tests {
     /// shell.  `wsl.exe -e herdr` fails with execvpe ENOENT.
     #[test]
     fn wsl_wraps_in_a_login_shell() {
-        let (program, args) =
-            Side::Wsl("kali-linux".into()).command(herdr::PROGRAM, &["agent", "list"]);
+        let side = Side::Wsl("kali-linux".into());
+        let (program, args) = side.command(&herdr::program(&side), &["agent", "list"]);
         assert_eq!(program, "wsl.exe");
         assert_eq!(args, vec!["-d", "kali-linux", "--exec", "sh", "-lc", "herdr agent list"]);
     }
 
     #[test]
     fn wsl_quotes_arguments_that_need_it() {
-        let (_, args) =
-            Side::Wsl("d".into()).command(herdr::PROGRAM, &["agent", "attach", "w1:p1"]);
+        let side = Side::Wsl("d".into());
+        let (_, args) = side.command(&herdr::program(&side), &["agent", "attach", "w1:p1"]);
         assert_eq!(args.last().unwrap(), "herdr agent attach 'w1:p1'");
     }
 

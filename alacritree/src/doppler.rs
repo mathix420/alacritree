@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use crate::tools::{self, Tool};
 use crate::{command_ext, jobs};
 
 /// `enclave.*` is doppler's on-disk spelling of the `project`/`config`
@@ -116,7 +117,7 @@ fn all_scopes(blocking: &jobs::Blocking) -> Option<Scopes> {
 /// case and must stay quiet.
 #[allow(clippy::disallowed_methods)] // Running the doppler CLI is this function's job.
 fn run(args: &[&str], scope: Option<&Path>, _blocking: &jobs::Blocking) -> Option<Vec<u8>> {
-    let mut cmd = command_ext::hidden("doppler");
+    let mut cmd = command_ext::hidden(tools::program(Tool::Doppler));
     cmd.args(args)
         .arg("--no-check-version")
         .stdin(Stdio::null())

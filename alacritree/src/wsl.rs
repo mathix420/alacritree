@@ -563,19 +563,6 @@ pub fn run_batch(
     Ok(stdout_bytes)
 }
 
-/// Resolve `delta`'s absolute path inside `distro`.  Returns `None` when delta
-/// isn't found; callers must not cache that, so an install mid-session is
-/// picked up on the next attempt.
-pub fn discover_delta(distro: &str, blocking: &jobs::Blocking) -> Option<String> {
-    // The helper's hello already resolved delta through the login shell; a
-    // missing capability is not a cached miss — fall through and re-check
-    // live so a mid-session install is still picked up.
-    if let Some(path) = crate::wsl_helper::capability_delta(distro) {
-        return Some(path);
-    }
-    probe_tools(distro, &["delta"], blocking).ok()?.into_iter().next().flatten()
-}
-
 /// Resolve each of `programs` inside `distro` as the user's login shell sees
 /// them, in one wsl.exe round trip — call off the UI thread.  Results are
 /// positional: a program that is not on that PATH comes back `None`.

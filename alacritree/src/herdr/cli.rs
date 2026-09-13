@@ -10,14 +10,20 @@ use std::time::{Duration, Instant};
 
 use crate::config::AttachMode;
 use crate::multiplexer::{CreatedPane, PaneTarget};
+use crate::tools::{self, Tool};
 use crate::{command_ext, jobs};
 
 use super::wire::{CreatedTab, SessionList};
 use super::{Listing, ListingReply, PollError, Side, error_code};
 
-/// The binary every call here runs.  `Side::command` takes it as an argument
-/// so a second multiplexer reaches its own through the same plumbing.
-pub const PROGRAM: &str = "herdr";
+/// The herdr binary every call on `side` runs. Each side resolves its own
+/// configured path and WSL uses a login shell for bare names.
+pub fn program(side: &Side) -> String {
+    match side {
+        Side::Native => tools::program(Tool::Herdr),
+        Side::Wsl(_) => tools::wsl_program(Tool::Herdr),
+    }
+}
 
 /// Direct attach to one agent.  Unsupported on native Windows, where
 /// `run_terminal_attach` is a `#[cfg(windows)]` refusal.
@@ -95,7 +101,7 @@ pub fn focus_pane_args(pane_id: &str) -> Vec<String> {
 /// way.
 pub fn focus_pane(side: &Side, focus: &[String]) -> Result<(), String> {
     let borrowed: Vec<&str> = focus.iter().map(String::as_str).collect();
-    let (program, args) = side.command(PROGRAM, &borrowed);
+    let (program, args) = side.command(&program(side), &borrowed);
     #[allow(clippy::disallowed_methods)] // Running herdr is this function's job.
     let run = move || {
         command_ext::hidden(program)
@@ -123,7 +129,7 @@ pub fn focus_pane(side: &Side, focus: &[String]) -> Result<(), String> {
 /// inside [`GESTURE_TIMEOUT`] is an `Err`, because attaching to a guessed
 /// name would only park the wedged wait inside the new session.
 pub fn running_session_name(side: &Side) -> Result<String, String> {
-    let (program, args) = side.command(PROGRAM, &["session", "list", "--json"]);
+    let (program, args) = side.command(&program(side), &["session", "list", "--json"]);
     #[allow(clippy::disallowed_methods)] // Running herdr is this function's job.
     let run = move || {
         command_ext::hidden(program)
@@ -172,7 +178,7 @@ fn create_args(cwd: Option<&str>) -> Vec<String> {
 pub fn create_pane(side: &Side, cwd: Option<String>) -> Result<CreatedPane, String> {
     let create = create_args(cwd.as_deref());
     let borrowed: Vec<&str> = create.iter().map(String::as_str).collect();
-    let (program, args) = side.command(PROGRAM, &borrowed);
+    let (program, args) = side.command(&program(side), &borrowed);
     #[allow(clippy::disallowed_methods)] // Running herdr is this function's job.
     let run = move || {
         command_ext::hidden(program)
@@ -212,7 +218,7 @@ pub(super) fn list_panes(
     attached: bool,
     _blocking: &jobs::Blocking,
 ) -> Result<ListingReply, PollError> {
-    let (program, args) = side.command(PROGRAM, &listing.args());
+    let (program, args) = side.command(&program(side), &listing.args());
     let sampled_at = Instant::now();
     let output = command_ext::hidden(program)
         .args(args)
@@ -256,7 +262,7 @@ pub fn herdr_attach_gesture(
         Some(session) => session,
         None => running_session_name(side)?,
     };
-    Ok(side.command(PROGRAM, &["session", "attach", &session]))
+    Ok(side.command(&program(side), &["session", "attach", &session]))
 }
 
 #[cfg(test)]

@@ -12,7 +12,6 @@
     "persistent_logging": false
   },
   "default_profile": null,
-  "delta_path": null,
   "env": {},
   "font": {
     "bold": {
@@ -46,16 +45,52 @@
     "size": 11.25
   },
   "integrations": {
+    "delta": {
+      "path": "delta",
+      "wsl_path": null
+    },
+    "diff_viewer": {
+      "button_icon": "review",
+      "section_buttons": false,
+      "viewer": {
+        "Pager": {
+          "args": [
+            "--paging=always"
+          ],
+          "pager": {
+            "Tool": "Delta"
+          }
+        }
+      }
+    },
+    "doppler": {
+      "path": "doppler",
+      "wsl_path": null
+    },
+    "gh": {
+      "path": "gh",
+      "wsl_path": null
+    },
+    "git": {
+      "path": "git",
+      "wsl_path": null
+    },
     "herdr": {
       "attach": "Agent",
       "enabled": true,
       "follow_focus": "Herdr",
+      "path": "herdr",
       "poll_interval": {
         "nanos": 0,
         "secs": 2
       },
       "show_panes": false,
-      "show_unmatched": true
+      "show_unmatched": true,
+      "wsl_path": null
+    },
+    "tuicr": {
+      "path": "tuicr",
+      "wsl_path": null
     }
   },
   "ipc_socket": true,

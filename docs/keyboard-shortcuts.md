@@ -235,6 +235,9 @@ caret there; bind them elsewhere if you want the caret back.
   Default: `Ctrl+Shift+O`.
 - `SetBaseBranch` — open the base-branch picker for the sidebar-cursored
   worktree, or the current one when the terminal has focus. No default key.
+- `ReviewStaged` / `ReviewUnstaged` / `ReviewBranch`: open the git panel's
+  Staged, Unstaged, or `Changes vs` section as a whole in the diff viewer, or
+  close that pane when it is already open. No default keys.
 - `ToggleSessionRows` / `ToggleSessionTabs` — flip the runtime
   `session_display.sidebar_always` / `session_display.tabs_always` values, which
   control whether a lone session still gets its own sidebar row or tab segment.

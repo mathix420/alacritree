@@ -555,7 +555,7 @@ impl AlacritreeApp {
             (launch.program, launch.argv)
         } else {
             let name = self.herdr_session_name(&key.side)?;
-            key.side.command(herdr::PROGRAM, &["session", "attach", &name])
+            key.side.command(&herdr::program(&key.side), &["session", "attach", &name])
         };
         self.open_herdr_session(ctx, key.clone(), workspace, program, argv, shared_view)?;
         self.herdr_session_for(key)
