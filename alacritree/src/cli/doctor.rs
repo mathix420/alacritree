@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 
 use crate::config::{self, Config, ConfigDiagnosis, ConfigFile, Profile, ShellConfig};
 use crate::crash_log::{Verdict, classify};
-use crate::ipc::{self, IpcRequest, SendError};
+use crate::ipc::protocol::{self, IpcRequest, SendError};
 use crate::shell_decision::{ShellDecision, shell_decision};
 use crate::wsl::{self, ShellChoice};
 use crate::{command_ext, jobs, state};
@@ -444,9 +444,14 @@ fn ipc_checks(socket: Option<&Path>, enabled: bool) -> Vec<Check> {
         let detail = "disabled in config — the CLI and MCP cannot reach a running window";
         checks.push(check("ipc", "ipc_socket", Status::Warn, detail));
     }
-    checks.push(check("ipc", "socket dir", Status::Ok, ipc::socket_dir().display().to_string()));
+    checks.push(check(
+        "ipc",
+        "socket dir",
+        Status::Ok,
+        protocol::socket_dir().display().to_string(),
+    ));
 
-    checks.push(match ipc::send_request(socket, &IpcRequest::ListProjects, PROBE_TIMEOUT) {
+    checks.push(match protocol::send_request(socket, &IpcRequest::ListProjects, PROBE_TIMEOUT) {
         Ok(_) => check("ipc", "instance", Status::Ok, "answering"),
         // Nothing running is not a fault: the CLI serves projects, git status
         // and worktrees from disk when no window is up.

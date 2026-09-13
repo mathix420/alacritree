@@ -6,7 +6,7 @@
 
 use serde_json::Value;
 
-use crate::ipc::IpcRequest;
+use crate::ipc::protocol::IpcRequest;
 
 pub fn human(request: &IpcRequest, value: &Value) {
     match request {

@@ -8,10 +8,10 @@ impl AlacritreeApp {
     pub(super) fn start_ipc(
         ctx: &Context,
         enabled: bool,
-    ) -> (Option<ipc::SocketHandle>, Option<Receiver<ipc::AppCall>>) {
+    ) -> (Option<ipc::server::SocketHandle>, Option<Receiver<ipc::server::AppCall>>) {
         // Before the first PTY spawn so children inherit ALACRITREE_SOCKET.
         if enabled {
-            match ipc::spawn_listener(ctx.clone()) {
+            match ipc::server::spawn_listener(ctx.clone()) {
                 Ok((handle, rx)) => {
                     log::info!("IPC socket: {}", handle.path().display());
                     (Some(handle), Some(rx))
@@ -55,34 +55,34 @@ impl AlacritreeApp {
 
     pub(super) fn process_ipc_calls(&mut self, ctx: &Context) {
         let Some(rx) = &self.ipc_rx else { return };
-        let calls: Vec<ipc::AppCall> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let calls: Vec<ipc::server::AppCall> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         for call in calls {
-            let ipc::AppCall { request, reply_tx } = call;
+            let ipc::server::AppCall { request, reply_tx } = call;
             // Discovery is far too slow to run here, and the caller still has
             // to be answered from the discovered list rather than the stale
             // one (or the placeholder), so these requests own their reply
             // channel until it lands.
             let request = match request {
-                ipc::IpcRequest::RefreshProject { root } => {
+                ipc::protocol::IpcRequest::RefreshProject { root } => {
                     self.defer_project_refresh(ctx, root, reply_tx);
                     continue;
                 },
-                ipc::IpcRequest::AddProject { path } => {
+                ipc::protocol::IpcRequest::AddProject { path } => {
                     self.defer_project_add(ctx, path, reply_tx);
                     continue;
                 },
                 // The reply has to wait for the PTY: a client that creates a
                 // session in order to write to it would otherwise be told the
                 // id before anything can receive what it writes.
-                ipc::IpcRequest::CreateSession { workspace } => {
+                ipc::protocol::IpcRequest::CreateSession { workspace } => {
                     self.defer_create_session(ctx, workspace, reply_tx);
                     continue;
                 },
-                ipc::IpcRequest::AttachMultiplexerPane { side, terminal_id } => {
+                ipc::protocol::IpcRequest::AttachMultiplexerPane { side, terminal_id } => {
                     self.defer_attach_multiplexer_pane(ctx, &side, &terminal_id, reply_tx);
                     continue;
                 },
-                ipc::IpcRequest::CreateMultiplexerPane { side, workspace } => {
+                ipc::protocol::IpcRequest::CreateMultiplexerPane { side, workspace } => {
                     self.defer_create_multiplexer_pane(ctx, side.as_deref(), workspace, reply_tx);
                     continue;
                 },
@@ -101,7 +101,7 @@ impl AlacritreeApp {
         &mut self,
         ctx: &Context,
         root: PathBuf,
-        reply_tx: mpsc::Sender<ipc::IpcResult>,
+        reply_tx: mpsc::Sender<ipc::protocol::IpcResult>,
     ) {
         let Some(idx) = self.projects.iter().position(|p| p.root == root) else {
             let _ =
@@ -122,7 +122,7 @@ impl AlacritreeApp {
         &mut self,
         ctx: &Context,
         path: PathBuf,
-        reply_tx: mpsc::Sender<ipc::IpcResult>,
+        reply_tx: mpsc::Sender<ipc::protocol::IpcResult>,
     ) {
         self.add_project_off_thread(ctx, path.clone());
         let Some(idx) = self.projects.iter().position(|p| p.root == path) else {
@@ -138,7 +138,7 @@ impl AlacritreeApp {
         &mut self,
         ctx: &Context,
         workspace: Option<PathBuf>,
-        reply_tx: mpsc::Sender<ipc::IpcResult>,
+        reply_tx: mpsc::Sender<ipc::protocol::IpcResult>,
     ) {
         let workspace = match workspace {
             None => None,
@@ -168,8 +168,12 @@ impl AlacritreeApp {
         }
     }
 
-    fn handle_ipc_request(&mut self, ctx: &Context, request: ipc::IpcRequest) -> ipc::IpcResult {
-        use ipc::IpcRequest as Req;
+    fn handle_ipc_request(
+        &mut self,
+        ctx: &Context,
+        request: ipc::protocol::IpcRequest,
+    ) -> ipc::protocol::IpcResult {
+        use ipc::protocol::IpcRequest as Req;
         match request {
             Req::ListProjects => Ok(json!({
                 "current_workspace": self.current_workspace,

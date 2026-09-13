@@ -1,7 +1,7 @@
 //! `alacritree mcp` — a Model Context Protocol server over stdio.
 //!
 //! Bridges MCP tool calls to a running alacritree instance through the IPC
-//! socket (see `ipc.rs`), so an LLM can inspect projects/worktrees, drive
+//! socket (see `ipc/protocol.rs`), so an LLM can inspect projects/worktrees, drive
 //! terminal sessions, and read their output.  Register it with e.g.
 //! `claude mcp add alacritree -- alacritree mcp`.  An MCP client launches this
 //! outside any session, so it usually has no `ALACRITREE_SOCKET` to inherit and
@@ -13,12 +13,12 @@
 //! crate that is otherwise fully synchronous.
 
 use std::io::{BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::ipc::{self, IpcRequest};
+use crate::ipc::protocol::{IpcRequest, LocalSocket, Transport};
 
 pub fn run(socket: Option<PathBuf>) {
     let stdin = std::io::stdin();
@@ -44,7 +44,7 @@ pub fn run(socket: Option<PathBuf>) {
             "initialize" => result_response(id, initialize_result(params)),
             "ping" => result_response(id, json!({})),
             "tools/list" => result_response(id, json!({ "tools": tool_definitions() })),
-            "tools/call" => tool_call_response(id, params, socket.as_deref()),
+            "tools/call" => tool_call_response(id, params, &LocalSocket(socket.as_deref())),
             other => error_response(id, -32601, &format!("method not found: {other}")),
         };
         write_message(&response);
@@ -80,7 +80,7 @@ fn initialize_result(params: Option<&Value>) -> Value {
     })
 }
 
-fn tool_call_response(id: Value, params: Option<&Value>, socket: Option<&Path>) -> Value {
+fn tool_call_response(id: Value, params: Option<&Value>, transport: &impl Transport) -> Value {
     let name = params.and_then(|p| p.get("name")).and_then(Value::as_str).unwrap_or_default();
     let arguments = params
         .and_then(|p| p.get("arguments"))
@@ -97,7 +97,7 @@ fn tool_call_response(id: Value, params: Option<&Value>, socket: Option<&Path>) 
         Err(e) => return error_response(id, -32602, &format!("invalid tool call: {e}")),
     };
 
-    match ipc::send_request(socket, &request, timeout_for(&request)) {
+    match transport.send(&request, timeout_for(&request)) {
         Ok(value) => {
             let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
             result_response(id, json!({ "content": [{ "type": "text", "text": text }] }))
@@ -325,6 +325,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::ipc::protocol::IpcResult;
+    use crate::ipc::server::InMemory;
+    use crate::repaint::Recorder;
 
     /// One of every `IpcRequest`, so the tests below can walk the whole surface.
     ///
@@ -416,5 +419,53 @@ mod tests {
             let encoded = serde_json::to_value(&request).expect("serialize");
             assert_eq!(encoded["type"], json!(tag_of(&request)));
         }
+    }
+
+    /// Answer the one call a test sends with `reply`, and return what the tool
+    /// call produced.
+    fn call_tool(params: Value, expected: IpcRequest, reply: IpcResult) -> Value {
+        let (transport, requests) = InMemory::new(Recorder::default());
+        let app = std::thread::spawn(move || {
+            let call = requests.recv().expect("the call reached the app");
+            assert_eq!(
+                serde_json::to_value(&call.request).expect("serialize"),
+                serde_json::to_value(&expected).expect("serialize"),
+                "the app got a different request than the tool call spelled"
+            );
+            call.reply_tx.send(reply).expect("reply");
+        });
+        let response = tool_call_response(json!(1), Some(&params), &transport);
+        app.join().unwrap();
+        response
+    }
+
+    #[test]
+    fn a_tool_call_reaches_the_app_and_returns_its_reply() {
+        let params = json!({ "name": "close_session", "arguments": { "session_id": 7 } });
+        let response = call_tool(
+            params,
+            IpcRequest::CloseSession { session_id: 7 },
+            Ok(json!({ "closed": 7 })),
+        );
+
+        let text = response["result"]["content"][0]["text"].as_str().expect("text content");
+        assert_eq!(serde_json::from_str::<Value>(text).expect("json text"), json!({ "closed": 7 }));
+        assert!(response["result"].get("isError").is_none());
+    }
+
+    /// The model reads a refusal only when it arrives as a tool result, so the
+    /// app's message comes back with `isError` set and no JSON-RPC error.
+    #[test]
+    fn an_app_refusal_is_a_failed_tool_call() {
+        let params = json!({ "name": "close_session", "arguments": { "session_id": 7 } });
+        let response = call_tool(
+            params,
+            IpcRequest::CloseSession { session_id: 7 },
+            Err("unknown session 7".into()),
+        );
+
+        assert!(response.get("error").is_none());
+        assert_eq!(response["result"]["isError"], json!(true));
+        assert_eq!(response["result"]["content"][0]["text"], "unknown session 7");
     }
 }
