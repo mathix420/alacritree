@@ -13,7 +13,7 @@ use egui::{
 use crate::builtin_font::{BuiltinGlyphCache, Metrics, is_builtin_glyph};
 use crate::clipboard::{self, Target};
 use crate::color_glyph::{CachedColorGlyph, ColorGlyphCache};
-use crate::colors::{background, default_background, foreground, resolve, rgb_to_color32};
+use crate::colors::{TerminalColors, default_background, resolve, rgb_to_color32};
 use crate::config::{Config, Palette};
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
 use crate::glyph_cache::{Face, GlyphCache, MAX_EXTRA_CELLS, growth_offset, may_grow};
@@ -39,7 +39,7 @@ pub fn show(
     gpu: Option<&GpuGrid>,
     detached_jobs: &mut Vec<jobs::Job<()>>,
 ) -> Response {
-    let font_id = FontId::monospace(config.font.egui_size());
+    let font_id = FontId::monospace(config.font.logical_size());
     let (cell_w_pt, cell_h_pt) =
         ui.ctx().fonts(|f| (f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
     // `Fonts` exposes no ascent, and deriving one from the face would miss the
@@ -189,10 +189,9 @@ pub fn show(
         ),
     }
 
-    let preedit_caret = ime
-        .preedit()
-        .map(|p| p.to_owned())
-        .and_then(|p| paint_preedit(&painter, rect, session, config, &font_id, cell_w, cell_h, &p));
+    let preedit_caret = ime.preedit().map(|p| p.to_owned()).and_then(|p| {
+        paint_preedit(&painter, rect, session, &snapshot.colors, &font_id, cell_w, cell_h, &p)
+    });
 
     if allow_focus && response.has_focus() {
         // Setting `PlatformOutput::ime` is what makes egui-winit call
@@ -869,7 +868,6 @@ impl Style {
 ///
 /// Both buffers are reused across frames, and colours are resolved during the
 /// copy, so painting from a snapshot needs neither the lock nor the palette.
-#[derive(Default)]
 pub struct GridSnapshot {
     /// One entry per viewport row.  Each row owns its bytes so re-walking one
     /// row never moves another's, which is what lets a capture skip the rows
@@ -880,15 +878,16 @@ pub struct GridSnapshot {
     /// cursor is drawn: the IME candidate window follows the caret even while
     /// the running app keeps the cursor hidden.
     caret: Option<(usize, i32)>,
-    /// The terminal's background as of the last capture.  `None` before the
-    /// first one, when there is no terminal to have an opinion yet.
-    default_bg: Option<Color32>,
+    /// The terminal's background as of the last capture, and the configured
+    /// one before the first.
+    default_bg: Color32,
     /// Rows the last capture rewrote, merged into one span.
     dirty_rows: std::ops::Range<usize>,
     /// Scratch for the rows a capture is about to walk, reused so reading
     /// damage costs no allocation.
     damaged: Vec<usize>,
     context: CaptureContext,
+    colors: TerminalColors,
 }
 
 #[derive(Default)]
@@ -899,8 +898,8 @@ struct RowSnapshot {
 
 /// What a capture depends on that the terminal's own damage tracking does not
 /// cover.  `Term::damage` documents the selection as caller-tracked, and it
-/// knows nothing about link highlighting or our configured palette, so a
-/// change to any of these invalidates rows the terminal calls clean.
+/// knows nothing about link highlighting, so a change to either invalidates
+/// rows the terminal calls clean.
 #[derive(Default, PartialEq)]
 struct CaptureContext {
     /// One snapshot is reused for every session, so the rows it holds belong
@@ -908,7 +907,6 @@ struct CaptureContext {
     session: Option<SessionId>,
     selection: Option<SelectionRange>,
     link: Option<Match>,
-    palette: Option<Palette>,
     dimensions: (usize, usize),
 }
 
@@ -933,15 +931,24 @@ struct CursorSnapshot {
 }
 
 impl GridSnapshot {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(palette: &Palette) -> Self {
+        let colors = TerminalColors::new(palette);
+        Self {
+            rows: Vec::new(),
+            cursor: None,
+            caret: None,
+            default_bg: colors.bg,
+            dirty_rows: 0..0,
+            damaged: Vec::new(),
+            context: CaptureContext::default(),
+            colors,
+        }
     }
 
     /// The terminal's background as of the last capture, for everything that
-    /// paints behind the grid as well as the grid itself.  Falls back to the
-    /// configured colour before the first capture.
-    pub fn default_bg(&self, palette: &Palette) -> Color32 {
-        self.default_bg.unwrap_or_else(|| background(palette))
+    /// paints behind the grid as well as the grid itself.
+    pub fn default_bg(&self) -> Color32 {
+        self.default_bg
     }
 
     /// Every run in the snapshot, paired with the text it covers.
@@ -982,7 +989,6 @@ impl GridSnapshot {
     fn collect_damage(
         &mut self,
         term: &mut Term<EventProxy>,
-        config: &Config,
         session: SessionId,
         link_bounds: Option<&Match>,
         selection: Option<SelectionRange>,
@@ -995,13 +1001,11 @@ impl GridSnapshot {
             session: Some(session),
             selection,
             link: link_bounds.cloned(),
-            palette: Some(config.palette.clone()),
             dimensions: (cols, screen_lines),
         };
         let rebuilt = self.rows.len() != screen_lines
             || self.context.session != context.session
-            || self.context.dimensions != context.dimensions
-            || self.context.palette != context.palette;
+            || self.context.dimensions != context.dimensions;
         if rebuilt {
             self.rows.clear();
             self.rows.resize_with(screen_lines, RowSnapshot::default);
@@ -1070,18 +1074,11 @@ impl GridSnapshot {
         let cols = term.grid().columns();
         let selection_range = term.selection.as_ref().and_then(|s| s.to_range(term));
 
-        self.collect_damage(
-            term,
-            config,
-            session,
-            link_bounds,
-            selection_range,
-            cols,
-            screen_lines,
-        );
+        self.collect_damage(term, session, link_bounds, selection_range, cols, screen_lines);
 
         let runtime_palette = term.colors();
-        self.default_bg = Some(default_background(runtime_palette, &config.palette));
+        let colors = self.colors;
+        self.default_bg = default_background(runtime_palette, &colors);
         let grid = term.grid();
         let in_link = |line: Line, column: Column| {
             link_bounds.is_some_and(|b| b.contains(&Point::new(line, column)))
@@ -1120,7 +1117,8 @@ impl GridSnapshot {
                 if dest.text.len() == text_start {
                     continue;
                 }
-                let (fg, bg) = run_colors(style, selected, runtime_palette, config);
+                let (fg, bg) =
+                    run_colors(style, selected, runtime_palette, &config.palette, &colors);
                 dest.runs.push(Run {
                     text: text_start..dest.text.len(),
                     start_col: start,
@@ -1145,15 +1143,13 @@ impl GridSnapshot {
 
         let cell = &grid[Line(cursor_point.line.0)][cursor_point.column];
         let color = runtime_palette[alacritty_terminal::vte::ansi::NamedColor::Cursor]
-            .map(rgb_to_color32)
-            .or_else(|| config.palette.cursor_bg.map(rgb_to_color32))
-            .unwrap_or_else(|| foreground(&config.palette));
+            .map_or(colors.cursor, rgb_to_color32);
         // Only the solid block covers the glyph underneath it.
         let glyph = (matches!(shape, CursorShape::Block)
             && cell.c != '\0'
             && !cell.flags.contains(Flags::HIDDEN))
         .then(|| {
-            let glyph_color = config.palette.cursor_fg.map(rgb_to_color32).unwrap_or_else(|| {
+            let glyph_color = colors.cursor_fg.unwrap_or_else(|| {
                 rgb_to_color32(resolve(
                     cell.bg,
                     cell.flags,
@@ -1162,8 +1158,7 @@ impl GridSnapshot {
                     false,
                 ))
             });
-            let glyph_color =
-                if glyph_color == color { background(&config.palette) } else { glyph_color };
+            let glyph_color = if glyph_color == color { colors.bg } else { glyph_color };
             (cell.c, cell.flags, glyph_color)
         });
 
@@ -1202,37 +1197,35 @@ fn run_colors(
     style: Style,
     selected: bool,
     runtime: &alacritty_terminal::term::color::Colors,
-    config: &Config,
+    palette: &Palette,
+    colors: &TerminalColors,
 ) -> (Color32, Color32) {
     let inverse = style.flags.contains(Flags::INVERSE);
-    let cell_fg = resolve(
+    let cell_fg = rgb_to_color32(resolve(
         if inverse { style.bg } else { style.fg },
         style.flags,
         runtime,
-        &config.palette,
+        palette,
         true,
-    );
-    let cell_bg = resolve(
+    ));
+    let cell_bg = rgb_to_color32(resolve(
         if inverse { style.fg } else { style.bg },
         style.flags,
         runtime,
-        &config.palette,
+        palette,
         false,
-    );
+    ));
     if !selected {
-        return (rgb_to_color32(cell_fg), rgb_to_color32(cell_bg));
+        return (cell_fg, cell_bg);
     }
     // When `colors.selection.background` is set we honor it; otherwise we swap
     // fg/bg of the underlying cell so the highlight is always visible without
     // requiring a config entry.
-    let sel_bg =
-        config.palette.selection_bg.map(rgb_to_color32).unwrap_or_else(|| rgb_to_color32(cell_fg));
-    let sel_fg = config.palette.selection_fg.map(rgb_to_color32).unwrap_or_else(|| {
-        if config.palette.selection_bg.is_some() {
-            rgb_to_color32(cell_fg)
-        } else {
-            rgb_to_color32(cell_bg)
-        }
+    let sel_bg = colors.selection_bg.unwrap_or(cell_fg);
+    let sel_fg = colors.selection_fg.unwrap_or(if colors.selection_bg.is_some() {
+        cell_fg
+    } else {
+        cell_bg
     });
     (sel_fg, sel_bg)
 }
@@ -1301,8 +1294,8 @@ fn paint_grid_gpu(
     glyphs: &mut GlyphCache,
     ctx: &egui::Context,
 ) {
-    let default_bg = snapshot.default_bg(&config.palette);
-    let size = config.font.egui_size();
+    let default_bg = snapshot.default_bg();
+    let size = config.font.logical_size();
     // Collected under the lock and drawn after it: painting needs the glyph
     // caches, and the grid state has no business being held while they work.
     let mut overlays = Vec::new();
@@ -1426,7 +1419,7 @@ fn paint_grid(
     glyphs: &mut GlyphCache,
     ctx: &egui::Context,
 ) {
-    let bg_color = snapshot.default_bg(&config.palette);
+    let bg_color = snapshot.default_bg();
     // Every background goes down before any glyph does.  A background is an
     // opaque fill over the whole run, so painting one run at a time cuts off
     // whatever the run before it overhung into its first cell — which is how a
@@ -1669,7 +1662,7 @@ fn paint_preedit(
     painter: &egui::Painter,
     rect: Rect,
     session: &Session,
-    config: &Config,
+    colors: &TerminalColors,
     font_id: &FontId,
     cell_w: f32,
     cell_h: f32,
@@ -1686,8 +1679,7 @@ fn paint_preedit(
     };
 
     let layout = crate::ime::preedit_layout(preedit, cursor_col, cols);
-    let fg = foreground(&config.palette);
-    let bg = background(&config.palette);
+    let (fg, bg) = (colors.fg, colors.bg);
     let y = rect.min.y + line as f32 * cell_h;
     let x = rect.min.x + layout.start_col as f32 * cell_w;
     let width_pt = layout.width as f32 * cell_w;
@@ -1774,7 +1766,7 @@ fn paint_builtin_glyph(
 #[cfg(test)]
 mod tests {
     use alacritty_terminal::term::Config as TermConfig;
-    use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+    use alacritty_terminal::vte::ansi::{Processor, Rgb, StdSyncHandler};
     use egui::Key;
 
     use super::*;
@@ -1824,7 +1816,7 @@ mod tests {
                 colors: ColorGlyphCache::new(Vec::new(), 0),
                 glyphs: GlyphCache::new(),
                 ime: crate::ime::Ime::default(),
-                snapshot: GridSnapshot::new(),
+                snapshot: GridSnapshot::new(&Config::default().palette),
                 detached_jobs: Vec::new(),
             }
         }
@@ -2033,7 +2025,7 @@ mod tests {
     #[test]
     fn a_blank_in_another_foreground_joins_the_run() {
         let mut term = term_running(b"\x1b[31mA\x1b[39m \x1b[31mB");
-        let mut snapshot = GridSnapshot::new();
+        let mut snapshot = GridSnapshot::new(&Config::default().palette);
 
         snapshot.capture(&mut term, &Config::default(), 0, None, true);
 
@@ -2047,7 +2039,7 @@ mod tests {
     #[test]
     fn the_first_capture_covers_every_row() {
         let mut term = term_running(b"hello");
-        let mut snapshot = GridSnapshot::new();
+        let mut snapshot = GridSnapshot::new(&Config::default().palette);
 
         snapshot.capture(&mut term, &Config::default(), 0, None, false);
 
@@ -2060,7 +2052,7 @@ mod tests {
     #[test]
     fn writing_one_line_dirties_only_that_line() {
         let mut term = term_running(b"first\r\nsecond");
-        let mut snapshot = GridSnapshot::new();
+        let mut snapshot = GridSnapshot::new(&Config::default().palette);
         snapshot.capture(&mut term, &Config::default(), 0, None, false);
 
         Processor::<StdSyncHandler>::new().advance(&mut term, b"!");
@@ -2074,7 +2066,7 @@ mod tests {
     #[test]
     fn an_undamaged_row_keeps_its_text() {
         let mut term = term_running(b"first\r\nsecond");
-        let mut snapshot = GridSnapshot::new();
+        let mut snapshot = GridSnapshot::new(&Config::default().palette);
         snapshot.capture(&mut term, &Config::default(), 0, None, false);
 
         Processor::<StdSyncHandler>::new().advance(&mut term, b"!");
@@ -2091,7 +2083,7 @@ mod tests {
     #[test]
     fn switching_session_rewrites_every_row() {
         let mut term = term_running(b"first\r\nsecond");
-        let mut snapshot = GridSnapshot::new();
+        let mut snapshot = GridSnapshot::new(&Config::default().palette);
         snapshot.capture(&mut term, &Config::default(), 7, None, false);
         Processor::<StdSyncHandler>::new().advance(&mut term, b"!");
 
@@ -2106,7 +2098,7 @@ mod tests {
     #[test]
     fn a_new_selection_dirties_the_rows_it_covers() {
         let mut term = term_running(b"first\r\nsecond\r\nthird\r\nfourth");
-        let mut snapshot = GridSnapshot::new();
+        let mut snapshot = GridSnapshot::new(&Config::default().palette);
         snapshot.capture(&mut term, &Config::default(), 0, None, false);
 
         let mut selection =
@@ -2125,7 +2117,7 @@ mod tests {
     #[test]
     fn only_the_damaged_rows_are_re_read_for_the_upload() {
         let mut term = term_running(b"first\r\nsecond\r\nthird");
-        let mut snapshot = GridSnapshot::new();
+        let mut snapshot = GridSnapshot::new(&Config::default().palette);
         snapshot.capture(&mut term, &Config::default(), 0, None, false);
 
         Processor::<StdSyncHandler>::new().advance(&mut term, b"\x1b[1;1Hone\x1b[3;1Hthree");
@@ -2196,7 +2188,7 @@ mod tests {
     #[test]
     fn a_wide_glyph_run_holds_a_character_per_cell() {
         let mut term = term_running("\x1b[41m\u{4f60}\u{597d}".as_bytes());
-        let mut snapshot = GridSnapshot::new();
+        let mut snapshot = GridSnapshot::new(&Config::default().palette);
 
         snapshot.capture(&mut term, &Config::default(), 0, None, true);
 
@@ -2213,7 +2205,7 @@ mod tests {
     #[test]
     fn an_underlined_blank_in_another_foreground_keeps_its_own_run() {
         let mut term = term_running(b"\x1b[4;31mA\x1b[39m \x1b[31mB");
-        let mut snapshot = GridSnapshot::new();
+        let mut snapshot = GridSnapshot::new(&Config::default().palette);
 
         snapshot.capture(&mut term, &Config::default(), 0, None, true);
 
@@ -2229,7 +2221,7 @@ mod tests {
     #[test]
     fn a_hidden_cursor_still_leaves_a_caret() {
         let mut term = term_running(b"\x1b[?25labc");
-        let mut snapshot = GridSnapshot::new();
+        let mut snapshot = GridSnapshot::new(&Config::default().palette);
 
         snapshot.capture(&mut term, &Config::default(), 0, None, false);
 
@@ -2364,8 +2356,8 @@ mod tests {
 
         let painted = painted_row(&ctx, &config, screen, "M\u{e600}".as_bytes());
 
-        let glyph_w =
-            ctx.fonts(|f| f.glyph_width(&FontId::monospace(config.font.egui_size()), '\u{e600}'));
+        let glyph_w = ctx
+            .fonts(|f| f.glyph_width(&FontId::monospace(config.font.logical_size()), '\u{e600}'));
         let cells = crate::glyph_cache::grown_cells(glyph_w, cell_w, MAX_EXTRA_CELLS);
         assert!(cells > 1, "the fixture's fallback glyph is not over-wide");
 
@@ -2408,8 +2400,8 @@ mod tests {
 
         let painted = painted_row(&ctx, &config, screen, "M\u{fb01}".as_bytes());
 
-        let glyph_w =
-            ctx.fonts(|f| f.glyph_width(&FontId::monospace(config.font.egui_size()), '\u{fb01}'));
+        let glyph_w = ctx
+            .fonts(|f| f.glyph_width(&FontId::monospace(config.font.logical_size()), '\u{fb01}'));
         assert!(glyph_w > cell_w * 1.25, "the fixture's letter is not over-wide");
         assert_eq!(x_of(&painted, "\u{fb01}"), origin + cell_w, "a letter was grown");
     }
@@ -2543,7 +2535,7 @@ mod tests {
             &config.palette,
             true,
         ));
-        let bg = background(&config.palette);
+        let bg = TerminalColors::new(&config.palette).bg;
 
         assert_eq!(at("P").color, fg, "a plain cell");
         assert_eq!(at("P").family, FontFamily::Monospace);
@@ -2557,6 +2549,35 @@ mod tests {
         assert_eq!(at("I").family, FontFamily::Name(ITALIC_FAMILY.into()), "an italic cell");
 
         assert_ne!(at("C").color, fg, "SGR 31 painted in the default foreground");
+    }
+
+    /// With no selection colours configured a selected cell swaps its pair.
+    /// A configured selection background takes the back and leaves the text in
+    /// the cell's own foreground, so only that half of the swap survives it.
+    #[test]
+    fn a_selection_background_alone_keeps_the_cell_foreground() {
+        use alacritty_terminal::vte::ansi::NamedColor;
+
+        let runtime = alacritty_terminal::term::color::Colors::default();
+        let style = Style {
+            fg: AnsiColor::Named(NamedColor::Foreground),
+            bg: AnsiColor::Named(NamedColor::Background),
+            flags: Flags::empty(),
+        };
+        let mut palette = Config::default().palette;
+        palette.selection_fg = None;
+        let selected = |palette: &Palette| {
+            run_colors(style, true, &runtime, palette, &TerminalColors::new(palette))
+        };
+        let (cell_fg, cell_bg) =
+            run_colors(style, false, &runtime, &palette, &TerminalColors::new(&palette));
+
+        palette.selection_bg = None;
+        assert_eq!(selected(&palette), (cell_bg, cell_fg));
+
+        let highlight = Rgb { r: 1, g: 2, b: 3 };
+        palette.selection_bg = Some(highlight);
+        assert_eq!(selected(&palette), (cell_fg, rgb_to_color32(highlight)));
     }
 
     /// Typing snaps the view back to the prompt (`on_terminal_input_start`), so

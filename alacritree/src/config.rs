@@ -18,9 +18,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Rgb};
-use egui::Color32;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use strum::{EnumIter, IntoEnumIterator, IntoStaticStr};
 
 use crate::bindings::{self, KeyBinding};
 use crate::path_style::PathStyle;
@@ -228,18 +228,18 @@ impl FontConfig {
     /// alacritty's `font.size`) into the logical-pixel value egui's `FontId`
     /// expects.  Without this step egui treats the number as logical pixels
     /// and renders 25% smaller than alacritty for the same config value.
-    pub fn egui_size(&self) -> f32 {
+    pub fn logical_size(&self) -> f32 {
         self.size * 96.0 / 72.0
     }
 
     /// Logical-pixel size for sidebar/modal titles.
     pub fn ui_heading_px(&self) -> f32 {
-        self.egui_size() * Self::UI_HEADING_RATIO
+        self.logical_size() * Self::UI_HEADING_RATIO
     }
 
     /// Logical-pixel size for the dominant non-heading UI text.
     pub fn ui_normal_px(&self) -> f32 {
-        self.egui_size() * Self::UI_NORMAL_RATIO
+        self.logical_size() * Self::UI_NORMAL_RATIO
     }
 }
 
@@ -354,7 +354,8 @@ pub struct Palette {
 /// When the sidebar's per-session `×` asks before killing the PTY.
 /// Confirmations otherwise exist only at worktree/app level, so the
 /// default keeps session close immediate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum ConfirmSessionClose {
     #[default]
     Never,
@@ -374,22 +375,11 @@ impl ConfirmSessionClose {
     }
 }
 
-fn parse_confirm_session_close(raw: &str) -> ConfirmSessionClose {
-    match raw {
-        "never" => ConfirmSessionClose::Never,
-        "busy" => ConfirmSessionClose::Busy,
-        "always" => ConfirmSessionClose::Always,
-        other => {
-            log::warn!("unknown ui.confirm_session_close value {other:?}, using \"never\"");
-            ConfirmSessionClose::default()
-        },
-    }
-}
-
 /// `[ui.drop] quote` as written in the config.  The five concrete modes are
 /// ported from wezterm's `quote_dropped_files` so an existing wezterm config
 /// carries over unchanged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum Quoting {
     /// Decide per session: a path headed into a distro is a POSIX shell word
     /// no matter what the host OS is.
@@ -446,21 +436,6 @@ impl ShellQuoting {
             },
             Self::WindowsAlwaysQuoted => format!("\"{path}\""),
         }
-    }
-}
-
-fn parse_quoting(raw: &str) -> Quoting {
-    match raw {
-        "auto" => Quoting::Auto,
-        "none" => Quoting::None,
-        "spaces_only" => Quoting::SpacesOnly,
-        "posix" => Quoting::Posix,
-        "windows" => Quoting::Windows,
-        "windows_always_quoted" => Quoting::WindowsAlwaysQuoted,
-        other => {
-            log::warn!("unknown ui.drop.quote value {other:?}, using \"auto\"");
-            Quoting::default()
-        },
     }
 }
 
@@ -554,7 +529,8 @@ pub struct IntegrationsConfig {
 }
 
 /// What opening a herdr agent row attaches to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum AttachMode {
     /// The agent's own pane.
     #[default]
@@ -563,22 +539,12 @@ pub enum AttachMode {
     Session,
 }
 
-fn parse_attach_mode(raw: &str) -> AttachMode {
-    match raw {
-        "agent" => AttachMode::Agent,
-        "session" => AttachMode::Session,
-        other => {
-            log::warn!("unknown integrations.herdr.attach value {other:?}, using \"agent\"");
-            AttachMode::default()
-        },
-    }
-}
-
 /// Whether a focus change made inside herdr may move alacritree, and from
 /// which sessions.  Following moves the keyboard, so the default is the
 /// narrower rule: only a session that is already showing herdr's view
 /// follows it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum FollowFocus {
     /// herdr never moves alacritree.  alacritree still tells herdr where to
     /// point when the user picks a row.
@@ -588,18 +554,6 @@ pub enum FollowFocus {
     Herdr,
     /// Follow from a native session too, on any reachable side.
     Always,
-}
-
-fn parse_follow_focus(raw: &str) -> FollowFocus {
-    match raw {
-        "off" => FollowFocus::Off,
-        "herdr" => FollowFocus::Herdr,
-        "always" => FollowFocus::Always,
-        other => {
-            log::warn!("unknown integrations.herdr.follow_focus value {other:?}, using \"herdr\"");
-            FollowFocus::default()
-        },
-    }
 }
 
 /// `[integrations.herdr]`: whether alacritree lists agents running under a
@@ -653,7 +607,8 @@ pub fn default_image_dir() -> PathBuf {
 }
 
 /// How the sidebar scroll areas draw their scrollbar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum ScrollbarStyle {
     /// egui's default: a thin bar overlaying the content edge, expanding on
     /// hover — which covers the icons at the right end of sidebar rows.
@@ -663,35 +618,8 @@ pub enum ScrollbarStyle {
     Solid,
 }
 
-fn parse_scrollbar(raw: &str) -> ScrollbarStyle {
-    match raw {
-        "floating" => ScrollbarStyle::Floating,
-        "solid" => ScrollbarStyle::Solid,
-        other => {
-            log::warn!("unknown ui.scrollbar value {other:?}, using \"floating\"");
-            ScrollbarStyle::default()
-        },
-    }
-}
-
-fn parse_path_style(raw: &str) -> PathStyle {
-    match raw {
-        "full" => PathStyle::Full,
-        "fish" => PathStyle::Fish,
-        "zed" => PathStyle::Zed,
-        other => {
-            log::warn!("unknown ui.path_style value {other:?}, using \"full\"");
-            PathStyle::default()
-        },
-    }
-}
-
 fn text_emphasis(raw: &RawTextEmphasis) -> TextEmphasis {
-    TextEmphasis {
-        color: raw.color.map(|v| rgb_to_color32(v.0)),
-        bold: raw.bold,
-        italic: raw.italic,
-    }
+    TextEmphasis { color: raw.color.map(|v| v.0), bold: raw.bold, italic: raw.italic }
 }
 
 /// A glyph alacritree ships and guarantees coverage for.  Paint helpers take
@@ -795,7 +723,8 @@ baked_glyphs! {
 
 /// What happens when the on-screen workspace stops having sessions, whether a
 /// close or a worktree deletion took the last one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum LastSessionClose {
     /// Recycle a shell in place — the workspace always has a live session,
     /// so the last session is by design unclosable.
@@ -826,19 +755,6 @@ impl LastSessionClose {
     }
 }
 
-fn parse_last_session_close(raw: &str) -> LastSessionClose {
-    match raw {
-        "respawn" => LastSessionClose::Respawn,
-        "navigate" => LastSessionClose::Navigate,
-        "ring_global" => LastSessionClose::RingGlobal,
-        "ring_project" => LastSessionClose::RingProject,
-        other => {
-            log::warn!("unknown ui.last_session_close value {other:?}, using \"respawn\"");
-            LastSessionClose::default()
-        },
-    }
-}
-
 /// `[ui] hold_exited_sessions`: whether a session whose child has exited stays
 /// on screen instead of closing with it.
 ///
@@ -847,7 +763,8 @@ fn parse_last_session_close(raw: &str) -> LastSessionClose {
 /// that matters is a shell that died with a message worth reading, and holding
 /// every clean exit as well turns an ordinary `exit` into a screen the user has
 /// to dismiss.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum HoldExitedSessions {
     /// Close a session as soon as its child exits.
     #[default]
@@ -870,22 +787,11 @@ impl HoldExitedSessions {
     }
 }
 
-fn parse_hold_exited_sessions(raw: &str) -> HoldExitedSessions {
-    match raw {
-        "never" => HoldExitedSessions::Never,
-        "on_error" => HoldExitedSessions::OnError,
-        "always" => HoldExitedSessions::Always,
-        other => {
-            log::warn!("unknown ui.hold_exited_sessions value {other:?}, using \"never\"");
-            HoldExitedSessions::default()
-        },
-    }
-}
-
 /// How far the projects sidebar goes when the cursor's row stops being
 /// rendered.  Both values keep the cursor; they differ only in whether the
 /// terminal comes along.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum SidebarFocus {
     /// A filtered-out cursor climbs to its nearest visible ancestor and is
     /// restored when the filter widens; a removed cursor slides to a sibling
@@ -903,21 +809,11 @@ impl SidebarFocus {
     }
 }
 
-fn parse_sidebar_focus(raw: &str) -> SidebarFocus {
-    match raw {
-        "preserve" => SidebarFocus::Preserve,
-        "follow" => SidebarFocus::Follow,
-        other => {
-            log::warn!("unknown ui.sidebar_focus value {other:?}, using \"preserve\"");
-            SidebarFocus::default()
-        },
-    }
-}
-
 /// `[ui] sidebar_scroll_align`: where a row a sidebar scrolled to is parked.
 /// Governs both panels and both reasons to scroll, because it describes the
 /// resting position rather than what chose the row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum ScrollAlign {
     /// egui's minimal scroll: move just far enough to bring the row into
     /// view, which leaves it against whichever edge it entered from.
@@ -928,29 +824,10 @@ pub enum ScrollAlign {
     Center,
 }
 
-impl ScrollAlign {
-    pub fn align(self) -> Option<egui::Align> {
-        match self {
-            Self::Minimal => None,
-            Self::Center => Some(egui::Align::Center),
-        }
-    }
-}
-
-fn parse_scroll_align(raw: &str) -> ScrollAlign {
-    match raw {
-        "minimal" => ScrollAlign::Minimal,
-        "center" => ScrollAlign::Center,
-        other => {
-            log::warn!("unknown ui.sidebar_scroll_align value {other:?}, using \"minimal\"");
-            ScrollAlign::default()
-        },
-    }
-}
-
 /// `[ui] search_scope`: whether a fuzzy query is confined by the panel's active
 /// toggle filters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum SearchScope {
     /// A query narrows the rows the toggles already allow.
     #[default]
@@ -960,20 +837,10 @@ pub enum SearchScope {
     All,
 }
 
-fn parse_search_scope(raw: &str) -> SearchScope {
-    match raw {
-        "filtered" => SearchScope::Filtered,
-        "all" => SearchScope::All,
-        other => {
-            log::warn!("unknown ui.search_scope value {other:?}, using \"filtered\"");
-            SearchScope::default()
-        },
-    }
-}
-
 /// `[ui] search_depth`: how far a sidebar query reaches.  `search_scope`
 /// says what a query is confined by; this says how far down it descends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum SearchDepth {
     /// Matches project and worktree names only.
     #[default]
@@ -982,22 +849,12 @@ pub enum SearchDepth {
     Sessions,
 }
 
-fn parse_search_depth(raw: &str) -> SearchDepth {
-    match raw {
-        "workspaces" => SearchDepth::Workspaces,
-        "sessions" => SearchDepth::Sessions,
-        other => {
-            log::warn!("unknown ui.search_depth value {other:?}, using \"workspaces\"");
-            SearchDepth::default()
-        },
-    }
-}
-
 /// `[ui.session_reorder] scope`: how far a session may travel when the user
 /// reorders it.  Widening it makes a reorder step able to change which
 /// workspace a session belongs to, which is why the default keeps a session
 /// inside the one it was spawned in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum ReorderScope {
     /// Only among the sessions of its own workspace.
     #[default]
@@ -1007,18 +864,6 @@ pub enum ReorderScope {
     Project,
     /// Home and every project's worktrees, in sidebar order.
     Anywhere,
-}
-
-fn parse_reorder_scope(raw: &str) -> ReorderScope {
-    match raw {
-        "workspace" => ReorderScope::Workspace,
-        "project" => ReorderScope::Project,
-        "anywhere" => ReorderScope::Anywhere,
-        other => {
-            log::warn!("unknown ui.session_reorder.scope value {other:?}, using \"workspace\"");
-            ReorderScope::default()
-        },
-    }
 }
 
 /// Whether session rows can be dragged, and how far a reorder may carry a
@@ -1033,7 +878,8 @@ pub struct SessionReorder {
 /// `[ui] sidebar_tooltips`: when a sidebar row offers its full name on hover.
 /// Governs both sidebars — a git panel row's path answers to it the same way a
 /// worktree or session name does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum SidebarTooltips {
     /// Never — a name the panel cut off stays cut off.
     Off,
@@ -1045,18 +891,6 @@ pub enum SidebarTooltips {
     /// has to wait out the delay again; offering one everywhere keeps a sweep
     /// down the list from stalling on the short names.
     Always,
-}
-
-fn parse_sidebar_tooltips(raw: &str) -> SidebarTooltips {
-    match raw {
-        "off" => SidebarTooltips::Off,
-        "elided" => SidebarTooltips::Elided,
-        "always" => SidebarTooltips::Always,
-        other => {
-            log::warn!("unknown ui.sidebar_tooltips value {other:?}, using \"elided\"");
-            SidebarTooltips::default()
-        },
-    }
 }
 
 /// Whether per-session UI (sidebar session rows, tab-strip segments) renders
@@ -1113,32 +947,63 @@ impl Default for UiFont {
 /// keys let the destructive one be marked. `reorder` and `upstream_diverged`
 /// share a default glyph and are otherwise unrelated.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct Icons {
+pub struct Icons<C = Rgb> {
     /// Glyph prefixing the sidebar search prompt.
-    pub search: IconStyle,
-    pub worktree_main: IconStyle,
-    pub worktree: IconStyle,
-    pub session: IconStyle,
-    pub herdr: IconStyle,
-    pub home: IconStyle,
-    pub project_expanded: IconStyle,
-    pub project_collapsed: IconStyle,
-    pub pr_open: IconStyle,
-    pub pr_draft: IconStyle,
-    pub pr_merged: IconStyle,
-    pub pr_closed: IconStyle,
-    pub upstream_level: IconStyle,
-    pub upstream_diverged: IconStyle,
-    pub upstream_gone: IconStyle,
-    pub upstream_untracked: IconStyle,
-    pub add_project: IconStyle,
-    pub new_worktree: IconStyle,
-    pub new_session: IconStyle,
-    pub remove_project: IconStyle,
-    pub delete_worktree: IconStyle,
-    pub close_session: IconStyle,
-    pub refresh: IconStyle,
-    pub reorder: IconStyle,
+    pub search: IconStyle<C>,
+    pub worktree_main: IconStyle<C>,
+    pub worktree: IconStyle<C>,
+    pub session: IconStyle<C>,
+    pub herdr: IconStyle<C>,
+    pub home: IconStyle<C>,
+    pub project_expanded: IconStyle<C>,
+    pub project_collapsed: IconStyle<C>,
+    pub pr_open: IconStyle<C>,
+    pub pr_draft: IconStyle<C>,
+    pub pr_merged: IconStyle<C>,
+    pub pr_closed: IconStyle<C>,
+    pub upstream_level: IconStyle<C>,
+    pub upstream_diverged: IconStyle<C>,
+    pub upstream_gone: IconStyle<C>,
+    pub upstream_untracked: IconStyle<C>,
+    pub add_project: IconStyle<C>,
+    pub new_worktree: IconStyle<C>,
+    pub new_session: IconStyle<C>,
+    pub remove_project: IconStyle<C>,
+    pub delete_worktree: IconStyle<C>,
+    pub close_session: IconStyle<C>,
+    pub refresh: IconStyle<C>,
+    pub reorder: IconStyle<C>,
+}
+
+impl<C: Copy> Icons<C> {
+    pub fn map_colors<D>(&self, f: impl Fn(C) -> D + Copy) -> Icons<D> {
+        Icons {
+            search: self.search.map_color(f),
+            worktree_main: self.worktree_main.map_color(f),
+            worktree: self.worktree.map_color(f),
+            session: self.session.map_color(f),
+            herdr: self.herdr.map_color(f),
+            home: self.home.map_color(f),
+            project_expanded: self.project_expanded.map_color(f),
+            project_collapsed: self.project_collapsed.map_color(f),
+            pr_open: self.pr_open.map_color(f),
+            pr_draft: self.pr_draft.map_color(f),
+            pr_merged: self.pr_merged.map_color(f),
+            pr_closed: self.pr_closed.map_color(f),
+            upstream_level: self.upstream_level.map_color(f),
+            upstream_diverged: self.upstream_diverged.map_color(f),
+            upstream_gone: self.upstream_gone.map_color(f),
+            upstream_untracked: self.upstream_untracked.map_color(f),
+            add_project: self.add_project.map_color(f),
+            new_worktree: self.new_worktree.map_color(f),
+            new_session: self.new_session.map_color(f),
+            remove_project: self.remove_project.map_color(f),
+            delete_worktree: self.delete_worktree.map_color(f),
+            close_session: self.close_session.map_color(f),
+            refresh: self.refresh.map_color(f),
+            reorder: self.reorder.map_color(f),
+        }
+    }
 }
 
 /// `[ui.focus_outline]`: stroke a border around a panel while it owns
@@ -1150,7 +1015,7 @@ pub struct FocusOutline {
     pub sidebar: bool,
     pub terminal: bool,
     /// `None` falls back to the theme accent at resolution time.
-    pub color: Option<Color32>,
+    pub color: Option<Rgb>,
     /// Absolute logical pixels (deliberately not ui_scale-multiplied);
     /// clamped to ≥ 0.5.
     pub thickness: f32,
@@ -1172,18 +1037,30 @@ impl Default for Icons {
 /// accepted as glyph-only, or a table that also styles color, weight, slant,
 /// and size.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
-pub struct IconStyle {
+pub struct IconStyle<C = Rgb> {
     pub glyph: Option<String>,
-    pub color: Option<Color32>,
+    pub color: Option<C>,
     pub bold: bool,
     pub italic: bool,
     /// Logical pixels before `ui_scale`; clamped to the icon's slot at paint.
     pub size: Option<f32>,
 }
 
-impl IconStyle {
+impl<C> IconStyle<C> {
     pub fn or_glyph<'a>(&'a self, default: &'a str) -> &'a str {
         self.glyph.as_deref().map(str::trim).filter(|g| !g.is_empty()).unwrap_or(default)
+    }
+}
+
+impl<C: Copy> IconStyle<C> {
+    pub fn map_color<D>(&self, f: impl Fn(C) -> D) -> IconStyle<D> {
+        IconStyle {
+            glyph: self.glyph.clone(),
+            color: self.color.map(f),
+            bold: self.bold,
+            italic: self.italic,
+            size: self.size,
+        }
     }
 }
 
@@ -1191,16 +1068,22 @@ impl IconStyle {
 /// site normally paints, so an emphasis that sets only `bold` still tracks the
 /// theme.
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
-pub struct TextEmphasis {
-    pub color: Option<Color32>,
+pub struct TextEmphasis<C = Rgb> {
+    pub color: Option<C>,
     pub bold: bool,
     pub italic: bool,
+}
+
+impl<C: Copy> TextEmphasis<C> {
+    pub fn map_color<D>(self, f: impl Fn(C) -> D) -> TextEmphasis<D> {
+        TextEmphasis { color: self.color.map(f), bold: self.bold, italic: self.italic }
+    }
 }
 
 /// `[ui.path_style]`: how each site spells a path, plus the two emphases the
 /// `Zed` style paints with.  Every field defaults to today's rendering.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
-pub struct PathStyleConfig {
+pub struct PathStyleConfig<C = Rgb> {
     /// The `diff: <path>` pane title.
     pub diff_title: PathStyle,
     /// Staged / Unstaged / Changes-vs file rows in the git panel.
@@ -1208,8 +1091,20 @@ pub struct PathStyleConfig {
     /// The workspace path atop the git panel.
     pub git_header: PathStyle,
     /// `Zed` style only, and only at the two egui sites.
-    pub filename: TextEmphasis,
-    pub parent: TextEmphasis,
+    pub filename: TextEmphasis<C>,
+    pub parent: TextEmphasis<C>,
+}
+
+impl<C: Copy> PathStyleConfig<C> {
+    pub fn map_colors<D>(self, f: impl Fn(C) -> D + Copy) -> PathStyleConfig<D> {
+        PathStyleConfig {
+            diff_title: self.diff_title,
+            git_rows: self.git_rows,
+            git_header: self.git_header,
+            filename: self.filename.map_color(f),
+            parent: self.parent.map_color(f),
+        }
+    }
 }
 
 /// One correction to a decoration the font placed: a shift in physical pixels,
@@ -1292,11 +1187,11 @@ fn parse_adjust(field: &str, raw: &str) -> Adjust {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UiTheme {
-    pub sidebar_background: Option<Color32>,
-    pub sidebar_foreground: Option<Color32>,
-    pub sidebar_border: Option<Color32>,
-    pub sidebar_accent: Option<Color32>,
-    pub sidebar_attention: Option<Color32>,
+    pub sidebar_background: Option<Rgb>,
+    pub sidebar_foreground: Option<Rgb>,
+    pub sidebar_border: Option<Rgb>,
+    pub sidebar_accent: Option<Rgb>,
+    pub sidebar_attention: Option<Rgb>,
     /// Fire a desktop notification when a non-visible session needs attention.
     pub notifications: bool,
     /// How long an attention trigger must survive without the session going
@@ -1857,12 +1752,31 @@ pub fn json_schema() -> schemars::Schema {
 // JSON Schema.  Every field's doc comment becomes the hover text an editor
 // shows for that key; a field left undocumented is a key nobody can look up
 // without reading this file.
-//
-// Fields whose value is a closed set carry `#[schemars(extend("enum" = ...))]`
-// so an editor completes and checks the spellings.  Only keys with one
-// spelling per value get one: the cursor parser below accepts `"Block"` and
-// `"block"` alike, and an `enum` listing one of the pair would mark a working
-// config as an error.
+
+/// Lists every spelling of a closed-set key so an editor completes and checks
+/// them.  Only keys with one spelling per value take it: the cursor parser
+/// accepts `"Block"` and `"block"` alike, and an `enum` listing one of the pair
+/// would mark a working config as an error.
+fn closed_set_schema<T>(_: &mut schemars::SchemaGenerator) -> schemars::Schema
+where
+    T: IntoEnumIterator + Into<&'static str>,
+{
+    let values: Vec<&'static str> = T::iter().map(Into::into).collect();
+    schemars::json_schema!({ "type": "string", "enum": values })
+}
+
+/// A closed-set key is read as a plain string so a misspelled value warns and
+/// falls back to the default rather than rejecting the whole config.
+fn parse_closed_set<T>(key: &str, raw: &str) -> T
+where
+    T: IntoEnumIterator + Default + Copy + Into<&'static str>,
+{
+    T::iter().find(|value| raw == Into::<&str>::into(*value)).unwrap_or_else(|| {
+        let fallback: &'static str = T::default().into();
+        log::warn!("unknown {key} value {raw:?}, using {fallback:?}");
+        T::default()
+    })
+}
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
@@ -2057,7 +1971,7 @@ struct RawFont {
 
 impl Default for RawFont {
     fn default() -> Self {
-        // Match alacritty's default of 11.25pt.  See `FontConfig::egui_size`
+        // Match alacritty's default of 11.25pt.  See `FontConfig::logical_size`
         // for the pt-to-logical-pixel conversion applied at use sites.
         Self {
             size: 11.25,
@@ -2620,7 +2534,7 @@ impl From<RawIconStyle> for IconStyle {
             RawIconStyle::Glyph(glyph) => IconStyle { glyph: Some(glyph), ..Default::default() },
             RawIconStyle::Table { glyph, color, bold, italic, size } => IconStyle {
                 glyph,
-                color: color.map(|c| rgb_to_color32(c.0)),
+                color: color.map(|c| c.0),
                 bold,
                 italic,
                 size: size.map(|s| s.max(1.0)),
@@ -2655,7 +2569,7 @@ struct RawSessionReorder {
     drag: bool,
     /// How far a reorder may carry a session: "workspace" | "project" |
     /// "anywhere".
-    #[schemars(extend("enum" = ["workspace", "project", "anywhere"]))]
+    #[schemars(schema_with = "closed_set_schema::<ReorderScope>")]
     scope: String,
 }
 
@@ -2765,14 +2679,7 @@ struct RawUiDrop {
     scratchpad: bool,
     /// How a path is quoted for the shell that receives it.  The five concrete
     /// modes are wezterm's `quote_dropped_files` values.
-    #[schemars(extend("enum" = [
-        "auto",
-        "none",
-        "spaces_only",
-        "posix",
-        "windows",
-        "windows_always_quoted"
-    ]))]
+    #[schemars(schema_with = "closed_set_schema::<Quoting>")]
     quote: String,
     /// Rewrite a Windows path to its distro spelling when the session runs
     /// inside WSL.
@@ -2853,7 +2760,7 @@ struct RawHerdr {
     /// break.  Honoured per side: the native side of a Windows host always
     /// attaches to the session, because herdr implements no direct attach
     /// there.
-    #[schemars(extend("enum" = ["agent", "session"]))]
+    #[schemars(schema_with = "closed_set_schema::<AttachMode>")]
     attach: String,
     /// Whether a focus change made inside herdr moves alacritree to the
     /// matching session.
@@ -2862,7 +2769,7 @@ struct RawHerdr {
     /// is already showing herdr's view, which is what an unmodified config
     /// has always done.  "always" also moves it from a plain native session,
     /// on any reachable side, after a gap in typing.
-    #[schemars(extend("enum" = ["off", "herdr", "always"]))]
+    #[schemars(schema_with = "closed_set_schema::<FollowFocus>")]
     follow_focus: String,
 }
 
@@ -2886,8 +2793,8 @@ impl RawHerdr {
             poll_interval: Duration::from_millis(self.poll_interval_ms),
             show_unmatched: self.show_unmatched,
             show_panes: self.show_panes,
-            attach: parse_attach_mode(&self.attach),
-            follow_focus: parse_follow_focus(&self.follow_focus),
+            attach: parse_closed_set("integrations.herdr.attach", &self.attach),
+            follow_focus: parse_closed_set("integrations.herdr.follow_focus", &self.follow_focus),
         }
     }
 }
@@ -2915,7 +2822,7 @@ struct RawUi {
     attention_grace_ms: u64,
     /// When the sidebar × on a session row asks before killing the PTY:
     /// "never" | "busy" | "always".
-    #[schemars(extend("enum" = ["never", "busy", "always"]))]
+    #[schemars(schema_with = "closed_set_schema::<ConfirmSessionClose>")]
     confirm_session_close: String,
     /// Whether the sidebar × on a harness-managed row asks before detaching,
     /// and whether DetachAllMultiplexerPanes asks once for the whole batch.
@@ -2930,18 +2837,18 @@ struct RawUi {
     /// What happens when the on-screen workspace stops having sessions,
     /// whether a close or a worktree deletion took the last one:
     /// "respawn" | "navigate" | "ring_global" | "ring_project".
-    #[schemars(extend("enum" = ["respawn", "navigate", "ring_global", "ring_project"]))]
+    #[schemars(schema_with = "closed_set_schema::<LastSessionClose>")]
     last_session_close: String,
     /// Whether a session whose child has exited stays on screen instead of
     /// closing with it: "never" | "on_error" | "always".  A held session
     /// writes one line into its own grid naming the key that closes it.  A
     /// herdr attach that was refused is held whatever this says, since its
     /// refusal message is the only report of what happened.
-    #[schemars(extend("enum" = ["never", "on_error", "always"]))]
+    #[schemars(schema_with = "closed_set_schema::<HoldExitedSessions>")]
     hold_exited_sessions: String,
     /// How far the projects sidebar goes when the cursor's row stops being
     /// rendered: "preserve" | "follow".
-    #[schemars(extend("enum" = ["preserve", "follow"]))]
+    #[schemars(schema_with = "closed_set_schema::<SidebarFocus>")]
     sidebar_focus: String,
     /// Whether the projects sidebar scrolls to the session on screen whenever
     /// it changes — a cycling key, a click, the palette, an IPC request.
@@ -2950,20 +2857,20 @@ struct RawUi {
     /// Where a row the sidebar scrolled to is parked: "minimal" | "center".
     /// Under "center" every cursor step re-centres the list, and clicking a
     /// row near the panel edge scrolls it out from under the pointer.
-    #[schemars(extend("enum" = ["minimal", "center"]))]
+    #[schemars(schema_with = "closed_set_schema::<ScrollAlign>")]
     sidebar_scroll_align: String,
     /// Whether a fuzzy query is confined by the panel's active toggle filters:
     /// "filtered" | "all".
-    #[schemars(extend("enum" = ["filtered", "all"]))]
+    #[schemars(schema_with = "closed_set_schema::<SearchScope>")]
     search_scope: String,
     /// How far a sidebar query reaches: "workspaces" matches project and
     /// worktree names only; "sessions" also matches session titles and herdr
     /// agent names.
-    #[schemars(extend("enum" = ["workspaces", "sessions"]))]
+    #[schemars(schema_with = "closed_set_schema::<SearchDepth>")]
     search_depth: String,
     /// When a sidebar row spells its full name out on hover:
     /// "elided" | "always" | "off".
-    #[schemars(extend("enum" = ["elided", "always", "off"]))]
+    #[schemars(schema_with = "closed_set_schema::<SidebarTooltips>")]
     sidebar_tooltips: String,
     /// Whether a sidebar icon explains itself on hover.
     icon_tooltips: bool,
@@ -2980,7 +2887,7 @@ struct RawUi {
     /// Sidebar glyph overrides.
     icons: RawIcons,
     /// Sidebar scrollbar style: "floating" | "solid".
-    #[schemars(extend("enum" = ["floating", "solid"]))]
+    #[schemars(schema_with = "closed_set_schema::<ScrollbarStyle>")]
     scrollbar: String,
     /// Draw the terminal grid through an OpenGL paint callback instead of
     /// handing epaint a mesh.  It needs a GL 3 context and bypasses the
@@ -3104,13 +3011,13 @@ struct RawPathStyle {
     /// "full" | "fish" | "zed", per site.
     ///
     /// The diff pane's title.
-    #[schemars(extend("enum" = ["full", "fish", "zed"]))]
+    #[schemars(schema_with = "closed_set_schema::<PathStyle>")]
     diff_title: String,
     /// Paths in the git panel's file rows.
-    #[schemars(extend("enum" = ["full", "fish", "zed"]))]
+    #[schemars(schema_with = "closed_set_schema::<PathStyle>")]
     git_rows: String,
     /// The path in the git panel's header.
-    #[schemars(extend("enum" = ["full", "fish", "zed"]))]
+    #[schemars(schema_with = "closed_set_schema::<PathStyle>")]
     git_header: String,
     /// How the last path segment is emphasized.
     filename: RawTextEmphasis,
@@ -3287,24 +3194,36 @@ impl RawConfig {
         palette.draw_bold_with_bright = c.draw_bold_text_with_bright_colors;
 
         let ui = UiTheme {
-            sidebar_background: self.ui.sidebar_background.map(|v| rgb_to_color32(v.0)),
-            sidebar_foreground: self.ui.sidebar_foreground.map(|v| rgb_to_color32(v.0)),
-            sidebar_border: self.ui.sidebar_border.map(|v| rgb_to_color32(v.0)),
-            sidebar_accent: self.ui.sidebar_accent.map(|v| rgb_to_color32(v.0)),
-            sidebar_attention: self.ui.sidebar_attention.map(|v| rgb_to_color32(v.0)),
+            sidebar_background: self.ui.sidebar_background.map(|v| v.0),
+            sidebar_foreground: self.ui.sidebar_foreground.map(|v| v.0),
+            sidebar_border: self.ui.sidebar_border.map(|v| v.0),
+            sidebar_accent: self.ui.sidebar_accent.map(|v| v.0),
+            sidebar_attention: self.ui.sidebar_attention.map(|v| v.0),
             notifications: self.ui.notifications,
             attention_grace: Duration::from_millis(self.ui.attention_grace_ms),
-            confirm_session_close: parse_confirm_session_close(&self.ui.confirm_session_close),
+            confirm_session_close: parse_closed_set(
+                "ui.confirm_session_close",
+                &self.ui.confirm_session_close,
+            ),
             confirm_session_detach: self.ui.confirm_session_detach,
             sessions_filter_counts_detached: self.ui.sessions_filter_counts_detached,
-            last_session_close: parse_last_session_close(&self.ui.last_session_close),
-            hold_exited_sessions: parse_hold_exited_sessions(&self.ui.hold_exited_sessions),
-            sidebar_focus: parse_sidebar_focus(&self.ui.sidebar_focus),
+            last_session_close: parse_closed_set(
+                "ui.last_session_close",
+                &self.ui.last_session_close,
+            ),
+            hold_exited_sessions: parse_closed_set(
+                "ui.hold_exited_sessions",
+                &self.ui.hold_exited_sessions,
+            ),
+            sidebar_focus: parse_closed_set("ui.sidebar_focus", &self.ui.sidebar_focus),
             sidebar_follow_active: self.ui.sidebar_follow_active,
-            sidebar_scroll_align: parse_scroll_align(&self.ui.sidebar_scroll_align),
-            search_scope: parse_search_scope(&self.ui.search_scope),
-            search_depth: parse_search_depth(&self.ui.search_depth),
-            sidebar_tooltips: parse_sidebar_tooltips(&self.ui.sidebar_tooltips),
+            sidebar_scroll_align: parse_closed_set(
+                "ui.sidebar_scroll_align",
+                &self.ui.sidebar_scroll_align,
+            ),
+            search_scope: parse_closed_set("ui.search_scope", &self.ui.search_scope),
+            search_depth: parse_closed_set("ui.search_depth", &self.ui.search_depth),
+            sidebar_tooltips: parse_closed_set("ui.sidebar_tooltips", &self.ui.sidebar_tooltips),
             icon_tooltips: self.ui.icon_tooltips,
             session_display: SessionDisplay {
                 sidebar_always: self.ui.session_display.sidebar_always,
@@ -3313,7 +3232,7 @@ impl RawConfig {
             },
             session_reorder: SessionReorder {
                 drag: self.ui.session_reorder.drag,
-                scope: parse_reorder_scope(&self.ui.session_reorder.scope),
+                scope: parse_closed_set("ui.session_reorder.scope", &self.ui.session_reorder.scope),
             },
             gpu_grid: self.ui.gpu_grid,
             decorations: Decorations {
@@ -3342,10 +3261,10 @@ impl RawConfig {
             focus_outline: FocusOutline {
                 sidebar: self.ui.focus_outline.sidebar,
                 terminal: self.ui.focus_outline.terminal,
-                color: self.ui.focus_outline.color.map(|v| rgb_to_color32(v.0)),
+                color: self.ui.focus_outline.color.map(|v| v.0),
                 thickness: self.ui.focus_outline.thickness.max(0.5),
             },
-            scrollbar: parse_scrollbar(&self.ui.scrollbar),
+            scrollbar: parse_closed_set("ui.scrollbar", &self.ui.scrollbar),
             sidebar_click_focus: self.ui.sidebar_click_focus,
             focus_priority_boost: self.ui.focus_priority_boost,
             async_session_spawn: self.ui.async_session_spawn,
@@ -3354,9 +3273,9 @@ impl RawConfig {
             worktree_name: self.ui.worktree_name.clone().filter(|t| !t.trim().is_empty()),
             project_name: self.ui.project_name.clone().filter(|t| !t.trim().is_empty()),
             path_style: PathStyleConfig {
-                diff_title: parse_path_style(&self.ui.path_style.diff_title),
-                git_rows: parse_path_style(&self.ui.path_style.git_rows),
-                git_header: parse_path_style(&self.ui.path_style.git_header),
+                diff_title: parse_closed_set("ui.path_style", &self.ui.path_style.diff_title),
+                git_rows: parse_closed_set("ui.path_style", &self.ui.path_style.git_rows),
+                git_header: parse_closed_set("ui.path_style", &self.ui.path_style.git_header),
                 filename: text_emphasis(&self.ui.path_style.filename),
                 parent: text_emphasis(&self.ui.path_style.parent),
             },
@@ -3366,7 +3285,7 @@ impl RawConfig {
                 sidebar: self.ui.drop.sidebar,
                 scratchpad: self.ui.drop.scratchpad,
                 spelling: PathSpelling {
-                    quote: parse_quoting(&self.ui.drop.quote),
+                    quote: parse_closed_set("ui.drop.quote", &self.ui.drop.quote),
                     wsl_translate: self.ui.drop.wsl_translate,
                 },
                 highlight: self.ui.drop.highlight,
@@ -3545,10 +3464,6 @@ fn apply_set(target: &mut [Rgb; 8], set: RawSet) {
             *slot = v.0;
         }
     }
-}
-
-fn rgb_to_color32(r: Rgb) -> Color32 {
-    Color32::from_rgb(r.r, r.g, r.b)
 }
 
 /// Drop unusable `[[ui.profiles]]` entries instead of failing the parse:
@@ -3880,13 +3795,19 @@ show_panes = true
             ("herdr", FollowFocus::Herdr),
             ("always", FollowFocus::Always),
         ] {
-            assert_eq!(parse_follow_focus(word), expected);
+            assert_eq!(
+                parse_closed_set::<FollowFocus>("integrations.herdr.follow_focus", word),
+                expected
+            );
         }
     }
 
     #[test]
     fn herdr_follow_focus_falls_back_on_an_unknown_word() {
-        assert_eq!(parse_follow_focus("sideways"), FollowFocus::Herdr);
+        assert_eq!(
+            parse_closed_set::<FollowFocus>("integrations.herdr.follow_focus", "sideways"),
+            FollowFocus::Herdr
+        );
     }
 
     #[test]
@@ -3978,7 +3899,7 @@ show_panes = true
             "[ui.path_style.filename]\ncolor = \"#e6e6e6\"\nbold = \
              true\n[ui.path_style.parent]\nitalic = true\n",
         );
-        assert_eq!(ui.path_style.filename.color, Some(Color32::from_rgb(0xe6, 0xe6, 0xe6)));
+        assert_eq!(ui.path_style.filename.color, Some(Rgb { r: 0xe6, g: 0xe6, b: 0xe6 }));
         assert!(ui.path_style.filename.bold);
         assert!(!ui.path_style.filename.italic);
         assert_eq!(ui.path_style.parent.color, None);
@@ -4105,7 +4026,7 @@ show_panes = true
         );
         let style = &ui.icons.upstream_gone;
         assert_eq!(style.or_glyph(""), "⌫");
-        assert_eq!(style.color, Some(Color32::from_rgb(0xff, 0x55, 0x55)));
+        assert_eq!(style.color, Some(Rgb { r: 0xff, g: 0x55, b: 0x55 }));
         assert!(style.bold);
         assert!(style.italic);
         assert_eq!(style.size, Some(14.0));
@@ -4135,7 +4056,7 @@ show_panes = true
             "icon = { glyph = \"⌫\", color = \"#ff5555\", bold = true, size = 12 }",
         );
         assert_eq!(icon.or_glyph("x"), "⌫");
-        assert_eq!(icon.color, Some(Color32::from_rgb(0xff, 0x55, 0x55)));
+        assert_eq!(icon.color, Some(Rgb { r: 0xff, g: 0x55, b: 0x55 }));
         assert!(icon.bold);
         assert_eq!(icon.size, Some(12.0));
     }
@@ -4791,7 +4712,7 @@ program = "second"
         let ui =
             ui_from_toml("[ui.icons]\ndelete_worktree = { glyph = \"✖\", color = \"#ff5555\" }");
         assert_eq!(ui.icons.delete_worktree.or_glyph(""), "✖");
-        assert_eq!(ui.icons.delete_worktree.color, Some(Color32::from_rgb(0xff, 0x55, 0x55)));
+        assert_eq!(ui.icons.delete_worktree.color, Some(Rgb { r: 0xff, g: 0x55, b: 0x55 }));
         // A sibling sharing the same default glyph is unaffected.
         assert_eq!(ui.icons.close_session.or_glyph(""), "×");
         assert_eq!(ui.icons.close_session.color, None);
@@ -4842,7 +4763,7 @@ program = "second"
         .focus_outline;
         assert!(fo.sidebar);
         assert!(fo.terminal);
-        assert_eq!(fo.color, Some(Color32::from_rgb(0x89, 0xb4, 0xfa)));
+        assert_eq!(fo.color, Some(Rgb { r: 0x89, g: 0xb4, b: 0xfa }));
         assert_eq!(fo.thickness, 2.5);
     }
 
@@ -5003,7 +4924,7 @@ program = "second"
         assert_eq!(ui_from_toml("").sidebar_attention, None);
         assert_eq!(
             ui_from_toml("[ui]\nsidebar_attention = \"#ffb86c\"").sidebar_attention,
-            Some(Color32::from_rgb(0xff, 0xb8, 0x6c))
+            Some(Rgb { r: 0xff, g: 0xb8, b: 0x6c })
         );
     }
 

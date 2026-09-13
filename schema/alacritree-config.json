@@ -1450,9 +1450,9 @@
           "default": "elided",
           "description": "When a sidebar row spells its full name out on hover:\n\"elided\" | \"always\" | \"off\".",
           "enum": [
+            "off",
             "elided",
-            "always",
-            "off"
+            "always"
           ],
           "type": "string"
         },

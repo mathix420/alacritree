@@ -12,19 +12,37 @@ pub fn rgb_to_color32(rgb: Rgb) -> Color32 {
     Color32::from_rgb(rgb.r, rgb.g, rgb.b)
 }
 
-pub fn background(palette: &Palette) -> Color32 {
-    rgb_to_color32(palette.bg)
+/// The palette colours that no cell or escape sequence decides, converted
+/// once for the painters.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerminalColors {
+    pub fg: Color32,
+    pub bg: Color32,
+    /// The configured cursor, or the foreground when none is set.
+    pub cursor: Color32,
+    pub cursor_fg: Option<Color32>,
+    pub selection_bg: Option<Color32>,
+    pub selection_fg: Option<Color32>,
+}
+
+impl TerminalColors {
+    pub fn new(palette: &Palette) -> Self {
+        Self {
+            fg: rgb_to_color32(palette.fg),
+            bg: rgb_to_color32(palette.bg),
+            cursor: rgb_to_color32(palette.cursor_bg.unwrap_or(palette.fg)),
+            cursor_fg: palette.cursor_fg.map(rgb_to_color32),
+            selection_bg: palette.selection_bg.map(rgb_to_color32),
+            selection_fg: palette.selection_fg.map(rgb_to_color32),
+        }
+    }
 }
 
 /// The terminal's own default background, which OSC 11 can move away from the
 /// configured one.  Everything painting behind the grid has to agree on this:
 /// the background pass draws no quad for a cell already carrying it.
-pub fn default_background(runtime: &Colors, palette: &Palette) -> Color32 {
-    rgb_to_color32(resolve_named_raw(NamedColor::Background, runtime, palette))
-}
-
-pub fn foreground(palette: &Palette) -> Color32 {
-    rgb_to_color32(palette.fg)
+pub fn default_background(runtime: &Colors, colors: &TerminalColors) -> Color32 {
+    runtime[NamedColor::Background].map_or(colors.bg, rgb_to_color32)
 }
 
 pub fn resolve(
@@ -226,5 +244,84 @@ fn cube_step(x: u8) -> u8 {
     match x {
         0 => 0,
         n => 55 + n * 40,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    const RED: Rgb = Rgb { r: 200, g: 100, b: 50 };
+    const BRIGHT_RED: Rgb = Rgb { r: 250, g: 120, b: 90 };
+
+    fn palette() -> Palette {
+        let mut palette = Config::default().palette;
+        palette.normal[1] = RED;
+        palette.bright[1] = BRIGHT_RED;
+        palette.dim = None;
+        palette.indexed.clear();
+        palette
+    }
+
+    fn fg(color: Color, flags: Flags, runtime: &Colors, palette: &Palette) -> Rgb {
+        resolve(color, flags, runtime, palette, true)
+    }
+
+    #[test]
+    fn bold_text_takes_the_bright_color_only_when_configured_to() {
+        let runtime = Colors::default();
+        let mut palette = palette();
+
+        palette.draw_bold_with_bright = true;
+        assert_eq!(fg(Color::Named(NamedColor::Red), Flags::BOLD, &runtime, &palette), BRIGHT_RED);
+        assert_eq!(fg(Color::Indexed(1), Flags::BOLD, &runtime, &palette), BRIGHT_RED);
+
+        palette.draw_bold_with_bright = false;
+        assert_eq!(fg(Color::Named(NamedColor::Red), Flags::BOLD, &runtime, &palette), RED);
+        assert_eq!(fg(Color::Indexed(1), Flags::BOLD, &runtime, &palette), RED);
+    }
+
+    #[test]
+    fn dim_text_darkens_its_color_when_no_dim_palette_is_set() {
+        let runtime = Colors::default();
+        let palette = palette();
+        let darkened = Rgb { r: 132, g: 66, b: 33 };
+
+        assert_eq!(fg(Color::Named(NamedColor::Red), Flags::DIM, &runtime, &palette), darkened);
+        assert_eq!(fg(Color::Spec(RED), Flags::DIM, &runtime, &palette), darkened);
+    }
+
+    #[test]
+    fn indexed_colors_past_the_ansi_sixteen_follow_the_cube_and_gray_ramp() {
+        let runtime = Colors::default();
+        let palette = palette();
+        let indexed = |i| resolve(Color::Indexed(i), Flags::empty(), &runtime, &palette, false);
+
+        assert_eq!(indexed(16), Rgb { r: 0, g: 0, b: 0 });
+        assert_eq!(indexed(21), Rgb { r: 0, g: 0, b: 255 });
+        assert_eq!(indexed(67), Rgb { r: 95, g: 135, b: 175 });
+        assert_eq!(indexed(231), Rgb { r: 255, g: 255, b: 255 });
+        assert_eq!(indexed(232), Rgb { r: 8, g: 8, b: 8 });
+        assert_eq!(indexed(255), Rgb { r: 238, g: 238, b: 238 });
+    }
+
+    #[test]
+    fn a_named_color_prefers_the_runtime_then_the_palette_then_a_derived_dim() {
+        let mut runtime = Colors::default();
+        let mut palette = palette();
+        let named = |n, runtime: &Colors, palette: &Palette| {
+            resolve(Color::Named(n), Flags::empty(), runtime, palette, false)
+        };
+
+        assert_eq!(named(NamedColor::Red, &runtime, &palette), RED);
+        let osc = Rgb { r: 1, g: 2, b: 3 };
+        runtime[NamedColor::Red] = Some(osc);
+        assert_eq!(named(NamedColor::Red, &runtime, &palette), osc);
+
+        assert_eq!(named(NamedColor::DimRed, &runtime, &palette), Rgb { r: 132, g: 66, b: 33 });
+        let configured_dim = Rgb { r: 9, g: 8, b: 7 };
+        palette.dim = Some([configured_dim; 8]);
+        assert_eq!(named(NamedColor::DimRed, &runtime, &palette), configured_dim);
     }
 }

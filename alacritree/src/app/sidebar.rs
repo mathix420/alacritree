@@ -219,6 +219,7 @@ impl AlacritreeApp {
 
     pub(super) fn show_project_sidebar(&mut self, ctx: &Context, panel_frame: Frame) -> egui::Rect {
         let view = self.project_sidebar_view(ctx);
+        let paint = SidebarPaint { view: &view, icons: &self.icons };
         let theme = view.theme;
         let mut requests = SidebarRequests::default();
         let panel_resp = SidePanel::left("left_sidebar")
@@ -236,11 +237,11 @@ impl AlacritreeApp {
                         ui,
                         "Projects",
                         &self.sidebar.filter,
-                        &self.config.ui.icons.search,
+                        &paint.icons.search,
                         &theme,
                         self.sidebar.filter.toggles_apply(self.sidebar_focus_state.search_scope),
                     );
-                    projects_header_buttons(ui, &view, &mut requests);
+                    projects_header_buttons(ui, paint, &mut requests);
                 });
                 ui.separator();
 
@@ -252,12 +253,7 @@ impl AlacritreeApp {
                     // whenever the list otherwise fits the panel.
                     let mut group_gap = 0.0_f32;
                     if !view.filtering || view.membership.home {
-                        paint_home_group(
-                            ui,
-                            &view,
-                            self.current_workspace.is_none(),
-                            &mut requests,
-                        );
+                        paint_home_group(ui, paint, &mut requests);
                         group_gap = 2.0;
                     }
 
@@ -280,17 +276,9 @@ impl AlacritreeApp {
                             continue;
                         }
                         ui.add_space(std::mem::take(&mut group_gap));
-                        paint_project_header(ui, &view, idx, project, &mut requests);
+                        paint_project_header(ui, paint, idx, project, &mut requests);
                         if project.expanded || view.filtering {
-                            paint_worktrees(
-                                ui,
-                                &view,
-                                idx,
-                                project,
-                                self.current_workspace.as_deref(),
-                                &self.liveness,
-                                &mut requests,
-                            );
+                            paint_worktrees(ui, paint, idx, project, &mut requests);
                             group_gap = 4.0;
                         }
                     }
@@ -413,7 +401,6 @@ impl AlacritreeApp {
 
         SidebarView {
             theme: self.theme,
-            icons: self.config.ui.icons.clone(),
             probing,
             reorder_mode: self.sidebar.reorder_mode,
             session_drag: self.session_drag,
@@ -425,6 +412,7 @@ impl AlacritreeApp {
             membership,
             filtered_empty,
             home_rows,
+            home_active: self.current_workspace.is_none(),
             home_attention,
             home_activity,
             projects,
@@ -505,6 +493,8 @@ impl AlacritreeApp {
                     } else {
                         self.workspace_activity(&ws)
                     },
+                    is_active: current_workspace == Some(wt.path.as_path()),
+                    missing: self.liveness.missing(&wt.path),
                     pr,
                     rows,
                 });
@@ -646,7 +636,6 @@ impl AlacritreeApp {
 /// borrow `projects` mutably alongside it.
 struct SidebarView {
     theme: Theme,
-    icons: Icons,
     probing: bool,
     reorder_mode: bool,
     session_drag: bool,
@@ -659,6 +648,7 @@ struct SidebarView {
     membership: FilterMembership,
     filtered_empty: bool,
     home_rows: Vec<WorkspaceRowData>,
+    home_active: bool,
     home_attention: bool,
     home_activity: SessionActivity,
     projects: Vec<ProjectView>,
@@ -667,6 +657,14 @@ struct SidebarView {
     distros: Vec<wsl::WslDistro>,
     profile_names: Vec<String>,
     worktree_profiles: Vec<(String, String)>,
+}
+
+/// A view paired with the app's icon set.  The icons stay a borrow of their
+/// own field, so the panel closure can still borrow `projects` mutably.
+#[derive(Clone, Copy)]
+struct SidebarPaint<'a> {
+    view: &'a SidebarView,
+    icons: &'a Icons<Color32>,
 }
 
 impl SidebarView {
@@ -742,6 +740,9 @@ struct WorktreeView {
     rows: Vec<WorkspaceRowData>,
     attention: bool,
     activity: SessionActivity,
+    is_active: bool,
+    /// What the liveness probe has seen since discovery ran, if anything.
+    missing: Option<bool>,
 }
 
 /// What the paint pass asks for, applied once the panel closure has released
@@ -773,13 +774,17 @@ struct SidebarRequests {
     drawn_worktrees: Vec<PathBuf>,
 }
 
-fn projects_header_buttons(ui: &mut egui::Ui, view: &SidebarView, requests: &mut SidebarRequests) {
-    let theme = &view.theme;
+fn projects_header_buttons(
+    ui: &mut egui::Ui,
+    paint: SidebarPaint<'_>,
+    requests: &mut SidebarRequests,
+) {
+    let theme = &paint.view.theme;
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
         if icon_tooltip(
             styled_icon_button(
                 ui,
-                &view.icons.add_project,
+                &paint.icons.add_project,
                 DEFAULT_ADD_ICON,
                 theme.text_dim,
                 theme,
@@ -793,13 +798,13 @@ fn projects_header_buttons(ui: &mut egui::Ui, view: &SidebarView, requests: &mut
         }
         // Lit while active: the mode is only visible as grips
         // on the rows, so the button has to say it's on.
-        let (color, hint) = if view.reorder_mode {
+        let (color, hint) = if paint.view.reorder_mode {
             (theme.accent, "done reordering")
         } else {
             (theme.text_dim, "reorder projects")
         };
         if icon_tooltip(
-            styled_icon_button(ui, &view.icons.reorder, DEFAULT_REORDER_ICON, color, theme),
+            styled_icon_button(ui, &paint.icons.reorder, DEFAULT_REORDER_ICON, color, theme),
             hint,
             theme.icon_tooltips,
         )
@@ -815,13 +820,13 @@ fn projects_header_buttons(ui: &mut egui::Ui, view: &SidebarView, requests: &mut
 /// `None` is a workspace row.
 fn session_drop_target(
     ui: &egui::Ui,
-    view: &SidebarView,
+    paint: SidebarPaint<'_>,
     row_rect: egui::Rect,
     ws: &WorkspaceKey,
     slot: Option<(usize, SessionId)>,
     requests: &mut SidebarRequests,
 ) {
-    let Some(dragged) = drop_candidate(view.drag_range.as_ref(), ws, slot) else { return };
+    let Some(dragged) = drop_candidate(paint.view.drag_range.as_ref(), ws, slot) else { return };
     let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) else { return };
     if !row_rect.contains(pointer) {
         return;
@@ -829,7 +834,7 @@ fn session_drop_target(
     let position = match slot {
         // A session row: the half the pointer is in decides.
         Some((idx, _)) => {
-            if draw_drop_indicator(ui, row_rect, pointer, &view.theme) {
+            if draw_drop_indicator(ui, row_rect, pointer, &paint.view.theme) {
                 idx
             } else {
                 idx + 1
@@ -844,7 +849,7 @@ fn session_drop_target(
             ui.painter().hline(
                 row_rect.x_range(),
                 row_rect.bottom(),
-                drop_indicator_stroke(&view.theme),
+                drop_indicator_stroke(&paint.view.theme),
             );
             0
         },
@@ -871,21 +876,20 @@ fn drop_candidate(
     range.contains(ws).then_some(*dragged)
 }
 
-fn paint_home_group(
-    ui: &mut egui::Ui,
-    view: &SidebarView,
-    is_active: bool,
-    requests: &mut SidebarRequests,
-) {
-    let is_cursor = matches!(&view.cursor_row, Some(SidebarRow::Home));
+fn paint_home_group(ui: &mut egui::Ui, paint: SidebarPaint<'_>, requests: &mut SidebarRequests) {
+    let is_cursor = matches!(&paint.view.cursor_row, Some(SidebarRow::Home));
     let action = home_row(
         ui,
-        is_active,
+        paint.view.home_active,
         is_cursor,
-        view.scrolls(is_cursor) || view.follows_home(),
-        RowStatus { attention: view.home_attention, activity: view.home_activity, managed: None },
-        &view.icons,
-        &view.theme,
+        paint.view.scrolls(is_cursor) || paint.view.follows_home(),
+        RowStatus {
+            attention: paint.view.home_attention,
+            activity: paint.view.home_activity,
+            managed: None,
+        },
+        paint.icons,
+        &paint.view.theme,
     );
     if action.activate {
         requests.home = true;
@@ -893,14 +897,14 @@ fn paint_home_group(
     if action.spawn {
         requests.spawn_shell = Some(None);
     }
-    session_drop_target(ui, view, action.rect, &None, None, requests);
-    paint_workspace_children(ui, view, &view.home_rows, &None, requests);
+    session_drop_target(ui, paint, action.rect, &None, None, requests);
+    paint_workspace_children(ui, paint, &paint.view.home_rows, &None, requests);
 }
 
 /// The session and herdr rows listed under the workspace `ws`.
 fn paint_workspace_children(
     ui: &mut egui::Ui,
-    view: &SidebarView,
+    paint: SidebarPaint<'_>,
     rows: &[WorkspaceRowData],
     ws: &WorkspaceKey,
     requests: &mut SidebarRequests,
@@ -913,18 +917,17 @@ fn paint_workspace_children(
     for row in rows {
         match row {
             WorkspaceRowData::Session(row) => {
-                let is_cursor =
-                    matches!(&view.cursor_row, Some(SidebarRow::Session(id)) if *id == row.id);
-                let scroll = view.scrolls(is_cursor) || view.follows_session(row.id);
+                let is_cursor = matches!(&paint.view.cursor_row, Some(SidebarRow::Session(id)) if *id == row.id);
+                let scroll = paint.view.scrolls(is_cursor) || paint.view.follows_session(row.id);
                 let movable = row.managed.is_none();
                 let act = session_row(
                     ui,
                     row,
                     is_cursor,
                     scroll,
-                    view.session_drag && movable,
-                    &view.icons,
-                    &view.theme,
+                    paint.view.session_drag && movable,
+                    paint.icons,
+                    &paint.view.theme,
                 );
                 if act.activate {
                     requests.activate_session = Some((ws.clone(), row.id));
@@ -933,18 +936,18 @@ fn paint_workspace_children(
                     requests.close_session = Some(row.id);
                 }
                 if movable {
-                    session_drop_target(ui, view, act.rect, ws, Some((slot, row.id)), requests);
+                    session_drop_target(ui, paint, act.rect, ws, Some((slot, row.id)), requests);
                     slot += 1;
                 }
             },
             WorkspaceRowData::Herdr(row) => {
                 let is_cursor = matches!(
-                    &view.cursor_row,
+                    &paint.view.cursor_row,
                     Some(SidebarRow::HerdrAgent(side, id))
                         if *side == row.side && *id == row.terminal_id
                 );
-                let scroll = view.scrolls(is_cursor);
-                let act = herdr_row(ui, row, is_cursor, scroll, &view.icons, &view.theme);
+                let scroll = paint.view.scrolls(is_cursor);
+                let act = herdr_row(ui, row, is_cursor, scroll, paint.icons, &paint.view.theme);
                 if act.attach {
                     requests.attach_herdr = Some((
                         ws.clone(),
@@ -963,13 +966,13 @@ fn paint_workspace_children(
 /// The project's own row: its controls, cursor, reorder drop and context menu.
 fn paint_project_header(
     ui: &mut egui::Ui,
-    view: &SidebarView,
+    paint: SidebarPaint<'_>,
     idx: usize,
     project: &mut Project,
     requests: &mut SidebarRequests,
 ) {
-    let theme = &view.theme;
-    let proj_attention = view.projects.get(idx).is_some_and(|p| p.attention);
+    let theme = &paint.view.theme;
+    let proj_attention = paint.view.projects.get(idx).is_some_and(|p| p.attention);
     // Bubble attention up to the project row only when the
     // project is collapsed.  Once expanded, the actual
     // worktree rows already show the dot, and doubling it
@@ -985,14 +988,14 @@ fn paint_project_header(
     let row_rect = row_with_trailing(
         ui,
         |ui| {
-            let (clicked, resp) = project_row_title(ui, view, idx, project);
+            let (clicked, resp) = project_row_title(ui, paint, idx, project);
             expand_clicked = clicked;
             name_resp = Some(resp);
         },
         |ui| {
             project_row_controls(
                 ui,
-                view,
+                paint,
                 idx,
                 &project_root,
                 &project_name,
@@ -1006,12 +1009,12 @@ fn paint_project_header(
         requests.expand_toggled = Some((project.root.clone(), project.expanded));
     }
     let header_is_cursor =
-        matches!(&view.cursor_row, Some(SidebarRow::Project(r)) if *r == project.root);
+        matches!(&paint.view.cursor_row, Some(SidebarRow::Project(r)) if *r == project.root);
     let header_rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), row_rect.y_range());
     if header_is_cursor {
         paint_cursor_outline(ui, header_rect, theme);
     }
-    if view.scrolls(header_is_cursor) || view.follows_project(&project.root) {
+    if paint.view.scrolls(header_is_cursor) || paint.view.follows_project(&project.root) {
         ui.scroll_to_rect(header_rect, theme.scroll_align);
     }
 
@@ -1036,7 +1039,7 @@ fn paint_project_header(
     // Right-click: rename the project, and choose which
     // shell its sessions use.
     if let Some(resp) = name_resp {
-        resp.context_menu(|ui| project_context_menu(ui, view, project, requests));
+        resp.context_menu(|ui| project_context_menu(ui, paint, project, requests));
     }
 }
 
@@ -1044,14 +1047,14 @@ fn paint_project_header(
 /// was clicked, with the name's response for the context menu.
 fn project_row_title(
     ui: &mut egui::Ui,
-    view: &SidebarView,
+    paint: SidebarPaint<'_>,
     idx: usize,
     project: &Project,
 ) -> (bool, egui::Response) {
-    let theme = &view.theme;
-    let icons = &view.icons;
+    let theme = &paint.view.theme;
+    let icons = &paint.icons;
     ui.spacing_mut().item_spacing.x = ICON_CLUSTER_SPACING;
-    if view.reorder_mode {
+    if paint.view.reorder_mode {
         drag_handle(ui, theme).dnd_set_drag_payload(DraggedProject(project.root.clone()));
     }
     let (arrow_style, arrow_default, arrow_hint) = if project.expanded {
@@ -1065,7 +1068,7 @@ fn project_row_title(
         theme.icon_tooltips,
     )
     .clicked();
-    let name = view.projects.get(idx).map_or(project.display_name(), |p| p.label.as_str());
+    let name = paint.view.projects.get(idx).map_or(project.display_name(), |p| p.label.as_str());
     let (resp, galley) = truncating_label(
         ui,
         RichText::new(name).strong().small().color(theme.text),
@@ -1079,15 +1082,15 @@ fn project_row_title(
 /// attention dot.
 fn project_row_controls(
     ui: &mut egui::Ui,
-    view: &SidebarView,
+    paint: SidebarPaint<'_>,
     idx: usize,
     root: &Path,
     name: &str,
     show_attention: bool,
     requests: &mut SidebarRequests,
 ) {
-    let theme = &view.theme;
-    let icons = &view.icons;
+    let theme = &paint.view.theme;
+    let icons = &paint.icons;
     if icon_tooltip(
         styled_icon_button(ui, &icons.remove_project, DEFAULT_CLOSE_ICON, theme.text_muted, theme),
         "remove from sidebar",
@@ -1123,7 +1126,7 @@ fn project_row_controls(
 
 fn project_context_menu(
     ui: &mut egui::Ui,
-    view: &SidebarView,
+    paint: SidebarPaint<'_>,
     project: &mut Project,
     requests: &mut SidebarRequests,
 ) {
@@ -1142,10 +1145,10 @@ fn project_context_menu(
     // The shell picker is hidden when there is
     // nothing to choose (no distros, no profiles)
     // so minimal setups see only the rename.
-    if !view.distros.is_empty() || !view.profile_names.is_empty() {
+    if !paint.view.distros.is_empty() || !paint.view.profile_names.is_empty() {
         ui.separator();
-        ui.label(RichText::new("Open in\u{2026}").color(view.theme.text_muted).small());
-        shell_override_menu(ui, view, project, requests);
+        ui.label(RichText::new("Open in\u{2026}").color(paint.view.theme.text_muted).small());
+        shell_override_menu(ui, paint, project, requests);
     }
 }
 
@@ -1153,7 +1156,7 @@ fn project_context_menu(
 /// profile, with the current override marked.
 fn shell_override_menu(
     ui: &mut egui::Ui,
-    view: &SidebarView,
+    paint: SidebarPaint<'_>,
     project: &mut Project,
     requests: &mut SidebarRequests,
 ) {
@@ -1170,7 +1173,7 @@ fn shell_override_menu(
         requests.shell_override_changed = Some(project.root.clone());
         ui.close_menu();
     }
-    for distro in &view.distros {
+    for distro in &paint.view.distros {
         let selected = matches!(
             &project.shell_override,
             Some(ShellChoice::Wsl(name)) if name == &distro.name
@@ -1181,7 +1184,7 @@ fn shell_override_menu(
             ui.close_menu();
         }
     }
-    for name in &view.profile_names {
+    for name in &paint.view.profile_names {
         let selected = matches!(
             &project.shell_override,
             Some(ShellChoice::Profile(n)) if n == name
@@ -1198,60 +1201,56 @@ fn shell_override_menu(
 /// placeholders for its minimized creations.
 fn paint_worktrees(
     ui: &mut egui::Ui,
-    view: &SidebarView,
+    paint: SidebarPaint<'_>,
     idx: usize,
     project: &Project,
-    current_workspace: Option<&Path>,
-    liveness: &worktree_liveness::LivenessCache,
     requests: &mut SidebarRequests,
 ) {
-    let states = view.projects.get(idx).map_or(&[][..], |p| p.worktrees.as_slice());
+    let states = paint.view.projects.get(idx).map_or(&[][..], |p| p.worktrees.as_slice());
     for (wt, state) in project.worktrees.iter().zip(states) {
-        if view.filtering && !view.membership.worktrees.contains(&wt.path) {
+        if paint.view.filtering && !paint.view.membership.worktrees.contains(&wt.path) {
             continue;
         }
-        let is_active = current_workspace == Some(&wt.path);
-        paint_worktree(ui, view, wt, state, is_active, liveness.missing(&wt.path), requests);
+        paint_worktree(ui, paint, wt, state, requests);
     }
-    for (_, branch) in view.creating.iter().filter(|(pi, _)| *pi == idx) {
-        creating_row(ui, branch, &view.icons, &view.theme);
+    for (_, branch) in paint.view.creating.iter().filter(|(pi, _)| *pi == idx) {
+        creating_row(ui, branch, paint.icons, &paint.view.theme);
     }
 }
 
 fn paint_worktree(
     ui: &mut egui::Ui,
-    view: &SidebarView,
+    paint: SidebarPaint<'_>,
     wt: &Worktree,
     state: &WorktreeView,
-    is_active: bool,
-    missing: Option<bool>,
     requests: &mut SidebarRequests,
 ) {
-    let is_cursor = matches!(&view.cursor_row, Some(SidebarRow::Worktree(p)) if *p == wt.path);
-    let scroll = view.scrolls(is_cursor) || view.follows_worktree(&wt.path);
-    let is_deleting = view.deleting_paths.contains(&wt.path);
+    let is_cursor =
+        matches!(&paint.view.cursor_row, Some(SidebarRow::Worktree(p)) if *p == wt.path);
+    let scroll = paint.view.scrolls(is_cursor) || paint.view.follows_worktree(&wt.path);
+    let is_deleting = paint.view.deleting_paths.contains(&wt.path);
     // A `\\wsl.localhost\` stat boots the distro's
     // 9P server, so probing one would restart a VM
     // the user had shut down and hold it resident
     // for as long as its worktrees are listed.
     // WSL rows keep discovery's word.
-    if view.probing && matches!(wsl::classify(&wt.path), wsl::Location::Windows(_)) {
+    if paint.view.probing && matches!(wsl::classify(&wt.path), wsl::Location::Windows(_)) {
         requests.drawn_worktrees.push(wt.path.clone());
     }
     let action = worktree_row(ui, &WorktreeRowView {
         wt,
-        missing,
+        missing: state.missing,
         display_name: &state.label,
         pr: state.pr.as_ref(),
-        is_active,
+        is_active: state.is_active,
         is_cursor,
         scroll_into_view: scroll,
         attention: state.attention,
         activity: state.activity,
         deleting: is_deleting,
-        profiles: &view.worktree_profiles,
-        icons: &view.icons,
-        theme: &view.theme,
+        profiles: &paint.view.worktree_profiles,
+        icons: paint.icons,
+        theme: &paint.view.theme,
     });
     if action.activate {
         requests.activate = Some(wt.path.clone());
@@ -1269,8 +1268,8 @@ fn paint_worktree(
         requests.spawn_profile = Some((wt.path.clone(), name));
     }
     let ws = Some(wt.path.clone());
-    session_drop_target(ui, view, action.rect, &ws, None, requests);
-    paint_workspace_children(ui, view, &state.rows, &ws, requests);
+    session_drop_target(ui, paint, action.rect, &ws, None, requests);
+    paint_workspace_children(ui, paint, &state.rows, &ws, requests);
 }
 
 pub(super) struct HomeAction {
@@ -1286,7 +1285,7 @@ pub(super) fn home_row(
     is_cursor: bool,
     scroll_into_view: bool,
     status: RowStatus<'_>,
-    icons: &Icons,
+    icons: &Icons<Color32>,
     theme: &Theme,
 ) -> HomeAction {
     // Reserve a slot *before* the labels so the hover bg paints beneath them.
@@ -1391,7 +1390,7 @@ pub(super) struct WorktreeAction {
 /// spinner stands in until `poll_pending_creates` refreshes the project and the
 /// real worktree row takes its place.  Indentation and the leading glyph match
 /// `worktree_row` so it lines up with its future sibling.
-fn creating_row(ui: &mut egui::Ui, branch: &str, icons: &Icons, theme: &Theme) {
+fn creating_row(ui: &mut egui::Ui, branch: &str, icons: &Icons<Color32>, theme: &Theme) {
     let s = theme.ui_scale;
     let frame = Frame::default().inner_margin(Margin { left: 16, right: 0, top: 3, bottom: 3 });
     frame.show(ui, |ui| {
@@ -1424,10 +1423,10 @@ fn creating_row(ui: &mut egui::Ui, branch: &str, icons: &Icons, theme: &Theme) {
 
 /// Badge glyph, color, and tooltip word for a PR state.
 fn pr_badge<'a>(
-    icons: &'a Icons,
+    icons: &'a Icons<Color32>,
     theme: &Theme,
     state: PrState,
-) -> (&'a IconStyle, BakedGlyph, Color32, &'static str) {
+) -> (&'a IconStyle<Color32>, BakedGlyph, Color32, &'static str) {
     match state {
         PrState::Open => (&icons.pr_open, DEFAULT_PR_OPEN_ICON, theme.pr_open, "open"),
         PrState::Draft => (&icons.pr_draft, DEFAULT_PR_DRAFT_ICON, theme.pr_draft, "draft"),
@@ -1439,10 +1438,10 @@ fn pr_badge<'a>(
 /// Badge style, color, and tooltip for an upstream state.  The tooltip names
 /// the upstream ref because the glyph cannot.
 pub(super) fn upstream_badge<'a>(
-    icons: &'a Icons,
+    icons: &'a Icons<Color32>,
     theme: &Theme,
     state: &UpstreamState,
-) -> (&'a IconStyle, BakedGlyph, Color32, String) {
+) -> (&'a IconStyle<Color32>, BakedGlyph, Color32, String) {
     match state {
         UpstreamState::Level { upstream } => (
             &icons.upstream_level,
@@ -1495,7 +1494,7 @@ pub(super) struct WorktreeRowView<'a> {
     // profile name (spawned and shown as the button label), `.1` is the
     // command shown on hover.
     pub(super) profiles: &'a [(String, String)],
-    pub(super) icons: &'a Icons,
+    pub(super) icons: &'a Icons<Color32>,
     pub(super) theme: &'a Theme,
 }
 
@@ -1576,7 +1575,7 @@ fn worktree_row_controls(
 fn paint_badge(
     ui: &mut egui::Ui,
     theme: &Theme,
-    style: &IconStyle,
+    style: &IconStyle<Color32>,
     default_glyph: BakedGlyph,
     color: Color32,
 ) -> egui::Rect {
@@ -1753,7 +1752,7 @@ pub(super) fn session_row(
     is_cursor: bool,
     scroll_into_view: bool,
     draggable: bool,
-    icons: &Icons,
+    icons: &Icons<Color32>,
     theme: &Theme,
 ) -> SessionRowAction {
     // Reserve a slot *before* the labels so the hover bg paints beneath them.
@@ -1910,7 +1909,7 @@ fn row_name_text(
 /// hang the hint on it.
 fn paint_managed_mark(
     ui: &mut egui::Ui,
-    icons: &Icons,
+    icons: &Icons<Color32>,
     theme: &Theme,
     color: Color32,
 ) -> egui::Rect {
@@ -1933,7 +1932,7 @@ fn herdr_row(
     row: &HerdrRowData,
     is_cursor: bool,
     scroll_into_view: bool,
-    icons: &Icons,
+    icons: &Icons<Color32>,
     theme: &Theme,
 ) -> HerdrRowAction {
     // Reserve a slot *before* the label so the hover bg paints beneath it.

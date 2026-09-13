@@ -60,7 +60,7 @@ impl AlacritreeApp {
         }
 
         let theme = self.theme;
-        let danger = rgb_to_color32(self.config.palette.normal[1]);
+        let danger = self.theme.error;
         let Some(req) = self.modals.pending_delete.as_mut() else {
             return;
         };
@@ -158,7 +158,7 @@ impl AlacritreeApp {
 
     pub(super) fn show_close_session_dialog(&mut self, ctx: &Context) {
         let theme = self.theme;
-        let danger = rgb_to_color32(self.config.palette.normal[1]);
+        let danger = self.theme.error;
         let Some(id) = self.modals.pending_session_close else {
             return;
         };
@@ -295,7 +295,7 @@ impl AlacritreeApp {
 
     pub(super) fn show_remove_project_dialog(&mut self, ctx: &Context) {
         let theme = self.theme;
-        let danger = rgb_to_color32(self.config.palette.normal[1]);
+        let danger = self.theme.error;
         let Some(state) = self.modals.pending_project_remove.as_ref() else {
             return;
         };
@@ -361,7 +361,7 @@ impl AlacritreeApp {
 
     pub(super) fn show_error_dialog(&mut self, ctx: &Context) {
         let theme = self.theme;
-        let danger = rgb_to_color32(self.config.palette.normal[1]);
+        let danger = self.theme.error;
         let Some(message) = self.modals.error_dialog.clone() else {
             return;
         };
@@ -712,7 +712,7 @@ impl AlacritreeApp {
             }
         }
         let theme = self.theme;
-        let danger = rgb_to_color32(self.config.palette.normal[1]);
+        let danger = self.theme.error;
         let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
         let (up, down) = ctx.input_mut(|i| {
             (
@@ -899,7 +899,7 @@ impl AlacritreeApp {
         mut error: Option<String>,
     ) -> Option<CreateState> {
         let theme = self.theme;
-        let danger = rgb_to_color32(self.config.palette.normal[1]);
+        let danger = self.theme.error;
         let project_name = self.projects[project_idx].display_name().to_string();
         let default_branch = self.projects[project_idx].default_branch.clone();
         let project_root = self.projects[project_idx].root.clone();
@@ -1044,8 +1044,8 @@ impl AlacritreeApp {
         result: &Result<PathBuf, String>,
     ) -> bool {
         let theme = self.theme;
-        let danger = rgb_to_color32(self.config.palette.normal[1]);
-        let ok = rgb_to_color32(self.config.palette.normal[2]);
+        let danger = self.theme.error;
+        let ok = self.theme.ok;
         let project_name = self.projects[project_idx].display_name().to_string();
         let frame = modal_frame(&theme);
         let mut close = false;
@@ -1096,7 +1096,7 @@ impl AlacritreeApp {
 
     pub(super) fn show_quit_dialog(&mut self, ctx: &Context) {
         let theme = self.theme;
-        let danger = rgb_to_color32(self.config.palette.normal[1]);
+        let danger = self.theme.error;
         let n = self.sessions.len();
 
         let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
