@@ -16,10 +16,10 @@ use std::path::PathBuf;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
-use crate::app::WorkspaceKey;
 use crate::bindings::{BindingAction, KeyBinding, NamedAction, bindable_actions};
 use crate::herdr::HerdrKey;
 use crate::session::SessionId;
+use crate::workspace::WorkspaceKey;
 
 /// A herdr agent no session holds, and where attaching to it lands.  The
 /// workspace rides along because the listing already resolved it: looking it

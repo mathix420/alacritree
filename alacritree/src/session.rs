@@ -1240,7 +1240,7 @@ pub fn open(request: OpenRequest) -> std::io::Result<Attachment> {
     // `tty::new` is where `LoadLibraryW("conpty.dll")` happens, and the
     // module it loads answers every later one for the life of the process.
     #[cfg(windows)]
-    crate::harden_dll_search_path();
+    crate::dll_search::harden_dll_search_path();
 
     let pty = tty::new(&pty_options, window_size, window_id)?;
     crate::frame_log::spawn_phase(Some(id), "pty", started.elapsed());
@@ -2735,7 +2735,7 @@ mod tests {
         use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
 
         if std::env::var_os("ALACRITREE_PROBE_HARDEN").is_some() {
-            crate::harden_dll_search_path();
+            crate::dll_search::harden_dll_search_path();
         }
 
         let name: Vec<u16> = "conpty.dll\0".encode_utf16().collect();

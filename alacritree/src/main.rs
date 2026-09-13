@@ -14,6 +14,7 @@ mod config;
 mod crash_log;
 mod decoration_sprites;
 mod digest;
+mod dll_search;
 mod doppler;
 mod file_drop;
 mod focus_priority;
@@ -36,8 +37,7 @@ mod logging;
 mod mcp;
 mod mouse;
 mod multiplexer;
-#[cfg(target_os = "macos")]
-mod notify_macos;
+mod notify;
 mod panel_filter;
 mod paste;
 mod path_style;
@@ -51,6 +51,7 @@ mod pty_rearm;
 mod row_label;
 mod scratchpad;
 mod session;
+mod shell_decision;
 mod sidebar_focus;
 mod sidebar_nav;
 mod stale_exe;
@@ -64,6 +65,7 @@ mod test_util;
 mod upstream;
 #[cfg(windows)]
 mod win_session;
+mod workspace;
 mod worktree;
 mod worktree_liveness;
 mod wsl;
@@ -78,49 +80,8 @@ use clap::Parser;
 /// what egui only needs at ~256x256.
 const WINDOW_ICON: &[u8] = include_bytes!("../assets/icon-256.png");
 
-/// Drop PATH and the working directory from the DLL search order, leaving the
-/// executable's own directory plus the system directories.
-///
-/// `alacritty_terminal` opens the pseudoconsole by `LoadLibraryW("conpty.dll")`
-/// so a build of OpenConsole shipped alongside the binary can be preferred over
-/// the one in Windows.  Windows has no `conpty.dll` of its own — the API lives
-/// in `kernel32` — so that bare name matches nothing until some *other* app's
-/// install directory is on PATH, at which point every PTY is hosted in a foreign
-/// terminal's console server.  WezTerm's blocks the child process for three
-/// seconds waiting on a device-attributes reply, which shows up as a multi-second
-/// stall opening any pane.
-///
-/// The first `LoadLibraryW` decides which module answers every later one, so
-/// this has to run before the first pseudoconsole opens.  `main` does it at
-/// startup and every pseudoconsole open repeats it, because a test binary has
-/// no `main` to do it for them.
-#[cfg(windows)]
-fn harden_dll_search_path() {
-    use std::sync::Once;
-
-    use windows_sys::Win32::System::LibraryLoader::{
-        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, SetDefaultDllDirectories,
-    };
-
-    static HARDENED: Once = Once::new();
-
-    HARDENED.call_once(|| {
-        // Failure only leaves the default search order in place, which is what
-        // we had before, so it is not worth refusing to start over.
-        if unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) } == 0 {
-            log::warn!(
-                "failed to restrict the DLL search path: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-    });
-}
-
-#[cfg(not(windows))]
-fn harden_dll_search_path() {}
-
 fn main() -> eframe::Result<()> {
-    harden_dll_search_path();
+    crate::dll_search::harden_dll_search_path();
 
     // egui_winit warns on every cold X11 clipboard probe even when it recovers.
     let default_filter = "info,egui_winit::clipboard=error";

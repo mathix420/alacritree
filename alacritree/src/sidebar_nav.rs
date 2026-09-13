@@ -7,11 +7,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::app::WorkspaceKey;
 use crate::config::ReorderScope;
 use crate::herdr::Side;
 use crate::projects::{Project, Worktree};
 use crate::session::SessionId;
+use crate::workspace::WorkspaceKey;
 
 /// A row the sidebar cursor can rest on, in render order.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

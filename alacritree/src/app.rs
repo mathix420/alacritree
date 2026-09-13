@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::tty::Shell;
@@ -38,25 +38,18 @@ use crate::session::{
     self, AttentionVerdict, LiveState, Session, SessionActivity, SessionId, SessionKind, TermSize,
     poll_attention_debounce,
 };
+use crate::shell_decision::{ShellDecision, shell_decision};
 use crate::sidebar_nav::{self, SidebarRow, StepTarget};
 use crate::state::{self, PersistedProject};
 use crate::upstream::UpstreamState;
+use crate::workspace::WorkspaceKey;
 use crate::worktree::{self as wt, CreateRequest, Progress};
 use crate::wsl::{self, ShellChoice};
 use crate::wsl_helper::{self, WslProbe};
 use crate::{
-    clipboard_image, doppler, file_drop, herdr, ipc, jobs, paste, path_style, scratchpad,
+    clipboard_image, doppler, file_drop, herdr, ipc, jobs, notify, paste, path_style, scratchpad,
     sidebar_focus, terminal_view, worktree_liveness,
 };
-
-/// `None` is the home workspace (sessions inherit `$PWD`); `Some` is a worktree path.
-pub type WorkspaceKey = Option<PathBuf>;
-
-/// Channel from notification-worker threads back to the app.  Set once by
-/// `AlacritreeApp::new`; each worker reads it to deliver the session the
-/// user clicked on.  Static because the worker has no other handle to the
-/// app and there's only ever one app instance per process.
-static NOTIFY_TX: OnceLock<Mutex<Sender<SessionId>>> = OnceLock::new();
 
 #[derive(Clone, Copy)]
 struct FocusOutlineTheme {
@@ -1175,15 +1168,10 @@ impl AlacritreeApp {
         // won't deliver while the authorization sheet is pending).
         #[cfg(target_os = "macos")]
         if config.ui.notifications {
-            crate::notify_macos::init(cc.egui_ctx.clone());
+            notify::macos::init(cc.egui_ctx.clone());
         }
 
-        let (notify_tx, notify_rx) = mpsc::channel();
-        // `set` may fail only if a previous instance already initialized the
-        // static (e.g. tests).  In that case the old sender points at a dead
-        // app, so overwriting via `Mutex` would be ideal — but since we only
-        // ever spawn one app per process, ignoring the error is fine.
-        let _ = NOTIFY_TX.set(Mutex::new(notify_tx));
+        let notify_rx = notify::channel();
 
         let pr_status_concurrency = config.ui.pr_status_concurrency;
         let mut app = Self::from_parts(
@@ -6237,54 +6225,6 @@ fn config_session_shell(config: &crate::config::Config) -> (Option<Shell>, Optio
     }
 }
 
-/// What shell a new session should run, decided from plain data so the
-/// precedence chain stays testable off the GUI.
-#[derive(Debug, PartialEq, Eq)]
-pub enum ShellDecision {
-    /// Fall through to `[terminal.shell]` / the OS default.
-    ConfigShell,
-    /// A shell inside this WSL distro (`wsl_shell` builds the argv).
-    WslDistro(String),
-    /// A named `[[ui.profiles]]` entry, verified to exist.
-    Profile(String),
-}
-
-/// Precedence: project override, then WSL location, then the default
-/// profile, then the config shell.  A stale override (distro unregistered,
-/// profile removed from config) warns and continues down the chain rather
-/// than failing the spawn.
-pub fn shell_decision(
-    override_choice: Option<&ShellChoice>,
-    location_distro: Option<&str>,
-    known_distros: &[String],
-    profiles: &[crate::config::Profile],
-    default_profile: Option<&str>,
-) -> ShellDecision {
-    match override_choice {
-        Some(ShellChoice::Windows) => return ShellDecision::ConfigShell,
-        Some(ShellChoice::Wsl(d)) => {
-            if known_distros.iter().any(|k| k == d) {
-                return ShellDecision::WslDistro(d.clone());
-            }
-            log::warn!("shell override names unknown WSL distro `{d}`; using auto");
-        },
-        Some(ShellChoice::Profile(n)) => {
-            if profiles.iter().any(|p| &p.name == n) {
-                return ShellDecision::Profile(n.clone());
-            }
-            log::warn!("shell override names unknown profile `{n}`; using auto");
-        },
-        None => {},
-    }
-    if let Some(d) = location_distro {
-        return ShellDecision::WslDistro(d.to_string());
-    }
-    if let Some(n) = default_profile {
-        return ShellDecision::Profile(n.to_string());
-    }
-    ShellDecision::ConfigShell
-}
-
 fn profile_shell(profile: &crate::config::Profile) -> Shell {
     Shell::new(profile.program.clone(), profile.args.clone())
 }
@@ -9650,7 +9590,7 @@ impl AlacritreeApp {
     /// id (session closed before the click) makes the activate a no-op, but
     /// the window still comes forward — the user asked for the app.
     fn process_notification_actions(&mut self, ctx: &Context) {
-        let Some(id) = latest_notification_click(&self.notify_rx) else { return };
+        let Some(id) = notify::latest_click(&self.notify_rx) else { return };
         self.activate_session_by_id(id);
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
@@ -9731,7 +9671,7 @@ impl AlacritreeApp {
                     let was_attending = self.sessions[idx].needs_attention;
                     self.sessions[idx].needs_attention = true;
                     if !was_attending && self.config.ui.notifications {
-                        notify_attention(&self.sessions[idx], ctx);
+                        notify::attention(&self.sessions[idx], ctx);
                     }
                 },
             }
@@ -12432,99 +12372,6 @@ impl eframe::App for AlacritreeApp {
     }
 }
 
-/// Drain every queued notification click, keeping only the newest.  Clicks
-/// can pile up while the window is unfocused; the user most likely meant
-/// the latest one.
-fn latest_notification_click(rx: &Receiver<SessionId>) -> Option<SessionId> {
-    let mut latest = None;
-    while let Ok(id) = rx.try_recv() {
-        latest = Some(id);
-    }
-    latest
-}
-
-/// Spawn a throwaway thread so the platform notifier's synchronous calls
-/// don't stall the egui paint loop.  The thread posts the session's id back
-/// through `NOTIFY_TX` when the user clicks the notification.
-fn notify_attention(session: &Session, ctx: &egui::Context) {
-    let where_label = session
-        .working_directory
-        .as_ref()
-        .and_then(|p| p.file_name())
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| session.title.clone());
-    let body = if where_label.is_empty() {
-        "Session is waiting for input".to_string()
-    } else {
-        format!("{where_label} is waiting for input")
-    };
-    let id = session.id;
-    let ctx = ctx.clone();
-    std::thread::Builder::new()
-        .name("alacritree-notify".into())
-        .spawn(move || notify_worker(body, id, ctx))
-        .ok();
-}
-
-/// Deliver a clicked notification's session id to the UI thread.
-pub(crate) fn notify_click(id: SessionId, ctx: &egui::Context) {
-    if let Some(lock) = NOTIFY_TX.get() {
-        if let Ok(tx) = lock.lock() {
-            let _ = tx.send(id);
-            ctx.request_repaint();
-        }
-    }
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn notify_worker(body: String, id: SessionId, ctx: egui::Context) {
-    // `default` is the action id freedesktop notifiers fire on body-click.
-    let result = notify_rust::Notification::new()
-        .summary("alacritree")
-        .body(&body)
-        .action("default", "Open")
-        .show();
-    let handle = match result {
-        Ok(h) => h,
-        Err(e) => {
-            log::debug!("desktop notification failed: {e}");
-            return;
-        },
-    };
-    handle.wait_for_action(|action| {
-        if action == "__closed" {
-            return;
-        }
-        notify_click(id, &ctx);
-    });
-}
-
-#[cfg(windows)]
-fn notify_worker(body: String, id: SessionId, ctx: egui::Context) {
-    use tauri_winrt_notification::Toast;
-    // notify-rust doesn't surface WinRT activation, so drive its own backend
-    // crate directly.  `show` returns immediately; the WinRT runtime holds
-    // the activation handler, so this worker thread can exit right away.
-    let result = Toast::new(Toast::POWERSHELL_APP_ID)
-        .title("alacritree")
-        .text1(&body)
-        .on_activated(move |_action| {
-            notify_click(id, &ctx);
-            Ok(())
-        })
-        .show();
-    if let Err(e) = result {
-        log::debug!("desktop notification failed: {e}");
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn notify_worker(body: String, id: SessionId, _ctx: egui::Context) {
-    // Clicks come back through the UNUserNotificationCenter delegate that
-    // `notify_macos::init` installed, not through this worker.
-    crate::notify_macos::notify(&body, id);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -14689,18 +14536,6 @@ mod tests {
     }
 
     #[test]
-    fn a_pile_of_notification_clicks_resolves_to_the_newest() {
-        let (tx, rx) = mpsc::channel();
-        assert_eq!(latest_notification_click(&rx), None);
-        tx.send(3).unwrap();
-        tx.send(7).unwrap();
-        tx.send(5).unwrap();
-        assert_eq!(latest_notification_click(&rx), Some(5));
-        // The drain consumed everything, not just the returned click.
-        assert_eq!(latest_notification_click(&rx), None);
-    }
-
-    #[test]
     fn session_ring_crosses_workspace_boundaries_and_wraps() {
         let ring = [(None, 1), (None, 2), (ws("a"), 3), (ws("b"), 4)];
         // Within a workspace it moves like tab cycling…
@@ -16704,105 +16539,6 @@ mod tests {
         );
         assert_eq!(args[8], "sh");
         assert_eq!(&args[9..], diff_args(&req("a.rs", DiffSource::Staged)).as_slice());
-    }
-
-    fn test_profiles() -> Vec<crate::config::Profile> {
-        vec![
-            crate::config::Profile {
-                name: "pwsh".into(),
-                program: "pwsh".into(),
-                args: vec!["-NoLogo".into()],
-            },
-            crate::config::Profile {
-                name: "ubuntu".into(),
-                program: "wsl.exe".into(),
-                args: vec!["-d".into(), "ubuntu".into()],
-            },
-        ]
-    }
-
-    #[test]
-    fn override_profile_wins_over_location_and_default() {
-        let d = shell_decision(
-            Some(&ShellChoice::Profile("pwsh".into())),
-            Some("ubuntu"),
-            &["ubuntu".into()],
-            &test_profiles(),
-            Some("ubuntu"),
-        );
-        assert_eq!(d, ShellDecision::Profile("pwsh".into()));
-    }
-
-    #[test]
-    fn override_windows_skips_default_profile() {
-        let d = shell_decision(
-            Some(&ShellChoice::Windows),
-            Some("ubuntu"),
-            &["ubuntu".into()],
-            &test_profiles(),
-            Some("pwsh"),
-        );
-        assert_eq!(d, ShellDecision::ConfigShell);
-    }
-
-    #[test]
-    fn stale_profile_override_falls_back_to_auto() {
-        // Unknown profile behaves like the unknown-distro case: warn, then
-        // continue down the auto chain (location, then default profile).
-        let d = shell_decision(
-            Some(&ShellChoice::Profile("gone".into())),
-            Some("ubuntu"),
-            &["ubuntu".into()],
-            &test_profiles(),
-            None,
-        );
-        assert_eq!(d, ShellDecision::WslDistro("ubuntu".into()));
-
-        let d = shell_decision(
-            Some(&ShellChoice::Profile("gone".into())),
-            None,
-            &[],
-            &test_profiles(),
-            Some("pwsh"),
-        );
-        assert_eq!(d, ShellDecision::Profile("pwsh".into()));
-    }
-
-    #[test]
-    fn wsl_location_beats_default_profile() {
-        let d = shell_decision(
-            None,
-            Some("ubuntu"),
-            &["ubuntu".into()],
-            &test_profiles(),
-            Some("pwsh"),
-        );
-        assert_eq!(d, ShellDecision::WslDistro("ubuntu".into()));
-    }
-
-    #[test]
-    fn default_profile_applies_without_override_or_location() {
-        // This is also the home-tab case: no project, no WSL location.
-        let d = shell_decision(None, None, &[], &test_profiles(), Some("pwsh"));
-        assert_eq!(d, ShellDecision::Profile("pwsh".into()));
-    }
-
-    #[test]
-    fn no_config_means_config_shell() {
-        let d = shell_decision(None, None, &[], &[], None);
-        assert_eq!(d, ShellDecision::ConfigShell);
-    }
-
-    #[test]
-    fn stale_wsl_override_falls_through_to_default_profile() {
-        let d = shell_decision(
-            Some(&ShellChoice::Wsl("gone".into())),
-            None,
-            &["ubuntu".into()],
-            &test_profiles(),
-            Some("pwsh"),
-        );
-        assert_eq!(d, ShellDecision::Profile("pwsh".into()));
     }
 
     #[test]

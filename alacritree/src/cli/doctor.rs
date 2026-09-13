@@ -19,10 +19,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::app::{ShellDecision, shell_decision};
 use crate::config::{self, Config, ConfigDiagnosis, ConfigFile, Profile, ShellConfig};
 use crate::crash_log::{Verdict, classify};
 use crate::ipc::{self, IpcRequest, SendError};
+use crate::shell_decision::{ShellDecision, shell_decision};
 use crate::wsl::{self, ShellChoice};
 use crate::{command_ext, jobs, state};
 

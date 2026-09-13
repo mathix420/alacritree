@@ -15,9 +15,9 @@ use egui::{
 };
 use serde_json::{Value, json};
 
-use crate::app::WorkspaceKey;
 use crate::digest::stable_digest;
 use crate::state;
+use crate::workspace::WorkspaceKey;
 
 // A scratchpad is normally a few notes. Bounding an MCP response keeps an
 // accidentally huge file from consuming the client's entire context window.

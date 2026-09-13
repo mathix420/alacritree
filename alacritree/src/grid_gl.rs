@@ -835,7 +835,7 @@ mod tests {
     #[test]
     fn laying_glyphs_out_can_grow_the_atlas_mid_frame() {
         #[cfg(windows)]
-        crate::harden_dll_search_path();
+        crate::dll_search::harden_dll_search_path();
 
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |_| {});

@@ -94,7 +94,7 @@ fn handle_response(response: &UNNotificationResponse) {
     let Some(value) = info.objectForKey(key) else { return };
     let Some(id) = value.downcast_ref::<NSNumber>().map(|n| n.as_u64()) else { return };
     if let Some(Some(ctx)) = STATE.get() {
-        crate::app::notify_click(id as SessionId, ctx);
+        super::click(id as SessionId, ctx);
     }
 }
 

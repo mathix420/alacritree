@@ -10,10 +10,10 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::app::WorkspaceKey;
 use crate::projects::{Project, Worktree};
 use crate::session::SessionId;
 use crate::sidebar_nav::SidebarRow;
+use crate::workspace::WorkspaceKey;
 
 /// Index into a single snapshot's `nodes`.  Deliberately not stable across
 /// snapshots: cross-snapshot matching goes through the row's own path/session
