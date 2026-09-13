@@ -1,10 +1,32 @@
-//! Shared fixtures: scratch space on disk, and a real repository with
-//! worktrees.
+//! Shared fixtures: scratch space on disk, a real repository with worktrees,
+//! and the herdr agents the row models and the render pass both name.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use git2::Repository;
+
+use crate::herdr;
+
+/// An idle agent on a native endpoint, the base every other agent varies from.
+pub fn herdr_agent(kind: Option<&str>) -> herdr::Agent {
+    herdr::Agent {
+        terminal_id: "term_65abfc8e300361".into(),
+        pane_id: "w5:p1".into(),
+        tab_id: Some("w5:t1".into()),
+        kind: kind.map(String::from),
+        title: None,
+        status: Some(herdr::Status::Idle),
+        focused: false,
+        cwd: None,
+        foreground_cwd: None,
+    }
+}
+
+/// An agent carrying a title, for the naming cases.
+pub fn titled_herdr_agent(kind: Option<&str>, title: Option<&str>) -> herdr::Agent {
+    herdr::Agent { title: title.map(String::from), ..herdr_agent(kind) }
+}
 
 /// Test scratch directories are named for the process that owns them.
 const SCRATCH_PREFIX: &str = "alacritree-test-scratch-";
