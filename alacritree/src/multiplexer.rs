@@ -1,12 +1,15 @@
 //! Which terminal multiplexer owns a pane, and what alacritree asks it in
 //! order to host one.
 //!
-//! Only three of those questions have answers that differ between
-//! multiplexers, and they go behind [`MultiplexerSession`], so a second
-//! multiplexer is a new [`Multiplexer`] variant rather than a new branch at
-//! every call site.
-//! Everything else stays in that multiplexer's own module, where its shape is
+//! Attaching, focusing, creating panes and matching agents to workspaces go
+//! behind [`MultiplexerSession`], so a second multiplexer is a new
+//! [`Multiplexer`] variant rather than a new branch at every call site.
+//! Following a pane into a shared view still spells herdr's own `session
+//! attach` in the app. The trait still speaks herdr's agent and key types,
+//! and the polling caches stay in herdr's own module, where their shape is
 //! honest about having exactly one example.
+
+use std::path::PathBuf;
 
 use enum_dispatch::enum_dispatch;
 use strum::{Display, EnumIter, EnumString};
@@ -150,6 +153,38 @@ pub trait MultiplexerSession {
     /// resolves it where it runs.  `None` leaves the directory to the
     /// multiplexer's own default.
     fn create_pane(&self, side: &Side, cwd: Option<String>) -> Result<CreatedPane, String>;
+
+    /// Whether a row on `side` opens the agent's own pane rather than a
+    /// shared view. `has_agent` is false for a pane the multiplexer found no
+    /// agent in.
+    fn attaches_directly(&self, side: &Side, mode: AttachMode, has_agent: bool) -> bool;
+
+    /// The arguments that bring `target`'s pane to the front of the user's
+    /// own multiplexer window. Built on the UI thread and handed to
+    /// `focus_pane`, which runs them off it.
+    fn focus_args(&self, target: &PaneTarget) -> Vec<String>;
+
+    /// Runs `focus_args`' answer on `side`. A process call, so this only ever
+    /// runs off the UI thread.
+    fn focus_pane(&self, side: &Side, focus: &[String]) -> Result<(), String>;
+
+    /// The agents on `side` that no live session is attached to.
+    fn unattached<'a>(
+        &self,
+        agents: &'a [herdr::Agent],
+        side: &Side,
+        claimed: &[herdr::HerdrKey],
+    ) -> Vec<&'a herdr::Agent>;
+
+    /// The sidebar workspace an agent is working in. `None` means it belongs
+    /// under Home. How an agent reports its directory is the multiplexer's
+    /// own business, WSL path translation included.
+    fn match_workspace(
+        &self,
+        agent: &herdr::Agent,
+        side: &Side,
+        workspaces: &[PathBuf],
+    ) -> Option<PathBuf>;
 }
 
 /// herdr, reached through the free functions in [`crate::herdr`].
@@ -182,6 +217,36 @@ impl MultiplexerSession for Herdr {
 
     fn create_pane(&self, side: &Side, cwd: Option<String>) -> Result<CreatedPane, String> {
         herdr::create_pane(side, cwd)
+    }
+
+    fn attaches_directly(&self, side: &Side, mode: AttachMode, has_agent: bool) -> bool {
+        herdr::attaches_directly(side, mode, has_agent)
+    }
+
+    fn focus_args(&self, target: &PaneTarget) -> Vec<String> {
+        herdr::focus_args(target)
+    }
+
+    fn focus_pane(&self, side: &Side, focus: &[String]) -> Result<(), String> {
+        herdr::focus_pane(side, focus)
+    }
+
+    fn unattached<'a>(
+        &self,
+        agents: &'a [herdr::Agent],
+        side: &Side,
+        claimed: &[herdr::HerdrKey],
+    ) -> Vec<&'a herdr::Agent> {
+        herdr::unattached(agents, side, claimed)
+    }
+
+    fn match_workspace(
+        &self,
+        agent: &herdr::Agent,
+        side: &Side,
+        workspaces: &[PathBuf],
+    ) -> Option<PathBuf> {
+        herdr::match_workspace(agent, side, workspaces)
     }
 }
 

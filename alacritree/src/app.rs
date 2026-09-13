@@ -2696,11 +2696,14 @@ fn listed_herdr_agents<'a>(
     workspaces: &[PathBuf],
     show_unmatched: bool,
 ) -> Vec<(WorkspaceKey, &'a herdr::Side, &'a herdr::Agent)> {
+    // The caches are herdr's listings, so they name the multiplexer they came
+    // from rather than resolving one from a key.
+    let multiplexer = Multiplexer::from(Herdr);
     let mut listed = Vec::new();
     for cache in caches {
         let side = cache.side();
-        for agent in herdr::unattached(cache.agents(), side, claimed) {
-            let ws = herdr::match_workspace(agent, side, workspaces);
+        for agent in multiplexer.unattached(cache.agents(), side, claimed) {
+            let ws = multiplexer.match_workspace(agent, side, workspaces);
             if ws.is_none() && !show_unmatched {
                 continue;
             }
@@ -4611,7 +4614,9 @@ mod tests {
             tab_id: Some("w1:t2".into()),
             has_agent: false,
         });
-        assert_eq!(herdr::focus_args(&queued.target), ["tab", "focus", "w1:t2"]);
+        assert_eq!(Multiplexer::owning(&queued.key).focus_args(&queued.target), [
+            "tab", "focus", "w1:t2"
+        ]);
         assert_eq!(queued.workspace, workspace);
         assert_eq!(app.current_workspace, workspace);
         assert!(app.herdr.pending_create.is_empty());
@@ -5324,7 +5329,7 @@ mod tests {
 
         let target = app.herdr_focus_target(&key).expect("a bound shell pane has nowhere to focus");
 
-        assert_eq!(herdr::focus_args(&target), ["tab", "focus", "w1:t2"]);
+        assert_eq!(Multiplexer::owning(&key).focus_args(&target), ["tab", "focus", "w1:t2"]);
     }
 
     /// A session's client was settled when it attached, so the tooltip that

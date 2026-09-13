@@ -464,14 +464,15 @@ impl AlacritreeApp {
         match action {
             Some(herdr::HerdrViewAction::Focus(id)) => {
                 let Some(key) = key else { return };
+                let multiplexer = Multiplexer::owning(&key);
                 let Some(focus) =
-                    self.herdr_focus_target(&key).map(|target| herdr::focus_args(&target))
+                    self.herdr_focus_target(&key).map(|target| multiplexer.focus_args(&target))
                 else {
                     return;
                 };
                 let stamp = key.clone();
                 let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
-                    herdr::focus_pane(&key.side, &focus)
+                    multiplexer.focus_pane(&key.side, &focus)
                 });
                 self.herdr.view_focus =
                     Some(herdr::HerdrViewFocus { session: id, key: stamp, job });
@@ -663,7 +664,7 @@ impl AlacritreeApp {
 
     /// Whether opening this pane's row attaches to the pane on its own.
     pub(super) fn herdr_attaches_directly(&self, key: &herdr::HerdrKey) -> bool {
-        herdr::attaches_directly(
+        Multiplexer::owning(key).attaches_directly(
             &key.side,
             self.config.integrations.herdr.attach,
             self.herdr_pane_has_agent(Some(key)),
@@ -717,7 +718,7 @@ impl AlacritreeApp {
                     "title": agent.title,
                     "status": agent.status.map(|status| status.label()),
                     "focused": agent.focused,
-                    "workspace": herdr::match_workspace(agent, side, &workspaces),
+                    "workspace": Multiplexer::owning(&key).match_workspace(agent, side, &workspaces),
                     "session_id": self.herdr_session_for(&key),
                 }));
             }
@@ -817,7 +818,7 @@ impl AlacritreeApp {
         let key =
             herdr::HerdrKey { side: parsed_side.clone(), terminal_id: terminal_id.to_string() };
         let workspaces = herdr_workspaces(&self.projects, |path| self.liveness.missing(path));
-        let workspace = herdr::match_workspace(agent, &parsed_side, &workspaces);
+        let workspace = Multiplexer::owning(&key).match_workspace(agent, &parsed_side, &workspaces);
 
         let previous = std::mem::replace(&mut self.current_workspace, workspace.clone());
         let unlisted = unlisted_pane_target(&key, &pane_id);
@@ -989,7 +990,7 @@ impl Managed {
         Self {
             harness: "herdr",
             detach: settings.detach.clone(),
-            shared_view: !herdr::attaches_directly(
+            shared_view: !Multiplexer::from(Herdr).attaches_directly(
                 side,
                 attach,
                 agent.is_none_or(|a| a.status.is_some()),
@@ -1390,7 +1391,7 @@ mod tests {
             foreground_cwd: None,
         };
         assert_eq!(
-            herdr::match_workspace(&agent, &herdr::Side::Native, &workspaces),
+            Multiplexer::from(Herdr).match_workspace(&agent, &herdr::Side::Native, &workspaces),
             None,
             "an agent under a removed checkout falls back to Home"
         );
