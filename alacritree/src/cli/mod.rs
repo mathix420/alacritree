@@ -1,6 +1,6 @@
 //! `alacritree <command>` — the terminal-side skin over the IPC surface.
 //!
-//! Every command is one [`IpcRequest`], the same enum the MCP bridge speaks, so
+//! Every command is built from [`IpcRequest`]s, the enum the MCP bridge speaks, so
 //! an agent that shells out reaches exactly the surface an agent with an MCP
 //! client does.  Running with no subcommand opens the window as before.
 //!
@@ -180,7 +180,15 @@ enum ProjectCommand {
     /// Remove a project from the sidebar.  Touches no files.
     Remove { root: PathBuf },
     /// Re-scan a project's worktrees and default branch.
-    Refresh { root: PathBuf },
+    Refresh {
+        /// A path inside the project or any of its worktrees.  Defaults to the
+        /// current directory.
+        #[arg(conflicts_with = "all")]
+        path: Option<PathBuf>,
+        /// Re-scan every project in the sidebar.
+        #[arg(long)]
+        all: bool,
+    },
     /// Set a project's display label.  Display only — the directory on disk
     /// is untouched.
     Rename {
@@ -328,11 +336,72 @@ pub fn run(cli: Cli) -> Option<i32> {
             crate::crash_log::provoke_lock_panic();
             return Some(0);
         },
+        Command::Project { command: ProjectCommand::Refresh { path, all } } => {
+            let config = ConfigSource { dir: cli.config_dir.as_deref(), overrides: &cli.options };
+            return Some(refresh(path, all, cli.socket.as_deref(), cli.json, config));
+        },
         other => to_request(other),
     };
 
     let config = ConfigSource { dir: cli.config_dir.as_deref(), overrides: &cli.options };
     Some(execute(&request, cli.socket.as_deref(), cli.json, config))
+}
+
+/// `project refresh` names its target by any path inside it, or asks for all
+/// of them, so the roots come from the project list before a refresh is sent.
+fn refresh(
+    path: Option<PathBuf>,
+    all: bool,
+    socket: Option<&Path>,
+    as_json: bool,
+    config: ConfigSource<'_>,
+) -> i32 {
+    let listed = match dispatch(&IpcRequest::ListProjects, socket, config) {
+        Ok(listed) => listed,
+        Err(e) => return fail(&e.to_string(), as_json),
+    };
+    let projects = listed["projects"].as_array().map(Vec::as_slice).unwrap_or_default();
+
+    if all {
+        let refreshed = projects
+            .iter()
+            .filter_map(|p| p["root"].as_str())
+            .map(|root| dispatch(&IpcRequest::RefreshProject { root: root.into() }, socket, config))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|projects| serde_json::json!({ "projects": projects }))
+            .map_err(|e| e.to_string());
+        return report(&IpcRequest::ListProjects, refreshed, as_json);
+    }
+
+    let path = absolute(path.unwrap_or_else(|| PathBuf::from(".")));
+    let root = owning_project(projects, &path).or_else(|| {
+        std::fs::canonicalize(&path).ok().and_then(|real| owning_project(projects, &real))
+    });
+    match root {
+        Some(root) => execute(&IpcRequest::RefreshProject { root }, socket, as_json, config),
+        None => {
+            fail(&format!("{} is not inside a project in the sidebar", path.display()), as_json)
+        },
+    }
+}
+
+/// The root of the project `path` sits in: the project whose root or worktree
+/// is the longest ancestor of `path`, so a checkout nested inside another
+/// resolves to its own project.
+fn owning_project(projects: &[serde_json::Value], path: &Path) -> Option<PathBuf> {
+    projects
+        .iter()
+        .flat_map(|p| {
+            let worktrees = p["worktrees"].as_array().into_iter().flatten().map(|wt| &wt["path"]);
+            std::iter::once(&p["root"])
+                .chain(worktrees)
+                .filter_map(serde_json::Value::as_str)
+                .map(move |dir| (&p["root"], Path::new(dir)))
+        })
+        .filter(|(_, dir)| path.starts_with(dir))
+        .max_by_key(|(_, dir)| dir.components().count())
+        .and_then(|(root, _)| root.as_str())
+        .map(PathBuf::from)
 }
 
 /// Where the offline path reads config from, carried down from the CLI args.
@@ -368,7 +437,11 @@ fn execute(
     as_json: bool,
     config: ConfigSource<'_>,
 ) -> i32 {
-    match dispatch(request, socket, config) {
+    report(request, dispatch(request, socket, config).map_err(|e| e.to_string()), as_json)
+}
+
+fn report(request: &IpcRequest, result: Result<serde_json::Value, String>, as_json: bool) -> i32 {
+    match result {
         Ok(value) => {
             if as_json {
                 println!("{:#}", value);
@@ -377,17 +450,19 @@ fn execute(
             }
             0
         },
-        // In JSON mode the error goes to stdout as JSON too, so a caller parses
-        // one stream and never has to interleave two.
-        Err(e) if as_json => {
-            println!("{:#}", serde_json::json!({ "error": e.to_string() }));
-            1
-        },
-        Err(e) => {
-            eprintln!("alacritree: {e}");
-            1
-        },
+        Err(e) => fail(&e, as_json),
     }
+}
+
+fn fail(error: &str, as_json: bool) -> i32 {
+    // In JSON mode the error goes to stdout as JSON too, so a caller parses
+    // one stream and never has to interleave two.
+    if as_json {
+        println!("{:#}", serde_json::json!({ "error": error }));
+    } else {
+        eprintln!("alacritree: {error}");
+    }
+    1
 }
 
 /// Ask a running alacritree, falling back to serving the request ourselves.
@@ -427,7 +502,7 @@ fn to_request(command: Command) -> IpcRequest {
             ProjectCommand::List => IpcRequest::ListProjects,
             ProjectCommand::Add { path } => IpcRequest::AddProject { path: absolute(path) },
             ProjectCommand::Remove { root } => IpcRequest::RemoveProject { root: absolute(root) },
-            ProjectCommand::Refresh { root } => IpcRequest::RefreshProject { root: absolute(root) },
+            ProjectCommand::Refresh { .. } => unreachable!("handled before dispatch"),
             ProjectCommand::Rename { root, label, .. } => {
                 IpcRequest::RenameProject { root: absolute(root), label }
             },
@@ -596,6 +671,58 @@ mod tests {
             Cli::try_parse_from(["alacritree", "project", "rename", ".", "Work", "--clear"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn refresh_takes_a_path_or_all_but_not_both() {
+        assert!(Cli::try_parse_from(["alacritree", "project", "refresh"]).is_ok());
+        assert!(Cli::try_parse_from(["alacritree", "project", "refresh", "."]).is_ok());
+        assert!(Cli::try_parse_from(["alacritree", "project", "refresh", "--all"]).is_ok());
+        assert!(Cli::try_parse_from(["alacritree", "project", "refresh", ".", "--all"]).is_err());
+    }
+
+    fn projects_json() -> Vec<serde_json::Value> {
+        let base = std::env::temp_dir();
+        let path = |p: &str| base.join(p).to_string_lossy().into_owned();
+        vec![
+            serde_json::json!({
+                "root": path("repo"),
+                "worktrees": [{ "path": path("repo") }, { "path": path("repo-worktrees/topic") }],
+            }),
+            serde_json::json!({
+                "root": path("repo/vendor/inner"),
+                "worktrees": [{ "path": path("repo/vendor/inner") }],
+            }),
+        ]
+    }
+
+    #[test]
+    fn a_path_in_a_linked_worktree_resolves_to_its_project() {
+        let base = std::env::temp_dir();
+        assert_eq!(
+            owning_project(&projects_json(), &base.join("repo-worktrees/topic/src")),
+            Some(base.join("repo"))
+        );
+    }
+
+    #[test]
+    fn a_nested_checkout_resolves_to_the_inner_project() {
+        let base = std::env::temp_dir();
+        assert_eq!(
+            owning_project(&projects_json(), &base.join("repo/vendor/inner/src")),
+            Some(base.join("repo/vendor/inner"))
+        );
+        assert_eq!(
+            owning_project(&projects_json(), &base.join("repo/src")),
+            Some(base.join("repo"))
+        );
+    }
+
+    #[test]
+    fn a_path_outside_every_project_resolves_to_nothing() {
+        let base = std::env::temp_dir();
+        assert_eq!(owning_project(&projects_json(), &base.join("repository")), None);
+        assert_eq!(owning_project(&projects_json(), &base.join("elsewhere")), None);
     }
 
     /// The shell hands us argv verbatim, so a user who writes `'ls\r'` sends a
