@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use git2::{Delta, DiffOptions, Repository, Status, StatusOptions};
 
+use crate::repaint::Repaint;
 use crate::{jobs, wsl};
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
@@ -238,7 +239,11 @@ impl StatusCache {
     /// Returns the most recent known status, kicking off a background refresh
     /// when stale or when the default-branch hint changed since the last
     /// completed compute.  Never blocks the caller.
-    pub fn poll(&mut self, default_branch_hint: Option<&str>, ctx: &egui::Context) -> &GitStatus {
+    pub fn poll(
+        &mut self,
+        default_branch_hint: Option<&str>,
+        repaint: &impl Repaint,
+    ) -> &GitStatus {
         // Drain any completed background result before deciding whether to
         // spawn another — a fresh answer shouldn't be ignored just because
         // the staleness timer also tripped.
@@ -292,7 +297,7 @@ impl StatusCache {
             self.pending = Some(spawn_compute(
                 self.path.clone(),
                 default_branch_hint.map(str::to_string),
-                ctx.clone(),
+                repaint.clone(),
             ));
         }
 
@@ -300,11 +305,11 @@ impl StatusCache {
     }
 }
 
-fn spawn_compute(path: PathBuf, hint: Option<String>, ctx: egui::Context) -> Pending {
+fn spawn_compute(path: PathBuf, hint: Option<String>, repaint: impl Repaint) -> Pending {
     let worker_hint = hint.clone();
     let job = jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
         let status = compute(&path, worker_hint.as_deref(), blocking);
-        ctx.request_repaint();
+        repaint.wake();
         status
     });
     Pending { hint, job, started: Instant::now(), warned: false }
@@ -737,6 +742,7 @@ fn parse_numstat_z(bytes: &[u8]) -> Vec<DiffStat> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repaint::Recorder;
 
     #[test]
     fn a_status_poll_reports_without_blocking_its_caller() {
@@ -747,19 +753,20 @@ mod tests {
         let repo = crate::test_util::init_repo(dir.path());
         drop(repo);
 
-        let ctx = egui::Context::default();
+        let repaint = Recorder::default();
         let mut cache = StatusCache::new(dir.path().to_path_buf());
         // The first poll has nothing banked and must return anyway.
         let started = Instant::now();
-        let _ = cache.poll(None, &ctx);
+        let _ = cache.poll(None, &repaint);
         assert!(started.elapsed() < Duration::from_millis(50), "poll blocked its caller");
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while cache.last().branch.is_none() && Instant::now() < deadline {
-            let _ = cache.poll(None, &ctx);
+            let _ = cache.poll(None, &repaint);
             std::thread::yield_now();
         }
         assert!(cache.last().branch.is_some(), "the background compute never landed");
+        assert_eq!(repaint.wakes(), 1, "the landed compute should wake the UI");
     }
 
     /// A panicked compute must not wedge the cache: without clearing
@@ -774,10 +781,10 @@ mod tests {
             });
         cache.pending = Some(Pending { hint: None, job, started: Instant::now(), warned: false });
 
-        let ctx = egui::Context::default();
+        let repaint = Recorder::default();
         let deadline = Instant::now() + Duration::from_secs(5);
         while cache.pending.is_some() {
-            let _ = cache.poll(None, &ctx);
+            let _ = cache.poll(None, &repaint);
             assert!(Instant::now() < deadline, "pending was never cleared after the job failed");
             std::thread::yield_now();
         }
@@ -810,13 +817,13 @@ mod tests {
         let stalled = cache.stalled_for().expect("a held compute is in flight");
         assert!(stalled > STALL_WARNING);
 
-        let ctx = egui::Context::default();
+        let repaint = Recorder::default();
         let pending_warned =
             |cache: &StatusCache| cache.pending.as_ref().expect("still in flight").warned;
         assert!(!pending_warned(&cache), "not warned before the first poll");
-        let _ = cache.poll(None, &ctx);
+        let _ = cache.poll(None, &repaint);
         assert!(pending_warned(&cache), "a stall past STALL_WARNING must be logged");
-        let _ = cache.poll(None, &ctx);
+        let _ = cache.poll(None, &repaint);
         assert!(pending_warned(&cache), "the warning must not repeat on every frame");
 
         let _ = release_tx.send(());
@@ -845,12 +852,12 @@ mod tests {
 
         let mut cache = StatusCache::new(PathBuf::from("/doesnt/matter"));
         cache.pending = Some(Pending { hint: None, job, started: Instant::now(), warned: false });
-        let ctx = egui::Context::default();
+        let repaint = Recorder::default();
 
-        let _ = cache.poll(None, &ctx);
+        let _ = cache.poll(None, &repaint);
         assert!(cache.pending.is_none(), "the poll that banks a failure must not start another");
         assert!(!cache.has_status(), "a compute that failed knows nothing about the tree");
-        let _ = cache.poll(None, &ctx);
+        let _ = cache.poll(None, &repaint);
         assert!(cache.pending.is_none(), "nor may the frames that follow it inside the interval");
     }
 
@@ -865,13 +872,13 @@ mod tests {
         let repo = crate::test_util::init_repo(dir.path());
         drop(repo);
 
-        let ctx = egui::Context::default();
+        let repaint = Recorder::default();
         let mut cache = StatusCache::new(dir.path().to_path_buf());
         assert!(!cache.has_status(), "a fresh cache has never completed a compute");
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while !cache.has_status() && Instant::now() < deadline {
-            let _ = cache.poll(None, &ctx);
+            let _ = cache.poll(None, &repaint);
             std::thread::yield_now();
         }
         assert!(cache.has_status(), "the background compute never landed");
@@ -887,12 +894,12 @@ mod tests {
         // Not a git repository, so `compute` lands an error rather than a
         // status.
         let dir = tempfile::tempdir().expect("a temp dir");
-        let ctx = egui::Context::default();
+        let repaint = Recorder::default();
         let mut cache = StatusCache::new(dir.path().to_path_buf());
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while cache.last().error.is_none() && Instant::now() < deadline {
-            let _ = cache.poll(None, &ctx);
+            let _ = cache.poll(None, &repaint);
             std::thread::yield_now();
         }
         assert!(cache.last().error.is_some(), "the background compute never landed an error");

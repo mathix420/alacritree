@@ -807,7 +807,8 @@ mod tests {
     #[test]
     fn a_running_app_answers_instead_of_the_offline_path() {
         let (socket, requests) =
-            ipc::listen_for_test("cli-online", egui::Context::default()).expect("listener");
+            ipc::listen_for_test("cli-online", crate::repaint::Recorder::default())
+                .expect("listener");
 
         let app = std::thread::spawn(move || {
             let call = requests.recv().expect("the request reached the app");

@@ -640,14 +640,14 @@ impl AlacritreeApp {
 
     /// herdr's word on a session's agent: `Some` only while this session is
     /// attached to one the endpoint listing still carries.
-    pub(super) fn session_herdr_status(&self, session: &Session) -> Option<herdr::Status> {
+    pub(super) fn session_herdr_status(&self, session: &AppSession) -> Option<herdr::Status> {
         self.session_herdr_agent(session).and_then(|agent| agent.status)
     }
 
     /// The agent this session is attached to, while the endpoint listing
     /// still carries it.  herdr watches the pane from outside, so it is the
     /// authority on both what the pane is called and what it is doing.
-    pub(super) fn session_herdr_agent(&self, session: &Session) -> Option<&herdr::Agent> {
+    pub(super) fn session_herdr_agent(&self, session: &AppSession) -> Option<&herdr::Agent> {
         let key = session.herdr_key.as_ref()?;
         self.find_herdr_agent(&key.side, &key.terminal_id)
     }
@@ -746,7 +746,7 @@ impl AlacritreeApp {
     /// rather than stored, so a config read that lands later, or a herdr that
     /// stops listing the agent, reaches the row without a second source of
     /// truth to keep in step.
-    pub(super) fn session_managed(&self, session: &Session) -> Option<Managed> {
+    pub(super) fn session_managed(&self, session: &AppSession) -> Option<Managed> {
         let key = session.herdr_key.as_ref()?;
         let agent = self.session_herdr_agent(session);
         let mut managed = Managed::herdr(

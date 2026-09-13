@@ -15,6 +15,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use crate::projects::Worktree;
+use crate::repaint::Repaint;
 use crate::{command_ext, jobs, pr_query, wsl};
 
 /// Re-query at most this often.  PR base branches rarely change, and a stale
@@ -165,7 +166,7 @@ impl PrCache {
         &mut self,
         path: &Path,
         branch: Option<&str>,
-        ctx: &egui::Context,
+        repaint: &impl Repaint,
     ) -> Option<PrInfo> {
         let now = self.now();
         let entry = self.entries.entry(path.to_path_buf()).or_default();
@@ -206,7 +207,7 @@ impl PrCache {
             // guard inside the spawn closure delivers that wake when a slot
             // frees, on the panicking path too.
             if may_spawn(self.concurrency, self.in_flight) {
-                ctx.request_repaint();
+                repaint.wake();
             }
         }
 
@@ -234,7 +235,7 @@ impl PrCache {
     /// site rather than inside `poll`: an entry whose project collapsed
     /// mid-lookup is never polled again, and a slot it still held would never
     /// come back.
-    pub fn drain_completed(&mut self, ctx: &egui::Context) {
+    pub fn drain_completed(&mut self, repaint: &impl Repaint) {
         let now = self.now();
         let mut banked = false;
         let mut still_running = Vec::new();
@@ -261,7 +262,7 @@ impl PrCache {
         if banked {
             self.generation = self.generation.wrapping_add(1);
         }
-        self.spawn_due(ctx);
+        self.spawn_due(repaint);
     }
 
     /// Record one member's answer.  `None` means the request covered this
@@ -295,7 +296,7 @@ impl PrCache {
     /// already written the new branch, so on a branch switch the stamp is the
     /// only thing left saying the entry is stale; keeping it would read as a
     /// fresh answer for a branch nothing ever looked up.
-    fn spawn_due(&mut self, ctx: &egui::Context) {
+    fn spawn_due(&mut self, repaint: &impl Repaint) {
         let due = std::mem::take(&mut self.due);
         if due.is_empty() {
             return;
@@ -310,12 +311,12 @@ impl PrCache {
             return;
         }
         let members = due.clone();
-        let ctx = ctx.clone();
+        let repaint = repaint.clone();
         let job = jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
             // Fires on a panicking unwind too, since it's a local: the drain
             // that frees this slot only runs on a frame, so an exit without a
             // repaint can stall polling for good.
-            let _wake = RepaintOnDrop(ctx);
+            let _wake = WakeOnDrop(repaint);
             run_due(due, blocking)
         });
         self.bank_batch(members, job);
@@ -591,11 +592,11 @@ fn run_graphql(cwd: &Path, query: &str, _blocking: &jobs::Blocking) -> Option<Ve
     output.status.success().then_some(output.stdout)
 }
 
-struct RepaintOnDrop(egui::Context);
+struct WakeOnDrop<R: Repaint>(R);
 
-impl Drop for RepaintOnDrop {
+impl<R: Repaint> Drop for WakeOnDrop<R> {
     fn drop(&mut self) {
-        self.0.request_repaint();
+        self.0.wake();
     }
 }
 
@@ -858,6 +859,7 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
 
+    use crate::repaint::Recorder;
     use crate::test_util::{add_worktree, init_repo};
 
     /// Spawn a job that blocks until `release` fires, so a test can hold a
@@ -912,10 +914,10 @@ mod tests {
     /// Drive `drain_completed` until the entry at `path` has no request
     /// outstanding, mirroring how the UI's frame loop drives it.
     fn drain_until(cache: &mut PrCache, path: &Path, timeout: Duration) {
-        let ctx = egui::Context::default();
+        let repaint = Recorder::default();
         let deadline = Instant::now() + timeout;
         loop {
-            cache.drain_completed(&ctx);
+            cache.drain_completed(&repaint);
             if cache.entries.get(path).is_none_or(|e| !e.pending) {
                 return;
             }
@@ -1191,8 +1193,8 @@ mod tests {
             refresh_requested: false,
         });
 
-        let ctx = egui::Context::default();
-        let result = cache.poll(&path, None, &ctx);
+        let repaint = Recorder::default();
+        let result = cache.poll(&path, None, &repaint);
 
         assert_eq!(result.map(|info| info.number), Some(7));
         let entry = cache.entries.get(&path).unwrap();
@@ -1340,7 +1342,7 @@ mod tests {
         assert_eq!(cache.in_flight(), 1);
 
         *now.lock().expect("clock poisoned") = TTL + Duration::from_nanos(1);
-        cache.drain_completed(&egui::Context::default());
+        cache.drain_completed(&Recorder::default());
 
         assert_eq!(cache.in_flight(), 0);
     }
@@ -1357,7 +1359,7 @@ mod tests {
             insert_stuck_entry(&mut cache, Path::new("/repo/wt"), "main", Duration::ZERO);
 
         *now.lock().expect("clock poisoned") = TTL + Duration::from_nanos(1);
-        cache.drain_completed(&egui::Context::default());
+        cache.drain_completed(&Recorder::default());
 
         let entry = cache.entries.get(Path::new("/repo/wt")).unwrap();
         assert!(
@@ -1407,7 +1409,7 @@ mod tests {
             insert_stuck_entry(&mut cache, Path::new("/repo/pending"), "main", Duration::ZERO);
 
         let before = cache.generation();
-        cache.drain_completed(&egui::Context::default());
+        cache.drain_completed(&Recorder::default());
         assert_eq!(cache.generation(), before, "a frame that banks nothing must not invalidate");
 
         let job = jobs::pool().spawn(jobs::Priority::Background, |_| BatchResult::new());
@@ -1543,35 +1545,25 @@ mod tests {
             pending: false,
             refresh_requested: false,
         });
-        let ctx = egui::Context::default();
-        cache.poll(capped, Some("feature"), &ctx);
-        cache.drain_completed(&ctx);
+        let repaint = Recorder::default();
+        cache.poll(capped, Some("feature"), &repaint);
+        cache.drain_completed(&repaint);
 
         assert_eq!(cache.in_flight(), 1, "the cap must refuse the second request");
         assert!(cache.is_due(capped, "feature"), "a refused member must fall due again");
     }
 
-    /// Drive a fresh context to the point where it wants no repaint of its
-    /// own: it always asks for an initial one, and `run` only clears that
-    /// once the request has been consumed — hence two passes.
-    fn quiesce(ctx: &egui::Context) {
-        let _ = ctx.run(Default::default(), |_| {});
-        let _ = ctx.run(Default::default(), |_| {});
-        assert!(!ctx.has_requested_repaint(), "precondition: no repaint pending");
-    }
-
-    /// The frame that queues a lookup is not the frame that spawns it — the
-    /// next drain is — and egui paints on demand, so without this the request
-    /// waits on the user's next input instead of on the TTL.
+    /// The next drain spawns a queued lookup, not the frame that queued it,
+    /// and egui paints on demand. Without a wake the request waits on the
+    /// user's next input instead of on the TTL.
     #[test]
     fn a_queued_poll_asks_for_the_frame_that_spawns_it() {
-        let ctx = egui::Context::default();
-        quiesce(&ctx);
+        let repaint = Recorder::default();
         let mut cache = PrCache::new();
 
-        cache.poll(Path::new("/repo/wt"), Some("main"), &ctx);
+        cache.poll(Path::new("/repo/wt"), Some("main"), &repaint);
 
-        assert!(ctx.has_requested_repaint(), "a queued lookup must ask for its spawning frame");
+        assert_eq!(repaint.wakes(), 1, "a queued lookup must ask for its spawning frame");
     }
 
     /// A member the cap refuses has its `pending` cleared, so it falls due
@@ -1582,33 +1574,26 @@ mod tests {
     /// a slot frees, on the panicking path too.
     #[test]
     fn a_poll_the_cap_will_refuse_does_not_ask_for_another_frame() {
-        let ctx = egui::Context::default();
+        let repaint = Recorder::default();
         let mut cache = PrCache::new();
         cache.set_concurrency(Some(1));
         let (_release, job) = spawn_stuck_job();
         bank_one(&mut cache, "/repo/busy", "main", job);
-        quiesce(&ctx);
 
-        cache.poll(Path::new("/repo/capped"), Some("feature"), &ctx);
+        cache.poll(Path::new("/repo/capped"), Some("feature"), &repaint);
 
-        assert!(!ctx.has_requested_repaint(), "a saturated cap must not spin the frame loop");
+        assert_eq!(repaint.wakes(), 0, "a saturated cap must not spin the frame loop");
     }
 
     /// The drain that frees a concurrency slot only runs on a frame, so a
     /// worker that exits without waking the app can stall polling for good.
     #[test]
     fn dropping_the_guard_wakes_the_app() {
-        let ctx = egui::Context::default();
-        // A fresh context always wants an initial repaint, and `run` only
-        // clears it once that first request has been consumed — hence two
-        // passes, so the assertion below can only be satisfied by the guard.
-        let _ = ctx.run(Default::default(), |_| {});
-        let _ = ctx.run(Default::default(), |_| {});
-        assert!(!ctx.has_requested_repaint(), "precondition: no repaint pending");
+        let repaint = Recorder::default();
 
-        drop(RepaintOnDrop(ctx.clone()));
+        drop(WakeOnDrop(repaint.clone()));
 
-        assert!(ctx.has_requested_repaint());
+        assert_eq!(repaint.wakes(), 1);
     }
 
     /// The spawn has no sender of its own — the pool's channel is internal —
@@ -1617,17 +1602,12 @@ mod tests {
     /// `poll` until `failed` latches.
     #[test]
     fn a_panicking_worker_still_wakes_the_app_and_reports_failed() {
-        let ctx = egui::Context::default();
-        // See `dropping_the_guard_wakes_the_app`: a fresh context needs two
-        // passes before its initial repaint request is fully consumed.
-        let _ = ctx.run(Default::default(), |_| {});
-        let _ = ctx.run(Default::default(), |_| {});
-        assert!(!ctx.has_requested_repaint(), "precondition: no repaint pending");
+        let repaint = Recorder::default();
 
         let job = {
-            let ctx = ctx.clone();
+            let repaint = repaint.clone();
             jobs::Pool::new(2).spawn(jobs::Priority::Background, move |_| -> BatchResult {
-                let _wake = RepaintOnDrop(ctx);
+                let _wake = WakeOnDrop(repaint);
                 panic!("worker died");
             })
         };
@@ -1639,7 +1619,7 @@ mod tests {
             thread::yield_now();
         }
 
-        assert!(ctx.has_requested_repaint(), "a panicking unwind still wakes the app");
+        assert_eq!(repaint.wakes(), 1, "a panicking unwind still wakes the app");
     }
 
     fn group_of(branches: &[&str]) -> Group {
@@ -1751,7 +1731,7 @@ mod tests {
     /// across every path that contributed to it.
     #[test]
     fn one_banked_result_reaches_every_member() {
-        let ctx = egui::Context::default();
+        let repaint = Recorder::default();
         let mut cache = PrCache::new();
         let members =
             vec![Member { path: PathBuf::from("/repo/a"), branch: "topic-a".into() }, Member {
@@ -1776,7 +1756,7 @@ mod tests {
         assert_eq!(cache.in_flight(), 1, "one request, not one per branch");
 
         for _ in 0..200 {
-            cache.drain_completed(&ctx);
+            cache.drain_completed(&repaint);
             if cache.in_flight() == 0 {
                 break;
             }

@@ -7,11 +7,12 @@ use alacritty_terminal::term::{Term, TermMode};
 
 use crate::clipboard::{self, Target};
 use crate::config::Config;
+use crate::repaint::Repaint;
 use crate::session::{EventProxy, Session};
 
 /// Pass `bracketed = true` for user-driven pastes; `false` is reserved for
 /// `Action::Esc` style writes that must reach the PTY verbatim.
-pub fn paste(session: &mut Session, text: &str, bracketed: bool) {
+pub fn paste(session: &mut Session<impl Repaint>, text: &str, bracketed: bool) {
     let bracketed_active = session.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
 
     on_terminal_input_start(session);
@@ -40,12 +41,12 @@ pub(crate) fn paste_bytes(text: &str, bracketed: bool, bracketed_active: bool) -
 
 /// Acquires the term lock; mouse handlers that already hold it should call
 /// `write_selection` instead.
-pub fn copy_selection(session: &Session, config: &Config, target: Target) {
+pub fn copy_selection(session: &Session<impl Repaint>, config: &Config, target: Target) {
     let term = session.term.lock();
     write_selection(&term, config, target);
 }
 
-pub fn write_selection(term: &Term<EventProxy>, config: &Config, target: Target) {
+pub fn write_selection(term: &Term<EventProxy<impl Repaint>>, config: &Config, target: Target) {
     let Some(text) = term.selection_to_string().filter(|s| !s.is_empty()) else {
         return;
     };
@@ -60,7 +61,7 @@ pub fn write_selection(term: &Term<EventProxy>, config: &Config, target: Target)
 /// Mirrors alacritty's `on_terminal_input_start`: any keypress or paste that
 /// reaches the PTY clears the active selection and snaps the view back to the
 /// active line so the user sees what they just typed.
-pub fn on_terminal_input_start(session: &Session) {
+pub fn on_terminal_input_start(session: &Session<impl Repaint>) {
     let mut term = session.term.lock();
     let _ = term.selection.take();
     if term.grid().display_offset() != 0 {

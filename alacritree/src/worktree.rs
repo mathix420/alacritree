@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 
+use crate::repaint::Repaint;
 use crate::{command_ext, jobs, wsl};
 
 #[derive(Debug, Clone)]
@@ -64,19 +65,22 @@ pub fn validate_branch_name(name: &str) -> Result<(), String> {
 /// streamed progress travels over the channel; the returned `Job` carries no
 /// result of its own and exists only to be held — dropping it would cancel
 /// the create before it starts.
-pub fn spawn_create(req: CreateRequest, ctx: egui::Context) -> (Receiver<Progress>, jobs::Job<()>) {
+pub fn spawn_create(
+    req: CreateRequest,
+    repaint: impl Repaint,
+) -> (Receiver<Progress>, jobs::Job<()>) {
     let (tx, rx) = mpsc::channel();
     let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
         let result = create(
             &req,
             |step| {
                 let _ = tx.send(Progress::Step(step.to_string()));
-                ctx.request_repaint();
+                repaint.wake();
             },
             blocking,
         );
         let _ = tx.send(Progress::Done(result));
-        ctx.request_repaint();
+        repaint.wake();
     });
     (rx, job)
 }
@@ -577,7 +581,7 @@ pub enum DeleteJob {
 pub fn spawn_delete(
     project_root: PathBuf,
     job: DeleteJob,
-    ctx: egui::Context,
+    repaint: impl Repaint,
 ) -> jobs::Job<Result<(), String>> {
     jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
         let result = match job {
@@ -588,7 +592,7 @@ pub fn spawn_delete(
                 prune_worktree(&project_root, &worktree_name, branch.as_deref(), delete_branch)
             },
         };
-        ctx.request_repaint();
+        repaint.wake();
         result
     })
 }
@@ -631,6 +635,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::repaint::Recorder;
     use crate::test_util::{add_worktree, init_repo};
 
     fn abs(tail: &str) -> PathBuf {
@@ -672,7 +677,8 @@ mod tests {
             branch: Some("feature".to_string()),
             force: false,
         };
-        let handle = spawn_delete(repo_dir, job, egui::Context::default());
+        let repaint = Recorder::default();
+        let handle = spawn_delete(repo_dir, job, repaint.clone());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let result = loop {
             if let Some(result) = handle.poll() {
@@ -683,6 +689,7 @@ mod tests {
         };
 
         assert!(result.is_ok(), "delete failed: {result:?}");
+        assert_eq!(repaint.wakes(), 1, "the finished delete should wake the UI");
         assert!(!wt_path.exists(), "worktree directory should be gone");
         assert!(repo.find_worktree("feature").is_err());
         assert!(repo.find_branch("feature", git2::BranchType::Local).is_err());

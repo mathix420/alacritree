@@ -338,6 +338,9 @@ where
     info
 }
 
+/// A session whose PTY output wakes the egui loop that paints it.
+type AppSession = Session<Context>;
+
 pub struct AlacritreeApp {
     show_left_sidebar: bool,
     show_right_sidebar: bool,
@@ -370,7 +373,7 @@ pub struct AlacritreeApp {
     /// The Ctrl+K command palette (query, selection, matcher). Transient:
     /// never persisted.
     palette: CommandPalette,
-    sessions: Vec<Session>,
+    sessions: Vec<AppSession>,
     current_workspace: WorkspaceKey,
     active_session: HashMap<WorkspaceKey, SessionId>,
     projects: Vec<Project>,
@@ -867,8 +870,8 @@ impl AlacritreeApp {
     /// for a shell.  Callers own `active_session`; this owns `self.sessions`.
     fn open_session(
         &mut self,
-        session: Session,
-        request: session::OpenRequest,
+        session: AppSession,
+        request: session::OpenRequest<Context>,
     ) -> std::io::Result<SessionId> {
         let id = session.id;
         self.sessions.push(session);

@@ -16,9 +16,9 @@
 //!
 //! Threading: the listener accepts on its own thread and spawns one thread
 //! per connection.  Requests that touch app state are forwarded to the UI
-//! thread as [`AppCall`]s (drained once per frame — the accompanying
-//! `request_repaint` is what wakes an idle egui loop, same contract as
-//! `EventProxy`).  Requests that would stall a frame (git status walks,
+//! thread as [`AppCall`]s, drained once per frame. The accompanying
+//! [`Repaint::wake`] is what wakes an idle UI loop, same contract as
+//! `EventProxy`. Requests that would stall a frame (git status walks,
 //! worktree creation with its `git fetch`) run directly on the connection
 //! thread instead.
 
@@ -34,6 +34,7 @@ use serde_json::{Value, json};
 
 use crate::git_status::{self, ChangeKind, GitStatus};
 use crate::jobs;
+use crate::repaint::Repaint;
 use crate::worktree::{self as wt, CreateRequest, Progress};
 
 pub const SOCKET_ENV: &str = "ALACRITREE_SOCKET";
@@ -206,8 +207,8 @@ impl Drop for SocketHandle {
     }
 }
 
-pub fn spawn_listener(ctx: egui::Context) -> std::io::Result<(SocketHandle, Receiver<AppCall>)> {
-    let listener = listen_at(socket_path(), ctx)?;
+pub fn spawn_listener(repaint: impl Repaint) -> std::io::Result<(SocketHandle, Receiver<AppCall>)> {
+    let listener = listen_at(socket_path(), repaint)?;
 
     // Advertise the socket to child PTYs, like alacritty does with
     // ALACRITTY_SOCKET.  Startup runs before the first session spawns, so
@@ -267,7 +268,7 @@ fn wslenv_with_alacritree_vars(current: Option<&str>) -> String {
 /// same name and answer each other's requests.
 fn listen_at(
     path: PathBuf,
-    ctx: egui::Context,
+    repaint: impl Repaint,
 ) -> std::io::Result<(SocketHandle, Receiver<AppCall>)> {
     // A leftover socket file at our pid (crashed predecessor) blocks bind; only
     // remove it once we've confirmed nothing is listening.
@@ -286,10 +287,10 @@ fn listen_at(
         loop {
             let Ok(stream) = listener.accept() else { continue };
             let tx = tx.clone();
-            let ctx = ctx.clone();
+            let repaint = repaint.clone();
             std::thread::Builder::new()
                 .name("alacritree-ipc-conn".into())
-                .spawn(move || handle_connection(stream, tx, ctx))
+                .spawn(move || handle_connection(stream, tx, repaint))
                 .ok();
         }
     })?;
@@ -297,7 +298,7 @@ fn listen_at(
     Ok((SocketHandle { path }, rx))
 }
 
-fn handle_connection(stream: Stream, app_tx: Sender<AppCall>, ctx: egui::Context) {
+fn handle_connection(stream: Stream, app_tx: Sender<AppCall>, repaint: impl Repaint) {
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
     match reader.read_line(&mut line) {
@@ -305,7 +306,7 @@ fn handle_connection(stream: Stream, app_tx: Sender<AppCall>, ctx: egui::Context
         Ok(_) => {},
     }
     let result = match serde_json::from_str::<IpcRequest>(&line) {
-        Ok(request) => dispatch(request, &app_tx, &ctx),
+        Ok(request) => dispatch(request, &app_tx, &repaint),
         Err(e) => Err(format!("invalid IPC request: {e}")),
     };
     let reply = match &result {
@@ -318,7 +319,7 @@ fn handle_connection(stream: Stream, app_tx: Sender<AppCall>, ctx: egui::Context
     let _ = writer.flush();
 }
 
-fn dispatch(request: IpcRequest, app_tx: &Sender<AppCall>, ctx: &egui::Context) -> IpcResult {
+fn dispatch(request: IpcRequest, app_tx: &Sender<AppCall>, repaint: &impl Repaint) -> IpcResult {
     match request {
         // `compute` walks the working tree — the same work StatusCache
         // pushes to a background thread — so keep it off the UI thread.
@@ -328,18 +329,18 @@ fn dispatch(request: IpcRequest, app_tx: &Sender<AppCall>, ctx: &egui::Context) 
             git_status::compute(&path, None, blocking)
         }))),
         IpcRequest::CreateWorktree { project_root, branch } => {
-            create_worktree(project_root, branch, app_tx, ctx)
+            create_worktree(project_root, branch, app_tx, repaint)
         },
-        other => call_app(other, app_tx, ctx),
+        other => call_app(other, app_tx, repaint),
     }
 }
 
-fn call_app(request: IpcRequest, app_tx: &Sender<AppCall>, ctx: &egui::Context) -> IpcResult {
+fn call_app(request: IpcRequest, app_tx: &Sender<AppCall>, repaint: &impl Repaint) -> IpcResult {
     let (reply_tx, reply_rx) = mpsc::channel();
     app_tx
         .send(AppCall { request, reply_tx })
         .map_err(|_| "alacritree is shutting down".to_string())?;
-    ctx.request_repaint();
+    repaint.wake();
     reply_rx
         .recv_timeout(APP_REPLY_TIMEOUT)
         .map_err(|_| "alacritree did not respond (app busy or closed)".to_string())?
@@ -354,7 +355,7 @@ fn create_worktree(
     project_root: PathBuf,
     branch: String,
     app_tx: &Sender<AppCall>,
-    ctx: &egui::Context,
+    repaint: &impl Repaint,
 ) -> IpcResult {
     wt::validate_branch_name(&branch)?;
     let req = CreateRequest {
@@ -363,7 +364,7 @@ fn create_worktree(
         branch,
         base_dir: None,
     };
-    let (rx, job) = wt::spawn_create(req, ctx.clone());
+    let (rx, job) = wt::spawn_create(req, repaint.clone());
     let outcome = drain_create(&rx, IPC_CREATE_BUDGET);
     // Dropping on every path, including the deadline, is what ends the fetch
     // and returns the worker.  Holding it would leave the pool one worker
@@ -373,7 +374,7 @@ fn create_worktree(
         Ok((path, steps)) => {
             // Best-effort: if the project is in the sidebar, show the new
             // worktree without waiting for a manual refresh.
-            let _ = call_app(IpcRequest::RefreshProject { root: project_root }, app_tx, ctx);
+            let _ = call_app(IpcRequest::RefreshProject { root: project_root }, app_tx, repaint);
             Ok(json!({ "path": path, "steps": steps }))
         },
         Err(e) => Err(e),
@@ -606,15 +607,16 @@ pub fn socket_dir() -> PathBuf {
 #[cfg(test)]
 pub fn listen_for_test(
     label: &str,
-    ctx: egui::Context,
+    repaint: impl Repaint,
 ) -> std::io::Result<(SocketHandle, Receiver<AppCall>)> {
-    listen_at(socket_dir().join(format!("alacritree-test-{label}.sock")), ctx)
+    listen_at(socket_dir().join(format!("alacritree-test-{label}.sock")), repaint)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use crate::repaint::Recorder;
     use crate::session::SESSION_ID_ENV;
 
     #[cfg(target_os = "linux")]
@@ -676,7 +678,8 @@ mod tests {
     /// would happily find a real alacritree running on the same machine.
     #[test]
     fn round_trip_over_the_socket() {
-        let (handle, rx) = spawn_listener(egui::Context::default()).expect("listener");
+        let repaint = Recorder::default();
+        let (handle, rx) = spawn_listener(repaint.clone()).expect("listener");
 
         let app = std::thread::spawn(move || {
             let call = rx.recv().expect("request reached the app thread");
@@ -689,6 +692,7 @@ mod tests {
                 .expect("reply from the listener");
         assert_eq!(reply, json!({ "sessions": [] }));
         app.join().unwrap();
+        assert_eq!(repaint.wakes(), 1, "a call forwarded to the app must wake it");
 
         // The advertised path has to be connectable: it is how a shell running
         // inside a session reaches its own instance.
