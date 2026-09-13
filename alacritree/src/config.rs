@@ -519,12 +519,11 @@ impl PasteConfig {
 
 /// `[integrations]`: how alacritree invokes external tools and the controls
 /// specific to those integrations, such as the diff viewer and its section
-/// buttons. General sidebar and terminal appearance stays under `[ui]`; a
-/// herdr row's glyph is `ui.icons.herdr`, not a setting here.
+/// buttons. General sidebar and terminal appearance stays under `[ui]`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct IntegrationsConfig {
     pub git: ToolConfig,
-    pub gh: ToolConfig,
+    pub gh: GhConfig,
     pub doppler: ToolConfig,
     pub herdr: HerdrConfig,
     pub delta: ToolConfig,
@@ -553,7 +552,7 @@ pub struct DiffViewerConfig {
 
 impl Default for IntegrationsConfig {
     fn default() -> Self {
-        RawIntegrations::default().resolve(None)
+        RawIntegrations::default().resolve(MovedUiKeys::default())
     }
 }
 
@@ -587,6 +586,26 @@ pub struct ToolConfig {
     pub wsl_path: Option<String>,
 }
 
+/// `[integrations.gh]`: where the GitHub CLI lives and whether the sidebar
+/// asks it about pull requests.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct GhConfig {
+    /// The tool's own name, or a native path that runs as written.
+    pub path: String,
+    /// A path that runs as written inside every WSL distro, or `None` to
+    /// find the tool by name there.
+    pub wsl_path: Option<String>,
+    /// Paint PR-status badges on worktree rows and poll `gh` for expanded
+    /// projects' worktrees. Best-effort like the diff-base lookup: no `gh`,
+    /// no auth, or no PR paints nothing.
+    pub pr_status: bool,
+    /// Max `gh` lookups in flight at once. Unset lets the pool decide, which
+    /// is one below its own background ceiling so a lookup can never take the
+    /// last slot local work needs. A value lowers that; nothing raises it,
+    /// because the pool's ceiling binds underneath either way.
+    pub pr_status_concurrency: Option<usize>,
+}
+
 /// What opening a herdr agent row attaches to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
@@ -616,15 +635,17 @@ pub enum FollowFocus {
 }
 
 /// `[integrations.herdr]`: whether alacritree lists agents running under a
-/// herdr server in the sidebar, and what opening one attaches to.  On by
-/// default; a probe with no herdr binary or server present costs nothing, so
-/// an unmodified config pays no price for it.
+/// herdr server in the sidebar, what opening one attaches to, and the glyph
+/// that marks them. A probe with no herdr binary or server present costs
+/// nothing.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct HerdrConfig {
     /// The native herdr binary, as `[integrations.herdr] path` names it.
     pub path: String,
     /// The herdr binary inside WSL, or `None` to find it by name there.
     pub wsl_path: Option<String>,
+    /// The glyph on a herdr pane's sidebar row and palette entry.
+    pub icon: IconStyle,
     /// Discover herdr servers and list their agents in the sidebar.
     pub enabled: bool,
     /// How often a reachable herdr server is re-polled for agent state.
@@ -644,7 +665,7 @@ pub struct HerdrConfig {
 
 impl Default for HerdrConfig {
     fn default() -> Self {
-        RawHerdr::default().resolve()
+        RawHerdr::default().resolve(None)
     }
 }
 
@@ -1016,7 +1037,6 @@ pub struct Icons<C = Rgb> {
     pub worktree_main: IconStyle<C>,
     pub worktree: IconStyle<C>,
     pub session: IconStyle<C>,
-    pub herdr: IconStyle<C>,
     pub home: IconStyle<C>,
     pub project_expanded: IconStyle<C>,
     pub project_collapsed: IconStyle<C>,
@@ -1045,7 +1065,6 @@ impl<C: Copy> Icons<C> {
             worktree_main: self.worktree_main.map_color(f),
             worktree: self.worktree.map_color(f),
             session: self.session.map_color(f),
-            herdr: self.herdr.map_color(f),
             home: self.home.map_color(f),
             project_expanded: self.project_expanded.map_color(f),
             project_collapsed: self.project_collapsed.map_color(f),
@@ -1317,11 +1336,6 @@ pub struct UiTheme {
     /// ([`Decorations`]).  Only the GPU grid reads these; the mesh path draws
     /// a straight rule at a fixed offset either way.
     pub decorations: Decorations,
-    /// Paint PR-status badges on worktree rows (and poll `gh` for expanded
-    /// projects' worktrees).  Off by default so an unmodified config spawns
-    /// no `gh` processes; when enabled it is best-effort like the diff-base
-    /// lookup: no `gh`, no auth, or no PR silently paints nothing.
-    pub pr_status: bool,
     /// Paint a badge showing each worktree branch's upstream state.  Off by
     /// default so an unmodified config does no extra ref work.  The state comes
     /// from local refs only — nothing fetches, so a branch deleted on the remote
@@ -1333,12 +1347,6 @@ pub struct UiTheme {
     /// default; the escape hatch exists because the probe is a `stat` per
     /// listed row and an exotic filesystem could make that expensive.
     pub worktree_liveness: bool,
-    /// `[ui] pr_status_concurrency`: max `gh` lookups in flight at once.
-    /// Unset lets the pool decide, which is one below its own background
-    /// ceiling so a lookup can never take the last slot local work needs.
-    /// A value lowers that; nothing raises it, because the pool's ceiling
-    /// binds underneath either way.
-    pub pr_status_concurrency: Option<usize>,
     pub icons: Icons,
     pub focus_outline: FocusOutline,
     /// `[ui] scrollbar`: sidebar scrollbar style, "floating" (default) or
@@ -1417,10 +1425,8 @@ impl Default for UiTheme {
             session_reorder: SessionReorder::default(),
             gpu_grid: false,
             decorations: Decorations::default(),
-            pr_status: false,
             upstream_status: false,
             worktree_liveness: true,
-            pr_status_concurrency: None,
             icons: Icons::default(),
             focus_outline: FocusOutline::default(),
             scrollbar: ScrollbarStyle::Floating,
@@ -2455,8 +2461,10 @@ struct RawIcons {
     worktree: RawIconStyle,
     /// A terminal session row.
     session: RawIconStyle,
-    /// A pane owned by a terminal workspace manager such as herdr.
-    herdr: RawIconStyle,
+    /// Deprecated. This value applies only while `[integrations.herdr] icon`
+    /// is omitted. Remove it after migration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    herdr: Option<RawIconStyle>,
     /// The home tab, whose sessions inherit the launch directory.
     home: RawIconStyle,
     /// An expanded project.
@@ -2509,7 +2517,7 @@ impl Default for RawIcons {
             worktree_main: raw_glyph(DEFAULT_WORKTREE_MAIN_ICON),
             worktree: raw_glyph(DEFAULT_WORKTREE_ICON),
             session: raw_glyph(DEFAULT_SESSION_ICON),
-            herdr: raw_glyph(DEFAULT_HERDR_ICON),
+            herdr: None,
             home: raw_glyph(DEFAULT_HOME_ICON),
             project_expanded: raw_glyph(DEFAULT_PROJECT_EXPANDED_ICON),
             project_collapsed: raw_glyph(DEFAULT_PROJECT_COLLAPSED_ICON),
@@ -2539,7 +2547,6 @@ fn build_icons(raw: RawIcons) -> Icons {
         worktree_main: raw.worktree_main.into(),
         worktree: raw.worktree.into(),
         session: raw.session.into(),
-        herdr: raw.herdr.into(),
         home: raw.home.into(),
         project_expanded: raw.project_expanded.into(),
         project_collapsed: raw.project_collapsed.into(),
@@ -2828,7 +2835,63 @@ macro_rules! raw_tool_table {
 }
 
 raw_tool_table!(RawGit, "git");
-raw_tool_table!(RawGh, "gh");
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(default)]
+struct RawGh {
+    /// The program to run on Windows or natively. Its own name is looked up
+    /// on PATH; any other value runs as written.
+    path: String,
+    /// The program to run inside every WSL distro, as written. Empty finds it
+    /// by name through the distro's login shell.
+    wsl_path: String,
+    /// Poll `gh` for each branch's open pull request, which drives the PR row
+    /// icons, the PR-state filters, and `$pr` in row templates.
+    #[schemars(default = "default_pr_status")]
+    pr_status: Option<bool>,
+    /// Max `gh` lookups in flight at once. Unset lets the pool decide, which
+    /// is one below its own background ceiling so a lookup can never take
+    /// the last slot local work needs. A value lowers that; nothing raises
+    /// it, because the pool's ceiling binds underneath either way.
+    pr_status_concurrency: Option<usize>,
+}
+
+impl Default for RawGh {
+    fn default() -> Self {
+        Self {
+            path: "gh".to_string(),
+            wsl_path: String::new(),
+            pr_status: None,
+            pr_status_concurrency: None,
+        }
+    }
+}
+
+fn default_pr_status() -> bool {
+    false
+}
+
+impl RawGh {
+    fn resolve(self, moved: &MovedUiKeys) -> GhConfig {
+        let tool = tool_config(self.path, self.wsl_path, Tool::Gh);
+        GhConfig {
+            path: tool.path,
+            wsl_path: tool.wsl_path,
+            pr_status: moved_key(
+                self.pr_status,
+                moved.pr_status,
+                "[ui] pr_status",
+                "[integrations.gh] pr_status",
+            )
+            .unwrap_or_else(default_pr_status),
+            pr_status_concurrency: moved_key(
+                self.pr_status_concurrency,
+                moved.pr_status_concurrency,
+                "[ui] pr_status_concurrency",
+                "[integrations.gh] pr_status_concurrency",
+            ),
+        }
+    }
+}
 raw_tool_table!(RawDoppler, "doppler");
 raw_tool_table!(RawDelta, "delta");
 raw_tool_table!(RawTuicr, "tuicr");
@@ -2945,17 +3008,37 @@ impl RawCustomDiffViewer {
 }
 
 impl RawIntegrations {
-    fn resolve(self, deprecated_delta_path: Option<String>) -> IntegrationsConfig {
+    fn resolve(self, moved: MovedUiKeys) -> IntegrationsConfig {
         IntegrationsConfig {
             git: tool_config(self.git.path, self.git.wsl_path, Tool::Git),
-            gh: tool_config(self.gh.path, self.gh.wsl_path, Tool::Gh),
+            gh: self.gh.resolve(&moved),
             doppler: tool_config(self.doppler.path, self.doppler.wsl_path, Tool::Doppler),
-            herdr: self.herdr.resolve(),
-            delta: delta_config(self.delta.path, self.delta.wsl_path, deprecated_delta_path),
+            herdr: self.herdr.resolve(moved.herdr_icon),
+            delta: delta_config(self.delta.path, self.delta.wsl_path, moved.delta_path),
             tuicr: tool_config(self.tuicr.path, self.tuicr.wsl_path, Tool::Tuicr),
             diff_viewer: self.diff_viewer.resolve(),
         }
     }
+}
+
+/// Deprecated `[ui]` keys, taken out of the raw `[ui]` table and handed to
+/// the `[integrations]` tables that own them.
+#[derive(Default)]
+struct MovedUiKeys {
+    delta_path: Option<String>,
+    pr_status: Option<bool>,
+    pr_status_concurrency: Option<usize>,
+    herdr_icon: Option<RawIconStyle>,
+}
+
+/// A deprecated key applies only where the file omits its replacement, so a
+/// replacement written at its default still wins. Raw config structs accept
+/// unknown keys, so dropping the old field would lose the override silently.
+fn moved_key<T>(new: Option<T>, old: Option<T>, from: &str, to: &str) -> Option<T> {
+    if old.is_some() {
+        log::warn!("{from} is deprecated; set {to}");
+    }
+    new.or(old)
 }
 
 /// A blank path means the side's default: the tool's name natively, and
@@ -2998,6 +3081,11 @@ struct RawHerdr {
     /// The program to run inside every WSL distro, as written. Empty finds it
     /// by name through the distro's login shell.
     wsl_path: String,
+    /// The glyph on a herdr pane's sidebar row and palette entry. A bare
+    /// string sets the glyph; a table also styles its color, weight, slant
+    /// and size, the way `[ui.icons]` keys do.
+    #[schemars(default = "default_herdr_icon")]
+    icon: Option<RawIconStyle>,
     /// Discover herdr servers and list their agents in the sidebar.  Inert
     /// when no herdr binary or server is present.
     enabled: bool,
@@ -3044,6 +3132,7 @@ impl Default for RawHerdr {
         Self {
             path: "herdr".to_string(),
             wsl_path: String::new(),
+            icon: None,
             enabled: true,
             poll_interval_ms: 2000,
             show_unmatched: true,
@@ -3054,12 +3143,19 @@ impl Default for RawHerdr {
     }
 }
 
+fn default_herdr_icon() -> RawIconStyle {
+    raw_glyph(DEFAULT_HERDR_ICON)
+}
+
 impl RawHerdr {
-    fn resolve(self) -> HerdrConfig {
+    fn resolve(self, old_icon: Option<RawIconStyle>) -> HerdrConfig {
         let tool = tool_config(self.path, self.wsl_path, Tool::Herdr);
         HerdrConfig {
             path: tool.path,
             wsl_path: tool.wsl_path,
+            icon: moved_key(self.icon, old_icon, "[ui.icons] herdr", "[integrations.herdr] icon")
+                .unwrap_or_else(default_herdr_icon)
+                .into(),
             enabled: self.enabled,
             poll_interval: Duration::from_millis(self.poll_interval_ms),
             show_unmatched: self.show_unmatched,
@@ -3151,8 +3247,8 @@ struct RawUi {
     /// Whether session rows can be dragged, and how far a reorder may carry
     /// a session.
     session_reorder: RawSessionReorder,
-    /// Deprecated location: `[integrations.delta] path` and `wsl_path`
-    /// supersede this, and each wins on its own side once set.
+    /// Deprecated. This value applies on each side while `[integrations.delta]`
+    /// `path` or `wsl_path` has its built-in value. Remove it after migration.
     delta_path: Option<String>,
     /// Sidebar glyph overrides.
     icons: RawIcons,
@@ -3168,9 +3264,9 @@ struct RawUi {
     /// Corrections to the underline and strikeout the font placed
     /// ([`RawDecorations`]).
     decorations: RawDecorations,
-    /// Poll `gh` for each branch's open pull request, which drives the PR row
-    /// icons, the PR-state filters, and `$pr` in row templates.
-    pr_status: bool,
+    /// Deprecated. This value applies only while `[integrations.gh] pr_status`
+    /// is omitted. Remove it after migration.
+    pr_status: Option<bool>,
     /// Paint a badge on each worktree row for its branch's upstream state.
     /// Local refs only: nothing fetches, so a branch deleted on the remote
     /// reads as tracked until something prunes locally.
@@ -3181,10 +3277,8 @@ struct RawUi {
     /// probe is one `stat` per listed row, which an exotic filesystem could
     /// make expensive.
     worktree_liveness: bool,
-    /// Max `gh` lookups in flight at once.  Unset lets the pool decide, which
-    /// is one below its own background ceiling so a lookup can never take
-    /// the last slot local work needs.  A value lowers that; nothing raises
-    /// it, because the pool's ceiling binds underneath either way.
+    /// Deprecated. This value applies only while `[integrations.gh]`
+    /// `pr_status_concurrency` is omitted. Remove it after migration.
     pr_status_concurrency: Option<usize>,
     /// The font sidebars, tabs and dialogs are drawn with.
     font: RawUiFont,
@@ -3252,7 +3346,7 @@ impl Default for RawUi {
             scrollbar: "floating".to_string(),
             gpu_grid: false,
             decorations: RawDecorations::default(),
-            pr_status: false,
+            pr_status: None,
             upstream_status: false,
             worktree_liveness: true,
             pr_status_concurrency: None,
@@ -3426,7 +3520,13 @@ fn parse_config_path(raw: &str, key: &str) -> Option<PathBuf> {
 }
 
 impl RawConfig {
-    fn into_config(self) -> Config {
+    fn into_config(mut self) -> Config {
+        let moved = MovedUiKeys {
+            delta_path: self.ui.delta_path.take(),
+            pr_status: self.ui.pr_status,
+            pr_status_concurrency: self.ui.pr_status_concurrency,
+            herdr_icon: self.ui.icons.herdr.take(),
+        };
         let config = Config::default();
         let mut palette = config.palette;
         let c = self.colors;
@@ -3523,10 +3623,8 @@ impl RawConfig {
                     &self.ui.decorations.strikeout_thickness,
                 ),
             },
-            pr_status: self.ui.pr_status,
             upstream_status: self.ui.upstream_status,
             worktree_liveness: self.ui.worktree_liveness,
-            pr_status_concurrency: self.ui.pr_status_concurrency,
             icons: build_icons(self.ui.icons),
             focus_outline: FocusOutline {
                 sidebar: self.ui.focus_outline.sidebar,
@@ -3697,7 +3795,7 @@ impl RawConfig {
             wsl_resident_helper,
             profiles,
             default_profile,
-            integrations: self.integrations.resolve(self.ui.delta_path),
+            integrations: self.integrations.resolve(moved),
         }
     }
 }
@@ -4010,7 +4108,46 @@ show_panes = true
 
     #[test]
     fn the_herdr_defaults_live_in_the_raw_layer() {
-        assert_eq!(HerdrConfig::default(), RawHerdr::default().resolve());
+        assert_eq!(HerdrConfig::default(), RawHerdr::default().resolve(None));
+    }
+
+    #[test]
+    fn the_herdr_icon_reads_from_integrations_herdr_in_either_form() {
+        let stock = config_from("");
+        assert_eq!(stock.integrations.herdr.icon.or_glyph(""), DEFAULT_HERDR_ICON.as_str());
+
+        let bare = config_from("[integrations.herdr]\nicon = \"✦\"\n");
+        assert_eq!(bare.integrations.herdr.icon.or_glyph(""), "✦");
+
+        let styled =
+            config_from("[integrations.herdr]\nicon = { glyph = \"✦\", bold = true, size = 8 }\n");
+        assert_eq!(styled.integrations.herdr.icon, IconStyle {
+            glyph: Some("✦".into()),
+            bold: true,
+            size: Some(8.0),
+            ..Default::default()
+        });
+    }
+
+    /// A table under the old key keeps its styling, and a written new key wins
+    /// even when it spells the built-in glyph.
+    #[test]
+    fn the_deprecated_ui_icons_herdr_applies_until_integrations_herdr_sets_icon() {
+        let old = config_from("[ui.icons]\nherdr = { glyph = \"✦\", bold = true }\n");
+        assert_eq!(old.integrations.herdr.icon, IconStyle {
+            glyph: Some("✦".into()),
+            bold: true,
+            ..Default::default()
+        });
+
+        let both = config_from("[ui.icons]\nherdr = \"✦\"\n[integrations.herdr]\nicon = \"◆\"\n");
+        assert_eq!(both.integrations.herdr.icon.or_glyph(""), "◆");
+
+        let built_in = config_from(&format!(
+            "[ui.icons]\nherdr = \"✦\"\n[integrations.herdr]\nicon = \"{}\"\n",
+            DEFAULT_HERDR_ICON.as_str()
+        ));
+        assert_eq!(built_in.integrations.herdr.icon, HerdrConfig::default().icon);
     }
 
     /// A raw struct that gained a `Default` but lost its `serde(default)`
@@ -5103,9 +5240,14 @@ program = "second"
     }
 
     #[test]
-    fn pr_status_defaults_off_and_parses_on() {
-        assert!(!ui_from_toml("").pr_status);
-        assert!(ui_from_toml("[ui]\npr_status = true").pr_status);
+    fn pr_status_reads_from_integrations_gh() {
+        let stock = config_from("");
+        assert!(!stock.integrations.gh.pr_status);
+        assert_eq!(stock.integrations.gh.pr_status_concurrency, None);
+
+        let set = config_from("[integrations.gh]\npr_status = true\npr_status_concurrency = 4\n");
+        assert!(set.integrations.gh.pr_status);
+        assert_eq!(set.integrations.gh.pr_status_concurrency, Some(4));
     }
 
     #[test]
@@ -5114,10 +5256,35 @@ program = "second"
         assert!(ui_from_toml("[ui]\nupstream_status = true").upstream_status);
     }
 
+    /// The old `[ui]` keys keep working, and each written new key wins, even
+    /// at its default value. `pr_status_concurrency` has no value to write at
+    /// its default, since its default is unset.
     #[test]
-    fn pr_status_concurrency_is_unset_by_default() {
-        assert_eq!(ui_from_toml("").pr_status_concurrency, None);
-        assert_eq!(ui_from_toml("[ui]\npr_status_concurrency = 4").pr_status_concurrency, Some(4));
+    fn the_deprecated_ui_pr_status_keys_apply_until_integrations_gh_sets_them() {
+        let old = config_from("[ui]\npr_status = true\npr_status_concurrency = 3\n");
+        assert!(old.integrations.gh.pr_status);
+        assert_eq!(old.integrations.gh.pr_status_concurrency, Some(3));
+
+        let both = config_from(
+            "[ui]\npr_status = false\npr_status_concurrency = 3\n[integrations.gh]\npr_status = \
+             true\npr_status_concurrency = 5\n",
+        );
+        assert!(both.integrations.gh.pr_status);
+        assert_eq!(both.integrations.gh.pr_status_concurrency, Some(5));
+
+        let at_default =
+            config_from("[ui]\npr_status = true\n[integrations.gh]\npr_status = false\n");
+        assert!(!at_default.integrations.gh.pr_status);
+    }
+
+    /// The startup log reports a setting under the table the file now uses,
+    /// even when the file still spells it the old way.
+    #[test]
+    fn a_moved_key_is_dumped_under_its_new_table() {
+        let json = changed("[ui]\npr_status = true\n");
+
+        assert_eq!(json["integrations"]["gh"]["pr_status"], serde_json::json!(true));
+        assert!(json.get("ui").is_none(), "{json}");
     }
 
     #[test]

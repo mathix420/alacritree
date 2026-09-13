@@ -106,8 +106,10 @@ const STARTER: &str = r##"
 
 # [ui]
 # sidebar_accent = "#6a9fb5"
-# pr_status = true          # poll `gh` for each branch's open pull request
 # upstream_status = true    # badge each worktree with its branch's upstream state
+
+# [integrations.gh]
+# pr_status = true          # poll `gh` for each branch's open pull request
 
 # Where `new worktree` puts a checkout.  $project is the repository's
 # directory name.
@@ -206,9 +208,9 @@ mod tests {
     #[test]
     fn doc_comments_reach_the_schema_as_hover_text() {
         let schema = parsed();
-        let ui = &schema["$defs"]["RawUi"]["properties"];
+        let gh = &schema["$defs"]["RawGh"]["properties"];
         assert!(
-            ui["pr_status"]["description"].as_str().unwrap().contains("gh"),
+            gh["pr_status"]["description"].as_str().unwrap().contains("pull request"),
             "descriptions are the only documentation an editor shows"
         );
     }
@@ -228,7 +230,7 @@ mod tests {
         // config file can hold.  A key that resolves to a fixed value
         // publishes that value instead.
         let schema = parsed();
-        let pr_status = &schema["$defs"]["RawUi"]["properties"]["pr_status"];
+        let pr_status = &schema["$defs"]["RawGh"]["properties"]["pr_status"];
         assert_eq!(pr_status["type"], "boolean");
         assert_eq!(pr_status["default"], serde_json::json!(false));
     }
@@ -301,7 +303,7 @@ mod tests {
     fn init_leaves_a_config_that_already_names_a_schema_alone() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("alacritree.toml");
-        let body = "#:schema ./elsewhere.json\n[ui]\npr_status = true\n";
+        let body = "#:schema ./elsewhere.json\n[ui]\nupstream_status = true\n";
         std::fs::write(&path, body).unwrap();
 
         init(&path).unwrap();
@@ -326,12 +328,12 @@ mod tests {
     fn init_keeps_the_settings_a_config_already_had() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("alacritree.toml");
-        std::fs::write(&path, "[ui]\npr_status = true\n").unwrap();
+        std::fs::write(&path, "[ui]\nupstream_status = true\n").unwrap();
 
         init(&path).unwrap();
 
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.starts_with(&directive()));
-        assert!(body.contains("pr_status = true"));
+        assert!(body.contains("upstream_status = true"));
     }
 }

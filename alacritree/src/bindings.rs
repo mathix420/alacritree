@@ -595,16 +595,16 @@ impl NamedAction {
                 "Filter the sidebar to workspaces wanting attention".into()
             },
             Self::TogglePrOpenFilter(_) => {
-                "Filter to worktrees with an open PR (requires [ui] pr_status)".into()
+                "Filter to worktrees with an open PR (requires [integrations.gh] pr_status)".into()
             },
             Self::TogglePrDraftFilter(_) => {
-                "Filter to worktrees with a draft PR (requires [ui] pr_status)".into()
+                "Filter to worktrees with a draft PR (requires [integrations.gh] pr_status)".into()
             },
             Self::TogglePrMergedFilter(_) => {
-                "Filter to worktrees with a merged PR (requires [ui] pr_status)".into()
+                "Filter to worktrees with a merged PR (requires [integrations.gh] pr_status)".into()
             },
             Self::TogglePrClosedFilter(_) => {
-                "Filter to worktrees with a closed PR (requires [ui] pr_status)".into()
+                "Filter to worktrees with a closed PR (requires [integrations.gh] pr_status)".into()
             },
             Self::ClearProjectFilters(_) => "Clear every projects-sidebar toggle".into(),
             Self::ToggleModifiedFilter(_) => {

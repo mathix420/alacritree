@@ -152,7 +152,7 @@ impl AlacritreeApp {
     /// ranking, and always current as sessions and worktrees come and go.
     pub(super) fn palette_items(&self) -> Vec<PaletteItem> {
         let mut items = command_palette::action_items(&self.shortcuts);
-        let herdr_glyph = self.config.ui.icons.herdr.or_glyph(DEFAULT_HERDR_ICON.as_str());
+        let herdr_glyph = self.config.integrations.herdr.icon.or_glyph(DEFAULT_HERDR_ICON.as_str());
         for (i, profile) in self.config.profiles.iter().enumerate() {
             let index = i + 1;
             // SpawnProfile only binds indices 1..=9; past that there is no

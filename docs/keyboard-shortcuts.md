@@ -316,8 +316,8 @@ survive:
   wants attention.
 - `TogglePrOpenFilter` / `TogglePrDraftFilter` / `TogglePrMergedFilter` /
   `TogglePrClosedFilter` (no default key) — narrow to worktrees with an open,
-  draft, merged, or closed PR. These four exist only when `[ui] pr_status =
-  true` (default `false`); a query against `gh` runs per worktree, so
+  draft, merged, or closed PR. These four exist only when `[integrations.gh]
+  pr_status = true`; a query against `gh` runs per worktree, so
   filtered rows fill in as each answer arrives rather than appearing all at
   once.
 - `ClearProjectFilters` (no default key) — drop every projects-sidebar

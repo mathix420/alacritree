@@ -452,7 +452,7 @@ impl AlacritreeApp {
         ctx: &Context,
         listed: &sidebar_nav::ListedRows,
     ) -> Vec<ProjectView> {
-        let pr_enabled = self.config.ui.pr_status;
+        let pr_enabled = self.config.integrations.gh.pr_status;
         let any_pr_toggle =
             any_pr_toggle_active(&self.sidebar.filter, self.sidebar_focus_state.search_scope);
         let current_workspace = self.current_workspace.as_deref();
@@ -664,7 +664,31 @@ struct SidebarView {
 #[derive(Clone, Copy)]
 struct SidebarPaint<'a> {
     view: &'a SidebarView,
-    icons: &'a Icons<Color32>,
+    icons: &'a PaintedIcons,
+}
+
+/// `[ui.icons]` and the `[integrations.herdr]` glyph, with colors converted
+/// for painting.
+pub(super) struct PaintedIcons {
+    ui: Icons<Color32>,
+    pub(super) herdr: IconStyle<Color32>,
+}
+
+impl PaintedIcons {
+    pub(super) fn new(config: &Config) -> Self {
+        Self {
+            ui: config.ui.icons.map_colors(rgb_to_color32),
+            herdr: config.integrations.herdr.icon.map_color(rgb_to_color32),
+        }
+    }
+}
+
+impl std::ops::Deref for PaintedIcons {
+    type Target = Icons<Color32>;
+
+    fn deref(&self) -> &Icons<Color32> {
+        &self.ui
+    }
 }
 
 impl SidebarView {
@@ -1752,7 +1776,7 @@ pub(super) fn session_row(
     is_cursor: bool,
     scroll_into_view: bool,
     draggable: bool,
-    icons: &Icons<Color32>,
+    icons: &PaintedIcons,
     theme: &Theme,
 ) -> SessionRowAction {
     // Reserve a slot *before* the labels so the hover bg paints beneath them.
@@ -1909,7 +1933,7 @@ fn row_name_text(
 /// hang the hint on it.
 fn paint_managed_mark(
     ui: &mut egui::Ui,
-    icons: &Icons<Color32>,
+    icons: &PaintedIcons,
     theme: &Theme,
     color: Color32,
 ) -> egui::Rect {
@@ -1932,7 +1956,7 @@ fn herdr_row(
     row: &HerdrRowData,
     is_cursor: bool,
     scroll_into_view: bool,
-    icons: &Icons<Color32>,
+    icons: &PaintedIcons,
     theme: &Theme,
 ) -> HerdrRowAction {
     // Reserve a slot *before* the label so the hover bg paints beneath it.

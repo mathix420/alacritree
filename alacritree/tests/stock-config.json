@@ -69,6 +69,8 @@
     },
     "gh": {
       "path": "gh",
+      "pr_status": false,
+      "pr_status_concurrency": null,
       "wsl_path": null
     },
     "git": {
@@ -79,6 +81,13 @@
       "attach": "Agent",
       "enabled": true,
       "follow_focus": "Herdr",
+      "icon": {
+        "bold": false,
+        "color": null,
+        "glyph": "◫",
+        "italic": false,
+        "size": null
+      },
       "path": "herdr",
       "poll_interval": {
         "nanos": 0,
@@ -275,13 +284,6 @@
         "italic": false,
         "size": null
       },
-      "herdr": {
-        "bold": false,
-        "color": null,
-        "glyph": "◫",
-        "italic": false,
-        "size": null
-      },
       "home": {
         "bold": false,
         "color": null,
@@ -446,8 +448,6 @@
         "italic": false
       }
     },
-    "pr_status": false,
-    "pr_status_concurrency": null,
     "project_name": null,
     "reap_descendants_on_close": false,
     "scrollbar": "Floating",

@@ -68,8 +68,8 @@ use herdr_glue::{
 };
 use modals::{BaseBranchPicker, CreateState, DeleteRequest, ProjectRemoveState, RenameState};
 use sidebar::{
-    HerdrRowData, SessionRowData, WorkspaceRowData, any_pr_toggle_active, project_filter_toggles,
-    session_row_name,
+    HerdrRowData, PaintedIcons, SessionRowData, WorkspaceRowData, any_pr_toggle_active,
+    project_filter_toggles, session_row_name,
 };
 use widgets::{
     ATTENTION_HINT, ICON_CLUSTER_SPACING, IconHints, ROW_STATUS_ICON_W, RowStatus, SessionMark,
@@ -382,8 +382,7 @@ pub struct AlacritreeApp {
     row_labels: crate::row_label::LabelTemplates,
     config: Config,
     theme: Theme,
-    /// `config.ui.icons` with its colors converted for painting.
-    icons: Icons<Color32>,
+    icons: PaintedIcons,
     /// `config.bindings` with its keys converted for matching.
     shortcuts: crate::shortcut::Shortcuts,
     modals: modals::Modals,
@@ -482,7 +481,7 @@ impl AlacritreeApp {
             session_drag: config.ui.session_reorder.drag,
             sessions_filter_counts_detached: config.ui.sessions_filter_counts_detached,
             sidebar: sidebar::Sidebar::new(PanelFilter::new(project_filter_toggles(
-                config.ui.pr_status,
+                config.integrations.gh.pr_status,
             ))),
             sidebar_auto_shown: false,
             last_followed: (None, None),
@@ -502,7 +501,7 @@ impl AlacritreeApp {
             projects,
             pr_cache: PrCache::new(),
             row_labels,
-            icons: config.ui.icons.map_colors(rgb_to_color32),
+            icons: PaintedIcons::new(&config),
             shortcuts: crate::shortcut::Shortcuts::new(&config.bindings),
             config,
             theme,
@@ -645,7 +644,7 @@ impl AlacritreeApp {
 
         let notify_rx = notify::channel();
 
-        let pr_status_concurrency = config.ui.pr_status_concurrency;
+        let pr_status_concurrency = config.integrations.gh.pr_status_concurrency;
         let mut app = Self::from_parts(
             config,
             theme,
@@ -4679,7 +4678,7 @@ mod tests {
         let mut app = herdr_lifecycle_app();
         app.config.ui.path_style.git_rows = PathStyle::Fish;
         app.config.integrations.herdr.show_panes = false;
-        app.config.ui.icons.herdr.glyph = Some("✦".into());
+        app.config.integrations.herdr.icon.glyph = Some("✦".into());
         let side = herdr::Side::Native;
         adopt_herdr_fixture(
             &mut app,
@@ -4740,7 +4739,7 @@ mod tests {
             let mut app = herdr_lifecycle_app();
             app.config.ui.path_style.git_rows = PathStyle::Fish;
             app.config.integrations.herdr.show_panes = false;
-            app.config.ui.icons.herdr.glyph = Some("✦".into());
+            app.config.integrations.herdr.icon.glyph = Some("✦".into());
             let side = herdr::Side::Wsl("fixture-distro".into());
             adopt_herdr_fixture(
                 &mut app,
@@ -4803,7 +4802,7 @@ mod tests {
         let mut app = herdr_lifecycle_app();
         app.config.ui.path_style.git_rows = PathStyle::Fish;
         app.config.integrations.herdr.show_panes = false;
-        app.config.ui.icons.herdr.glyph = Some("✦".into());
+        app.config.integrations.herdr.icon.glyph = Some("✦".into());
         app.herdr.endpoints.caches_mut_for_test()[0].complete_listing_for_test(
             Ok(r#"{"result":{"agents":[{"terminal_id":"term-kept","pane_id":"w1:p1","agent":"claude","agent_status":"working","terminal_title_stripped":"review work","cwd":"/private/project","focused":true}]}}"#),
             herdr::Listing::Agents,
@@ -4868,7 +4867,7 @@ mod tests {
     #[test]
     fn attached_herdr_palette_without_metadata_uses_the_binding() {
         let mut app = herdr_lifecycle_app();
-        app.config.ui.icons.herdr.glyph = Some("✦".into());
+        app.config.integrations.herdr.icon.glyph = Some("✦".into());
         let id = bind_herdr_fixture(&mut app, herdr::Side::Native, "term-unseen");
         let items = app.palette_items();
         let row = items
@@ -6272,7 +6271,7 @@ mod tests {
         project.label = Some("renamed".into());
         project.worktrees[1].name = "feature".into();
         app.projects.push(project);
-        app.config.ui.icons.herdr.glyph = Some("✦".into());
+        app.config.integrations.herdr.icon.glyph = Some("✦".into());
         let side = herdr::Side::Native;
         adopt_herdr_fixture(
             &mut app,
@@ -6293,7 +6292,7 @@ mod tests {
             ("claude", Some("✦ renamed / feature"))
         );
 
-        app.config.ui.icons.herdr.glyph = Some("  ".into());
+        app.config.integrations.herdr.icon.glyph = Some("  ".into());
         let items = app.palette_items();
         let item =
             items.iter().find(|item| item.action == PaletteAction::ActivateSession(id)).unwrap();
@@ -7293,7 +7292,7 @@ mod tests {
     /// buttons need the same recovery as the worktree row's.
     #[test]
     fn icon_tooltips_reach_the_session_and_home_row_buttons() {
-        let icons = crate::config::Icons::default().map_colors(rgb_to_color32);
+        let icons = PaintedIcons::new(&Config::default());
         for (icon_tooltips, want) in [(true, true), (false, false)] {
             let mut config = Config::default();
             config.ui.icon_tooltips = icon_tooltips;
@@ -7394,7 +7393,7 @@ mod tests {
     #[test]
     fn icon_tooltips_gate_the_status_slot_hint() {
         const WIDTH: f32 = 220.0;
-        let icons = crate::config::Icons::default().map_colors(rgb_to_color32);
+        let icons = PaintedIcons::new(&Config::default());
         let session = |attention, activity| SessionRowData {
             id: 1,
             name: RowName::plain("zsh".to_owned()),
@@ -7619,7 +7618,7 @@ mod tests {
     #[test]
     fn hovering_an_elided_session_row_reveals_the_full_title() {
         let theme = Theme::from_config(&Config::default());
-        let icons = crate::config::Icons::default().map_colors(rgb_to_color32);
+        let icons = PaintedIcons::new(&Config::default());
         let row = SessionRowData {
             id: 1,
             name: RowName::plain("cargo test --workspace --all-features -- --nocapture".to_owned()),

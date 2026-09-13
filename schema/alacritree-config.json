@@ -674,12 +674,23 @@
       "properties": {
         "path": {
           "default": "gh",
-          "description": "The program to run on Windows or natively. Its own name is\nlooked up on PATH; any other value runs as written.",
+          "description": "The program to run on Windows or natively. Its own name is looked up\non PATH; any other value runs as written.",
           "type": "string"
+        },
+        "pr_status": {
+          "default": false,
+          "description": "Poll `gh` for each branch's open pull request, which drives the PR row\nicons, the PR-state filters, and `$pr` in row templates.",
+          "type": "boolean"
+        },
+        "pr_status_concurrency": {
+          "description": "Max `gh` lookups in flight at once. Unset lets the pool decide, which\nis one below its own background ceiling so a lookup can never take\nthe last slot local work needs. A value lowers that; nothing raises\nit, because the pool's ceiling binds underneath either way.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         },
         "wsl_path": {
           "default": "",
-          "description": "The program to run inside every WSL distro, as written. Empty\nfinds it by name through the distro's login shell.",
+          "description": "The program to run inside every WSL distro, as written. Empty finds it\nby name through the distro's login shell.",
           "type": "string"
         }
       },
@@ -725,6 +736,15 @@
             "always"
           ],
           "type": "string"
+        },
+        "icon": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "default": "◫",
+          "description": "The glyph on a herdr pane's sidebar row and palette entry. A bare\nstring sets the glyph; a table also styles its color, weight, slant\nand size, the way `[ui.icons]` keys do."
         },
         "path": {
           "default": "herdr",
@@ -817,9 +837,12 @@
           "description": "The \"delete worktree\" button."
         },
         "herdr": {
-          "$ref": "#/$defs/RawIconStyle",
-          "default": "◫",
-          "description": "A pane owned by a terminal workspace manager such as herdr."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "Deprecated. This value applies only while `[integrations.herdr] icon`\nis omitted. Remove it after migration."
         },
         "home": {
           "$ref": "#/$defs/RawIconStyle",
@@ -1446,7 +1469,7 @@
           "type": "string"
         },
         "delta_path": {
-          "description": "Deprecated location: `[integrations.delta] path` and `wsl_path`\nsupersede this, and each wins on its own side once set.",
+          "description": "Deprecated. This value applies on each side while `[integrations.delta]`\n`path` or `wsl_path` has its built-in value. Remove it after migration.",
           "type": "string"
         },
         "drop": {
@@ -1492,7 +1515,6 @@
             "add_project": "+",
             "close_session": "×",
             "delete_worktree": "×",
-            "herdr": "◫",
             "home": "⌂",
             "new_session": "+",
             "new_worktree": "+",
@@ -1541,12 +1563,11 @@
           "description": "How paths are abbreviated where the UI writes them."
         },
         "pr_status": {
-          "default": false,
-          "description": "Poll `gh` for each branch's open pull request, which drives the PR row\nicons, the PR-state filters, and `$pr` in row templates.",
+          "description": "Deprecated. This value applies only while `[integrations.gh] pr_status`\nis omitted. Remove it after migration.",
           "type": "boolean"
         },
         "pr_status_concurrency": {
-          "description": "Max `gh` lookups in flight at once.  Unset lets the pool decide, which\nis one below its own background ceiling so a lookup can never take\nthe last slot local work needs.  A value lowers that; nothing raises\nit, because the pool's ceiling binds underneath either way.",
+          "description": "Deprecated. This value applies only while `[integrations.gh]`\n`pr_status_concurrency` is omitted. Remove it after migration.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
