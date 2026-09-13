@@ -331,28 +331,30 @@ impl AlacritreeApp {
     }
 }
 
-impl AlacritreeApp {
-    pub(super) fn dispatch_search_action(&mut self, action: NamedAction) -> bool {
-        match action {
-            NamedAction::SidebarSearchConfirm => {
-                self.sidebar_search_confirm();
-            },
-            NamedAction::SidebarSearchCancel => {
-                self.sidebar_search_cancel();
-            },
-            NamedAction::SidebarSearchCancelToTerminal => {
-                self.sidebar_search_cancel_to_terminal();
-            },
-            NamedAction::ToggleSearchScope => {
-                self.sidebar_focus_state.search_scope = match self.sidebar_focus_state.search_scope
-                {
-                    SearchScope::Filtered => SearchScope::All,
-                    SearchScope::All => SearchScope::Filtered,
-                };
-            },
-            _ => return false,
-        }
-        true
+impl Action for action::SidebarSearchConfirm {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.sidebar_search_confirm();
+    }
+}
+
+impl Action for action::SidebarSearchCancel {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.sidebar_search_cancel();
+    }
+}
+
+impl Action for action::SidebarSearchCancelToTerminal {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.sidebar_search_cancel_to_terminal();
+    }
+}
+
+impl Action for action::ToggleSearchScope {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.sidebar_focus_state.search_scope = match app.sidebar_focus_state.search_scope {
+            SearchScope::Filtered => SearchScope::All,
+            SearchScope::All => SearchScope::Filtered,
+        };
     }
 }
 

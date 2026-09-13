@@ -1,4 +1,23 @@
+use alacritty_terminal::grid::Scroll;
+use enum_dispatch::enum_dispatch;
+
 use super::*;
+
+/// What running a keyboard action does, whether a binding, the palette or IPC
+/// asked for it.
+///
+/// `enum_dispatch` copies this signature into the impl it generates for
+/// `NamedAction`, and that impl can land in `bindings.rs`, so the signature
+/// names every type by its full path.
+#[enum_dispatch]
+pub(crate) trait Action {
+    fn run(
+        &self,
+        app: &mut crate::app::AlacritreeApp,
+        ctx: &egui::Context,
+        origin: crate::app::ActionOrigin,
+    );
+}
 
 impl AlacritreeApp {
     pub(super) fn dispatch_action(
@@ -19,7 +38,7 @@ impl AlacritreeApp {
         }
         match action {
             BindingAction::Chars(bytes) => self.dispatch_chars(ctx, bytes),
-            BindingAction::Named(action) => self.dispatch_named_action(ctx, action, origin),
+            BindingAction::Named(action) => action.run(self, ctx, origin),
             BindingAction::Unsupported(name) => {
                 log::debug!("unsupported keyboard binding action: {name}")
             },
@@ -46,143 +65,324 @@ impl AlacritreeApp {
         }
     }
 
-    fn dispatch_named_action(&mut self, ctx: &Context, action: NamedAction, origin: ActionOrigin) {
-        match action {
-            NamedAction::Paste => self.paste_from_clipboard(ctx, Target::Clipboard),
-            NamedAction::PasteSelection => self.paste_from_clipboard(ctx, Target::Primary),
-            NamedAction::Quit => self.modals.quit_dialog_open = true,
-            NamedAction::Minimize => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
-            NamedAction::SelectNextTab => self.cycle_tabs(1),
-            NamedAction::SelectPreviousTab => self.cycle_tabs(-1),
-            NamedAction::SelectNextSession => self.cycle_sessions(ctx, 1),
-            NamedAction::SelectPreviousSession => self.cycle_sessions(ctx, -1),
-            NamedAction::SelectTab(n) => self.select_tab(n),
-            NamedAction::SelectLastTab => self.select_last_tab(),
-            NamedAction::NoOp => {},
-            NamedAction::ReceiveChar => {},
-            NamedAction::ToggleSessionRows => self.session_rows_always = !self.session_rows_always,
-            NamedAction::ToggleSessionTabs => self.session_tabs_always = !self.session_tabs_always,
-            NamedAction::MoveSessionUp => self.step_session(-1),
-            NamedAction::MoveSessionDown => self.step_session(1),
-            NamedAction::ToggleSessionDrag => self.session_drag = !self.session_drag,
-            NamedAction::ToggleDetachedSessionsFilter => {
-                self.sessions_filter_counts_detached = !self.sessions_filter_counts_detached
-            },
-            NamedAction::SelectNextWorkspace => self.cycle_workspaces(ctx, 1),
-            NamedAction::SelectPreviousWorkspace => self.cycle_workspaces(ctx, -1),
-            NamedAction::OpenScratchpad => self.toggle_scratchpad_tab(ctx),
-            NamedAction::AddProject => self.add_project_via_dialog(ctx),
-            NamedAction::RefreshProjects => self.refresh_all_projects(ctx),
-            NamedAction::TogglePalette => self.palette.toggle(),
-            NamedAction::FocusTerminal => self.focus_terminal(),
-            NamedAction::FocusLeft => self.move_focus(FocusDir::Left, origin),
-            NamedAction::FocusRight => self.move_focus(FocusDir::Right, origin),
-            other => {
-                if self.dispatch_sidebar_action(ctx, other)
-                    || self.dispatch_git_action(ctx, other)
-                    || self.dispatch_herdr_action(ctx, other)
-                    || self.dispatch_search_action(other)
-                    || self.dispatch_session_action(ctx, other)
-                {
-                    return;
-                }
-                self.dispatch_filter_or_other(other);
-            },
+    /// Copy the scratchpad editor's selection when one is on screen, and the
+    /// terminal's otherwise.
+    fn copy_active_selection(&mut self, ctx: &Context, target: Target) {
+        let Some(idx) = self.active_session_index() else { return };
+        if let Some(editor) = self.sessions[idx].scratchpad.as_ref() {
+            if let Some(text) = editor.selected_text(ctx, self.sessions[idx].id) {
+                clipboard::write(target, &text);
+            }
+        } else {
+            paste::copy_selection(&self.sessions[idx], &self.config, target);
         }
-    }
-
-    fn dispatch_session_action(&mut self, ctx: &Context, action: NamedAction) -> bool {
-        match action {
-            NamedAction::Copy => {
-                if let Some(idx) = self.active_session_index() {
-                    if let Some(editor) = self.sessions[idx].scratchpad.as_ref() {
-                        if let Some(text) = editor.selected_text(ctx, self.sessions[idx].id) {
-                            clipboard::write(Target::Clipboard, &text);
-                        }
-                    } else {
-                        paste::copy_selection(&self.sessions[idx], &self.config, Target::Clipboard);
-                    }
-                }
-            },
-            NamedAction::CopySelection => {
-                if let Some(idx) = self.active_session_index() {
-                    if let Some(editor) = self.sessions[idx].scratchpad.as_ref() {
-                        if let Some(text) = editor.selected_text(ctx, self.sessions[idx].id) {
-                            clipboard::write(Target::Primary, &text);
-                        }
-                    } else {
-                        paste::copy_selection(&self.sessions[idx], &self.config, Target::Primary);
-                    }
-                }
-            },
-            NamedAction::SpawnNewInstance => {
-                let ws = self.current_workspace.clone();
-                if let Err(e) = self.spawn_session(ctx, ws.clone()) {
-                    self.report_spawn_failure(ctx, &ws, &e);
-                }
-            },
-            NamedAction::ClearHistory => {
-                use alacritty_terminal::vte::ansi::{ClearMode, Handler};
-                if let Some(idx) = self.active_session_index() {
-                    if self.sessions[idx].scratchpad.is_none() {
-                        self.sessions[idx].term.lock().clear_screen(ClearMode::Saved);
-                    }
-                }
-            },
-            NamedAction::ToggleFullscreen => {
-                let on = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!on));
-            },
-            NamedAction::ToggleMaximized => {
-                let on = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!on));
-            },
-            NamedAction::SpawnProfile(n) => {
-                match self.config.profiles.get((n - 1) as usize).map(|p| p.name.clone()) {
-                    Some(name) => self.spawn_profile_session(ctx, &name),
-                    None => {
-                        log::warn!(
-                            "SpawnProfile{n}: only {} profiles configured",
-                            self.config.profiles.len()
-                        );
-                        self.modals.error_dialog =
-                            Some(format!("SpawnProfile{n}: no such profile"));
-                    },
-                }
-            },
-            // No confirmation and no cursor: the child is already gone, so
-            // there is nothing left to interrupt and nothing to ask about.
-            NamedAction::CloseExitedSession => {
-                if let Some(idx) = self.active_session_index()
-                    && self.sessions[idx].is_exited()
-                {
-                    let id = self.sessions[idx].id;
-                    self.close_session(ctx, id);
-                }
-            },
-            _ => return false,
-        }
-        true
-    }
-
-    fn dispatch_filter_or_other(&mut self, action: NamedAction) {
-        if self.dispatch_project_filter(action) || self.dispatch_git_filter(action) {
-            return;
-        }
-        self.dispatch_scroll_or_other(action);
     }
 }
 
-/// Where a dispatched binding action came from.  A keyboard action consumed
+impl Action for action::Paste {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        app.paste_from_clipboard(ctx, Target::Clipboard);
+    }
+}
+
+impl Action for action::PasteSelection {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        app.paste_from_clipboard(ctx, Target::Primary);
+    }
+}
+
+impl Action for action::Copy {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        app.copy_active_selection(ctx, Target::Clipboard);
+    }
+}
+
+impl Action for action::CopySelection {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        app.copy_active_selection(ctx, Target::Primary);
+    }
+}
+
+impl Action for action::ScrollPageUp {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.scroll_display(|_| Scroll::PageUp);
+    }
+}
+
+impl Action for action::ScrollPageDown {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.scroll_display(|_| Scroll::PageDown);
+    }
+}
+
+impl Action for action::ScrollHalfPageUp {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.scroll_display(|lines_per_page| Scroll::Delta(lines_per_page / 2));
+    }
+}
+
+impl Action for action::ScrollHalfPageDown {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.scroll_display(|lines_per_page| Scroll::Delta(-(lines_per_page / 2)));
+    }
+}
+
+impl Action for action::ScrollLineUp {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.scroll_display(|_| Scroll::Delta(1));
+    }
+}
+
+impl Action for action::ScrollLineDown {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.scroll_display(|_| Scroll::Delta(-1));
+    }
+}
+
+impl Action for action::ScrollToTop {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.scroll_display(|_| Scroll::Top);
+    }
+}
+
+impl Action for action::ScrollToBottom {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.scroll_display(|_| Scroll::Bottom);
+    }
+}
+
+impl Action for action::ClearHistory {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        use alacritty_terminal::vte::ansi::{ClearMode, Handler};
+        if let Some(idx) = app.active_session_index() {
+            if app.sessions[idx].scratchpad.is_none() {
+                app.sessions[idx].term.lock().clear_screen(ClearMode::Saved);
+            }
+        }
+    }
+}
+
+impl Action for action::SpawnNewInstance {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        let ws = app.current_workspace.clone();
+        if let Err(e) = app.spawn_session(ctx, ws.clone()) {
+            app.report_spawn_failure(ctx, &ws, &e);
+        }
+    }
+}
+
+impl Action for action::ToggleFullscreen {
+    fn run(&self, _: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        let on = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!on));
+    }
+}
+
+impl Action for action::ToggleMaximized {
+    fn run(&self, _: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        let on = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!on));
+    }
+}
+
+impl Action for action::Minimize {
+    fn run(&self, _: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+    }
+}
+
+impl Action for action::Quit {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.modals.quit_dialog_open = true;
+    }
+}
+
+impl Action for action::SelectNextTab {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.cycle_tabs(1);
+    }
+}
+
+impl Action for action::SelectPreviousTab {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.cycle_tabs(-1);
+    }
+}
+
+impl Action for action::SelectTab {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.select_tab(self.0);
+    }
+}
+
+impl Action for action::SelectLastTab {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.select_last_tab();
+    }
+}
+
+impl Action for action::SelectNextSession {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        app.cycle_sessions(ctx, 1);
+    }
+}
+
+impl Action for action::SelectPreviousSession {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        app.cycle_sessions(ctx, -1);
+    }
+}
+
+impl Action for action::SelectNextWorkspace {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        app.cycle_workspaces(ctx, 1);
+    }
+}
+
+impl Action for action::SelectPreviousWorkspace {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        app.cycle_workspaces(ctx, -1);
+    }
+}
+
+impl Action for action::OpenScratchpad {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        app.toggle_scratchpad_tab(ctx);
+    }
+}
+
+impl Action for action::AddProject {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        app.add_project_via_dialog(ctx);
+    }
+}
+
+impl Action for action::RefreshProjects {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        app.refresh_all_projects(ctx);
+    }
+}
+
+impl Action for action::TogglePalette {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.palette.toggle();
+    }
+}
+
+impl Action for action::FocusTerminal {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.focus_terminal();
+    }
+}
+
+impl Action for action::FocusLeft {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, origin: ActionOrigin) {
+        app.move_focus(FocusDir::Left, origin);
+    }
+}
+
+impl Action for action::FocusRight {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, origin: ActionOrigin) {
+        app.move_focus(FocusDir::Right, origin);
+    }
+}
+
+impl Action for action::ToggleSessionRows {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.session_rows_always = !app.session_rows_always;
+    }
+}
+
+impl Action for action::ToggleSessionTabs {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.session_tabs_always = !app.session_tabs_always;
+    }
+}
+
+impl Action for action::ToggleSessionDrag {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.session_drag = !app.session_drag;
+    }
+}
+
+impl Action for action::MoveSessionUp {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.step_session(-1);
+    }
+}
+
+impl Action for action::MoveSessionDown {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.step_session(1);
+    }
+}
+
+impl Action for action::ToggleDetachedSessionsFilter {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.sessions_filter_counts_detached = !app.sessions_filter_counts_detached;
+    }
+}
+
+impl Action for action::SpawnProfile {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        let n = self.0;
+        match app.config.profiles.get((n - 1) as usize).map(|p| p.name.clone()) {
+            Some(name) => app.spawn_profile_session(ctx, &name),
+            None => {
+                log::warn!(
+                    "SpawnProfile{n}: only {} profiles configured",
+                    app.config.profiles.len()
+                );
+                app.modals.error_dialog = Some(format!("SpawnProfile{n}: no such profile"));
+            },
+        }
+    }
+}
+
+// No confirmation and no cursor: the child is already gone, so there is
+// nothing left to interrupt and nothing to ask about.
+impl Action for action::CloseExitedSession {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        if let Some(idx) = app.active_session_index()
+            && app.sessions[idx].is_exited()
+        {
+            let id = app.sessions[idx].id;
+            app.close_session(ctx, id);
+        }
+    }
+}
+
+macro_rules! runs_nothing {
+    ($($ty:ident),* $(,)?) => {
+        $(
+            impl Action for action::$ty {
+                fn run(&self, _: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {}
+            }
+        )*
+    };
+}
+
+// An unbind and alacritty's pass-through marker: the binding table acts on
+// both, and running either does nothing.
+runs_nothing!(NoOp, ReceiveChar);
+
+// The palette moves its own cursor while it is open, in `consume_palette_keys`.
+runs_nothing!(PaletteTop, PaletteBottom, PalettePageUp, PalettePageDown);
+
+// Nothing resizes the font at runtime. The names still parse, so a shared
+// alacritty.toml binding them is not reported as unsupported.
+runs_nothing!(IncreaseFontSize, DecreaseFontSize, ResetFontSize);
+
+/// Where a dispatched binding action came from. A keyboard action consumed
 /// a real key press, so FocusLeft/FocusRight may re-synthesize it into the
-/// PTY when the inner TUI should handle it.  An IPC action has no key press
-/// to forward — the caller is typically that inner program declaring it has
+/// PTY when the inner TUI should handle it. An IPC action has no key press
+/// to forward. Its caller is typically that inner program declaring it has
 /// no window in the requested direction, and passthrough would bounce the
-/// key straight back to it.  A palette action consumed a key press too, but
+/// key straight back to it. A palette action consumed a key press too, but
 /// arrives with the panel still searching over a row the query may have
-/// hidden — so actions that need a browsing cursor are refused at this origin.
+/// hidden, so actions that need a browsing cursor are refused at this origin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ActionOrigin {
+pub(crate) enum ActionOrigin {
     Keyboard,
     Palette,
     Ipc,

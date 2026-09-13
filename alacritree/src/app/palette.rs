@@ -70,10 +70,10 @@ impl AlacritreeApp {
                     }
                     for jump in &jumps {
                         match jump {
-                            NamedAction::PaletteTop => palette.select_top(),
-                            NamedAction::PaletteBottom => palette.select_bottom(flat.len()),
-                            NamedAction::PalettePageUp => palette.page_up(),
-                            NamedAction::PalettePageDown => palette.page_down(flat.len()),
+                            NamedAction::PaletteTop(_) => palette.select_top(),
+                            NamedAction::PaletteBottom(_) => palette.select_bottom(flat.len()),
+                            NamedAction::PalettePageUp(_) => palette.page_up(),
+                            NamedAction::PalettePageDown(_) => palette.page_down(flat.len()),
                             _ => {},
                         }
                     }
@@ -743,10 +743,10 @@ pub(super) fn paint_palette_row(
 fn palette_hint(shortcuts: &crate::shortcut::Shortcuts) -> String {
     let mut parts = vec!["↑↓ move".to_string()];
     for (action, label) in [
-        (NamedAction::PaletteTop, "top"),
-        (NamedAction::PaletteBottom, "bottom"),
-        (NamedAction::PalettePageUp, "page up"),
-        (NamedAction::PalettePageDown, "page down"),
+        (NamedAction::PaletteTop(action::PaletteTop), "top"),
+        (NamedAction::PaletteBottom(action::PaletteBottom), "bottom"),
+        (NamedAction::PalettePageUp(action::PalettePageUp), "page up"),
+        (NamedAction::PalettePageDown(action::PalettePageDown), "page down"),
     ] {
         if let Some(key) = command_palette::first_key(shortcuts, action) {
             parts.push(format!("{key} {label}"));

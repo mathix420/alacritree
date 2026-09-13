@@ -10,7 +10,7 @@ use egui::{Color32, Context, Frame, Margin, RichText, ScrollArea, SidePanel, Str
 
 use serde_json::{Value, json};
 
-use crate::bindings::{BindingAction, NamedAction};
+use crate::bindings::{BindingAction, NamedAction, action};
 use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
@@ -61,7 +61,7 @@ mod palette;
 mod sidebar;
 mod widgets;
 
-use actions::ActionOrigin;
+pub(crate) use actions::{Action, ActionOrigin};
 use focus::DeferredClose;
 use herdr_glue::{
     HarnessMark, Managed, StateTone, herdr_mark, managed_tooltip, unlisted_pane_target,
@@ -2001,9 +2001,9 @@ impl AlacritreeApp {
                     let matched =
                         dispatched_actions(self.shortcuts.matches(*key, *modifiers), scope);
                     if !matched.is_empty() {
-                        let suppress_chars = matched
-                            .iter()
-                            .all(|a| !matches!(a, BindingAction::Named(NamedAction::ReceiveChar)));
+                        let suppress_chars = matched.iter().all(|a| {
+                            !matches!(a, BindingAction::Named(NamedAction::ReceiveChar(_)))
+                        });
                         for a in matched {
                             actions.push(a.clone());
                         }
@@ -2333,8 +2333,10 @@ impl AlacritreeApp {
         }
     }
 
-    fn dispatch_scroll_or_other(&mut self, action: NamedAction) {
-        use alacritty_terminal::grid::{Dimensions, Scroll};
+    /// Scroll the terminal on screen. `scroll` receives the page height in
+    /// lines, for the half-page steps; a scratchpad has no grid to scroll.
+    fn scroll_display(&mut self, scroll: impl FnOnce(i32) -> alacritty_terminal::grid::Scroll) {
+        use alacritty_terminal::grid::Dimensions;
         let Some(idx) = self.active_session_index() else {
             return;
         };
@@ -2344,20 +2346,7 @@ impl AlacritreeApp {
         }
         let mut term = session.term.lock();
         let lines_per_page = term.grid().screen_lines() as i32;
-        let scroll = match action {
-            NamedAction::ScrollLineUp => Some(Scroll::Delta(1)),
-            NamedAction::ScrollLineDown => Some(Scroll::Delta(-1)),
-            NamedAction::ScrollHalfPageUp => Some(Scroll::Delta(lines_per_page / 2)),
-            NamedAction::ScrollHalfPageDown => Some(Scroll::Delta(-(lines_per_page / 2))),
-            NamedAction::ScrollPageUp => Some(Scroll::PageUp),
-            NamedAction::ScrollPageDown => Some(Scroll::PageDown),
-            NamedAction::ScrollToTop => Some(Scroll::Top),
-            NamedAction::ScrollToBottom => Some(Scroll::Bottom),
-            _ => None,
-        };
-        if let Some(s) = scroll {
-            term.scroll_display(s);
-        }
+        term.scroll_display(scroll(lines_per_page));
     }
 
     fn select_tab(&mut self, n: u8) {
@@ -2777,8 +2766,10 @@ impl AlacritreeApp {
             // session that survives it says here how to dismiss it — nothing
             // else on screen would.
             if outcome.exited && !self.sessions[idx].should_reap(hold) {
-                let chord =
-                    command_palette::first_key(&self.shortcuts, NamedAction::CloseExitedSession);
+                let chord = command_palette::first_key(
+                    &self.shortcuts,
+                    NamedAction::CloseExitedSession(action::CloseExitedSession),
+                );
                 self.sessions[idx].write_hold_notice(chord.as_deref());
             }
             let is_visible_to_user = Some(idx) == visible_idx && focused;
@@ -4408,7 +4399,7 @@ mod tests {
 
         app.dispatch_action(
             &Context::default(),
-            BindingAction::Named(NamedAction::NewMultiplexerPane),
+            BindingAction::Named(NamedAction::NewMultiplexerPane(action::NewMultiplexerPane)),
             ActionOrigin::Keyboard,
         );
 
@@ -4429,7 +4420,7 @@ mod tests {
 
         app.dispatch_action(
             &Context::default(),
-            BindingAction::Named(NamedAction::NewMultiplexerPane),
+            BindingAction::Named(NamedAction::NewMultiplexerPane(action::NewMultiplexerPane)),
             ActionOrigin::Keyboard,
         );
 
@@ -4515,7 +4506,7 @@ mod tests {
 
         app.dispatch_action(
             &Context::default(),
-            BindingAction::Named(NamedAction::NewMultiplexerPane),
+            BindingAction::Named(NamedAction::NewMultiplexerPane(action::NewMultiplexerPane)),
             ActionOrigin::Keyboard,
         );
 
@@ -5262,7 +5253,9 @@ mod tests {
 
         app.dispatch_action(
             &Context::default(),
-            BindingAction::Named(NamedAction::AttachAllMultiplexerPanes),
+            BindingAction::Named(NamedAction::AttachAllMultiplexerPanes(
+                action::AttachAllMultiplexerPanes,
+            )),
             ActionOrigin::Keyboard,
         );
         assert_eq!(app.modals.error_dialog.as_deref(), Some(HERDR_DISABLED));
@@ -5271,7 +5264,9 @@ mod tests {
         app.modals.error_dialog = None;
         app.dispatch_action(
             &Context::default(),
-            BindingAction::Named(NamedAction::DetachAllMultiplexerPanes),
+            BindingAction::Named(NamedAction::DetachAllMultiplexerPanes(
+                action::DetachAllMultiplexerPanes,
+            )),
             ActionOrigin::Keyboard,
         );
         assert_eq!(app.modals.error_dialog.as_deref(), Some(HERDR_DISABLED));
@@ -5702,7 +5697,7 @@ mod tests {
         );
         assert!(!retain, "a matched search action consumes the key");
         assert!(matches!(steps.as_slice(), [SidebarNavStep::SearchAction(
-            NamedAction::SidebarSearchConfirm
+            NamedAction::SidebarSearchConfirm(action::SidebarSearchConfirm)
         )]));
         // The filter is untouched by the drain — the action does the exit.
         assert_eq!(f.mode(), panel_filter::Mode::Search);
@@ -5718,7 +5713,7 @@ mod tests {
             false,
         );
         assert!(matches!(steps.as_slice(), [SidebarNavStep::SearchAction(
-            NamedAction::SidebarSearchCancel
+            NamedAction::SidebarSearchCancel(action::SidebarSearchCancel)
         )]));
 
         let mut steps = Vec::new();
@@ -5732,7 +5727,7 @@ mod tests {
         );
         assert!(
             matches!(steps.as_slice(), [SidebarNavStep::SearchAction(
-                NamedAction::SidebarSearchCancelToTerminal
+                NamedAction::SidebarSearchCancelToTerminal(action::SidebarSearchCancelToTerminal)
             )]),
             "Shift+Esc is a distinct search action from plain Esc"
         );
@@ -7786,17 +7781,17 @@ mod tests {
     #[test]
     fn the_git_filter_actions_map_to_their_identities() {
         for (action, identity) in [
-            (NamedAction::ToggleModifiedFilter, Some('m')),
-            (NamedAction::ToggleDeletedFilter, Some('d')),
-            (NamedAction::ToggleUntrackedFilter, Some('u')),
-            (NamedAction::ClearGitFilters, None),
-            (NamedAction::ToggleSessionsFilter, None),
-            (NamedAction::ToggleAttentionFilter, None),
-            (NamedAction::TogglePrOpenFilter, None),
-            (NamedAction::TogglePrDraftFilter, None),
-            (NamedAction::TogglePrMergedFilter, None),
-            (NamedAction::TogglePrClosedFilter, None),
-            (NamedAction::Paste, None),
+            (NamedAction::ToggleModifiedFilter(action::ToggleModifiedFilter), Some('m')),
+            (NamedAction::ToggleDeletedFilter(action::ToggleDeletedFilter), Some('d')),
+            (NamedAction::ToggleUntrackedFilter(action::ToggleUntrackedFilter), Some('u')),
+            (NamedAction::ClearGitFilters(action::ClearGitFilters), None),
+            (NamedAction::ToggleSessionsFilter(action::ToggleSessionsFilter), None),
+            (NamedAction::ToggleAttentionFilter(action::ToggleAttentionFilter), None),
+            (NamedAction::TogglePrOpenFilter(action::TogglePrOpenFilter), None),
+            (NamedAction::TogglePrDraftFilter(action::TogglePrDraftFilter), None),
+            (NamedAction::TogglePrMergedFilter(action::TogglePrMergedFilter), None),
+            (NamedAction::TogglePrClosedFilter(action::TogglePrClosedFilter), None),
+            (NamedAction::Paste(action::Paste), None),
         ] {
             assert_eq!(git_filter_identity(action), identity, "{action:?}");
             if let Some(key) = identity {
@@ -8582,32 +8577,38 @@ mod tests {
 
     #[test]
     fn projects_filter_action_valid_when_projects_sidebar_focused() {
-        let action = BindingAction::Named(NamedAction::ToggleSessionsFilter);
+        let action =
+            BindingAction::Named(NamedAction::ToggleSessionsFilter(action::ToggleSessionsFilter));
         assert!(valid_for_focus(&action, BindingScope { sidebar_focused: true, ..scope() }));
     }
 
     #[test]
     fn projects_filter_action_rejected_when_git_sidebar_focused() {
-        let action = BindingAction::Named(NamedAction::ToggleSessionsFilter);
+        let action =
+            BindingAction::Named(NamedAction::ToggleSessionsFilter(action::ToggleSessionsFilter));
         assert!(!valid_for_focus(&action, BindingScope { git_focused: true, ..scope() }));
     }
 
     #[test]
     fn git_filter_action_valid_when_git_sidebar_focused() {
-        let action = BindingAction::Named(NamedAction::ToggleModifiedFilter);
+        let action =
+            BindingAction::Named(NamedAction::ToggleModifiedFilter(action::ToggleModifiedFilter));
         assert!(valid_for_focus(&action, BindingScope { git_focused: true, ..scope() }));
     }
 
     #[test]
     fn git_filter_action_rejected_when_projects_sidebar_focused() {
-        let action = BindingAction::Named(NamedAction::ToggleModifiedFilter);
+        let action =
+            BindingAction::Named(NamedAction::ToggleModifiedFilter(action::ToggleModifiedFilter));
         assert!(!valid_for_focus(&action, BindingScope { sidebar_focused: true, ..scope() }));
     }
 
     #[test]
     fn both_sidebar_filters_rejected_when_terminal_focused() {
-        let projects_action = BindingAction::Named(NamedAction::ToggleSessionsFilter);
-        let git_action = BindingAction::Named(NamedAction::ToggleModifiedFilter);
+        let projects_action =
+            BindingAction::Named(NamedAction::ToggleSessionsFilter(action::ToggleSessionsFilter));
+        let git_action =
+            BindingAction::Named(NamedAction::ToggleModifiedFilter(action::ToggleModifiedFilter));
         assert!(!valid_for_focus(&projects_action, scope()));
         assert!(!valid_for_focus(&git_action, scope()));
     }
@@ -8616,7 +8617,7 @@ mod tests {
     /// editor stealing it back (via `terminal_only`) should block it.
     #[test]
     fn terminal_only_action_yields_to_the_scratchpad_editor() {
-        let action = BindingAction::Named(NamedAction::ScrollPageUp);
+        let action = BindingAction::Named(NamedAction::ScrollPageUp(action::ScrollPageUp));
         assert!(!valid_for_focus(&action, BindingScope { scratchpad_focused: true, ..scope() }));
         assert!(valid_for_focus(&action, scope()));
     }
@@ -8631,9 +8632,10 @@ mod tests {
         let shortcuts = crate::shortcut::Shortcuts::new(&bindings);
         let matched = shortcuts.matches(egui::Key::Enter, egui::Modifiers::NONE);
         assert!(
-            matched
-                .iter()
-                .any(|a| matches!(a, BindingAction::Named(NamedAction::CloseExitedSession))),
+            matched.iter().any(|a| matches!(
+                a,
+                BindingAction::Named(NamedAction::CloseExitedSession(action::CloseExitedSession))
+            )),
             "Enter must still reach the exited-session binding"
         );
         assert!(
@@ -8652,7 +8654,10 @@ mod tests {
         let dispatched = dispatched_actions(matched, scope);
         assert_eq!(dispatched.len(), 1, "{dispatched:?}");
         assert!(
-            matches!(dispatched[0], BindingAction::Named(NamedAction::CloseExitedSession)),
+            matches!(
+                dispatched[0],
+                BindingAction::Named(NamedAction::CloseExitedSession(action::CloseExitedSession))
+            ),
             "{dispatched:?}"
         );
     }

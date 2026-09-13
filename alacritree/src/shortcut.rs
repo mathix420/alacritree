@@ -174,7 +174,7 @@ mod tests {
     use strum::IntoEnumIterator;
 
     use super::*;
-    use crate::bindings::{RawBinding, parse_bindings};
+    use crate::bindings::{RawBinding, action, parse_bindings};
 
     fn named(shortcuts: &Shortcuts, key: egui::Key, mods: egui::Modifiers) -> Vec<NamedAction> {
         shortcuts
@@ -210,10 +210,12 @@ mod tests {
             command: None,
         }]));
         let ctrl = egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::NONE };
-        assert_eq!(named(&shortcuts, egui::Key::K, ctrl), vec![NamedAction::TogglePalette]);
+        assert_eq!(named(&shortcuts, egui::Key::K, ctrl), vec![NamedAction::TogglePalette(
+            action::TogglePalette
+        )]);
         assert!(named(&shortcuts, egui::Key::L, ctrl).is_empty());
         assert_eq!(named(&shortcuts, egui::Key::L, egui::Modifiers::NONE), vec![
-            NamedAction::ToggleSessionRows
+            NamedAction::ToggleSessionRows(action::ToggleSessionRows)
         ]);
     }
 

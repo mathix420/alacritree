@@ -15,8 +15,9 @@ use std::path::PathBuf;
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
+use strum::IntoEnumIterator;
 
-use crate::bindings::{BindingAction, NamedAction, bindable_actions};
+use crate::bindings::{BindingAction, NamedAction, action};
 use crate::herdr::HerdrKey;
 use crate::session::SessionId;
 use crate::shortcut::Shortcuts;
@@ -94,34 +95,47 @@ fn section_of(a: NamedAction) -> PaletteSection {
     use NamedAction::*;
     use PaletteSection::*;
     match a {
-        Paste | PasteSelection | Copy | CopySelection => Clipboard,
-        ScrollPageUp | ScrollPageDown | ScrollHalfPageUp | ScrollHalfPageDown => Scrollback,
-        ScrollLineUp | ScrollLineDown | ScrollToTop | ScrollToBottom => Scrollback,
-        ClearHistory => Scrollback,
-        SpawnNewInstance | SpawnProfile(_) | CloseSession | CloseExitedSession
-        | NewMultiplexerPane => Sessions,
-        AttachAllMultiplexerPanes | DetachAllMultiplexerPanes => Sessions,
-        SelectNextTab | SelectPreviousTab | SelectTab(_) | SelectLastTab => Sessions,
-        SelectNextSession | SelectPreviousSession => Sessions,
-        ToggleSessionRows | ToggleSessionTabs | ToggleSessionDrag => Sessions,
-        MoveSessionUp | MoveSessionDown => Sessions,
-        SelectNextWorkspace | SelectPreviousWorkspace => Workspaces,
-        AddProject | RefreshProjects | SetBaseBranch | ReviewStaged | ReviewUnstaged
-        | ReviewBranch => Workspaces,
-        ToggleLeftSidebar | ToggleRightSidebar | ToggleSidebarFocus => Sidebar,
-        SidebarTop | SidebarBottom | SidebarNextProject | SidebarPreviousProject => Sidebar,
-        DeleteSelected | RenameSelected | ToggleProjectExpanded => Sidebar,
-        FocusProjectsSidebar | FocusGitSidebar | FocusTerminal => Sidebar,
-        FocusLeft | FocusRight => Sidebar,
-        SidebarSearchConfirm | SidebarSearchCancel | SidebarSearchCancelToTerminal => Sidebar,
-        ToggleSessionsFilter | ToggleDetachedSessionsFilter => Filters,
-        ToggleAttentionFilter | ClearProjectFilters => Filters,
-        TogglePrOpenFilter | TogglePrDraftFilter => Filters,
-        TogglePrMergedFilter | TogglePrClosedFilter => Filters,
-        ToggleModifiedFilter | ToggleDeletedFilter => Filters,
-        ToggleUntrackedFilter | ClearGitFilters | ToggleSearchScope => Filters,
-        RefreshPrStatus => Sidebar,
-        _ => Window,
+        Paste(_) | PasteSelection(_) | Copy(_) | CopySelection(_) => Clipboard,
+        ScrollPageUp(_) | ScrollPageDown(_) | ScrollHalfPageUp(_) | ScrollHalfPageDown(_) => {
+            Scrollback
+        },
+        ScrollLineUp(_) | ScrollLineDown(_) | ScrollToTop(_) | ScrollToBottom(_) => Scrollback,
+        ClearHistory(_) => Scrollback,
+        SpawnNewInstance(_)
+        | SpawnProfile(_)
+        | CloseSession(_)
+        | CloseExitedSession(_)
+        | NewMultiplexerPane(_) => Sessions,
+        AttachAllMultiplexerPanes(_) | DetachAllMultiplexerPanes(_) => Sessions,
+        SelectNextTab(_) | SelectPreviousTab(_) | SelectTab(_) | SelectLastTab(_) => Sessions,
+        SelectNextSession(_) | SelectPreviousSession(_) => Sessions,
+        ToggleSessionRows(_) | ToggleSessionTabs(_) | ToggleSessionDrag(_) => Sessions,
+        MoveSessionUp(_) | MoveSessionDown(_) => Sessions,
+        SelectNextWorkspace(_) | SelectPreviousWorkspace(_) => Workspaces,
+        AddProject(_) | RefreshProjects(_) | SetBaseBranch(_) | ReviewStaged(_)
+        | ReviewUnstaged(_) | ReviewBranch(_) => Workspaces,
+        ToggleLeftSidebar(_) | ToggleRightSidebar(_) | ToggleSidebarFocus(_) => Sidebar,
+        SidebarTop(_) | SidebarBottom(_) | SidebarNextProject(_) | SidebarPreviousProject(_) => {
+            Sidebar
+        },
+        DeleteSelected(_) | RenameSelected(_) | ToggleProjectExpanded(_) => Sidebar,
+        FocusProjectsSidebar(_) | FocusGitSidebar(_) | FocusTerminal(_) => Sidebar,
+        FocusLeft(_) | FocusRight(_) => Sidebar,
+        SidebarSearchConfirm(_) | SidebarSearchCancel(_) | SidebarSearchCancelToTerminal(_) => {
+            Sidebar
+        },
+        ToggleSessionsFilter(_) | ToggleDetachedSessionsFilter(_) => Filters,
+        ToggleAttentionFilter(_) | ClearProjectFilters(_) => Filters,
+        TogglePrOpenFilter(_) | TogglePrDraftFilter(_) => Filters,
+        TogglePrMergedFilter(_) | TogglePrClosedFilter(_) => Filters,
+        ToggleModifiedFilter(_) | ToggleDeletedFilter(_) => Filters,
+        ToggleUntrackedFilter(_) | ClearGitFilters(_) | ToggleSearchScope(_) => Filters,
+        RefreshPrStatus(_) => Sidebar,
+        IncreaseFontSize(_) | DecreaseFontSize(_) | ResetFontSize(_) => Window,
+        ToggleFullscreen(_) | ToggleMaximized(_) | Minimize(_) | Quit(_) => Window,
+        OpenScratchpad(_) | TogglePalette(_) => Window,
+        PaletteTop(_) | PaletteBottom(_) | PalettePageUp(_) | PalettePageDown(_) => Window,
+        NoOp(_) | ReceiveChar(_) => Window,
     }
 }
 
@@ -281,9 +295,9 @@ fn session_search(
 fn is_hidden(a: NamedAction) -> bool {
     matches!(
         a,
-        NamedAction::NoOp
-            | NamedAction::ReceiveChar
-            | NamedAction::TogglePalette
+        NamedAction::NoOp(_)
+            | NamedAction::ReceiveChar(_)
+            | NamedAction::TogglePalette(_)
             | NamedAction::SpawnProfile(_)
     ) || a.is_palette_scoped()
 }
@@ -295,8 +309,7 @@ fn is_hidden(a: NamedAction) -> bool {
 /// listed too, keyless: runnable from here all the same, and that is how the
 /// full vocabulary stays discoverable without the docs.
 pub fn action_items(shortcuts: &Shortcuts) -> Vec<PaletteItem> {
-    let mut order: Vec<NamedAction> =
-        bindable_actions().into_iter().filter(|a| !is_hidden(*a)).collect();
+    let mut order: Vec<NamedAction> = NamedAction::iter().filter(|a| !is_hidden(*a)).collect();
     for action in shortcuts.actions() {
         if let BindingAction::Named(a) = action {
             if !is_hidden(*a) && !order.contains(a) {
@@ -314,7 +327,7 @@ fn keys_for(shortcuts: &Shortcuts, action: NamedAction) -> String {
 
 /// Every trigger bound to `SpawnProfile(index)`, for a profile's palette row.
 pub fn profile_keys(shortcuts: &Shortcuts, index: u8) -> String {
-    keys_for(shortcuts, NamedAction::SpawnProfile(index))
+    keys_for(shortcuts, NamedAction::SpawnProfile(action::SpawnProfile(index)))
 }
 
 /// The first key bound to `action`, for the footer hint.
@@ -489,7 +502,10 @@ mod tests {
         let items = action_items(&shortcuts(vec![]));
         let close = find(&items, "CloseSession").expect("CloseSession missing");
         assert_eq!(close.keys, "Ctrl+Shift+W");
-        assert_eq!(close.action, PaletteAction::Run(NamedAction::CloseSession));
+        assert_eq!(
+            close.action,
+            PaletteAction::Run(NamedAction::CloseSession(action::CloseSession))
+        );
         assert!(!close.primary.is_empty());
     }
 
@@ -536,7 +552,7 @@ mod tests {
         let items = action_items(&bindings);
         let rows: Vec<_> = items.iter().filter(|i| i.secondary == "IncreaseFontSize").collect();
         assert_eq!(rows.len(), 1, "IncreaseFontSize should be a single row");
-        let expected = keys_for(&bindings, NamedAction::IncreaseFontSize);
+        let expected = keys_for(&bindings, NamedAction::IncreaseFontSize(action::IncreaseFontSize));
         assert!(expected.contains(", "), "IncreaseFontSize has two default keys: {expected}");
         assert_eq!(rows[0].keys, expected);
     }
@@ -604,14 +620,17 @@ mod tests {
         // TogglePalette is bound to Ctrl+K by default, yet must not appear as a
         // row — running it from inside the palette would only reopen it.
         let items = action_items(&shortcuts(vec![]));
-        assert!(!items.iter().any(|i| i.action == PaletteAction::Run(NamedAction::TogglePalette)));
+        assert!(
+            !items.iter().any(|i| i.action
+                == PaletteAction::Run(NamedAction::TogglePalette(action::TogglePalette)))
+        );
     }
 
     #[test]
     fn rank_orders_matches_ahead_of_non_matches_and_filters_the_rest() {
         let items = vec![
-            PaletteItem::action(NamedAction::Paste, String::new()),
-            PaletteItem::action(NamedAction::CloseSession, String::new()),
+            PaletteItem::action(NamedAction::Paste(action::Paste), String::new()),
+            PaletteItem::action(NamedAction::CloseSession(action::CloseSession), String::new()),
         ];
         let mut palette = CommandPalette::new();
         palette.query_mut().push_str("paste");
@@ -672,9 +691,9 @@ mod tests {
     #[test]
     fn session_reorder_actions_file_under_sessions() {
         for action in [
-            NamedAction::ToggleSessionDrag,
-            NamedAction::MoveSessionUp,
-            NamedAction::MoveSessionDown,
+            NamedAction::ToggleSessionDrag(action::ToggleSessionDrag),
+            NamedAction::MoveSessionUp(action::MoveSessionUp),
+            NamedAction::MoveSessionDown(action::MoveSessionDown),
         ] {
             assert_eq!(section_of(action), PaletteSection::Sessions, "{action:?}");
         }
@@ -693,7 +712,7 @@ mod tests {
     fn profile_row_carries_the_key_bound_to_its_index() {
         let bindings = shortcuts(vec![bind_spawn_profile(2)]);
         let keys = profile_keys(&bindings, 2);
-        assert_eq!(keys, keys_for(&bindings, NamedAction::SpawnProfile(2)));
+        assert_eq!(keys, keys_for(&bindings, NamedAction::SpawnProfile(action::SpawnProfile(2))));
         assert!(!keys.is_empty());
 
         let item =
@@ -716,7 +735,8 @@ mod tests {
         let bindings = shortcuts(vec![bind_spawn_profile(2)]);
         let items = action_items(&bindings);
         assert!(
-            !items.iter().any(|i| i.action == PaletteAction::Run(NamedAction::SpawnProfile(2))),
+            !items.iter().any(|i| i.action
+                == PaletteAction::Run(NamedAction::SpawnProfile(action::SpawnProfile(2)))),
             "the Profiles section owns this row now"
         );
     }

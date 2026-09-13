@@ -1104,61 +1104,10 @@ fn paint_git_row_cursor(
 }
 
 impl AlacritreeApp {
-    pub(super) fn dispatch_git_action(&mut self, ctx: &Context, action: NamedAction) -> bool {
-        match action {
-            NamedAction::SetBaseBranch => {
-                let target = base_branch_target(
-                    self.focus == PaneFocus::ProjectsSidebar,
-                    self.sidebar.cursor.as_ref(),
-                    |id| {
-                        self.sessions
-                            .iter()
-                            .find(|s| s.id == id)
-                            .map(|s| s.working_directory.clone())
-                    },
-                    &self.current_workspace,
-                );
-                if let Some(path) = target {
-                    self.open_base_branch_picker(path);
-                }
-            },
-            NamedAction::ClearGitFilters => {
-                self.git_panel.filter.clear_toggles();
-                self.after_git_filter_changed();
-            },
-            NamedAction::ToggleRightSidebar => {
-                self.show_right_sidebar = !self.show_right_sidebar;
-                // A deliberate visibility change opts out of the auto-shown
-                // round trip, and a hidden sidebar cannot keep keyboard focus.
-                self.git_panel.auto_shown = false;
-                if !self.show_right_sidebar && self.focus == PaneFocus::GitSidebar {
-                    self.focus = PaneFocus::Terminal;
-                }
-                self.persist_sidebars();
-            },
-            NamedAction::FocusGitSidebar => {
-                if self.focus != PaneFocus::GitSidebar {
-                    self.focus_git_sidebar()
-                } else {
-                    self.focus_terminal()
-                }
-            },
-            NamedAction::RefreshPrStatus => {
-                self.pr_cache.invalidate_all();
-                // The poll sites run while the sidebars paint, and the palette
-                // dispatches after both have; without a wake the re-query would
-                // wait for whatever repaint happened to come next.
-                ctx.request_repaint();
-            },
-            NamedAction::ReviewStaged | NamedAction::ReviewUnstaged | NamedAction::ReviewBranch => {
-                if let Some(section) = review_section(action, self.cached_branch_base().as_deref())
-                {
-                    self.open_diff(ctx, Target::Section(section));
-                }
-            },
-            _ => return false,
+    fn open_review(&mut self, ctx: &Context, action: NamedAction) {
+        if let Some(section) = review_section(action, self.cached_branch_base().as_deref()) {
+            self.open_diff(ctx, Target::Section(section));
         }
-        true
     }
 
     /// The base resolved by the latest status, so ReviewBranch works while the
@@ -1169,11 +1118,101 @@ impl AlacritreeApp {
         status.default_branch_resolved.clone().or_else(|| status.default_branch.clone())
     }
 
-    pub(super) fn dispatch_git_filter(&mut self, action: NamedAction) -> bool {
-        let Some(key) = git_filter_identity(action) else { return false };
-        self.git_panel.filter.toggle(key);
-        self.after_git_filter_changed();
-        true
+    fn toggle_git_filter(&mut self, action: NamedAction) {
+        if let Some(key) = git_filter_identity(action) {
+            self.git_panel.filter.toggle(key);
+            self.after_git_filter_changed();
+        }
+    }
+}
+
+impl Action for action::SetBaseBranch {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        let target = base_branch_target(
+            app.focus == PaneFocus::ProjectsSidebar,
+            app.sidebar.cursor.as_ref(),
+            |id| app.sessions.iter().find(|s| s.id == id).map(|s| s.working_directory.clone()),
+            &app.current_workspace,
+        );
+        if let Some(path) = target {
+            app.open_base_branch_picker(path);
+        }
+    }
+}
+
+impl Action for action::ClearGitFilters {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.git_panel.filter.clear_toggles();
+        app.after_git_filter_changed();
+    }
+}
+
+impl Action for action::ToggleRightSidebar {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.show_right_sidebar = !app.show_right_sidebar;
+        // A deliberate visibility change opts out of the auto-shown
+        // round trip, and a hidden sidebar cannot keep keyboard focus.
+        app.git_panel.auto_shown = false;
+        if !app.show_right_sidebar && app.focus == PaneFocus::GitSidebar {
+            app.focus = PaneFocus::Terminal;
+        }
+        app.persist_sidebars();
+    }
+}
+
+impl Action for action::FocusGitSidebar {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        if app.focus != PaneFocus::GitSidebar {
+            app.focus_git_sidebar();
+        } else {
+            app.focus_terminal();
+        }
+    }
+}
+
+impl Action for action::RefreshPrStatus {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        app.pr_cache.invalidate_all();
+        // The poll sites run while the sidebars paint, and the palette
+        // dispatches after both have; without a wake the re-query would
+        // wait for whatever repaint happened to come next.
+        ctx.request_repaint();
+    }
+}
+
+impl Action for action::ReviewStaged {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        app.open_review(ctx, (*self).into());
+    }
+}
+
+impl Action for action::ReviewUnstaged {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        app.open_review(ctx, (*self).into());
+    }
+}
+
+impl Action for action::ReviewBranch {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        app.open_review(ctx, (*self).into());
+    }
+}
+
+impl Action for action::ToggleModifiedFilter {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.toggle_git_filter((*self).into());
+    }
+}
+
+impl Action for action::ToggleDeletedFilter {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.toggle_git_filter((*self).into());
+    }
+}
+
+impl Action for action::ToggleUntrackedFilter {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.toggle_git_filter((*self).into());
     }
 }
 
@@ -1181,9 +1220,9 @@ impl AlacritreeApp {
 /// not one of its filters.
 pub(super) fn git_filter_identity(action: NamedAction) -> Option<char> {
     match action {
-        NamedAction::ToggleModifiedFilter => Some('m'),
-        NamedAction::ToggleDeletedFilter => Some('d'),
-        NamedAction::ToggleUntrackedFilter => Some('u'),
+        NamedAction::ToggleModifiedFilter(_) => Some('m'),
+        NamedAction::ToggleDeletedFilter(_) => Some('d'),
+        NamedAction::ToggleUntrackedFilter(_) => Some('u'),
         _ => None,
     }
 }
@@ -1191,9 +1230,9 @@ pub(super) fn git_filter_identity(action: NamedAction) -> Option<char> {
 /// The section a Review action opens. The branch section needs a known base.
 pub(super) fn review_section(action: NamedAction, base: Option<&str>) -> Option<Section> {
     match action {
-        NamedAction::ReviewStaged => Some(Section::Staged),
-        NamedAction::ReviewUnstaged => Some(Section::Unstaged),
-        NamedAction::ReviewBranch => Some(Section::Branch { base: base?.to_string() }),
+        NamedAction::ReviewStaged(_) => Some(Section::Staged),
+        NamedAction::ReviewUnstaged(_) => Some(Section::Unstaged),
+        NamedAction::ReviewBranch(_) => Some(Section::Branch { base: base?.to_string() }),
         _ => None,
     }
 }
@@ -1311,14 +1350,20 @@ mod tests {
 
     #[test]
     fn a_review_action_names_its_section_and_the_branch_needs_a_base() {
-        assert_eq!(review_section(NamedAction::ReviewStaged, None), Some(Section::Staged));
-        assert_eq!(review_section(NamedAction::ReviewUnstaged, None), Some(Section::Unstaged));
-        assert_eq!(review_section(NamedAction::ReviewBranch, None), None);
         assert_eq!(
-            review_section(NamedAction::ReviewBranch, Some("main")),
+            review_section(NamedAction::ReviewStaged(action::ReviewStaged), None),
+            Some(Section::Staged)
+        );
+        assert_eq!(
+            review_section(NamedAction::ReviewUnstaged(action::ReviewUnstaged), None),
+            Some(Section::Unstaged)
+        );
+        assert_eq!(review_section(NamedAction::ReviewBranch(action::ReviewBranch), None), None);
+        assert_eq!(
+            review_section(NamedAction::ReviewBranch(action::ReviewBranch), Some("main")),
             Some(Section::Branch { base: "main".to_string() })
         );
-        assert_eq!(review_section(NamedAction::Paste, Some("main")), None);
+        assert_eq!(review_section(NamedAction::Paste(action::Paste), Some("main")), None);
     }
 
     /// An app whose current workspace shows a diff pane under `key`. The

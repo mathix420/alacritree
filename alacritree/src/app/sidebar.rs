@@ -1975,107 +1975,180 @@ fn herdr_row(
 }
 
 impl AlacritreeApp {
-    pub(super) fn dispatch_sidebar_action(&mut self, ctx: &Context, action: NamedAction) -> bool {
-        match action {
-            NamedAction::SidebarTop => self.sidebar_cursor_to_edge(true),
-            NamedAction::SidebarBottom => self.sidebar_cursor_to_edge(false),
-            NamedAction::SidebarNextProject => self.sidebar_cursor_project_jump(1),
-            NamedAction::SidebarPreviousProject => self.sidebar_cursor_project_jump(-1),
-            NamedAction::DeleteSelected => match self.sidebar.cursor.clone() {
-                Some(SidebarRow::Session(id)) => self.request_close_session(ctx, id),
-                Some(SidebarRow::Worktree(path)) => self.request_worktree_delete(&path),
-                Some(SidebarRow::Project(root)) => {
-                    if let Some(p) = self.projects.iter().find(|p| p.root == root) {
-                        self.modals.pending_project_remove =
-                            Some(ProjectRemoveState { name: p.display_name().to_string(), root });
-                    }
-                },
-                Some(SidebarRow::Home) | Some(SidebarRow::HerdrAgent(..)) | None => {},
-            },
-            NamedAction::RenameSelected => {
-                // Only project rows carry an editable label; sessions and
-                // worktrees take their names from the terminal title and the
-                // `[ui] worktree_name` template.
-                if let Some(SidebarRow::Project(root)) = self.sidebar.cursor.clone() {
-                    if let Some(p) = self.projects.iter().find(|p| p.root == root) {
-                        self.modals.pending_rename =
-                            Some(RenameState { root, label: p.display_name().to_string() });
-                    }
-                }
-            },
-            NamedAction::ToggleProjectExpanded => {
-                let Some(cursor) = self.sidebar.cursor.clone() else {
-                    return true;
-                };
-                let root = {
-                    let session_workspace = |id: SessionId| {
-                        self.sessions
-                            .iter()
-                            .find(|s| s.id == id)
-                            .map(|s| s.working_directory.clone())
-                    };
-                    row_project_root(&self.projects, session_workspace, &cursor)
-                };
-                if let Some(root) = root {
-                    let expanded =
-                        self.projects.iter().find(|p| p.root == root).is_some_and(|p| p.expanded);
-                    self.set_project_expanded(&root, !expanded);
-                    // Collapsing hides the cursored child; move the cursor to
-                    // the header so it doesn't point at a now-invisible row.
-                    if expanded && !matches!(cursor, SidebarRow::Project(_)) {
-                        self.set_sidebar_cursor(SidebarRow::Project(root));
-                    }
-                }
-            },
-            NamedAction::ClearProjectFilters => {
-                self.sidebar.filter.clear_toggles();
-            },
-            NamedAction::ToggleLeftSidebar => {
-                self.show_left_sidebar = !self.show_left_sidebar;
-                // A deliberate visibility change opts out of the auto-shown
-                // round trip, and a hidden sidebar cannot keep keyboard focus.
-                self.sidebar_auto_shown = false;
-                if !self.show_left_sidebar && self.focus == PaneFocus::ProjectsSidebar {
-                    self.focus = PaneFocus::Terminal;
-                }
-                self.persist_sidebars();
-            },
-            NamedAction::ToggleSidebarFocus => match self.focus {
-                PaneFocus::Terminal => self.focus_sidebar(),
-                PaneFocus::ProjectsSidebar => self.focus_terminal(),
-                // Toggle stays "left <-> terminal"; from the right panel it
-                // hops to the left one rather than doing nothing.
-                PaneFocus::GitSidebar => self.focus_sidebar(),
-            },
-            NamedAction::CloseSession => {
-                let cursored = if self.focus == PaneFocus::ProjectsSidebar {
-                    match &self.sidebar.cursor {
-                        Some(SidebarRow::Session(id)) => Some(*id),
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                let target = cursored
-                    .or_else(|| self.active_session_index().map(|idx| self.sessions[idx].id));
-                if let Some(id) = target {
-                    self.request_close_session(ctx, id);
-                }
-            },
-            NamedAction::FocusProjectsSidebar => {
-                if self.focus != PaneFocus::ProjectsSidebar {
-                    self.focus_sidebar();
-                }
-            },
-            _ => return false,
+    fn toggle_project_filter(&mut self, action: NamedAction) {
+        if let Some(key) = project_filter_identity(action) {
+            self.sidebar.filter.toggle(key);
         }
-        true
     }
+}
 
-    pub(super) fn dispatch_project_filter(&mut self, action: NamedAction) -> bool {
-        let Some(key) = project_filter_identity(action) else { return false };
-        self.sidebar.filter.toggle(key);
-        true
+impl Action for action::SidebarTop {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.sidebar_cursor_to_edge(true);
+    }
+}
+
+impl Action for action::SidebarBottom {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.sidebar_cursor_to_edge(false);
+    }
+}
+
+impl Action for action::SidebarNextProject {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.sidebar_cursor_project_jump(1);
+    }
+}
+
+impl Action for action::SidebarPreviousProject {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.sidebar_cursor_project_jump(-1);
+    }
+}
+
+impl Action for action::DeleteSelected {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        match app.sidebar.cursor.clone() {
+            Some(SidebarRow::Session(id)) => app.request_close_session(ctx, id),
+            Some(SidebarRow::Worktree(path)) => app.request_worktree_delete(&path),
+            Some(SidebarRow::Project(root)) => {
+                if let Some(p) = app.projects.iter().find(|p| p.root == root) {
+                    app.modals.pending_project_remove =
+                        Some(ProjectRemoveState { name: p.display_name().to_string(), root });
+                }
+            },
+            Some(SidebarRow::Home) | Some(SidebarRow::HerdrAgent(..)) | None => {},
+        }
+    }
+}
+
+impl Action for action::RenameSelected {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        // Only project rows carry an editable label; sessions and
+        // worktrees take their names from the terminal title and the
+        // `[ui] worktree_name` template.
+        if let Some(SidebarRow::Project(root)) = app.sidebar.cursor.clone() {
+            if let Some(p) = app.projects.iter().find(|p| p.root == root) {
+                app.modals.pending_rename =
+                    Some(RenameState { root, label: p.display_name().to_string() });
+            }
+        }
+    }
+}
+
+impl Action for action::ToggleProjectExpanded {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        let Some(cursor) = app.sidebar.cursor.clone() else {
+            return;
+        };
+        let root = {
+            let session_workspace = |id: SessionId| {
+                app.sessions.iter().find(|s| s.id == id).map(|s| s.working_directory.clone())
+            };
+            row_project_root(&app.projects, session_workspace, &cursor)
+        };
+        if let Some(root) = root {
+            let expanded = app.projects.iter().find(|p| p.root == root).is_some_and(|p| p.expanded);
+            app.set_project_expanded(&root, !expanded);
+            // Collapsing hides the cursored child; move the cursor to
+            // the header so it doesn't point at a now-invisible row.
+            if expanded && !matches!(cursor, SidebarRow::Project(_)) {
+                app.set_sidebar_cursor(SidebarRow::Project(root));
+            }
+        }
+    }
+}
+
+impl Action for action::ClearProjectFilters {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.sidebar.filter.clear_toggles();
+    }
+}
+
+impl Action for action::ToggleLeftSidebar {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.show_left_sidebar = !app.show_left_sidebar;
+        // A deliberate visibility change opts out of the auto-shown
+        // round trip, and a hidden sidebar cannot keep keyboard focus.
+        app.sidebar_auto_shown = false;
+        if !app.show_left_sidebar && app.focus == PaneFocus::ProjectsSidebar {
+            app.focus = PaneFocus::Terminal;
+        }
+        app.persist_sidebars();
+    }
+}
+
+impl Action for action::ToggleSidebarFocus {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        match app.focus {
+            PaneFocus::Terminal => app.focus_sidebar(),
+            PaneFocus::ProjectsSidebar => app.focus_terminal(),
+            // Toggle stays "left <-> terminal"; from the right panel it
+            // hops to the left one rather than doing nothing.
+            PaneFocus::GitSidebar => app.focus_sidebar(),
+        }
+    }
+}
+
+impl Action for action::CloseSession {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        let cursored = if app.focus == PaneFocus::ProjectsSidebar {
+            match &app.sidebar.cursor {
+                Some(SidebarRow::Session(id)) => Some(*id),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let target =
+            cursored.or_else(|| app.active_session_index().map(|idx| app.sessions[idx].id));
+        if let Some(id) = target {
+            app.request_close_session(ctx, id);
+        }
+    }
+}
+
+impl Action for action::FocusProjectsSidebar {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        if app.focus != PaneFocus::ProjectsSidebar {
+            app.focus_sidebar();
+        }
+    }
+}
+
+impl Action for action::ToggleSessionsFilter {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.toggle_project_filter((*self).into());
+    }
+}
+
+impl Action for action::ToggleAttentionFilter {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.toggle_project_filter((*self).into());
+    }
+}
+
+impl Action for action::TogglePrOpenFilter {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.toggle_project_filter((*self).into());
+    }
+}
+
+impl Action for action::TogglePrDraftFilter {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.toggle_project_filter((*self).into());
+    }
+}
+
+impl Action for action::TogglePrMergedFilter {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.toggle_project_filter((*self).into());
+    }
+}
+
+impl Action for action::TogglePrClosedFilter {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        app.toggle_project_filter((*self).into());
     }
 }
 
@@ -2124,12 +2197,12 @@ pub(super) fn project_filter_toggles(pr_status: bool) -> &'static [char] {
 /// the call site can catch a wrong pairing — assert it here instead.
 pub(super) fn project_filter_identity(action: NamedAction) -> Option<char> {
     match action {
-        NamedAction::ToggleSessionsFilter => Some('s'),
-        NamedAction::ToggleAttentionFilter => Some('a'),
-        NamedAction::TogglePrOpenFilter => Some('o'),
-        NamedAction::TogglePrDraftFilter => Some('d'),
-        NamedAction::TogglePrMergedFilter => Some('m'),
-        NamedAction::TogglePrClosedFilter => Some('c'),
+        NamedAction::ToggleSessionsFilter(_) => Some('s'),
+        NamedAction::ToggleAttentionFilter(_) => Some('a'),
+        NamedAction::TogglePrOpenFilter(_) => Some('o'),
+        NamedAction::TogglePrDraftFilter(_) => Some('d'),
+        NamedAction::TogglePrMergedFilter(_) => Some('m'),
+        NamedAction::TogglePrClosedFilter(_) => Some('c'),
         _ => None,
     }
 }
@@ -2585,20 +2658,20 @@ mod tests {
     #[test]
     fn the_projects_filter_actions_map_to_their_identities() {
         for (action, identity) in [
-            (NamedAction::ToggleSessionsFilter, Some('s')),
-            (NamedAction::ToggleDetachedSessionsFilter, None),
-            (NamedAction::ToggleAttentionFilter, Some('a')),
-            (NamedAction::TogglePrOpenFilter, Some('o')),
-            (NamedAction::TogglePrDraftFilter, Some('d')),
-            (NamedAction::TogglePrMergedFilter, Some('m')),
-            (NamedAction::TogglePrClosedFilter, Some('c')),
-            (NamedAction::ClearProjectFilters, None),
-            (NamedAction::ToggleModifiedFilter, None),
-            (NamedAction::ToggleDeletedFilter, None),
-            (NamedAction::ToggleUntrackedFilter, None),
-            (NamedAction::ToggleSearchScope, None),
-            (NamedAction::RefreshPrStatus, None),
-            (NamedAction::Paste, None),
+            (NamedAction::ToggleSessionsFilter(action::ToggleSessionsFilter), Some('s')),
+            (NamedAction::ToggleDetachedSessionsFilter(action::ToggleDetachedSessionsFilter), None),
+            (NamedAction::ToggleAttentionFilter(action::ToggleAttentionFilter), Some('a')),
+            (NamedAction::TogglePrOpenFilter(action::TogglePrOpenFilter), Some('o')),
+            (NamedAction::TogglePrDraftFilter(action::TogglePrDraftFilter), Some('d')),
+            (NamedAction::TogglePrMergedFilter(action::TogglePrMergedFilter), Some('m')),
+            (NamedAction::TogglePrClosedFilter(action::TogglePrClosedFilter), Some('c')),
+            (NamedAction::ClearProjectFilters(action::ClearProjectFilters), None),
+            (NamedAction::ToggleModifiedFilter(action::ToggleModifiedFilter), None),
+            (NamedAction::ToggleDeletedFilter(action::ToggleDeletedFilter), None),
+            (NamedAction::ToggleUntrackedFilter(action::ToggleUntrackedFilter), None),
+            (NamedAction::ToggleSearchScope(action::ToggleSearchScope), None),
+            (NamedAction::RefreshPrStatus(action::RefreshPrStatus), None),
+            (NamedAction::Paste(action::Paste), None),
         ] {
             assert_eq!(project_filter_identity(action), identity, "{action:?}");
             if let Some(key) = identity {

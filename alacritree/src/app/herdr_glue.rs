@@ -908,31 +908,31 @@ impl AlacritreeApp {
     }
 }
 
-impl AlacritreeApp {
-    pub(super) fn dispatch_herdr_action(&mut self, ctx: &Context, action: NamedAction) -> bool {
-        match action {
-            NamedAction::NewMultiplexerPane => {
-                if !self.config.integrations.herdr.enabled {
-                    self.modals.error_dialog = Some(HERDR_DISABLED.to_string());
-                } else {
-                    match self.default_multiplexer_side() {
-                        Ok(side) => {
-                            let workspace = self.current_workspace.clone();
-                            self.create_multiplexer_pane(ctx, side, workspace, None);
-                        },
-                        Err(e) => self.modals.error_dialog = Some(e),
-                    }
-                }
-            },
-            NamedAction::AttachAllMultiplexerPanes => {
-                self.attach_every_multiplexer_pane(ctx);
-            },
-            NamedAction::DetachAllMultiplexerPanes => {
-                self.detach_every_multiplexer_pane(ctx);
-            },
-            _ => return false,
+impl Action for action::NewMultiplexerPane {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        if !app.config.integrations.herdr.enabled {
+            app.modals.error_dialog = Some(HERDR_DISABLED.to_string());
+            return;
         }
-        true
+        match app.default_multiplexer_side() {
+            Ok(side) => {
+                let workspace = app.current_workspace.clone();
+                app.create_multiplexer_pane(ctx, side, workspace, None);
+            },
+            Err(e) => app.modals.error_dialog = Some(e),
+        }
+    }
+}
+
+impl Action for action::AttachAllMultiplexerPanes {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        app.attach_every_multiplexer_pane(ctx);
+    }
+}
+
+impl Action for action::DetachAllMultiplexerPanes {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        app.detach_every_multiplexer_pane(ctx);
     }
 }
 

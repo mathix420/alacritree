@@ -103,6 +103,12 @@
                 "SidebarSearchCancelToTerminal",
                 "Quit",
                 "TogglePalette",
+                "PaletteTop",
+                "PaletteBottom",
+                "PalettePageUp",
+                "PalettePageDown",
+                "None",
+                "ReceiveChar",
                 "ToggleSessionsFilter",
                 "ToggleDetachedSessionsFilter",
                 "ToggleAttentionFilter",
@@ -120,6 +126,10 @@
                 "ReviewStaged",
                 "ReviewUnstaged",
                 "ReviewBranch",
+                "RefreshProjects",
+                "DeleteSelected",
+                "RenameSelected",
+                "ToggleProjectExpanded",
                 "SelectTab1",
                 "SelectTab2",
                 "SelectTab3",
@@ -137,9 +147,7 @@
                 "SpawnProfile6",
                 "SpawnProfile7",
                 "SpawnProfile8",
-                "SpawnProfile9",
-                "None",
-                "ReceiveChar"
+                "SpawnProfile9"
               ]
             },
             {
