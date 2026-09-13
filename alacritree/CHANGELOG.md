@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/mathix420/alacritree/compare/v0.12.0...v0.13.0) (2026-09-13)
+
+
+### Features
+
+* **cli:** resolve project refresh from a path, add --all ([#225](https://github.com/mathix420/alacritree/issues/225)) ([f051b77](https://github.com/mathix420/alacritree/commit/f051b774df3fcf4b65030b5a776404fc80b657ef))
+
 ## [0.12.0](https://github.com/mathix420/alacritree/compare/v0.11.0...v0.12.0) (2026-09-12)
 
 
