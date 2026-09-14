@@ -228,7 +228,7 @@ impl VisitBudget {
 
 /// Owns the PTY because `EventedReadWrite` hands out `&mut Self::Reader`, and
 /// only the type holding the reader can supply that.
-pub struct RearmingReader {
+pub(crate) struct RearmingReader {
     pty: Pty,
     poller: Option<Arc<Poller>>,
     staged: Staging,
@@ -257,12 +257,12 @@ impl Read for RearmingReader {
     }
 }
 
-pub struct RearmingPty {
+pub(crate) struct RearmingPty {
     reader: RearmingReader,
 }
 
 impl RearmingPty {
-    pub fn new(pty: Pty) -> Self {
+    pub(crate) fn new(pty: Pty) -> Self {
         Self {
             reader: RearmingReader {
                 pty,

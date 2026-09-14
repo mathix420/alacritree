@@ -73,7 +73,7 @@ fn set_boosted(pid: u32, boosted: bool) {
 ///
 /// Asked for every frame, so the state is remembered and an unchanged answer
 /// costs no syscall.
-pub fn set_self_boosted(boosted: bool) {
+pub(crate) fn set_self_boosted(boosted: bool) {
     static SELF_BOOSTED: AtomicBool = AtomicBool::new(false);
     if SELF_BOOSTED.swap(boosted, Ordering::Relaxed) != boosted {
         set_boosted(std::process::id(), boosted);
@@ -82,7 +82,7 @@ pub fn set_self_boosted(boosted: bool) {
 
 /// A job object holding one session's shell, and through it everything the
 /// shell goes on to start.
-pub struct PriorityJob {
+pub(crate) struct PriorityJob {
     job: Owned,
     boosted: Cell<bool>,
     /// Whether closing this job ends what it holds.  Fixed at creation, since
@@ -115,7 +115,7 @@ impl PriorityJob {
     /// Taking a pid rather than the caller's handle is safe here because the
     /// caller holds one: a process cannot have its number reused while any
     /// handle to it is open.
-    pub fn adopt(pid: u32, reaping: bool) -> Option<Self> {
+    pub(crate) fn adopt(pid: u32, reaping: bool) -> Option<Self> {
         let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if job.is_null() {
             log::debug!("could not create a job for {pid}: {}", io::Error::last_os_error());
@@ -143,7 +143,7 @@ impl PriorityJob {
     /// Raise every member one class above the load, or return them all to
     /// normal.  Focus asks for this every frame, so an unchanged state costs
     /// nothing.
-    pub fn set_boosted(&self, boosted: bool) {
+    pub(crate) fn set_boosted(&self, boosted: bool) {
         if self.boosted.get() == boosted {
             return;
         }

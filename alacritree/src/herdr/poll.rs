@@ -25,7 +25,7 @@ const GRACE_POLLS: u32 = 3;
 /// per tick; a side that has a herdr is retried forever, because starting the
 /// server is the ordinary thing to do after alacritree is already open.
 #[derive(Debug, Default)]
-pub struct Reach {
+pub(super) struct Reach {
     ever_answered: bool,
     failing: bool,
     /// Whether the last failure was one that waiting cannot fix.
@@ -35,7 +35,7 @@ pub struct Reach {
 
 impl Reach {
     /// Whether to poll again, given how long it has been since the last try.
-    pub fn should_retry(&self, since_last: Duration) -> bool {
+    pub(super) fn should_retry(&self, since_last: Duration) -> bool {
         if !self.failing {
             return true;
         }
@@ -44,11 +44,11 @@ impl Reach {
 
     /// Whether this endpoint has been given up on for the process lifetime:
     /// no herdr has ever spoken from it, and the last try found none there.
-    pub fn abandoned(&self) -> bool {
+    pub(super) fn abandoned(&self) -> bool {
         self.failing && self.absent && !self.ever_answered
     }
 
-    pub fn record_success(&mut self) {
+    pub(super) fn record_success(&mut self) {
         self.ever_answered = true;
         self.failing = false;
         self.absent = false;
@@ -57,7 +57,7 @@ impl Reach {
 
     /// Records a failure, returning whether it is worth logging — a code
     /// repeating every tick is logged once, not once per poll.
-    pub fn record_failure(&mut self, error: &PollError) -> bool {
+    pub(super) fn record_failure(&mut self, error: &PollError) -> bool {
         self.failing = true;
         self.absent = matches!(error, PollError::Absent(_));
         let novel = self.last_error.as_deref() != Some(error.code());
@@ -198,7 +198,7 @@ impl EndpointCache {
 
     /// A cache holding one listing at a chosen sample time, for tests that
     /// drive `HerdrViewSync` without a poll behind them.
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn for_test(side: Side, agents: Vec<Agent>, sampled_at: Instant) -> Self {
         let mut cache = Self::new(side);
         cache.agents = agents;

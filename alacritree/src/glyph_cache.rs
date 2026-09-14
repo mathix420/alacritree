@@ -20,7 +20,7 @@ use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
 /// Which of the four terminal faces a glyph is drawn with.  Cheaper to hash
 /// than a `FontId`, whose `f32` size is not `Hash` anyway.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Face {
+pub(crate) enum Face {
     Normal,
     Bold,
     Italic,
@@ -28,7 +28,7 @@ pub enum Face {
 }
 
 impl Face {
-    pub fn new(bold: bool, italic: bool) -> Self {
+    pub(crate) fn new(bold: bool, italic: bool) -> Self {
         match (bold, italic) {
             (true, true) => Self::BoldItalic,
             (true, false) => Self::Bold,
@@ -69,7 +69,7 @@ const OVERFLOW_SLACK: f32 = 1.25;
 /// Ceiling on how many extra cells one glyph may claim, mirroring kitty's
 /// `MAX_NUM_EXTRA_GLYPHS_PUA`.  A face reporting an absurd advance must not
 /// swallow the rest of the line.
-pub const MAX_EXTRA_CELLS: usize = 4;
+pub(crate) const MAX_EXTRA_CELLS: usize = 4;
 
 /// How many cells a laid-out glyph should be drawn across, given how many
 /// blank cells follow it.
@@ -79,7 +79,7 @@ pub const MAX_EXTRA_CELLS: usize = 4;
 /// the terminal gave it.  kitty grows such a glyph over the blanks that
 /// follow rather than letting it overrun them; blanks are the only cells it
 /// may take, since anything else is a character it would paint over.
-pub fn grown_cells(glyph_w: f32, cell_w: f32, spare: usize) -> usize {
+pub(crate) fn grown_cells(glyph_w: f32, cell_w: f32, spare: usize) -> usize {
     if !(glyph_w > cell_w * OVERFLOW_SLACK) || cell_w <= 0.0 {
         return 1;
     }
@@ -100,7 +100,7 @@ pub fn grown_cells(glyph_w: f32, cell_w: f32, spare: usize) -> usize {
 /// marks read as part of the segment beside them rather than as icons in
 /// their own right, so a wider one looks wrong where a clipped one only looks
 /// cramped.
-pub fn may_grow(c: char) -> bool {
+pub(crate) fn may_grow(c: char) -> bool {
     matches!(
         c,
         '\u{e000}'..='\u{f8ff}' | '\u{f0000}'..='\u{ffffd}' | '\u{100000}'..='\u{10fffd}'
@@ -115,7 +115,7 @@ pub fn may_grow(c: char) -> bool {
 /// put it left of its own cell, over the character before it.  Such a glyph
 /// stays where it started and overruns to the right, as it does with growth
 /// off.
-pub fn growth_offset(glyph_w: f32, cell_w: f32, spare: usize) -> f32 {
+pub(crate) fn growth_offset(glyph_w: f32, cell_w: f32, spare: usize) -> f32 {
     let cells = grown_cells(glyph_w, cell_w, spare);
     ((cells as f32 * cell_w - glyph_w) / 2.0).max(0.0)
 }
@@ -155,7 +155,7 @@ impl AtlasState {
 }
 
 #[derive(Default)]
-pub struct GlyphCache {
+pub(crate) struct GlyphCache {
     /// Point size the cached galleys were laid out at.  A font-size change
     /// (zoom, config reload) invalidates every one of them.
     size: f32,
@@ -167,7 +167,7 @@ pub struct GlyphCache {
 }
 
 impl GlyphCache {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -179,7 +179,7 @@ impl GlyphCache {
     /// changes, or the atlas passes 80% full.  Glyphs are repacked into
     /// different positions, so a galley held across that boundary addresses
     /// whatever landed in its old slot and paints some other character.
-    pub fn begin_frame(&mut self, ctx: &Context) {
+    pub(crate) fn begin_frame(&mut self, ctx: &Context) {
         let now = AtlasState::read(ctx);
         if self.atlas.is_some_and(|prev| prev.outlived_by(now)) {
             self.entries.clear();
@@ -189,7 +189,7 @@ impl GlyphCache {
 
     /// The galley for `ch` in `face`, laid out once and reused.  Colour is not
     /// baked in: callers override it per cell.
-    pub fn get(&mut self, ctx: &Context, ch: char, face: Face, size: f32) -> Arc<Galley> {
+    pub(crate) fn get(&mut self, ctx: &Context, ch: char, face: Face, size: f32) -> Arc<Galley> {
         if self.size != size {
             self.entries.clear();
             self.size = size;
@@ -203,7 +203,7 @@ impl GlyphCache {
     }
 
     #[cfg(test)]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 }

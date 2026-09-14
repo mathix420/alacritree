@@ -7,19 +7,19 @@ use alacritty_terminal::index::Point;
 use alacritty_terminal::term::TermMode;
 use egui::Modifiers;
 
-pub const BUTTON_LEFT: u8 = 0;
-pub const BUTTON_MIDDLE: u8 = 1;
-pub const BUTTON_RIGHT: u8 = 2;
+pub(crate) const BUTTON_LEFT: u8 = 0;
+pub(crate) const BUTTON_MIDDLE: u8 = 1;
+pub(crate) const BUTTON_RIGHT: u8 = 2;
 
 /// Motion reports add 32 to the held button's code; `MOTION_NONE` is used for
 /// pointer movement with no button down (any-motion tracking).
-pub const MOTION_OFFSET: u8 = 32;
-pub const MOTION_NONE: u8 = 35;
+pub(crate) const MOTION_OFFSET: u8 = 32;
+pub(crate) const MOTION_NONE: u8 = 35;
 
-pub const WHEEL_UP: u8 = 64;
-pub const WHEEL_DOWN: u8 = 65;
-pub const WHEEL_LEFT: u8 = 66;
-pub const WHEEL_RIGHT: u8 = 67;
+pub(crate) const WHEEL_UP: u8 = 64;
+pub(crate) const WHEEL_DOWN: u8 = 65;
+pub(crate) const WHEEL_LEFT: u8 = 66;
+pub(crate) const WHEEL_RIGHT: u8 = 67;
 
 /// xterm modifier bits for mouse reports: Shift +4, Alt +8, Ctrl +16.
 fn modifier_offset(mods: Modifiers) -> u8 {
@@ -34,7 +34,7 @@ fn modifier_offset(mods: Modifiers) -> u8 {
 /// active encoding can express.  Mirrors alacritty's `mouse_report`: SGR keeps
 /// the button and marks release with a trailing `m`; the legacy encoding can't
 /// name the button on release, so it reports button 3.
-pub fn mouse_report(
+pub(crate) fn mouse_report(
     mode: TermMode,
     point: Point,
     button: u8,
@@ -92,7 +92,12 @@ fn normal_mouse_report(mode: TermMode, point: Point, button: u8) -> Option<Vec<u
 
 /// Encode one wheel tick.  Wheel ticks are momentary, so they always report as
 /// a press.
-pub fn wheel_report(mode: TermMode, point: Point, button: u8, mods: Modifiers) -> Option<Vec<u8>> {
+pub(crate) fn wheel_report(
+    mode: TermMode,
+    point: Point,
+    button: u8,
+    mods: Modifiers,
+) -> Option<Vec<u8>> {
     mouse_report(mode, point, button, true, mods)
 }
 

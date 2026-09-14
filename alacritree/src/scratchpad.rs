@@ -27,23 +27,23 @@ const MAX_MCP_BYTES: usize = 256 * 1024;
 /// written to `path`; `save_error` is painted in-place instead of replacing
 /// the editor with a modal, so a transient filesystem failure never loses the
 /// user's buffer.
-pub struct Editor {
+pub(crate) struct Editor {
     path: PathBuf,
     text: String,
     save_error: Option<String>,
 }
 
 impl Editor {
-    pub fn open(path: PathBuf) -> io::Result<Self> {
+    pub(crate) fn open(path: PathBuf) -> io::Result<Self> {
         let text = fs::read_to_string(&path)?;
         Ok(Self { path, text, save_error: None })
     }
 
-    pub fn text(&self) -> &str {
+    pub(crate) fn text(&self) -> &str {
         &self.text
     }
 
-    pub fn insert_at_cursor(&mut self, ctx: &egui::Context, session_id: u64, text: &str) {
+    pub(crate) fn insert_at_cursor(&mut self, ctx: &egui::Context, session_id: u64, text: &str) {
         if text.is_empty() {
             return;
         }
@@ -64,7 +64,7 @@ impl Editor {
     /// caller inserting a block can tell whether it needs its own newlines.
     /// A selection is replaced, so the following character is the one at the
     /// end of the range, not the start.
-    pub fn cursor_boundary(
+    pub(crate) fn cursor_boundary(
         &self,
         ctx: &egui::Context,
         session_id: u64,
@@ -79,7 +79,7 @@ impl Editor {
         (preceding, self.text.chars().nth(max.index))
     }
 
-    pub fn selected_text(&self, ctx: &egui::Context, session_id: u64) -> Option<String> {
+    pub(crate) fn selected_text(&self, ctx: &egui::Context, session_id: u64) -> Option<String> {
         let state = TextEdit::load_state(ctx, editor_id(session_id))?;
         let [min, max] = state.cursor.char_range()?.sorted();
         (min.index != max.index).then(|| self.text.char_range(min.index..max.index).to_string())
@@ -92,14 +92,14 @@ impl Editor {
     }
 }
 
-pub fn editor_id(session_id: u64) -> Id {
+fn editor_id(session_id: u64) -> Id {
     Id::new(("scratchpad-editor", session_id))
 }
 
 /// Full-pane editor inspired by notes.vercel.app: no toolbar, border, status
 /// chrome, or explicit save action—just a padded text surface that inherits
 /// the terminal pane's background.
-pub fn show_editor(
+pub(crate) fn show_editor(
     ui: &mut egui::Ui,
     session_id: u64,
     editor: &mut Editor,
@@ -171,7 +171,7 @@ pub fn show_editor(
     response
 }
 
-pub fn ensure_file(workspace: &WorkspaceKey) -> io::Result<PathBuf> {
+pub(crate) fn ensure_file(workspace: &WorkspaceKey) -> io::Result<PathBuf> {
     let config_dir = state::config_dir().ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, "could not locate alacritree's config directory")
     })?;
@@ -187,7 +187,7 @@ fn ensure_file_in(config_dir: &Path, workspace: &WorkspaceKey) -> io::Result<Pat
     Ok(path)
 }
 
-pub fn path_for(workspace: &WorkspaceKey) -> Option<PathBuf> {
+pub(crate) fn path_for(workspace: &WorkspaceKey) -> Option<PathBuf> {
     Some(path_for_in(&state::config_dir()?, workspace))
 }
 
@@ -231,7 +231,7 @@ fn slug(input: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-pub fn read_json(workspace: &WorkspaceKey) -> Result<Value, String> {
+pub(crate) fn read_json(workspace: &WorkspaceKey) -> Result<Value, String> {
     let path = path_for(workspace)
         .ok_or_else(|| "could not locate alacritree's config directory".to_string())?;
     read_json_at(&path, workspace)

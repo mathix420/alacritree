@@ -29,9 +29,9 @@ use crate::config::{FontConfig, UiFont};
 /// when someone has hundreds of fonts installed.
 const MAX_FALLBACK_FACES: usize = 32;
 
-pub const BOLD_FAMILY: &str = "alacritree_bold";
-pub const ITALIC_FAMILY: &str = "alacritree_italic";
-pub const BOLD_ITALIC_FAMILY: &str = "alacritree_bold_italic";
+pub(crate) const BOLD_FAMILY: &str = "alacritree_bold";
+pub(crate) const ITALIC_FAMILY: &str = "alacritree_italic";
+pub(crate) const BOLD_ITALIC_FAMILY: &str = "alacritree_bold_italic";
 
 /// Glyphs alacritree paints itself, so the chrome renders on systems whose
 /// fonts lack them.  Appended last in each chrome family, so an installed
@@ -54,9 +54,9 @@ const UI_FAMILY: &str = "alacritree_ui";
 /// `BOLD_FAMILY`/`ITALIC_FAMILY`/`BOLD_ITALIC_FAMILY` (the terminal grid's
 /// variant faces) so a `[ui.font]` override never changes what bold/italic
 /// cells render in the terminal.
-pub const UI_BOLD_FAMILY: &str = "alacritree_ui_bold";
-pub const UI_ITALIC_FAMILY: &str = "alacritree_ui_italic";
-pub const UI_BOLD_ITALIC_FAMILY: &str = "alacritree_ui_bold_italic";
+pub(crate) const UI_BOLD_FAMILY: &str = "alacritree_ui_bold";
+pub(crate) const UI_ITALIC_FAMILY: &str = "alacritree_ui_italic";
+pub(crate) const UI_BOLD_ITALIC_FAMILY: &str = "alacritree_ui_bold_italic";
 
 #[derive(Clone, Copy)]
 enum Variant {
@@ -347,13 +347,13 @@ mod disk_cache {
     const MAGIC: &[u8; 4] = b"ATCC";
     const VERSION: u32 = 1;
 
-    pub struct CachedFile {
+    pub(super) struct CachedFile {
         pub size: u64,
         pub mtime_millis: u64,
         pub faces: HashMap<u32, Vec<(u32, u32)>>,
     }
 
-    pub fn default_cache_path() -> Option<PathBuf> {
+    pub(super) fn default_cache_path() -> Option<PathBuf> {
         let local_app_data = std::env::var_os("LOCALAPPDATA")?;
         Some(PathBuf::from(local_app_data).join("alacritree").join("coverage-cache.v1.bin"))
     }
@@ -361,14 +361,14 @@ mod disk_cache {
     /// A file's identity for cache purposes: byte size plus modification
     /// time.  Either changing is treated as "this file might have new
     /// glyphs" and forces a rescan of every face in it.
-    pub fn stat_file(path: &Path) -> Option<(u64, u64)> {
+    pub(super) fn stat_file(path: &Path) -> Option<(u64, u64)> {
         let meta = std::fs::metadata(path).ok()?;
         let modified = meta.modified().ok()?;
         let millis = modified.duration_since(UNIX_EPOCH).ok()?.as_millis() as u64;
         Some((meta.len(), millis))
     }
 
-    pub fn load(path: &Path) -> Option<HashMap<String, CachedFile>> {
+    pub(super) fn load(path: &Path) -> Option<HashMap<String, CachedFile>> {
         let bytes = std::fs::read(path).ok()?;
         parse(&bytes)
     }
@@ -426,7 +426,7 @@ mod disk_cache {
 
     /// Font problems must never fail startup, so every I/O error here is
     /// swallowed after a debug log; the next launch simply rescans.
-    pub fn write(path: &Path, files: &HashMap<String, CachedFile>) {
+    pub(super) fn write(path: &Path, files: &HashMap<String, CachedFile>) {
         let mut buf = Vec::new();
         buf.extend_from_slice(MAGIC);
         buf.extend_from_slice(&VERSION.to_le_bytes());
@@ -471,7 +471,7 @@ mod disk_cache {
 /// colour glyph renderer resolves against this same order and must see the
 /// face the user asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ChainFace {
+pub(crate) struct ChainFace {
     pub path: PathBuf,
     pub face_index: u32,
     /// egui cannot rasterize this face; only the colour glyph renderer can.
@@ -705,7 +705,7 @@ const STRIKEOUT_ASCENDER_RATIO: f32 = 0.35;
 /// a strikeout position is positive, and so is the ascender while the
 /// descender is negative.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct FaceMetrics {
+pub(crate) struct FaceMetrics {
     pub ascender: f32,
     pub descender: f32,
     pub underline_position: f32,
@@ -730,7 +730,7 @@ impl Default for FaceMetrics {
 impl FaceMetrics {
     /// Read face `index` of `data`.  Anything the face leaves at zero, omits,
     /// or cannot express is filled in by `resolve_fallbacks`.
-    pub fn from_face(data: &[u8], index: u32) -> Self {
+    pub(crate) fn from_face(data: &[u8], index: u32) -> Self {
         let Ok(face) = ttf_parser::Face::parse(data, index) else {
             log::warn!("could not parse the terminal face; using default decoration metrics");
             return Self::default();
@@ -1009,7 +1009,7 @@ fn install_symbol_fallback(defs: &mut FontDefinitions, ui: &UiFont) {
 
 /// Maps ANSI-style bold/italic flags onto the chrome font family carrying
 /// that style; unstyled text keeps using `Proportional` directly.
-pub fn ui_variant_family(bold: bool, italic: bool) -> FontFamily {
+pub(crate) fn ui_variant_family(bold: bool, italic: bool) -> FontFamily {
     match (bold, italic) {
         (false, false) => FontFamily::Proportional,
         (true, false) => FontFamily::Name(UI_BOLD_FAMILY.into()),
@@ -1022,7 +1022,7 @@ pub fn ui_variant_family(bold: bool, italic: bool) -> FontFamily {
 /// fallback chain, in the order egui consults it, for the colour glyph
 /// renderer to resolve against, together with the decoration metrics of the
 /// face at its head.
-pub fn install_terminal_fonts(
+pub(crate) fn install_terminal_fonts(
     ctx: &Context,
     font: &FontConfig,
     ui: &UiFont,
@@ -1656,7 +1656,11 @@ mod fontconfig_resolve {
 
     use super::{FallbackFace, ResolvedFace, Variant};
 
-    pub fn resolve(family: &str, style: Option<&str>, variant: Variant) -> Option<ResolvedFace> {
+    pub(super) fn resolve(
+        family: &str,
+        style: Option<&str>,
+        variant: Variant,
+    ) -> Option<ResolvedFace> {
         let fc = Fontconfig::new()?;
         let mut pattern = Pattern::new(&fc);
 
@@ -1688,7 +1692,7 @@ mod fontconfig_resolve {
     /// font's named instances (FreeType's encoding).  ttf_parser and epaint
     /// take a plain collection index and cannot apply a named instance
     /// anyway, so the default instance stands in for the named one.
-    pub fn plain_face_index(index: i32) -> u32 {
+    pub(super) fn plain_face_index(index: i32) -> u32 {
         (index.max(0) as u32) & 0xFFFF
     }
 
@@ -1696,7 +1700,7 @@ mod fontconfig_resolve {
     /// any whose Unicode coverage is fully covered by an earlier entry.  This
     /// is the same chain `FcFontMatch` walks per glyph when crossfont misses,
     /// so registering it up front in egui gives equivalent coverage.
-    pub fn sorted_fallbacks(
+    pub(super) fn sorted_fallbacks(
         family: &str,
         style: Option<&str>,
         variant: Variant,
@@ -2808,12 +2812,12 @@ mod coverage {
     use std::path::PathBuf;
 
     #[derive(Clone, Debug, Default, PartialEq)]
-    pub struct Coverage {
+    pub(super) struct Coverage {
         ranges: Vec<(u32, u32)>,
     }
 
     #[derive(Clone, Debug, PartialEq)]
-    pub struct Candidate {
+    pub(super) struct Candidate {
         pub path: PathBuf,
         pub face_index: u32,
         pub family: String,
@@ -2828,7 +2832,7 @@ mod coverage {
     impl Coverage {
         /// Build from an arbitrary codepoint list: sorted, deduped, and
         /// collapsed into inclusive, disjoint ranges.
-        pub fn from_codepoints(mut codepoints: Vec<u32>) -> Self {
+        pub(super) fn from_codepoints(mut codepoints: Vec<u32>) -> Self {
             codepoints.sort_unstable();
             codepoints.dedup();
             let mut ranges: Vec<(u32, u32)> = Vec::new();
@@ -2850,7 +2854,7 @@ mod coverage {
         /// through `from_codepoints`, which is why `walk` is `Fn`: `codepoints`
         /// has no early exit, so the first pass has to finish before the second
         /// can start.
-        pub fn from_ascending_walk(walk: impl Fn(&mut dyn FnMut(u32))) -> Self {
+        pub(super) fn from_ascending_walk(walk: impl Fn(&mut dyn FnMut(u32))) -> Self {
             let mut ranges: Vec<(u32, u32)> = Vec::new();
             let mut ascending = true;
             walk(&mut |cp| {
@@ -2877,7 +2881,7 @@ mod coverage {
         /// The Unicode bound matters too: a well-formed but bogus range like
         /// `(0, u32::MAX)` would mark everything as covered and silently empty
         /// the automatic chain until the font file changes.
-        pub fn from_stored_ranges(ranges: Vec<(u32, u32)>) -> Option<Self> {
+        pub(super) fn from_stored_ranges(ranges: Vec<(u32, u32)>) -> Option<Self> {
             if ranges.iter().any(|&(start, end)| start > end || end > 0x10FFFF) {
                 return None;
             }
@@ -2887,11 +2891,11 @@ mod coverage {
             Some(Self { ranges })
         }
 
-        pub fn ranges(&self) -> &[(u32, u32)] {
+        pub(super) fn ranges(&self) -> &[(u32, u32)] {
             &self.ranges
         }
 
-        pub fn merge(&mut self, other: &Coverage) {
+        pub(super) fn merge(&mut self, other: &Coverage) {
             let mut merged: Vec<(u32, u32)> =
                 Vec::with_capacity(self.ranges.len() + other.ranges.len());
             let push = |merged: &mut Vec<(u32, u32)>, range: (u32, u32)| match merged.last_mut() {
@@ -2921,7 +2925,7 @@ mod coverage {
         /// How many codepoints `self` covers that `other` doesn't — the
         /// FcFontSort(trim) keep-test, counted rather than merely detected so
         /// the trim can weigh what a face adds against what it costs.
-        pub fn novel_codepoints(&self, other: &Coverage) -> u64 {
+        pub(super) fn novel_codepoints(&self, other: &Coverage) -> u64 {
             let mut novel = 0;
             let mut i = 0;
             for &(start, end) in &self.ranges {
@@ -2977,7 +2981,7 @@ mod coverage {
     /// same-family siblings, then weight/slant matches, then monospace, then
     /// everything else; ties break on family name, path, and face index so
     /// the resulting chain is deterministic across runs.
-    pub fn order_candidates(
+    pub(super) fn order_candidates(
         candidates: &mut [(Candidate, Coverage)],
         family: &str,
         weight: u16,
@@ -3003,7 +3007,7 @@ mod coverage {
     /// keeping only faces that cover codepoints the seed face and the
     /// already-kept faces don't — and, for the large ones, enough of them to
     /// justify carrying the face at all.
-    pub fn trim_by_coverage(
+    pub(super) fn trim_by_coverage(
         candidates: Vec<(Candidate, Coverage)>,
         seed_coverage: &Coverage,
         limit: usize,

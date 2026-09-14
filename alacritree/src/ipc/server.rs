@@ -29,7 +29,7 @@ use crate::{git_status, jobs};
 /// Absolute path to the running binary.  A shell can exec the CLI through it
 /// without a PATH lookup — which is the only reliable way in a distro, where
 /// the Windows binary is reachable through interop but is not on `$PATH`.
-pub const EXE_ENV: &str = "ALACRITREE_EXE";
+const EXE_ENV: &str = "ALACRITREE_EXE";
 
 /// How long a connection waits for the UI thread before giving up — long
 /// enough for a busy frame, short enough that a wedged app doesn't hang
@@ -49,19 +49,19 @@ const IPC_CREATE_BUDGET: Duration = Duration::from_secs(240);
 
 /// One request en route to the UI thread, with the channel the connection
 /// thread is blocking on for the reply.
-pub struct AppCall {
+pub(crate) struct AppCall {
     pub request: IpcRequest,
     pub reply_tx: Sender<IpcResult>,
 }
 
 /// Owns the socket; dropping it (app shutdown) unlinks the path so clients
 /// don't find a dead socket.
-pub struct SocketHandle {
+pub(crate) struct SocketHandle {
     path: PathBuf,
 }
 
 impl SocketHandle {
-    pub fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 }
@@ -72,7 +72,9 @@ impl Drop for SocketHandle {
     }
 }
 
-pub fn spawn_listener(repaint: impl Repaint) -> std::io::Result<(SocketHandle, Receiver<AppCall>)> {
+pub(crate) fn spawn_listener(
+    repaint: impl Repaint,
+) -> std::io::Result<(SocketHandle, Receiver<AppCall>)> {
     let listener = listen_at(socket_path(), repaint)?;
 
     // Advertise the socket to child PTYs, like alacritty does with
@@ -277,14 +279,14 @@ fn socket_path() -> PathBuf {
 /// a connection thread gives it, and the ones bound for the app arrive on the
 /// receiver [`InMemory::new`] returns.
 #[cfg(test)]
-pub struct InMemory<R: Repaint> {
+pub(crate) struct InMemory<R: Repaint> {
     app_tx: Sender<AppCall>,
     repaint: R,
 }
 
 #[cfg(test)]
 impl<R: Repaint> InMemory<R> {
-    pub fn new(repaint: R) -> (Self, Receiver<AppCall>) {
+    pub(crate) fn new(repaint: R) -> (Self, Receiver<AppCall>) {
         let (app_tx, app_rx) = mpsc::channel();
         (Self { app_tx, repaint }, app_rx)
     }

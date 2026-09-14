@@ -14,14 +14,14 @@ use serde_json::{Value, json};
 
 use crate::git_status::{self, ChangeKind, GitStatus};
 
-pub const SOCKET_ENV: &str = "ALACRITREE_SOCKET";
+pub(crate) const SOCKET_ENV: &str = "ALACRITREE_SOCKET";
 
 /// Everything a client can ask of a running alacritree.  Tagged so the wire
 /// format is `{"type": "list_sessions", …fields}` — the MCP bridge builds
 /// these directly from tool names + arguments.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum IpcRequest {
+pub(crate) enum IpcRequest {
     ListProjects,
     ListSessions,
     SelectWorkspace {
@@ -111,7 +111,7 @@ pub enum IpcRequest {
 impl IpcRequest {
     /// The variant's name, for logs that must not print the payload: paths and
     /// `SendText` bodies are the caller's data, not ours to write to a file.
-    pub fn name(&self) -> &'static str {
+    pub(crate) fn name(&self) -> &'static str {
         match self {
             Self::ListProjects => "ListProjects",
             Self::ListSessions => "ListSessions",
@@ -136,9 +136,9 @@ impl IpcRequest {
     }
 }
 
-pub type IpcResult = Result<Value, String>;
+pub(crate) type IpcResult = Result<Value, String>;
 
-pub fn git_status_json(status: &GitStatus) -> Value {
+pub(crate) fn git_status_json(status: &GitStatus) -> Value {
     if let Some(err) = &status.error {
         return json!({ "error": err });
     }
@@ -176,7 +176,7 @@ fn kind_name(kind: ChangeKind) -> &'static str {
 /// to talk to, and falls back to serving the request itself.  Distinguishing it
 /// by matching on an error message would break the day someone rewords one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SendError {
+pub(crate) enum SendError {
     NoInstance,
     Failed(String),
 }
@@ -197,7 +197,7 @@ impl std::fmt::Display for SendError {
 /// come from this side.  A request that times out leaves its thread parked on
 /// the read until the app answers or dies — only reachable when the app is
 /// already wedged, and both clients are short-lived processes.
-pub fn send_request(
+pub(crate) fn send_request(
     socket: Option<&Path>,
     request: &IpcRequest,
     timeout: Duration,
@@ -219,12 +219,12 @@ pub fn send_request(
 /// Where a client's requests go. Production sends them over a running
 /// alacritree's socket, and tests hand them to the listener's dispatch
 /// in-process.
-pub trait Transport {
+pub(crate) trait Transport {
     fn send(&self, request: &IpcRequest, timeout: Duration) -> Result<Value, SendError>;
 }
 
 /// A running alacritree's socket: the given path, or the one discovery finds.
-pub struct LocalSocket<'a>(pub Option<&'a Path>);
+pub(crate) struct LocalSocket<'a>(pub Option<&'a Path>);
 
 impl Transport for LocalSocket<'_> {
     fn send(&self, request: &IpcRequest, timeout: Duration) -> Result<Value, SendError> {
@@ -309,7 +309,7 @@ pub(super) fn connect(path: &Path) -> std::io::Result<Stream> {
 /// `$XDG_RUNTIME_DIR/alacritree` with a tmpdir fallback, mirroring alacritty's
 /// `socket_dir` (which also falls back to tmp on macOS).
 #[cfg(unix)]
-pub fn socket_dir() -> PathBuf {
+pub(crate) fn socket_dir() -> PathBuf {
     runtime_dir(std::env::var_os("XDG_RUNTIME_DIR").as_deref())
         .map(|dir| dir.join("alacritree"))
         .and_then(|path| std::fs::create_dir_all(&path).ok().map(|_| path))
@@ -340,7 +340,7 @@ fn platform_runtime_dir() -> Option<PathBuf> {
 /// The named-pipe filesystem, which is also a directory: listing it is how a
 /// client that did not inherit `ALACRITREE_SOCKET` finds a running instance.
 #[cfg(windows)]
-pub fn socket_dir() -> PathBuf {
+pub(crate) fn socket_dir() -> PathBuf {
     PathBuf::from(r"\\.\pipe\")
 }
 

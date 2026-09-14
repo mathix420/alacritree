@@ -4,7 +4,7 @@
 /// FNV-1a is small, deterministic across Rust versions, and sufficient here:
 /// the digest disambiguates file names rather than protecting an adversarial
 /// namespace.
-pub fn stable_digest(bytes: &[u8]) -> u64 {
+pub(crate) fn stable_digest(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in bytes {
         hash ^= u64::from(*byte);

@@ -30,7 +30,7 @@ const DEPTH: usize = 3;
 /// Frames gathered before a line is logged and the buckets start over.
 const REPORT_EVERY: usize = 240;
 
-pub struct GpuTimers {
+pub(crate) struct GpuTimers {
     queries: [[glow::Query; STAGES.len()]; DEPTH],
     /// Which queries a slot actually issued.  A frame that skipped the
     /// decoration pass runs three stages, not four, so this cannot be one flag
@@ -70,7 +70,7 @@ impl GpuTimers {
     /// `None` on a context that cannot time itself.  The grid runs on anything
     /// from GL 3 up and timer queries arrive in 3.3, so this is a real case
     /// rather than a defensive one.
-    pub fn new(gl: &glow::Context) -> Option<Self> {
+    pub(crate) fn new(gl: &glow::Context) -> Option<Self> {
         let version = gl.version();
         let core = !version.is_embedded && (version.major, version.minor) >= (3, 3);
         let extension = gl.supported_extensions().iter().any(|name| name.contains("timer_query"));
@@ -109,13 +109,13 @@ impl GpuTimers {
 
     /// Record that this frame drew no decorations, so the report can say how
     /// often the gate fired rather than only what a drawn pass cost.
-    pub fn skipped_decorations(&mut self) {
+    pub(crate) fn skipped_decorations(&mut self) {
         self.skipped += 1;
     }
 
     /// Collect whatever the slot about to be reused finished, so the frame
     /// that issued those queries is the one that paid for them.
-    pub fn begin_frame(&mut self, gl: &glow::Context) {
+    pub(crate) fn begin_frame(&mut self, gl: &glow::Context) {
         let (mut total, mut ran, mut complete) = (0.0, false, true);
         for stage in 0..STAGES.len() {
             if !std::mem::take(&mut self.issued[self.slot][stage]) {
@@ -159,7 +159,7 @@ impl GpuTimers {
     /// Bracket everything the callback issues, the clear included, so the
     /// report can be read against the stages that are supposed to add up to it.
     /// Silent on the frames measuring stages, which cannot nest inside this.
-    pub fn begin_whole(&mut self, gl: &glow::Context) {
+    pub(crate) fn begin_whole(&mut self, gl: &glow::Context) {
         if !self.whole_frame {
             return;
         }
@@ -167,7 +167,7 @@ impl GpuTimers {
         unsafe { gl.begin_query(glow::TIME_ELAPSED, self.frame_queries[self.slot]) };
     }
 
-    pub fn end_whole(&self, gl: &glow::Context) {
+    pub(crate) fn end_whole(&self, gl: &glow::Context) {
         if self.whole_frame {
             unsafe { gl.end_query(glow::TIME_ELAPSED) };
         }
@@ -176,7 +176,7 @@ impl GpuTimers {
     /// `GL_TIME_ELAPSED` queries cannot nest, so a stage has to end before the
     /// next one starts, and a frame measuring the whole callback measures no
     /// stage at all.
-    pub fn begin(&mut self, gl: &glow::Context, stage: usize) {
+    pub(crate) fn begin(&mut self, gl: &glow::Context, stage: usize) {
         if self.whole_frame {
             return;
         }
@@ -184,13 +184,13 @@ impl GpuTimers {
         unsafe { gl.begin_query(glow::TIME_ELAPSED, self.queries[self.slot][stage]) };
     }
 
-    pub fn end(&self, gl: &glow::Context) {
+    pub(crate) fn end(&self, gl: &glow::Context) {
         if !self.whole_frame {
             unsafe { gl.end_query(glow::TIME_ELAPSED) };
         }
     }
 
-    pub fn end_frame(&mut self, submit: Duration, grid: (usize, usize)) {
+    pub(crate) fn end_frame(&mut self, submit: Duration, grid: (usize, usize)) {
         self.submit.push(submit.as_secs_f64() * 1e6);
         self.grid = grid;
         self.slot = (self.slot + 1) % DEPTH;
@@ -237,10 +237,10 @@ impl GpuTimers {
 }
 
 /// The stage index the callback passes to `begin`.
-pub const UPLOAD: usize = 0;
-pub const BACKGROUNDS: usize = 1;
-pub const GLYPHS: usize = 2;
-pub const DECORATIONS: usize = 3;
+pub(crate) const UPLOAD: usize = 0;
+pub(crate) const BACKGROUNDS: usize = 1;
+pub(crate) const GLYPHS: usize = 2;
+pub(crate) const DECORATIONS: usize = 3;
 
 fn median(samples: &mut [f64]) -> f64 {
     samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN from a duration"));

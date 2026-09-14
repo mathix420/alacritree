@@ -27,7 +27,7 @@ pub enum UpstreamState {
 /// is empty for a level branch, absent-upstream branches carry an empty upstream, and `gone` marks
 /// a configured upstream whose ref no longer resolves. Callers must run git under `LC_ALL=C`: the
 /// track vocabulary is localized.
-pub fn parse_for_each_ref(bytes: &[u8]) -> HashMap<String, UpstreamState> {
+pub(crate) fn parse_for_each_ref(bytes: &[u8]) -> HashMap<String, UpstreamState> {
     let text = String::from_utf8_lossy(bytes);
     let mut map = HashMap::new();
     for line in text.lines() {
@@ -85,7 +85,7 @@ fn parse_track_counts(track: &str) -> Option<(usize, usize)> {
 
 /// Every linked worktree of a project shares `refs/heads` and `refs/remotes`,
 /// so one walk of the project's local branches answers for every row.
-pub fn map_from_repo(repo: &Repository) -> HashMap<String, UpstreamState> {
+pub(crate) fn map_from_repo(repo: &Repository) -> HashMap<String, UpstreamState> {
     let mut map = HashMap::new();
     let Ok(branches) = repo.branches(Some(BranchType::Local)) else {
         return map;

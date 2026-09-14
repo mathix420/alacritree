@@ -10,7 +10,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::session::SessionId;
 
 #[derive(Default)]
-pub struct Ime {
+pub(crate) struct Ime {
     /// In-progress composition; `Some` suppresses key input to the PTY.
     preedit: Option<String>,
     /// Session the composition targets.  Composition belongs to the
@@ -19,19 +19,19 @@ pub struct Ime {
 }
 
 impl Ime {
-    pub fn preedit(&self) -> Option<&str> {
+    pub(crate) fn preedit(&self) -> Option<&str> {
         self.preedit.as_deref()
     }
 
     /// Drop any active composition (focus loss; the IME's `Disabled`
     /// event arrives only while we are still draining input).
-    pub fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.preedit = None;
     }
 
     /// Point the composition at the currently shown session, dropping it
     /// if the session changed mid-composition.
-    pub fn retarget(&mut self, session: SessionId) {
+    pub(crate) fn retarget(&mut self, session: SessionId) {
         if self.owner != Some(session) {
             self.preedit = None;
             self.owner = Some(session);
@@ -39,7 +39,7 @@ impl Ime {
     }
 
     /// Apply an IME event; returns text to write to the PTY on commit.
-    pub fn process(&mut self, event: &ImeEvent) -> Option<String> {
+    pub(crate) fn process(&mut self, event: &ImeEvent) -> Option<String> {
         match event {
             ImeEvent::Enabled | ImeEvent::Disabled => {
                 self.preedit = None;
@@ -62,11 +62,11 @@ impl Ime {
 
 /// Terminal cell width of one char.  Control/zero-width chars count 1 so a
 /// malformed preedit still advances and stays visible.
-pub fn char_cells(c: char) -> usize {
+pub(crate) fn char_cells(c: char) -> usize {
     c.width().unwrap_or(1).max(1)
 }
 
-pub struct PreeditLayout<'a> {
+pub(crate) struct PreeditLayout<'a> {
     pub start_col: usize,
     pub visible: &'a str,
     pub width: usize,
@@ -77,7 +77,7 @@ pub struct PreeditLayout<'a> {
 /// the caret is) stays visible — right-aligned against the grid edge when
 /// the cursor is too far right, truncated from the left (whole chars) when
 /// wider than the grid.
-pub fn preedit_layout(text: &str, cursor_col: usize, cols: usize) -> PreeditLayout<'_> {
+pub(crate) fn preedit_layout(text: &str, cursor_col: usize, cols: usize) -> PreeditLayout<'_> {
     let mut width: usize = text.chars().map(char_cells).sum();
     let mut start_byte = 0;
     let mut chars = text.char_indices();

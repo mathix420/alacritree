@@ -1,10 +1,11 @@
 //! The CLI must not become a crash-logging process.
 //!
 //! Every check here is about which *process* does what, which no in-crate test
-//! can observe: the crate is binary-only, so these drive the real executable.
+//! can observe, so these drive the real executable.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+use alacritree::command_ext::hidden;
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_alacritree")
@@ -13,12 +14,9 @@ fn binary() -> &'static str {
 /// Point every log-directory environment variable at a scratch path so the
 /// developer's real artifacts are never touched.
 fn run_isolated(home: &Path, args: &[&str]) -> std::process::Output {
-    // The child here is alacritree itself, a GUI-subsystem binary that
-    // allocates no console at all, so there is no window to hide. This crate
-    // has no lib target, so an integration test cannot reach
-    // `command_ext::hidden` to build it the sanctioned way.
+    // A test has no UI thread for a blocking wait to stall.
     #[allow(clippy::disallowed_methods)]
-    Command::new(binary())
+    hidden(binary())
         .args(args)
         .env("LOCALAPPDATA", home)
         .env("APPDATA", home)
@@ -141,12 +139,9 @@ fn a_panic_holding_the_recorder_lock_does_not_hang() {
     }
 
     let home = tempfile::tempdir().expect("a temp dir");
-    // The child here is alacritree itself, a GUI-subsystem binary that
-    // allocates no console at all, so there is no window to hide. This crate
-    // has no lib target, so an integration test cannot reach
-    // `command_ext::hidden` to build it the sanctioned way.
+    // A test has no UI thread for a blocking wait to stall.
     #[allow(clippy::disallowed_methods)]
-    let mut child = Command::new(binary())
+    let mut child = hidden(binary())
         .arg("provoke-lock-panic")
         .env("LOCALAPPDATA", home.path())
         .env("APPDATA", home.path())

@@ -42,7 +42,7 @@ const SLOTS_PER_ROW: usize = 256;
 
 /// What the shaders need that is not in a per-cell record.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Frame {
+pub(crate) struct Frame {
     /// Grid rect in points, relative to the callback viewport's top-left.
     pub origin: [f32; 2],
     pub cell: [f32; 2],
@@ -63,7 +63,7 @@ pub struct Frame {
 /// Both run on the same thread under eframe, so the lock is never contended;
 /// it exists because `egui_glow::CallbackFn` demands `Send + Sync`.
 #[derive(Default)]
-pub struct GridState {
+pub(crate) struct GridState {
     pub instances: GridInstances,
     pub table: GlyphTable,
     /// The rasterized decoration styles, rebuilt when the cell changes size.
@@ -78,18 +78,18 @@ pub struct GridState {
 
 impl GridState {
     /// Every row is dirty after a resize: the records moved.
-    pub fn mark_all_dirty(&mut self) {
+    pub(crate) fn mark_all_dirty(&mut self) {
         self.dirty_rows = 0..self.instances.dimensions().1;
     }
 
     /// The two buffers a frame writes, handed back separately so a run can be
     /// interned into the glyph table while it is being written into the
     /// instance buffer.
-    pub fn buffers(&mut self) -> (&mut GridInstances, &mut GlyphTable) {
+    pub(crate) fn buffers(&mut self) -> (&mut GridInstances, &mut GlyphTable) {
         (&mut self.instances, &mut self.table)
     }
 
-    pub fn mark_rows_dirty(&mut self, rows: std::ops::Range<usize>) {
+    pub(crate) fn mark_rows_dirty(&mut self, rows: std::ops::Range<usize>) {
         if self.dirty_rows.is_empty() {
             self.dirty_rows = rows;
         } else {
@@ -101,7 +101,7 @@ impl GridState {
 
 /// Handle the app holds: the shared CPU state plus the GL objects, built on
 /// the first paint because that is the first time a `glow::Context` exists.
-pub struct GpuGrid {
+pub(crate) struct GpuGrid {
     pub state: Arc<Mutex<GridState>>,
     gl: Arc<Mutex<GlSlot>>,
     /// Set by the paint callback when the GL side will not build.  Only the
@@ -121,7 +121,7 @@ enum GlSlot {
 }
 
 impl GpuGrid {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(GridState::default())),
             gl: Arc::new(Mutex::new(GlSlot::Unbuilt)),
@@ -131,7 +131,7 @@ impl GpuGrid {
 
     /// Whether the GL side is known not to build, so the caller can paint the
     /// mesh instead of a shape that draws nothing.
-    pub fn unavailable(&self) -> bool {
+    pub(crate) fn unavailable(&self) -> bool {
         self.failed.load(Ordering::Relaxed)
     }
 
@@ -139,14 +139,14 @@ impl GpuGrid {
     /// `glow::Context` for the callback to fail against, so the state it would
     /// have reached has to be set from outside.
     #[cfg(test)]
-    pub fn mark_unavailable(&self) {
+    pub(crate) fn mark_unavailable(&self) {
         self.failed.store(true, Ordering::Relaxed);
     }
 
     /// The shape to hand egui.  Everything it draws comes from `state`, which
     /// the caller has already written this frame — except the atlas size,
     /// which only the atlas live at paint time can give.
-    pub fn callback(&self, rect: Rect, ctx: &egui::Context, time_gpu: bool) -> egui::Shape {
+    pub(crate) fn callback(&self, rect: Rect, ctx: &egui::Context, time_gpu: bool) -> egui::Shape {
         let (state, resources, ctx) = (self.state.clone(), self.gl.clone(), ctx.clone());
         let failed = self.failed.clone();
         egui::Shape::Callback(egui::epaint::PaintCallback {

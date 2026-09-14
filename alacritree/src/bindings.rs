@@ -4,7 +4,7 @@
 //! once, when the app is built, and converts only a press's modifiers. Running
 //! a `NamedAction` goes through the app's `Action` trait, which does take egui.
 
-pub mod action;
+pub(crate) mod action;
 
 use enum_dispatch::enum_dispatch;
 use schemars::JsonSchema;
@@ -642,7 +642,7 @@ impl From<NamedAction> for String {
 /// One `[[keyboard.bindings]]` entry.  A binding needs `key`, plus exactly one
 /// of `chars`, `action` or `command` to say what pressing it does.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct RawBinding {
+pub(crate) struct RawBinding {
     /// The key, as alacritty spells it: a character (`"A"`), a named key
     /// (`"F5"`, `"PageUp"`), or a scancode.  A key alacritree cannot map is
     /// dropped with a warning.
@@ -695,7 +695,7 @@ enum BindingCommand {
     },
 }
 
-pub fn parse_bindings(raw: Vec<RawBinding>) -> Vec<KeyBinding> {
+pub(crate) fn parse_bindings(raw: Vec<RawBinding>) -> Vec<KeyBinding> {
     let mut out = Vec::with_capacity(raw.len());
     for r in raw {
         if r.mode.is_some() {
@@ -1345,7 +1345,7 @@ fn action_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
 /// The action a binding's `action` names. A name alacritree does not
 /// implement comes back `Unsupported` rather than failing the config, since
 /// a shared `alacritty.toml` carries actions only alacritty knows.
-pub fn parse_action(name: &str) -> BindingAction {
+pub(crate) fn parse_action(name: &str) -> BindingAction {
     let index = |prefix: &str| match name.strip_prefix(prefix)?.as_bytes() {
         &[digit @ b'1'..=b'9'] => Some(digit - b'0'),
         _ => None,

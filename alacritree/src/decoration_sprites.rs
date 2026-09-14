@@ -19,22 +19,22 @@ use crate::fonts::FaceMetrics;
 /// Underline styles, in the order their tiles sit in the strip.  Zero is the
 /// undecorated cell, whose tile is never sampled: the vertex shader collapses
 /// that quad rather than reading it.
-pub const UNDERLINE_KINDS: u16 = 6;
+const UNDERLINE_KINDS: u16 = 6;
 
-pub const NONE: u16 = 0;
-pub const STRAIGHT: u16 = 1;
-pub const DOUBLE: u16 = 2;
-pub const CURLY: u16 = 3;
-pub const DOTTED: u16 = 4;
-pub const DASHED: u16 = 5;
+pub(crate) const NONE: u16 = 0;
+pub(crate) const STRAIGHT: u16 = 1;
+pub(crate) const DOUBLE: u16 = 2;
+pub(crate) const CURLY: u16 = 3;
+pub(crate) const DOTTED: u16 = 4;
+pub(crate) const DASHED: u16 = 5;
 
 /// Tiles in the strip: every underline style, once plain and once struck
 /// through.  A cell carries at most one of each, so the pair fits in one tile
 /// and a cell with both still costs a single sample.
-pub const TILES: u16 = UNDERLINE_KINDS * 2;
+pub(crate) const TILES: u16 = UNDERLINE_KINDS * 2;
 
 /// The tile a cell carrying `underline` and `strikeout` samples.
-pub fn tile(underline: u16, strikeout: bool) -> u16 {
+pub(crate) fn tile(underline: u16, strikeout: bool) -> u16 {
     underline + if strikeout { UNDERLINE_KINDS } else { 0 }
 }
 
@@ -42,7 +42,7 @@ pub fn tile(underline: u16, strikeout: bool) -> u16 {
 /// values and `baseline` are measured down from the cell's top edge;
 /// `descent` is a length.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub struct Geometry {
+pub(crate) struct Geometry {
     pub cell: [usize; 2],
     /// Where epaint puts the glyph baseline inside the cell.  The descent area
     /// hangs from here rather than from the cell's bottom edge: `cell_h` is a
@@ -66,7 +66,7 @@ impl Geometry {
     /// The face resolves to pixels before a knob touches it, and thickness
     /// rounds after: rounding first would quantize the value a percentage then
     /// scales, leaving a 50% request against a one-pixel line nothing to halve.
-    pub fn resolve(
+    pub(crate) fn resolve(
         cell: [usize; 2],
         font_ascent_pt: f32,
         pixels_per_point: f32,
@@ -106,7 +106,7 @@ impl Geometry {
 
 /// The strip, rebuilt whenever the cell it was drawn for changes size.
 #[derive(Default)]
-pub struct DecorationAtlas {
+pub(crate) struct DecorationAtlas {
     texture: Option<TextureHandle>,
     drawn_for: Option<Geometry>,
 }
@@ -116,7 +116,7 @@ impl DecorationAtlas {
     ///
     /// Returns `None` for a cell too small to hold a line, which is only
     /// reachable before the first layout has given the view a font.
-    pub fn texture(&mut self, ctx: &Context, geometry: Geometry) -> Option<TextureId> {
+    pub(crate) fn texture(&mut self, ctx: &Context, geometry: Geometry) -> Option<TextureId> {
         let [w, h] = geometry.cell;
         if w == 0 || h == 0 {
             return None;

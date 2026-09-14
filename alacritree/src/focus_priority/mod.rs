@@ -22,9 +22,9 @@
 #[cfg(not(windows))]
 mod other;
 #[cfg(not(windows))]
-pub use self::other::*;
+pub(crate) use self::other::*;
 
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use self::windows::*;
+pub(crate) use self::windows::*;

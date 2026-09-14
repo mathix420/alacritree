@@ -21,23 +21,27 @@ struct Pending {
 }
 
 #[derive(Default)]
-pub struct ProjectRefreshes {
+pub(crate) struct ProjectRefreshes {
     pending: HashMap<PathBuf, Pending>,
 }
 
 impl ProjectRefreshes {
-    pub fn is_running(&self, root: &Path) -> bool {
+    pub(crate) fn is_running(&self, root: &Path) -> bool {
         self.pending.contains_key(root)
     }
 
-    pub fn start(&mut self, root: PathBuf, rx: Receiver<Discovered>) {
+    pub(crate) fn start(&mut self, root: PathBuf, rx: Receiver<Discovered>) {
         self.pending.insert(root, Pending { rx, waiters: Vec::new() });
     }
 
     /// Park `reply_tx` until the refresh running for `root` has been applied.
     /// Hands the channel back when nothing is running, leaving the caller to
     /// answer it however it sees fit.
-    pub fn watch(&mut self, root: &Path, reply_tx: Sender<IpcResult>) -> Option<Sender<IpcResult>> {
+    pub(crate) fn watch(
+        &mut self,
+        root: &Path,
+        reply_tx: Sender<IpcResult>,
+    ) -> Option<Sender<IpcResult>> {
         match self.pending.get_mut(root) {
             Some(pending) => {
                 pending.waiters.push(reply_tx);
@@ -49,7 +53,7 @@ impl ProjectRefreshes {
 
     /// Adopt every finished discovery through `apply`, then answer whoever was
     /// waiting on it with the reply `apply` produced.
-    pub fn poll(&mut self, mut apply: impl FnMut(&Path, Discovered) -> IpcResult) {
+    pub(crate) fn poll(&mut self, mut apply: impl FnMut(&Path, Discovered) -> IpcResult) {
         self.pending.retain(|root, pending| match pending.rx.try_recv() {
             Ok(found) => {
                 let reply = apply(root, found);

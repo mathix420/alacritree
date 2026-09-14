@@ -176,6 +176,9 @@ windows-sys = { version = "0.59", features = [
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3.0.2"
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "alacritree"
 path = "src/main.rs"

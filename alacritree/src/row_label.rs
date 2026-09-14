@@ -19,7 +19,7 @@ use crate::projects::{Project, Worktree};
 /// Substitute `vars` into `template`.  `None` on any subst error or when the
 /// trimmed result is empty — the caller falls back to the plain name either
 /// way, because a blank row label is as useless as a failed one.
-pub fn render_label(template: &str, vars: &HashMap<String, String>) -> Option<String> {
+fn render_label(template: &str, vars: &HashMap<String, String>) -> Option<String> {
     let rendered = subst::substitute(template, vars).ok()?;
     let trimmed = rendered.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -30,14 +30,14 @@ pub fn render_label(template: &str, vars: &HashMap<String, String>) -> Option<St
 /// that hits the same mistake without flooding the log every frame — keying
 /// on the template alone would let a second, independently broken config key
 /// hide behind the first one's warning just because the text matched.
-pub struct LabelTemplates {
+pub(crate) struct LabelTemplates {
     worktree: Option<String>,
     project: Option<String>,
     warned: HashSet<(String, String)>,
 }
 
 impl LabelTemplates {
-    pub fn new(worktree: Option<String>, project: Option<String>) -> Self {
+    pub(crate) fn new(worktree: Option<String>, project: Option<String>) -> Self {
         Self { worktree, project, warned: HashSet::new() }
     }
 
@@ -46,7 +46,7 @@ impl LabelTemplates {
     /// `$path` (full worktree path), `$pr` (the branch's PR number as
     /// `#123`, absent when none is known — `${pr:}` shows it only when one
     /// exists).
-    pub fn worktree_label(&mut self, wt: &Worktree, pr: Option<&PrInfo>) -> String {
+    pub(crate) fn worktree_label(&mut self, wt: &Worktree, pr: Option<&PrInfo>) -> String {
         let Some(template) = self.worktree.clone() else {
             return wt.name.clone();
         };
@@ -65,7 +65,7 @@ impl LabelTemplates {
     /// Display name for a project row.  A manual rename always wins — the
     /// template only shapes the *default* name.  Variables: `$name`
     /// (directory name), `$path` (full project root).
-    pub fn project_label(&mut self, project: &Project) -> String {
+    pub(crate) fn project_label(&mut self, project: &Project) -> String {
         if let Some(label) = &project.label {
             return label.clone();
         }

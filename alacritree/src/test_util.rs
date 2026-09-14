@@ -9,7 +9,7 @@ use git2::Repository;
 use crate::herdr;
 
 /// An idle agent on a native endpoint, the base every other agent varies from.
-pub fn herdr_agent(kind: Option<&str>) -> herdr::Agent {
+pub(crate) fn herdr_agent(kind: Option<&str>) -> herdr::Agent {
     herdr::Agent {
         terminal_id: "term_65abfc8e300361".into(),
         pane_id: "w5:p1".into(),
@@ -24,7 +24,7 @@ pub fn herdr_agent(kind: Option<&str>) -> herdr::Agent {
 }
 
 /// An agent carrying a title, for the naming cases.
-pub fn titled_herdr_agent(kind: Option<&str>, title: Option<&str>) -> herdr::Agent {
+pub(crate) fn titled_herdr_agent(kind: Option<&str>, title: Option<&str>) -> herdr::Agent {
     herdr::Agent { title: title.map(String::from), ..herdr_agent(kind) }
 }
 
@@ -39,7 +39,7 @@ const SCRATCH_PREFIX: &str = "alacritree-test-scratch-";
 /// rewritten by them at all: Windows fails that write with
 /// `ERROR_USER_MAPPED_FILE`.  Nothing deletes these on the way out, so the
 /// first caller sweeps the ones whose process has gone.
-pub fn scratch_dir() -> &'static Path {
+pub(crate) fn scratch_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
         let root = std::env::temp_dir();
@@ -68,7 +68,7 @@ fn sweep_abandoned_scratch_dirs(root: &Path) {
 }
 
 /// Initialize a repository with one empty commit so worktrees can be added.
-pub fn init_repo(dir: &Path) -> Repository {
+pub(crate) fn init_repo(dir: &Path) -> Repository {
     std::fs::create_dir_all(dir).unwrap();
     let repo = Repository::init(dir).unwrap();
     {
@@ -85,7 +85,7 @@ pub fn init_repo(dir: &Path) -> Repository {
 
 /// Add a linked worktree named `name` (git2 also creates a branch `name`).
 /// Returns the worktree's checkout path, a sibling of the repo directory.
-pub fn add_worktree(repo: &Repository, name: &str) -> PathBuf {
+pub(crate) fn add_worktree(repo: &Repository, name: &str) -> PathBuf {
     let path = repo.workdir().unwrap().parent().unwrap().join(format!("wt-{name}"));
     repo.worktree(name, &path, None).unwrap();
     path
@@ -97,7 +97,7 @@ pub fn add_worktree(repo: &Repository, name: &str) -> PathBuf {
 /// a mapped image cannot — so tests may rely on rename behaviour, never on
 /// delete behaviour.
 #[cfg(windows)]
-pub fn hold_like_a_running_image(path: &Path) -> std::fs::File {
+pub(crate) fn hold_like_a_running_image(path: &Path) -> std::fs::File {
     use std::os::windows::fs::OpenOptionsExt;
 
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};

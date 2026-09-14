@@ -19,7 +19,7 @@ use crate::jobs;
 const MAX_PIXELS: usize = 64 * 1024 * 1024;
 
 #[derive(Debug)]
-pub enum EncodeError {
+pub(crate) enum EncodeError {
     TooLarge { pixels: usize },
     Inconsistent { expected: usize, actual: usize },
     Encoding(png::EncodingError),
@@ -41,7 +41,7 @@ impl fmt::Display for EncodeError {
 
 /// `Compression::Fast` buys latency on a keypress at the cost of a larger file
 /// that nothing keeps.
-pub fn encode_png(image: &ImageData<'_>) -> Result<Vec<u8>, EncodeError> {
+pub(crate) fn encode_png(image: &ImageData<'_>) -> Result<Vec<u8>, EncodeError> {
     let pixels = image.width.saturating_mul(image.height);
     if pixels > MAX_PIXELS {
         return Err(EncodeError::TooLarge { pixels });
@@ -66,7 +66,7 @@ pub fn encode_png(image: &ImageData<'_>) -> Result<Vec<u8>, EncodeError> {
 /// same screenshot twice reuses one file, and the full 64-bit digest rather
 /// than the scratchpad's truncated one, since here a collision would paste the
 /// wrong image instead of merely colliding a label.
-pub fn file_name(png: &[u8]) -> String {
+pub(crate) fn file_name(png: &[u8]) -> String {
     format!("clipboard-{:016x}.png", crate::digest::stable_digest(png))
 }
 
@@ -77,7 +77,7 @@ pub fn file_name(png: &[u8]) -> String {
 /// a filename pattern is no proof of ownership.  An owned directory gets the
 /// tightened permissions of [`prepare_managed_dir`]; the resulting cap on file
 /// count is [`sweep`]'s job, not this function's.
-pub fn store(dir: &Path, png: &[u8], owned: bool) -> io::Result<PathBuf> {
+pub(crate) fn store(dir: &Path, png: &[u8], owned: bool) -> io::Result<PathBuf> {
     if owned {
         prepare_managed_dir(dir)?;
     } else {
@@ -93,7 +93,7 @@ pub fn store(dir: &Path, png: &[u8], owned: bool) -> io::Result<PathBuf> {
 /// Trim the managed directory to its cap.  Separate from `store` because the
 /// stored path is pasted into the terminal the moment it exists, while the
 /// sweep is housekeeping nothing reads.
-pub fn sweep(dir: &Path, keep: usize, in_use: &Path, _blocking: &jobs::Blocking) {
+pub(crate) fn sweep(dir: &Path, keep: usize, in_use: &Path, _blocking: &jobs::Blocking) {
     apply_cap(dir, keep, in_use);
 }
 

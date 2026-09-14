@@ -24,6 +24,8 @@ use clap_complete::Shell;
 
 use crate::ipc::protocol::{IpcRequest, LocalSocket, SendError, Transport};
 
+pub use schema::document as schema_document;
+
 /// Redistributing the embedded subset obliges us to carry its notice, and
 /// installation copies only the executable — so the text ships inside it.
 const FONT_LICENSE: &str = include_str!("../../assets/FONT-LICENSE.txt");

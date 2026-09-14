@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub trait Repaint: Clone + Send + Sync + 'static {
+pub(crate) trait Repaint: Clone + Send + Sync + 'static {
     /// Ask for a frame as soon as possible.
     fn wake(&self);
 
@@ -32,7 +32,7 @@ impl Repaint for egui::Context {
 /// Clones share one record, as clones of a context share one window.
 #[cfg(test)]
 #[derive(Clone, Default)]
-pub struct Recorder {
+pub(crate) struct Recorder {
     wakes: Arc<AtomicUsize>,
     delayed: Arc<Mutex<Vec<Duration>>>,
 }
@@ -40,12 +40,12 @@ pub struct Recorder {
 #[cfg(test)]
 impl Recorder {
     /// Immediate wakes so far.
-    pub fn wakes(&self) -> usize {
+    pub(crate) fn wakes(&self) -> usize {
         self.wakes.load(Ordering::SeqCst)
     }
 
     /// The delay of each deferred wake so far, in call order.
-    pub fn delayed_wakes(&self) -> Vec<Duration> {
+    pub(crate) fn delayed_wakes(&self) -> Vec<Duration> {
         self.delayed.lock().unwrap().clone()
     }
 }

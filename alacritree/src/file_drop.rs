@@ -13,7 +13,7 @@ use crate::wsl;
 
 /// Which region a drop landed on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Target {
+pub(crate) enum Target {
     Terminal,
     ProjectsSidebar,
     Scratchpad,
@@ -22,7 +22,7 @@ pub enum Target {
 /// The drop-accepting rectangles of the current frame, in egui coordinates.
 /// The git-status sidebar is deliberately absent: it accepts nothing, so a
 /// drop over it falls through to `None`.
-pub struct Regions {
+pub(crate) struct Regions {
     /// `None` when the projects sidebar is hidden or its target is disabled.
     pub sidebar: Option<egui::Rect>,
     pub central: egui::Rect,
@@ -31,7 +31,7 @@ pub struct Regions {
 impl Regions {
     /// A hidden sidebar and a disabled sidebar target collapse to the same
     /// `None`, so `route` needs to know about neither.
-    pub fn new(sidebar: Option<egui::Rect>, central: egui::Rect, cfg: &DropConfig) -> Self {
+    pub(crate) fn new(sidebar: Option<egui::Rect>, central: egui::Rect, cfg: &DropConfig) -> Self {
         Self { sidebar: sidebar.filter(|_| cfg.sidebar), central }
     }
 }
@@ -43,7 +43,7 @@ impl Regions {
 /// winit reports no cursor position during a drag on any platform, so off
 /// Windows this is the only branch that ever runs, and pasting into the shell
 /// is what every other terminal does with a drop.
-pub fn route(
+pub(crate) fn route(
     pointer: Option<egui::Pos2>,
     regions: &Regions,
     active_is_scratchpad: bool,
@@ -79,7 +79,7 @@ pub fn route(
 /// to end-of-file and `\t` to completion.  Quoting is no substitute for any of
 /// it: the line editor acts on the byte before the shell parser ever sees the
 /// quotes around it.
-pub fn is_terminal_safe(path: &str) -> bool {
+pub(crate) fn is_terminal_safe(path: &str) -> bool {
     !path.contains(char::is_control)
 }
 
@@ -89,7 +89,11 @@ pub fn is_terminal_safe(path: &str) -> bool {
 ///
 /// `distro` names the WSL distro the receiving session runs in, `None` for a
 /// native session.  Paths that would act as terminal input are left out.
-pub fn shell_payload(paths: &[PathBuf], distro: Option<&str>, spelling: &PathSpelling) -> String {
+pub(crate) fn shell_payload(
+    paths: &[PathBuf],
+    distro: Option<&str>,
+    spelling: &PathSpelling,
+) -> String {
     let mut out = String::new();
     for path in paths {
         let (word, quoting) = shell_word(path, distro, spelling);
@@ -149,7 +153,7 @@ fn distro_path(path: &Path, distro: &str) -> Option<String> {
 /// `preceding` and `following` are the characters either side of the insertion
 /// point.  Without the boundary newlines a drop into the middle of a line welds
 /// the first path onto the text before it and the last onto the text after.
-pub fn document_payload(
+pub(crate) fn document_payload(
     paths: &[PathBuf],
     preceding: Option<char>,
     following: Option<char>,
@@ -181,7 +185,7 @@ pub fn document_payload(
 /// deliberately not `document_payload`'s: a drop frames its paths as their own
 /// block, while a paste lands wherever the cursor is and must leave the
 /// surrounding line alone.
-pub fn paste_payload(
+pub(crate) fn paste_payload(
     paths: &[PathBuf],
     scratchpad: bool,
     distro: Option<&str>,
@@ -198,7 +202,7 @@ pub fn paste_payload(
 /// root; a file means the directory holding it, which is what dragging a file
 /// out of a checkout is asking for.  Dragging several files from one folder is
 /// ordinary, so repeats collapse rather than adding the same project twice.
-pub fn project_roots(paths: &[PathBuf]) -> Vec<PathBuf> {
+pub(crate) fn project_roots(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     for path in paths {
         let root = if path.is_dir() {
@@ -228,7 +232,7 @@ pub fn project_roots(paths: &[PathBuf]) -> Vec<PathBuf> {
 /// way to learn where a drop landed.  No other platform has an equivalent
 /// here, so they route by the central-panel fallback in `route`.
 #[cfg(windows)]
-pub fn screen_pointer(ctx: &egui::Context) -> Option<egui::Pos2> {
+pub(crate) fn screen_pointer(ctx: &egui::Context) -> Option<egui::Pos2> {
     use windows_sys::Win32::Foundation::POINT;
     use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
@@ -243,7 +247,7 @@ pub fn screen_pointer(ctx: &egui::Context) -> Option<egui::Pos2> {
 }
 
 #[cfg(not(windows))]
-pub fn screen_pointer(_ctx: &egui::Context) -> Option<egui::Pos2> {
+pub(crate) fn screen_pointer(_ctx: &egui::Context) -> Option<egui::Pos2> {
     None
 }
 

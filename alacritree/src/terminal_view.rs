@@ -26,7 +26,7 @@ use crate::session::{EventProxy, Session, SessionId, SessionKind, TermSize};
 use crate::{decoration_sprites, jobs, mouse, paste};
 
 #[allow(clippy::too_many_arguments)]
-pub fn show(
+pub(crate) fn show(
     ui: &mut Ui,
     session: &mut Session<impl Repaint>,
     config: &Config,
@@ -869,7 +869,7 @@ impl Style {
 ///
 /// Both buffers are reused across frames, and colours are resolved during the
 /// copy, so painting from a snapshot needs neither the lock nor the palette.
-pub struct GridSnapshot {
+pub(crate) struct GridSnapshot {
     /// One entry per viewport row.  Each row owns its bytes so re-walking one
     /// row never moves another's, which is what lets a capture skip the rows
     /// the terminal reports as clean.
@@ -932,7 +932,7 @@ struct CursorSnapshot {
 }
 
 impl GridSnapshot {
-    pub fn new(palette: &Palette) -> Self {
+    pub(crate) fn new(palette: &Palette) -> Self {
         let colors = TerminalColors::new(palette);
         Self {
             rows: Vec::new(),
@@ -948,7 +948,7 @@ impl GridSnapshot {
 
     /// The terminal's background as of the last capture, for everything that
     /// paints behind the grid as well as the grid itself.
-    pub fn default_bg(&self) -> Color32 {
+    pub(crate) fn default_bg(&self) -> Color32 {
         self.default_bg
     }
 
@@ -3214,7 +3214,7 @@ mod tests {
             let each = start.elapsed() / iterations;
             let (build, tessellate) = (build / iterations, tessellate / iterations);
 
-            let (_, counts) = crate::steady_state::measure(|| {
+            let (_, counts) = crate::alloc_count::measure(|| {
                 paint_one_frame(&ctx, &mut session, &config, &mut caches, screen)
             });
 

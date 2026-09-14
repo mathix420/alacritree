@@ -9,9 +9,8 @@
 //! run, and a window appears while they do.
 
 #![cfg(windows)]
-// This crate has no lib target, reaching neither `command_ext::hidden` nor
-// `alacritree::jobs`, and `clippy.toml` disallows only `Command` methods
-// here — there is no UI thread for a blocking wait to stall.
+// A test has no UI thread for a blocking wait to stall, so `alacritree::jobs`
+// has nothing to protect here.
 #![allow(clippy::disallowed_methods)]
 
 use std::io::Write;

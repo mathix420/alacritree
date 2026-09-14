@@ -4,4 +4,4 @@
 use std::path::PathBuf;
 
 /// `None` is the home workspace (sessions inherit `$PWD`); `Some` is a worktree path.
-pub type WorkspaceKey = Option<PathBuf>;
+pub(crate) type WorkspaceKey = Option<PathBuf>;

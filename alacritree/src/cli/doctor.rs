@@ -31,7 +31,7 @@ use crate::{command_ext, jobs, state, tools};
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Status {
+pub(super) enum Status {
     Ok,
     Warn,
     Fail,
@@ -48,7 +48,7 @@ impl Status {
 }
 
 #[derive(Debug, Clone)]
-pub struct Check {
+pub(super) struct Check {
     section: &'static str,
     name: String,
     status: Status,
@@ -83,7 +83,7 @@ struct Found {
     version: Option<String>,
 }
 
-pub fn run(
+pub(super) fn run(
     as_json: bool,
     socket: Option<&Path>,
     config_dir: Option<&Path>,

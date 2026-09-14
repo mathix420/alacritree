@@ -8,14 +8,14 @@ use egui::Color32;
 
 use crate::config::Palette;
 
-pub fn rgb_to_color32(rgb: Rgb) -> Color32 {
+pub(crate) fn rgb_to_color32(rgb: Rgb) -> Color32 {
     Color32::from_rgb(rgb.r, rgb.g, rgb.b)
 }
 
 /// The palette colours that no cell or escape sequence decides, converted
 /// once for the painters.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct TerminalColors {
+pub(crate) struct TerminalColors {
     pub fg: Color32,
     pub bg: Color32,
     /// The configured cursor, or the foreground when none is set.
@@ -26,7 +26,7 @@ pub struct TerminalColors {
 }
 
 impl TerminalColors {
-    pub fn new(palette: &Palette) -> Self {
+    pub(crate) fn new(palette: &Palette) -> Self {
         Self {
             fg: rgb_to_color32(palette.fg),
             bg: rgb_to_color32(palette.bg),
@@ -41,11 +41,11 @@ impl TerminalColors {
 /// The terminal's own default background, which OSC 11 can move away from the
 /// configured one.  Everything painting behind the grid has to agree on this:
 /// the background pass draws no quad for a cell already carrying it.
-pub fn default_background(runtime: &Colors, colors: &TerminalColors) -> Color32 {
+pub(crate) fn default_background(runtime: &Colors, colors: &TerminalColors) -> Color32 {
     runtime[NamedColor::Background].map_or(colors.bg, rgb_to_color32)
 }
 
-pub fn resolve(
+pub(crate) fn resolve(
     color: Color,
     flags: Flags,
     runtime: &Colors,
@@ -78,7 +78,7 @@ pub fn resolve(
 /// The color to report for an OSC 4 / 10 / 11 / 12 query.  `None` for a cursor
 /// color the app never set: alacritty leaves that query unanswered rather than
 /// naming a color it doesn't have, and the asking app falls back to its own.
-pub fn query(index: usize, runtime: &Colors, palette: &Palette) -> Option<Rgb> {
+pub(crate) fn query(index: usize, runtime: &Colors, palette: &Palette) -> Option<Rgb> {
     if let Some(rgb) = runtime[index] {
         return Some(rgb);
     }

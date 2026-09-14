@@ -360,7 +360,7 @@ impl HerdrViewSync {
 /// shell holds no pane and never asks; every session that does hold one asks
 /// once per switch onto it, so activating a row always points herdr at that
 /// row's pane.
-pub fn needs_view_focus(
+pub(super) fn needs_view_focus(
     key: Option<&HerdrKey>,
     active: SessionId,
     focused: Option<SessionId>,

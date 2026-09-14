@@ -21,10 +21,10 @@ use std::time::{Duration, Instant};
 /// How long a batch of results stands before the visible rows are checked
 /// again.  Matches `git_status::StatusCache`, which answers the same "did this
 /// worktree change under us" question at the same human timescale.
-pub const FRESH_FOR: Duration = Duration::from_millis(1500);
+const FRESH_FOR: Duration = Duration::from_millis(1500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Liveness {
+pub(crate) enum Liveness {
     Present,
     Missing,
     /// The probe failed for a reason other than "not found" — a distro that
@@ -44,7 +44,7 @@ pub enum Liveness {
 ///
 /// `metadata` rather than `exists` so the difference between "not there" and
 /// "could not tell" survives: `exists` folds every error into `false`.
-pub fn probe(path: &Path) -> Liveness {
+pub(crate) fn probe(path: &Path) -> Liveness {
     match std::fs::metadata(path.join(".git")) {
         Ok(_) => Liveness::Present,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Liveness::Missing,
@@ -57,7 +57,7 @@ pub fn probe(path: &Path) -> Liveness {
 /// and a refused shell never disagree about the same directory.  A probe that
 /// could not tell answers `false`: an unreachable filesystem must not turn
 /// into a refusal.
-pub fn is_gone(path: &Path) -> bool {
+pub(crate) fn is_gone(path: &Path) -> bool {
     probe(path) == Liveness::Missing
 }
 
@@ -65,7 +65,7 @@ pub fn is_gone(path: &Path) -> bool {
 /// Entries live only as long as the sidebar keeps drawing their path, so a
 /// project the user removes does not leave its worktrees behind.
 #[derive(Default)]
-pub struct LivenessCache {
+pub(crate) struct LivenessCache {
     states: HashMap<PathBuf, Liveness>,
     /// `None` until the first batch lands, which is what makes the first
     /// painted frame probe rather than wait out an interval.
@@ -78,7 +78,7 @@ impl LivenessCache {
     /// word in *both* directions: a checkout restored under a path discovery
     /// last saw as pruned has to lose the grey, or this fixes one stale
     /// direction and leaves its mirror image behind.
-    pub fn missing(&self, path: &Path) -> Option<bool> {
+    pub(crate) fn missing(&self, path: &Path) -> Option<bool> {
         match self.states.get(path)? {
             Liveness::Present => Some(false),
             Liveness::Missing => Some(true),
@@ -89,7 +89,7 @@ impl LivenessCache {
     /// Whether the interval has elapsed.  The sidebar asks this *before* it
     /// starts collecting the paths it draws, so a steady frame does no work
     /// and makes no allocation on this path at all.
-    pub fn wants_probe(&self, now: Instant) -> bool {
+    pub(crate) fn wants_probe(&self, now: Instant) -> bool {
         self.next_probe.is_none_or(|due| now >= due)
     }
 
@@ -98,7 +98,7 @@ impl LivenessCache {
     /// leaves nothing eligible.  All visible paths go in together: they are
     /// checked on one worker, so splitting them by individual freshness would
     /// buy nothing.
-    pub fn batch(&mut self, visible: &[PathBuf]) -> Vec<PathBuf> {
+    pub(crate) fn batch(&mut self, visible: &[PathBuf]) -> Vec<PathBuf> {
         self.states.retain(|path, _| visible.contains(path));
         visible.to_vec()
     }
@@ -111,7 +111,7 @@ impl LivenessCache {
     ///
     /// A round that probed nothing still restarts the interval, so a frame
     /// with no eligible rows cannot leave `wants_probe` true forever.
-    pub fn adopt(&mut self, results: Vec<(PathBuf, Liveness)>, now: Instant) {
+    pub(crate) fn adopt(&mut self, results: Vec<(PathBuf, Liveness)>, now: Instant) {
         for (path, state) in results {
             self.states.insert(path, state);
         }
@@ -125,7 +125,7 @@ impl LivenessCache {
     /// idle terminal would stay marked live indefinitely.  The `Option` is
     /// what keeps "no deadline" from collapsing into a zero wait, which
     /// `request_repaint_after` reads as "repaint now" — every frame, forever.
-    pub fn wait(&self, now: Instant) -> Option<Duration> {
+    pub(crate) fn wait(&self, now: Instant) -> Option<Duration> {
         self.next_probe.map(|due| due.saturating_duration_since(now))
     }
 }

@@ -19,7 +19,7 @@ use crate::state::{self, PersistedProject, PersistedState};
 use crate::worktree::{self as wt, CreateRequest};
 use crate::{git_status, jobs, scratchpad};
 
-pub fn handle(request: &IpcRequest) -> IpcResult {
+pub(super) fn handle(request: &IpcRequest) -> IpcResult {
     let Some(path) = state::config_path() else {
         return Err("could not locate alacritree's state file".to_string());
     };

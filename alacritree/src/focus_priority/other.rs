@@ -9,14 +9,14 @@
 /// has nothing to adopt into.
 ///
 /// [`adopt`]: PriorityJob::adopt
-pub struct PriorityJob;
+pub(crate) struct PriorityJob;
 
 impl PriorityJob {
-    pub fn adopt(_pid: u32, _reaping: bool) -> Option<Self> {
+    pub(crate) fn adopt(_pid: u32, _reaping: bool) -> Option<Self> {
         None
     }
 
-    pub fn set_boosted(&self, _boosted: bool) {}
+    pub(crate) fn set_boosted(&self, _boosted: bool) {}
 }
 
-pub fn set_self_boosted(_boosted: bool) {}
+pub(crate) fn set_self_boosted(_boosted: bool) {}

@@ -15,7 +15,7 @@ use crate::pr_status::PrInfo;
 /// around 50.  100 wins at the concurrency this pool actually leaves for
 /// lookups, and is also under the ceiling a Windows command line would impose
 /// if the query ever moved off stdin.
-pub const CHUNK: usize = 100;
+pub(crate) const CHUNK: usize = 100;
 
 const FIELDS: &str = "number baseRefName url state isDraft headRepositoryOwner { login }";
 
@@ -30,7 +30,7 @@ const FIELDS: &str = "number baseRefName url state isDraft headRepositoryOwner {
 /// down with it, not just its own. `graphql_string` is what closes that: a
 /// JSON string literal is a valid GraphQL string literal, so encoding through
 /// `serde_json` escapes exactly what GraphQL needs escaped.
-pub fn build(owner: &str, name: &str, branches: &[String]) -> String {
+pub(crate) fn build(owner: &str, name: &str, branches: &[String]) -> String {
     let mut q = format!(
         "query {{ repository(owner: {}, name: {}) {{",
         graphql_string(owner),
@@ -56,7 +56,7 @@ fn graphql_string(s: &str) -> String {
 
 /// `gh api graphql --input -` reads a JSON body, so the query is wrapped
 /// rather than piped raw.
-pub fn body(query: &str) -> String {
+pub(crate) fn body(query: &str) -> String {
     serde_json::json!({ "query": query }).to_string()
 }
 
@@ -71,7 +71,7 @@ pub fn body(query: &str) -> String {
 /// that no branch in this repository has a PR.  The two have to stay
 /// distinguishable, or the common "nobody here has a PR" answer costs a
 /// per-branch sweep that finds the same nothing.
-pub fn parse(
+pub(crate) fn parse(
     stdout: &[u8],
     branches: &[String],
     origin_owner: Option<&str>,

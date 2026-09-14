@@ -12,7 +12,7 @@ use arboard::{GetExtLinux, LinuxClipboardKind, SetExtLinux};
 use crate::config::PasteConfig;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Target {
+pub(crate) enum Target {
     /// `Ctrl+V` clipboard.
     Clipboard,
     /// Linux PRIMARY selection (X11 / Wayland primary).  Falls back to the
@@ -20,7 +20,7 @@ pub enum Target {
     Primary,
 }
 
-pub fn write(target: Target, text: &str) {
+pub(crate) fn write(target: Target, text: &str) {
     if text.is_empty() {
         return;
     }
@@ -43,7 +43,7 @@ pub fn write(target: Target, text: &str) {
     }
 }
 
-pub fn read(target: Target) -> Option<String> {
+pub(crate) fn read(target: Target) -> Option<String> {
     match read_text(target) {
         Probe::Found(text) => Some(text),
         Probe::Absent | Probe::Failed => None,
@@ -53,13 +53,13 @@ pub fn read(target: Target) -> Option<String> {
 /// What one clipboard probe found.  The distinction is load-bearing: `Absent`
 /// means "try the next format", while `Failed` must stop the paste, because a
 /// read that failed says nothing about whether the format was there.
-pub enum Probe<T> {
+pub(crate) enum Probe<T> {
     Found(T),
     Absent,
     Failed,
 }
 
-pub enum Payload {
+pub(crate) enum Payload {
     Text(String),
     Paths(Vec<PathBuf>),
     Image(arboard::ImageData<'static>),
@@ -92,7 +92,7 @@ fn with_clipboard<T>(
     }
 }
 
-pub fn read_text(target: Target) -> Probe<String> {
+pub(crate) fn read_text(target: Target) -> Probe<String> {
     let label = match target {
         Target::Clipboard => "clipboard text",
         Target::Primary => "primary selection",
@@ -109,11 +109,11 @@ pub fn read_text(target: Target) -> Probe<String> {
 /// Paths a file manager put on the clipboard.  Explorer's Cut advertises a move
 /// effect alongside the same list; reading the paths neither performs nor
 /// completes that move, so Cut and Copy paste identically.
-pub fn read_files() -> Probe<Vec<PathBuf>> {
+pub(crate) fn read_files() -> Probe<Vec<PathBuf>> {
     with_clipboard("file list", |clip| clip.get().file_list())
 }
 
-pub fn read_image() -> Probe<arboard::ImageData<'static>> {
+pub(crate) fn read_image() -> Probe<arboard::ImageData<'static>> {
     with_clipboard("image", |clip| clip.get_image())
 }
 
@@ -121,7 +121,7 @@ pub fn read_image() -> Probe<arboard::ImageData<'static>> {
 /// copied paths, then a bitmap.  Each probe runs only once every earlier one
 /// came back absent, so an ordinary text paste never opens the image formats,
 /// and a format the config switched off is never probed at all.
-pub fn resolve(
+pub(crate) fn resolve(
     cfg: &PasteConfig,
     text: impl FnOnce() -> Probe<String>,
     files: impl FnOnce() -> Probe<Vec<PathBuf>>,

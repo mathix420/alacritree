@@ -21,13 +21,13 @@ const STALL_WARNING: Duration = Duration::from_secs(120);
 const WORKER_DIED: &str = "the background worker did not finish";
 
 #[derive(Debug, Clone)]
-pub struct FileChange {
+pub(crate) struct FileChange {
     pub path: String,
     pub kind: ChangeKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChangeKind {
+pub(crate) enum ChangeKind {
     Added,
     Modified,
     Deleted,
@@ -37,7 +37,7 @@ pub enum ChangeKind {
 }
 
 impl ChangeKind {
-    pub fn glyph(&self) -> &'static str {
+    pub(crate) fn glyph(&self) -> &'static str {
         match self {
             ChangeKind::Added => "A",
             ChangeKind::Modified => "M",
@@ -49,7 +49,7 @@ impl ChangeKind {
     }
 
     /// What the glyph stands for, for readers who do not know porcelain.
-    pub fn label(&self) -> &'static str {
+    pub(crate) fn label(&self) -> &'static str {
         match self {
             ChangeKind::Added => "added",
             ChangeKind::Modified => "modified",
@@ -62,27 +62,27 @@ impl ChangeKind {
 }
 
 #[derive(Debug, Clone)]
-pub struct DiffStat {
+pub(crate) struct DiffStat {
     pub path: String,
     pub additions: usize,
     pub deletions: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct DirtyCounts {
+pub(crate) struct DirtyCounts {
     pub staged: usize,
     pub modified: usize,
     pub untracked: usize,
 }
 
 impl DirtyCounts {
-    pub fn is_dirty(&self) -> bool {
+    pub(crate) fn is_dirty(&self) -> bool {
         self.staged + self.modified + self.untracked > 0
     }
 
     /// Derive the delete modal's counts from a status the git panel already
     /// polled, so opening the dialog costs no repository walk.
-    pub fn from_status(status: &GitStatus) -> Self {
+    pub(crate) fn from_status(status: &GitStatus) -> Self {
         let untracked = status.unstaged.iter().filter(|c| c.kind == ChangeKind::Untracked).count();
         Self { staged: status.staged.len(), modified: status.unstaged.len() - untracked, untracked }
     }
@@ -93,7 +93,7 @@ impl DirtyCounts {
 /// since we only need to know whether `git worktree remove` will refuse the
 /// path. Takes `&jobs::Blocking` because it shells out — call it from a pool
 /// job, never from the UI thread.
-pub fn dirty_counts(path: &Path, blocking: &jobs::Blocking) -> DirtyCounts {
+pub(crate) fn dirty_counts(path: &Path, blocking: &jobs::Blocking) -> DirtyCounts {
     match wsl::classify(path) {
         wsl::Location::Wsl { distro, linux_path } => {
             dirty_counts_wsl(&distro, &linux_path, blocking)
@@ -154,7 +154,7 @@ fn dirty_counts_wsl(distro: &str, linux_path: &str, blocking: &jobs::Blocking) -
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct GitStatus {
+pub(crate) struct GitStatus {
     pub branch: Option<String>,
     pub default_branch: Option<String>,
     pub default_branch_resolved: Option<String>,
@@ -169,7 +169,7 @@ pub struct GitStatus {
 /// take long enough to be felt as a stutter when done on the UI thread, so we
 /// spawn the work on a helper thread and let `poll` adopt the result on a
 /// later frame.  Callers always see the last known status immediately.
-pub struct StatusCache {
+pub(crate) struct StatusCache {
     path: PathBuf,
     last: GitStatus,
     last_refreshed: Option<Instant>,
@@ -192,7 +192,7 @@ struct Pending {
 }
 
 impl StatusCache {
-    pub fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf) -> Self {
         Self {
             path,
             last: GitStatus::default(),
@@ -204,14 +204,14 @@ impl StatusCache {
 
     /// Last branch we resolved, for callers that need it before triggering a
     /// new poll (e.g. the PR cache wants the branch name to query `gh`).
-    pub fn current_branch(&self) -> Option<&str> {
+    pub(crate) fn current_branch(&self) -> Option<&str> {
         self.last.branch.as_deref()
     }
 
     /// The most recent known status without triggering a refresh, for callers
     /// that need to re-derive rows between polls (e.g. re-filtering on a
     /// keystroke).
-    pub fn last(&self) -> &GitStatus {
+    pub(crate) fn last(&self) -> &GitStatus {
         &self.last
     }
 
@@ -219,7 +219,7 @@ impl StatusCache {
     /// nothing is in flight.  A compute that never returns pins `pending`,
     /// and `poll` will not spawn another while it does, so the panel keeps
     /// rendering whatever it last held.
-    pub fn stalled_for(&self) -> Option<Duration> {
+    pub(crate) fn stalled_for(&self) -> Option<Duration> {
         self.pending.as_ref().map(|pending| pending.started.elapsed())
     }
 
@@ -232,14 +232,14 @@ impl StatusCache {
     /// same "don't know" case — as is a compute whose worker unwound, which
     /// is banked the same way — it still sets `last_refreshed` so `poll`
     /// doesn't retry every frame, but it answers `false` here too.
-    pub fn has_status(&self) -> bool {
+    pub(crate) fn has_status(&self) -> bool {
         self.last_refreshed.is_some() && self.last.error.is_none()
     }
 
     /// Returns the most recent known status, kicking off a background refresh
     /// when stale or when the default-branch hint changed since the last
     /// completed compute.  Never blocks the caller.
-    pub fn poll(
+    pub(crate) fn poll(
         &mut self,
         default_branch_hint: Option<&str>,
         repaint: &impl Repaint,
@@ -315,7 +315,7 @@ fn spawn_compute(path: PathBuf, hint: Option<String>, repaint: impl Repaint) -> 
     Pending { hint, job, started: Instant::now(), warned: false }
 }
 
-pub fn compute(
+pub(crate) fn compute(
     path: &Path,
     default_branch_hint: Option<&str>,
     blocking: &jobs::Blocking,

@@ -31,7 +31,11 @@ type Scopes = HashMap<String, HashMap<String, serde_json::Value>>;
 /// config) survives.  Returns how many scopes were written.  Takes
 /// `&jobs::Blocking` because it shells out — call it from a pool job, never
 /// from the UI thread.
-pub fn mirror_scopes(main_checkout: &Path, worktree: &Path, blocking: &jobs::Blocking) -> usize {
+pub(crate) fn mirror_scopes(
+    main_checkout: &Path,
+    worktree: &Path,
+    blocking: &jobs::Blocking,
+) -> usize {
     let Some(scopes) = all_scopes(blocking) else {
         return 0;
     };
@@ -77,7 +81,7 @@ pub fn mirror_scopes(main_checkout: &Path, worktree: &Path, blocking: &jobs::Blo
 /// end up empty.  Returns how many scopes were cleaned.  Takes
 /// `&jobs::Blocking` because it shells out — call it from a pool job, never
 /// from the UI thread.
-pub fn forget_scopes(worktree: &Path, blocking: &jobs::Blocking) -> usize {
+pub(crate) fn forget_scopes(worktree: &Path, blocking: &jobs::Blocking) -> usize {
     let Some(scopes) = all_scopes(blocking) else {
         return 0;
     };

@@ -1,7 +1,11 @@
 use alacritty_terminal::term::TermMode;
 use egui::{Event, Key, Modifiers};
 
-pub fn event_to_bytes(event: &Event, key_text: Option<&str>, mode: TermMode) -> Option<Vec<u8>> {
+pub(crate) fn event_to_bytes(
+    event: &Event,
+    key_text: Option<&str>,
+    mode: TermMode,
+) -> Option<Vec<u8>> {
     match event {
         // OS-composed text — already accounts for Shift and dead-key composition.
         // When the app asked for every key as an escape sequence, the Key event
@@ -30,14 +34,14 @@ pub fn event_to_bytes(event: &Event, key_text: Option<&str>, mode: TermMode) -> 
 /// protocol's associated-text field.  Control characters and private-use
 /// codepoints never reach this point — egui-winit drops them before raising
 /// the event, which is the same rule the protocol states.
-pub fn associated_text(next_event: Option<&Event>) -> Option<&str> {
+pub(crate) fn associated_text(next_event: Option<&Event>) -> Option<&str> {
     match next_event? {
         Event::Text(text) if !text.is_empty() => Some(text),
         _ => None,
     }
 }
 
-pub fn key_to_bytes(
+pub(crate) fn key_to_bytes(
     key: Key,
     mods: Modifiers,
     key_text: Option<&str>,

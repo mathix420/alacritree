@@ -23,7 +23,7 @@ use crate::wsl_helper::{self, WslProbe};
 use crate::{colors, herdr, scratchpad};
 
 #[derive(Clone)]
-pub struct EventProxy<R> {
+pub(crate) struct EventProxy<R> {
     repaint: R,
     sender: mpsc::Sender<TermEvent>,
     /// Whether this session's grid is the one on screen.  Read from the PTY
@@ -32,12 +32,12 @@ pub struct EventProxy<R> {
 }
 
 impl<R: Repaint> EventProxy<R> {
-    pub fn new(repaint: R) -> (Self, mpsc::Receiver<TermEvent>) {
+    pub(crate) fn new(repaint: R) -> (Self, mpsc::Receiver<TermEvent>) {
         let (sender, receiver) = mpsc::channel();
         (Self { repaint, sender, visible: Arc::new(AtomicBool::new(true)) }, receiver)
     }
 
-    pub fn set_visible(&self, visible: bool) {
+    pub(crate) fn set_visible(&self, visible: bool) {
         self.visible.store(visible, Ordering::Relaxed);
     }
 }
@@ -93,13 +93,13 @@ impl<R: Repaint> EventListener for EventProxy<R> {
 }
 
 #[derive(Copy, Clone, Debug)]
-pub struct TermSize {
+pub(crate) struct TermSize {
     pub columns: usize,
     pub screen_lines: usize,
 }
 
 impl TermSize {
-    pub fn new(columns: usize, screen_lines: usize) -> Self {
+    pub(crate) fn new(columns: usize, screen_lines: usize) -> Self {
         Self { columns: columns.max(1), screen_lines: screen_lines.max(1) }
     }
 }
@@ -118,12 +118,12 @@ impl Dimensions for TermSize {
     }
 }
 
-pub type SessionId = u64;
+pub(crate) type SessionId = u64;
 
 /// What this session is showing. Shells are persistent; diff panes are
 /// throwaway terminal commands; scratchpads are built-in document editors.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum SessionKind {
+pub(crate) enum SessionKind {
     Shell,
     Diff {
         key: String,
@@ -143,7 +143,7 @@ pub enum SessionKind {
 /// Ordered by how much a state wants a human, which is what an aggregate row
 /// ranks by when several sessions report at once.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub enum LiveState {
+pub(crate) enum LiveState {
     /// Present and waiting on you, with nothing in flight.
     #[default]
     Idle,
@@ -166,7 +166,7 @@ impl LiveState {
     /// `done` collapses to `Idle`: a finished turn is not work in flight.
     /// The word survives in the row's label, which is where the distinction
     /// is worth drawing.
-    pub fn from_herdr(status: herdr::Status) -> Option<Self> {
+    pub(crate) fn from_herdr(status: herdr::Status) -> Option<Self> {
         match status {
             herdr::Status::Idle | herdr::Status::Done => Some(Self::Idle),
             herdr::Status::Working => Some(Self::Working),
@@ -178,7 +178,7 @@ impl LiveState {
     /// Word a row paints for this state, mirroring `herdr::Status::label` so
     /// an agent alacritree reads on its own speaks the same vocabulary herdr
     /// does.
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Idle => "idle",
             Self::Working => "working",
@@ -193,7 +193,7 @@ impl LiveState {
 /// agent shares the same visual language instead of each CLI bringing its own
 /// status glyph.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SessionActivity {
+pub(crate) enum SessionActivity {
     /// Nothing agent-shaped in the foreground.
     #[default]
     Shell,
@@ -204,25 +204,25 @@ pub enum SessionActivity {
 }
 
 impl SessionActivity {
-    pub fn agent(name: Option<&'static str>, live: LiveState) -> Self {
+    pub(crate) fn agent(name: Option<&'static str>, live: LiveState) -> Self {
         Self::Agent { name, live }
     }
 
     /// Whether an agent holds the foreground at all — the gate the row's
     /// title cleanup and the workspace aggregate both key on.
-    pub fn is_agent(self) -> bool {
+    pub(crate) fn is_agent(self) -> bool {
         matches!(self, Self::Agent { .. })
     }
 
     /// The live state, or `None` when no agent is present to have one.
-    pub fn live(self) -> Option<LiveState> {
+    pub(crate) fn live(self) -> Option<LiveState> {
         match self {
             Self::Shell => None,
             Self::Agent { live, .. } => Some(live),
         }
     }
 
-    pub fn name(self) -> Option<&'static str> {
+    pub(crate) fn name(self) -> Option<&'static str> {
         match self {
             Self::Shell => None,
             Self::Agent { name, .. } => name,
@@ -232,7 +232,7 @@ impl SessionActivity {
     /// The same agent, re-reported as doing something else.  A plain shell
     /// gains the gate: whoever supplies a live state has already established
     /// that an agent is there.
-    pub fn with_live(self, live: LiveState) -> Self {
+    pub(crate) fn with_live(self, live: LiveState) -> Self {
         Self::Agent { name: self.name(), live }
     }
 }
@@ -240,7 +240,7 @@ impl SessionActivity {
 /// One tab in a workspace. Shell/diff tabs own a PTY and parsed terminal;
 /// scratchpad tabs retain the same lightweight terminal allocation so the tab
 /// model stays uniform, but own no child process or event-loop thread.
-pub struct Session<R: Repaint> {
+pub(crate) struct Session<R: Repaint> {
     pub id: SessionId,
     pub title: String,
     pub working_directory: Option<PathBuf>,
@@ -325,7 +325,7 @@ const AGENT_PROCESS_NAMES: &[&str] =
     &["claude", "codex", "gemini", "aider", "cursor-agent", "continue"];
 
 /// Plain-text dump of a session's grid for IPC clients.
-pub struct ScreenSnapshot {
+pub(crate) struct ScreenSnapshot {
     /// Requested scrollback (top) followed by the full visible screen, one
     /// string per row, trailing blanks trimmed.
     pub lines: Vec<String>,
@@ -420,7 +420,7 @@ fn agent_name_by_cmdline(cmds: impl IntoIterator<Item = impl AsRef<str>>) -> Opt
 }
 
 #[derive(Default)]
-pub struct DrainOutcome {
+pub(crate) struct DrainOutcome {
     /// Set if any event in this batch warrants flagging the session: BEL, or
     /// a title transitioning out of a spinner state.
     pub attention: bool,
@@ -472,7 +472,7 @@ fn is_spinner_title(title: &str) -> bool {
 
 /// Outcome of polling a pending attention trigger.
 #[derive(Debug, PartialEq, Eq)]
-pub enum AttentionVerdict {
+pub(crate) enum AttentionVerdict {
     /// Latch the flag and notify now.
     Fire,
     /// Still inside the grace window; poll again after the returned delay.
@@ -487,7 +487,7 @@ pub enum AttentionVerdict {
 /// immediate ping per boundary is noise.  A trigger only fires if the title
 /// stays out of its spinner state for the whole grace window.  Zero grace
 /// disables the debounce and fires on the trigger frame, spinner or not.
-pub fn poll_attention_debounce(
+pub(crate) fn poll_attention_debounce(
     since: Instant,
     now: Instant,
     title: &str,
@@ -911,7 +911,7 @@ fn foreground_nav_tui(_shell_pid: u32) -> bool {
 }
 
 /// Terminal options derived from the user config.
-pub fn term_config(config: &Config) -> TermConfig {
+pub(crate) fn term_config(config: &Config) -> TermConfig {
     TermConfig {
         scrolling_history: config.scrolling.history,
         default_cursor_style: config.cursor_style(),
@@ -1157,7 +1157,7 @@ mod windows_process_probe {
 
 /// How a process inside a session names itself to `alacritree session move`
 /// / the MCP tools.
-pub const SESSION_ID_ENV: &str = "ALACRITREE_SESSION_ID";
+pub(crate) const SESSION_ID_ENV: &str = "ALACRITREE_SESSION_ID";
 
 /// The environment a session's PTY starts with: the user's `[env]` table,
 /// the diff-pane `LESS` default, and the session's own id.
@@ -1184,7 +1184,7 @@ fn session_env(
 
 /// Everything opening a PTY needs, and nothing that has to stay on the UI
 /// thread.  Built by [`Session::pending`], consumed by [`open`].
-pub struct OpenRequest<R> {
+pub(crate) struct OpenRequest<R> {
     id: SessionId,
     window_id: u64,
     pty_options: PtyOptions,
@@ -1233,7 +1233,7 @@ impl Drop for Attachment {
 /// it, and the event loop that drains it.  This is the part that costs
 /// milliseconds, which is why it is a free function rather than a method —
 /// it must be callable from a thread that holds no `Session`.
-pub fn open<R: Repaint>(request: OpenRequest<R>) -> std::io::Result<Attachment> {
+pub(crate) fn open<R: Repaint>(request: OpenRequest<R>) -> std::io::Result<Attachment> {
     let started = std::time::Instant::now();
     let OpenRequest { id, window_id, pty_options, window_size, term, proxy, boost, reap } = request;
 
@@ -1268,7 +1268,7 @@ pub fn open<R: Repaint>(request: OpenRequest<R>) -> std::io::Result<Attachment> 
 }
 
 impl<R: Repaint> Session<R> {
-    pub fn bind_herdr(&mut self, key: herdr::HerdrKey, shared_view: bool) {
+    pub(crate) fn bind_herdr(&mut self, key: herdr::HerdrKey, shared_view: bool) {
         let bound_at = Instant::now();
         log::debug!(
             "herdr binding session={} side={:?} terminal_id={} shared_view={} bound_at={:?}",
@@ -1283,7 +1283,7 @@ impl<R: Repaint> Session<R> {
         self.herdr_key = Some(key);
     }
 
-    pub fn spawn_scratchpad(
+    pub(crate) fn spawn_scratchpad(
         repaint: R,
         config: &Config,
         working_directory: Option<PathBuf>,
@@ -1327,7 +1327,7 @@ impl<R: Repaint> Session<R> {
     /// and attached in one call.  Test-only: the app reaches the same place
     /// through `pending_command`, so that a slow open cannot cost a frame.
     #[cfg(test)]
-    pub fn spawn_command(
+    pub(crate) fn spawn_command(
         repaint: R,
         config: &Config,
         working_directory: Option<PathBuf>,
@@ -1355,7 +1355,7 @@ impl<R: Repaint> Session<R> {
 
     /// A pending shell session plus what its PTY will need, without opening
     /// it: the shell resolution and the title, and nothing that costs a frame.
-    pub fn pending_shell(
+    pub(crate) fn pending_shell(
         repaint: R,
         config: &Config,
         working_directory: Option<PathBuf>,
@@ -1393,7 +1393,7 @@ impl<R: Repaint> Session<R> {
     /// without opening its PTY.  The git sidebar drops into `delta` this way
     /// for an inline diff view; once the command exits, `reap_exited_sessions`
     /// removes the tab.
-    pub fn pending_command(
+    pub(crate) fn pending_command(
         repaint: R,
         config: &Config,
         working_directory: Option<PathBuf>,
@@ -1514,7 +1514,7 @@ impl<R: Repaint> Session<R> {
     /// Adopt a PTY opened elsewhere.  Everything a session cannot do without
     /// one is switched on here, in one place, so there is a single answer to
     /// "when does this session become live".
-    pub fn attach(&mut self, attachment: Attachment) {
+    pub(crate) fn attach(&mut self, attachment: Attachment) {
         let (shell_pid, priority_job, sender) = attachment.into_parts();
         self.shell_pid = shell_pid;
         self.priority_job = priority_job;
@@ -1537,7 +1537,7 @@ impl<R: Repaint> Session<R> {
     /// Mark whether this session's grid is the one being painted.  Output from
     /// a session that isn't stops waking the UI loop, so a busy agent in a
     /// background tab no longer costs a full repaint per chunk of output.
-    pub fn set_visible(&self, visible: bool) {
+    pub(crate) fn set_visible(&self, visible: bool) {
         self.proxy.set_visible(visible);
     }
 
@@ -1546,7 +1546,7 @@ impl<R: Repaint> Session<R> {
     /// boost.  A session with no job holds nothing and always answers false.
     /// Only the session the user is typing into may be raised; see
     /// `app::process_session_events`.
-    pub fn set_priority_boost(&self, boosted: bool) -> bool {
+    pub(crate) fn set_priority_boost(&self, boosted: bool) -> bool {
         let Some(job) = &self.priority_job else {
             return false;
         };
@@ -1554,7 +1554,7 @@ impl<R: Repaint> Session<R> {
         boosted
     }
 
-    pub fn write(&mut self, bytes: Vec<u8>) {
+    pub(crate) fn write(&mut self, bytes: Vec<u8>) {
         if let Some(notifier) = &self.notifier {
             notifier.notify(bytes);
         } else if let Some(pending) = self.pending_writes.as_mut() {
@@ -1563,14 +1563,14 @@ impl<R: Repaint> Session<R> {
     }
 
     /// Whether this session is waiting for a PTY that is on its way.
-    pub fn is_pending(&self) -> bool {
+    pub(crate) fn is_pending(&self) -> bool {
         self.pending_writes.is_some()
     }
 
     /// Pull every pending event out of the PTY channel.  Called once per frame
     /// for every session — including background ones — so bells, title
     /// changes, and child-exits from non-visible sessions don't pile up.
-    pub fn drain_events(&mut self, palette: &Palette) -> DrainOutcome {
+    pub(crate) fn drain_events(&mut self, palette: &Palette) -> DrainOutcome {
         let mut outcome = DrainOutcome::default();
         // Derived rather than stored: a `title_pinned` field set at spawn is a
         // second source of truth that can drift from `kind`.
@@ -1616,7 +1616,7 @@ impl<R: Repaint> Session<R> {
         outcome
     }
 
-    pub fn resize(&mut self, size: TermSize, cell_size: (f32, f32)) {
+    pub(crate) fn resize(&mut self, size: TermSize, cell_size: (f32, f32)) {
         if size.columns == self.size.columns
             && size.screen_lines == self.size.screen_lines
             && cell_size == self.cell_size
@@ -1636,14 +1636,14 @@ impl<R: Repaint> Session<R> {
         let _ = sender.send(Msg::Resize(ws));
     }
 
-    pub fn is_exited(&self) -> bool {
+    pub(crate) fn is_exited(&self) -> bool {
         self.exit_status.is_some()
     }
 
     /// Whether an exited child left cleanly.  A herdr agent that refuses to
     /// attach exits within a frame, and only a non-zero exit distinguishes
     /// that refusal from an ordinary shell the user closed.
-    pub fn exit_was_clean(&self) -> bool {
+    pub(crate) fn exit_was_clean(&self) -> bool {
         self.exit_status.is_none_or(|status| status.success())
     }
 
@@ -1653,7 +1653,7 @@ impl<R: Repaint> Session<R> {
     /// message with it and leave only a flash, so a session holding a herdr
     /// key stays until the user closes it, unless it exited cleanly.  That
     /// carve-out outranks `hold`, which only ever widens what is held.
-    pub fn should_reap(&self, hold: HoldExitedSessions) -> bool {
+    pub(crate) fn should_reap(&self, hold: HoldExitedSessions) -> bool {
         if !self.is_exited() {
             return false;
         }
@@ -1668,21 +1668,21 @@ impl<R: Repaint> Session<R> {
     /// to `CloseExitedSession` — or the command palette when nothing is bound.
     /// Fed through alacritty's own parser because the PTY that would otherwise
     /// carry it is already gone.
-    pub fn write_hold_notice(&self, chord: Option<&str>) {
+    pub(crate) fn write_hold_notice(&self, chord: Option<&str>) {
         let mut term = self.term.lock();
         Processor::<StdSyncHandler>::new().advance(&mut *term, &hold_notice_bytes(chord));
     }
 
     /// The distro a shimmed WSL session runs in.  Dropped paths need it to
     /// decide whether a `C:\` path has to be rewritten before a shell sees it.
-    pub fn wsl_distro(&self) -> Option<&str> {
+    pub(crate) fn wsl_distro(&self) -> Option<&str> {
         self.wsl_probe.as_ref().map(|probe| probe.distro.as_str())
     }
 
     /// Semantic sidebar state for this session. Process probing identifies a
     /// waiting agent; a Braille title takes precedence because it signals
     /// active work even for an agent the process list does not recognize.
-    pub fn activity(&self) -> SessionActivity {
+    pub(crate) fn activity(&self) -> SessionActivity {
         if self.scratchpad.is_some() {
             return SessionActivity::Shell;
         }
@@ -1694,7 +1694,7 @@ impl<R: Repaint> Session<R> {
     /// Windows, the helper's foreground probe for shimmed WSL sessions), its
     /// foreground process is a recognized agent, or its title is in a
     /// spinner state — the signal the close-confirmation policy keys on.
-    pub fn is_busy(&self) -> bool {
+    pub(crate) fn is_busy(&self) -> bool {
         if self.scratchpad.is_some() {
             return false;
         }
@@ -1714,7 +1714,7 @@ impl<R: Repaint> Session<R> {
     /// stream, so a launcher touching it after vim starts clobbers vim's
     /// own title until vim re-emits it.  A direct herdr attach is excluded:
     /// it runs as `herdr` but draws one agent with no splits to hand back.
-    pub fn nav_tui_running(&self) -> bool {
+    pub(crate) fn nav_tui_running(&self) -> bool {
         if self.scratchpad.is_some() || (self.herdr_key.is_some() && !self.herdr_shared_view) {
             return false;
         }
@@ -1750,7 +1750,7 @@ impl<R: Repaint> Session<R> {
     /// history above it.  Reads the live (unscrolled) screen regardless of
     /// the user's display offset so IPC clients always see where output and
     /// the cursor actually are.
-    pub fn screen_snapshot(&self, scrollback_lines: usize) -> ScreenSnapshot {
+    pub(crate) fn screen_snapshot(&self, scrollback_lines: usize) -> ScreenSnapshot {
         if let Some(editor) = &self.scratchpad {
             let mut lines: Vec<String> = editor.text().lines().map(str::to_owned).collect();
             if lines.is_empty() || editor.text().ends_with('\n') {
@@ -1802,7 +1802,7 @@ impl<R: Repaint> Session<R> {
         }
     }
 
-    pub fn shutdown(&self) {
+    pub(crate) fn shutdown(&self) {
         if let Some(sender) = &self.sender {
             let _ = sender.send(Msg::Shutdown);
         }
@@ -2150,7 +2150,7 @@ mod tests {
         }
         let each = started.elapsed() / iterations;
 
-        let (_, counts) = crate::steady_state::measure(|| windows_process_probe::probe(pid));
+        let (_, counts) = crate::alloc_count::measure(|| windows_process_probe::probe(pid));
         println!(
             "probe on the calling thread: {each:?}, {} allocations ({} KiB)",
             counts.allocs,

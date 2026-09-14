@@ -12,7 +12,7 @@ use std::{fs, io};
 
 use crate::stale_exe;
 
-pub fn run(dest: Option<PathBuf>, as_json: bool) -> i32 {
+pub(super) fn run(dest: Option<PathBuf>, as_json: bool) -> i32 {
     let installed = std::env::current_exe().and_then(|source| {
         let dir = destination(dest)?;
         install_file(&source, &dir)

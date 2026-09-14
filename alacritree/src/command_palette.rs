@@ -28,7 +28,7 @@ use crate::workspace::WorkspaceKey;
 /// up again would go through `herdr_row_workspace`, whose outer `None` means
 /// "listed nowhere" — a state the palette can reach and the sidebar cannot.
 #[derive(Debug, Clone, PartialEq)]
-pub struct HerdrAttach {
+pub(crate) struct HerdrAttach {
     pub key: HerdrKey,
     pub pane_id: String,
     pub workspace: WorkspaceKey,
@@ -37,7 +37,7 @@ pub struct HerdrAttach {
 /// What activating a palette row does. Each arm is resolved by
 /// `run_palette_action` in `app.rs`, which already owns the machinery it needs.
 #[derive(Debug, Clone, PartialEq)]
-pub enum PaletteAction {
+pub(crate) enum PaletteAction {
     /// Dispatch a keyboard action, exactly as its binding would.
     Run(NamedAction),
     /// Focus an open session, switching workspace to reach it if needed.
@@ -56,7 +56,7 @@ pub enum PaletteAction {
 /// The heading a row files under. Grouping keeps the list readable now that a
 /// row per action (rather than per binding) still runs to fifty-odd entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PaletteSection {
+pub(crate) enum PaletteSection {
     Clipboard,
     Scrollback,
     Sessions,
@@ -72,7 +72,7 @@ pub enum PaletteSection {
 }
 
 impl PaletteSection {
-    pub fn title(self) -> &'static str {
+    pub(crate) fn title(self) -> &'static str {
         match self {
             Self::Clipboard => "Clipboard",
             Self::Scrollback => "Scrollback",
@@ -142,7 +142,7 @@ fn section_of(a: NamedAction) -> PaletteSection {
 /// One selectable row. `keys`/`primary`/`secondary` are what the row paints;
 /// `search` is the precomputed haystack the matcher scores, so ranking never
 /// re-allocates a per-item string on every keystroke.
-pub struct PaletteItem {
+pub(crate) struct PaletteItem {
     pub action: PaletteAction,
     pub section: PaletteSection,
     pub keys: String,
@@ -169,7 +169,7 @@ impl PaletteItem {
         Self::new(PaletteAction::Run(a), section_of(a), keys, a.description(), a.config_name())
     }
 
-    pub fn session(
+    pub(crate) fn session(
         id: SessionId,
         primary: String,
         subtitle: String,
@@ -192,7 +192,7 @@ impl PaletteItem {
         }
     }
 
-    pub fn workspace(ws: WorkspaceKey, primary: String, secondary: String) -> Self {
+    pub(crate) fn workspace(ws: WorkspaceKey, primary: String, secondary: String) -> Self {
         Self::new(
             PaletteAction::SwitchWorkspace(ws),
             PaletteSection::SwitchWorkspace,
@@ -202,7 +202,7 @@ impl PaletteItem {
         )
     }
 
-    pub fn create_worktree(root: PathBuf, primary: String, secondary: String) -> Self {
+    pub(crate) fn create_worktree(root: PathBuf, primary: String, secondary: String) -> Self {
         Self::new(
             PaletteAction::CreateWorktree(root),
             PaletteSection::NewWorktree,
@@ -216,7 +216,7 @@ impl PaletteItem {
     /// bound-key parsers accept, empty past index 9) is folded into the
     /// search haystack so typing it still finds the row, without painting a
     /// name the profile itself never carries.
-    pub fn profile(name: String, command: String, keys: String, config_name: &str) -> Self {
+    pub(crate) fn profile(name: String, command: String, keys: String, config_name: &str) -> Self {
         let mut item = Self::new(
             PaletteAction::SpawnProfile(name.clone()),
             PaletteSection::Profiles,
@@ -232,7 +232,7 @@ impl PaletteItem {
     }
 
     /// A herdr pane available to attach to, filed apart from open sessions.
-    pub fn herdr_agent(
+    pub(crate) fn herdr_agent(
         attach: HerdrAttach,
         primary: String,
         subtitle: String,
@@ -308,7 +308,7 @@ fn is_hidden(a: NamedAction) -> bool {
 /// run and so only exist as concrete bindings. Actions no binding names are
 /// listed too, keyless: runnable from here all the same, and that is how the
 /// full vocabulary stays discoverable without the docs.
-pub fn action_items(shortcuts: &Shortcuts) -> Vec<PaletteItem> {
+pub(crate) fn action_items(shortcuts: &Shortcuts) -> Vec<PaletteItem> {
     let mut order: Vec<NamedAction> = NamedAction::iter().filter(|a| !is_hidden(*a)).collect();
     for action in shortcuts.actions() {
         if let BindingAction::Named(a) = action {
@@ -326,19 +326,19 @@ fn keys_for(shortcuts: &Shortcuts, action: NamedAction) -> String {
 }
 
 /// Every trigger bound to `SpawnProfile(index)`, for a profile's palette row.
-pub fn profile_keys(shortcuts: &Shortcuts, index: u8) -> String {
+pub(crate) fn profile_keys(shortcuts: &Shortcuts, index: u8) -> String {
     keys_for(shortcuts, NamedAction::SpawnProfile(action::SpawnProfile(index)))
 }
 
 /// The first key bound to `action`, for the footer hint.
-pub fn first_key(shortcuts: &Shortcuts, action: NamedAction) -> Option<String> {
+pub(crate) fn first_key(shortcuts: &Shortcuts, action: NamedAction) -> Option<String> {
     shortcuts.labels(action).next().map(str::to_owned)
 }
 
 /// Ranked rows grouped under their headings. A section appears where its
 /// best-ranked row does, so the top match always leads the list and an
 /// unfiltered palette keeps the natural order.
-pub fn group(items: &[PaletteItem], ranked: &[usize]) -> Vec<(PaletteSection, Vec<usize>)> {
+pub(crate) fn group(items: &[PaletteItem], ranked: &[usize]) -> Vec<(PaletteSection, Vec<usize>)> {
     let mut out: Vec<(PaletteSection, Vec<usize>)> = Vec::new();
     for &i in ranked {
         let section = items[i].section;
@@ -353,7 +353,7 @@ pub fn group(items: &[PaletteItem], ranked: &[usize]) -> Vec<(PaletteSection, Ve
 /// The palette's query, selection cursor, and reusable `nucleo` matcher.
 /// Owning the matcher here keeps its scratch allocations alive across
 /// keystrokes instead of rebuilding one per frame.
-pub struct CommandPalette {
+pub(crate) struct CommandPalette {
     open: bool,
     query: String,
     selected: usize,
@@ -362,7 +362,7 @@ pub struct CommandPalette {
 }
 
 impl CommandPalette {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             open: false,
             query: String::new(),
@@ -372,24 +372,24 @@ impl CommandPalette {
         }
     }
 
-    pub fn is_open(&self) -> bool {
+    pub(crate) fn is_open(&self) -> bool {
         self.open
     }
 
     /// Open fresh: a stale query or cursor from last time would be confusing.
-    pub fn open(&mut self) {
+    pub(crate) fn open(&mut self) {
         self.open = true;
         self.query.clear();
         self.selected = 0;
     }
 
-    pub fn close(&mut self) {
+    pub(crate) fn close(&mut self) {
         self.open = false;
         self.query.clear();
         self.selected = 0;
     }
 
-    pub fn toggle(&mut self) {
+    pub(crate) fn toggle(&mut self) {
         if self.open {
             self.close();
         } else {
@@ -397,27 +397,27 @@ impl CommandPalette {
         }
     }
 
-    pub fn query(&self) -> &str {
+    pub(crate) fn query(&self) -> &str {
         &self.query
     }
 
-    pub fn query_mut(&mut self) -> &mut String {
+    pub(crate) fn query_mut(&mut self) -> &mut String {
         &mut self.query
     }
 
-    pub fn clear_query(&mut self) {
+    pub(crate) fn clear_query(&mut self) {
         self.query.clear();
         self.selected = 0;
     }
 
-    pub fn selected(&self) -> usize {
+    pub(crate) fn selected(&self) -> usize {
         self.selected
     }
 
     /// Indices into `items`, best match first. An empty query keeps the natural
     /// order (actions, then sessions, then workspaces); ties hold their input
     /// order so the list stays stable as the user types.
-    pub fn rank(&mut self, items: &[PaletteItem]) -> Vec<usize> {
+    pub(crate) fn rank(&mut self, items: &[PaletteItem]) -> Vec<usize> {
         if self.query.is_empty() {
             return (0..items.len()).collect();
         }
@@ -436,33 +436,33 @@ impl CommandPalette {
 
     /// After a rank, settle the cursor: a query edit jumps to the top match,
     /// otherwise the cursor holds its place, clamped to the new result count.
-    pub fn reseed(&mut self, query_changed: bool, len: usize) {
+    pub(crate) fn reseed(&mut self, query_changed: bool, len: usize) {
         self.selected = if query_changed { 0 } else { self.selected.min(len.saturating_sub(1)) };
     }
 
-    pub fn select_prev(&mut self) {
+    pub(crate) fn select_prev(&mut self) {
         self.selected = self.selected.saturating_sub(1);
     }
 
-    pub fn select_next(&mut self, len: usize) {
+    pub(crate) fn select_next(&mut self, len: usize) {
         if len > 0 {
             self.selected = (self.selected + 1).min(len - 1);
         }
     }
 
-    pub fn select_top(&mut self) {
+    pub(crate) fn select_top(&mut self) {
         self.selected = 0;
     }
 
-    pub fn select_bottom(&mut self, len: usize) {
+    pub(crate) fn select_bottom(&mut self, len: usize) {
         self.selected = len.saturating_sub(1);
     }
 
-    pub fn page_up(&mut self) {
+    pub(crate) fn page_up(&mut self) {
         self.selected = self.selected.saturating_sub(PAGE);
     }
 
-    pub fn page_down(&mut self, len: usize) {
+    pub(crate) fn page_down(&mut self, len: usize) {
         self.selected = (self.selected + PAGE).min(len.saturating_sub(1));
     }
 }

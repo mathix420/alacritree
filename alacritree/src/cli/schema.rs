@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 /// substitutes their tag: `releases/download/v0.9.0/alacritree-config.json`.
 /// Both beat pointing at `master`, which would validate every config against
 /// unreleased keys.
-pub const ID: &str =
+pub(super) const ID: &str =
     "https://github.com/mathix420/alacritree/releases/latest/download/alacritree-config.json";
 
 /// The schema document, pretty-printed with a trailing newline.
@@ -82,7 +82,7 @@ fn drop_nulls(value: &mut serde_json::Value) {
     }
 }
 
-pub fn print() {
+pub(super) fn print() {
     // Written to the raw handle rather than `println!`, which panics on a
     // closed pipe — `alacritree schema | head` is an ordinary thing to run.
     let _ = std::io::stdout().write_all(document().as_bytes());
@@ -120,7 +120,7 @@ const STARTER: &str = r##"
 /// Point `path` at the published schema, creating it from [`STARTER`] when it
 /// does not exist.  Idempotent: a file that already carries a directive is left
 /// exactly as it is, so this is safe to run against a config under review.
-pub fn init(path: &Path) -> Result<(), String> {
+pub(super) fn init(path: &Path) -> Result<(), String> {
     let existing = match std::fs::read_to_string(path) {
         Ok(body) => Some(body),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -147,7 +147,7 @@ pub fn init(path: &Path) -> Result<(), String> {
 
 /// Where `schema init` writes when given no path: the `alacritree.toml`
 /// already in use, or the one the search path would pick up next.
-pub fn default_config_path(config_dir: Option<&Path>) -> PathBuf {
+pub(super) fn default_config_path(config_dir: Option<&Path>) -> PathBuf {
     // Overrides carry no path, so they cannot answer where to write.
     crate::config::diagnose(config_dir, &[])
         .files

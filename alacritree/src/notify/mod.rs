@@ -29,7 +29,7 @@ static NOTIFY_TX: OnceLock<Mutex<Sender<SessionId>>> = OnceLock::new();
 
 /// Open the click channel, keeping the sending half for the workers and
 /// handing the receiving half to the app.
-pub fn channel() -> Receiver<SessionId> {
+pub(crate) fn channel() -> Receiver<SessionId> {
     let (notify_tx, notify_rx) = mpsc::channel();
     // `set` may fail only if a previous instance already initialized the
     // static (e.g. tests).  In that case the old sender points at a dead
@@ -42,7 +42,7 @@ pub fn channel() -> Receiver<SessionId> {
 /// Drain every queued notification click, keeping only the newest.  Clicks
 /// can pile up while the window is unfocused; the user most likely meant
 /// the latest one.
-pub fn latest_click(rx: &Receiver<SessionId>) -> Option<SessionId> {
+pub(crate) fn latest_click(rx: &Receiver<SessionId>) -> Option<SessionId> {
     let mut latest = None;
     while let Ok(id) = rx.try_recv() {
         latest = Some(id);
@@ -53,7 +53,7 @@ pub fn latest_click(rx: &Receiver<SessionId>) -> Option<SessionId> {
 /// Spawn a throwaway thread so the platform notifier's synchronous calls
 /// don't stall the paint loop.  The thread posts the session's id back
 /// through `NOTIFY_TX` when the user clicks the notification.
-pub fn attention(session: &Session<impl Repaint>, repaint: &impl Repaint) {
+pub(crate) fn attention(session: &Session<impl Repaint>, repaint: &impl Repaint) {
     let where_label = session
         .working_directory
         .as_ref()

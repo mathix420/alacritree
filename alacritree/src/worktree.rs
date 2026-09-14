@@ -14,12 +14,12 @@ use crate::tools::{self, Tool};
 use crate::{command_ext, jobs, wsl};
 
 #[derive(Debug, Clone)]
-pub enum Progress {
+pub(crate) enum Progress {
     Step(String),
     Done(Result<PathBuf, String>),
 }
 
-pub struct CreateRequest {
+pub(crate) struct CreateRequest {
     pub project_root: PathBuf,
     pub default_branch: Option<String>,
     pub branch: String,
@@ -31,7 +31,7 @@ pub struct CreateRequest {
 /// git-check-ref-format rules, abridged: no whitespace/control chars, no
 /// `..`, `~`, `^`, `:`, `?`, `*`, `[`, `\`, `@{`; can't start with `-` or `.`,
 /// or end with `.` or `.lock`.
-pub fn validate_branch_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_branch_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("Branch name is empty.".into());
     }
@@ -66,7 +66,7 @@ pub fn validate_branch_name(name: &str) -> Result<(), String> {
 /// streamed progress travels over the channel; the returned `Job` carries no
 /// result of its own and exists only to be held — dropping it would cancel
 /// the create before it starts.
-pub fn spawn_create(
+pub(crate) fn spawn_create(
     req: CreateRequest,
     repaint: impl Repaint,
 ) -> (Receiver<Progress>, jobs::Job<()>) {
@@ -91,7 +91,7 @@ pub fn spawn_create(
 /// Nothing here needs a window, so callers without one (the CLI, with no
 /// running app to talk to) drive this directly through [`jobs::on_this_thread`]
 /// rather than through [`spawn_create`].
-pub fn create(
+pub(crate) fn create(
     req: &CreateRequest,
     mut on_step: impl FnMut(&str),
     blocking: &jobs::Blocking,
@@ -259,7 +259,7 @@ fn has_remote(cwd: &Path, name: &str) -> bool {
 /// rather than using git2 so WSL worktrees resolve the same way everything
 /// else in this module does.
 #[allow(clippy::disallowed_methods)] // Running git is this function's job.
-pub fn list_branches(cwd: &Path, _blocking: &jobs::Blocking) -> Result<Vec<String>, String> {
+pub(crate) fn list_branches(cwd: &Path, _blocking: &jobs::Blocking) -> Result<Vec<String>, String> {
     let output = git_command(cwd)
         .args(["for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes/origin"])
         .stdout(Stdio::piped())
@@ -537,7 +537,7 @@ fn copy_path(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
 }
 
-pub fn delete_worktree(
+pub(crate) fn delete_worktree(
     project_root: &Path,
     worktree_path: &Path,
     branch: Option<&str>,
@@ -569,7 +569,7 @@ pub fn delete_worktree(
 /// A worktree removal to run on a background thread: either delete a live
 /// checkout ([`delete_worktree`]) or prune the leftover metadata of one whose
 /// directory is already gone ([`prune_worktree`]).
-pub enum DeleteJob {
+pub(crate) enum DeleteJob {
     Remove { worktree_path: PathBuf, branch: Option<String>, force: bool },
     Prune { worktree_name: String, branch: Option<String>, delete_branch: bool },
 }
@@ -579,7 +579,7 @@ pub enum DeleteJob {
 /// caller confirms the dialog, hands the work here, and adopts the result (an
 /// error to surface, or nothing) from the returned handle — the sidebar row
 /// shows a spinner until it lands, so this runs at interactive priority.
-pub fn spawn_delete(
+pub(crate) fn spawn_delete(
     project_root: PathBuf,
     job: DeleteJob,
     repaint: impl Repaint,
@@ -602,7 +602,7 @@ pub fn spawn_delete(
 /// (git calls these *prunable*). Uses git2's per-worktree prune rather than
 /// shelling out to `git worktree prune`, which would sweep every stale
 /// worktree in the repo instead of just the one the user asked about.
-pub fn prune_worktree(
+fn prune_worktree(
     project_root: &Path,
     worktree_name: &str,
     branch: Option<&str>,

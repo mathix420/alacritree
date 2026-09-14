@@ -106,7 +106,7 @@ pub struct PaneTarget {
 
 /// A program and its argv, ready to be a session's shell.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Launch {
+pub(crate) struct Launch {
     pub program: String,
     pub argv: Vec<String>,
 }
@@ -124,7 +124,7 @@ pub struct CreatedPane {
 
 /// What a multiplexer answers so alacritree can host one of its panes.
 #[enum_dispatch]
-pub trait MultiplexerSession {
+pub(crate) trait MultiplexerSession {
     /// The command that opens a session already showing `target`, when this
     /// multiplexer can hand one pane over on this side under `mode`.  `None`
     /// means the pane is reachable only by sharing the multiplexer's whole
@@ -192,7 +192,7 @@ pub trait MultiplexerSession {
 /// `Default` is what the enum's `FromStr` and `EnumIter` build the variant's
 /// payload with.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct Herdr;
+pub(crate) struct Herdr;
 
 impl MultiplexerSession for Herdr {
     fn open_multiplexer_session(&self, target: &PaneTarget, mode: AttachMode) -> Option<Launch> {
@@ -254,7 +254,7 @@ impl MultiplexerSession for Herdr {
 #[enum_dispatch(MultiplexerSession)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display, EnumString, EnumIter)]
 #[strum(serialize_all = "lowercase")]
-pub enum Multiplexer {
+pub(crate) enum Multiplexer {
     Herdr(Herdr),
 }
 
@@ -267,7 +267,7 @@ impl Multiplexer {
     /// asking for one names its multiplexer itself.  A side cannot stand in
     /// for the key: it names a server, and two multiplexers can each have one
     /// on the same side.
-    pub fn owning(_key: &herdr::HerdrKey) -> Self {
+    pub(crate) fn owning(_key: &herdr::HerdrKey) -> Self {
         Herdr.into()
     }
 }

@@ -32,7 +32,7 @@ thread_local! {
 }
 
 #[derive(Debug, Clone)]
-pub struct Link {
+pub(crate) struct Link {
     pub bounds: Match,
     pub uri: String,
 }
@@ -41,7 +41,7 @@ pub struct Link {
 ///
 /// OSC 8 hyperlinks take priority over regex matches because they carry an
 /// explicit URI that may differ from the visible text.
-pub fn link_at(term: &Term<EventProxy<impl Repaint>>, point: Point) -> Option<Link> {
+pub(crate) fn link_at(term: &Term<EventProxy<impl Repaint>>, point: Point) -> Option<Link> {
     if let Some(link) = hyperlink_at(term, point) {
         return Some(link);
     }
@@ -164,7 +164,7 @@ fn post_process(
 /// action.  Submitted rather than spawned inline: `CreateProcess` is not free
 /// on a loaded machine, and this runs from the grid's click handler.
 #[must_use = "dropping the handle cancels the open"]
-pub fn open(uri: &str) -> jobs::Job<()> {
+pub(crate) fn open(uri: &str) -> jobs::Job<()> {
     let uri = uri.to_owned();
     jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
         if let Err(err) = spawn(&uri, blocking) {

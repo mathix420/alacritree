@@ -102,7 +102,7 @@ fn handle_response(response: &UNNotificationResponse) {
 /// on the main thread before the first notification; safe to call when
 /// unbundled (delivery is disabled with a warning instead of the framework's
 /// exception).
-pub fn init(ctx: egui::Context) {
+pub(crate) fn init(ctx: egui::Context) {
     if NSBundle::mainBundle().bundleIdentifier().is_none() {
         log::warn!(
             "desktop notifications disabled: not running from an app bundle (assemble one with \
@@ -131,7 +131,7 @@ pub fn init(ctx: egui::Context) {
 
 /// Post one attention toast.  Thread-safe; a no-op until `init` ran with a
 /// bundle identifier present.
-pub fn notify(body: &str, id: SessionId) {
+pub(super) fn notify(body: &str, id: SessionId) {
     if !matches!(STATE.get(), Some(Some(_))) {
         return;
     }

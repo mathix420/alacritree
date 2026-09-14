@@ -7,7 +7,7 @@ use crate::bindings::{BindingAction, Key, KeyBinding, Modifiers, NamedAction};
 /// The configured bindings with each key already in egui's terms and each
 /// trigger already spelled, so a key press or a painted palette row converts
 /// nothing.
-pub struct Shortcuts {
+pub(crate) struct Shortcuts {
     entries: Vec<Shortcut>,
 }
 
@@ -19,7 +19,7 @@ struct Shortcut {
 }
 
 impl Shortcuts {
-    pub fn new(bindings: &[KeyBinding]) -> Self {
+    pub(crate) fn new(bindings: &[KeyBinding]) -> Self {
         let entries = bindings
             .iter()
             .map(|b| Shortcut {
@@ -37,7 +37,7 @@ impl Shortcuts {
     /// user's typical pattern of stacking `ClearLogNotice` + `chars = "\f"` on
     /// Ctrl+L works: the first action is our `Unsupported` no-op, the second
     /// writes 0x0c.
-    pub fn matches(&self, key: egui::Key, mods: egui::Modifiers) -> Vec<&BindingAction> {
+    pub(crate) fn matches(&self, key: egui::Key, mods: egui::Modifiers) -> Vec<&BindingAction> {
         let mods = binding_mods(mods);
         self.entries
             .iter()
@@ -47,13 +47,13 @@ impl Shortcuts {
     }
 
     /// Every bound action, in binding order.
-    pub fn actions(&self) -> impl Iterator<Item = &BindingAction> {
+    pub(crate) fn actions(&self) -> impl Iterator<Item = &BindingAction> {
         self.entries.iter().map(|s| &s.action)
     }
 
     /// The spelled triggers bound to `action`, in binding order: user bindings
     /// before the defaults they did not replace.
-    pub fn labels(&self, action: NamedAction) -> impl Iterator<Item = &str> {
+    pub(crate) fn labels(&self, action: NamedAction) -> impl Iterator<Item = &str> {
         self.entries
             .iter()
             .filter(move |s| matches!(s.action, BindingAction::Named(a) if a == action))

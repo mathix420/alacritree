@@ -16,7 +16,7 @@ use crate::glyph_cache::{AtlasState, Face};
 
 /// Slot 0 is reserved for a cell with nothing to draw.  Its size is zero, so
 /// the vertex shader collapses the quad and the rasterizer discards it.
-pub const BLANK_SLOT: u16 = 0;
+const BLANK_SLOT: u16 = 0;
 
 /// Where one character's artwork sits in egui's font atlas and where it is
 /// drawn relative to its cell.  Read off a galley epaint laid out, so the
@@ -26,7 +26,7 @@ pub const BLANK_SLOT: u16 = 0;
 /// tens of thousands of cells drawn from a few hundred distinct characters.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 #[repr(C)]
-pub struct GlyphSlot {
+pub(crate) struct GlyphSlot {
     /// Atlas rectangle in texels, as the galley's vertices carry it.
     pub uv_min: [f32; 2],
     pub uv_max: [f32; 2],
@@ -48,7 +48,7 @@ pub struct GlyphSlot {
 /// one upload rather than two and a cell's colours share a cache line.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[repr(C)]
-pub struct GlyphInstance {
+pub(crate) struct GlyphInstance {
     pub slot: u16,
     /// Tile in the decoration strip; zero is an undecorated cell.
     pub deco: u16,
@@ -62,7 +62,7 @@ pub struct GlyphInstance {
 /// egui lays a one-character galley out as exactly one quad; anything else
 /// (a character with no ink, a fallback that produced nothing) has no slot and
 /// draws as blank.
-pub fn slot_from_galley(galley: &Galley) -> Option<GlyphSlot> {
+fn slot_from_galley(galley: &Galley) -> Option<GlyphSlot> {
     let row = galley.rows.first()?;
     let v = &row.visuals.mesh.vertices;
     if v.len() != 4 {
@@ -84,7 +84,7 @@ pub fn slot_from_galley(galley: &Galley) -> Option<GlyphSlot> {
 /// of mostly-untouched memory, so the low byte of the character picks an entry
 /// within a page and the rest picks the page, which is allocated the first
 /// time a character on it is asked for.
-pub struct GlyphTable {
+pub(crate) struct GlyphTable {
     size: f32,
     /// Where each page starts in `entries`.  Offset zero is the shared page of
     /// blanks every untouched page points at, so a lookup is two loads with
@@ -125,11 +125,11 @@ impl Default for GlyphTable {
 }
 
 impl GlyphTable {
-    pub fn slots(&self) -> &[GlyphSlot] {
+    pub(crate) fn slots(&self) -> &[GlyphSlot] {
         &self.slots
     }
 
-    pub fn generation(&self) -> u32 {
+    pub(crate) fn generation(&self) -> u32 {
         self.generation
     }
 
@@ -144,7 +144,7 @@ impl GlyphTable {
     /// A `true` obliges the caller to rewrite every cell it has outstanding.
     /// Clearing renumbers the table from nothing, so a record written against
     /// the old numbering addresses some other character, or none at all.
-    pub fn begin_frame(&mut self, ctx: &egui::Context, size: f32) -> bool {
+    pub(crate) fn begin_frame(&mut self, ctx: &egui::Context, size: f32) -> bool {
         let now = AtlasState::read(ctx);
         let stale = self.size != size || self.atlas.is_some_and(|prev| prev.outlived_by(now));
         if stale {
@@ -174,7 +174,7 @@ impl GlyphTable {
     /// Whether the table is still valid is `begin_frame`'s to decide: clearing
     /// part-way through a frame would renumber slots the frame had already
     /// written into cells it is not going to revisit.
-    pub fn slot(
+    pub(crate) fn slot(
         &mut self,
         ch: char,
         face: Face,
@@ -210,7 +210,7 @@ impl GlyphTable {
 /// The character and colour are kept here because the overlay is repainted
 /// every frame while the records behind it are only rewritten on damage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Overlay {
+pub(crate) struct Overlay {
     pub col: usize,
     pub ch: char,
     pub fg: [u8; 4],
@@ -221,7 +221,7 @@ pub struct Overlay {
 /// `glyphs` is `cols * rows` long at all times so a row's records never move,
 /// which is what makes a damage-driven partial upload possible.
 #[derive(Default)]
-pub struct GridInstances {
+pub(crate) struct GridInstances {
     pub glyphs: Vec<GlyphInstance>,
     /// Per row, so rewriting three rows rescans three rows rather than the
     /// screen.  Almost always empty: a terminal of text has no emoji in it.
@@ -234,7 +234,7 @@ pub struct GridInstances {
 }
 
 impl GridInstances {
-    pub fn dimensions(&self) -> (usize, usize) {
+    pub(crate) fn dimensions(&self) -> (usize, usize) {
         (self.cols, self.rows)
     }
 
@@ -243,17 +243,17 @@ impl GridInstances {
     /// Conservative: a decorated run whose cells all landed past the last
     /// column still counts, so the pass runs on a frame that would have drawn
     /// nothing.  Erring the other way would drop a real underline.
-    pub fn any_decorated(&self) -> bool {
+    pub(crate) fn any_decorated(&self) -> bool {
         self.deco_rows.contains(&true)
     }
 
     /// Byte range covering `rows`, for a partial buffer upload.
-    pub fn row_bytes(&self, first: usize, count: usize) -> std::ops::Range<usize> {
+    pub(crate) fn row_bytes(&self, first: usize, count: usize) -> std::ops::Range<usize> {
         let stride = self.cols * size_of::<GlyphInstance>();
         first * stride..(first + count) * stride
     }
 
-    pub fn resize(&mut self, cols: usize, rows: usize, default_bg: Color32) {
+    pub(crate) fn resize(&mut self, cols: usize, rows: usize, default_bg: Color32) {
         if (self.cols, self.rows) == (cols, rows) {
             return;
         }
@@ -280,7 +280,7 @@ impl GridInstances {
     }
 
     /// Every cell an overlay owns, with the row it sits on.
-    pub fn overlays(&self) -> impl Iterator<Item = (usize, Overlay)> + '_ {
+    pub(crate) fn overlays(&self) -> impl Iterator<Item = (usize, Overlay)> + '_ {
         self.overlays
             .iter()
             .enumerate()
@@ -294,7 +294,7 @@ impl GridInstances {
     /// out of a `flat_map`, whose `size_hint` floors at zero: collecting them
     /// grows a vector by doubling, which on a full-screen redraw of a colour
     /// per cell allocates megabytes per frame for a sequence read once.
-    pub fn write_rows<'a>(
+    pub(crate) fn write_rows<'a>(
         &mut self,
         rows_touched: impl IntoIterator<Item = usize>,
         runs: impl IntoIterator<Item = RunView<'a>>,
@@ -355,7 +355,7 @@ impl GridInstances {
 /// What `write_rows` needs from a snapshot run, without borrowing the snapshot
 /// itself — the caller resolves the text slice and the face once.
 #[derive(Clone, Copy)]
-pub struct RunView<'a> {
+pub(crate) struct RunView<'a> {
     pub text: &'a str,
     pub start_col: usize,
     pub row: usize,

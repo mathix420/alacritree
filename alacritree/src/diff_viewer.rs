@@ -11,7 +11,7 @@ use crate::tools::Tool;
 
 /// Which `git diff` flavor a git panel row opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DiffSource {
+pub(crate) enum DiffSource {
     Staged,
     Worktree,
     Untracked,
@@ -23,7 +23,7 @@ pub enum DiffSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiffRequest {
+pub(crate) struct DiffRequest {
     pub file: String,
     pub source: DiffSource,
 }
@@ -31,7 +31,7 @@ pub struct DiffRequest {
 /// Stable identifier for "the diff this click would open". It matches the
 /// active diff session's `SessionKind::Diff { key }` to highlight the row and
 /// toggle the pane off when clicked again.
-pub fn diff_key(req: &DiffRequest) -> String {
+pub(crate) fn diff_key(req: &DiffRequest) -> String {
     let tag = match &req.source {
         DiffSource::Staged => "staged",
         DiffSource::Worktree => "worktree",
@@ -42,7 +42,7 @@ pub fn diff_key(req: &DiffRequest) -> String {
 }
 
 /// git arguments after `git` for the requested diff.
-pub fn diff_args(req: &DiffRequest) -> Vec<String> {
+fn diff_args(req: &DiffRequest) -> Vec<String> {
     let mut args = vec!["diff".to_string()];
     match &req.source {
         DiffSource::Staged => args.push("--cached".to_string()),
@@ -60,7 +60,7 @@ pub fn diff_args(req: &DiffRequest) -> Vec<String> {
 
 /// A whole git panel section.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Section {
+pub(crate) enum Section {
     Staged,
     Unstaged,
     Branch { base: String },
@@ -68,7 +68,7 @@ pub enum Section {
 
 impl Section {
     /// What the pane's tab calls the section.
-    pub fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         match self {
             Section::Staged => "staged changes".to_string(),
             Section::Unstaged => "unstaged changes".to_string(),
@@ -78,14 +78,14 @@ impl Section {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Target {
+pub(crate) enum Target {
     Row(DiffRequest),
     Section(Section),
 }
 
 impl Target {
     /// Stable identity of the pane this target opens.
-    pub fn key(&self) -> String {
+    pub(crate) fn key(&self) -> String {
         match self {
             Target::Row(req) => diff_key(req),
             Target::Section(Section::Staged) => "section:staged".to_string(),
@@ -195,13 +195,13 @@ impl Viewer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Launch {
+pub(crate) enum Launch {
     Pager { pager: Program, pager_args: Vec<String>, git_args: Vec<String> },
     Direct { program: Program, args: Vec<String> },
 }
 
 /// Whether the viewer can open this target.
-pub fn opens(viewer: &Viewer, target: &Target) -> bool {
+pub(crate) fn opens(viewer: &Viewer, target: &Target) -> bool {
     match viewer {
         Viewer::Pager { .. } => true,
         Viewer::Direct { templates, .. } => {
@@ -216,7 +216,7 @@ pub fn opens(viewer: &Viewer, target: &Target) -> bool {
 }
 
 /// How a viewer opens a target, or `None` when the target is unavailable.
-pub fn plan(viewer: &Viewer, target: &Target) -> Option<Launch> {
+pub(crate) fn plan(viewer: &Viewer, target: &Target) -> Option<Launch> {
     if !opens(viewer, target) {
         return None;
     }
@@ -264,7 +264,7 @@ fn substitute(arg: &str, target: &Target) -> String {
 }
 
 /// `pager` with its arguments, as one `core.pager` value.
-pub fn pager_command(pager: &str, args: &[String]) -> String {
+pub(crate) fn pager_command(pager: &str, args: &[String]) -> String {
     let mut words = vec![pager.to_string()];
     words.extend(args.iter().map(|arg| shell_quote(arg)));
     words.join(" ")
@@ -272,7 +272,7 @@ pub fn pager_command(pager: &str, args: &[String]) -> String {
 
 /// A registry-resolved executable path with arguments, as one `core.pager`
 /// value. Git runs that value through a shell, so quote the path as one word.
-pub fn executable_pager_command(path: &str, args: &[String]) -> String {
+pub(crate) fn executable_pager_command(path: &str, args: &[String]) -> String {
     let mut words = vec![shell_quote(path)];
     words.extend(args.iter().map(|arg| shell_quote(arg)));
     words.join(" ")
@@ -283,7 +283,11 @@ fn shell_quote(value: &str) -> String {
 }
 
 /// git with the pager wired in as its `core.pager`.
-pub fn native_pager_command(git: &str, pager: &str, git_args: &[String]) -> (String, Vec<String>) {
+pub(crate) fn native_pager_command(
+    git: &str,
+    pager: &str,
+    git_args: &[String],
+) -> (String, Vec<String>) {
     let mut args = vec!["-c".to_string(), format!("core.pager={pager}")];
     args.extend(git_args.iter().cloned());
     (git.to_string(), args)
@@ -294,7 +298,7 @@ const LOGIN_SHELL: &str = r#"s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d:
 const PAGER_SCRIPT: &str =
     r#"export LESS="${LESS-R}"; g=$1; p=$2; shift 2; exec "$g" -c "core.pager=$p" "$@""#;
 
-pub fn wsl_pager_command(
+pub(crate) fn wsl_pager_command(
     distro: &str,
     workspace: &Path,
     git: &str,
@@ -306,7 +310,7 @@ pub fn wsl_pager_command(
     wsl_sh(distro, workspace, PAGER_SCRIPT.to_string(), positional)
 }
 
-pub fn wsl_pager_command_login(
+pub(crate) fn wsl_pager_command_login(
     distro: &str,
     workspace: &Path,
     git: &str,
@@ -319,7 +323,7 @@ pub fn wsl_pager_command_login(
     wsl_sh(distro, workspace, script, positional)
 }
 
-pub fn wsl_direct_command(
+pub(crate) fn wsl_direct_command(
     distro: &str,
     workspace: &Path,
     program: &str,
@@ -337,7 +341,7 @@ pub fn wsl_direct_command(
     ("wsl.exe".to_string(), argv)
 }
 
-pub fn wsl_direct_command_login(
+pub(crate) fn wsl_direct_command_login(
     distro: &str,
     workspace: &Path,
     program: &str,

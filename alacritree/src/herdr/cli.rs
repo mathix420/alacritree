@@ -34,7 +34,7 @@ pub fn attach_args(pane_id: &str) -> Vec<String> {
 /// Whether direct per-agent attach works on this side.  herdr's
 /// `run_terminal_attach` is a `#[cfg(windows)]` refusal, so a native Windows
 /// server falls back to focusing the pane and attaching the whole session.
-pub fn can_attach(side: &Side) -> bool {
+pub(super) fn can_attach(side: &Side) -> bool {
     match side {
         Side::Native => !cfg!(windows),
         Side::Wsl(_) => true,
@@ -89,7 +89,7 @@ pub fn focus_args(target: &PaneTarget) -> Vec<String> {
 }
 
 /// The `herdr` subcommand that focuses one pane by id.
-pub fn focus_pane_args(pane_id: &str) -> Vec<String> {
+pub(super) fn focus_pane_args(pane_id: &str) -> Vec<String> {
     vec!["agent".into(), "focus".into(), pane_id.into()]
 }
 
@@ -238,7 +238,7 @@ pub(super) fn list_panes(
     Ok(ListingReply::parse(&String::from_utf8_lossy(&output.stdout), listing, sampled_at, attached))
 }
 
-pub type HerdrAttachResult = Result<(String, Vec<String>), String>;
+pub(super) type HerdrAttachResult = Result<(String, Vec<String>), String>;
 
 /// What a shared-view attach asks herdr before its client can start: focus
 /// the pane, since every app client draws whatever herdr has focused, then

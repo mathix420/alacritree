@@ -28,7 +28,7 @@ use crate::fonts::ChainFace;
 
 /// A rasterized colour glyph, already scaled and centred within its cell box.
 /// Offsets and dimensions are device pixels, matching `builtin_font`.
-pub struct CachedColorGlyph {
+pub(crate) struct CachedColorGlyph {
     pub texture: TextureHandle,
     pub left: i32,
     pub top: i32,
@@ -42,7 +42,7 @@ impl CachedColorGlyph {
     }
 }
 
-pub struct ColorGlyphCache {
+pub(crate) struct ColorGlyphCache {
     /// The fallback chain in egui's own consultation order.
     chain: Vec<ChainFace>,
     /// Font files behind the chain, borrowed from the mappings `fonts` already
@@ -70,7 +70,7 @@ pub struct ColorGlyphCache {
 }
 
 impl ColorGlyphCache {
-    pub fn new(chain: Vec<ChainFace>, budget_mb: usize) -> Self {
+    pub(crate) fn new(chain: Vec<ChainFace>, budget_mb: usize) -> Self {
         Self {
             chain,
             files: HashMap::new(),
@@ -92,7 +92,7 @@ impl ColorGlyphCache {
     ///
     /// `cells` is the character's width in terminal cells, so a double-width
     /// emoji is fitted to the two cells it actually occupies.
-    pub fn get(
+    pub(crate) fn get(
         &mut self,
         ctx: &Context,
         c: char,

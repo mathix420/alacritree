@@ -25,7 +25,7 @@ struct Artifact {
     truncated: bool,
 }
 
-pub fn run(as_json: bool, all: bool) -> i32 {
+pub(super) fn run(as_json: bool, all: bool) -> i32 {
     let Some(dir) = logdir::log_dir() else {
         eprintln!("alacritree: no log directory on this platform");
         return 1;

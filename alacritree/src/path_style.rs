@@ -23,13 +23,13 @@ pub enum PathStyle {
 /// never reordered; `parent` keeps its trailing separator, and is empty for a
 /// bare name.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Parts {
+pub(crate) struct Parts {
     pub root: String,
     pub parent: String,
     pub name: String,
 }
 
-pub fn split(path: &str, style: PathStyle, home: Option<&str>) -> Parts {
+pub(crate) fn split(path: &str, style: PathStyle, home: Option<&str>) -> Parts {
     let (root, rest, sep) = split_root(path);
     let collapsed = match style {
         PathStyle::Full => None,
@@ -55,7 +55,7 @@ pub fn split(path: &str, style: PathStyle, home: Option<&str>) -> Parts {
     Parts { root, parent, name }
 }
 
-pub fn render(path: &str, style: PathStyle, home: Option<&str>) -> String {
+pub(crate) fn render(path: &str, style: PathStyle, home: Option<&str>) -> String {
     if style == PathStyle::Full {
         return path.to_string();
     }

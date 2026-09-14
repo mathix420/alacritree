@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use crate::ipc::protocol::{IpcRequest, LocalSocket, Transport};
 
-pub fn run(socket: Option<PathBuf>) {
+pub(crate) fn run(socket: Option<PathBuf>) {
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };

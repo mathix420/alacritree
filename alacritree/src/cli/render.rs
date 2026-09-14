@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::ipc::protocol::IpcRequest;
 
-pub fn human(request: &IpcRequest, value: &Value) {
+pub(super) fn human(request: &IpcRequest, value: &Value) {
     match request {
         IpcRequest::ListProjects => projects(value),
         IpcRequest::AddProject { .. }

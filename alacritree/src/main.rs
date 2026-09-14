@@ -1,83 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app;
-mod bindings;
-mod builtin_font;
-mod cli;
-mod clipboard;
-mod clipboard_image;
-mod color_glyph;
-mod colors;
-mod command_ext;
-mod command_palette;
-mod config;
-mod crash_log;
-mod decoration_sprites;
-mod diff_viewer;
-mod digest;
-mod dll_search;
-mod doppler;
-mod file_drop;
-mod focus_priority;
-mod fonts;
-mod frame_log;
-mod git_nav;
-mod git_status;
-mod glyph_cache;
-mod gpu_timing;
-mod grid_gl;
-mod grid_instances;
-mod herdr;
-mod ime;
-mod input;
-mod ipc;
-mod jobs;
-mod links;
-mod logdir;
-mod logging;
-mod mcp;
-mod mouse;
-mod multiplexer;
-mod notify;
-mod panel_filter;
-mod paste;
-mod path_style;
-mod pending_spawn;
-mod pr_query;
-mod pr_status;
-mod project_refresh;
-mod projects;
-#[cfg(windows)]
-mod pty_rearm;
-mod repaint;
-mod row_label;
-mod scratchpad;
-mod session;
-mod shell_decision;
-mod shortcut;
-mod sidebar_focus;
-mod sidebar_nav;
-mod stale_exe;
-mod startup_log;
-mod state;
-#[cfg(test)]
-mod steady_state;
-mod terminal_view;
-#[cfg(test)]
-mod test_util;
-mod tools;
-mod upstream;
-#[cfg(windows)]
-mod win_session;
-mod workspace;
-mod worktree;
-mod worktree_liveness;
-mod wsl;
-mod wsl_helper;
-
 use std::io::IsTerminal;
 
-use app::AlacritreeApp;
+use alacritree::app::AlacritreeApp;
+#[cfg(windows)]
+use alacritree::win_session;
+use alacritree::{
+    cli, config, crash_log, dll_search, frame_log, logdir, logging, startup_log, state, tools, wsl,
+    wsl_helper,
+};
 use clap::Parser;
 
 /// Pre-resized from the 2048x2048 source so we don't embed a 4 MB blob for
@@ -85,7 +16,7 @@ use clap::Parser;
 const WINDOW_ICON: &[u8] = include_bytes!("../assets/icon-256.png");
 
 fn main() -> eframe::Result<()> {
-    crate::dll_search::harden_dll_search_path();
+    dll_search::harden_dll_search_path();
 
     // egui_winit warns on every cold X11 clipboard probe even when it recovers.
     let default_filter = "info,egui_winit::clipboard=error";

@@ -14,5 +14,5 @@
 //! Alacritty's IPC is unix-only, but nothing above the transport is, and the
 //! MCP bridge is worth as much on Windows.
 
-pub mod protocol;
-pub mod server;
+pub(crate) mod protocol;
+pub(crate) mod server;

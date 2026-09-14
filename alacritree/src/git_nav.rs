@@ -10,7 +10,7 @@ use crate::git_status::{ChangeKind, DiffStat, FileChange};
 
 /// Which list of the git panel a row belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GitSection {
+pub(crate) enum GitSection {
     Staged,
     Unstaged,
     Branch,
@@ -18,7 +18,7 @@ pub enum GitSection {
 
 /// A row the git-panel cursor can rest on, in render order.
 #[derive(Debug, Clone)]
-pub struct GitRow {
+pub(crate) struct GitRow {
     pub section: GitSection,
     pub path: String,
     /// `None` for branch-diff rows: `DiffStat` carries no `ChangeKind`.
@@ -32,12 +32,12 @@ impl PartialEq for GitRow {
 }
 
 /// Visible/total counts for one section, for the panel's header labels.
-pub struct SectionCount {
+pub(crate) struct SectionCount {
     pub visible: usize,
     pub total: usize,
 }
 
-pub struct GitRows {
+pub(crate) struct GitRows {
     pub rows: Vec<GitRow>,
     pub staged: SectionCount,
     pub unstaged: SectionCount,
@@ -70,7 +70,7 @@ fn push_change_rows(
 /// Render-order rows under the active kind/query filters: Staged, then
 /// Unstaged, then Branch. Branch rows have no `ChangeKind` to test against
 /// `kind_pass`, so only `query_pass` applies to them.
-pub fn visible_rows(
+pub(crate) fn visible_rows(
     staged: &[FileChange],
     unstaged: &[FileChange],
     branch: &[DiffStat],
@@ -101,7 +101,7 @@ pub fn visible_rows(
 
 /// The row `delta` steps away from `cursor`, clamped to the list ends.
 /// `None` only when `rows` is empty.
-pub fn step(rows: &[GitRow], cursor: &GitRow, delta: i32) -> Option<GitRow> {
+pub(crate) fn step(rows: &[GitRow], cursor: &GitRow, delta: i32) -> Option<GitRow> {
     if rows.is_empty() {
         return None;
     }
@@ -113,7 +113,7 @@ pub fn step(rows: &[GitRow], cursor: &GitRow, delta: i32) -> Option<GitRow> {
 
 /// Cursor fallback: unchanged when still visible, else the first row, else
 /// `None` when the panel has nothing to show.
-pub fn ensure_cursor(rows: &[GitRow], cursor: Option<&GitRow>) -> Option<GitRow> {
+pub(crate) fn ensure_cursor(rows: &[GitRow], cursor: Option<&GitRow>) -> Option<GitRow> {
     match cursor {
         Some(c) if rows.contains(c) => Some(c.clone()),
         _ => rows.first().cloned(),

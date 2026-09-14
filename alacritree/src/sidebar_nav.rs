@@ -35,13 +35,13 @@ pub enum SidebarRow {
 /// blocks because attaching turns the second into the first, and a pane that
 /// changed how it is drawn has not changed where it belongs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkspaceEntry {
+pub(crate) enum WorkspaceEntry {
     Session(SessionId),
     Agent(Side, String),
 }
 
 impl WorkspaceEntry {
-    pub fn row(&self) -> SidebarRow {
+    pub(crate) fn row(&self) -> SidebarRow {
         match self {
             Self::Session(id) => SidebarRow::Session(*id),
             Self::Agent(side, terminal_id) => {
@@ -50,7 +50,7 @@ impl WorkspaceEntry {
         }
     }
 
-    pub fn session(&self) -> Option<SessionId> {
+    pub(crate) fn session(&self) -> Option<SessionId> {
         match self {
             Self::Session(id) => Some(*id),
             Self::Agent(..) => None,
@@ -62,7 +62,7 @@ impl WorkspaceEntry {
 /// the order it draws them.  The caller owns both the listing rule
 /// (threshold, config overrides) and the order, so the cursor model cannot
 /// drift from the paint pass.
-pub type ListedRows = HashMap<WorkspaceKey, Vec<WorkspaceEntry>>;
+pub(crate) type ListedRows = HashMap<WorkspaceKey, Vec<WorkspaceEntry>>;
 
 fn push_entry_rows(rows: &mut Vec<SidebarRow>, listed: &ListedRows, ws: &WorkspaceKey) {
     if let Some(entries) = listed.get(ws) {
@@ -73,7 +73,7 @@ fn push_entry_rows(rows: &mut Vec<SidebarRow>, listed: &ListedRows, ws: &Workspa
 /// Every row the sidebar currently renders, in render order: Home first,
 /// then each project's header followed by its worktrees when expanded, with
 /// each workspace's listed rows directly after its own row.
-pub fn visible_rows(projects: &[Project], listed: &ListedRows) -> Vec<SidebarRow> {
+pub(crate) fn visible_rows(projects: &[Project], listed: &ListedRows) -> Vec<SidebarRow> {
     let mut rows = vec![SidebarRow::Home];
     push_entry_rows(&mut rows, listed, &None);
     for p in projects {
@@ -109,7 +109,7 @@ fn owning_project<'a>(projects: &'a [Project], path: &Path) -> Option<&'a Projec
 /// collapses to `origin` alone: a detached session, or one in a worktree being
 /// deleted, has no position in a list it is not in, and must still be free to
 /// move inside its own workspace.
-pub fn move_range(
+pub(crate) fn move_range(
     projects: &[Project],
     order: &[WorkspaceKey],
     origin: &WorkspaceKey,
@@ -136,7 +136,7 @@ pub fn move_range(
 
 /// Where a session lands after one reorder step.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StepTarget {
+pub(crate) struct StepTarget {
     pub workspace: WorkspaceKey,
     /// Position among that workspace's sessions once the move is applied.
     pub position: usize,
@@ -152,7 +152,7 @@ pub struct StepTarget {
 /// empty neighbour resolves to position 0 either way, so it needs no case of
 /// its own.  `None` is every refusal — both ends of the range are clamped and
 /// nothing wraps.
-pub fn step_target(
+pub(crate) fn step_target(
     range: &[WorkspaceKey],
     lens: &[usize],
     origin: &WorkspaceKey,
@@ -184,7 +184,7 @@ pub fn step_target(
 /// workspace no listed project owns.  A path two projects both list belongs to
 /// the first in sidebar order; the session records a directory, not a project,
 /// so nothing better is available.
-pub fn project_of<'a>(projects: &'a [Project], ws: &WorkspaceKey) -> Option<&'a Path> {
+pub(crate) fn project_of<'a>(projects: &'a [Project], ws: &WorkspaceKey) -> Option<&'a Path> {
     let path = ws.as_deref()?;
     projects.iter().find(|p| p.worktrees.iter().any(|w| w.path == path)).map(|p| p.root.as_path())
 }
@@ -194,7 +194,7 @@ pub fn project_of<'a>(projects: &'a [Project], ws: &WorkspaceKey) -> Option<&'a 
 /// None when none of them do — a session whose project was removed has no
 /// row at all — which tells the caller to leave its comparison unwritten and
 /// try again once the tree renders it.
-pub fn follow_scroll_row(
+pub(crate) fn follow_scroll_row(
     rows: &[SidebarRow],
     workspace: &WorkspaceKey,
     displayed: Option<SessionId>,
@@ -217,7 +217,7 @@ pub fn follow_scroll_row(
 /// happened this frame, or the last followed pair already matches — so a
 /// change whose row renders nowhere keeps retrying every frame instead of
 /// resolving once and going quiet.
-pub fn wants_follow(
+pub(crate) fn wants_follow(
     follow_active: bool,
     cursor_moved: bool,
     last_followed: &(WorkspaceKey, Option<SessionId>),
@@ -230,7 +230,7 @@ pub fn wants_follow(
 /// The row `delta` steps away from `cursor`, clamped to the list ends.
 /// A cursor no longer in `rows` (worktree removed, project collapsed) falls
 /// back to Home rather than guessing a neighbor.
-pub fn step(rows: &[SidebarRow], cursor: &SidebarRow, delta: i32) -> SidebarRow {
+pub(crate) fn step(rows: &[SidebarRow], cursor: &SidebarRow, delta: i32) -> SidebarRow {
     let Some(pos) = rows.iter().position(|r| r == cursor) else {
         return SidebarRow::Home;
     };
@@ -243,7 +243,7 @@ pub fn step(rows: &[SidebarRow], cursor: &SidebarRow, delta: i32) -> SidebarRow 
 /// idiom.  A worktree's parent is its project header; a session's or herdr
 /// agent's parent is the worktree (or Home) row it's listed under.  `None`
 /// for Home and project cursors.
-pub fn left_target(rows: &[SidebarRow], cursor: &SidebarRow) -> Option<SidebarRow> {
+pub(crate) fn left_target(rows: &[SidebarRow], cursor: &SidebarRow) -> Option<SidebarRow> {
     let pos = rows.iter().position(|r| r == cursor)?;
     match cursor {
         SidebarRow::Worktree(_) => {
@@ -261,13 +261,13 @@ pub fn left_target(rows: &[SidebarRow], cursor: &SidebarRow) -> Option<SidebarRo
 /// The nearest project header strictly after `cursor` — the PageDown-style
 /// project jump.  `None` when no header follows or the cursor has vanished
 /// from `rows` (the caller reseats it, as `step` callers do).
-pub fn next_project(rows: &[SidebarRow], cursor: &SidebarRow) -> Option<SidebarRow> {
+pub(crate) fn next_project(rows: &[SidebarRow], cursor: &SidebarRow) -> Option<SidebarRow> {
     let pos = rows.iter().position(|r| r == cursor)?;
     rows[pos + 1..].iter().find(|r| matches!(r, SidebarRow::Project(_))).cloned()
 }
 
 /// The nearest project header strictly before `cursor`.
-pub fn previous_project(rows: &[SidebarRow], cursor: &SidebarRow) -> Option<SidebarRow> {
+pub(crate) fn previous_project(rows: &[SidebarRow], cursor: &SidebarRow) -> Option<SidebarRow> {
     let pos = rows.iter().position(|r| r == cursor)?;
     rows[..pos].iter().rev().find(|r| matches!(r, SidebarRow::Project(_))).cloned()
 }
@@ -276,7 +276,7 @@ pub fn previous_project(rows: &[SidebarRow], cursor: &SidebarRow) -> Option<Side
 /// row when it's currently listed in the sidebar, otherwise the current
 /// workspace's row, its project header when that project is collapsed, or
 /// Home.
-pub fn seed(
+pub(crate) fn seed(
     projects: &[Project],
     current_workspace: Option<&Path>,
     listed: &ListedRows,
@@ -317,7 +317,7 @@ pub fn seed(
 /// surfaces a workspace through the gate and never around it.  `name` and
 /// `child` take `&mut` so a caller may answer from state it carries between
 /// rows; both of today's callers answer from a map resolved before the call.
-pub struct RowPredicates<'a> {
+pub(crate) struct RowPredicates<'a> {
     pub home_gate: bool,
     pub home_name: bool,
     pub project_self: &'a dyn Fn(&Project) -> bool,
@@ -333,7 +333,7 @@ pub struct RowPredicates<'a> {
 /// matches itself or keeps at least one visible worktree.  A workspace that
 /// matched by name keeps all its children; one surfaced only because a child
 /// matched keeps just the matching ones.
-pub fn filtered_rows(
+pub(crate) fn filtered_rows(
     projects: &[Project],
     listed: &ListedRows,
     mut preds: RowPredicates<'_>,
@@ -398,7 +398,10 @@ pub fn filtered_rows(
 }
 
 /// Cursor fallback: unchanged when still visible, else the first row.
-pub fn ensure_cursor(rows: &[SidebarRow], cursor: Option<&SidebarRow>) -> Option<SidebarRow> {
+pub(crate) fn ensure_cursor(
+    rows: &[SidebarRow],
+    cursor: Option<&SidebarRow>,
+) -> Option<SidebarRow> {
     match cursor {
         Some(c) if rows.contains(c) => Some(c.clone()),
         _ => rows.first().cloned(),

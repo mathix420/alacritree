@@ -14,7 +14,7 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 /// Whether a panel is browsing its rows or typing a fuzzy-search query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
+pub(crate) enum Mode {
     Browsing,
     Search,
 }
@@ -23,7 +23,7 @@ pub enum Mode {
 /// consumed. `None` from `on_key`/`on_text` means the event fell through
 /// unconsumed and the caller's existing handling should run instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Outcome {
+pub(crate) enum Outcome {
     FilterChanged,
     MoveCursor(i32),
     LeavePanel,
@@ -31,7 +31,7 @@ pub enum Outcome {
 }
 
 /// Search/toggle state for one sidebar panel.
-pub struct PanelFilter {
+pub(crate) struct PanelFilter {
     /// Render/bit order of this panel's toggle filters, not a set of keys:
     /// `active_toggles` renders in this order and `toggle_bits` indexes it.
     allowed_toggles: &'static [char],
@@ -44,7 +44,7 @@ pub struct PanelFilter {
 }
 
 impl PanelFilter {
-    pub fn new(allowed_toggles: &'static [char]) -> Self {
+    pub(crate) fn new(allowed_toggles: &'static [char]) -> Self {
         Self {
             allowed_toggles,
             mode: Mode::Browsing,
@@ -56,21 +56,21 @@ impl PanelFilter {
         }
     }
 
-    pub fn mode(&self) -> Mode {
+    pub(crate) fn mode(&self) -> Mode {
         self.mode
     }
 
-    pub fn query(&self) -> &str {
+    pub(crate) fn query(&self) -> &str {
         &self.query
     }
 
-    pub fn is_toggled(&self, key: char) -> bool {
+    pub(crate) fn is_toggled(&self, key: char) -> bool {
         self.toggles.contains(&key)
     }
 
     /// Flip one toggle by its identity char.  A char outside `allowed_toggles`
     /// names no filter on this panel and is ignored.
-    pub fn toggle(&mut self, key: char) {
+    pub(crate) fn toggle(&mut self, key: char) {
         if !self.allowed_toggles.contains(&key) {
             return;
         }
@@ -79,19 +79,19 @@ impl PanelFilter {
         }
     }
 
-    pub fn clear_toggles(&mut self) {
+    pub(crate) fn clear_toggles(&mut self) {
         self.toggles.clear();
     }
 
     /// Active toggles in `allowed_toggles` order (render order).
-    pub fn active_toggles(&self) -> Vec<char> {
+    pub(crate) fn active_toggles(&self) -> Vec<char> {
         self.allowed_toggles.iter().copied().filter(|k| self.toggles.contains(k)).collect()
     }
 
     /// The active toggles as a bitmask over `allowed_toggles` order.  The
     /// focus reconciler compares this on every frame, where `active_toggles`'s
     /// `Vec` would put an allocation in the steady-state path.
-    pub fn toggle_bits(&self) -> u32 {
+    pub(crate) fn toggle_bits(&self) -> u32 {
         self.allowed_toggles
             .iter()
             .enumerate()
@@ -101,17 +101,17 @@ impl PanelFilter {
 
     /// Whether the panel currently narrows its rows: a non-empty query or
     /// any active toggle.
-    pub fn is_filtering(&self) -> bool {
+    pub(crate) fn is_filtering(&self) -> bool {
         !self.query.is_empty() || !self.toggles.is_empty()
     }
 
     /// Whether the toggle filters apply this frame.  Under `All` a live query
     /// stands them down, so a search reaches rows the toggles hide.
-    pub fn toggles_apply(&self, scope: crate::config::SearchScope) -> bool {
+    pub(crate) fn toggles_apply(&self, scope: crate::config::SearchScope) -> bool {
         scope == crate::config::SearchScope::Filtered || self.query.is_empty()
     }
 
-    pub fn on_key(&mut self, key: egui::Key) -> Option<Outcome> {
+    pub(crate) fn on_key(&mut self, key: egui::Key) -> Option<Outcome> {
         match self.mode {
             Mode::Browsing => match key {
                 egui::Key::Escape if !self.toggles.is_empty() => {
@@ -137,7 +137,7 @@ impl PanelFilter {
         }
     }
 
-    pub fn on_text(&mut self, text: &str) -> Option<Outcome> {
+    pub(crate) fn on_text(&mut self, text: &str) -> Option<Outcome> {
         match self.mode {
             Mode::Browsing => {
                 if text == "/" {
@@ -156,7 +156,7 @@ impl PanelFilter {
 
     /// Whether `haystack` matches the current query. An empty query matches
     /// everything.
-    pub fn matches(&mut self, haystack: &str) -> bool {
+    pub(crate) fn matches(&mut self, haystack: &str) -> bool {
         if self.query.is_empty() {
             return true;
         }
@@ -167,7 +167,7 @@ impl PanelFilter {
     /// Leave search mode: clear the query (rebuilding the empty, match-all
     /// pattern) and return to browsing. Toggle filters are a separate dimension
     /// and are left intact.
-    pub fn exit_search(&mut self) {
+    pub(crate) fn exit_search(&mut self) {
         self.clear_query();
         self.mode = Mode::Browsing;
     }

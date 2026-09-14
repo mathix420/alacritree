@@ -156,7 +156,7 @@ const MAX_PHASES: usize = 16;
 ///
 /// A stall that strikes once every few seconds does not move any percentile,
 /// so the summary cannot find it.  This names the phase it happened in.
-pub struct Phases {
+pub(crate) struct Phases {
     marks: [(&'static str, Duration); MAX_PHASES],
     len: usize,
     since: Instant,
@@ -164,7 +164,7 @@ pub struct Phases {
 }
 
 impl Phases {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             marks: [("", Duration::ZERO); MAX_PHASES],
             len: 0,
@@ -173,13 +173,13 @@ impl Phases {
         }
     }
 
-    pub fn restart(&mut self) {
+    pub(crate) fn restart(&mut self) {
         self.len = 0;
         self.since = Instant::now();
     }
 
     /// Close the phase that ended here, naming it.
-    pub fn mark(&mut self, name: &'static str) {
+    pub(crate) fn mark(&mut self, name: &'static str) {
         if !self.on || self.len == MAX_PHASES {
             return;
         }
@@ -189,7 +189,7 @@ impl Phases {
         self.len += 1;
     }
 
-    pub fn report_if_slow(&self) {
+    pub(crate) fn report_if_slow(&self) {
         let marks = &self.marks[..self.len];
         let total: Duration = marks.iter().map(|(_, d)| *d).sum();
         if total < SLOW_FRAME {

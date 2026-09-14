@@ -24,14 +24,14 @@ use crate::config::FontDelta;
 /// the first draw at a new cell size.  Keyed by `char` because (cell_w_px,
 /// cell_h_px) are an invariant of the cache instance — a size change wipes
 /// every entry rather than tagging keys with the size.
-pub struct BuiltinGlyphCache {
+pub(crate) struct BuiltinGlyphCache {
     /// Pixel-space cell size the cached textures were rasterized for; once
     /// this changes (font resize, DPI change) every entry is invalidated.
     cell_size: (u32, u32),
     entries: HashMap<char, CachedGlyph>,
 }
 
-pub struct CachedGlyph {
+pub(crate) struct CachedGlyph {
     pub texture: TextureHandle,
     pub top: i32,
     pub left: i32,
@@ -40,14 +40,14 @@ pub struct CachedGlyph {
 }
 
 impl BuiltinGlyphCache {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { cell_size: (0, 0), entries: HashMap::new() }
     }
 
     /// Get or rasterize the glyph for `c` at `metrics`.  Returns `None` for
     /// characters outside the built-in coverage range, or when the renderer
     /// declines (e.g. powerline arrows in too-narrow cells).
-    pub fn get(
+    pub(crate) fn get(
         &mut self,
         ctx: &Context,
         c: char,
@@ -113,7 +113,7 @@ const POWERLINE_BACKSLASH_SEPARATOR_ALT: char = '\u{e0bf}';
 /// the three fields actually referenced inside `box_drawing` /
 /// `powerline_drawing` are kept, so callers don't need a full font shaper.
 #[derive(Clone, Copy, Debug)]
-pub struct Metrics {
+pub(crate) struct Metrics {
     pub average_advance: f64,
     pub line_height: f64,
     pub descent: f32,
@@ -124,7 +124,7 @@ pub struct Metrics {
 /// time multiplies cleanly into the foreground color.  `top`/`left` mirror
 /// crossfont's `RasterizedGlyph` positioning relative to the baseline; the
 /// caller converts those to a screen rect.
-pub struct BuiltinGlyph {
+pub(crate) struct BuiltinGlyph {
     pub image: Arc<ColorImage>,
     pub top: i32,
     pub left: i32,
@@ -140,7 +140,7 @@ pub struct BuiltinGlyph {
 /// True iff `builtin_glyph` would return `Some` for `c`.  Used by the painter
 /// to decide whether to detour through the bitmap cache before laying down
 /// text shapes — avoids the cost of a full attempt for every cell.
-pub fn is_builtin_glyph(c: char) -> bool {
+pub(crate) fn is_builtin_glyph(c: char) -> bool {
     matches!(
         c,
         '\u{2500}'..='\u{259f}'
@@ -151,7 +151,7 @@ pub fn is_builtin_glyph(c: char) -> bool {
 }
 
 /// Returns the rasterized glyph if the character is part of the built-in font.
-pub fn builtin_glyph(
+fn builtin_glyph(
     character: char,
     metrics: &Metrics,
     offset: &FontDelta,

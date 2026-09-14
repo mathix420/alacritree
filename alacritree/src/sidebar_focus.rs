@@ -1189,4 +1189,56 @@ mod tests {
         let r = repair(&prev, &next, Some(&SidebarRow::Session(22)), None);
         assert_eq!(r.cursor, Some(SidebarRow::Home));
     }
+
+    #[test]
+    fn the_compare_is_linear_in_the_tree_size() {
+        fn tree(projects: usize, worktrees: usize) -> Vec<crate::projects::Project> {
+            (0..projects)
+                .map(|p| {
+                    let wts: Vec<String> = (0..worktrees)
+                        .map(|w| format!("/home/user/code/p{p}/worktree-{w}"))
+                        .collect();
+                    let refs: Vec<&str> = wts.iter().map(String::as_str).collect();
+                    crate::sidebar_nav::tests::project(
+                        &format!("/home/user/code/p{p}"),
+                        true,
+                        &refs,
+                    )
+                })
+                .collect()
+        }
+
+        let small = tree(10, 5);
+        let big = tree(50, 10);
+        let ui = UiInputs {
+            session_rows_always: false,
+            sessions_filter_counts_detached: false,
+            query: "",
+            toggles: 0,
+            toggles_apply: true,
+            pr_generation: 0,
+            active_workspace: None,
+            active_branch: None,
+            herdr_generation: 0,
+        };
+
+        let base_small = ObservedInputs::capture(&small, std::iter::empty(), ui);
+        reset_visits();
+        assert!(base_small.matches(&small, std::iter::empty(), ui));
+        let small_visits = visits();
+
+        let base_big = ObservedInputs::capture(&big, std::iter::empty(), ui);
+        reset_visits();
+        assert!(base_big.matches(&big, std::iter::empty(), ui));
+        let big_visits = visits();
+
+        // 50×10 is 10× the records of 10×5. Linear work lands near 10×;
+        // anything quadratic lands near 100× and trips this well before a
+        // timing threshold would notice.
+        assert!(
+            big_visits < small_visits * 20,
+            "comparing a 10× larger tree examined {big_visits} records against {small_visits}. \
+             That is superlinear, so something is scanning inside a per-node loop"
+        );
+    }
 }

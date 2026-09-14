@@ -27,7 +27,7 @@ const TTL: Duration = Duration::from_secs(300);
 /// GitHub's PR lifecycle, folded to what the sidebar paints.  `gh` reports
 /// draftness as a separate boolean, so OPEN splits into Open/Draft here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrState {
+pub(crate) enum PrState {
     Open,
     Draft,
     Merged,
@@ -35,7 +35,7 @@ pub enum PrState {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct PrInfo {
+pub(crate) struct PrInfo {
     pub number: u64,
     pub base_branch: String,
     pub url: String,
@@ -57,7 +57,7 @@ fn effective_cap(configured: Option<usize>, ceiling: usize) -> usize {
     configured.unwrap_or(usize::MAX).min(ceiling.saturating_sub(1)).max(1)
 }
 
-pub struct PrCache {
+pub(crate) struct PrCache {
     entries: HashMap<PathBuf, Entry>,
     /// Requests in flight.  `in_flight` counts these rather than branches:
     /// what a burst costs follows the repositories it spans — a resolve and a
@@ -127,11 +127,11 @@ struct Batch {
 type BatchResult = HashMap<PathBuf, Option<PrInfo>>;
 
 impl PrCache {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    pub fn with_clock(clock: impl Fn() -> Duration + Send + 'static) -> Self {
+    pub(crate) fn with_clock(clock: impl Fn() -> Duration + Send + 'static) -> Self {
         Self {
             entries: HashMap::new(),
             batches: Vec::new(),
@@ -151,7 +151,7 @@ impl PrCache {
     /// `None` unless the entry was queried for `branch`: an entry is keyed by
     /// path but only ever valid for one branch, so a caller reading it under a
     /// different branch would be reading the previous branch's PR.
-    pub fn state(&self, path: &Path, branch: Option<&str>) -> Option<PrState> {
+    pub(crate) fn state(&self, path: &Path, branch: Option<&str>) -> Option<PrState> {
         let entry = self.entries.get(path)?;
         if entry.branch.as_deref() != branch {
             return None;
@@ -163,7 +163,7 @@ impl PrCache {
     /// a background refresh if the cache is stale or branch-mismatched.
     /// Never blocks — the caller will see the previous value (or `None`)
     /// until the worker finishes and the next frame picks up the result.
-    pub fn poll(
+    pub(crate) fn poll(
         &mut self,
         path: &Path,
         branch: Option<&str>,
@@ -219,7 +219,7 @@ impl PrCache {
     /// reconciler compares it to know a filtered row set needs rebuilding; a
     /// banked result that happens to match the previous one costs one extra
     /// rebuild, which is cheaper than diffing states to avoid it.
-    pub fn generation(&self) -> u64 {
+    pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
 
@@ -227,7 +227,7 @@ impl PrCache {
     /// pool decides.  Either way it never exceeds the pool's own background
     /// ceiling, so a cold cache can't fork one `gh` process per eligible
     /// worktree and starve the local work sharing the pool.
-    pub fn set_concurrency(&mut self, configured: Option<usize>) {
+    pub(crate) fn set_concurrency(&mut self, configured: Option<usize>) {
         self.concurrency = effective_cap(configured, jobs::pool().background_ceiling());
     }
 
@@ -236,7 +236,7 @@ impl PrCache {
     /// site rather than inside `poll`: an entry whose project collapsed
     /// mid-lookup is never polled again, and a slot it still held would never
     /// come back.
-    pub fn drain_completed(&mut self, repaint: &impl Repaint) {
+    pub(crate) fn drain_completed(&mut self, repaint: &impl Repaint) {
         let now = self.now();
         let mut banked = false;
         let mut still_running = Vec::new();
@@ -327,7 +327,7 @@ impl PrCache {
     /// `refresh_requested`, because clearing `queried_at` alone cannot reach
     /// them: `poll` will not spawn while `pending` is occupied, and the drain
     /// would stamp a fresh timestamp over the request.
-    pub fn invalidate_all(&mut self) {
+    pub(crate) fn invalidate_all(&mut self) {
         for entry in self.entries.values_mut() {
             entry.queried_at = None;
             if entry.pending {
@@ -401,7 +401,7 @@ fn should_invalidate(cached_branch: Option<&str>, incoming_branch: Option<&str>)
 /// Whether a worktree in `state` survives the projects panel's PR dimension.
 /// The active states union; with none active every worktree passes.  An unknown
 /// state — no lookup yet, no PR, or no `gh` — satisfies no active toggle.
-pub fn pr_pass(
+pub(crate) fn pr_pass(
     state: Option<PrState>,
     open: bool,
     draft: bool,
@@ -433,7 +433,7 @@ pub fn pr_pass(
 /// inactive workspace's `StatusCache` is created once and then never re-polled
 /// or pruned: reading it would freeze the branch at whatever it was on the last
 /// visit and shadow later `refresh_project` updates to `wt.branch`.
-pub fn effective_branch<'a>(
+pub(crate) fn effective_branch<'a>(
     wt: &'a Worktree,
     current_workspace: Option<&Path>,
     live_branch: Option<&'a str>,
