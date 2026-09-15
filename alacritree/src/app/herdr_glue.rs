@@ -395,10 +395,14 @@ impl AlacritreeApp {
         argv: Vec<String>,
         shared_view: bool,
     ) -> Option<SessionId> {
+        let (argv, probe) = match herdr_attach_probe(&key.side, &program, &argv) {
+            Some((wrapped, probe)) => (wrapped, Some(probe)),
+            None => (argv, None),
+        };
         // `alacritty_terminal::tty::Shell`'s fields are crate-private, so
         // this goes through the constructor rather than a struct literal.
         let shell = Shell::new(program, argv);
-        match self.spawn_session_with_shell(ctx, workspace, Some(shell), None) {
+        match self.spawn_session_with_shell(ctx, workspace, Some(shell), probe) {
             Ok(id) => {
                 if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
                     session.bind_herdr(key.clone(), shared_view);

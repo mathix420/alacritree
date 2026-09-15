@@ -3162,6 +3162,31 @@ mod tests {
         assert!(session.nav_tui_running(), "a shared view shows herdr's own splits");
     }
 
+    /// A WSL attach runs herdr inside the distro, out of reach of the Windows
+    /// descendant walk, so without the helper's foreground probe the session
+    /// reads as idle for its whole life and never forwards a focus key.
+    #[test]
+    fn a_wsl_attach_carries_a_foreground_probe() {
+        let argv: Vec<String> = ["-d", "kali-linux", "--exec", "sh", "-lc", "herdr session attach"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let wsl = herdr::Side::Wsl("kali-linux".to_string());
+        let (wrapped, probe) = crate::app::herdr_attach_probe(&wsl, "wsl.exe", &argv)
+            .expect("a wsl attach takes the shim");
+        assert_eq!(probe.distro, "kali-linux");
+        assert!(
+            wrapped.contains(&probe.key),
+            "the shim publishes the PID under the key the probe reads: {wrapped:?}"
+        );
+
+        let native = ["session", "attach"].iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(
+            crate::app::herdr_attach_probe(&herdr::Side::Native, "herdr.exe", &native).is_none()
+        );
+    }
+
     #[test]
     fn nav_tui_name_match_covers_both_platforms_naming() {
         // Windows image names.

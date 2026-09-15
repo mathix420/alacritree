@@ -307,32 +307,12 @@ pub fn wrap_profile_argv(
     args: &[String],
     probe_key: &str,
 ) -> Option<(Vec<String>, Option<String>)> {
-    // The argv comes from a Windows host, so the program path uses Windows
-    // separators — split on them explicitly rather than via `Path`, whose
-    // separator set depends on the compilation target.
-    let file_name = program.rsplit(['\\', '/']).next().unwrap_or(program);
-    let stem = Path::new(file_name).file_stem()?.to_str()?;
-    if !stem.eq_ignore_ascii_case("wsl") {
+    if !is_wsl_program(program) {
         return None;
     }
-    let mut distro = None;
-    let mut wrapped = Vec::new();
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "-d" | "--distribution" => {
-                let name = it.next()?;
-                distro = Some(name.clone());
-                wrapped.push(arg.clone());
-                wrapped.push(name.clone());
-            },
-            "--cd" => {
-                let dir = it.next()?;
-                wrapped.push(arg.clone());
-                wrapped.push(dir.clone());
-            },
-            _ => return None,
-        }
+    let (mut wrapped, distro, rest) = split_leading_flags(args)?;
+    if !rest.is_empty() {
+        return None;
     }
     wrapped.extend([
         "--exec".to_string(),
@@ -343,6 +323,81 @@ pub fn wrap_profile_argv(
         probe_key.to_string(),
     ]);
     Some((wrapped, distro))
+}
+
+/// Command shim for an argv that already names what to run: publish the PID
+/// under the probe key, then become that command.  `SHIM_SCRIPT` cannot
+/// stand in, since its `exec` is hard-wired to the login shell and would
+/// drop the command.  The `exec` here keeps the pidfile PID on the process
+/// that owns the tty, where the helper's `PROBE` starts its walk.  One
+/// line, for `SHIM_SCRIPT`'s reason.
+pub(crate) const EXEC_SHIM_SCRIPT: &str = r##"d=${XDG_RUNTIME_DIR:-/tmp}/alacritree; mkdir -p "$d" 2>/dev/null && printf %s $$ > "$d/session-$1.pid"; shift; exec "$@""##;
+
+/// Probe-key shim for a wsl.exe argv whose `--exec` carries a command, the
+/// shape a multiplexer attach takes.  The command runs under
+/// [`EXEC_SHIM_SCRIPT`] rather than the login-shell shim, so the session
+/// that was asked for is still the session that runs.  An argv this parser
+/// does not fully understand gets `None` and runs unmodified, probing as
+/// unknown.
+pub fn wrap_exec_argv(program: &str, args: &[String], probe_key: &str) -> Option<Vec<String>> {
+    if !is_wsl_program(program) {
+        return None;
+    }
+    let (mut wrapped, _, rest) = split_leading_flags(args)?;
+    let [exec, command @ ..] = rest else { return None };
+    if exec != "--exec" || command.is_empty() {
+        return None;
+    }
+    wrapped.extend([
+        "--exec".to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        EXEC_SHIM_SCRIPT.to_string(),
+        "sh".to_string(),
+        probe_key.to_string(),
+    ]);
+    wrapped.extend(command.iter().cloned());
+    Some(wrapped)
+}
+
+fn is_wsl_program(program: &str) -> bool {
+    // The argv comes from a Windows host, so the program path uses Windows
+    // separators. Split on them explicitly rather than via `Path`, whose
+    // separator set depends on the compilation target.
+    let file_name = program.rsplit(['\\', '/']).next().unwrap_or(program);
+    Path::new(file_name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("wsl"))
+}
+
+/// The leading `-d`/`--distribution <distro>` and `--cd <dir>` flags, the
+/// distro they name, and whatever follows them.  A flag missing its value
+/// gets `None`: the rest of the argv then means something this parser
+/// cannot see.
+fn split_leading_flags(args: &[String]) -> Option<(Vec<String>, Option<String>, &[String])> {
+    let mut distro = None;
+    let mut flags = Vec::new();
+    let mut rest = args;
+    while let Some((arg, tail)) = rest.split_first() {
+        match arg.as_str() {
+            "-d" | "--distribution" => {
+                let (name, tail) = tail.split_first()?;
+                distro = Some(name.clone());
+                flags.push(arg.clone());
+                flags.push(name.clone());
+                rest = tail;
+            },
+            "--cd" => {
+                let (dir, tail) = tail.split_first()?;
+                flags.push(arg.clone());
+                flags.push(dir.clone());
+                rest = tail;
+            },
+            _ => break,
+        }
+    }
+    Some((flags, distro, rest))
 }
 
 use std::collections::HashMap;
@@ -1136,6 +1191,40 @@ mod tests {
         assert!(wrap_profile_argv("wsl.exe", &to_vec(&["-d"]), "k").is_none());
         assert!(wrap_profile_argv("pwsh.exe", &[], "k").is_none());
         assert!(wrap_profile_argv("wslhost.exe", &[], "k").is_none());
+    }
+
+    #[test]
+    fn wraps_an_exec_command_around_the_probe_shim() {
+        let argv: Vec<String> = ["-d", "kali-linux", "--exec", "sh", "-lc", "herdr session attach"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let wrapped = wrap_exec_argv("wsl.exe", &argv, "7-1").unwrap();
+        assert_eq!(wrapped, vec![
+            "-d",
+            "kali-linux",
+            "--exec",
+            "sh",
+            "-c",
+            EXEC_SHIM_SCRIPT,
+            "sh",
+            "7-1",
+            "sh",
+            "-lc",
+            "herdr session attach"
+        ]);
+    }
+
+    #[test]
+    fn refuses_an_argv_that_names_no_command() {
+        let to_vec = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // A login-shell launch belongs to `wrap_profile_argv`; `--exec` with
+        // nothing after it, an unknown flag, or another program is not ours.
+        assert!(wrap_exec_argv("wsl.exe", &to_vec(&["-d", "kali"]), "k").is_none());
+        assert!(wrap_exec_argv("wsl.exe", &to_vec(&["-d", "kali", "--exec"]), "k").is_none());
+        assert!(wrap_exec_argv("wsl.exe", &to_vec(&["-e", "herdr"]), "k").is_none());
+        assert!(wrap_exec_argv("wsl.exe", &to_vec(&["-d"]), "k").is_none());
+        assert!(wrap_exec_argv("herdr.exe", &to_vec(&["session", "attach"]), "k").is_none());
     }
 
     #[test]
