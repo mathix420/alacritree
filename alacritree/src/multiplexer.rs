@@ -71,10 +71,9 @@ impl Side {
                     .chain(args.iter().map(|a| sh_quote(a)))
                     .collect::<Vec<_>>()
                     .join(" ");
-                // `--exec` hands wsl.exe a bare program lookup, and these
-                // binaries install off that PATH; routing through `sh -lc`
-                // sources the login shell that puts them back.
-                wsl::exec_invocation(distro, &["sh", "-lc", &script])
+                // The login shell supplies PATH; exec preserves the PID
+                // recorded by the foreground probe.
+                wsl::exec_invocation(distro, &["sh", "-lc", &format!("exec {script}")])
             },
         }
     }
@@ -325,14 +324,14 @@ mod tests {
         let side = Side::Wsl("kali-linux".into());
         let (program, args) = side.command(&herdr::program(&side), &["agent", "list"]);
         assert_eq!(program, "wsl.exe");
-        assert_eq!(args, vec!["-d", "kali-linux", "--exec", "sh", "-lc", "herdr agent list"]);
+        assert_eq!(args, vec!["-d", "kali-linux", "--exec", "sh", "-lc", "exec herdr agent list"]);
     }
 
     #[test]
     fn wsl_quotes_arguments_that_need_it() {
         let side = Side::Wsl("d".into());
         let (_, args) = side.command(&herdr::program(&side), &["agent", "attach", "w1:p1"]);
-        assert_eq!(args.last().unwrap(), "herdr agent attach 'w1:p1'");
+        assert_eq!(args.last().unwrap(), "exec herdr agent attach 'w1:p1'");
     }
 
     /// A client reads a multiplexer's name off a reply and may send it back,

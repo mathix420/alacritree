@@ -3552,6 +3552,28 @@ fn shimmed_wsl_argv(program: &str, args: &[String]) -> Option<(Shell, WslProbe)>
     Some((Shell::new(program.to_string(), args), WslProbe { distro, key }))
 }
 
+/// The probe shim for a multiplexer attach, which launches a command rather
+/// than a login shell.  A WSL attach runs the multiplexer inside the distro,
+/// where the Windows descendant walk cannot see it, so it needs the helper's
+/// foreground probe to answer for it.  A native attach already stands in that
+/// walk, and an argv this module cannot wrap probes as unknown: both get
+/// `None` and spawn the argv unchanged.
+pub(crate) fn herdr_attach_probe(
+    side: &herdr::Side,
+    program: &str,
+    argv: &[String],
+) -> Option<(Vec<String>, WslProbe)> {
+    let herdr::Side::Wsl(distro) = side else {
+        return None;
+    };
+    if !wsl_helper::enabled() {
+        return None;
+    }
+    let key = wsl_helper::new_probe_key();
+    let wrapped = wsl_helper::wrap_exec_argv(program, argv, &key)?;
+    Some((wrapped, WslProbe { distro: distro.clone(), key }))
+}
+
 fn profile_session_shell(profile: &crate::config::Profile) -> (Option<Shell>, Option<WslProbe>) {
     match shimmed_wsl_argv(&profile.program, &profile.args) {
         Some((shell, probe)) => (Some(shell), Some(probe)),
