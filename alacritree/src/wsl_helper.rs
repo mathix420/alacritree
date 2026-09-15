@@ -259,6 +259,13 @@ while IFS=$TAB read -r id kind rest; do
           done
           ;;
         esac
+      elif [ -n "$tpgid" ]; then
+        # An attach that execs straight into its TUI leaves the TUI as its own
+        # group leader, so the tty's foreground group is the pidfile process
+        # itself.  Only a nav TUI counts here: an idle shell is its own leader
+        # too, and reporting its comm would read as a foreground job.
+        m=$(cat "/proc/$tpgid/comm" 2>/dev/null)
+        case $m in nvim*|vim*|tmux*|zellij*|herdr*) comm=$m ;; esac
       fi
     fi
     printf %s "$comm" > "$t/$id.out"
