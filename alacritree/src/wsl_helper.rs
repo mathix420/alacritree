@@ -1592,6 +1592,27 @@ mod tests {
         let _ = child.wait();
     }
 
+    #[test]
+    #[ignore = "requires WSL"]
+    fn multiplexer_command_keeps_the_probe_pid() {
+        let distro =
+            crate::wsl::distros().into_iter().find(|d| d.is_default).expect("a default distro");
+        let key = new_probe_key();
+        let (program, args) = crate::multiplexer::Side::Wsl(distro.name).command("sh", &[
+            "-c",
+            r#"f=${XDG_RUNTIME_DIR:-/tmp}/alacritree/session-$1.pid; p=$(cat "$f") || exit 1; rm -f "$f"; printf '%s\n%s\n' "$$" "$p""#,
+            "sh",
+            &key,
+        ]);
+        let args = wrap_exec_argv(&program, &args, &key).expect("wrap multiplexer command");
+        let output = crate::command_ext::hidden(program).args(args).output().expect("run in WSL");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let stdout = String::from_utf8(output.stdout).expect("PID output is UTF-8");
+        let pids: Vec<_> = stdout.lines().collect();
+        assert_eq!(pids.len(), 2, "command and probe PIDs: {stdout:?}");
+        assert_eq!(pids[0], pids[1], "the probe must track the command, not its login shell");
+    }
+
     /// Killing the child is what frees a writer parked inside `write_all` on a
     /// pipe nobody is draining.  Requires WSL and kills the shared helper for
     /// the default distro, so run it on its own:
