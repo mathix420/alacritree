@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.13.0](https://github.com/mathix420/alacritree/compare/v0.12.0...v0.13.0) (2026-09-16)
+
+
+### Features
+
+* **cli:** resolve project refresh from a path, add --all ([#225](https://github.com/mathix420/alacritree/issues/225)) ([f051b77](https://github.com/mathix420/alacritree/commit/f051b774df3fcf4b65030b5a776404fc80b657ef))
+* **diff:** choose the diff pane viewer [23] ([#233](https://github.com/mathix420/alacritree/issues/233)) ([3b28b0e](https://github.com/mathix420/alacritree/commit/3b28b0ed5e729ecf6fafbff8ccf5f530a1048853))
+* **ipc:** attach multiplexer panes without focus [29] ([#239](https://github.com/mathix420/alacritree/issues/239)) ([17132cb](https://github.com/mathix420/alacritree/commit/17132cb95de39699c3d9950ad79e0b41f8d33cb9))
+
+
+### Bug Fixes
+
+* **herdr:** restore WSL pane navigation [28] ([#238](https://github.com/mathix420/alacritree/issues/238)) ([d48ddb8](https://github.com/mathix420/alacritree/commit/d48ddb85afc5d83a15cb0d83cc5681eb9632f46d))
+* **session:** forward focus keys to zellij and herdr ([#232](https://github.com/mathix420/alacritree/issues/232)) ([c6602ad](https://github.com/mathix420/alacritree/commit/c6602ad0740d736a0c7880ba569afd9da49a49a7))
+
 ## [0.12.0](https://github.com/mathix420/alacritree/compare/v0.11.0...v0.12.0) (2026-09-12)
 
 
