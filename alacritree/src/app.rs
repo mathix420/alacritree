@@ -28,18 +28,18 @@ use crate::config::{
 use crate::crash_log::{self, ExitReason};
 use crate::git_nav::{self, GitSection, SectionCount};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
+use crate::in_flight::{Finished, InFlight};
 use crate::multiplexer::{
     AttachFocus, HarnessMark, Managed, MultiplexerSession, Multiplexers, PaneKey, PaneStatus,
     PaneTarget, Side, StateTone,
 };
 use crate::panel_filter::{self, PanelFilter};
 use crate::path_style::PathStyle;
-use crate::pending_spawn::{Finished, PendingSpawns};
 use crate::pr_status::{self, PrCache, PrInfo, PrState};
-use crate::projects::{Project, Worktree, project_json};
+use crate::projects::{Discovered, Project, Worktree, project_json};
 use crate::session::{
-    self, AttentionVerdict, LiveState, Session, SessionActivity, SessionId, SessionKind, TermSize,
-    poll_attention_debounce,
+    self, Attachment, AttentionVerdict, LiveState, Session, SessionActivity, SessionId,
+    SessionKind, TermSize, poll_attention_debounce,
 };
 use crate::shell_decision::{ShellDecision, shell_decision};
 use crate::sidebar_nav::{self, SidebarRow, StepTarget};
@@ -431,14 +431,15 @@ pub struct AlacritreeApp {
     /// backend may block paint: wsl.exe takes seconds while the distro VM
     /// boots, and git2 takes tens of milliseconds on a project with many
     /// worktrees.  Results are adopted in `poll_project_refreshes`.
-    project_refreshes: crate::project_refresh::ProjectRefreshes,
-    /// Keeps each `project_refreshes` job alive on the pool: `jobs::Job`
-    /// cancels its work on drop, so this is what stands between a refresh and
-    /// having it cancelled the instant `refresh_project` returns.  Cleared
-    /// alongside `project_refreshes` as each result is adopted.
-    project_refresh_jobs: HashMap<PathBuf, jobs::Job<()>>,
-    /// PTYs opened on a worker, adopted in `poll_pending_spawns`.
-    pending_spawns: PendingSpawns,
+    ///
+    /// IPC callers are answered only once the result is live, since a client
+    /// that refreshes a project to act on the new worktree list would
+    /// otherwise race its own request.
+    project_refreshes: InFlight<PathBuf, Discovered>,
+    /// PTYs opened on a worker, adopted in `poll_pending_spawns`.  A client
+    /// that creates a session to write to it is answered once the PTY is
+    /// live, or it would race its own shell.
+    pending_spawns: InFlight<SessionId, std::io::Result<Attachment>>,
     /// Every multiplexer alacritree hosts panes from, each with its own
     /// listing and calls in flight.
     multiplexers: Multiplexers,
@@ -530,7 +531,6 @@ impl AlacritreeApp {
             grid_paint: std::time::Duration::ZERO,
             last_pane_geometry: None,
             project_refreshes: Default::default(),
-            project_refresh_jobs: HashMap::new(),
             pending_spawns: Default::default(),
             multiplexers,
             liveness: Default::default(),
@@ -745,19 +745,16 @@ impl AlacritreeApp {
     /// milliseconds on a project with many worktrees.
     fn refresh_project(&mut self, ctx: &Context, idx: usize) {
         let root = self.projects[idx].root.clone();
-        if self.project_refreshes.is_running(&root) {
-            return;
-        }
-        let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         let worker_root = root.clone();
         let upstream = self.config.ui.upstream_status;
-        let job = jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
-            let _ = tx.send(Project::discover(worker_root, upstream, blocking));
-            ctx.request_repaint();
+        self.project_refreshes.start(root, || {
+            jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
+                let found = Project::discover(worker_root, upstream, blocking);
+                ctx.request_repaint();
+                found
+            })
         });
-        self.project_refresh_jobs.insert(root.clone(), job);
-        self.project_refreshes.start(root, rx);
     }
 
     /// Keep the worktree rows the sidebar just drew honest about whether their
@@ -850,21 +847,22 @@ impl AlacritreeApp {
     /// terminal output happened to trigger, for the discoveries that are not
     /// running.
     fn poll_project_refreshes(&mut self) {
-        let sessions = &self.sessions;
-        let projects = &mut self.projects;
-        let refresh_jobs = &mut self.project_refresh_jobs;
-        self.project_refreshes.poll(|root, found| {
-            refresh_jobs.remove(root);
-            match projects.iter_mut().find(|p| p.root == *root) {
+        for Finished { key: root, outcome, waiters } in self.project_refreshes.take_finished() {
+            let Some(found) = outcome else {
+                waiters.answer(Err("the project refresh worker panicked".to_string()));
+                continue;
+            };
+            let reply = match self.projects.iter_mut().find(|p| p.root == root) {
                 Some(project) => {
                     let occupied: HashSet<PathBuf> =
-                        sessions.iter().filter_map(|s| s.working_directory.clone()).collect();
+                        self.sessions.iter().filter_map(|s| s.working_directory.clone()).collect();
                     project.apply(found, &occupied);
                     Ok(project_json(project))
                 },
                 None => Err(format!("{} is not a project in the sidebar", root.display())),
-            }
-        });
+            };
+            waiters.answer(reply);
+        }
     }
 
     /// Push a session record and get its PTY opened: inline when the gate is
@@ -902,7 +900,7 @@ impl AlacritreeApp {
         // load is the shell's own first output seconds later.
         let job = jobs::pool()
             .spawn(jobs::Priority::Interactive, move |_blocking| session::open(request));
-        self.pending_spawns.start(id, job);
+        self.pending_spawns.start(id, || job);
         Ok(id)
     }
 
@@ -910,26 +908,25 @@ impl AlacritreeApp {
     /// was closed while it was opening: dropping the attachment shuts its
     /// shell down rather than resurrecting the tab.
     fn poll_pending_spawns(&mut self, ctx: &Context) {
-        for finished in self.pending_spawns.take_finished() {
-            match finished {
-                Finished::Opened(id, attachment, waiters) => {
-                    match self.sessions.iter().position(|s| s.id == id) {
-                        Some(idx) => {
-                            let started = Instant::now();
-                            self.sessions[idx].attach(attachment);
-                            crate::frame_log::spawn_phase(Some(id), "attach", started.elapsed());
-                            PendingSpawns::answer(waiters, Ok(json!({ "session_id": id })));
-                        },
-                        None => {
-                            drop(attachment);
-                            PendingSpawns::answer(
-                                waiters,
-                                Err("the session was closed while its shell was starting".into()),
-                            );
-                        },
-                    }
+        for Finished { key: id, outcome, waiters } in self.pending_spawns.take_finished() {
+            let opened = outcome
+                .unwrap_or_else(|| Err(std::io::Error::other("the session's PTY worker panicked")));
+            match opened {
+                Ok(attachment) => match self.sessions.iter().position(|s| s.id == id) {
+                    Some(idx) => {
+                        let started = Instant::now();
+                        self.sessions[idx].attach(attachment);
+                        crate::frame_log::spawn_phase(Some(id), "attach", started.elapsed());
+                        waiters.answer(Ok(json!({ "session_id": id })));
+                    },
+                    None => {
+                        drop(attachment);
+                        waiters.answer(Err(
+                            "the session was closed while its shell was starting".into()
+                        ));
+                    },
                 },
-                Finished::Failed(id, e, waiters) => {
+                Err(e) => {
                     // The workspace comes off the record rather than off the
                     // pending entry: `move_session_to_key` can re-key a
                     // session while its PTY is opening.
@@ -942,7 +939,7 @@ impl AlacritreeApp {
                         self.close_session_with(ctx, id, CloseReason::SpawnFailed);
                         self.report_spawn_failure(ctx, &ws, &e);
                     }
-                    PendingSpawns::answer(waiters, Err(format!("failed to spawn shell: {e}")));
+                    waiters.answer(Err(format!("failed to spawn shell: {e}")));
                 },
             }
         }
@@ -5645,7 +5642,7 @@ mod tests {
     }
 
     /// `park_attach_reply` builds the `Ok` reply itself when nothing is
-    /// opening for the id; `pending_spawn.rs` proves `watch` hands the
+    /// opening for the id; `in_flight.rs` proves `watch` hands the
     /// channel back in that case, but nothing there asserts what this
     /// method does with it, so a dropped `Ok` wrap or a wrong id would go
     /// uncaught.

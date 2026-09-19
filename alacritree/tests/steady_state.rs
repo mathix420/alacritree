@@ -7,8 +7,8 @@ use std::time::Instant;
 use alacritree::alloc_count::{CountingAllocator, measure};
 use alacritree::config::FollowFocus;
 use alacritree::herdr;
+use alacritree::in_flight::InFlight;
 use alacritree::multiplexer::Side;
-use alacritree::pending_spawn::PendingSpawns;
 use alacritree::projects::{Project, Worktree};
 use alacritree::sidebar_focus::{ObservedInputs, SessionInput, UiInputs};
 
@@ -116,7 +116,7 @@ fn an_unchanged_frame_with_toggle_filters_and_a_narrow_query_allocates_nothing()
 /// common case of nothing opening has to be free.
 #[test]
 fn polling_no_pending_spawns_allocates_nothing() {
-    let mut spawns = PendingSpawns::default();
+    let mut spawns = InFlight::<u64, ()>::default();
 
     let (finished, counts) = measure(|| spawns.take_finished());
 

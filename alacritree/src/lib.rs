@@ -36,6 +36,7 @@ pub(crate) mod grid_gl;
 pub(crate) mod grid_instances;
 pub mod herdr;
 pub(crate) mod ime;
+pub mod in_flight;
 pub(crate) mod input;
 pub(crate) mod ipc;
 pub(crate) mod jobs;
@@ -49,10 +50,8 @@ pub(crate) mod notify;
 pub(crate) mod panel_filter;
 pub(crate) mod paste;
 pub(crate) mod path_style;
-pub mod pending_spawn;
 pub(crate) mod pr_query;
 pub(crate) mod pr_status;
-pub(crate) mod project_refresh;
 pub mod projects;
 #[cfg(windows)]
 pub(crate) mod pty_rearm;
