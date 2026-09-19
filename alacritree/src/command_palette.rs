@@ -83,7 +83,7 @@ impl PaletteSection {
             Self::Window => "Window & application",
             Self::Profiles => "Shell profiles",
             Self::OpenSessions => "Open sessions",
-            Self::MultiplexerPanes => "Herdr sessions",
+            Self::MultiplexerPanes => "Multiplexer panes",
             Self::SwitchWorkspace => "Switch workspace",
             Self::NewWorktree => "New worktree",
         }
@@ -806,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    fn herdr_panes_have_their_own_section() {
+    fn multiplexer_panes_have_their_own_section() {
         let items = vec![
             PaletteItem::session(
                 1,
@@ -832,7 +832,7 @@ mod tests {
         let sections: Vec<PaletteSection> =
             group(&items, &ranked).into_iter().map(|(s, _)| s).collect();
         assert_eq!(sections, vec![PaletteSection::OpenSessions, PaletteSection::MultiplexerPanes]);
-        assert_eq!(items[1].section.title(), "Herdr sessions");
+        assert_eq!(items[1].section.title(), "Multiplexer panes");
     }
 
     #[test]

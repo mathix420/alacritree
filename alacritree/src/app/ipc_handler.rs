@@ -78,19 +78,30 @@ impl AlacritreeApp {
                     continue;
                 },
                 ipc::protocol::IpcRequest::AttachMultiplexerPane {
+                    multiplexer,
                     side,
                     terminal_id,
                     no_focus,
                 } => {
                     let focus = AttachFocus::requested(no_focus);
-                    self.defer_attach_multiplexer_pane(ctx, &side, &terminal_id, reply_tx, focus);
+                    self.defer_attach_multiplexer_pane(
+                        ctx,
+                        (multiplexer.as_deref(), &side, &terminal_id),
+                        reply_tx,
+                        focus,
+                    );
                     continue;
                 },
-                ipc::protocol::IpcRequest::CreateMultiplexerPane { side, workspace, no_focus } => {
+                ipc::protocol::IpcRequest::CreateMultiplexerPane {
+                    multiplexer,
+                    side,
+                    workspace,
+                    no_focus,
+                } => {
                     let focus = AttachFocus::requested(no_focus);
                     self.defer_create_multiplexer_pane(
                         ctx,
-                        side.as_deref(),
+                        (multiplexer.as_deref(), side.as_deref()),
                         workspace,
                         reply_tx,
                         focus,

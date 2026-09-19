@@ -1,11 +1,13 @@
 //! What alacritree means by a pane some multiplexer owns, in terms every
 //! multiplexer answers in.
 
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
 use super::{MultiplexerKind, PaneTarget, Side};
 use crate::ipc::protocol::IpcResult;
 use crate::workspace::WorkspaceKey;
+use crate::wsl;
 
 /// Identifies one pane across polls.  `terminal_id` is unique only within one
 /// server, which is why the side and the multiplexer are part of it.
@@ -89,6 +91,45 @@ impl Pane {
             .as_deref()
             .filter(|cwd| !cwd.trim().is_empty())
             .or_else(|| self.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()))
+    }
+
+    /// The sidebar workspace this pane is working in, by longest path prefix.
+    /// `None` means it belongs under Home.
+    pub fn workspace(&self, side: &Side, workspaces: &[PathBuf]) -> Option<PathBuf> {
+        let reported = self.foreground_cwd.as_deref().or(self.cwd.as_deref())?;
+        let cwd = match side {
+            Side::Native => PathBuf::from(reported),
+            Side::Wsl(distro) => wsl::linux_to_windows(reported, distro),
+        };
+        workspaces
+            .iter()
+            .filter(|ws| starts_with(&cwd, ws))
+            .max_by_key(|ws| ws.components().count())
+            .cloned()
+    }
+}
+
+/// Component-wise prefix test.  Case-insensitive on Windows, where a
+/// multiplexer reports the cwd as the shell spelled it and `Path::starts_with`
+/// would refuse `c:\users\dev` against `C:\Users\Dev`.
+fn starts_with(cwd: &Path, workspace: &Path) -> bool {
+    if cfg!(windows) {
+        let mut want = workspace.components();
+        let mut have = cwd.components();
+        loop {
+            match (want.next(), have.next()) {
+                (None, _) => return true,
+                (Some(_), None) => return false,
+                (Some(w), Some(h)) => {
+                    let (w, h) = (w.as_os_str(), h.as_os_str());
+                    if !w.eq_ignore_ascii_case(h) {
+                        return false;
+                    }
+                },
+            }
+        }
+    } else {
+        cwd.starts_with(workspace)
     }
 }
 
@@ -242,4 +283,86 @@ pub(crate) struct ViewStep {
     /// A pane the user moved to inside the multiplexer, for the app to follow.
     pub follow: Option<PaneKey>,
     pub repaint: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(cwd: &str, foreground: Option<&str>) -> Pane {
+        Pane {
+            terminal_id: "t1".into(),
+            pane_id: "w1:p1".into(),
+            tab_id: Some("w1:t1".into()),
+            kind: None,
+            title: None,
+            status: Some(PaneStatus::Idle),
+            focused: false,
+            cwd: Some(cwd.into()),
+            foreground_cwd: foreground.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn prefers_foreground_cwd_when_present() {
+        let spaces = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        let matched = at("/a", Some("/b")).workspace(&Side::Native, &spaces);
+        assert_eq!(matched, Some(PathBuf::from("/b")));
+    }
+
+    #[test]
+    fn falls_back_to_cwd_when_foreground_is_absent() {
+        let spaces = vec![PathBuf::from("/a")];
+        assert_eq!(at("/a/src", None).workspace(&Side::Native, &spaces), Some("/a".into()));
+    }
+
+    #[test]
+    fn takes_the_longest_matching_prefix() {
+        let spaces = vec![PathBuf::from("/a"), PathBuf::from("/a/nested")];
+        let matched = at("/a/nested/src", None).workspace(&Side::Native, &spaces);
+        assert_eq!(matched, Some(PathBuf::from("/a/nested")));
+    }
+
+    /// Component-wise, so a sibling sharing a string prefix never matches.
+    #[test]
+    fn a_sibling_with_a_shared_prefix_does_not_match() {
+        let spaces = vec![PathBuf::from("/repo")];
+        assert_eq!(at("/repo-other", None).workspace(&Side::Native, &spaces), None);
+    }
+
+    #[test]
+    fn an_unmatched_pane_has_no_workspace() {
+        let spaces = vec![PathBuf::from("/a")];
+        assert_eq!(at("/elsewhere", None).workspace(&Side::Native, &spaces), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_prefixes_compare_case_insensitively() {
+        let spaces = vec![PathBuf::from(r"C:\Users\Dev\repo")];
+        let matched = at(r"c:\users\dev\repo\src", None).workspace(&Side::Native, &spaces);
+        assert_eq!(matched, Some(PathBuf::from(r"C:\Users\Dev\repo")));
+    }
+
+    /// A translated WSL path is a Windows path, and off Windows that is one
+    /// opaque component which never prefixes another.
+    #[cfg(windows)]
+    #[test]
+    fn a_wsl_pane_matches_by_the_translated_windows_path() {
+        let distro = "kali-linux";
+        let workspace = wsl::linux_to_windows("/mnt/c/Users/dev/repo", distro);
+        let spaces = vec![workspace.clone()];
+        let matched =
+            at("/mnt/c/Users/dev/repo/src", None).workspace(&Side::Wsl(distro.into()), &spaces);
+        assert_eq!(matched, Some(workspace));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_wsl_pane_outside_every_workspace_still_has_none() {
+        let distro = "kali-linux";
+        let spaces = vec![wsl::linux_to_windows("/mnt/c/Users/dev/repo", distro)];
+        let matched = at("/mnt/d/elsewhere", None).workspace(&Side::Wsl(distro.into()), &spaces);
+        assert_eq!(matched, None);
+    }
 }

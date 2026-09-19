@@ -2,8 +2,7 @@
 //!
 //! Everything goes through the CLI rather than herdr's socket, so a missing
 //! binary or an absent server is a silent no-op and no wire protocol is
-//! pinned.  This is the only file that knows how to reach a herdr server; a
-//! second multiplexer would need its own equivalent and nothing else.
+//! pinned.  This is the only file that knows how to reach a herdr server.
 
 use std::process::Stdio;
 use std::time::{Duration, Instant};

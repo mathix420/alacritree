@@ -996,6 +996,10 @@
         "tuicr": {
           "$ref": "#/$defs/RawTuicr",
           "description": "The review TUI the tuicr diff viewer runs."
+        },
+        "zellij": {
+          "$ref": "#/$defs/RawZellij",
+          "description": "Panes of running zellij sessions."
         }
       },
       "type": "object"
@@ -1911,6 +1915,52 @@
           "default": true,
           "description": "Keep a resident helper process per distro for foreground probes,\nbatched git queries, and tool discovery.  `false` restores one-shot\nwsl.exe spawns everywhere; WSL sessions then always report \"no\nTUI\", so FocusLeft/FocusRight always move panel focus.",
           "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "RawZellij": {
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "List the panes of every running zellij session in the sidebar.\nOpening one attaches to its whole session with the pane focused, since\nzellij has no attach for a single pane.",
+          "type": "boolean"
+        },
+        "icon": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "default": "◫",
+          "description": "The glyph on a zellij pane's sidebar row and palette entry. A bare\nstring sets the glyph; a table also styles its color, weight, slant\nand size, the way `[ui.icons]` keys do."
+        },
+        "path": {
+          "default": "zellij",
+          "description": "The program to run on Windows or natively. Its own name is looked up\non PATH; any other value runs as written.",
+          "type": "string"
+        },
+        "poll_interval_ms": {
+          "default": 2000,
+          "description": "How often each side's zellij sessions are re-listed.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session": {
+          "default": "",
+          "description": "The session a new pane opens in. Empty takes the one session running\non that side and refuses when there are several.",
+          "type": "string"
+        },
+        "show_unmatched": {
+          "default": true,
+          "description": "List panes whose working directory matches no worktree, under Home.",
+          "type": "boolean"
+        },
+        "wsl_path": {
+          "default": "",
+          "description": "The program to run inside every WSL distro, as written. Empty finds it\nby name through the distro's login shell.",
+          "type": "string"
         }
       },
       "type": "object"

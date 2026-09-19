@@ -437,7 +437,7 @@ impl AlacritreeApp {
         let shared_view = !self.pane_attaches_directly(key);
         let multiplexer = self.multiplexers.get(key.multiplexer);
         let launch = if shared_view {
-            multiplexer.shared_view(&key.side)?
+            multiplexer.shared_view(key)?
         } else {
             let pane = multiplexer.find(&key.side, &key.terminal_id)?;
             // The branch already asked the question the multiplexer answers
@@ -538,7 +538,7 @@ impl AlacritreeApp {
                     "title": pane.title,
                     "status": pane.status.map(|status| status.label()),
                     "focused": pane.focused,
-                    "workspace": multiplexer.match_workspace(pane, side, &workspaces),
+                    "workspace": pane.workspace(side, &workspaces),
                     "session_id": self.pane_session(&key),
                 }));
             }
@@ -597,24 +597,26 @@ impl AlacritreeApp {
     /// precisely enough to act on: a side that names no server, a pane no
     /// multiplexer is reporting, and an integration that is switched off are
     /// three different situations, and only the last is worth retrying after
-    /// a config change.
+    /// a config change.  `multiplexer` narrows the search to the one named.
     pub(super) fn defer_attach_multiplexer_pane(
         &mut self,
         ctx: &Context,
-        side: &str,
-        terminal_id: &str,
+        (multiplexer, side, terminal_id): (Option<&str>, &str, &str),
         reply_tx: mpsc::Sender<ipc::protocol::IpcResult>,
         focus: AttachFocus,
     ) {
-        if !self.multiplexers.any_enabled() {
-            let _ = reply_tx.send(Err(self.multiplexers.disabled_reason().to_string()));
-            return;
-        }
+        let only = match self.multiplexers.requested(multiplexer) {
+            Ok(only) => only,
+            Err(e) => {
+                let _ = reply_tx.send(Err(e));
+                return;
+            },
+        };
         let Some(parsed_side) = Side::parse(side) else {
             let _ = reply_tx.send(Err(not_a_side(side)));
             return;
         };
-        let Some((key, pane)) = self.multiplexers.locate(&parsed_side, terminal_id) else {
+        let Some((key, pane)) = self.multiplexers.locate(only, &parsed_side, terminal_id) else {
             let _ = reply_tx.send(Err(format!(
                 "no pane `{terminal_id}` on {side}, see list_multiplexer_panes"
             )));
@@ -622,8 +624,7 @@ impl AlacritreeApp {
         };
         let pane_id = pane.pane_id.clone();
         let workspaces = pane_workspaces(&self.projects, |path| self.liveness.missing(path));
-        let workspace =
-            self.multiplexers.get(key.multiplexer).match_workspace(pane, &parsed_side, &workspaces);
+        let workspace = pane.workspace(&parsed_side, &workspaces);
 
         let switch = self.switch_for_attach(&workspace, focus);
         let unlisted = PaneTarget::unlisted(&key, &pane_id);
@@ -640,15 +641,18 @@ impl AlacritreeApp {
     pub(super) fn defer_create_multiplexer_pane(
         &mut self,
         ctx: &Context,
-        side: Option<&str>,
+        (multiplexer, side): (Option<&str>, Option<&str>),
         workspace: Option<PathBuf>,
         reply_tx: mpsc::Sender<ipc::protocol::IpcResult>,
         focus: AttachFocus,
     ) {
-        if !self.multiplexers.any_enabled() {
-            let _ = reply_tx.send(Err(self.multiplexers.disabled_reason().to_string()));
-            return;
-        }
+        let only = match self.multiplexers.requested(multiplexer) {
+            Ok(only) => only,
+            Err(e) => {
+                let _ = reply_tx.send(Err(e));
+                return;
+            },
+        };
         let named = match side {
             Some(name) => match Side::parse(name) {
                 Some(side) => Some(side),
@@ -659,7 +663,7 @@ impl AlacritreeApp {
             },
             None => None,
         };
-        let target = match self.create_target(named) {
+        let target = match self.create_target(only, named) {
             Ok(target) => target,
             Err(e) => {
                 let _ = reply_tx.send(Err(e));
@@ -683,20 +687,27 @@ impl AlacritreeApp {
 
     /// Where a create lands: the multiplexer and side the active session's
     /// own pane belongs to, and failing that the first multiplexer enabled,
-    /// on the one side a server is answering on.  `Err` names every side it
-    /// could have meant, so a caller can retry saying which.
+    /// on the one side a server is answering on.  `only` holds both to the
+    /// multiplexer a caller named.  `Err` names every side it could have
+    /// meant, so a caller can retry saying which.
     pub(super) fn create_target(
         &self,
+        only: Option<MultiplexerKind>,
         named: Option<Side>,
     ) -> Result<(MultiplexerKind, Side), String> {
         let focused = self
             .active_session_index()
             .and_then(|idx| self.sessions[idx].pane_key.as_ref())
-            .filter(|key| self.multiplexers.get(key.multiplexer).enabled());
+            .filter(|key| self.multiplexers.get(key.multiplexer).enabled())
+            .filter(|key| only.is_none_or(|kind| kind == key.multiplexer));
         if let Some(key) = focused {
             return Ok((key.multiplexer, named.unwrap_or_else(|| key.side.clone())));
         }
-        let Some(multiplexer) = self.multiplexers.default_enabled() else {
+        let default = match only {
+            Some(kind) => Some(self.multiplexers.get(kind)),
+            None => self.multiplexers.default_enabled(),
+        };
+        let Some(multiplexer) = default else {
             return Err(self.multiplexers.disabled_reason().to_string());
         };
         let side = match named {
@@ -713,7 +724,7 @@ impl Action for action::NewMultiplexerPane {
             app.modals.error_dialog = Some(app.multiplexers.disabled_reason().to_string());
             return;
         }
-        match app.create_target(None) {
+        match app.create_target(None, None) {
             Ok(target) => {
                 let workspace = app.current_workspace.clone();
                 app.create_multiplexer_pane(ctx, target, workspace, None, AttachFocus::Take);
@@ -812,8 +823,6 @@ pub(super) fn not_a_side(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::IntegrationsConfig;
-    use crate::multiplexer::Multiplexers;
     use crate::test_util::herdr_agent;
 
     /// The click switched workspace before handing the gesture over, so a
@@ -873,12 +882,7 @@ mod tests {
         assert_eq!(workspaces, vec![PathBuf::from("/a/wt1")]);
 
         let pane = Pane { cwd: Some(gone.to_string_lossy().into_owned()), ..herdr_agent(None) };
-        let multiplexers = Multiplexers::new(&IntegrationsConfig::default());
-        let matched = multiplexers.get(MultiplexerKind::Herdr).match_workspace(
-            &pane,
-            &Side::Native,
-            &workspaces,
-        );
+        let matched = pane.workspace(&Side::Native, &workspaces);
         assert_eq!(matched, None, "a pane under a removed checkout falls back to Home");
     }
 }

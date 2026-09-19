@@ -4272,8 +4272,7 @@ mod tests {
 
         app.defer_attach_multiplexer_pane(
             &Context::default(),
-            "bogus",
-            "t1",
+            (None, "bogus", "t1"),
             reply_tx,
             AttachFocus::Take,
         );
@@ -4292,8 +4291,7 @@ mod tests {
 
         app.defer_attach_multiplexer_pane(
             &Context::default(),
-            "native",
-            "missing",
+            (None, "native", "missing"),
             reply_tx,
             AttachFocus::Take,
         );
@@ -4312,8 +4310,7 @@ mod tests {
 
         app.defer_attach_multiplexer_pane(
             &Context::default(),
-            "native",
-            "t1",
+            (Some("herdr"), "native", "t1"),
             reply_tx,
             AttachFocus::Take,
         );
@@ -4322,6 +4319,80 @@ mod tests {
             reply_rx.try_recv().unwrap(),
             Err("the herdr integration is disabled ([integrations.herdr] enabled)".to_string())
         );
+    }
+
+    /// With every multiplexer off, a request naming none cannot be pointed at
+    /// one table to fix, so the refusal names them all.
+    #[test]
+    fn attaching_while_every_integration_is_disabled_names_each_table() {
+        let mut app = test_app();
+        app.multiplexers.herdr_mut_for_test().config_mut_for_test().enabled = false;
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        app.defer_attach_multiplexer_pane(
+            &Context::default(),
+            (None, "native", "t1"),
+            reply_tx,
+            AttachFocus::Take,
+        );
+
+        assert_eq!(
+            reply_rx.try_recv().unwrap(),
+            Err("every multiplexer integration is disabled ([integrations.herdr] or \
+                 [integrations.zellij] enabled)"
+                .to_string())
+        );
+    }
+
+    #[test]
+    fn attaching_through_a_multiplexer_that_does_not_exist_is_refused_by_name() {
+        let mut app = test_app();
+        app.multiplexers.herdr_mut_for_test().config_mut_for_test().enabled = true;
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        app.defer_attach_multiplexer_pane(
+            &Context::default(),
+            (Some("tmux"), "native", "t1"),
+            reply_tx,
+            AttachFocus::Take,
+        );
+
+        assert_eq!(
+            reply_rx.try_recv().unwrap(),
+            Err("`tmux` is not a multiplexer, expected `herdr` or `zellij`".to_string())
+        );
+    }
+
+    /// A zellij pane reaches every client the way a herdr one does, named by
+    /// its multiplexer and session, through nothing but the trait.
+    #[test]
+    fn a_zellij_pane_is_listed_under_its_own_name() {
+        let mut app = test_app();
+        let pane = Pane {
+            terminal_id: "work/terminal_3".into(),
+            pane_id: "terminal_3".into(),
+            tab_id: Some("0".into()),
+            kind: None,
+            title: Some("shell".into()),
+            status: None,
+            focused: true,
+            cwd: Some("/repo".into()),
+            foreground_cwd: None,
+        };
+        app.multiplexers.zellij_mut_for_test().adopt_for_test(vec![crate::zellij::SideListing {
+            side: Side::Native,
+            sessions: vec!["work".into()],
+            read: vec!["work".into()],
+            panes: vec![pane],
+            sampled_at: Instant::now(),
+        }]);
+
+        let json = app.multiplexer_panes_json();
+
+        let listed = &json["panes"][0]["multiplexer"];
+        assert_eq!(listed["name"], "zellij");
+        assert_eq!(listed["session"], "work");
+        assert_eq!(listed["terminal_id"], "work/terminal_3");
     }
 
     /// A pane a session already holds answers with that session rather than
@@ -4344,8 +4415,7 @@ mod tests {
 
         app.defer_attach_multiplexer_pane(
             &Context::default(),
-            "native",
-            "term-held",
+            (None, "native", "term-held"),
             reply_tx,
             AttachFocus::Take,
         );
@@ -4377,8 +4447,7 @@ mod tests {
 
         app.defer_attach_multiplexer_pane(
             &Context::default(),
-            "native",
-            "term-held",
+            (None, "native", "term-held"),
             reply_tx,
             AttachFocus::Leave,
         );
@@ -4408,8 +4477,7 @@ mod tests {
 
         app.defer_attach_multiplexer_pane(
             &Context::default(),
-            "native",
-            "term-loose",
+            (None, "native", "term-loose"),
             reply_tx,
             AttachFocus::Leave,
         );
@@ -4439,7 +4507,7 @@ mod tests {
 
         app.defer_create_multiplexer_pane(
             &Context::default(),
-            Some("bogus"),
+            (None, Some("bogus")),
             None,
             reply_tx,
             AttachFocus::Take,
@@ -4471,7 +4539,7 @@ mod tests {
 
         app.defer_create_multiplexer_pane(
             &Context::default(),
-            None,
+            (None, None),
             None,
             reply_tx,
             AttachFocus::Take,
@@ -4551,7 +4619,7 @@ mod tests {
         let id = bind_herdr_fixture(&mut app, side.clone(), "term-focused");
         app.set_active_in_current_workspace(id);
 
-        assert_eq!(app.create_target(None), Ok((MultiplexerKind::Herdr, side)));
+        assert_eq!(app.create_target(None, None), Ok((MultiplexerKind::Herdr, side)));
     }
 
     /// A side whose rows are still drawn through one missed poll is still
@@ -4574,7 +4642,7 @@ mod tests {
             Duration::from_secs(2),
         );
 
-        assert_eq!(app.create_target(None), Ok((MultiplexerKind::Herdr, Side::Native)));
+        assert_eq!(app.create_target(None, None), Ok((MultiplexerKind::Herdr, Side::Native)));
     }
 
     /// A worktree the sidebar does not have is refused before herdr is asked,
@@ -4588,7 +4656,7 @@ mod tests {
 
         app.defer_create_multiplexer_pane(
             &Context::default(),
-            Some("native"),
+            (None, Some("native")),
             Some(unknown.clone()),
             reply_tx,
             AttachFocus::Take,
@@ -4905,7 +4973,7 @@ mod tests {
 
         app.defer_create_multiplexer_pane(
             &Context::default(),
-            None,
+            (None, None),
             None,
             reply_tx,
             AttachFocus::Take,

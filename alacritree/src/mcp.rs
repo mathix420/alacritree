@@ -135,7 +135,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "list_multiplexer_panes",
-            "description": "List every pane of the terminal multiplexer alacritree has detected (herdr), on every side it reaches, whether or not a session is attached to one. Each entry carries the multiplexer block naming the pane (side and terminal_id), the pane's agent kind, title and live status, whether the multiplexer's own window is showing it, the workspace its working directory matches, and the id of the alacritree session holding it (null when none is). Unattached panes appear here and nowhere else.",
+            "description": "List every pane of the terminal multiplexers alacritree has detected (herdr, zellij), on every side they reach, whether or not a session is attached to one. Each entry carries the multiplexer block naming the pane (the multiplexer's name, side and terminal_id), the pane's agent kind, title and live status, whether the multiplexer's own window is showing it, the workspace its working directory matches, and the id of the alacritree session holding it (null when none is). Unattached panes appear here and nowhere else.",
             "inputSchema": { "type": "object", "properties": {} },
         },
         {
@@ -144,6 +144,7 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "multiplexer": { "type": "string", "description": "The multiplexer's name from the pane's multiplexer block. Omit to search every enabled one." },
                     "side": { "type": "string", "description": "\"native\" or \"wsl:<distro>\", from list_multiplexer_panes." },
                     "terminal_id": { "type": "string", "description": "Terminal id from list_multiplexer_panes." },
                     "no_focus": { "type": "boolean", "description": "Open the session without switching the window to it, making it its workspace's active tab, or moving the multiplexer's focus. Defaults to false." },
@@ -153,10 +154,11 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "create_multiplexer_pane",
-            "description": "Open a new pane in the terminal multiplexer (herdr) and an alacritree session on it, and return the session id once the session can be read. Omit side to use the one the active session's pane belongs to, which is what a machine reaching only one herdr server always wants; a machine reaching several must name it when no herdr session is focused. Omit workspace to open the pane in the focused workspace.",
+            "description": "Open a new pane in a terminal multiplexer (herdr, zellij) and an alacritree session on it, and return the session id once the session can be read. Omit multiplexer to use the active session's, or else the first one enabled. Omit side to use the one the active session's pane belongs to, which is what a machine reaching only one server always wants; a machine reaching several must name it when no multiplexer-backed session is focused. Omit workspace to open the pane in the focused workspace.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "multiplexer": { "type": "string", "description": "\"herdr\" or \"zellij\". Omit to use the active session's multiplexer, or else the first one enabled." },
                     "side": { "type": "string", "description": "\"native\" or \"wsl:<distro>\", from list_multiplexer_panes." },
                     "workspace": { "type": "string", "description": "Worktree path from list_projects; omit for the focused workspace." },
                     "no_focus": { "type": "boolean", "description": "Open the pane and its session without switching the window to them, making the session its workspace's active tab, or moving the multiplexer's focus. Defaults to false." },
@@ -342,11 +344,17 @@ mod tests {
             IpcRequest::ListSessions,
             IpcRequest::ListMultiplexerPanes,
             IpcRequest::AttachMultiplexerPane {
+                multiplexer: None,
                 side: "native".into(),
                 terminal_id: "t1".into(),
                 no_focus: false,
             },
-            IpcRequest::CreateMultiplexerPane { side: None, workspace: None, no_focus: false },
+            IpcRequest::CreateMultiplexerPane {
+                multiplexer: None,
+                side: None,
+                workspace: None,
+                no_focus: false,
+            },
             IpcRequest::SelectWorkspace { path: None },
             IpcRequest::CreateSession { workspace: None },
             IpcRequest::CloseSession { session_id: 1 },

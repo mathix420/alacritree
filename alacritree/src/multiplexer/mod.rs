@@ -4,13 +4,15 @@
 //! Everything the app needs from a multiplexer goes behind
 //! [`MultiplexerSession`]: listing its panes, attaching to one, creating one,
 //! and keeping its focus in step with the session on screen.  Each variant of
-//! [`Multiplexer`] owns its own polling and in-flight calls, so a second
+//! [`Multiplexer`] owns its own polling and in-flight calls, so another
 //! multiplexer is a new variant and a new module, with nothing to change in
 //! the app.
 
 mod model;
 
 use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use enum_dispatch::enum_dispatch;
@@ -26,6 +28,7 @@ use crate::config::{BakedGlyph, IconStyle, IntegrationsConfig};
 use crate::herdr::Herdr;
 use crate::session::SessionId;
 use crate::wsl;
+use crate::zellij::Zellij;
 
 /// Which server a pane belongs to.  Two servers on one machine cannot see
 /// each other, so this is part of a pane's identity.
@@ -165,9 +168,6 @@ pub(crate) trait MultiplexerSession {
     /// polling too, since the subprocesses are the whole cost.
     fn enabled(&self) -> bool;
 
-    /// What a request says when it reaches this multiplexer while it is off.
-    fn disabled_reason(&self) -> &'static str;
-
     /// The glyph a row names this multiplexer with, and the one it falls back
     /// to when the config leaves it blank.
     fn icon(&self) -> (&IconStyle, BakedGlyph);
@@ -201,10 +201,6 @@ pub(crate) trait MultiplexerSession {
     /// user asked to see those under Home.
     fn listed(&self, claimed: &[PaneKey], workspaces: &[PathBuf]) -> Vec<ListedPane<'_>>;
 
-    /// The workspace a pane is working in.  `None` means it belongs under
-    /// Home.
-    fn match_workspace(&self, pane: &Pane, side: &Side, workspaces: &[PathBuf]) -> Option<PathBuf>;
-
     /// The side a create that named none happens on, when only one server is
     /// answering.  `Err` names every side it could have meant.
     fn default_side(&self) -> Result<Side, String>;
@@ -232,9 +228,9 @@ pub(crate) trait MultiplexerSession {
     /// only by sharing the whole view, which `queue_attach` prepares.
     fn open_directly(&self, target: &PaneTarget) -> Option<Launch>;
 
-    /// The command that shares the whole view on `side` as it stands, with no
-    /// focus call first.
-    fn shared_view(&self, side: &Side) -> Option<Launch>;
+    /// The command that shares the whole view holding `key`'s pane as it
+    /// stands, with no focus call first.
+    fn shared_view(&self, key: &PaneKey) -> Option<Launch>;
 
     /// Start preparing a shared view of `target`.  A second request for the
     /// same pane joins the first.
@@ -277,14 +273,28 @@ pub(crate) trait MultiplexerSession {
     vis(pub),
     strum(serialize_all = "lowercase")
 )]
+// One of each is built for the app's lifetime, so the size spread between
+// variants costs nothing.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Multiplexer {
     Herdr(Herdr),
+    Zellij(Zellij),
+}
+
+impl MultiplexerKind {
+    /// Why a request that named this multiplexer is refused while it is off.
+    /// Alone among the refusals, this one is worth retrying after a config
+    /// change.
+    pub(crate) fn disabled_reason(self) -> String {
+        format!("the {self} integration is disabled ([integrations.{self}] enabled)")
+    }
 }
 
 impl Multiplexer {
     fn new(kind: MultiplexerKind, config: &IntegrationsConfig) -> Self {
         match kind {
             MultiplexerKind::Herdr => Herdr::new(config.herdr.clone()).into(),
+            MultiplexerKind::Zellij => Zellij::new(config.zellij.clone()).into(),
         }
     }
 
@@ -334,7 +344,30 @@ impl Multiplexers {
     /// The reason a request naming no multiplexer is refused while every one
     /// is off.
     pub(crate) fn disabled_reason(&self) -> &'static str {
-        self.0[0].disabled_reason()
+        static REASON: OnceLock<String> = OnceLock::new();
+        REASON.get_or_init(|| {
+            let tables: Vec<String> =
+                MultiplexerKind::iter().map(|kind| format!("[integrations.{kind}]")).collect();
+            format!("every multiplexer integration is disabled ({} enabled)", tables.join(" or "))
+        })
+    }
+
+    /// The multiplexer a request named, or `None` when it named none and any
+    /// may answer.  A name that is no multiplexer, one that is switched off,
+    /// and every one being off are all refusals.
+    pub(crate) fn requested(&self, name: Option<&str>) -> Result<Option<MultiplexerKind>, String> {
+        let Some(name) = name else {
+            return if self.any_enabled() {
+                Ok(None)
+            } else {
+                Err(self.disabled_reason().to_string())
+            };
+        };
+        let kind = MultiplexerKind::from_str(name).map_err(|_| {
+            let known: Vec<String> = MultiplexerKind::iter().map(|k| format!("`{k}`")).collect();
+            format!("`{name}` is not a multiplexer, expected {}", known.join(" or "))
+        })?;
+        if self.get(kind).enabled() { Ok(Some(kind)) } else { Err(kind.disabled_reason()) }
     }
 
     /// The multiplexer a request naming none goes to: the first one enabled.
@@ -347,11 +380,16 @@ impl Multiplexers {
         self.get(key.multiplexer).find(&key.side, &key.terminal_id)
     }
 
-    /// The pane a client named by side and terminal id alone, which is all
-    /// the wire carries.
-    pub(crate) fn locate(&self, side: &Side, terminal_id: &str) -> Option<(PaneKey, &Pane)> {
+    /// The pane a client named by side and terminal id, in the multiplexer it
+    /// named or else in the first enabled one listing it.
+    pub(crate) fn locate(
+        &self,
+        only: Option<MultiplexerKind>,
+        side: &Side,
+        terminal_id: &str,
+    ) -> Option<(PaneKey, &Pane)> {
         self.iter()
-            .filter(|m| m.enabled())
+            .filter(|m| m.enabled() && only.is_none_or(|kind| kind == m.kind()))
             .find_map(|m| m.find(side, terminal_id).map(|pane| (m.key(side, terminal_id), pane)))
     }
 
@@ -391,16 +429,26 @@ impl Multiplexers {
 
     #[cfg(test)]
     pub(crate) fn herdr_mut_for_test(&mut self) -> &mut Herdr {
-        match self.get_mut(MultiplexerKind::Herdr) {
-            Multiplexer::Herdr(herdr) => herdr,
-        }
+        let Multiplexer::Herdr(herdr) = self.get_mut(MultiplexerKind::Herdr) else {
+            unreachable!("`get_mut` answers with the kind it was asked for")
+        };
+        herdr
     }
 
     #[cfg(test)]
     pub(crate) fn herdr_for_test(&self) -> &Herdr {
-        match self.get(MultiplexerKind::Herdr) {
-            Multiplexer::Herdr(herdr) => herdr,
-        }
+        let Multiplexer::Herdr(herdr) = self.get(MultiplexerKind::Herdr) else {
+            unreachable!("`get` answers with the kind it was asked for")
+        };
+        herdr
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zellij_mut_for_test(&mut self) -> &mut Zellij {
+        let Multiplexer::Zellij(zellij) = self.get_mut(MultiplexerKind::Zellij) else {
+            unreachable!("`get_mut` answers with the kind it was asked for")
+        };
+        zellij
     }
 }
 
@@ -466,6 +514,7 @@ mod tests {
     #[test]
     fn a_multiplexer_reads_back_as_the_name_it_spelled() {
         assert_eq!(MultiplexerKind::Herdr.to_string(), "herdr");
+        assert_eq!(MultiplexerKind::Zellij.to_string(), "zellij");
         for kind in MultiplexerKind::iter() {
             assert_eq!(MultiplexerKind::from_str(&kind.to_string()), Ok(kind));
         }

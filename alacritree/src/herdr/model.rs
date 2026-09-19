@@ -1,10 +1,7 @@
 //! What alacritree reads from herdr, and the pure questions it asks about a
 //! pane herdr lists.
 
-use std::path::{Path, PathBuf};
-
 use crate::multiplexer::{MultiplexerKind, Pane, PaneKey, Side};
-use crate::wsl;
 
 /// Which of herdr's two indicator sets its config selects.  Rows follow the
 /// user's own choice, so a pane's mark in the sidebar is the mark it carries
@@ -70,49 +67,6 @@ pub(super) fn unattached<'a>(
         .collect()
 }
 
-/// The sidebar workspace an agent is working in, by longest path prefix.
-/// `None` means it belongs under Home.
-pub(super) fn match_workspace(
-    agent: &Pane,
-    side: &Side,
-    workspaces: &[PathBuf],
-) -> Option<PathBuf> {
-    let reported = agent.foreground_cwd.as_deref().or(agent.cwd.as_deref())?;
-    let cwd = match side {
-        Side::Native => PathBuf::from(reported),
-        Side::Wsl(distro) => wsl::linux_to_windows(reported, distro),
-    };
-    workspaces
-        .iter()
-        .filter(|ws| starts_with(&cwd, ws))
-        .max_by_key(|ws| ws.components().count())
-        .cloned()
-}
-
-/// Component-wise prefix test.  Case-insensitive on Windows, where herdr
-/// reports the cwd as the shell spelled it and `Path::starts_with` would
-/// refuse `c:\users\dev` against `C:\Users\Dev`.
-fn starts_with(cwd: &Path, workspace: &Path) -> bool {
-    if cfg!(windows) {
-        let mut want = workspace.components();
-        let mut have = cwd.components();
-        loop {
-            match (want.next(), have.next()) {
-                (None, _) => return true,
-                (Some(_), None) => return false,
-                (Some(w), Some(h)) => {
-                    let (w, h) = (w.as_os_str(), h.as_os_str());
-                    if !w.eq_ignore_ascii_case(h) {
-                        return false;
-                    }
-                },
-            }
-        }
-    } else {
-        cwd.starts_with(workspace)
-    }
-}
-
 /// The key a herdr pane on `side` is known by.
 pub(crate) fn pane_key(side: Side, terminal_id: String) -> PaneKey {
     PaneKey { multiplexer: MultiplexerKind::Herdr, side, terminal_id }
@@ -167,87 +121,6 @@ mod tests {
             cwd: Some("/repo".into()),
             foreground_cwd: None,
         }
-    }
-
-    fn at(cwd: &str, foreground: Option<&str>) -> Pane {
-        Pane {
-            terminal_id: "t1".into(),
-            pane_id: "w1:p1".into(),
-            tab_id: Some("w1:t1".into()),
-            kind: None,
-            title: None,
-            status: Some(PaneStatus::Idle),
-            focused: false,
-            cwd: Some(cwd.into()),
-            foreground_cwd: foreground.map(str::to_string),
-        }
-    }
-
-    #[test]
-    fn prefers_foreground_cwd_when_present() {
-        let spaces = vec![PathBuf::from("/a"), PathBuf::from("/b")];
-        let matched = match_workspace(&at("/a", Some("/b")), &Side::Native, &spaces);
-        assert_eq!(matched, Some(PathBuf::from("/b")));
-    }
-
-    #[test]
-    fn falls_back_to_cwd_when_foreground_is_absent() {
-        let spaces = vec![PathBuf::from("/a")];
-        assert_eq!(match_workspace(&at("/a/src", None), &Side::Native, &spaces), Some("/a".into()));
-    }
-
-    #[test]
-    fn takes_the_longest_matching_prefix() {
-        let spaces = vec![PathBuf::from("/a"), PathBuf::from("/a/nested")];
-        let matched = match_workspace(&at("/a/nested/src", None), &Side::Native, &spaces);
-        assert_eq!(matched, Some(PathBuf::from("/a/nested")));
-    }
-
-    /// Component-wise, so a sibling sharing a string prefix never matches.
-    #[test]
-    fn a_sibling_with_a_shared_prefix_does_not_match() {
-        let spaces = vec![PathBuf::from("/repo")];
-        assert_eq!(match_workspace(&at("/repo-other", None), &Side::Native, &spaces), None);
-    }
-
-    #[test]
-    fn an_unmatched_agent_has_no_workspace() {
-        let spaces = vec![PathBuf::from("/a")];
-        assert_eq!(match_workspace(&at("/elsewhere", None), &Side::Native, &spaces), None);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_prefixes_compare_case_insensitively() {
-        let spaces = vec![PathBuf::from(r"C:\Users\Dev\repo")];
-        let matched = match_workspace(&at(r"c:\users\dev\repo\src", None), &Side::Native, &spaces);
-        assert_eq!(matched, Some(PathBuf::from(r"C:\Users\Dev\repo")));
-    }
-
-    /// A translated WSL path is a Windows path, and off Windows that is one
-    /// opaque component which never prefixes another.
-    #[cfg(windows)]
-    #[test]
-    fn wsl_agent_matches_by_the_translated_windows_path() {
-        let distro = "kali-linux";
-        let workspace = wsl::linux_to_windows("/mnt/c/Users/dev/repo", distro);
-        let spaces = vec![workspace.clone()];
-        let matched = match_workspace(
-            &at("/mnt/c/Users/dev/repo/src", None),
-            &Side::Wsl(distro.into()),
-            &spaces,
-        );
-        assert_eq!(matched, Some(workspace));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn a_wsl_agent_outside_every_workspace_still_has_none() {
-        let distro = "kali-linux";
-        let spaces = vec![wsl::linux_to_windows("/mnt/c/Users/dev/repo", distro)];
-        let matched =
-            match_workspace(&at("/mnt/d/elsewhere", None), &Side::Wsl(distro.into()), &spaces);
-        assert_eq!(matched, None);
     }
 
     #[test]

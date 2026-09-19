@@ -257,6 +257,10 @@ enum MultiplexerCommand {
         /// Terminal id from `multiplexer list`.  Not the pane id, which
         /// changes when a pane moves between workspaces.
         terminal_id: String,
+        /// The multiplexer holding the pane, as `multiplexer list` names it.
+        /// Omit to search every enabled one.
+        #[arg(long)]
+        multiplexer: Option<String>,
         /// Open the session without switching to it or moving the
         /// multiplexer's focus.
         #[arg(long)]
@@ -264,6 +268,10 @@ enum MultiplexerCommand {
     },
     /// Open a new pane in the multiplexer and a session on it.
     Create {
+        /// The multiplexer to open it in.  Omit to use the active session's,
+        /// or else the first one enabled.
+        #[arg(long)]
+        multiplexer: Option<String>,
         /// `native`, or `wsl:<distro>`.  Omit to use the side the active
         /// session's pane belongs to.
         #[arg(long)]
@@ -542,11 +550,12 @@ fn to_request(command: Command) -> IpcRequest {
         },
         Command::Multiplexer { command } => match command {
             MultiplexerCommand::List => IpcRequest::ListMultiplexerPanes,
-            MultiplexerCommand::Attach { side, terminal_id, no_focus } => {
-                IpcRequest::AttachMultiplexerPane { side, terminal_id, no_focus }
+            MultiplexerCommand::Attach { side, terminal_id, multiplexer, no_focus } => {
+                IpcRequest::AttachMultiplexerPane { multiplexer, side, terminal_id, no_focus }
             },
-            MultiplexerCommand::Create { side, workspace, no_focus } => {
+            MultiplexerCommand::Create { multiplexer, side, workspace, no_focus } => {
                 IpcRequest::CreateMultiplexerPane {
+                    multiplexer,
                     side,
                     workspace: workspace.map(absolute),
                     no_focus,

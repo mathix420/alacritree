@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use super::view::{HerdrViewAction, HerdrViewFocus, HerdrViewSync, ViewInputs};
 use super::{
     EndpointCache, Endpoints, Indicators, Listing, Settings, attaches_directly, cli, focus_args,
-    focus_pane, match_workspace, pane_key, program, unattached,
+    focus_pane, pane_key, program, unattached,
 };
 use crate::config::{BakedGlyph, DEFAULT_HERDR_ICON, HerdrConfig, IconStyle};
 use crate::jobs;
@@ -19,10 +19,6 @@ use crate::multiplexer::{
     PaneTarget, Side, StateTone, ViewState, ViewStep,
 };
 use crate::session::SessionId;
-
-/// Why a request is refused while herdr is off.  Alone among the refusals,
-/// this one is worth retrying after a config change.
-const DISABLED: &str = "the herdr integration is disabled ([integrations.herdr] enabled)";
 
 /// A shared-view attach waiting on herdr.  The gesture answers with the argv
 /// its client runs, so everything the session needs is in hand by the time it
@@ -158,10 +154,6 @@ impl MultiplexerSession for Herdr {
         self.config.enabled
     }
 
-    fn disabled_reason(&self) -> &'static str {
-        DISABLED
-    }
-
     fn icon(&self) -> (&IconStyle, BakedGlyph) {
         (&self.config.icon, DEFAULT_HERDR_ICON)
     }
@@ -221,7 +213,7 @@ impl MultiplexerSession for Herdr {
         for cache in self.endpoints.caches() {
             let side = cache.side();
             for pane in unattached(cache.agents(), side, claimed) {
-                let workspace = match_workspace(pane, side, workspaces);
+                let workspace = pane.workspace(side, workspaces);
                 if workspace.is_none() && !self.config.show_unmatched {
                     continue;
                 }
@@ -230,10 +222,6 @@ impl MultiplexerSession for Herdr {
             }
         }
         listed
-    }
-
-    fn match_workspace(&self, pane: &Pane, side: &Side, workspaces: &[PathBuf]) -> Option<PathBuf> {
-        match_workspace(pane, side, workspaces)
     }
 
     fn default_side(&self) -> Result<Side, String> {
@@ -312,7 +300,9 @@ impl MultiplexerSession for Herdr {
         Some(Launch { program, argv })
     }
 
-    fn shared_view(&self, side: &Side) -> Option<Launch> {
+    /// herdr runs one session per server, so the side alone names the view.
+    fn shared_view(&self, key: &PaneKey) -> Option<Launch> {
+        let side = &key.side;
         let name = self.cache(side).and_then(EndpointCache::session_name)?;
         let (program, argv) = side.command(&program(side), &["session", "attach", &name]);
         Some(Launch { program, argv })

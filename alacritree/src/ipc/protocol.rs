@@ -88,8 +88,11 @@ pub(crate) enum IpcRequest {
     ///
     /// `no_focus` opens the session behind the scenes: the workspace on
     /// screen, each workspace's active tab and the multiplexer's own focus
-    /// all stay where they were.
+    /// all stay where they were.  `multiplexer` names the one to search, as
+    /// `ListMultiplexerPanes` spells it; omitted, every enabled one is.
     AttachMultiplexerPane {
+        #[serde(default)]
+        multiplexer: Option<String>,
         side: String,
         terminal_id: String,
         #[serde(default)]
@@ -99,8 +102,11 @@ pub(crate) enum IpcRequest {
     /// `workspace` both default: an omitted side picks the one the active
     /// session already belongs to, and an omitted workspace opens the pane
     /// in the focused one. `no_focus` means what it does for
-    /// `AttachMultiplexerPane`.
+    /// `AttachMultiplexerPane`.  An omitted `multiplexer` is the active
+    /// session's, and failing that the first one enabled.
     CreateMultiplexerPane {
+        #[serde(default)]
+        multiplexer: Option<String>,
         #[serde(default)]
         side: Option<String>,
         #[serde(default)]

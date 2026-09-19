@@ -100,6 +100,24 @@
     "tuicr": {
       "path": "tuicr",
       "wsl_path": null
+    },
+    "zellij": {
+      "enabled": false,
+      "icon": {
+        "bold": false,
+        "color": null,
+        "glyph": "◫",
+        "italic": false,
+        "size": null
+      },
+      "path": "zellij",
+      "poll_interval": {
+        "nanos": 0,
+        "secs": 2
+      },
+      "session": null,
+      "show_unmatched": true,
+      "wsl_path": null
     }
   },
   "ipc_socket": true,
