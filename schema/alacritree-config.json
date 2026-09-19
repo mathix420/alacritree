@@ -1932,7 +1932,7 @@
               "$ref": "#/$defs/RawIconStyle"
             }
           ],
-          "default": "◫",
+          "default": "⬡",
           "description": "The glyph on a zellij pane's sidebar row and palette entry. A bare\nstring sets the glyph; a table also styles its color, weight, slant\nand size, the way `[ui.icons]` keys do."
         },
         "path": {

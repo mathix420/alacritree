@@ -775,6 +775,10 @@ baked_glyphs! {
     /// vendor's logo would only say "smudge" — and it stays neutral as more
     /// than one such manager becomes supportable.
     DEFAULT_HERDR_ICON = "◫";
+    /// zellij's own logo is a hexagon.  The baked face refits this one to a
+    /// capital M's box, since DejaVu draws it past the ascender and below
+    /// the baseline.
+    DEFAULT_ZELLIJ_ICON = "⬡";
     DEFAULT_HOME_ICON = "⌂";
     DEFAULT_PROJECT_EXPANDED_ICON = "▾";
     DEFAULT_PROJECT_COLLAPSED_ICON = "▸";
@@ -3240,7 +3244,7 @@ impl Default for RawZellij {
 }
 
 fn default_zellij_icon() -> RawIconStyle {
-    raw_glyph(DEFAULT_HERDR_ICON)
+    raw_glyph(DEFAULT_ZELLIJ_ICON)
 }
 
 impl RawZellij {
@@ -5663,8 +5667,9 @@ program = "second"
     fn the_icon_slice_carries_exactly_the_default_icon_glyphs() {
         let mut icons: Vec<&str> = DEFAULT_ICON_GLYPHS.iter().map(|g| g.as_str()).collect();
         icons.sort_unstable();
-        let mut expected =
+        let expected =
             ["⌕", "●", "○", "▪", "◫", "⌂", "▾", "▸", "⬤", "◯", "⬤", "⬤", "✓", "⇅", "⌫", "↑"];
+        let mut expected = [expected.as_slice(), &["\u{2B21}"]].concat();
         expected.sort_unstable();
         assert_eq!(icons, expected);
     }

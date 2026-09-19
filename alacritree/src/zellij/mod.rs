@@ -18,7 +18,7 @@ pub use cli::{SideListing, attach, create_pane, focus_pane, list_side};
 pub use listing::{split_terminal_id, terminal_id};
 use serde_json::{Value, json};
 
-use crate::config::{BakedGlyph, DEFAULT_HERDR_ICON, IconStyle, ZellijConfig};
+use crate::config::{BakedGlyph, DEFAULT_ZELLIJ_ICON, IconStyle, ZellijConfig};
 use crate::multiplexer::{
     AttachAnswer, AttachRequest, CreateAnswer, CreateRequest, CreatedPane, HarnessMark, Launch,
     ListedPane, Managed, MultiplexerKind, MultiplexerSession, Pane, PaneKey, PaneStatus,
@@ -126,7 +126,7 @@ impl MultiplexerSession for Zellij {
     }
 
     fn icon(&self) -> (&IconStyle, BakedGlyph) {
-        (&self.config.icon, DEFAULT_HERDR_ICON)
+        (&self.config.icon, DEFAULT_ZELLIJ_ICON)
     }
 
     fn poll(&mut self, _attached: &dyn Fn(&Side) -> bool) {

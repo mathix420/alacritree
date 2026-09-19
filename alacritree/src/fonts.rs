@@ -2486,7 +2486,29 @@ mod tests {
 
     #[test]
     fn the_baked_glyph_set_is_the_documented_size() {
-        assert_eq!(baked_glyphs().len(), 26, "assets/README.md lists the codepoints");
+        assert_eq!(baked_glyphs().len(), 27, "assets/build_symbols.py lists the codepoints");
+    }
+
+    /// The zellij hexagon is refitted to a capital M's box when the face is
+    /// built; DejaVu's own outline runs past the ascender and below the
+    /// baseline and reads as a smudge at row size.  M is not in the baked
+    /// face, so its cap height comes from the metrics the face carries over.
+    #[test]
+    fn the_zellij_hexagon_fills_a_capital_m_s_box() {
+        let face = ttf_parser::Face::parse(SYMBOLS_FONT, 0).expect("the baked face parses");
+        let hexagon = crate::config::DEFAULT_ZELLIJ_ICON.as_str().chars().next().unwrap();
+        let id = face.glyph_index(hexagon).expect("the baked face maps the hexagon");
+        let bbox = face.glyph_bounding_box(id).expect("the hexagon has an outline");
+        // DejaVu Sans 2.37's capital M spans 0..1493 units.
+        const M_CAP_HEIGHT: i16 = 1493;
+        assert!(bbox.y_min.abs() <= 2, "the hexagon sits on the baseline: {bbox:?}");
+        assert!(
+            (bbox.y_max - M_CAP_HEIGHT).abs() <= 4,
+            "the hexagon reaches M's cap height: {bbox:?}"
+        );
+        let advance = face.glyph_hor_advance(id).expect("the hexagon has an advance") as i16;
+        let (left, right) = (bbox.x_min, advance - bbox.x_max);
+        assert!((left - right).abs() <= 2, "the hexagon is centered in its advance: {bbox:?}");
     }
 
     /// Last position is the whole guarantee: an earlier face that already draws
