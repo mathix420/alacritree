@@ -16,15 +16,19 @@ artifact is a derivative and should not be mistaken for the real face.
 
 ### Regenerating
 
-Needed whenever a glyph is added to `DEFAULT_ICON_GLYPHS` or
-`CHROME_GLYPHS`. `fonts.rs`'s coverage test fails until this is done, and
-names the missing codepoint.
+Needed whenever a glyph is added to `DEFAULT_ICON_GLYPHS`, `CHROME_GLYPHS` or `OPT_IN_GLYPHS`, or `herdr-ram.svg` changes. `fonts.rs`'s coverage test fails until this is done, and names the missing codepoint.
 
 Add the codepoint to `build_symbols.py`, then run it against DejaVu 2.37. `--dejavu` defaults to `/usr/share/fonts/truetype/dejavu`:
 
     uv run alacritree/assets/build_symbols.py --dejavu <dir holding DejaVuSans.ttf and DejaVuSansMono.ttf>
 
-The script subsets both faces, merges them, refits zellij's hexagon (U+2B21) to the box a capital M takes up in DejaVu Sans, sets the names above, and writes over `alacritree-symbols.ttf`, printing the hexagon's transform. DejaVu draws that hexagon past the ascender and below the baseline, so unfitted it does not line up with the text beside it. A `fonts.rs` test fails if a rebuild drops the refit.
+Use Debian's or Kali's DejaVu, which is what the committed font was built from. The copy Windows ships also calls itself 2.37 but draws `◇` and `◫` differently.
+
+The script subsets both faces, merges them, adds the herdr ram from `herdr-ram.svg` at U+E000, fits it and zellij's hexagon (U+2B21) to the box a capital M takes up in DejaVu Sans, sets the names above, and writes over `alacritree-symbols.ttf`, printing each fitted glyph's transform. DejaVu draws the hexagon past the ascender and below the baseline, so unfitted it does not line up with the text beside it. A `fonts.rs` test fails if a rebuild drops the fit.
+
+## `herdr-ram.svg`
+
+The source of the ram glyph (U+E000) that `[integrations.herdr] icon` can name. Edit it in any vector editor and rebuild the font. The build reads every path, fills it even-odd, and scales it to fit, so the SVG's size and position do not matter.
 
 ## `FONT-LICENSE.txt`
 

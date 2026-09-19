@@ -744,7 +744,7 @@
             }
           ],
           "default": "◫",
-          "description": "The glyph on a herdr pane's sidebar row and palette entry. A bare\nstring sets the glyph; a table also styles its color, weight, slant\nand size, the way `[ui.icons]` keys do."
+          "description": "The glyph on a herdr pane's sidebar row and palette entry. A bare\nstring sets the glyph; a table also styles its color, weight, slant\nand size, the way `[ui.icons]` keys do. `\"\"` is a ram's head\nthat alacritree ships in its symbol font."
         },
         "path": {
           "default": "herdr",

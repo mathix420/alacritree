@@ -1,12 +1,12 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["fonttools>=4.47"]
+# dependencies = ["fonttools>=4.47", "skia-pathops>=0.8"]
 # ///
-"""Build alacritree-symbols.ttf from DejaVu 2.37.
+"""Build alacritree-symbols.ttf from DejaVu 2.37 and herdr-ram.svg.
 
 Subsets DejaVu Sans and DejaVu Sans Mono down to the glyphs alacritree
-paints, merges them, fits the zellij hexagon to a capital M's box, and names
-the result Alacritree Symbols.
+paints, merges them, adds the herdr ram, fits the zellij hexagon and the ram
+to a capital M's box, and names the result Alacritree Symbols.
 
     uv run alacritree/assets/build_symbols.py [--dejavu DIR] [--output FILE]
 """
@@ -15,11 +15,14 @@ import argparse
 import tempfile
 from pathlib import Path
 
+import pathops
 from fontTools import subset
 from fontTools.merge import Merger
 from fontTools.pens.boundsPen import BoundsPen
+from fontTools.pens.cu2quPen import Cu2QuPen
 from fontTools.pens.transformPen import TransformPen
 from fontTools.pens.ttGlyphPen import TTGlyphPen
+from fontTools.svgLib import SVGPath
 from fontTools.ttLib import TTFont
 
 # Every codepoint drawn from DejaVu Sans.
@@ -34,6 +37,11 @@ MONO = [0x2315]
 # zellij's sidebar icon.  DejaVu draws it past the ascender and below the
 # baseline, so it is refitted to the box a capital M takes up.
 HEXAGON = 0x2B21
+
+# herdr's ram, drawn in herdr-ram.svg.  The first private use codepoint, so it
+# cannot shadow a glyph any installed font means as something else.
+RAM = 0xE000
+RAM_SVG = Path(__file__).with_name("herdr-ram.svg")
 
 NAMES = {
     1: "Alacritree Symbols",
@@ -65,17 +73,17 @@ def bounds(font: TTFont, glyph: str) -> tuple[float, float, float, float]:
     return pen.bounds
 
 
-def fit_to_capital_m(font: TTFont, reference: TTFont) -> None:
-    """Scale the hexagon to M's height, sit it on the baseline, and center it
-    in M's advance.  A regular hexagon is narrower than M, so the height sets
-    the scale and the width follows from it."""
-    glyph = font.getBestCmap()[HEXAGON]
+def fit_to_capital_m(font: TTFont, reference: TTFont, codepoint: int) -> None:
+    """Scale a glyph to fit M's height and advance, sit it on the baseline,
+    and center it in M's advance.  Whichever of height or width runs out
+    first sets the scale, so the shape keeps its proportions."""
+    glyph = font.getBestCmap()[codepoint]
     m = reference.getBestCmap()[ord("M")]
     x_min, y_min, x_max, y_max = bounds(font, glyph)
     _, m_bottom, _, m_top = bounds(reference, m)
     m_advance = reference["hmtx"][m][0]
 
-    scale = (m_top - m_bottom) / (y_max - y_min)
+    scale = min((m_top - m_bottom) / (y_max - y_min), m_advance / (x_max - x_min))
     width = (x_max - x_min) * scale
     dx = (m_advance - width) / 2 - x_min * scale
     dy = m_bottom - y_min * scale
@@ -87,11 +95,32 @@ def fit_to_capital_m(font: TTFont, reference: TTFont) -> None:
     font["glyf"][glyph].recalcBounds(font["glyf"])
     font["hmtx"][glyph] = (m_advance, font["glyf"][glyph].xMin)
     print(
-        f"U+{HEXAGON:04X}: source bbox {(x_min, y_min, x_max, y_max)}, "
+        f"U+{codepoint:04X}: source bbox {(x_min, y_min, x_max, y_max)}, "
         f"M bbox {bounds(reference, m)} advance {m_advance}, "
         f"scale {scale:.5f}, dx {dx:.1f}, dy {dy:.1f}, "
         f"result bbox {bounds(font, glyph)}"
     )
+
+
+def add_svg_glyph(font: TTFont, svg: Path, codepoint: int) -> None:
+    """Add the SVG's paths as a glyph at their own size, for
+    `fit_to_capital_m` to place.  SVG's y axis points down, so the outline is
+    flipped, and the SVG's even-odd fill is rewritten as the nonzero winding
+    TrueType fills by."""
+    path = pathops.Path(fillType=pathops.FillType.EVEN_ODD)
+    SVGPath(str(svg)).draw(TransformPen(path.getPen(), (1, 0, 0, -1, 0, 0)))
+    path = pathops.simplify(path, clockwise=True)
+
+    name = f"uni{codepoint:04X}"
+    pen = TTGlyphPen(None)
+    path.draw(Cu2QuPen(pen, max_err=1.0, reverse_direction=False))
+    font["glyf"][name] = pen.glyph()
+    font["glyf"][name].recalcBounds(font["glyf"])
+    font["hmtx"][name] = (0, font["glyf"][name].xMin)
+    font.setGlyphOrder(font.getGlyphOrder() + [name])
+    for table in font["cmap"].tables:
+        if table.isUnicode():
+            table.cmap[codepoint] = name
 
 
 def main() -> None:
@@ -108,7 +137,10 @@ def main() -> None:
         subset_face(args.dejavu / "DejaVuSansMono.ttf", MONO, mono, drop_math=False)
         font = Merger().merge([str(sans), str(mono)])
 
-    fit_to_capital_m(font, TTFont(args.dejavu / "DejaVuSans.ttf"))
+    add_svg_glyph(font, RAM_SVG, RAM)
+    reference = TTFont(args.dejavu / "DejaVuSans.ttf")
+    for codepoint in (HEXAGON, RAM):
+        fit_to_capital_m(font, reference, codepoint)
     for record in font["name"].names:
         if record.nameID in NAMES:
             record.string = NAMES[record.nameID]

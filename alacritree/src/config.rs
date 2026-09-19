@@ -793,6 +793,15 @@ baked_glyphs! {
 }
 
 baked_glyphs! {
+    OPT_IN_GLYPHS:
+    /// herdr's ram, drawn in `assets/herdr-ram.svg`.  No default paints it;
+    /// `[integrations.herdr] icon = ""` opts in, so only the coverage
+    /// check reads the constant.
+    #[cfg(test)]
+    HERDR_RAM_GLYPH = "\u{E000}";
+}
+
+baked_glyphs! {
     CHROME_GLYPHS:
     /// Every recognized agent shares one status mark; identity belongs in the
     /// tooltip and title instead of changing the sidebar's visual grammar.
@@ -3119,7 +3128,8 @@ struct RawHerdr {
     wsl_path: String,
     /// The glyph on a herdr pane's sidebar row and palette entry. A bare
     /// string sets the glyph; a table also styles its color, weight, slant
-    /// and size, the way `[ui.icons]` keys do.
+    /// and size, the way `[ui.icons]` keys do. `""` is a ram's head
+    /// that alacritree ships in its symbol font.
     #[schemars(default = "default_herdr_icon")]
     icon: Option<RawIconStyle>,
     /// Discover herdr servers and list their agents in the sidebar.  Inert
