@@ -330,6 +330,7 @@ mod tests {
 
     use super::*;
     use crate::ipc::protocol::IpcResult;
+    use crate::ipc::route::Route;
     use crate::ipc::server::InMemory;
     use crate::repaint::Recorder;
 
@@ -442,8 +443,8 @@ mod tests {
         let app = std::thread::spawn(move || {
             let call = requests.recv().expect("the call reached the app");
             assert_eq!(
-                serde_json::to_value(&call.request).expect("serialize"),
-                serde_json::to_value(&expected).expect("serialize"),
+                Route::App(call.request),
+                Route::from(expected),
                 "the app got a different request than the tool call spelled"
             );
             call.reply_tx.send(reply).expect("reply");

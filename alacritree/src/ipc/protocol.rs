@@ -20,6 +20,7 @@ pub(crate) const SOCKET_ENV: &str = "ALACRITREE_SOCKET";
 /// format is `{"type": "list_sessions", …fields}` — the MCP bridge builds
 /// these directly from tool names + arguments.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(strum::EnumIter, strum::IntoStaticStr))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum IpcRequest {
     ListProjects,
@@ -121,34 +122,6 @@ pub(crate) enum IpcRequest {
     RunAction {
         action: String,
     },
-}
-
-impl IpcRequest {
-    /// The variant's name, for logs that must not print the payload: paths and
-    /// `SendText` bodies are the caller's data, not ours to write to a file.
-    pub(crate) fn name(&self) -> &'static str {
-        match self {
-            Self::ListProjects => "ListProjects",
-            Self::ListSessions => "ListSessions",
-            Self::SelectWorkspace { .. } => "SelectWorkspace",
-            Self::CreateSession { .. } => "CreateSession",
-            Self::CloseSession { .. } => "CloseSession",
-            Self::SendText { .. } => "SendText",
-            Self::MoveSession { .. } => "MoveSession",
-            Self::ReadScreen { .. } => "ReadScreen",
-            Self::ReadScratchpad { .. } => "ReadScratchpad",
-            Self::RefreshProject { .. } => "RefreshProject",
-            Self::AddProject { .. } => "AddProject",
-            Self::RemoveProject { .. } => "RemoveProject",
-            Self::RenameProject { .. } => "RenameProject",
-            Self::GitStatus { .. } => "GitStatus",
-            Self::CreateWorktree { .. } => "CreateWorktree",
-            Self::ListMultiplexerPanes => "ListMultiplexerPanes",
-            Self::AttachMultiplexerPane { .. } => "AttachMultiplexerPane",
-            Self::CreateMultiplexerPane { .. } => "CreateMultiplexerPane",
-            Self::RunAction { .. } => "RunAction",
-        }
-    }
 }
 
 pub(crate) type IpcResult = Result<Value, String>;

@@ -23,6 +23,7 @@ use super::protocol::connect;
 use super::protocol::{
     IpcRequest, IpcResult, SOCKET_ENV, git_status_json, socket_dir, unlink_socket,
 };
+use super::route::{AppRequest, ConnectionRequest, DeferredRequest, Route};
 use crate::config::WorkspaceConfig;
 use crate::repaint::Repaint;
 use crate::worktree::{self as wt, CreateRequest, Progress};
@@ -52,7 +53,7 @@ const IPC_CREATE_BUDGET: Duration = Duration::from_secs(240);
 /// One request en route to the UI thread, with the channel the connection
 /// thread is blocking on for the reply.
 pub(crate) struct AppCall {
-    pub request: IpcRequest,
+    pub request: AppRequest,
     pub reply_tx: Sender<IpcResult>,
 }
 
@@ -200,22 +201,24 @@ fn dispatch(
     repaint: &impl Repaint,
     workspace: &WorkspaceConfig,
 ) -> IpcResult {
-    match request {
+    match Route::from(request) {
         // `compute` walks the working tree — the same work StatusCache
         // pushes to a background thread — so keep it off the UI thread.
         // This is already the connection thread, not the UI thread; the
         // token just proves that plainly rather than adding a real wait.
-        IpcRequest::GitStatus { path } => Ok(git_status_json(&jobs::on_this_thread(|blocking| {
-            git_status::compute(&path, None, blocking)
-        }))),
-        IpcRequest::CreateWorktree { project_root, branch } => {
+        Route::Connection(ConnectionRequest::GitStatus { path }) => {
+            Ok(git_status_json(&jobs::on_this_thread(|blocking| {
+                git_status::compute(&path, None, blocking)
+            })))
+        },
+        Route::Connection(ConnectionRequest::CreateWorktree { project_root, branch }) => {
             create_worktree(project_root, branch, app_tx, repaint, workspace)
         },
-        other => call_app(other, app_tx, repaint),
+        Route::App(request) => call_app(request, app_tx, repaint),
     }
 }
 
-fn call_app(request: IpcRequest, app_tx: &Sender<AppCall>, repaint: &impl Repaint) -> IpcResult {
+fn call_app(request: AppRequest, app_tx: &Sender<AppCall>, repaint: &impl Repaint) -> IpcResult {
     let (reply_tx, reply_rx) = mpsc::channel();
     app_tx
         .send(AppCall { request, reply_tx })
@@ -248,7 +251,8 @@ fn create_worktree(
         Ok((path, steps)) => {
             // Best-effort: if the project is in the sidebar, show the new
             // worktree without waiting for a manual refresh.
-            let _ = call_app(IpcRequest::RefreshProject { root: project_root }, app_tx, repaint);
+            let refresh = DeferredRequest::RefreshProject { root: project_root };
+            let _ = call_app(refresh.into(), app_tx, repaint);
             Ok(json!({ "path": path, "steps": steps }))
         },
         Err(e) => Err(e),
@@ -319,6 +323,7 @@ mod tests {
     use super::*;
 
     use crate::ipc::protocol::send_request;
+    use crate::ipc::route::FrameRequest;
     use crate::repaint::Recorder;
     use crate::session::SESSION_ID_ENV;
 
@@ -377,7 +382,7 @@ mod tests {
 
         let app = std::thread::spawn(move || {
             let call = rx.recv().expect("request reached the app thread");
-            assert!(matches!(call.request, IpcRequest::ListSessions));
+            assert_eq!(call.request, AppRequest::Frame(FrameRequest::ListSessions));
             call.reply_tx.send(Ok(json!({ "sessions": [] }))).expect("reply");
         });
 

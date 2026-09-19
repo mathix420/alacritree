@@ -15,4 +15,5 @@
 //! MCP bridge is worth as much on Windows.
 
 pub(crate) mod protocol;
+pub(crate) mod route;
 pub(crate) mod server;

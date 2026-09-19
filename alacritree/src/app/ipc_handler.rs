@@ -3,6 +3,7 @@
 //! input does; the connection thread blocks on `reply_tx` meanwhile.
 
 use super::*;
+use crate::ipc::route::{AppRequest, DeferredRequest, FrameRequest};
 
 impl AlacritreeApp {
     pub(super) fn start_ipc(
@@ -57,65 +58,56 @@ impl AlacritreeApp {
         let calls: Vec<ipc::server::AppCall> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         for call in calls {
             let ipc::server::AppCall { request, reply_tx } = call;
-            // Discovery is far too slow to run here, and the caller still has
-            // to be answered from the discovered list rather than the stale
-            // one (or the placeholder), so these requests own their reply
-            // channel until it lands.
-            let request = match request {
-                ipc::protocol::IpcRequest::RefreshProject { root } => {
-                    self.defer_project_refresh(ctx, root, reply_tx);
-                    continue;
+            match request {
+                AppRequest::Deferred(request) => self.defer_ipc_request(ctx, request, reply_tx),
+                AppRequest::Frame(request) => {
+                    let name: &'static str = (&request).into();
+                    let started = std::time::Instant::now();
+                    let result = self.handle_ipc_request(ctx, request);
+                    crate::frame_log::note_if_slow("ipc request", name, started.elapsed());
+                    // A send error means the client gave up waiting, so there
+                    // is nothing to do.
+                    let _ = reply_tx.send(result);
                 },
-                ipc::protocol::IpcRequest::AddProject { path } => {
-                    self.defer_project_add(ctx, path, reply_tx);
-                    continue;
-                },
-                // The reply has to wait for the PTY: a client that creates a
-                // session in order to write to it would otherwise be told the
-                // id before anything can receive what it writes.
-                ipc::protocol::IpcRequest::CreateSession { workspace } => {
-                    self.defer_create_session(ctx, workspace, reply_tx);
-                    continue;
-                },
-                ipc::protocol::IpcRequest::AttachMultiplexerPane {
-                    multiplexer,
-                    side,
-                    terminal_id,
-                    no_focus,
-                } => {
-                    let focus = AttachFocus::requested(no_focus);
-                    self.defer_attach_multiplexer_pane(
-                        ctx,
-                        (multiplexer.as_deref(), &side, &terminal_id),
-                        reply_tx,
-                        focus,
-                    );
-                    continue;
-                },
-                ipc::protocol::IpcRequest::CreateMultiplexerPane {
-                    multiplexer,
-                    side,
+            }
+        }
+    }
+
+    /// Each of these answers `reply_tx` itself once its work lands, which is
+    /// why it takes the channel rather than returning a result.
+    fn defer_ipc_request(
+        &mut self,
+        ctx: &Context,
+        request: DeferredRequest,
+        reply_tx: mpsc::Sender<ipc::protocol::IpcResult>,
+    ) {
+        match request {
+            DeferredRequest::RefreshProject { root } => {
+                self.defer_project_refresh(ctx, root, reply_tx)
+            },
+            DeferredRequest::AddProject { path } => self.defer_project_add(ctx, path, reply_tx),
+            DeferredRequest::CreateSession { workspace } => {
+                self.defer_create_session(ctx, workspace, reply_tx)
+            },
+            DeferredRequest::AttachMultiplexerPane { multiplexer, side, terminal_id, no_focus } => {
+                let focus = AttachFocus::requested(no_focus);
+                self.defer_attach_multiplexer_pane(
+                    ctx,
+                    (multiplexer.as_deref(), &side, &terminal_id),
+                    reply_tx,
+                    focus,
+                );
+            },
+            DeferredRequest::CreateMultiplexerPane { multiplexer, side, workspace, no_focus } => {
+                let focus = AttachFocus::requested(no_focus);
+                self.defer_create_multiplexer_pane(
+                    ctx,
+                    (multiplexer.as_deref(), side.as_deref()),
                     workspace,
-                    no_focus,
-                } => {
-                    let focus = AttachFocus::requested(no_focus);
-                    self.defer_create_multiplexer_pane(
-                        ctx,
-                        (multiplexer.as_deref(), side.as_deref()),
-                        workspace,
-                        reply_tx,
-                        focus,
-                    );
-                    continue;
-                },
-                other => other,
-            };
-            let name = request.name();
-            let started = std::time::Instant::now();
-            let result = self.handle_ipc_request(ctx, request);
-            crate::frame_log::note_if_slow("ipc request", name, started.elapsed());
-            // A send error means the client gave up waiting — nothing to do.
-            let _ = reply_tx.send(result);
+                    reply_tx,
+                    focus,
+                );
+            },
         }
     }
 
@@ -193,9 +185,9 @@ impl AlacritreeApp {
     fn handle_ipc_request(
         &mut self,
         ctx: &Context,
-        request: ipc::protocol::IpcRequest,
+        request: FrameRequest,
     ) -> ipc::protocol::IpcResult {
-        use ipc::protocol::IpcRequest as Req;
+        use FrameRequest as Req;
         match request {
             Req::ListProjects => Ok(json!({
                 "current_workspace": self.current_workspace,
@@ -222,22 +214,6 @@ impl AlacritreeApp {
                     self.activate_worktree(ctx, &known);
                     Ok(json!({ "workspace": known }))
                 },
-            },
-            // Claimed by `process_ipc_calls` before dispatch: the reply is
-            // held until the session's PTY is live, which needs the reply
-            // channel this method does not have.
-            Req::CreateSession { .. } => Err("create_session was not deferred".to_string()),
-            // Claimed by `process_ipc_calls` before dispatch: the reply is
-            // held until the attached session's PTY is live, which needs the
-            // reply channel this method does not have.
-            Req::AttachMultiplexerPane { .. } => {
-                Err("attach_multiplexer_pane was not deferred".to_string())
-            },
-            // Claimed by `process_ipc_calls` before dispatch: the reply is
-            // held until the created pane's session can be read, which needs
-            // the reply channel this method does not have.
-            Req::CreateMultiplexerPane { .. } => {
-                Err("create_multiplexer_pane was not deferred".to_string())
             },
             Req::CloseSession { session_id } => {
                 if !self.sessions.iter().any(|s| s.id == session_id) {
@@ -296,12 +272,6 @@ impl AlacritreeApp {
                 };
                 scratchpad::read_json(&workspace)
             },
-            // Claimed by `process_ipc_calls` before dispatch: the reply is
-            // held until the background discovery lands, which needs the
-            // reply channel this method does not have.
-            Req::RefreshProject { .. } | Req::AddProject { .. } => {
-                Err("discovery was not deferred".to_string())
-            },
             Req::RemoveProject { root } => {
                 let idx =
                     self.projects.iter().position(|p| p.root == root).ok_or_else(|| {
@@ -320,10 +290,6 @@ impl AlacritreeApp {
                     self.dispatch_action(ctx, parsed, ActionOrigin::Ipc);
                     Ok(json!({ "action": action }))
                 },
-            },
-            // Dispatched on the IPC connection thread; never forwarded here.
-            Req::GitStatus { .. } | Req::CreateWorktree { .. } => {
-                Err("request is handled off the UI thread".to_string())
             },
         }
     }
