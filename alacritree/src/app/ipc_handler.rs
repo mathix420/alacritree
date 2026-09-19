@@ -206,8 +206,7 @@ impl AlacritreeApp {
                     .sessions
                     .iter()
                     .map(|s| {
-                        let active =
-                            self.active_session.get(&s.working_directory).copied() == Some(s.id);
+                        let active = self.sessions.active(&s.working_directory) == Some(s.id);
                         self.session_json(s, active)
                     })
                     .collect();

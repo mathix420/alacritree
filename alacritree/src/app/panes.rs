@@ -320,14 +320,13 @@ impl AlacritreeApp {
         // this goes through the constructor rather than a struct literal.
         let shell = Shell::new(launch.program, argv);
         let kept_tab = self
-            .active_session
-            .get(&workspace)
-            .copied()
+            .sessions
+            .active(&workspace)
             .filter(|id| !focus.takes() && self.sessions.iter().any(|s| s.id == *id));
         match self.spawn_session_with_shell(ctx, workspace.clone(), Some(shell), probe) {
             Ok(id) => {
                 if let Some(kept) = kept_tab {
-                    self.active_session.insert(workspace, kept);
+                    self.sessions.set_active(workspace, kept);
                 }
                 if let Some(session) = self.sessions.iter_mut().find(|s| s.id == id) {
                     session.bind_pane(key.clone(), shared_view);

@@ -407,56 +407,9 @@ impl AlacritreeApp {
             return;
         };
         let project_root = self.projects[req.project_idx].root.clone();
-        let policy = self.config.ui.last_session_close;
-        let ring = policy.rings().then(|| self.session_ring()).unwrap_or_default();
-        let removed: Vec<SessionId> = policy
-            .rings()
-            .then(|| {
-                self.sessions
-                    .iter()
-                    .filter(|s| s.working_directory.as_deref() == Some(&req.worktree_path))
-                    .map(|s| s.id)
-                    .collect()
-            })
-            .unwrap_or_default();
-
         // Drop sessions whose cwd is the worktree before deleting it; the PTY
         // would otherwise block the directory removal on some filesystems.
-        self.sessions.retain(|s| s.working_directory.as_deref() != Some(&req.worktree_path));
-        self.active_session.remove(&Some(req.worktree_path.clone()));
-        if self.current_workspace.as_deref() == Some(&req.worktree_path) {
-            let landing = policy
-                .rings()
-                .then(|| {
-                    let prefer = policy
-                        .prefers_project()
-                        .then(|| {
-                            sidebar_nav::project_of(
-                                &self.projects,
-                                &Some(req.worktree_path.clone()),
-                            )
-                        })
-                        .flatten();
-                    ring_landing(&ring, &removed, prefer)
-                })
-                .flatten();
-            let verdict = match landing {
-                Some((_, id)) => CloseFallback::ActivateSession(id),
-                None => CloseFallback::Home,
-            };
-            if defers_close_navigation(self.config.ui.sidebar_focus) {
-                self.sidebar_focus_state.deferred_close = Some(DeferredClose {
-                    verdict,
-                    removed_worktree: Some(req.worktree_path.clone()),
-                });
-                ctx.request_repaint();
-            } else {
-                // Deleting the on-screen worktree is an explicit user action,
-                // so the view should greet with a live shell rather than the
-                // "no session" placeholder.
-                self.apply_close_fallback(ctx, verdict);
-            }
-        }
+        self.close_worktree_sessions(ctx, &req.worktree_path);
 
         // The git removal (shellouts, branch delete, doppler cleanup) is slow
         // enough to stutter paint, so run it off-thread and adopt the result in
@@ -494,6 +447,17 @@ impl AlacritreeApp {
             prunable: req.prunable,
             job,
         });
+    }
+
+    pub(super) fn close_worktree_sessions(&mut self, ctx: &Context, worktree_path: &Path) {
+        let workspace = Some(worktree_path.to_path_buf());
+        let ids: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|s| s.working_directory == workspace)
+            .map(|s| s.id)
+            .collect();
+        self.close_sessions(ctx, &ids, workspace, CloseReason::WorktreeDeleted);
     }
 
     /// Adopt finished background deletes: pop up any failure and refresh the

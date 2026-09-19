@@ -61,6 +61,7 @@ mod ipc_handler;
 mod modals;
 mod palette;
 mod panes;
+mod session_list;
 mod sidebar;
 mod widgets;
 
@@ -68,6 +69,7 @@ pub(crate) use actions::{Action, ActionOrigin};
 use focus::DeferredClose;
 use modals::{BaseBranchPicker, CreateState, DeleteRequest, ProjectRemoveState, RenameState};
 use panes::managed_tooltip;
+use session_list::SessionList;
 use sidebar::{
     PaintedIcons, PaneRowData, SessionRowData, WorkspaceRowData, any_pr_toggle_active,
     project_filter_toggles, session_row_name,
@@ -374,9 +376,8 @@ pub struct AlacritreeApp {
     /// The Ctrl+K command palette (query, selection, matcher). Transient:
     /// never persisted.
     palette: CommandPalette,
-    sessions: Vec<AppSession>,
+    sessions: SessionList,
     current_workspace: WorkspaceKey,
-    active_session: HashMap<WorkspaceKey, SessionId>,
     projects: Vec<Project>,
     pr_cache: PrCache,
     /// Renders `[ui] worktree_name` / `project_name` templates at paint time.
@@ -499,9 +500,8 @@ impl AlacritreeApp {
             sidebar_focus_state: focus::SidebarFocusState::new(config.ui.search_scope),
             search_depth: config.ui.search_depth,
             palette: CommandPalette::new(),
-            sessions: Vec::new(),
+            sessions: SessionList::default(),
             current_workspace: None,
-            active_session: HashMap::new(),
             projects,
             pr_cache: PrCache::new(),
             row_labels,
@@ -870,7 +870,7 @@ impl AlacritreeApp {
     /// Push a session record and get its PTY opened: inline when the gate is
     /// off, on the job pool when it is on.  The record exists before this
     /// returns either way, so a caller can activate the tab without waiting
-    /// for a shell.  Callers own `active_session`; this owns `self.sessions`.
+    /// for a shell.  Callers decide whether it becomes the active session.
     fn open_session(
         &mut self,
         session: AppSession,
@@ -890,7 +890,7 @@ impl AlacritreeApp {
                     // The record went in before the open, so it comes back out
                     // before the error does: with the gate off, a caller that
                     // gets `Err` must see no trace of the session.
-                    self.sessions.retain(|s| s.id != id);
+                    self.sessions.remove(&[id], self.config.ui.sidebar_focus);
                     return Err(e);
                 },
             }
@@ -1022,7 +1022,7 @@ impl AlacritreeApp {
             wsl_probe,
         );
         let id = self.open_session(session, request)?;
-        self.active_session.insert(working_directory, id);
+        self.sessions.set_active(working_directory, id);
         Ok(id)
     }
 
@@ -1030,13 +1030,13 @@ impl AlacritreeApp {
         let workspace = self.current_workspace.clone();
         if let Some(index) = self.scratchpad_session_index(&workspace) {
             let id = self.sessions[index].id;
-            if self.active_session.get(&workspace).copied() == Some(id) {
+            if self.sessions.active(&workspace) == Some(id) {
                 // Scratchpad edits are persisted as they happen, so toggling
                 // the active tab closed never needs the session-close prompt.
                 self.close_session(ctx, id);
                 return;
             }
-            self.active_session.insert(workspace, id);
+            self.sessions.set_active(workspace, id);
         } else if let Err(e) = self.spawn_scratchpad(ctx, workspace) {
             self.modals.error_dialog = Some(format!("failed to open scratchpad: {e}"));
             return;
@@ -1060,7 +1060,7 @@ impl AlacritreeApp {
         )?;
         let id = session.id;
         self.sessions.push(session);
-        self.active_session.insert(workspace, id);
+        self.sessions.set_active(workspace, id);
         Ok(id)
     }
 
@@ -1213,7 +1213,7 @@ impl AlacritreeApp {
         let ws_idx = self.workspace_display_indices(&self.current_workspace);
         if let Some(&idx) = ws_idx.first() {
             let id = self.sessions[idx].id;
-            self.active_session.insert(self.current_workspace.clone(), id);
+            self.sessions.set_active(self.current_workspace.clone(), id);
             // Filling in a missing active entry is self-healing, not navigation.
             self.mark_sidebar_focus_write();
         }
@@ -1224,32 +1224,34 @@ impl AlacritreeApp {
     }
 
     fn close_session_with(&mut self, ctx: &Context, id: SessionId, reason: CloseReason) {
-        let Some(idx) = self.sessions.iter().position(|s| s.id == id) else {
+        let Some(session) = self.sessions.iter().find(|s| s.id == id) else {
             return;
         };
-        let workspace = self.sessions[idx].working_directory.clone();
-        let pane_key = self.sessions[idx].pane_key.clone();
-        self.multiplexers.session_closed(id, pane_key.as_ref());
-        if self.modals.pending_session_close == Some(id) {
-            self.modals.pending_session_close = None;
-        }
+        let workspace = session.working_directory.clone();
+        self.close_sessions(ctx, &[id], workspace, reason);
+    }
+
+    /// Remove `ids`, all of them from `workspace`, and settle where the view
+    /// goes.  Every close of a session that got a record comes through here,
+    /// so each gets the same cleanup and lands by the same rules.
+    fn close_sessions(
+        &mut self,
+        ctx: &Context,
+        ids: &[SessionId],
+        workspace: WorkspaceKey,
+        reason: CloseReason,
+    ) {
         let policy = self.config.ui.last_session_close;
         let ring = policy.rings().then(|| self.session_ring()).unwrap_or_default();
-        self.sessions.remove(idx);
+        for session in self.sessions.remove(ids, self.config.ui.sidebar_focus) {
+            self.multiplexers.session_closed(session.id, session.pane_key.as_ref());
+            if self.modals.pending_session_close == Some(session.id) {
+                self.modals.pending_session_close = None;
+            }
+        }
 
         let remaining: Vec<(WorkspaceKey, SessionId)> =
             self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect();
-
-        if self.active_session.get(&workspace).copied() == Some(id) {
-            match close_landing(&remaining, &workspace, idx, self.config.ui.sidebar_focus) {
-                Some(new_id) => {
-                    self.active_session.insert(workspace.clone(), new_id);
-                },
-                None => {
-                    self.active_session.remove(&workspace);
-                },
-            }
-        }
 
         // Closing the on-screen workspace's last session must not strand the
         // view on an empty pane. What happens instead is policy: `respawn`
@@ -1257,7 +1259,11 @@ impl AlacritreeApp {
         // unclosable), `navigate` falls back to the project main, then home,
         // and the ring policies land on the nearest surviving session in the
         // flat session ring instead.
-        let main = workspace.as_deref().and_then(|p| project_main_for(&self.projects, p));
+        let deleted = reason == CloseReason::WorktreeDeleted;
+        let main = workspace
+            .as_deref()
+            .filter(|_| !deleted)
+            .and_then(|p| project_main_for(&self.projects, p));
         let mut verdict = close_navigation(
             reason,
             close_fallback(&workspace, &self.current_workspace, &remaining, main),
@@ -1267,19 +1273,20 @@ impl AlacritreeApp {
                 .prefers_project()
                 .then(|| sidebar_nav::project_of(&self.projects, &workspace))
                 .flatten();
-            if let Some((_, landing)) = ring_landing(&ring, &[id], prefer) {
+            if let Some((_, landing)) = ring_landing(&ring, ids, prefer) {
                 verdict = CloseFallback::ActivateSession(landing);
             }
         }
-        if verdict != CloseFallback::Stay && policy == LastSessionClose::Respawn {
+        if verdict != CloseFallback::Stay && policy == LastSessionClose::Respawn && !deleted {
             if let Err(e) = self.spawn_session(ctx, workspace.clone()) {
                 self.report_spawn_failure(ctx, &workspace, &e);
             }
             return;
         }
         if defers_close_navigation(self.config.ui.sidebar_focus) && verdict != CloseFallback::Stay {
+            let removed_worktree = if deleted { workspace } else { None };
             self.sidebar_focus_state.deferred_close =
-                Some(DeferredClose { verdict, removed_worktree: None });
+                Some(DeferredClose { verdict, removed_worktree });
             // `reap_exited_sessions` runs after paint, so a shell that exited
             // on its own has no reconciler pass left this frame; without this
             // the deferral would wait for unrelated input.
@@ -1408,36 +1415,7 @@ impl AlacritreeApp {
         if matches!(&self.sessions[idx].kind, SessionKind::Diff { .. }) {
             return Err("diff panes belong to the workspace they were opened from".into());
         }
-        let source = self.sessions[idx].working_directory.clone();
-        if source == target {
-            return Ok(target);
-        }
-
-        let was_source_active = self.active_session.get(&source).copied() == Some(id);
-        let on_screen = was_source_active && self.current_workspace == source;
-        self.sessions[idx].working_directory = target.clone();
-        let next_in_source =
-            self.sessions.iter().find(|s| s.working_directory == source).map(|s| s.id);
-
-        let outcome = plan_move(
-            was_source_active,
-            on_screen,
-            next_in_source,
-            self.active_session.contains_key(&target),
-        );
-        match outcome.source {
-            SourceRepair::Keep => {},
-            SourceRepair::Set(next) => {
-                self.active_session.insert(source, next);
-            },
-            SourceRepair::Remove => {
-                self.active_session.remove(&source);
-            },
-        }
-        if outcome.claim_target {
-            self.active_session.insert(target.clone(), id);
-        }
-        if outcome.follow {
+        if self.sessions.move_to(idx, &target, &self.current_workspace) {
             self.current_workspace = target.clone();
         }
         Ok(target)
@@ -1612,8 +1590,8 @@ impl AlacritreeApp {
         let Some(id) = reorder_subject(
             sidebar_focused,
             self.sidebar.cursor.as_ref(),
-            || self.active_session.get(&None).copied(),
-            |path| self.active_session.get(&Some(path.to_path_buf())).copied(),
+            || self.sessions.active(&None),
+            |path| self.sessions.active(&Some(path.to_path_buf())),
             || self.active_session_index().map(|idx| self.sessions[idx].id),
         ) else {
             return;
@@ -1671,12 +1649,12 @@ impl AlacritreeApp {
     }
 
     fn active_session_index(&self) -> Option<usize> {
-        let id = self.active_session.get(&self.current_workspace).copied()?;
+        let id = self.sessions.active(&self.current_workspace)?;
         self.sessions.iter().position(|s| s.id == id)
     }
 
     fn set_active_in_current_workspace(&mut self, id: SessionId) {
-        self.active_session.insert(self.current_workspace.clone(), id);
+        self.sessions.set_active(self.current_workspace.clone(), id);
     }
 
     fn cycle_tabs(&mut self, delta: i32) {
@@ -1728,7 +1706,7 @@ impl AlacritreeApp {
         };
         // Record the target before switching: ensure_active_session would
         // otherwise re-adopt the workspace's previously active session.
-        self.active_session.insert(target_ws.clone(), id);
+        self.sessions.set_active(target_ws.clone(), id);
         match target_ws {
             None => self.activate_home(ctx),
             Some(path) => self.activate_worktree(ctx, &path),
@@ -1912,7 +1890,7 @@ impl AlacritreeApp {
             &self.projects,
             self.current_workspace.as_deref(),
             &self.listed_workspace_rows(),
-            self.active_session.get(&self.current_workspace).copied(),
+            self.sessions.active(&self.current_workspace),
         ));
         // Seeding reads the unfiltered tree, so a lingering filter from a prior
         // focus round-trip can leave the seeded row outside the current rows;
@@ -2218,7 +2196,7 @@ impl AlacritreeApp {
             return;
         };
         self.current_workspace = ws.clone();
-        self.active_session.insert(ws, id);
+        self.sessions.set_active(ws, id);
     }
 
     fn set_sidebar_cursor(&mut self, row: SidebarRow) {
@@ -2793,7 +2771,7 @@ impl AlacritreeApp {
     /// session that is working or blocked wins over a merely present agent,
     /// because a collapsed row is the only place either state can surface.
     fn workspace_activity(&self, ws: &WorkspaceKey) -> SessionActivity {
-        let active_id = self.active_session.get(ws).copied();
+        let active_id = self.sessions.active(ws);
         let mut other = SessionActivity::Shell;
         for s in &self.sessions {
             if s.working_directory != *ws {
@@ -2882,7 +2860,7 @@ impl AlacritreeApp {
         listed: &sidebar_nav::ListedRows,
     ) -> Vec<WorkspaceRowData> {
         let Some(entries) = listed.get(ws) else { return Vec::new() };
-        let active = self.active_session.get(ws).copied();
+        let active = self.sessions.active(ws);
         let is_current = self.current_workspace == *ws;
         entries
             .iter()
@@ -3704,6 +3682,9 @@ enum CloseFallback {
 enum CloseReason {
     User,
     SpawnFailed,
+    /// The workspace's directory is being removed, so nothing may respawn
+    /// into it and the view goes home rather than to its main checkout.
+    WorktreeDeleted,
 }
 
 /// The verdict a close acts on.  A failed open stays put whatever the
@@ -3713,7 +3694,7 @@ enum CloseReason {
 /// workspace honestly holds.
 fn close_navigation(reason: CloseReason, verdict: CloseFallback) -> CloseFallback {
     match reason {
-        CloseReason::User => verdict,
+        CloseReason::User | CloseReason::WorktreeDeleted => verdict,
         CloseReason::SpawnFailed => CloseFallback::Stay,
     }
 }
@@ -4441,7 +4422,7 @@ mod tests {
         let asked_from = Some(PathBuf::from("elsewhere"));
         app.current_workspace = asked_from.clone();
         let tab = app.sessions[0].id;
-        app.active_session.insert(None, tab);
+        app.sessions.set_active(None, tab);
         let id = bind_herdr_fixture(&mut app, side, "term-held");
         let (reply_tx, reply_rx) = mpsc::channel();
 
@@ -4454,7 +4435,7 @@ mod tests {
 
         assert_eq!(reply_rx.try_recv().unwrap(), Ok(json!({ "session_id": id })));
         assert_eq!(app.current_workspace, asked_from);
-        assert_eq!(app.active_session.get(&None).copied(), Some(tab));
+        assert_eq!(app.sessions.active(&None), Some(tab));
     }
 
     /// A background attach that has to wait on herdr leaves the workspace on
@@ -4936,7 +4917,7 @@ mod tests {
         let mut app = test_app();
         app.config.ui.async_session_spawn = true;
         let tab = app.sessions[0].id;
-        app.active_session.insert(None, tab);
+        app.sessions.set_active(None, tab);
         let asked_from = Some(PathBuf::from("elsewhere"));
         app.current_workspace = asked_from.clone();
         let mut created = created_pane_fixture(None, None);
@@ -4960,7 +4941,7 @@ mod tests {
         let key = herdr_pane_key(Side::Wsl("distro".into()), "term-new");
         let id = app.pane_session(&key).expect("the gesture opened a session");
         assert_ne!(id, tab);
-        assert_eq!(app.active_session.get(&None).copied(), Some(tab));
+        assert_eq!(app.sessions.active(&None), Some(tab));
         assert_eq!(app.current_workspace, asked_from);
         assert_eq!(app.multiplexers.herdr_mut_for_test().view_mut_for_test().visible, None);
     }
@@ -5291,7 +5272,7 @@ mod tests {
         );
         let shell = bind_herdr_fixture(&mut app, side.clone(), "term-shell");
         let gone = bind_herdr_fixture(&mut app, side.clone(), "term-gone");
-        app.active_session.insert(None, gone);
+        app.sessions.set_active(None, gone);
         adopt_herdr_fixture(
             &mut app,
             side,
@@ -5304,7 +5285,7 @@ mod tests {
         app.reconcile_pane_sessions(&Context::default());
 
         assert_eq!(app.sessions.iter().map(|session| session.id).collect::<Vec<_>>(), [shell]);
-        assert_eq!(app.active_session.get(&None), Some(&shell));
+        assert_eq!(app.sessions.active(&None), Some(shell));
         assert!(
             app.multiplexers.herdr_for_test().caches_for_test()[0]
                 .attachment_pane("term-gone")
@@ -5318,7 +5299,7 @@ mod tests {
         let side = Side::Native;
         let gone = bind_herdr_fixture(&mut app, side.clone(), "term-gone");
         let other = bind_herdr_fixture(&mut app, side.clone(), "term-other");
-        app.active_session.insert(None, gone);
+        app.sessions.set_active(None, gone);
         app.modals.pending_session_close = Some(gone);
         app.multiplexers.herdr_mut_for_test().view_mut_for_test().attached(
             gone,
@@ -5348,7 +5329,7 @@ mod tests {
         app.reconcile_pane_sessions(&Context::default());
 
         assert!(!app.sessions.iter().any(|session| [gone, other].contains(&session.id)));
-        assert!(!app.active_session.contains_key(&None));
+        assert!(!app.sessions.has_active(&None));
         assert!(app.modals.pending_session_close.is_none());
         assert!(app.multiplexers.herdr_mut_for_test().view_focus_mut_for_test().is_none());
         assert!(app.multiplexers.herdr_mut_for_test().view_mut_for_test().visible.is_none());
@@ -5708,6 +5689,120 @@ mod tests {
             Err("the session behind this pane was closed before the attach finished".to_string())
         );
         assert!(app.multiplexers.herdr_for_test().pending_attach_for_test().is_empty());
+    }
+
+    /// Deleting a worktree closes its sessions the way a close does, so an
+    /// attach queued on one of them is answered rather than dropped.
+    #[test]
+    fn deleting_a_worktree_answers_a_queued_attach_for_a_session_in_it() {
+        let mut app = test_app();
+        let worktree = PathBuf::from("doomed-worktree");
+        let side = Side::Native;
+        let id = bind_herdr_fixture(&mut app, side.clone(), "term-doomed");
+        app.sessions.iter_mut().find(|s| s.id == id).unwrap().working_directory =
+            Some(worktree.clone());
+        let key = herdr_pane_key(side, "term-doomed");
+        let (reply_tx, reply_rx) = mpsc::channel();
+        app.multiplexers.herdr_mut_for_test().pending_attach_mut_for_test().push(PendingAttach {
+            job: None,
+            target: PaneTarget::unlisted(&key, "w1:p1"),
+            key,
+            request: AttachRequest {
+                workspace: Some(worktree.clone()),
+                previous: None,
+                waiters: vec![reply_tx],
+                focus: AttachFocus::Take,
+            },
+        });
+
+        app.close_worktree_sessions(&Context::default(), &worktree);
+
+        assert!(app.sessions.iter().all(|s| s.id != id));
+        assert_eq!(
+            reply_rx.try_recv().unwrap(),
+            Err("the session behind this pane was closed before the attach finished".to_string())
+        );
+        assert!(app.multiplexers.herdr_for_test().pending_attach_for_test().is_empty());
+    }
+
+    /// A pending shell in `workspace`, pushed without opening a PTY.
+    fn push_shell(app: &mut AlacritreeApp, workspace: WorkspaceKey) -> SessionId {
+        let (session, _) = Session::pending_shell(
+            Context::default(),
+            &app.config,
+            workspace,
+            TermSize { columns: 80, screen_lines: 24 },
+            (8.0, 16.0),
+            None,
+            None,
+        );
+        let id = session.id;
+        app.sessions.push(session);
+        id
+    }
+
+    /// Under `respawn`, deleting the on-screen worktree still goes home: a
+    /// shell respawned into it would hold the directory being removed.
+    #[test]
+    fn deleting_the_on_screen_worktree_goes_home_without_respawning_into_it() {
+        let mut app = test_app();
+        assert_eq!(app.config.ui.last_session_close, LastSessionClose::Respawn);
+        let home = app.sessions[0].id;
+        app.sessions.set_active(None, home);
+        let worktree = Some(PathBuf::from("doomed-worktree"));
+        let doomed = push_shell(&mut app, worktree.clone());
+        app.sessions.set_active(worktree.clone(), doomed);
+        app.current_workspace = worktree.clone();
+
+        app.close_worktree_sessions(&Context::default(), worktree.as_deref().unwrap());
+
+        assert_eq!(app.current_workspace, None);
+        assert!(app.sessions.iter().all(|s| s.working_directory != worktree));
+        assert!(!app.sessions.has_active(&worktree));
+        assert_eq!(app.sessions.active(&None), Some(home));
+    }
+
+    #[test]
+    fn closing_the_last_session_of_the_on_screen_workspace_navigates_home() {
+        let mut app = test_app();
+        app.config.ui.last_session_close = LastSessionClose::Navigate;
+        let home = app.sessions[0].id;
+        app.sessions.set_active(None, home);
+        let worktree = Some(PathBuf::from("wt"));
+        let last = push_shell(&mut app, worktree.clone());
+        app.sessions.set_active(worktree.clone(), last);
+        app.current_workspace = worktree.clone();
+
+        app.close_session(&Context::default(), last);
+
+        assert_eq!(app.current_workspace, None);
+        assert!(!app.sessions.has_active(&worktree));
+        assert_eq!(app.sessions.active(&None), Some(home));
+    }
+
+    /// A move re-points both workspaces' active entries, so a close right
+    /// after it still leaves each one naming a live session.
+    #[test]
+    fn a_move_then_a_close_leaves_both_workspaces_with_a_live_active_session() {
+        let mut app = test_app();
+        app.config.ui.last_session_close = LastSessionClose::Navigate;
+        let moved = app.sessions[0].id;
+        let stays = push_shell(&mut app, None);
+        app.sessions.set_active(None, moved);
+        app.current_workspace = None;
+        let worktree = Some(PathBuf::from("wt"));
+
+        app.move_session_to_key(moved, worktree.clone()).unwrap();
+
+        assert_eq!(app.current_workspace, worktree, "the view follows a watched session");
+        assert_eq!(app.sessions.active(&worktree), Some(moved));
+        assert_eq!(app.sessions.active(&None), Some(stays));
+
+        app.close_session(&Context::default(), moved);
+
+        assert_eq!(app.current_workspace, None);
+        assert!(!app.sessions.has_active(&worktree));
+        assert_eq!(app.sessions.active(&None), Some(stays));
     }
 
     #[test]

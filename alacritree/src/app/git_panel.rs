@@ -487,7 +487,7 @@ impl AlacritreeApp {
             return;
         };
         if let Some((id, _)) = existing {
-            self.sessions.retain(|s| s.id != id);
+            self.sessions.remove(&[id], self.config.ui.sidebar_focus);
         }
 
         let (program, args) = match wsl::classify(&workspace) {
@@ -515,7 +515,7 @@ impl AlacritreeApp {
         );
         match self.open_session(session, request) {
             Ok(id) => {
-                self.active_session.insert(Some(workspace), id);
+                self.sessions.set_active(Some(workspace), id);
             },
             Err(e) => {
                 self.modals.error_dialog = Some(format!("failed to open diff: {e}"));

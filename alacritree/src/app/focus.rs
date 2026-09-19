@@ -77,7 +77,7 @@ impl AlacritreeApp {
             &self.sidebar_focus_state.written,
             self.sidebar.cursor.as_ref(),
             &self.current_workspace,
-            self.active_session.get(&self.current_workspace).copied(),
+            self.sessions.active(&self.current_workspace),
         ) {
             self.sidebar.anchor = None;
         }
@@ -156,7 +156,7 @@ impl AlacritreeApp {
         self.sidebar_focus_state.written = Some(SidebarFocusWrite {
             cursor: self.sidebar.cursor.clone(),
             workspace: self.current_workspace.clone(),
-            active: self.active_session.get(&self.current_workspace).copied(),
+            active: self.sessions.active(&self.current_workspace),
         });
     }
 
@@ -167,9 +167,8 @@ impl AlacritreeApp {
             sidebar_focus::FollowTarget::Session(id) => self.activate_session_by_id(id),
             sidebar_focus::FollowTarget::Workspace(ws) => {
                 let id = self
-                    .active_session
-                    .get(&ws)
-                    .copied()
+                    .sessions
+                    .active(&ws)
                     .filter(|id| self.sessions.iter().any(|s| s.id == *id))
                     .or_else(|| {
                         self.sessions.iter().find(|s| s.working_directory == ws).map(|s| s.id)
@@ -299,7 +298,7 @@ impl AlacritreeApp {
                     &self.projects,
                     self.current_workspace.as_deref(),
                     &self.listed_workspace_rows(),
-                    self.active_session.get(&self.current_workspace).copied(),
+                    self.sessions.active(&self.current_workspace),
                 );
                 self.finish_project_search_at(Some(seed));
             },

@@ -328,7 +328,7 @@ impl AlacritreeApp {
         let cursor_moved = std::mem::take(&mut self.sidebar.cursor_moved);
 
         let filtering = self.sidebar.filter.is_filtering();
-        let active_now = self.active_session.get(&self.current_workspace).copied();
+        let active_now = self.sessions.active(&self.current_workspace);
         // egui keeps one scroll target per frame and the last writer wins, so the
         // two reasons to scroll are resolved here rather than by paint order.  An
         // explicit cursor move outranks following the terminal.
@@ -572,7 +572,7 @@ impl AlacritreeApp {
             // active_session_index() misses and adopt_active_session picks
             // an existing shell, or the empty-workspace placeholder shows.
             self.current_workspace = ws.clone();
-            self.active_session.insert(ws, id);
+            self.sessions.set_active(ws, id);
             workspace_activated = true;
         }
         if let Some(id) = requests.close_session {
