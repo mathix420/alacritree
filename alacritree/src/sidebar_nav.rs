@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::ReorderScope;
-use crate::herdr::Side;
+use crate::multiplexer::PaneKey;
 use crate::projects::{Project, Worktree};
 use crate::session::SessionId;
 use crate::workspace::WorkspaceKey;
@@ -24,36 +24,32 @@ pub enum SidebarRow {
     /// Session row, keyed by its stable session id.  Only present when its
     /// workspace lists sessions in the sidebar.
     Session(SessionId),
-    /// A herdr-managed agent, keyed by the server it lives on and the
-    /// terminal it runs in.  Both parts are needed: terminal ids are unique
-    /// only within one server.
-    HerdrAgent(Side, String),
+    /// A pane a multiplexer owns and no session holds.
+    Pane(PaneKey),
 }
 
-/// One row listed under a workspace: a session alacritree runs, or a herdr
-/// agent nothing is attached to.  The two are one sequence rather than two
-/// blocks because attaching turns the second into the first, and a pane that
-/// changed how it is drawn has not changed where it belongs.
+/// One row listed under a workspace: a session alacritree runs, or a
+/// multiplexer's pane nothing is attached to.  The two are one sequence
+/// rather than two blocks because attaching turns the second into the first,
+/// and a pane that changed how it is drawn has not changed where it belongs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkspaceEntry {
     Session(SessionId),
-    Agent(Side, String),
+    Pane(PaneKey),
 }
 
 impl WorkspaceEntry {
     pub(crate) fn row(&self) -> SidebarRow {
         match self {
             Self::Session(id) => SidebarRow::Session(*id),
-            Self::Agent(side, terminal_id) => {
-                SidebarRow::HerdrAgent(side.clone(), terminal_id.clone())
-            },
+            Self::Pane(key) => SidebarRow::Pane(key.clone()),
         }
     }
 
     pub(crate) fn session(&self) -> Option<SessionId> {
         match self {
             Self::Session(id) => Some(*id),
-            Self::Agent(..) => None,
+            Self::Pane(_) => None,
         }
     }
 }
@@ -249,7 +245,7 @@ pub(crate) fn left_target(rows: &[SidebarRow], cursor: &SidebarRow) -> Option<Si
         SidebarRow::Worktree(_) => {
             rows[..pos].iter().rev().find(|r| matches!(r, SidebarRow::Project(_))).cloned()
         },
-        SidebarRow::Session(_) | SidebarRow::HerdrAgent(..) => rows[..pos]
+        SidebarRow::Session(_) | SidebarRow::Pane(_) => rows[..pos]
             .iter()
             .rev()
             .find(|r| matches!(r, SidebarRow::Worktree(_) | SidebarRow::Home))
@@ -411,7 +407,9 @@ pub(crate) fn ensure_cursor(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::multiplexer::Side;
     use crate::projects::Worktree;
+    use crate::test_util::herdr_pane_key;
 
     fn no_sessions() -> ListedRows {
         HashMap::new()
@@ -825,25 +823,25 @@ pub(crate) mod tests {
         let projects = vec![project("/p", true, &["/p/wt"])];
         let listed = ListedRows::from([(Some(PathBuf::from("/p/wt")), vec![
             WorkspaceEntry::Session(1),
-            WorkspaceEntry::Agent(Side::Native, "term_a".to_string()),
+            WorkspaceEntry::Pane(herdr_pane_key(Side::Native, "term_a")),
         ])]);
 
         let rows = visible_rows(&projects, &listed);
 
         let wt = rows.iter().position(|r| matches!(r, SidebarRow::Worktree(_))).unwrap();
         assert!(matches!(rows[wt + 1], SidebarRow::Session(_)));
-        assert!(matches!(rows[wt + 2], SidebarRow::HerdrAgent(..)));
+        assert!(matches!(rows[wt + 2], SidebarRow::Pane(_)));
     }
 
     #[test]
     fn unmatched_agents_land_under_home() {
-        let listed = ListedRows::from([(None, vec![WorkspaceEntry::Agent(
+        let listed = ListedRows::from([(None, vec![WorkspaceEntry::Pane(herdr_pane_key(
             Side::Native,
-            "term_a".to_string(),
-        )])]);
+            "term_a",
+        ))])]);
         let rows = visible_rows(&[], &listed);
         assert!(matches!(rows[0], SidebarRow::Home));
-        assert!(matches!(rows[1], SidebarRow::HerdrAgent(..)));
+        assert!(matches!(rows[1], SidebarRow::Pane(_)));
     }
 
     #[test]
@@ -935,7 +933,7 @@ pub(crate) mod tests {
     fn agent_listing() -> ListedRows {
         ListedRows::from([(ws("/a/wt1"), vec![
             WorkspaceEntry::Session(1),
-            WorkspaceEntry::Agent(Side::Native, "term_a".into()),
+            WorkspaceEntry::Pane(herdr_pane_key(Side::Native, "term_a")),
         ])])
     }
 
@@ -950,12 +948,14 @@ pub(crate) mod tests {
             project_self: &|_p| false,
             gate: &|_ws| true,
             name: &mut |_p, _wt| false,
-            child: Some(&mut |e| *e == WorkspaceEntry::Agent(Side::Native, "term_a".into())),
+            child: Some(&mut |e| {
+                *e == WorkspaceEntry::Pane(herdr_pane_key(Side::Native, "term_a"))
+            }),
         };
         assert_eq!(filtered_rows(&projects, &agent_listing(), preds), vec![
             SidebarRow::Project(PathBuf::from("/a")),
             SidebarRow::Worktree(PathBuf::from("/a/wt1")),
-            SidebarRow::HerdrAgent(Side::Native, "term_a".into()),
+            SidebarRow::Pane(herdr_pane_key(Side::Native, "term_a")),
         ]);
     }
 
@@ -977,7 +977,7 @@ pub(crate) mod tests {
             SidebarRow::Project(PathBuf::from("/a")),
             SidebarRow::Worktree(PathBuf::from("/a/wt1")),
             SidebarRow::Session(1),
-            SidebarRow::HerdrAgent(Side::Native, "term_a".into()),
+            SidebarRow::Pane(herdr_pane_key(Side::Native, "term_a")),
         ]);
     }
 
@@ -1003,8 +1003,10 @@ pub(crate) mod tests {
     /// gate.
     #[test]
     fn filtered_rows_does_not_let_a_home_child_match_bypass_the_home_gate() {
-        let listed =
-            ListedRows::from([(None, vec![WorkspaceEntry::Agent(Side::Native, "term_a".into())])]);
+        let listed = ListedRows::from([(None, vec![WorkspaceEntry::Pane(herdr_pane_key(
+            Side::Native,
+            "term_a",
+        ))])]);
         let preds = RowPredicates {
             home_gate: false,
             home_name: false,

@@ -1,9 +1,9 @@
-//! What alacritree means by a herdr agent, and the pure questions it can ask
-//! about one.
+//! What alacritree reads from herdr, and the pure questions it asks about a
+//! pane herdr lists.
 
 use std::path::{Path, PathBuf};
 
-use crate::multiplexer::{PaneTarget, Side};
+use crate::multiplexer::{MultiplexerKind, Pane, PaneKey, Side};
 use crate::wsl;
 
 /// Which of herdr's two indicator sets its config selects.  Rows follow the
@@ -22,82 +22,6 @@ pub enum Indicators {
 pub struct Settings {
     pub detach: Option<String>,
     pub indicators: Indicators,
-}
-
-/// herdr's agent state.  An unrecognised string maps to `Unknown` so a value
-/// herdr adds later renders as a plain row instead of dropping the agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Status {
-    Idle,
-    Working,
-    Blocked,
-    Done,
-    #[default]
-    Unknown,
-}
-
-impl Status {
-    pub(super) fn parse(raw: &str) -> Self {
-        match raw {
-            "idle" => Self::Idle,
-            "working" => Self::Working,
-            "blocked" => Self::Blocked,
-            "done" => Self::Done,
-            _ => Self::Unknown,
-        }
-    }
-
-    /// Word the sidebar paints for this status.
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Idle => "idle",
-            Self::Working => "working",
-            Self::Blocked => "blocked",
-            Self::Done => "done",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-/// One pane as herdr reports it.  `terminal_id` is the identity because
-/// `pane_id` is positional: a pane moved between workspaces gets a new one,
-/// and ids restart at `w1` after `session delete`.
-#[derive(Debug, Clone)]
-pub struct Agent {
-    pub terminal_id: String,
-    pub pane_id: String,
-    /// The tab holding this pane.  `herdr agent focus` resolves its target
-    /// through the agent registry, so a pane with no agent in it is reached
-    /// through its tab instead.
-    pub tab_id: Option<String>,
-    pub kind: Option<String>,
-    /// The pane's title, with the decorative agent prefix already removed by
-    /// herdr.  Two agents of one kind in one checkout are told apart by this
-    /// and nothing else.
-    pub title: Option<String>,
-    /// herdr's word on the agent in this pane, and `None` when herdr found no
-    /// agent in it at all.  `Some(Unknown)` is the other half of that
-    /// distinction: an agent is there and herdr cannot classify it.
-    pub status: Option<Status>,
-    /// The pane herdr's own window is showing.  A shared-view attach borrows
-    /// that window rather than one pane, so this is what such a session has
-    /// on screen.
-    pub focused: bool,
-    pub cwd: Option<String>,
-    pub foreground_cwd: Option<String>,
-}
-
-impl Agent {
-    /// This pane in the terms a multiplexer answers about, which is every
-    /// field of it that decides how the pane is reached rather than drawn.
-    pub fn target(&self, side: &Side) -> PaneTarget {
-        PaneTarget {
-            side: side.clone(),
-            pane_id: self.pane_id.clone(),
-            tab_id: self.tab_id.clone(),
-            has_agent: self.status.is_some(),
-        }
-    }
 }
 
 /// Which herdr listing a poll asks for.  `agent list` answers with the panes
@@ -129,16 +53,30 @@ impl Listing {
 /// The agents on `side` that no live session is attached to.  These are the
 /// ones that get a sidebar row; an attached agent is drawn by its session
 /// row instead, so each agent appears exactly once.
-pub fn unattached<'a>(agents: &'a [Agent], side: &Side, claimed: &[HerdrKey]) -> Vec<&'a Agent> {
+pub(super) fn unattached<'a>(
+    agents: &'a [Pane],
+    side: &Side,
+    claimed: &[PaneKey],
+) -> Vec<&'a Pane> {
     agents
         .iter()
-        .filter(|a| !claimed.iter().any(|k| k.side == *side && k.terminal_id == a.terminal_id))
+        .filter(|a| {
+            !claimed.iter().any(|k| {
+                k.multiplexer == MultiplexerKind::Herdr
+                    && k.side == *side
+                    && k.terminal_id == a.terminal_id
+            })
+        })
         .collect()
 }
 
 /// The sidebar workspace an agent is working in, by longest path prefix.
 /// `None` means it belongs under Home.
-pub fn match_workspace(agent: &Agent, side: &Side, workspaces: &[PathBuf]) -> Option<PathBuf> {
+pub(super) fn match_workspace(
+    agent: &Pane,
+    side: &Side,
+    workspaces: &[PathBuf],
+) -> Option<PathBuf> {
     let reported = agent.foreground_cwd.as_deref().or(agent.cwd.as_deref())?;
     let cwd = match side {
         Side::Native => PathBuf::from(reported),
@@ -175,11 +113,9 @@ fn starts_with(cwd: &Path, workspace: &Path) -> bool {
     }
 }
 
-/// Identifies one herdr agent across polls.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct HerdrKey {
-    pub side: Side,
-    pub terminal_id: String,
+/// The key a herdr pane on `side` is known by.
+pub(crate) fn pane_key(side: Side, terminal_id: String) -> PaneKey {
+    PaneKey { multiplexer: MultiplexerKind::Herdr, side, terminal_id }
 }
 
 /// Why a poll produced no agents.  What separates the two is whether a herdr
@@ -208,18 +144,19 @@ impl PollError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::multiplexer::PaneStatus;
 
     #[test]
     fn status_label_names_each_variant() {
-        assert_eq!(Status::Idle.label(), "idle");
-        assert_eq!(Status::Working.label(), "working");
-        assert_eq!(Status::Blocked.label(), "blocked");
-        assert_eq!(Status::Done.label(), "done");
-        assert_eq!(Status::Unknown.label(), "unknown");
+        assert_eq!(PaneStatus::Idle.label(), "idle");
+        assert_eq!(PaneStatus::Working.label(), "working");
+        assert_eq!(PaneStatus::Blocked.label(), "blocked");
+        assert_eq!(PaneStatus::Done.label(), "done");
+        assert_eq!(PaneStatus::Unknown.label(), "unknown");
     }
 
-    fn agent(id: &str, status: Status) -> Agent {
-        Agent {
+    fn agent(id: &str, status: PaneStatus) -> Pane {
+        Pane {
             terminal_id: id.into(),
             pane_id: "w1:p1".into(),
             tab_id: Some("w1:t1".into()),
@@ -232,14 +169,14 @@ mod tests {
         }
     }
 
-    fn at(cwd: &str, foreground: Option<&str>) -> Agent {
-        Agent {
+    fn at(cwd: &str, foreground: Option<&str>) -> Pane {
+        Pane {
             terminal_id: "t1".into(),
             pane_id: "w1:p1".into(),
             tab_id: Some("w1:t1".into()),
             kind: None,
             title: None,
-            status: Some(Status::Idle),
+            status: Some(PaneStatus::Idle),
             focused: false,
             cwd: Some(cwd.into()),
             foreground_cwd: foreground.map(str::to_string),
@@ -315,8 +252,8 @@ mod tests {
 
     #[test]
     fn an_attached_agent_yields_no_row() {
-        let agents = vec![agent("t1", Status::Idle), agent("t2", Status::Working)];
-        let claimed = [HerdrKey { side: Side::Native, terminal_id: "t1".into() }];
+        let agents = vec![agent("t1", PaneStatus::Idle), agent("t2", PaneStatus::Working)];
+        let claimed = [pane_key(Side::Native, "t1".into())];
         let rows = unattached(&agents, &Side::Native, &claimed);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].terminal_id, "t2");
@@ -324,7 +261,7 @@ mod tests {
 
     #[test]
     fn detaching_brings_the_row_back() {
-        let agents = vec![agent("t1", Status::Idle)];
+        let agents = vec![agent("t1", PaneStatus::Idle)];
         assert_eq!(unattached(&agents, &Side::Native, &[]).len(), 1);
     }
 
@@ -332,8 +269,8 @@ mod tests {
     /// must not hide the same id on another.
     #[test]
     fn a_claim_on_one_side_does_not_hide_the_other_side() {
-        let agents = vec![agent("t1", Status::Idle)];
-        let claimed = [HerdrKey { side: Side::Wsl("d".into()), terminal_id: "t1".into() }];
+        let agents = vec![agent("t1", PaneStatus::Idle)];
+        let claimed = [pane_key(Side::Wsl("d".into()), "t1".into())];
         assert_eq!(unattached(&agents, &Side::Native, &claimed).len(), 1);
     }
 }

@@ -18,9 +18,10 @@ use alacritty_terminal::vte::ansi::{Processor, Rgb, StdSyncHandler};
 
 use crate::clipboard::Target;
 use crate::config::{Config, HoldExitedSessions, Palette};
+use crate::multiplexer::{PaneKey, PaneStatus};
 use crate::repaint::Repaint;
 use crate::wsl_helper::{self, WslProbe};
-use crate::{colors, herdr, scratchpad};
+use crate::{colors, scratchpad};
 
 #[derive(Clone)]
 pub(crate) struct EventProxy<R> {
@@ -159,23 +160,23 @@ pub(crate) enum LiveState {
 }
 
 impl LiveState {
-    /// The live state a herdr status reports.  `None` is herdr declining to
-    /// say rather than a claim that the agent is idle, so a caller that
+    /// The live state a multiplexer's status reports.  `None` is the
+    /// multiplexer declining to say rather than a claim that the agent is idle, so a caller that
     /// already has a reading of its own keeps it.
     ///
     /// `done` collapses to `Idle`: a finished turn is not work in flight.
     /// The word survives in the row's label, which is where the distinction
     /// is worth drawing.
-    pub(crate) fn from_herdr(status: herdr::Status) -> Option<Self> {
+    pub(crate) fn from_pane(status: PaneStatus) -> Option<Self> {
         match status {
-            herdr::Status::Idle | herdr::Status::Done => Some(Self::Idle),
-            herdr::Status::Working => Some(Self::Working),
-            herdr::Status::Blocked => Some(Self::Blocked),
-            herdr::Status::Unknown => None,
+            PaneStatus::Idle | PaneStatus::Done => Some(Self::Idle),
+            PaneStatus::Working => Some(Self::Working),
+            PaneStatus::Blocked => Some(Self::Blocked),
+            PaneStatus::Unknown => None,
         }
     }
 
-    /// Word a row paints for this state, mirroring `herdr::Status::label` so
+    /// Word a row paints for this state, mirroring `PaneStatus::label` so
     /// an agent alacritree reads on its own speaks the same vocabulary herdr
     /// does.
     pub(crate) fn label(self) -> &'static str {
@@ -290,18 +291,18 @@ pub(crate) struct Session<R: Repaint> {
     /// thread posts events through.
     proxy: EventProxy<R>,
     exit_status: Option<ExitStatus>,
-    /// Set when this session is a shell attached to a herdr agent, so the
-    /// sidebar draws one row for that agent rather than two.  Dies with the
+    /// Set when this session is a shell attached to a multiplexer's pane, so
+    /// the sidebar draws one row for that pane rather than two.  Dies with the
     /// session, which is why it lives here and not in a map.
-    pub herdr_key: Option<herdr::HerdrKey>,
+    pub pane_key: Option<PaneKey>,
     /// Inventories started before this binding cannot establish its absence.
-    pub herdr_bound_at: Option<Instant>,
+    pub pane_bound_at: Option<Instant>,
     /// Whether this session shares the multiplexer's whole view rather than
     /// drawing one pane of its own.  Settled when the attach chose its client
     /// and recorded rather than recomputed, because a pane that gains or
     /// loses an agent afterwards does not change what the running client
     /// draws.
-    pub herdr_shared_view: bool,
+    pub shared_view: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1268,19 +1269,21 @@ pub(crate) fn open<R: Repaint>(request: OpenRequest<R>) -> std::io::Result<Attac
 }
 
 impl<R: Repaint> Session<R> {
-    pub(crate) fn bind_herdr(&mut self, key: herdr::HerdrKey, shared_view: bool) {
+    pub(crate) fn bind_pane(&mut self, key: PaneKey, shared_view: bool) {
         let bound_at = Instant::now();
         log::debug!(
-            "herdr binding session={} side={:?} terminal_id={} shared_view={} bound_at={:?}",
+            "pane binding session={} multiplexer={} side={:?} terminal_id={} shared_view={} \
+             bound_at={:?}",
             self.id,
+            key.multiplexer,
             key.side,
             key.terminal_id,
             shared_view,
             bound_at
         );
-        self.herdr_bound_at = Some(bound_at);
-        self.herdr_shared_view = shared_view;
-        self.herdr_key = Some(key);
+        self.pane_bound_at = Some(bound_at);
+        self.shared_view = shared_view;
+        self.pane_key = Some(key);
     }
 
     pub(crate) fn spawn_scratchpad(
@@ -1317,9 +1320,9 @@ impl<R: Repaint> Session<R> {
             pending_writes: None,
             proxy,
             exit_status: None,
-            herdr_key: None,
-            herdr_bound_at: None,
-            herdr_shared_view: false,
+            pane_key: None,
+            pane_bound_at: None,
+            shared_view: false,
         })
     }
 
@@ -1492,9 +1495,9 @@ impl<R: Repaint> Session<R> {
             pending_writes: Some(Vec::new()),
             proxy: proxy.clone(),
             exit_status: None,
-            herdr_key: None,
-            herdr_bound_at: None,
-            herdr_shared_view: false,
+            pane_key: None,
+            pane_bound_at: None,
+            shared_view: false,
         };
 
         let request = OpenRequest {
@@ -1658,7 +1661,7 @@ impl<R: Repaint> Session<R> {
             return false;
         }
         let clean = self.exit_was_clean();
-        if self.herdr_key.is_some() && !clean {
+        if self.pane_key.is_some() && !clean {
             return false;
         }
         !hold.holds(clean)
@@ -1715,7 +1718,7 @@ impl<R: Repaint> Session<R> {
     /// own title until vim re-emits it.  A direct herdr attach is excluded:
     /// it runs as `herdr` but draws one agent with no splits to hand back.
     pub(crate) fn nav_tui_running(&self) -> bool {
-        if self.scratchpad.is_some() || (self.herdr_key.is_some() && !self.herdr_shared_view) {
+        if self.scratchpad.is_some() || (self.pane_key.is_some() && !self.shared_view) {
             return false;
         }
         self.process_probe().2
@@ -1925,6 +1928,7 @@ mod tests {
     use alacritty_terminal::Term;
 
     use super::*;
+    use crate::multiplexer::Side;
     use crate::repaint::Recorder;
 
     /// A repainted frame costs a full grid paint of whatever session is on
@@ -2319,9 +2323,9 @@ mod tests {
             pending_writes: None,
             proxy,
             exit_status: None,
-            herdr_key: None,
-            herdr_bound_at: None,
-            herdr_shared_view: false,
+            pane_key: None,
+            pane_bound_at: None,
+            shared_view: false,
         }
     }
 
@@ -2438,8 +2442,7 @@ mod tests {
         let mut session = pty_less_probe(SessionKind::Shell, "shell");
         session.exit_status = Some(status);
         if herdr_keyed {
-            session.herdr_key =
-                Some(herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() });
+            session.pane_key = Some(crate::herdr::pane_key(Side::Native, "t1".into()));
         }
         session
     }
@@ -2989,14 +2992,14 @@ mod tests {
 
     #[test]
     fn a_herdr_status_maps_onto_the_live_axis() {
-        assert_eq!(LiveState::from_herdr(herdr::Status::Idle), Some(LiveState::Idle));
-        assert_eq!(LiveState::from_herdr(herdr::Status::Working), Some(LiveState::Working));
-        assert_eq!(LiveState::from_herdr(herdr::Status::Blocked), Some(LiveState::Blocked));
+        assert_eq!(LiveState::from_pane(PaneStatus::Idle), Some(LiveState::Idle));
+        assert_eq!(LiveState::from_pane(PaneStatus::Working), Some(LiveState::Working));
+        assert_eq!(LiveState::from_pane(PaneStatus::Blocked), Some(LiveState::Blocked));
         // A finished turn is not work in flight.  The word itself survives in
         // the row's label, which is where `done` is worth distinguishing.
-        assert_eq!(LiveState::from_herdr(herdr::Status::Done), Some(LiveState::Idle));
+        assert_eq!(LiveState::from_pane(PaneStatus::Done), Some(LiveState::Idle));
         // herdr declining to say is not a claim that the agent is idle.
-        assert_eq!(LiveState::from_herdr(herdr::Status::Unknown), None);
+        assert_eq!(LiveState::from_pane(PaneStatus::Unknown), None);
     }
 
     #[test]
@@ -3153,12 +3156,12 @@ mod tests {
             nav_tui: true,
             ..AgentCache::default()
         });
-        let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
+        let key = crate::herdr::pane_key(Side::Native, "t1".into());
 
-        session.bind_herdr(key.clone(), false);
+        session.bind_pane(key.clone(), false);
         assert!(!session.nav_tui_running());
 
-        session.bind_herdr(key, true);
+        session.bind_pane(key, true);
         assert!(session.nav_tui_running(), "a shared view shows herdr's own splits");
     }
 
@@ -3172,8 +3175,8 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
 
-        let wsl = herdr::Side::Wsl("kali-linux".to_string());
-        let (wrapped, probe) = crate::app::herdr_attach_probe(&wsl, "wsl.exe", &argv)
+        let wsl = Side::Wsl("kali-linux".to_string());
+        let (wrapped, probe) = crate::app::multiplexer_attach_probe(&wsl, "wsl.exe", &argv)
             .expect("a wsl attach takes the shim");
         assert_eq!(probe.distro, "kali-linux");
         assert!(
@@ -3183,7 +3186,7 @@ mod tests {
 
         let native = ["session", "attach"].iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert!(
-            crate::app::herdr_attach_probe(&herdr::Side::Native, "herdr.exe", &native).is_none()
+            crate::app::multiplexer_attach_probe(&Side::Native, "herdr.exe", &native).is_none()
         );
     }
 

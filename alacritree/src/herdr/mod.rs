@@ -1,4 +1,4 @@
-//! Surface agents running under a herdr server in the sidebar.
+//! herdr as a multiplexer alacritree hosts panes from.
 //!
 //! herdr owns its own PTYs and detects the agent in each pane; alacritree
 //! only asks what it has and can hand one to a shell.  Everything here goes
@@ -8,25 +8,23 @@
 //! capture both.
 
 mod cli;
+mod host;
 mod model;
 mod poll;
 mod settings;
 mod view;
 mod wire;
 
+pub(crate) use host::Herdr;
+#[cfg(test)]
+pub(crate) use host::{PendingAttach, PendingCreate};
 pub(in crate::herdr) use poll::ListingReply;
 
-/// A side belongs to the multiplexer module, which every multiplexer's server
-/// runs under; herdr names it here for the convenience of its own callers.
-pub use crate::multiplexer::Side;
-pub use cli::{
-    attach_args, attaches_directly, create_pane, focus_args, focus_pane, herdr_attach_gesture,
-    program, running_session_name,
-};
-pub use model::{
-    Agent, HerdrKey, Indicators, Listing, PollError, Settings, Status, match_workspace, unattached,
-};
+use cli::{attaches_directly, focus_args, focus_pane, program, running_session_name};
+pub(crate) use model::pane_key;
+pub use model::{Indicators, Listing, PollError, Settings};
+use model::{match_workspace, unattached};
 pub use poll::{EndpointCache, Endpoints};
-pub use settings::settings;
+use settings::settings;
 pub use view::{HerdrViewAction, HerdrViewFocus, HerdrViewSync, ViewInputs};
 pub use wire::error_code;

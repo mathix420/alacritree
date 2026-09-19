@@ -18,18 +18,18 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 use strum::IntoEnumIterator;
 
 use crate::bindings::{BindingAction, NamedAction, action};
-use crate::herdr::HerdrKey;
+use crate::multiplexer::{MultiplexerKind, PaneKey};
 use crate::session::SessionId;
 use crate::shortcut::Shortcuts;
 use crate::workspace::WorkspaceKey;
 
-/// A herdr agent no session holds, and where attaching to it lands.  The
-/// workspace rides along because the listing already resolved it: looking it
-/// up again would go through `herdr_row_workspace`, whose outer `None` means
+/// A multiplexer's pane no session holds, and where attaching to it lands.
+/// The workspace rides along because the listing already resolved it: looking
+/// it up again would go through `pane_row_workspace`, whose outer `None` means
 /// "listed nowhere" — a state the palette can reach and the sidebar cannot.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct HerdrAttach {
-    pub key: HerdrKey,
+pub(crate) struct PaneAttach {
+    pub key: PaneKey,
     pub pane_id: String,
     pub workspace: WorkspaceKey,
 }
@@ -48,9 +48,9 @@ pub(crate) enum PaletteAction {
     CreateWorktree(PathBuf),
     /// Spawn a `[[ui.profiles]]` entry by name into the current workspace.
     SpawnProfile(String),
-    /// Attach to a herdr agent no session holds, in the workspace its working
-    /// directory matched.
-    AttachHerdrAgent(HerdrAttach),
+    /// Attach to a multiplexer's pane no session holds, in the workspace its
+    /// working directory matched.
+    AttachPane(PaneAttach),
 }
 
 /// The heading a row files under. Grouping keeps the list readable now that a
@@ -66,7 +66,7 @@ pub(crate) enum PaletteSection {
     Window,
     Profiles,
     OpenSessions,
-    HerdrSessions,
+    MultiplexerPanes,
     SwitchWorkspace,
     NewWorktree,
 }
@@ -83,7 +83,7 @@ impl PaletteSection {
             Self::Window => "Window & application",
             Self::Profiles => "Shell profiles",
             Self::OpenSessions => "Open sessions",
-            Self::HerdrSessions => "Herdr sessions",
+            Self::MultiplexerPanes => "Herdr sessions",
             Self::SwitchWorkspace => "Switch workspace",
             Self::NewWorktree => "New worktree",
         }
@@ -177,9 +177,10 @@ impl PaletteItem {
         hover: String,
         agent_kind: Option<&str>,
         pane_id: Option<&str>,
-        is_herdr: bool,
+        multiplexer: Option<MultiplexerKind>,
     ) -> Self {
-        let search = session_search(&primary, &subtitle, &secondary, agent_kind, pane_id, is_herdr);
+        let search =
+            session_search(&primary, &subtitle, &secondary, agent_kind, pane_id, multiplexer);
         Self {
             action: PaletteAction::ActivateSession(id),
             section: PaletteSection::OpenSessions,
@@ -231,9 +232,10 @@ impl PaletteItem {
         item
     }
 
-    /// A herdr pane available to attach to, filed apart from open sessions.
-    pub(crate) fn herdr_agent(
-        attach: HerdrAttach,
+    /// A multiplexer's pane available to attach to, filed apart from open
+    /// sessions.
+    pub(crate) fn pane(
+        attach: PaneAttach,
         primary: String,
         subtitle: String,
         secondary: String,
@@ -246,11 +248,11 @@ impl PaletteItem {
             &secondary,
             agent_kind,
             Some(&attach.pane_id),
-            true,
+            Some(attach.key.multiplexer),
         );
         Self {
-            action: PaletteAction::AttachHerdrAgent(attach),
-            section: PaletteSection::HerdrSessions,
+            action: PaletteAction::AttachPane(attach),
+            section: PaletteSection::MultiplexerPanes,
             keys: String::new(),
             primary,
             subtitle: Some(subtitle),
@@ -261,7 +263,7 @@ impl PaletteItem {
     }
 }
 
-/// `pane_id` is folded in unpainted: a generic herdr row's second line is
+/// `pane_id` is folded in unpainted: a generic pane row's second line is
 /// just the glyph, so duplicate rows with the same title, cwd and status
 /// would otherwise be findable by neither sight nor search.
 fn session_search(
@@ -270,7 +272,7 @@ fn session_search(
     secondary: &str,
     agent_kind: Option<&str>,
     pane_id: Option<&str>,
-    is_herdr: bool,
+    multiplexer: Option<MultiplexerKind>,
 ) -> String {
     let mut search = format!("{primary} {subtitle} {secondary}");
     if let Some(agent_kind) = agent_kind {
@@ -281,8 +283,9 @@ fn session_search(
         search.push(' ');
         search.push_str(pane_id);
     }
-    if is_herdr {
-        search.push_str(" herdr");
+    if let Some(multiplexer) = multiplexer {
+        search.push(' ');
+        search.push_str(&multiplexer.to_string());
     }
     search
 }
@@ -754,12 +757,9 @@ mod tests {
         assert_eq!(palette.rank(&items), vec![0]);
     }
 
-    fn attach(id: &str) -> HerdrAttach {
-        HerdrAttach {
-            key: crate::herdr::HerdrKey {
-                side: crate::herdr::Side::Native,
-                terminal_id: id.into(),
-            },
+    fn attach(id: &str) -> PaneAttach {
+        PaneAttach {
+            key: crate::test_util::herdr_pane_key(crate::multiplexer::Side::Native, id),
             pane_id: "w5:p1".into(),
             workspace: None,
         }
@@ -776,9 +776,9 @@ mod tests {
                 "hover".into(),
                 Some("claude"),
                 None,
-                true,
+                Some(MultiplexerKind::Herdr),
             ),
-            PaletteItem::herdr_agent(
+            PaletteItem::pane(
                 attach("t1"),
                 "review the schema".into(),
                 "w1:p1".into(),
@@ -794,7 +794,7 @@ mod tests {
                 "hover".into(),
                 None,
                 None,
-                false,
+                None,
             ),
         ];
         let mut palette = CommandPalette::new();
@@ -816,9 +816,9 @@ mod tests {
                 "hover".into(),
                 None,
                 None,
-                false,
+                None,
             ),
-            PaletteItem::herdr_agent(
+            PaletteItem::pane(
                 attach("t1"),
                 "review".into(),
                 "w1:p1".into(),
@@ -831,7 +831,7 @@ mod tests {
         let ranked = palette.rank(&items);
         let sections: Vec<PaletteSection> =
             group(&items, &ranked).into_iter().map(|(s, _)| s).collect();
-        assert_eq!(sections, vec![PaletteSection::OpenSessions, PaletteSection::HerdrSessions]);
+        assert_eq!(sections, vec![PaletteSection::OpenSessions, PaletteSection::MultiplexerPanes]);
         assert_eq!(items[1].section.title(), "Herdr sessions");
     }
 
@@ -845,7 +845,7 @@ mod tests {
             "Terminal: term_123\nWorkspace: C:\\full\\private".into(),
             Some("claude"),
             None,
-            false,
+            None,
         )];
         let mut palette = CommandPalette::new();
         palette.query_mut().push_str("private");

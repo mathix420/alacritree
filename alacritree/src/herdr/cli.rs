@@ -9,16 +9,16 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use crate::config::AttachMode;
-use crate::multiplexer::{CreatedPane, PaneTarget};
+use crate::multiplexer::{CreatedPane, PaneTarget, Side};
 use crate::tools::{self, Tool};
 use crate::{command_ext, jobs};
 
 use super::wire::{CreatedTab, SessionList};
-use super::{Listing, ListingReply, PollError, Side, error_code};
+use super::{Listing, ListingReply, PollError, error_code};
 
 /// The herdr binary every call on `side` runs. Each side resolves its own
 /// configured path and WSL uses a login shell for bare names.
-pub fn program(side: &Side) -> String {
+pub(super) fn program(side: &Side) -> String {
     match side {
         Side::Native => tools::program(Tool::Herdr),
         Side::Wsl(_) => tools::wsl_program(Tool::Herdr),
@@ -27,7 +27,7 @@ pub fn program(side: &Side) -> String {
 
 /// Direct attach to one agent.  Unsupported on native Windows, where
 /// `run_terminal_attach` is a `#[cfg(windows)]` refusal.
-pub fn attach_args(pane_id: &str) -> Vec<String> {
+pub(super) fn attach_args(pane_id: &str) -> Vec<String> {
     vec!["agent".into(), "attach".into(), pane_id.into()]
 }
 
@@ -50,7 +50,7 @@ pub(super) fn can_attach(side: &Side) -> bool {
 /// agent` subcommand resolves its target through the agent registry, which
 /// holds nothing for such a pane, so it is only ever reachable through the
 /// session.
-pub fn attaches_directly(side: &Side, mode: AttachMode, has_agent: bool) -> bool {
+pub(super) fn attaches_directly(side: &Side, mode: AttachMode, has_agent: bool) -> bool {
     has_agent && mode == AttachMode::Agent && can_attach(side)
 }
 
@@ -81,7 +81,7 @@ pub(super) fn bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static)
 /// user's own herdr window.  `agent focus` resolves its target through the
 /// agent registry and answers `agent_not_found` for a pane with no agent in
 /// it, so such a pane is reached by focusing the tab that holds it.
-pub fn focus_args(target: &PaneTarget) -> Vec<String> {
+pub(super) fn focus_args(target: &PaneTarget) -> Vec<String> {
     match (target.has_agent, &target.tab_id) {
         (false, Some(tab_id)) => vec!["tab".into(), "focus".into(), tab_id.clone()],
         _ => focus_pane_args(&target.pane_id),
@@ -99,7 +99,7 @@ pub(super) fn focus_pane_args(pane_id: &str) -> Vec<String> {
 /// message wants herdr's human-readable text, not its machine code, and a
 /// server that does not answer inside [`GESTURE_TIMEOUT`] refuses the same
 /// way.
-pub fn focus_pane(side: &Side, focus: &[String]) -> Result<(), String> {
+pub(super) fn focus_pane(side: &Side, focus: &[String]) -> Result<(), String> {
     let borrowed: Vec<&str> = focus.iter().map(String::as_str).collect();
     let (program, args) = side.command(&program(side), &borrowed);
     #[allow(clippy::disallowed_methods)] // Running herdr is this function's job.
@@ -128,7 +128,7 @@ pub fn focus_pane(side: &Side, focus: &[String]) -> Result<(), String> {
 /// the name herdr gives an unnamed session; a server that does not answer
 /// inside [`GESTURE_TIMEOUT`] is an `Err`, because attaching to a guessed
 /// name would only park the wedged wait inside the new session.
-pub fn running_session_name(side: &Side) -> Result<String, String> {
+pub(super) fn running_session_name(side: &Side) -> Result<String, String> {
     let (program, args) = side.command(&program(side), &["session", "list", "--json"]);
     #[allow(clippy::disallowed_methods)] // Running herdr is this function's job.
     let run = move || {
@@ -177,7 +177,11 @@ fn create_args(cwd: Option<&str>, focus: bool) -> Vec<String> {
 /// `cwd` is spelled in the side's own terms: a Windows path on the native
 /// side, and a path inside the distro on a WSL one, since herdr resolves it
 /// where it runs.
-pub fn create_pane(side: &Side, cwd: Option<String>, focus: bool) -> Result<CreatedPane, String> {
+pub(super) fn create_pane(
+    side: &Side,
+    cwd: Option<String>,
+    focus: bool,
+) -> Result<CreatedPane, String> {
     let create = create_args(cwd.as_deref(), focus);
     let borrowed: Vec<&str> = create.iter().map(String::as_str).collect();
     let (program, args) = side.command(&program(side), &borrowed);
@@ -251,7 +255,7 @@ pub(super) type HerdrAttachResult = Result<(String, Vec<String>), String>;
 /// `cached_name` is what the endpoint learned in the background.  A gesture
 /// that beats the first read asks herdr itself: a wait is better than a
 /// refusal.
-pub fn herdr_attach_gesture(
+pub(super) fn herdr_attach_gesture(
     side: &Side,
     focus: Option<&[String]>,
     cached_name: Option<String>,

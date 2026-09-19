@@ -489,7 +489,7 @@ pub(super) fn session_status_mark(status: &RowStatus<'_>) -> Option<(SessionMark
     {
         return Some((
             SessionMark::Harness(mark),
-            format!("{} says {}", managed.harness, mark.label),
+            format!("{} says {}", managed.multiplexer, mark.label),
         ));
     }
     match status.activity {
@@ -504,7 +504,8 @@ pub(super) fn session_status_mark(status: &RowStatus<'_>) -> Option<(SessionMark
 mod tests {
     use super::*;
     use crate::config::AttachMode;
-    use crate::test_util::herdr_agent;
+    use crate::multiplexer::{Pane, PaneStatus, Side};
+    use crate::test_util::{herdr_agent, herdr_managed};
 
     /// A native agent's mark is coloured by the state it reports, the same
     /// way a harness-backed row's mark is, so two rows in one state never
@@ -528,12 +529,7 @@ mod tests {
     #[test]
     fn session_status_mark_puts_attention_first() {
         let agent = herdr_agent(Some("claude"));
-        let managed = Managed::herdr(
-            &herdr::Side::Native,
-            &herdr::Settings::default(),
-            AttachMode::Agent,
-            Some(&agent),
-        );
+        let managed = herdr_managed(&agent, &Side::Native, AttachMode::Agent);
         let status = RowStatus {
             attention: true,
             activity: SessionActivity::Shell,
@@ -544,26 +540,20 @@ mod tests {
         assert_eq!(hint, ATTENTION_HINT);
     }
 
-    /// A herdr-backed session's mark and hover come from the same call the
+    /// A pane-backed session's mark and hover come from the same call the
     /// sidebar makes for the identical `Managed`, so the two can never
     /// disagree about what a pane is doing.
     #[test]
-    fn session_status_mark_matches_the_sidebar_for_a_herdr_backed_session() {
-        let agent =
-            herdr::Agent { status: Some(herdr::Status::Working), ..herdr_agent(Some("claude")) };
-        let managed = Managed::herdr(
-            &herdr::Side::Native,
-            &herdr::Settings::default(),
-            AttachMode::Agent,
-            Some(&agent),
-        );
+    fn session_status_mark_matches_the_sidebar_for_a_pane_backed_session() {
+        let agent = Pane { status: Some(PaneStatus::Working), ..herdr_agent(Some("claude")) };
+        let managed = herdr_managed(&agent, &Side::Native, AttachMode::Agent);
         let activity = SessionActivity::agent(Some("claude"), LiveState::Idle);
         let status = RowStatus { attention: false, activity, managed: Some(&managed) };
         let (mark, hint) =
-            session_status_mark(&status).expect("a listed herdr agent always has a mark");
+            session_status_mark(&status).expect("a listed pane with an agent has a mark");
         let harness_mark = managed.mark.expect("a listed agent always has one");
         assert_eq!(mark, SessionMark::Harness(harness_mark));
-        assert_eq!(hint, format!("{} says {}", managed.harness, harness_mark.label));
+        assert_eq!(hint, format!("{} says {}", managed.multiplexer, harness_mark.label));
     }
 
     #[test]

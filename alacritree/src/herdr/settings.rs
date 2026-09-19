@@ -8,7 +8,8 @@ use crate::{command_ext, jobs, wsl};
 use serde::Deserialize;
 
 use super::cli::bounded;
-use super::{Indicators, Settings, Side};
+use super::{Indicators, Settings};
+use crate::multiplexer::Side;
 
 const DEFAULT_PREFIX: &str = "ctrl+b";
 const DEFAULT_DETACH: &str = "prefix+q";
@@ -171,7 +172,7 @@ fn read_config(side: &Side, _blocking: &jobs::Blocking) -> Option<String> {
 /// What herdr's own config on this side says about leaving a pane and drawing
 /// its state.  Every part is user-settable, so a row spelling out a chord the
 /// user has rebound would be worse than a row that stays quiet.
-pub fn settings(side: &Side, blocking: &jobs::Blocking) -> Option<Settings> {
+pub(super) fn settings(side: &Side, blocking: &jobs::Blocking) -> Option<Settings> {
     Some(settings_from(&read_config(side, blocking)?))
 }
 

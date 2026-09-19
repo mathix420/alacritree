@@ -167,7 +167,7 @@ fn climb(from_tree: &TreeSnapshot, next: &TreeSnapshot, from: NodeId) -> Option<
 fn follow_target(next: &TreeSnapshot, landing: &SidebarRow) -> Option<FollowTarget> {
     match landing {
         SidebarRow::Session(id) => Some(FollowTarget::Session(*id)),
-        SidebarRow::Project(_) | SidebarRow::HerdrAgent(..) => None,
+        SidebarRow::Project(_) | SidebarRow::Pane(_) => None,
         SidebarRow::Home | SidebarRow::Worktree(_) => {
             let id = next.find(landing)?;
             let has_session = next.nodes.iter().any(|node| {
@@ -302,7 +302,7 @@ pub struct SessionInput<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct UiInputs<'a> {
     pub session_rows_always: bool,
-    /// Whether a listed herdr pane counts as occupancy for the sessions
+    /// Whether a listed multiplexer pane counts as occupancy for the sessions
     /// toggle.  Flipping it moves the row set while the toggle bits hold
     /// still, so the projection has to rebuild when it does.
     pub sessions_filter_counts_detached: bool,
@@ -320,10 +320,10 @@ pub struct UiInputs<'a> {
     /// moves every PR lookup key while nothing observed changes.
     pub active_workspace: Option<&'a Path>,
     pub active_branch: Option<&'a str>,
-    /// Advances when a herdr poll changes something a row draws.  Agent churn
+    /// Advances when a multiplexer poll changes something a row draws.  Churn
     /// no row shows deliberately does not move it, so an idle agent repainting
     /// does not rebuild the tree.
-    pub herdr_generation: u64,
+    pub panes_generation: u64,
 }
 
 #[cfg(test)]
@@ -410,7 +410,7 @@ pub struct ObservedInputs {
     pr_generation: u64,
     active_workspace: Option<PathBuf>,
     active_branch: Option<String>,
-    herdr_generation: u64,
+    panes_generation: u64,
 }
 
 impl ObservedInputs {
@@ -449,7 +449,7 @@ impl ObservedInputs {
             pr_generation: ui.pr_generation,
             active_workspace: ui.active_workspace.map(Path::to_path_buf),
             active_branch: ui.active_branch.map(str::to_string),
-            herdr_generation: ui.herdr_generation,
+            panes_generation: ui.panes_generation,
         }
     }
 
@@ -475,7 +475,7 @@ impl ObservedInputs {
             || self.pr_generation != ui.pr_generation
             || self.active_workspace.as_deref() != ui.active_workspace
             || self.active_branch.as_deref() != ui.active_branch
-            || self.herdr_generation != ui.herdr_generation
+            || self.panes_generation != ui.panes_generation
         {
             return false;
         }
@@ -539,7 +539,7 @@ mod tests {
             pr_generation: 0,
             active_workspace: None,
             active_branch: None,
-            herdr_generation: 0,
+            panes_generation: 0,
         }
     }
 
@@ -560,7 +560,7 @@ mod tests {
             pr_generation,
             active_workspace,
             active_branch,
-            herdr_generation: 0,
+            panes_generation: 0,
         }
     }
 
@@ -594,7 +594,7 @@ mod tests {
     fn a_herdr_generation_bump_invalidates_the_snapshot() {
         let inputs = ObservedInputs::capture(&[], std::iter::empty(), ui("", 0));
         let mut moved = ui("", 0);
-        moved.herdr_generation = 1;
+        moved.panes_generation = 1;
         assert!(inputs.matches(&[], std::iter::empty(), ui("", 0)));
         assert!(!inputs.matches(&[], std::iter::empty(), moved));
     }
@@ -1219,7 +1219,7 @@ mod tests {
             pr_generation: 0,
             active_workspace: None,
             active_branch: None,
-            herdr_generation: 0,
+            panes_generation: 0,
         };
 
         let base_small = ObservedInputs::capture(&small, std::iter::empty(), ui);

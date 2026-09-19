@@ -1292,7 +1292,7 @@ pub struct UiTheme {
     /// Whether the sidebar's sessions toggle also counts a listed but
     /// unattached herdr row as occupying a workspace — an agent nothing is
     /// attached to, and, once `show_panes` is on, an agentless pane.  Off by
-    /// default: such a row is a `WorkspaceEntry::Agent`, not a
+    /// default: such a row is a `WorkspaceEntry::Pane`, not a
     /// [`crate::session::Session`], so `false` reproduces the toggle's
     /// original session-only behavior.
     pub sessions_filter_counts_detached: bool,

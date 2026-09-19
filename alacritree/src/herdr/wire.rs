@@ -1,4 +1,4 @@
-//! What herdr's CLI prints, and how it becomes an [`Agent`].
+//! What herdr's CLI prints, and how it becomes a [`Pane`].
 //!
 //! herdr prints success on stdout and errors on stderr, and its field set
 //! grows between releases, so every type here tolerates unknown fields and a
@@ -6,13 +6,14 @@
 
 use serde::Deserialize;
 
-use super::{Agent, Listing, Status};
+use super::Listing;
+use crate::multiplexer::{Pane, PaneStatus};
 
 impl Listing {
     /// Panes from one reply.  An entry missing an identity — or, where the
     /// entry is an agent, a status — is dropped on its own; its siblings
     /// still parse.
-    pub fn parse(self, stdout: &str) -> Vec<Agent> {
+    pub fn parse(self, stdout: &str) -> Vec<Pane> {
         let Ok(envelope) = serde_json::from_str::<Envelope>(stdout) else {
             return Vec::new();
         };
@@ -24,6 +25,19 @@ impl Listing {
             Self::Panes => listed.panes,
         };
         raw.into_iter().filter_map(|raw| raw.into_agent(self)).collect()
+    }
+}
+
+/// herdr's word for an agent's state.  An unrecognised string is `Unknown`, so
+/// a value herdr adds later renders as a plain row instead of dropping the
+/// agent.
+fn parse_status(raw: &str) -> PaneStatus {
+    match raw {
+        "idle" => PaneStatus::Idle,
+        "working" => PaneStatus::Working,
+        "blocked" => PaneStatus::Blocked,
+        "done" => PaneStatus::Done,
+        _ => PaneStatus::Unknown,
     }
 }
 
@@ -74,12 +88,12 @@ struct RawPane {
 }
 
 impl RawPane {
-    fn into_agent(self, listing: Listing) -> Option<Agent> {
+    fn into_agent(self, listing: Listing) -> Option<Pane> {
         // Everything `agent list` returns is an agent, whatever it says about
         // the agent's kind; in a pane listing the `agent` key is what says so.
         let has_agent = listing == Listing::Agents || self.agent.is_some();
-        let status = if has_agent { Some(Status::parse(&self.agent_status?)) } else { None };
-        Some(Agent {
+        let status = if has_agent { Some(parse_status(&self.agent_status?)) } else { None };
+        Some(Pane {
             terminal_id: self.terminal_id?,
             pane_id: self.pane_id?,
             tab_id: self.tab_id,
@@ -218,7 +232,7 @@ mod tests {
         assert_eq!(agents[0].terminal_id, "term_65abfc8e300361");
         assert_eq!(agents[0].pane_id, "w5:p1");
         assert_eq!(agents[0].kind.as_deref(), Some("claude"));
-        assert_eq!(agents[0].status, Some(Status::Idle));
+        assert_eq!(agents[0].status, Some(PaneStatus::Idle));
         assert_eq!(agents[0].foreground_cwd, None);
     }
 
@@ -249,7 +263,7 @@ mod tests {
              "future_field":true}],"type":"agent_list"}}"#;
         let agents = Listing::Agents.parse(reply);
         assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].status, Some(Status::Unknown));
+        assert_eq!(agents[0].status, Some(PaneStatus::Unknown));
     }
 
     #[test]
@@ -274,7 +288,7 @@ mod tests {
     fn a_pane_listing_keeps_the_shell_beside_the_agent() {
         let panes = Listing::Panes.parse(PANES);
         assert_eq!(panes.len(), 2);
-        assert_eq!(panes[0].status, Some(Status::Idle));
+        assert_eq!(panes[0].status, Some(PaneStatus::Idle));
         assert_eq!(panes[0].kind.as_deref(), Some("claude"));
         assert_eq!(panes[1].status, None);
         assert_eq!(panes[1].kind, None);

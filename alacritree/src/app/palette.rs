@@ -3,6 +3,7 @@
 //! The item model and ranking live in the crate-level `command_palette`.
 
 use super::*;
+use crate::multiplexer::{ListedPane, Multiplexer, MultiplexerKind, Pane};
 
 impl AlacritreeApp {
     /// The Ctrl+K command palette: one fuzzy-searchable, executable list of
@@ -152,7 +153,6 @@ impl AlacritreeApp {
     /// ranking, and always current as sessions and worktrees come and go.
     pub(super) fn palette_items(&self) -> Vec<PaletteItem> {
         let mut items = command_palette::action_items(&self.shortcuts);
-        let herdr_glyph = self.config.integrations.herdr.icon.or_glyph(DEFAULT_HERDR_ICON.as_str());
         for (i, profile) in self.config.profiles.iter().enumerate() {
             let index = i + 1;
             // SpawnProfile only binds indices 1..=9; past that there is no
@@ -164,30 +164,27 @@ impl AlacritreeApp {
             items.push(PaletteItem::profile(profile.name.clone(), command, keys, &config_name));
         }
         for session in &self.sessions {
-            let agent = self.session_herdr_agent(session);
+            let agent = self.session_pane(session);
             let activity =
-                herdr_backed_activity(session.activity(), self.session_herdr_status(session));
+                pane_backed_activity(session.activity(), self.session_pane_status(session));
             let name = session_row_name(&session.title, activity, agent);
-            if let Some(key) = session.herdr_key.as_ref() {
-                let retained = self
-                    .herdr
-                    .endpoints
-                    .caches()
-                    .iter()
-                    .find(|cache| cache.side() == &key.side)
-                    .and_then(|cache| cache.attachment_pane(&key.terminal_id));
-                let current = retained.map_or(agent.is_some(), |pane| pane.current);
-                let agent = retained.map(|pane| &pane.agent).or(agent);
+            if let Some(key) = session.pane_key.as_ref() {
+                let multiplexer = self.multiplexers.get(key.multiplexer);
+                let glyph = pane_glyph(multiplexer);
+                let retained = multiplexer.retained(&key.side, &key.terminal_id);
+                let current = retained.map_or(agent.is_some(), |(_, current)| current);
+                let agent = retained.map(|(pane, _)| pane).or(agent);
                 let workspace = session
                     .working_directory
                     .as_ref()
                     .map(|_| self.workspace_label(&session.working_directory));
                 let mut content = if let Some(agent) = agent {
-                    herdr_palette_content(
+                    pane_palette_content(
                         Some(session_row_name(&session.title, activity, Some(agent)).text),
                         agent,
+                        key.multiplexer,
                         workspace.as_deref(),
-                        herdr_glyph,
+                        glyph,
                         self.config.ui.path_style.git_rows,
                         None,
                     )
@@ -199,8 +196,8 @@ impl AlacritreeApp {
                         None,
                         "shell",
                     );
-                    content.subtitle = herdr_subtitle(
-                        herdr_glyph,
+                    content.subtitle = pane_subtitle(
+                        glyph,
                         (!content.subtitle.is_empty()).then_some(content.subtitle.as_str()),
                     );
                     content
@@ -208,15 +205,15 @@ impl AlacritreeApp {
                 let kind = agent.and_then(|agent| agent.kind.as_deref());
                 let status = agent.filter(|_| current).and_then(|agent| agent.status);
                 if !current {
-                    content.secondary = session_middle(Some("herdr"), kind, None, "shell");
+                    let lead = key.multiplexer.to_string();
+                    content.secondary = session_middle(Some(&lead), kind, None, "shell");
                 }
                 let mut managed = self.session_managed(session).unwrap();
                 managed.kind = kind.map(str::to_owned);
                 managed.title = agent
                     .and_then(|agent| agent.title.clone())
                     .filter(|title| Some(title.as_str()) != kind);
-                managed.mark = status
-                    .map(|status| herdr_mark(status, self.herdr_settings(&key.side).indicators));
+                managed.mark = status.map(|status| multiplexer.mark(&key.side, status));
                 let side = key.side.label().unwrap_or_else(|| "native".to_string());
                 let hover = palette_hover(
                     &content.title_for_hover,
@@ -224,7 +221,7 @@ impl AlacritreeApp {
                     status.map(|status| status.label()),
                     &side,
                     session.working_directory.as_deref(),
-                    agent.and_then(herdr_cwd),
+                    agent.and_then(Pane::working_directory),
                     agent.map(|agent| agent.pane_id.as_str()),
                     Some(&key.terminal_id),
                     Some(&managed),
@@ -238,7 +235,7 @@ impl AlacritreeApp {
                     hover,
                     kind,
                     agent.map(|agent| agent.pane_id.as_str()),
-                    true,
+                    Some(key.multiplexer),
                 ));
                 continue;
             }
@@ -281,41 +278,37 @@ impl AlacritreeApp {
                 hover,
                 agent_kind,
                 None,
-                false,
+                None,
             ));
         }
-        for (ws, side, agent) in self.herdr_agent_listing() {
+        for ListedPane { workspace: ws, key, pane: agent } in self.pane_listing() {
             let workspace = ws.as_ref().map(|_| self.workspace_label(&ws));
-            let content = herdr_palette_content(
+            let content = pane_palette_content(
                 agent.title.clone(),
                 agent,
+                key.multiplexer,
                 workspace.as_deref(),
-                herdr_glyph,
+                pane_glyph(self.multiplexers.get(key.multiplexer)),
                 self.config.ui.path_style.git_rows,
                 None,
             );
-            let settings = self.herdr_settings(side);
-            let managed =
-                Managed::herdr(side, &settings, self.config.integrations.herdr.attach, Some(agent));
+            let managed = self.pane_managed(&key, agent);
             let hover = palette_hover(
                 &content.title_for_hover,
                 agent.kind.as_deref(),
                 agent.status.map(|status| status.label()),
-                &side.label().unwrap_or_else(|| "native".to_string()),
+                &key.side.label().unwrap_or_else(|| "native".to_string()),
                 ws.as_deref(),
-                herdr_cwd(agent),
+                agent.working_directory(),
                 Some(&agent.pane_id),
                 Some(&agent.terminal_id),
                 Some(&managed),
-                "attach to this herdr pane",
+                &format!("attach to this {} pane", key.multiplexer),
             );
-            items.push(PaletteItem::herdr_agent(
-                command_palette::HerdrAttach {
-                    key: herdr::HerdrKey {
-                        side: side.clone(),
-                        terminal_id: agent.terminal_id.clone(),
-                    },
+            items.push(PaletteItem::pane(
+                command_palette::PaneAttach {
                     pane_id: agent.pane_id.clone(),
+                    key,
                     workspace: ws.clone(),
                 },
                 content.primary,
@@ -340,13 +333,13 @@ impl AlacritreeApp {
     }
 
     /// The status mark each palette row should paint, resolved the same way
-    /// the sidebar resolves one for the same session or unattached herdr
-    /// agent, so the two can never disagree.  Kept apart from `palette_items`
+    /// the sidebar resolves one for the same session or unattached pane, so
+    /// the two can never disagree.  Kept apart from `palette_items`
     /// so building a row's text and picking its mark stay separate.  `None`
     /// while `[ui.session_display] palette_marks` is off, and for any row
-    /// that is neither a session nor a herdr agent.
+    /// that is neither a session nor a multiplexer's pane.
     ///
-    /// A herdr agent has no `Session` of its own, so unlike a session row it
+    /// Such a pane has no `Session` of its own, so unlike a session row it
     /// carries no attention flag or live-state axis: the harness mark is all
     /// there is, and its hover is `managed_tooltip` — what the sidebar's own
     /// unattached-agent row shows too.
@@ -359,10 +352,8 @@ impl AlacritreeApp {
             .map(|item| match &item.action {
                 PaletteAction::ActivateSession(id) => {
                     let session = self.sessions.iter().find(|s| s.id == *id)?;
-                    let activity = herdr_backed_activity(
-                        session.activity(),
-                        self.session_herdr_status(session),
-                    );
+                    let activity =
+                        pane_backed_activity(session.activity(), self.session_pane_status(session));
                     let managed = self.session_managed(session);
                     session_status_mark(&RowStatus {
                         attention: session.needs_attention,
@@ -370,15 +361,9 @@ impl AlacritreeApp {
                         managed: managed.as_ref(),
                     })
                 },
-                PaletteAction::AttachHerdrAgent(attach) => {
-                    let agent = self.find_herdr_agent(&attach.key.side, &attach.key.terminal_id)?;
-                    let settings = self.herdr_settings(&attach.key.side);
-                    let managed = Managed::herdr(
-                        &attach.key.side,
-                        &settings,
-                        self.config.integrations.herdr.attach,
-                        Some(agent),
-                    );
+                PaletteAction::AttachPane(attach) => {
+                    let pane = self.find_pane(&attach.key)?;
+                    let managed = self.pane_managed(&attach.key, pane);
                     let mark = managed.mark?;
                     Some((SessionMark::Harness(mark), managed_tooltip(&managed)))
                 },
@@ -435,12 +420,12 @@ impl AlacritreeApp {
                 self.spawn_profile_session(ctx, &name);
                 self.focus_terminal();
             },
-            PaletteAction::AttachHerdrAgent(a) => {
+            PaletteAction::AttachPane(a) => {
                 // Switches first, same as both sidebar paths: a refusal is only
                 // visible if the workspace it happened in is on screen.
                 let switch = self.switch_for_attach(&a.workspace, AttachFocus::Take);
-                let unlisted = unlisted_pane_target(&a.key, &a.pane_id);
-                if self.attach_herdr_agent(ctx, a.key, unlisted, &switch, None, AttachFocus::Take) {
+                let unlisted = PaneTarget::unlisted(&a.key, &a.pane_id);
+                if self.attach_pane(ctx, a.key, unlisted, &switch, None, AttachFocus::Take) {
                     self.focus_terminal();
                 } else {
                     self.current_workspace = switch.from;
@@ -888,14 +873,6 @@ pub(super) struct PaletteSessionContent {
     pub(super) title_for_hover: String,
 }
 
-fn herdr_cwd(agent: &herdr::Agent) -> Option<&str> {
-    agent
-        .foreground_cwd
-        .as_deref()
-        .filter(|cwd| !cwd.trim().is_empty())
-        .or_else(|| agent.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()))
-}
-
 /// The middle column's words, most general first: where the row comes from,
 /// what runs in it, what that is doing.  The kind is spelled out whether or
 /// not the title repeats it, so every row in one state reads identically.
@@ -934,19 +911,26 @@ fn native_palette_content(
     }
 }
 
-fn herdr_subtitle(glyph: &str, location: Option<&str>) -> String {
+/// The glyph a palette row names `multiplexer`'s panes with.
+fn pane_glyph(multiplexer: &Multiplexer) -> &str {
+    let (icon, default) = multiplexer.icon();
+    icon.or_glyph(default.as_str())
+}
+
+fn pane_subtitle(glyph: &str, location: Option<&str>) -> String {
     location.map(|location| format!("{glyph} {location}")).unwrap_or_else(|| glyph.to_string())
 }
 
-pub(super) fn herdr_palette_content(
+pub(super) fn pane_palette_content(
     title: Option<String>,
-    agent: &herdr::Agent,
+    agent: &Pane,
+    multiplexer: MultiplexerKind,
     workspace: Option<&str>,
     glyph: &str,
     cwd_style: PathStyle,
     cwd_home: Option<&str>,
 ) -> PaletteSessionContent {
-    let cwd = herdr_cwd(agent);
+    let cwd = agent.working_directory();
     let abbreviated_cwd = cwd.map(|cwd| path_style::render(cwd, cwd_style, cwd_home));
     let (primary, title_for_hover) =
         if let Some(title) = title.filter(|title| !title.trim().is_empty()) {
@@ -967,14 +951,14 @@ pub(super) fn herdr_palette_content(
         None => abbreviated_cwd.clone().filter(|_| cwd != Some(primary.as_str())),
     };
     let subtitle = match location.filter(|location| *location != primary) {
-        Some(location) => herdr_subtitle(glyph, Some(&location)),
+        Some(location) => pane_subtitle(glyph, Some(&location)),
         None => glyph.to_string(),
     };
     PaletteSessionContent {
         primary,
         subtitle,
         secondary: session_middle(
-            Some("herdr"),
+            Some(&multiplexer.to_string()),
             agent.kind.as_deref(),
             agent.status.map(|status| status.label()),
             "shell",
@@ -1029,7 +1013,7 @@ fn shell_state_for(kind: &SessionKind, busy: bool) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{herdr_agent, titled_herdr_agent as titled};
+    use crate::test_util::{herdr_agent, herdr_pane_key, titled_herdr_agent as titled};
 
     /// The mark has a gutter of its own ahead of the description.  A gutter
     /// only as wide as the glyph leaves the label butted against the mark.
@@ -1056,13 +1040,14 @@ mod tests {
 
     #[test]
     fn specific_herdr_titles_keep_workspace_and_status_separate() {
-        let agent = herdr::Agent {
-            status: Some(herdr::Status::Working),
+        let agent = Pane {
+            status: Some(PaneStatus::Working),
             ..titled(Some("claude"), Some("fix the wrap bug"))
         };
-        let content = herdr_palette_content(
+        let content = pane_palette_content(
             agent.title.clone(),
             &agent,
+            MultiplexerKind::Herdr,
             Some("alacritree / master"),
             "◆",
             PathStyle::Fish,
@@ -1084,9 +1069,10 @@ mod tests {
     #[test]
     fn a_herdr_title_repeating_its_kind_keeps_the_workspace_below_it() {
         let agent = titled(Some("claude"), Some("claude"));
-        let content = herdr_palette_content(
+        let content = pane_palette_content(
             agent.title.clone(),
             &agent,
+            MultiplexerKind::Herdr,
             Some("renamed / main"),
             "◆",
             PathStyle::Fish,
@@ -1102,13 +1088,14 @@ mod tests {
     /// which project holds it, so the workspace label still gets its line.
     #[test]
     fn a_herdr_title_naming_its_directory_keeps_the_workspace_below_it() {
-        let agent = herdr::Agent {
+        let agent = Pane {
             cwd: Some("/home/dev/Git/devkit".into()),
             ..titled(Some("claude"), Some("devkit"))
         };
-        let content = herdr_palette_content(
+        let content = pane_palette_content(
             agent.title.clone(),
             &agent,
+            MultiplexerKind::Herdr,
             Some("devkit / main"),
             "◆",
             PathStyle::Fish,
@@ -1123,8 +1110,15 @@ mod tests {
     #[test]
     fn untitled_herdr_panes_without_a_directory_use_home() {
         let agent = herdr_agent(Some("claude"));
-        let content =
-            herdr_palette_content(agent.title.clone(), &agent, None, "◆", PathStyle::Fish, None);
+        let content = pane_palette_content(
+            agent.title.clone(),
+            &agent,
+            MultiplexerKind::Herdr,
+            None,
+            "◆",
+            PathStyle::Fish,
+            None,
+        );
         assert_eq!(
             (content.primary, content.subtitle, content.secondary),
             ("Home".into(), "◆".into(), "herdr · claude · idle".into(),)
@@ -1137,30 +1131,31 @@ mod tests {
     /// does not carry, like the terminal id.
     #[test]
     fn duplicate_unmatched_herdr_panes_share_a_primary_but_stay_searchable() {
-        let panes = herdr::Listing::Panes.parse(
-            r#"{"result":{"panes":[
-            {"terminal_id":"t1","pane_id":"w7:p1","agent":"codex",
-             "agent_status":"working","terminal_title_stripped":"~/.local/share/chezmoi",
-             "cwd":"~/.local/share/chezmoi"},
-            {"terminal_id":"t2","pane_id":"w7:p3","agent":"codex",
-             "agent_status":"idle","terminal_title_stripped":"~/.local/share/chezmoi",
-             "cwd":"~/.local/share/chezmoi"}
-        ]}}"#,
-        );
-        let side = herdr::Side::Wsl("kali-linux".into());
-        let mut cache = herdr::EndpointCache::new(side.clone());
-        cache.set_agents_for_test(panes);
-        let caches = [cache];
+        let chezmoi = |terminal_id: &str, pane_id: &str, status| Pane {
+            terminal_id: terminal_id.into(),
+            pane_id: pane_id.into(),
+            status: Some(status),
+            cwd: Some("~/.local/share/chezmoi".into()),
+            ..titled(Some("codex"), Some("~/.local/share/chezmoi"))
+        };
+        let panes =
+            [chezmoi("t1", "w7:p1", PaneStatus::Working), chezmoi("t2", "w7:p3", PaneStatus::Idle)];
+        let side = Side::Wsl("kali-linux".into());
         let mut items = Vec::new();
-        for (workspace, side, agent) in listed_herdr_agents(&caches, &[], &[], true) {
-            let content =
-                herdr_palette_content(agent.title.clone(), agent, None, "◆", PathStyle::Fish, None);
-            items.push(PaletteItem::herdr_agent(
-                command_palette::HerdrAttach {
-                    key: herdr::HerdrKey {
-                        side: side.clone(),
-                        terminal_id: agent.terminal_id.clone(),
-                    },
+        for agent in &panes {
+            let workspace = None;
+            let content = pane_palette_content(
+                agent.title.clone(),
+                agent,
+                MultiplexerKind::Herdr,
+                None,
+                "◆",
+                PathStyle::Fish,
+                None,
+            );
+            items.push(PaletteItem::pane(
+                command_palette::PaneAttach {
+                    key: herdr_pane_key(side.clone(), &agent.terminal_id),
                     pane_id: agent.pane_id.clone(),
                     workspace,
                 },
@@ -1180,7 +1175,7 @@ mod tests {
         let mut palette = CommandPalette::new();
         let ranked = palette.rank(&items);
         assert_eq!(command_palette::group(&items, &ranked), vec![(
-            command_palette::PaletteSection::HerdrSessions,
+            command_palette::PaletteSection::MultiplexerPanes,
             vec![0, 1],
         )]);
         for (query, expected) in
@@ -1194,21 +1189,20 @@ mod tests {
 
     #[test]
     fn untitled_herdr_panes_promote_home_before_terminal_id_fallback() {
-        let agent = herdr::Agent {
-            kind: None,
-            title: None,
-            cwd: None,
-            foreground_cwd: None,
-            ..herdr_agent(None)
-        };
-        let content =
-            herdr_palette_content(agent.title.clone(), &agent, None, "◆", PathStyle::Fish, None);
-        let item = PaletteItem::herdr_agent(
-            command_palette::HerdrAttach {
-                key: herdr::HerdrKey {
-                    side: herdr::Side::Native,
-                    terminal_id: agent.terminal_id.clone(),
-                },
+        let agent =
+            Pane { kind: None, title: None, cwd: None, foreground_cwd: None, ..herdr_agent(None) };
+        let content = pane_palette_content(
+            agent.title.clone(),
+            &agent,
+            MultiplexerKind::Herdr,
+            None,
+            "◆",
+            PathStyle::Fish,
+            None,
+        );
+        let item = PaletteItem::pane(
+            command_palette::PaneAttach {
+                key: herdr_pane_key(Side::Native, &agent.terminal_id),
                 pane_id: agent.pane_id.clone(),
                 workspace: None,
             },
@@ -1228,8 +1222,15 @@ mod tests {
     #[test]
     fn attached_untitled_herdr_panes_promote_home_and_keep_their_glyph() {
         let agent = herdr_agent(None);
-        let content =
-            herdr_palette_content(Some(String::new()), &agent, None, "◆", PathStyle::Fish, None);
+        let content = pane_palette_content(
+            Some(String::new()),
+            &agent,
+            MultiplexerKind::Herdr,
+            None,
+            "◆",
+            PathStyle::Fish,
+            None,
+        );
         assert_eq!((content.primary, content.subtitle), ("Home".into(), "◆".into()));
     }
 
@@ -1239,9 +1240,10 @@ mod tests {
     #[test]
     fn an_attached_panes_pty_title_survives_a_titleless_herdr_report() {
         let agent = herdr_agent(None);
-        let content = herdr_palette_content(
+        let content = pane_palette_content(
             Some("vim src/main.rs".into()),
             &agent,
+            MultiplexerKind::Herdr,
             Some("alacritree / master"),
             "◆",
             PathStyle::Fish,
@@ -1256,9 +1258,10 @@ mod tests {
     #[test]
     fn configured_workspace_label_and_herdr_glyph_survive_untitled_rows() {
         let agent = herdr_agent(Some("claude"));
-        let content = herdr_palette_content(
+        let content = pane_palette_content(
             agent.title.clone(),
             &agent,
+            MultiplexerKind::Herdr,
             Some("◆ renamed / main"),
             "✦",
             PathStyle::Fish,
@@ -1371,7 +1374,7 @@ mod tests {
             "hover".into(),
             Some("claude"),
             None,
-            false,
+            None,
         );
         assert_eq!(item.primary, "claude");
         assert_eq!(item.subtitle.as_deref(), Some("Home"));

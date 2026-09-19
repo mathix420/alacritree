@@ -7,6 +7,7 @@ use std::time::Instant;
 use alacritree::alloc_count::{CountingAllocator, measure};
 use alacritree::config::FollowFocus;
 use alacritree::herdr;
+use alacritree::multiplexer::Side;
 use alacritree::pending_spawn::PendingSpawns;
 use alacritree::projects::{Project, Worktree};
 use alacritree::sidebar_focus::{ObservedInputs, SessionInput, UiInputs};
@@ -72,7 +73,7 @@ fn ui(query: &str, toggles: u32) -> UiInputs<'_> {
         pr_generation: 0,
         active_workspace: None,
         active_branch: None,
-        herdr_generation: 0,
+        panes_generation: 0,
     }
 }
 
@@ -136,7 +137,7 @@ fn a_mode_that_ignores_the_trail_allocates_nothing() {
             {"terminal_id":"t1","pane_id":"w1:p1","tab_id":"w1:t1","focused":true}
         ]}}"#,
     );
-    let caches = vec![herdr::EndpointCache::for_test(herdr::Side::Native, panes, Instant::now())];
+    let caches = vec![herdr::EndpointCache::for_test(Side::Native, panes, Instant::now())];
 
     for follow in [FollowFocus::Herdr, FollowFocus::Off] {
         let mut sync = herdr::HerdrViewSync::default();

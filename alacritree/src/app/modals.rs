@@ -170,7 +170,7 @@ impl AlacritreeApp {
         // A managed session's attach client is always running, so the busy
         // warning would fire every time and warn about nothing: what it
         // guards against is losing work, and detaching loses none.
-        let managed = session.herdr_key.is_some();
+        let managed = session.pane_key.is_some();
         let title = if managed {
             format!("Detach from `{}`?", session.title)
         } else {

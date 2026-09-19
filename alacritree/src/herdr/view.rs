@@ -12,7 +12,8 @@ use crate::herdr::EndpointCache;
 use crate::jobs;
 use crate::session::SessionId;
 
-use super::{HerdrKey, Side};
+use super::pane_key;
+use crate::multiplexer::{PaneKey, Side};
 
 /// Where a side's focus was last established, and when.  The stamp is a
 /// watermark: a listing sampled at or before it cannot form an edge, so one
@@ -38,7 +39,7 @@ const FOLLOW_EXPIRY: Duration = Duration::from_secs(10);
 /// would expire a follow while the user was in another window, which is the
 /// catch-up-on-return case the trail exists to preserve.
 struct PendingFollow {
-    key: HerdrKey,
+    key: PaneKey,
     /// The session that was active when this was proposed.  A different one
     /// means the proposal no longer describes the situation.
     active: Option<SessionId>,
@@ -56,7 +57,7 @@ pub struct HerdrViewFocus {
     /// The pane the job's own focus call targets, for stamping the trail on
     /// success with the pane herdr is actually on rather than whatever
     /// session happens to be active when the job completes.
-    pub key: HerdrKey,
+    pub key: PaneKey,
     pub job: jobs::Job<Result<(), String>>,
 }
 
@@ -77,7 +78,7 @@ pub struct HerdrViewSync {
 #[derive(Debug, PartialEq, Eq)]
 pub enum HerdrViewAction {
     Focus(SessionId),
-    Follow(HerdrKey),
+    Follow(PaneKey),
 }
 
 /// Everything `next` decides from, in one struct because there are more of
@@ -87,7 +88,7 @@ pub struct ViewInputs<'a> {
     /// herdr's whole view rather than drawing one pane of its own.  The last
     /// is settled when the session attaches: a pane that gains or loses an
     /// agent afterwards does not change what its client is already drawing.
-    pub active: Option<(SessionId, Option<&'a HerdrKey>, bool)>,
+    pub active: Option<(SessionId, Option<&'a PaneKey>, bool)>,
     pub follow: FollowFocus,
     pub caches: &'a [EndpointCache],
     /// The window is focused, the terminal has pane focus, and neither a
@@ -105,7 +106,7 @@ pub struct ViewInputs<'a> {
 }
 
 impl HerdrViewSync {
-    pub fn closed(&mut self, id: SessionId, key: Option<&HerdrKey>, at: Instant) {
+    pub fn closed(&mut self, id: SessionId, key: Option<&PaneKey>, at: Instant) {
         if self.visible == Some(id) {
             self.visible = None;
             self.follow_after = None;
@@ -121,7 +122,7 @@ impl HerdrViewSync {
         }
     }
 
-    pub fn attached(&mut self, id: SessionId, key: Option<&HerdrKey>, at: Instant) {
+    pub fn attached(&mut self, id: SessionId, key: Option<&PaneKey>, at: Instant) {
         if let Some(key) = key {
             self.moved_focus(key, at);
         }
@@ -143,7 +144,7 @@ impl HerdrViewSync {
     /// herdr and a refusal is never re-proposed from the same stale entry.
     /// A pending follow on the same side, proposed against a state this
     /// stamp just superseded, goes with it.
-    pub fn moved_focus(&mut self, key: &HerdrKey, at: Instant) {
+    pub fn moved_focus(&mut self, key: &PaneKey, at: Instant) {
         self.trail.insert(key.side.clone(), TrailEntry {
             terminal_id: key.terminal_id.clone(),
             stamped_at: at,
@@ -157,7 +158,7 @@ impl HerdrViewSync {
     /// Two sides changing between one frame and the next is rare enough that
     /// a deliberate tiebreak would be inventing a rule nobody can observe,
     /// and the other side's change is still a change on the next frame.
-    fn trail_edge(&mut self, inputs: &ViewInputs<'_>) -> Option<HerdrKey> {
+    fn trail_edge(&mut self, inputs: &ViewInputs<'_>) -> Option<PaneKey> {
         // A pending targeting a side that just vanished would follow to an
         // unreachable pane; its trail entry is gone the same way.
         let live = |side: &Side| inputs.caches.iter().any(|cache| cache.side() == side);
@@ -174,8 +175,7 @@ impl HerdrViewSync {
             let Some(focused) = cache.agents().iter().find(|agent| agent.focused) else {
                 continue;
             };
-            let key =
-                HerdrKey { side: cache.side().clone(), terminal_id: focused.terminal_id.clone() };
+            let key = pane_key(cache.side().clone(), focused.terminal_id.clone());
             // An id appearing where there was no entry is first sight.
             let Some(entry) = self.trail.get(cache.side()) else {
                 self.moved_focus(&key, sampled_at);
@@ -207,7 +207,7 @@ impl HerdrViewSync {
     /// proposal exists because herdr focused that pane; following once herdr
     /// is elsewhere lands the user on a pane herdr has left, which a shared
     /// view there would then drag herdr back to.
-    fn void_pending(&mut self, focused: &HerdrKey) {
+    fn void_pending(&mut self, focused: &PaneKey) {
         let stale = self
             .pending
             .as_ref()
@@ -264,7 +264,7 @@ impl HerdrViewSync {
     /// so `void_pending` is what retires the proposal there.  `input_seen` is
     /// left for `deliver` to reconcile, so a pending born this frame is never
     /// credited with quiet time that predates its own proposal.
-    fn propose(&mut self, key: HerdrKey, inputs: &ViewInputs<'_>) {
+    fn propose(&mut self, key: PaneKey, inputs: &ViewInputs<'_>) {
         if self.pending.as_ref().is_some_and(|pending| pending.key == key) {
             return;
         }
@@ -348,10 +348,7 @@ impl HerdrViewSync {
         let focused = cache.agents().iter().find(|agent| agent.focused)?;
         self.follow_after = Some(sampled_at);
         (focused.terminal_id != key.terminal_id).then(|| {
-            HerdrViewAction::Follow(HerdrKey {
-                side: key.side.clone(),
-                terminal_id: focused.terminal_id.clone(),
-            })
+            HerdrViewAction::Follow(pane_key(key.side.clone(), focused.terminal_id.clone()))
         })
     }
 }
@@ -361,7 +358,7 @@ impl HerdrViewSync {
 /// once per switch onto it, so activating a row always points herdr at that
 /// row's pane.
 pub(super) fn needs_view_focus(
-    key: Option<&HerdrKey>,
+    key: Option<&PaneKey>,
     active: SessionId,
     focused: Option<SessionId>,
 ) -> bool {
@@ -377,7 +374,7 @@ mod tests {
     use crate::herdr;
 
     fn inputs<'a>(
-        active: Option<(SessionId, Option<&'a HerdrKey>, bool)>,
+        active: Option<(SessionId, Option<&'a PaneKey>, bool)>,
         caches: &'a [herdr::EndpointCache],
         busy: bool,
     ) -> ViewInputs<'a> {
@@ -393,7 +390,7 @@ mod tests {
     }
 
     fn always<'a>(
-        active: Option<(SessionId, Option<&'a HerdrKey>, bool)>,
+        active: Option<(SessionId, Option<&'a PaneKey>, bool)>,
         caches: &'a [herdr::EndpointCache],
         now: Instant,
     ) -> ViewInputs<'a> {
@@ -408,11 +405,7 @@ mod tests {
         }
     }
 
-    fn one_focused(
-        side: &herdr::Side,
-        terminal_id: &str,
-        at: Instant,
-    ) -> Vec<herdr::EndpointCache> {
+    fn one_focused(side: &Side, terminal_id: &str, at: Instant) -> Vec<herdr::EndpointCache> {
         let panes = herdr::Listing::Panes.parse(&format!(
             r#"{{"result":{{"panes":[
                 {{"terminal_id":"{terminal_id}","pane_id":"w1:p1","tab_id":"w1:t1","focused":true}}
@@ -423,7 +416,7 @@ mod tests {
 
     /// A side whose listing also carries herdr's full pane membership, as an
     /// attached side's does.
-    fn inventoried(side: &herdr::Side, panes: &str, at: Instant) -> Vec<herdr::EndpointCache> {
+    fn inventoried(side: &Side, panes: &str, at: Instant) -> Vec<herdr::EndpointCache> {
         let mut cache = herdr::EndpointCache::new(side.clone());
         cache.complete_listing_for_test(
             Ok(&format!(r#"{{"result":{{"panes":[{panes}]}}}}"#)),
@@ -438,7 +431,7 @@ mod tests {
     /// reading of a side is a baseline rather than a change.
     #[test]
     fn a_first_sight_records_without_following() {
-        let side = herdr::Side::Native;
+        let side = Side::Native;
         let now = Instant::now();
         let caches = one_focused(&side, "t1", now);
         let mut sync = HerdrViewSync::default();
@@ -451,7 +444,7 @@ mod tests {
 
     #[test]
     fn a_native_session_follows_a_change_on_any_side() {
-        let side = herdr::Side::Wsl("ubuntu".into());
+        let side = Side::Wsl("ubuntu".into());
         let start = Instant::now();
         let first = one_focused(&side, "t1", start);
         let mut sync = HerdrViewSync::default();
@@ -462,10 +455,7 @@ mod tests {
         let quiet = later + FOLLOW_QUIET_GAP + Duration::from_millis(1);
         assert_eq!(
             sync.next(always(Some((1, None, false)), &second, quiet)),
-            Some(HerdrViewAction::Follow(HerdrKey {
-                side: side.clone(),
-                terminal_id: "t2".into(),
-            }))
+            Some(HerdrViewAction::Follow(pane_key(side.clone(), "t2".into())))
         );
     }
 
@@ -474,7 +464,7 @@ mod tests {
     #[test]
     fn the_modes_that_are_not_always_ignore_the_trail() {
         for mode in [FollowFocus::Herdr, FollowFocus::Off] {
-            let side = herdr::Side::Native;
+            let side = Side::Native;
             let start = Instant::now();
             let first = one_focused(&side, "t1", start);
             let mut sync = HerdrViewSync::default();
@@ -500,8 +490,8 @@ mod tests {
     fn a_change_onto_the_active_pane_records_without_following() {
         // A session drawing its own pane, so the shared-view path stops after
         // the focus call and leaves the active-pane question to the trail.
-        let side = herdr::Side::Wsl("ubuntu".into());
-        let key = HerdrKey { side: side.clone(), terminal_id: "t2".into() };
+        let side = Side::Wsl("ubuntu".into());
+        let key = pane_key(side.clone(), "t2".into());
         let start = Instant::now();
         let first = one_focused(&side, "t1", start);
         let own_pane = Some((1, Some(&key), false));
@@ -521,10 +511,7 @@ mod tests {
         let quiet = latest + FOLLOW_QUIET_GAP + Duration::from_millis(1);
         assert_eq!(
             sync.next(always(own_pane, &third, quiet)),
-            Some(HerdrViewAction::Follow(HerdrKey {
-                side: side.clone(),
-                terminal_id: "t1".into()
-            }))
+            Some(HerdrViewAction::Follow(pane_key(side.clone(), "t1".into())))
         );
     }
 
@@ -532,13 +519,13 @@ mod tests {
     /// reports the old pane, and acting on it would run the change backwards.
     #[test]
     fn a_sample_older_than_the_stamp_forms_no_edge() {
-        let side = herdr::Side::Native;
+        let side = Side::Native;
         let start = Instant::now();
         let mut sync = HerdrViewSync::default();
         let first = one_focused(&side, "t1", start);
         assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
         let moved = start + Duration::from_millis(5);
-        sync.moved_focus(&HerdrKey { side: side.clone(), terminal_id: "t3".into() }, moved);
+        sync.moved_focus(&pane_key(side.clone(), "t3".into()), moved);
         let arrived = start + Duration::from_millis(2);
         let in_flight = one_focused(&side, "t2", arrived);
         assert_eq!(sync.next(always(Some((1, None, false)), &in_flight, arrived)), None);
@@ -552,14 +539,14 @@ mod tests {
     /// for a change herdr made once the user has moved on to something else.
     #[test]
     fn attached_stamps_the_trail_so_its_own_pane_is_not_a_change() {
-        let side = herdr::Side::Wsl("ubuntu".into());
+        let side = Side::Wsl("ubuntu".into());
         let start = Instant::now();
         let mut sync = HerdrViewSync::default();
         let first = one_focused(&side, "t1", start);
         assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
 
         let attached_at = start + Duration::from_millis(1);
-        let key = HerdrKey { side: side.clone(), terminal_id: "t2".into() };
+        let key = pane_key(side.clone(), "t2".into());
         sync.attached(2, Some(&key), attached_at);
 
         // The active session has moved on by the time the poll confirms
@@ -577,7 +564,7 @@ mod tests {
     /// distro stopped loses its cache entirely; neither is a focus change.
     #[test]
     fn a_silent_or_vanished_side_forms_no_edge() {
-        let side = herdr::Side::Wsl("ubuntu".into());
+        let side = Side::Wsl("ubuntu".into());
         let start = Instant::now();
         let first = one_focused(&side, "t1", start);
         let mut sync = HerdrViewSync::default();
@@ -606,8 +593,8 @@ mod tests {
     /// not a change.
     #[test]
     fn a_change_on_one_side_leaves_a_quiet_side_alone() {
-        let native = herdr::Side::Native;
-        let wsl = herdr::Side::Wsl("ubuntu".into());
+        let native = Side::Native;
+        let wsl = Side::Wsl("ubuntu".into());
         let start = Instant::now();
         let mut sync = HerdrViewSync::default();
         let mut first = one_focused(&native, "n1", start);
@@ -621,7 +608,7 @@ mod tests {
         let quiet = later + FOLLOW_QUIET_GAP + Duration::from_millis(1);
         assert_eq!(
             sync.next(always(Some((1, None, false)), &second, quiet)),
-            Some(HerdrViewAction::Follow(HerdrKey { side: wsl.clone(), terminal_id: "w2".into() })),
+            Some(HerdrViewAction::Follow(pane_key(wsl.clone(), "w2".into()))),
             "the side that moved is the one to go to"
         );
     }
@@ -630,8 +617,8 @@ mod tests {
     /// speaks only when that path has nothing to say.
     #[test]
     fn the_shared_view_path_wins_over_the_trail() {
-        let side = herdr::Side::Native;
-        let key = HerdrKey { side: side.clone(), terminal_id: "t1".into() };
+        let side = Side::Native;
+        let key = pane_key(side.clone(), "t1".into());
         let start = Instant::now();
         let caches = one_focused(&side, "t2", start);
         let mut sync = HerdrViewSync::default();
@@ -643,9 +630,9 @@ mod tests {
 
     #[test]
     fn herdr_shared_view_follows_new_tabs_and_refocuses_on_return() {
-        let side = herdr::Side::Native;
-        let t1 = herdr::HerdrKey { side: side.clone(), terminal_id: "t1".into() };
-        let t2 = herdr::HerdrKey { side: side.clone(), terminal_id: "t2".into() };
+        let side = Side::Native;
+        let t1 = herdr::pane_key(side.clone(), "t1".into());
+        let t2 = herdr::pane_key(side.clone(), "t2".into());
         let panes = herdr::Listing::Panes.parse(
             r#"{"result":{"panes":[
                 {"terminal_id":"t1","pane_id":"w1:p1","tab_id":"w1:t1","focused":false},
@@ -675,7 +662,7 @@ mod tests {
 
     #[test]
     fn herdr_shared_view_refocuses_after_an_ordinary_session() {
-        let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
+        let key = herdr::pane_key(Side::Native, "t1".into());
         let mut sync = HerdrViewSync::default();
         sync.attached(1, None, Instant::now());
         let no_caches: Vec<herdr::EndpointCache> = Vec::new();
@@ -688,8 +675,8 @@ mod tests {
 
     #[test]
     fn herdr_follow_attempts_wait_for_a_new_snapshot() {
-        let side = herdr::Side::Native;
-        let key = herdr::HerdrKey { side: side.clone(), terminal_id: "t1".into() };
+        let side = Side::Native;
+        let key = herdr::pane_key(side.clone(), "t1".into());
         let panes = herdr::Listing::Panes.parse(
             r#"{"result":{"panes":[
                 {"terminal_id":"t2","pane_id":"w2:p1","tab_id":"w2:t1","focused":true}
@@ -729,9 +716,9 @@ mod tests {
 
     #[test]
     fn herdr_shared_view_rejects_stale_and_foreign_focus_snapshots() {
-        let side = herdr::Side::Wsl("ubuntu".into());
-        let other_side = herdr::Side::Wsl("debian".into());
-        let key = herdr::HerdrKey { side: side.clone(), terminal_id: "t1".into() };
+        let side = Side::Wsl("ubuntu".into());
+        let other_side = Side::Wsl("debian".into());
+        let key = herdr::pane_key(side.clone(), "t1".into());
         let panes = herdr::Listing::Panes.parse(
             r#"{"result":{"panes":[
                 {"terminal_id":"t2","pane_id":"w2:p1","tab_id":"w2:t1","focused":true}
@@ -759,7 +746,7 @@ mod tests {
 
     #[test]
     fn herdr_focus_completion_cannot_restore_a_view_left_while_pending() {
-        let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
+        let key = herdr::pane_key(Side::Native, "t1".into());
         let active = Some((1, Some(&key), true));
         let mut sync = HerdrViewSync::default();
         let no_caches: Vec<herdr::EndpointCache> = Vec::new();
@@ -775,7 +762,7 @@ mod tests {
     /// still owes herdr a focus call, or it draws the wrong pane.
     #[test]
     fn off_still_asks_herdr_for_the_shared_view_pane() {
-        let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
+        let key = herdr::pane_key(Side::Native, "t1".into());
         let caches: Vec<herdr::EndpointCache> = Vec::new();
         let mut sync = HerdrViewSync::default();
         let mut off = inputs(Some((1, Some(&key), true)), &caches, false);
@@ -788,9 +775,9 @@ mod tests {
     #[test]
     fn a_shared_view_follows_herdr_in_every_mode() {
         for mode in [FollowFocus::Herdr, FollowFocus::Always] {
-            let side = herdr::Side::Native;
-            let t1 = HerdrKey { side: side.clone(), terminal_id: "t1".into() };
-            let t2 = HerdrKey { side: side.clone(), terminal_id: "t2".into() };
+            let side = Side::Native;
+            let t1 = pane_key(side.clone(), "t1".into());
+            let t2 = pane_key(side.clone(), "t2".into());
             let panes = herdr::Listing::Panes.parse(
                 r#"{"result":{"panes":[
                     {"terminal_id":"t2","pane_id":"w2:p1","tab_id":"w2:t1","focused":true}
@@ -818,8 +805,8 @@ mod tests {
     /// return, rather than deferring it to whenever the mode next changes.
     #[test]
     fn off_suppresses_a_shared_view_follow() {
-        let side = herdr::Side::Native;
-        let t1 = HerdrKey { side: side.clone(), terminal_id: "t1".into() };
+        let side = Side::Native;
+        let t1 = pane_key(side.clone(), "t1".into());
         let panes = herdr::Listing::Panes.parse(
             r#"{"result":{"panes":[
                 {"terminal_id":"t2","pane_id":"w2:p1","tab_id":"w2:t1","focused":true}
@@ -842,8 +829,8 @@ mod tests {
     /// asks on the way in, on every side and whatever herdr was showing.
     #[test]
     fn every_row_holding_a_pane_asks_herdr_for_it() {
-        for side in [herdr::Side::Native, herdr::Side::Wsl("d".into())] {
-            let key = herdr::HerdrKey { side, terminal_id: "t1".into() };
+        for side in [Side::Native, Side::Wsl("d".into())] {
+            let key = herdr::pane_key(side, "t1".into());
             assert!(needs_view_focus(Some(&key), 1, None));
         }
     }
@@ -859,7 +846,7 @@ mod tests {
     /// again every frame would spawn a herdr per frame.
     #[test]
     fn a_row_asks_once_per_switch() {
-        let key = herdr::HerdrKey { side: herdr::Side::Native, terminal_id: "t1".into() };
+        let key = herdr::pane_key(Side::Native, "t1".into());
         assert!(!needs_view_focus(Some(&key), 1, Some(1)));
         assert!(needs_view_focus(Some(&key), 2, Some(1)));
     }
@@ -868,7 +855,7 @@ mod tests {
     /// the keyboard, so it waits for the typing to stop.
     #[test]
     fn a_follow_waits_for_a_gap_in_typing() {
-        let side = herdr::Side::Native;
+        let side = Side::Native;
         let start = Instant::now();
         let mut sync = HerdrViewSync::default();
         let first = one_focused(&side, "t1", start);
@@ -892,17 +879,14 @@ mod tests {
         quiet.last_direct_input = Some(sampled + Duration::from_millis(500));
         assert_eq!(
             sync.next(quiet),
-            Some(HerdrViewAction::Follow(HerdrKey {
-                side: side.clone(),
-                terminal_id: "t2".into(),
-            }))
+            Some(HerdrViewAction::Follow(pane_key(side.clone(), "t2".into())))
         );
     }
 
     /// Moving the user long after the change is worse than not moving them.
     #[test]
     fn a_follow_expires_if_the_gap_never_comes() {
-        let side = herdr::Side::Native;
+        let side = Side::Native;
         let start = Instant::now();
         let mut sync = HerdrViewSync::default();
         let first = one_focused(&side, "t1", start);
@@ -930,7 +914,7 @@ mod tests {
     /// The pane herdr is on now is the only one worth going to.
     #[test]
     fn a_second_change_retargets_the_pending_follow_and_restarts_its_clock() {
-        let side = herdr::Side::Native;
+        let side = Side::Native;
         let start = Instant::now();
         let mut sync = HerdrViewSync::default();
         let first = one_focused(&side, "t1", start);
@@ -952,10 +936,7 @@ mod tests {
         quiet.last_direct_input = Some(b);
         assert_eq!(
             sync.next(quiet),
-            Some(HerdrViewAction::Follow(HerdrKey {
-                side: side.clone(),
-                terminal_id: "t3".into(),
-            })),
+            Some(HerdrViewAction::Follow(pane_key(side.clone(), "t3".into()))),
             "the newest change wins"
         );
     }
@@ -963,7 +944,7 @@ mod tests {
     /// The proposal was made against a situation that no longer holds.
     #[test]
     fn a_pending_follow_is_dropped_when_the_active_session_changes() {
-        let side = herdr::Side::Native;
+        let side = Side::Native;
         let start = Instant::now();
         let mut sync = HerdrViewSync::default();
         let first = one_focused(&side, "t1", start);
@@ -983,8 +964,8 @@ mod tests {
     /// and herdr keeps reporting that row as focused for as long as it is.
     #[test]
     fn a_closed_target_suppresses_the_follow_rather_than_delaying_it() {
-        let side = herdr::Side::Native;
-        let target = HerdrKey { side: side.clone(), terminal_id: "t2".into() };
+        let side = Side::Native;
+        let target = pane_key(side.clone(), "t2".into());
         let start = Instant::now();
         let mut sync = HerdrViewSync::default();
         let first = one_focused(&side, "t1", start);
@@ -1013,8 +994,8 @@ mod tests {
     /// afterwards moves them a second time, to a pane they never chose.
     #[test]
     fn the_pane_herdr_falls_back_to_after_a_close_is_not_followed() {
-        let side = herdr::Side::Native;
-        let gone = HerdrKey { side: side.clone(), terminal_id: "t1".into() };
+        let side = Side::Native;
+        let gone = pane_key(side.clone(), "t1".into());
         let start = Instant::now();
         let mut sync = HerdrViewSync::default();
         sync.attached(1, Some(&gone), start);
@@ -1035,7 +1016,7 @@ mod tests {
     /// Leaving a pane that is still there is a move the user made in herdr.
     #[test]
     fn a_move_off_a_pane_that_still_exists_is_followed() {
-        let side = herdr::Side::Native;
+        let side = Side::Native;
         let start = Instant::now();
         let mut sync = HerdrViewSync::default();
         let first = inventoried(
@@ -1057,10 +1038,7 @@ mod tests {
         let quiet = moved + FOLLOW_QUIET_GAP + Duration::from_millis(1);
         assert_eq!(
             sync.next(always(Some((1, None, false)), &second, quiet)),
-            Some(HerdrViewAction::Follow(HerdrKey {
-                side: side.clone(),
-                terminal_id: "t2".into()
-            }))
+            Some(HerdrViewAction::Follow(pane_key(side.clone(), "t2".into())))
         );
     }
 
@@ -1069,7 +1047,7 @@ mod tests {
     /// the user on a pane herdr has left.
     #[test]
     fn a_pending_follow_is_dropped_when_herdr_returns_to_the_trailed_pane() {
-        let side = herdr::Side::Native;
+        let side = Side::Native;
         let start = Instant::now();
         let mut sync = HerdrViewSync::default();
         let first = one_focused(&side, "t1", start);
@@ -1092,7 +1070,7 @@ mod tests {
     /// gone by the time the session on screen returns to the trail.
     #[test]
     fn a_pending_follow_is_dropped_when_a_shared_view_takes_over() {
-        let side = herdr::Side::Native;
+        let side = Side::Native;
         let start = Instant::now();
         let mut sync = HerdrViewSync::default();
         let first = one_focused(&side, "t1", start);
@@ -1104,7 +1082,7 @@ mod tests {
         assert_eq!(sync.next(typing), None);
 
         // The active session switches to one the shared-view path owns.
-        let shared_key = HerdrKey { side: side.clone(), terminal_id: "shared".into() };
+        let shared_key = pane_key(side.clone(), "shared".into());
         let shared_active = Some((9, Some(&shared_key), false));
         assert_eq!(
             sync.next(always(shared_active, &second, sampled + Duration::from_millis(2))),
@@ -1123,7 +1101,7 @@ mod tests {
     /// never saw must not spend the follow's budget.
     #[test]
     fn a_busy_frame_neither_advances_nor_expires_the_pending_follow() {
-        let side = herdr::Side::Native;
+        let side = Side::Native;
         let start = Instant::now();
         let mut sync = HerdrViewSync::default();
         let first = one_focused(&side, "t1", start);
@@ -1154,7 +1132,7 @@ mod tests {
     /// exists to preserve, not time the follow should age through.
     #[test]
     fn an_inattentive_frame_neither_advances_nor_expires_the_pending_follow() {
-        let side = herdr::Side::Native;
+        let side = Side::Native;
         let start = Instant::now();
         let mut sync = HerdrViewSync::default();
         let first = one_focused(&side, "t1", start);
@@ -1183,7 +1161,7 @@ mod tests {
     /// refusal.  Until it does, the change stands and is proposed again.
     #[test]
     fn an_undelivered_follow_is_proposed_again() {
-        let side = herdr::Side::Native;
+        let side = Side::Native;
         let start = Instant::now();
         let mut sync = HerdrViewSync::default();
         let first = one_focused(&side, "t1", start);
@@ -1208,7 +1186,7 @@ mod tests {
     /// change would be re-proposed forever.
     #[test]
     fn an_expired_follow_stamps_the_trail() {
-        let side = herdr::Side::Native;
+        let side = Side::Native;
         let start = Instant::now();
         let mut sync = HerdrViewSync::default();
         let first = one_focused(&side, "t1", start);

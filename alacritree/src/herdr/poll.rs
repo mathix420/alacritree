@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use crate::{jobs, wsl};
 
 use super::cli::list_panes;
-use super::{Agent, Listing, PollError, Settings, Side, running_session_name, settings};
+use super::{Listing, PollError, Settings, running_session_name, settings};
+use crate::multiplexer::{Pane, Side};
 
 /// How long an endpoint known to have a herdr waits before being retried.
 const RECOVERY_RETRY: Duration = Duration::from_secs(30);
@@ -69,7 +70,7 @@ impl Reach {
 pub(super) struct ListingReply {
     sampled_at: Instant,
     listing: Listing,
-    agents: Vec<Agent>,
+    agents: Vec<Pane>,
     inventory: Option<Result<HashSet<String>, PollError>>,
 }
 
@@ -122,14 +123,14 @@ fn parse_pane_inventory(stdout: &str) -> Result<HashSet<String>, PollError> {
 
 /// Last known pane details, with live fields valid only in a current reply.
 pub struct PaneMetadata {
-    pub agent: Agent,
+    pub agent: Pane,
     pub current: bool,
 }
 
 /// One herdr server's agents, refreshed off the UI thread.
 pub struct EndpointCache {
     side: Side,
-    agents: Vec<Agent>,
+    agents: Vec<Pane>,
     attachment_panes: Vec<PaneMetadata>,
     generation: u64,
     reach: Reach,
@@ -172,7 +173,7 @@ impl EndpointCache {
         &self.side
     }
 
-    pub fn agents(&self) -> &[Agent] {
+    pub fn agents(&self) -> &[Pane] {
         &self.agents
     }
 
@@ -192,14 +193,19 @@ impl EndpointCache {
     }
 
     #[cfg(test)]
-    pub fn set_agents_for_test(&mut self, agents: Vec<Agent>) {
+    pub fn set_agents_for_test(&mut self, agents: Vec<Pane>) {
         self.agents = agents;
+    }
+
+    #[cfg(test)]
+    pub fn set_settings_for_test(&mut self, settings: Settings) {
+        self.settings = Read::Done(settings);
     }
 
     /// A cache holding one listing at a chosen sample time, for tests that
     /// drive `HerdrViewSync` without a poll behind them.
     #[doc(hidden)]
-    pub fn for_test(side: Side, agents: Vec<Agent>, sampled_at: Instant) -> Self {
+    pub fn for_test(side: Side, agents: Vec<Pane>, sampled_at: Instant) -> Self {
         let mut cache = Self::new(side);
         cache.agents = agents;
         cache.sampled_at = Some(sampled_at);
@@ -667,7 +673,7 @@ impl Endpoints {
 /// Whether anything the sidebar draws changed.  Named field by field rather
 /// than a whole-struct compare, so a field herdr reports that no row shows
 /// cannot force the tree to rebuild.
-fn rendered_differs(was: &[Agent], now: &[Agent]) -> bool {
+fn rendered_differs(was: &[Pane], now: &[Pane]) -> bool {
     was.len() != now.len()
         || was.iter().zip(now).any(|(a, b)| {
             a.terminal_id != b.terminal_id
@@ -693,7 +699,7 @@ enum Read<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::herdr::Status;
+    use crate::multiplexer::PaneStatus;
 
     /// One working agent, for the tests about what survives a poll that did
     /// not answer.
@@ -749,9 +755,9 @@ mod tests {
         cache.fail_listing_for_test(PollError::Absent("spawn_failed"), Duration::from_secs(2));
 
         assert_eq!(cache.agents().len(), 1);
-        assert_eq!(cache.agents()[0].status, Some(Status::Working));
+        assert_eq!(cache.agents()[0].status, Some(PaneStatus::Working));
         let pane = cache.attachment_pane("agent").expect("the pane keeps its row");
-        assert_eq!(pane.agent.status, Some(Status::Working));
+        assert_eq!(pane.agent.status, Some(PaneStatus::Working));
         assert!(pane.current);
         // The listing and when it was taken are one fact, so a reader asking
         // whether the side is answering agrees with the rows still drawn.
@@ -804,7 +810,7 @@ mod tests {
         );
         cache.fail_listing_for_test(PollError::Absent("spawn_failed"), interval);
 
-        assert_eq!(cache.agents()[0].status, Some(Status::Working));
+        assert_eq!(cache.agents()[0].status, Some(PaneStatus::Working));
     }
 
     #[test]
@@ -1115,8 +1121,8 @@ mod tests {
         assert!(reach.record_failure(&PollError::Server("server_not_running".into())));
     }
 
-    fn agent(id: &str, status: Status) -> Agent {
-        Agent {
+    fn agent(id: &str, status: PaneStatus) -> Pane {
+        Pane {
             terminal_id: id.into(),
             pane_id: "w1:p1".into(),
             tab_id: Some("w1:t1".into()),
@@ -1131,14 +1137,14 @@ mod tests {
 
     #[test]
     fn an_unchanged_agent_list_is_not_a_change() {
-        let was = vec![agent("t1", Status::Idle)];
+        let was = vec![agent("t1", PaneStatus::Idle)];
         assert!(!rendered_differs(&was, &was));
     }
 
     #[test]
     fn a_status_change_counts() {
-        let was = vec![agent("t1", Status::Idle)];
-        let now = vec![agent("t1", Status::Working)];
+        let was = vec![agent("t1", PaneStatus::Idle)];
+        let now = vec![agent("t1", PaneStatus::Working)];
         assert!(rendered_differs(&was, &now));
     }
 }

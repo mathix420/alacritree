@@ -6,17 +6,34 @@ use std::sync::OnceLock;
 
 use git2::Repository;
 
+use crate::config::{AttachMode, IntegrationsConfig};
 use crate::herdr;
+use crate::multiplexer::{
+    Managed, MultiplexerKind, MultiplexerSession, Multiplexers, Pane, PaneKey, PaneStatus, Side,
+};
+
+/// The key a herdr pane on `side` is known by.
+pub(crate) fn herdr_pane_key(side: Side, terminal_id: &str) -> PaneKey {
+    herdr::pane_key(side, terminal_id.to_string())
+}
+
+/// How a row describes a herdr pane on `side`, with herdr opening rows under
+/// `attach` and no config read from the server yet.
+pub(crate) fn herdr_managed(pane: &Pane, side: &Side, attach: AttachMode) -> Managed {
+    let mut multiplexers = Multiplexers::new(&IntegrationsConfig::default());
+    multiplexers.herdr_mut_for_test().config_mut_for_test().attach = attach;
+    multiplexers.get(MultiplexerKind::Herdr).managed(side, Some(pane))
+}
 
 /// An idle agent on a native endpoint, the base every other agent varies from.
-pub(crate) fn herdr_agent(kind: Option<&str>) -> herdr::Agent {
-    herdr::Agent {
+pub(crate) fn herdr_agent(kind: Option<&str>) -> Pane {
+    Pane {
         terminal_id: "term_65abfc8e300361".into(),
         pane_id: "w5:p1".into(),
         tab_id: Some("w5:t1".into()),
         kind: kind.map(String::from),
         title: None,
-        status: Some(herdr::Status::Idle),
+        status: Some(PaneStatus::Idle),
         focused: false,
         cwd: None,
         foreground_cwd: None,
@@ -24,8 +41,8 @@ pub(crate) fn herdr_agent(kind: Option<&str>) -> herdr::Agent {
 }
 
 /// An agent carrying a title, for the naming cases.
-pub(crate) fn titled_herdr_agent(kind: Option<&str>, title: Option<&str>) -> herdr::Agent {
-    herdr::Agent { title: title.map(String::from), ..herdr_agent(kind) }
+pub(crate) fn titled_herdr_agent(kind: Option<&str>, title: Option<&str>) -> Pane {
+    Pane { title: title.map(String::from), ..herdr_agent(kind) }
 }
 
 /// Test scratch directories are named for the process that owns them.

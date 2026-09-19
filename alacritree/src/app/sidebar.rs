@@ -2,7 +2,7 @@
 //! the row painters that pass draws with.
 
 use super::*;
-use crate::config::AttachMode;
+use crate::multiplexer::{MultiplexerKind, Pane};
 
 pub(super) struct Sidebar {
     pub(super) cursor: Option<SidebarRow>,
@@ -155,21 +155,17 @@ impl AlacritreeApp {
                                 .iter()
                                 .find(|s| s.id == *id)
                                 .map(|s| {
-                                    let activity = herdr_backed_activity(
+                                    let activity = pane_backed_activity(
                                         s.activity(),
-                                        self.session_herdr_status(s),
+                                        self.session_pane_status(s),
                                     );
-                                    session_row_name(
-                                        &s.title,
-                                        activity,
-                                        self.session_herdr_agent(s),
-                                    )
+                                    session_row_name(&s.title, activity, self.session_pane(s))
                                 })
                                 .map(RowName::search_text)
                                 .unwrap_or_default(),
-                            sidebar_nav::WorkspaceEntry::Agent(side, terminal_id) => self
-                                .find_herdr_agent(side, terminal_id)
-                                .map(|a| herdr_display_name(a).search_text())
+                            sidebar_nav::WorkspaceEntry::Pane(key) => self
+                                .find_pane(key)
+                                .map(|pane| pane_display_name(pane).search_text())
                                 .unwrap_or_default(),
                         };
                         (entry.row(), name)
@@ -582,12 +578,12 @@ impl AlacritreeApp {
         if let Some(id) = requests.close_session {
             self.request_close_session(ctx, id);
         }
-        if let Some((ws, key, pane_id)) = requests.attach_herdr.take() {
+        if let Some((ws, key, pane_id)) = requests.attach_pane.take() {
             // Switches first, same as `spawn_shell` below: a refusal
             // is only visible if the workspace it happened in is on screen.
             let switch = self.switch_for_attach(&ws, AttachFocus::Take);
-            let unlisted = unlisted_pane_target(&key, &pane_id);
-            if self.attach_herdr_agent(ctx, key, unlisted, &switch, None, AttachFocus::Take) {
+            let unlisted = PaneTarget::unlisted(&key, &pane_id);
+            if self.attach_pane(ctx, key, unlisted, &switch, None, AttachFocus::Take) {
                 workspace_activated = true;
             } else {
                 self.current_workspace = switch.from;
@@ -667,19 +663,33 @@ struct SidebarPaint<'a> {
     icons: &'a PaintedIcons,
 }
 
-/// `[ui.icons]` and the `[integrations.herdr]` glyph, with colors converted
-/// for painting.
+/// `[ui.icons]` and each multiplexer's own glyph, with colors converted for
+/// painting.
 pub(super) struct PaintedIcons {
     ui: Icons<Color32>,
-    pub(super) herdr: IconStyle<Color32>,
+    panes: Vec<(MultiplexerKind, IconStyle<Color32>, BakedGlyph)>,
 }
 
 impl PaintedIcons {
-    pub(super) fn new(config: &Config) -> Self {
-        Self {
-            ui: config.ui.icons.map_colors(rgb_to_color32),
-            herdr: config.integrations.herdr.icon.map_color(rgb_to_color32),
-        }
+    pub(super) fn new(config: &Config, multiplexers: &Multiplexers) -> Self {
+        let panes = multiplexers
+            .iter()
+            .map(|multiplexer| {
+                let (icon, default) = multiplexer.icon();
+                (multiplexer.kind(), icon.map_color(rgb_to_color32), default)
+            })
+            .collect();
+        Self { ui: config.ui.icons.map_colors(rgb_to_color32), panes }
+    }
+
+    /// The glyph marking a pane `multiplexer` owns, and its fallback.
+    pub(super) fn pane(&self, multiplexer: MultiplexerKind) -> (&IconStyle<Color32>, BakedGlyph) {
+        let (_, icon, default) = self
+            .panes
+            .iter()
+            .find(|(kind, ..)| *kind == multiplexer)
+            .expect("every multiplexer has an icon");
+        (icon, *default)
     }
 }
 
@@ -742,7 +752,7 @@ impl FilterMembership {
                     SidebarRow::Worktree(path) => {
                         membership.worktrees.insert(path);
                     },
-                    SidebarRow::Session(_) | SidebarRow::HerdrAgent(..) => {
+                    SidebarRow::Session(_) | SidebarRow::Pane(_) => {
                         membership.children.insert(row);
                     },
                 }
@@ -793,7 +803,7 @@ struct SidebarRequests {
     spawn_profile: Option<(PathBuf, String)>,
     activate_session: Option<(WorkspaceKey, SessionId)>,
     close_session: Option<SessionId>,
-    attach_herdr: Option<(WorkspaceKey, herdr::HerdrKey, String)>,
+    attach_pane: Option<(WorkspaceKey, PaneKey, String)>,
     /// Worktree rows painted on a probe frame, the only ones worth probing.
     drawn_worktrees: Vec<PathBuf>,
 }
@@ -925,7 +935,7 @@ fn paint_home_group(ui: &mut egui::Ui, paint: SidebarPaint<'_>, requests: &mut S
     paint_workspace_children(ui, paint, &paint.view.home_rows, &None, requests);
 }
 
-/// The session and herdr rows listed under the workspace `ws`.
+/// The session and pane rows listed under the workspace `ws`.
 fn paint_workspace_children(
     ui: &mut egui::Ui,
     paint: SidebarPaint<'_>,
@@ -934,8 +944,8 @@ fn paint_workspace_children(
     requests: &mut SidebarRequests,
 ) {
     // Only rows a reorder can move take a drop slot, and
-    // the slot index counts those alone: a herdr pane's
-    // place is herdr's to decide, so it is neither a drag
+    // the slot index counts those alone: a multiplexer pane's
+    // place is the multiplexer's to decide, so it is neither a drag
     // subject nor a landing.
     let mut slot = 0usize;
     for row in rows {
@@ -964,23 +974,15 @@ fn paint_workspace_children(
                     slot += 1;
                 }
             },
-            WorkspaceRowData::Herdr(row) => {
+            WorkspaceRowData::Pane(row) => {
                 let is_cursor = matches!(
                     &paint.view.cursor_row,
-                    Some(SidebarRow::HerdrAgent(side, id))
-                        if *side == row.side && *id == row.terminal_id
+                    Some(SidebarRow::Pane(key)) if *key == row.key
                 );
                 let scroll = paint.view.scrolls(is_cursor);
-                let act = herdr_row(ui, row, is_cursor, scroll, paint.icons, &paint.view.theme);
+                let act = pane_row(ui, row, is_cursor, scroll, paint.icons, &paint.view.theme);
                 if act.attach {
-                    requests.attach_herdr = Some((
-                        ws.clone(),
-                        herdr::HerdrKey {
-                            side: row.side.clone(),
-                            terminal_id: row.terminal_id.clone(),
-                        },
-                        row.pane_id.clone(),
-                    ));
+                    requests.attach_pane = Some((ws.clone(), row.key.clone(), row.pane_id.clone()));
                 }
             },
         }
@@ -1813,7 +1815,7 @@ pub(super) fn session_row(
                         row.is_active,
                     );
                     if let Some(managed) = &row.managed {
-                        let rect = paint_managed_mark(ui, icons, theme, theme.text_muted);
+                        let rect = paint_managed_mark(ui, icons, managed, theme, theme.text_muted);
                         managed_slot = Some((rect, managed_tooltip(managed)));
                     }
                     let (_, galley) = truncating_label(
@@ -1934,31 +1936,32 @@ fn row_name_text(
 fn paint_managed_mark(
     ui: &mut egui::Ui,
     icons: &PaintedIcons,
+    managed: &Managed,
     theme: &Theme,
     color: Color32,
 ) -> egui::Rect {
     // 10.0 is what the status marks beside it use, and `◫` shares its em
     // height with `◇` and `●`, so the same size puts them on one optical line.
-    let (glyph, font, glyph_color) =
-        resolve_icon(&icons.herdr, DEFAULT_HERDR_ICON, color, 10.0, 10.0, theme);
+    let (icon, default) = icons.pane(managed.multiplexer);
+    let (glyph, font, glyph_color) = resolve_icon(icon, default, color, 10.0, 10.0, theme);
     ui.label(RichText::new(glyph).color(glyph_color).font(font)).rect
 }
 
-/// A herdr agent nothing is attached to.  Drawn in `theme.text_dim` because
-/// it is listed but not live — the same weight `worktree_gone` gives a row
-/// whose checkout has been removed.  An attached agent has an ordinary
-/// session row instead, so no agent is ever drawn twice.
+/// A multiplexer's pane nothing is attached to.  Drawn in `theme.text_dim`
+/// because it is listed but not live, the same weight `worktree_gone` gives a
+/// row whose checkout has been removed.  An attached pane has an ordinary
+/// session row instead, so no pane is ever drawn twice.
 ///
-/// Not draggable and carries no drop-target rect: a herdr agent has no
-/// position in the session order to reorder into.
-fn herdr_row(
+/// Not draggable and carries no drop-target rect: such a pane has no position
+/// in the session order to reorder into.
+fn pane_row(
     ui: &mut egui::Ui,
-    row: &HerdrRowData,
+    row: &PaneRowData,
     is_cursor: bool,
     scroll_into_view: bool,
     icons: &PaintedIcons,
     theme: &Theme,
-) -> HerdrRowAction {
+) -> PaneRowAction {
     // Reserve a slot *before* the label so the hover bg paints beneath it.
     let bg_idx = ui.painter().add(egui::Shape::Noop);
     let panel_x = ui.max_rect().x_range();
@@ -1972,7 +1975,7 @@ fn herdr_row(
                     let (rect, _) =
                         ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
                     paint_harness_mark(ui, row.managed.mark, rect, theme);
-                    paint_managed_mark(ui, icons, theme, theme.text_dim);
+                    paint_managed_mark(ui, icons, &row.managed, theme, theme.text_dim);
                     let text = row_name_text(ui, &row.name, theme.text_dim, theme.text_muted);
                     let _ = truncating_label(ui, text, theme.text_dim, egui::Sense::hover());
                 },
@@ -1995,7 +1998,7 @@ fn herdr_row(
     if scroll_into_view {
         ui.scroll_to_rect(full_rect, None);
     }
-    HerdrRowAction { attach: resp.clicked() }
+    PaneRowAction { attach: resp.clicked() }
 }
 
 impl AlacritreeApp {
@@ -2041,7 +2044,7 @@ impl Action for action::DeleteSelected {
                         Some(ProjectRemoveState { name: p.display_name().to_string(), root });
                 }
             },
-            Some(SidebarRow::Home) | Some(SidebarRow::HerdrAgent(..)) | None => {},
+            Some(SidebarRow::Home) | Some(SidebarRow::Pane(_)) | None => {},
         }
     }
 }
@@ -2191,7 +2194,7 @@ pub(super) fn project_toggles_pass(
 }
 
 /// Whether a workspace counts as occupied for the sessions toggle: it holds a
-/// live session, or — when `counts_detached` is set — a listed herdr agent
+/// live session or, when `counts_detached` is set, a listed multiplexer pane
 /// nothing is attached to.  `session_workspaces` is the workspace of every
 /// live session; a folded lone shell (absent from `listed` below the row
 /// threshold, but still in `session_workspaces`) passes either way.
@@ -2204,7 +2207,7 @@ pub(super) fn sessions_filter_passes(
     session_workspaces.contains(key)
         || (counts_detached
             && listed.get(key).is_some_and(|entries| {
-                entries.iter().any(|e| matches!(e, sidebar_nav::WorkspaceEntry::Agent(..)))
+                entries.iter().any(|e| matches!(e, sidebar_nav::WorkspaceEntry::Pane(_)))
             }))
 }
 
@@ -2254,7 +2257,7 @@ pub(super) fn worktree_pr_passes(
     !any_pr || pr_matches.get(path).copied().unwrap_or(false)
 }
 
-/// Whether `current_project_rows` resolves session and herdr-agent names for
+/// Whether `current_project_rows` resolves session and pane names for
 /// `child_matches` this frame.  `[ui] search_depth` at its "workspaces"
 /// default answers false unconditionally, so no child name is ever computed
 /// and a query costs what matching workspace names alone costs.
@@ -2306,11 +2309,11 @@ pub(super) struct SessionRowData {
 }
 
 /// One painted row under a workspace, in the order the sidebar draws them.
-/// Attaching turns a herdr row into a session row in place, so the two travel
+/// Attaching turns a pane row into a session row in place, so the two travel
 /// as one list rather than as two blocks that would reorder on attach.
 pub(super) enum WorkspaceRowData {
     Session(SessionRowData),
-    Herdr(HerdrRowData),
+    Pane(PaneRowData),
 }
 
 impl WorkspaceRowData {
@@ -2322,31 +2325,18 @@ impl WorkspaceRowData {
     }
 }
 
-/// Everything a sidebar herdr-agent row needs, snapshotted before the panel
-/// closure so rendering doesn't borrow `self.herdr.endpoints`.
-pub(super) struct HerdrRowData {
-    pub(super) side: herdr::Side,
-    pub(super) terminal_id: String,
+/// Everything a sidebar pane row needs, snapshotted before the panel closure
+/// so rendering doesn't borrow the multiplexers.
+pub(super) struct PaneRowData {
+    pub(super) key: PaneKey,
     pub(super) pane_id: String,
     pub(super) name: RowName,
     pub(super) managed: Managed,
 }
 
-impl HerdrRowData {
-    pub(super) fn from_agent(
-        agent: &herdr::Agent,
-        side: &herdr::Side,
-        settings: &herdr::Settings,
-        attach: AttachMode,
-    ) -> Self {
-        let name = herdr_display_name(agent);
-        Self {
-            side: side.clone(),
-            terminal_id: agent.terminal_id.clone(),
-            pane_id: agent.pane_id.clone(),
-            name,
-            managed: Managed::herdr(side, settings, attach, Some(agent)),
-        }
+impl PaneRowData {
+    pub(super) fn new(key: PaneKey, pane: &Pane, managed: Managed) -> Self {
+        Self { key, pane_id: pane.pane_id.clone(), name: pane_display_name(pane), managed }
     }
 }
 
@@ -2376,11 +2366,11 @@ impl RowName {
     }
 }
 
-/// The name herdr reports for a pane, and `None` when it reports none.  The
-/// kind rides along as context unless it says the same thing as the title.
-/// What a titleless agent falls back to differs by row, so each caller says
-/// so itself rather than passing its answer through here.
-pub(super) fn herdr_row_name(agent: &herdr::Agent) -> Option<RowName> {
+/// The name a multiplexer reports for a pane, and `None` when it reports
+/// none.  The kind rides along as context unless it says the same thing as
+/// the title.  What a titleless pane falls back to differs by row, so each
+/// caller says so itself rather than passing its answer through here.
+pub(super) fn pane_row_name(agent: &Pane) -> Option<RowName> {
     let title = agent.title.clone()?;
     let context = agent.kind.clone().filter(|kind| *kind != title);
     Some(RowName { text: title, context })
@@ -2388,12 +2378,12 @@ pub(super) fn herdr_row_name(agent: &herdr::Agent) -> Option<RowName> {
 
 /// The sidebar row, the palette row and the text filter must all resolve an
 /// agent's name the same way, or the filter stops matching what the other two
-/// paint.  Falls back from herdr's title, to the agent's kind, to the last
-/// six characters of its terminal id — a listed row has nothing better than
+/// paint.  Falls back from the pane's title, to the agent's kind, to the last
+/// six characters of its terminal id.  A listed row has nothing better than
 /// the terminal id's tail behind the kind, so the kind takes the name rather
 /// than standing in front of six characters nobody reads.
-pub(super) fn herdr_display_name(agent: &herdr::Agent) -> RowName {
-    herdr_row_name(agent).unwrap_or_else(|| {
+pub(super) fn pane_display_name(agent: &Pane) -> RowName {
+    pane_row_name(agent).unwrap_or_else(|| {
         RowName::plain(agent.kind.clone().unwrap_or_else(|| {
             let id = &agent.terminal_id;
             let skip = id.chars().count().saturating_sub(6);
@@ -2406,19 +2396,19 @@ pub(super) fn herdr_display_name(agent: &herdr::Agent) -> RowName {
 /// paints a semantic agent/loader status, retaining that mark beside it would
 /// reintroduce the vendor-specific icon set this status model replaces.
 /// What an attached session's row is called.  On Linux and WSL an attach is
-/// full passthrough, so the pane on screen is herdr's and the row names it
-/// the way herdr's own listed row would — attaching must not rename the row
-/// under the user.  A pane herdr reports no title for keeps the title its own
-/// PTY set, with the kind in front of it.
+/// full passthrough, so the pane on screen is the multiplexer's and the row
+/// names it the way the listed row would.  Attaching must not rename the row
+/// under the user.  A pane that reports no title keeps the title its own PTY
+/// set, with the kind in front of it.
 pub(super) fn session_row_name(
     pty_title: &str,
     activity: SessionActivity,
-    agent: Option<&herdr::Agent>,
+    agent: Option<&Pane>,
 ) -> RowName {
     let Some(agent) = agent else {
         return RowName::plain(session_row_title(pty_title, activity));
     };
-    herdr_row_name(agent).unwrap_or_else(|| RowName {
+    pane_row_name(agent).unwrap_or_else(|| RowName {
         text: session_row_title(pty_title, activity),
         context: agent.kind.clone(),
     })
@@ -2447,7 +2437,7 @@ pub(super) fn profile_menu_label(index: usize, name: &str) -> String {
     format!("{index}. {name}")
 }
 
-pub(super) struct HerdrRowAction {
+pub(super) struct PaneRowAction {
     pub(super) attach: bool,
 }
 
@@ -2587,21 +2577,11 @@ mod tests {
     }
 
     #[test]
-    fn herdr_display_name_keeps_a_short_terminal_id_whole() {
+    fn pane_display_name_keeps_a_short_terminal_id_whole() {
         // `saturating_sub(6)` exists precisely for ids shorter than the tail
         // it takes; a plain `- 6` would panic on this one.
-        let agent = herdr::Agent {
-            terminal_id: "t1".into(),
-            pane_id: "w1:p1".into(),
-            tab_id: Some("w1:t1".into()),
-            kind: None,
-            title: None,
-            status: Some(herdr::Status::Idle),
-            focused: false,
-            cwd: None,
-            foreground_cwd: None,
-        };
-        assert_eq!(herdr_display_name(&agent), RowName::plain("t1".into()));
+        let agent = Pane { terminal_id: "t1".into(), ..crate::test_util::herdr_agent(None) };
+        assert_eq!(pane_display_name(&agent), RowName::plain("t1".into()));
     }
 
     /// The filter matches what the row paints, so a query naming the category
@@ -2619,7 +2599,7 @@ mod tests {
         assert_eq!(RowName::plain("claude".into()).search_text(), "claude");
     }
 
-    /// Ending a herdr-managed session ends the attach and leaves the pane
+    /// Ending a multiplexer-managed session ends the attach and leaves the pane
     /// running, so the control cannot call itself a close.
     #[test]
     fn the_close_control_is_a_detach_on_a_managed_row() {
@@ -2638,9 +2618,8 @@ mod tests {
     #[test]
     fn sessions_filter_counts_a_detached_agent_bucketed_under_home() {
         let listed =
-            sidebar_nav::ListedRows::from([(None, vec![sidebar_nav::WorkspaceEntry::Agent(
-                herdr::Side::Native,
-                "term_home".to_string(),
+            sidebar_nav::ListedRows::from([(None, vec![sidebar_nav::WorkspaceEntry::Pane(
+                crate::test_util::herdr_pane_key(Side::Native, "term_home"),
             )])]);
         assert!(sessions_filter_passes(&[], &listed, &None, true));
     }

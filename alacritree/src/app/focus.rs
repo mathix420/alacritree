@@ -52,7 +52,7 @@ impl AlacritreeApp {
                 ),
                 active_workspace,
                 active_branch,
-                herdr_generation: self.herdr_generation(),
+                panes_generation: self.panes_generation(),
             },
         );
         let rows = self.current_project_rows();
@@ -112,7 +112,7 @@ impl AlacritreeApp {
                         ),
                         active_workspace,
                         active_branch,
-                        herdr_generation: self.herdr_generation(),
+                        panes_generation: self.panes_generation(),
                     },
                 );
                 if unchanged {
@@ -215,7 +215,7 @@ impl AlacritreeApp {
             },
             Key::ArrowLeft => match &cursor {
                 SidebarRow::Project(root) => self.set_project_expanded(root, false),
-                SidebarRow::Worktree(_) | SidebarRow::Session(_) | SidebarRow::HerdrAgent(..) => {
+                SidebarRow::Worktree(_) | SidebarRow::Session(_) | SidebarRow::Pane(_) => {
                     if let Some(target) = sidebar_nav::left_target(&rows, &cursor) {
                         self.set_sidebar_cursor(target);
                     }
