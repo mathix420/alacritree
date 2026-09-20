@@ -544,10 +544,7 @@ mod tests {
         assert_eq!(herdr.managed(&Side::Native, Some(&repeated)).title, None);
 
         let distinct = crate::test_util::titled_agent(Some("codex"), Some("primary"));
-        assert_eq!(
-            herdr.managed(&Side::Native, Some(&distinct)).title.as_deref(),
-            Some("primary")
-        );
+        assert_eq!(herdr.managed(&Side::Native, Some(&distinct)).title.as_deref(), Some("primary"));
     }
 
     /// A row shares herdr's view wherever a direct attach is impossible, and
