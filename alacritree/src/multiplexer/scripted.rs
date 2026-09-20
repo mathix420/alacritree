@@ -33,14 +33,12 @@ const SCRIPTED_ICON: BakedGlyph = DEFAULT_SESSION_ICON;
 /// An attach this adapter was asked for and has not answered yet.
 pub(crate) struct QueuedAttach {
     pub key: PaneKey,
-    pub target: PaneTarget,
     pub request: AttachRequest,
 }
 
 /// A create this adapter was asked for and has not answered yet.
 pub(crate) struct QueuedCreate {
     pub side: Side,
-    pub cwd: Option<String>,
     pub request: CreateRequest,
 }
 
@@ -101,14 +99,6 @@ impl Scripted {
         }
     }
 
-    /// A pane on `side` in the listing, by terminal id.
-    pub(crate) fn pane_mut(&mut self, side: &Side, terminal_id: &str) -> Option<&mut Pane> {
-        self.sides
-            .iter_mut()
-            .find(|(s, _)| s == side)
-            .and_then(|(_, panes)| panes.iter_mut().find(|p| p.terminal_id == terminal_id))
-    }
-
     pub(crate) fn enable(&mut self) -> &mut Self {
         self.enabled = true;
         self
@@ -159,13 +149,6 @@ impl Scripted {
         self
     }
 
-    /// The side a create that named none happens on.  Unset, a create with no
-    /// side is refused the way a multiplexer with several servers refuses one.
-    pub(crate) fn default_side(&mut self, side: Option<Side>) -> &mut Self {
-        self.default_side = side;
-        self
-    }
-
     /// What the next queued attach resolves to.  Answers are taken in the
     /// order they were pushed.
     pub(crate) fn answer_attach(&mut self, launch: Result<Launch, String>) -> &mut Self {
@@ -178,28 +161,12 @@ impl Scripted {
         self
     }
 
-    /// Report a move the user made inside the multiplexer, for the app to
-    /// follow on the next `sync_view`.
-    pub(crate) fn propose_follow(&mut self, key: PaneKey) -> &mut Self {
-        self.follow = Some(key);
-        self
-    }
-
     pub(crate) fn pending_attach(&self) -> &[QueuedAttach] {
         &self.attach_queue
     }
 
     pub(crate) fn pending_create(&self) -> &[QueuedCreate] {
         &self.create_queue
-    }
-
-    /// The panes the app told this adapter it would not follow to.
-    pub(crate) fn refused(&self) -> &[PaneKey] {
-        &self.refused
-    }
-
-    pub(crate) fn closed(&self) -> &[(SessionId, Option<PaneKey>)] {
-        &self.closed
     }
 
     pub(crate) fn attached(&self) -> &[(SessionId, PaneKey)] {
@@ -220,13 +187,6 @@ impl Pane {
         self
     }
 
-    /// An agent the multiplexer found but could not classify, which is a
-    /// different answer from finding none.
-    pub(crate) fn with_unclassified_agent(mut self) -> Self {
-        self.status = Some(PaneStatus::Unknown);
-        self
-    }
-
     pub(crate) fn with_title(mut self, title: &str) -> Self {
         self.title = Some(title.to_string());
         self
@@ -234,27 +194,6 @@ impl Pane {
 
     pub(crate) fn in_dir(mut self, cwd: &str) -> Self {
         self.cwd = Some(cwd.to_string());
-        self
-    }
-
-    /// The directory the pane's foreground job is in, which outranks its own
-    /// when the two disagree.
-    pub(crate) fn in_foreground_dir(mut self, cwd: &str) -> Self {
-        self.foreground_cwd = Some(cwd.to_string());
-        self
-    }
-
-    /// The pane the multiplexer's own window is showing.
-    pub(crate) fn with_focus(mut self) -> Self {
-        self.focused = true;
-        self
-    }
-
-    /// A pane reached through its tab rather than by its own id, which is how
-    /// a multiplexer resolving through an agent registry reaches one with no
-    /// agent in it.
-    pub(crate) fn in_tab(mut self, tab_id: Option<&str>) -> Self {
-        self.tab_id = tab_id.map(str::to_string);
         self
     }
 }
@@ -388,7 +327,7 @@ impl MultiplexerSession for Scripted {
         })
     }
 
-    fn queue_attach(&mut self, key: PaneKey, target: PaneTarget, request: AttachRequest) {
+    fn queue_attach(&mut self, key: PaneKey, _target: PaneTarget, request: AttachRequest) {
         if let Some(pending) = self.attach_queue.iter_mut().find(|p| p.key == key) {
             pending.request.waiters.extend(request.waiters);
             if request.focus.takes() && !pending.request.focus.takes() {
@@ -396,7 +335,7 @@ impl MultiplexerSession for Scripted {
             }
             return;
         }
-        self.attach_queue.push(QueuedAttach { key, target, request });
+        self.attach_queue.push(QueuedAttach { key, request });
     }
 
     /// One at a time, in the order they were queued, each taking the next
@@ -414,8 +353,8 @@ impl MultiplexerSession for Scripted {
         (Some(AttachAnswer { key, request, launch }), false)
     }
 
-    fn queue_create(&mut self, side: Side, cwd: Option<String>, request: CreateRequest) {
-        self.create_queue.push(QueuedCreate { side, cwd, request });
+    fn queue_create(&mut self, side: Side, _cwd: Option<String>, request: CreateRequest) {
+        self.create_queue.push(QueuedCreate { side, request });
     }
 
     fn poll_create(&mut self) -> Option<CreateAnswer> {

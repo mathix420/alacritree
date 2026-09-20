@@ -503,7 +503,6 @@ pub(super) fn session_status_mark(status: &RowStatus<'_>) -> Option<(SessionMark
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AttachMode;
     use crate::multiplexer::{Pane, PaneStatus, Side};
     use crate::test_util::{listed_agent, managed};
 
