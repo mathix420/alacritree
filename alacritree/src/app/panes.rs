@@ -3,8 +3,6 @@
 //! a multiplexer answers comes through [`MultiplexerSession`]; this file only
 //! decides what the app does with the answer.
 
-use strum::IntoEnumIterator;
-
 use super::*;
 use crate::multiplexer::{
     AttachFocus, AttachRequest, CreateRequest, Launch, ListedPane, Managed, MultiplexerKind, Pane,
@@ -177,7 +175,8 @@ impl AlacritreeApp {
     /// the session and any refusal are both readable where they were asked
     /// for.
     pub(super) fn poll_pane_creates(&mut self, ctx: &Context) {
-        for kind in MultiplexerKind::iter() {
+        for at in 0..self.multiplexers.len() {
+            let kind = self.multiplexers.kind_at(at);
             let Some(answer) = self.multiplexers.get_mut(kind).poll_create() else { continue };
             let request = answer.request;
             match answer.pane {
@@ -226,7 +225,8 @@ impl AlacritreeApp {
     /// opens in the workspace its own click came from, which that click
     /// switched to before handing the gesture over.
     pub(super) fn poll_pane_attaches(&mut self, ctx: &Context) {
-        for kind in MultiplexerKind::iter() {
+        for at in 0..self.multiplexers.len() {
+            let kind = self.multiplexers.kind_at(at);
             let (answer, starting) = self.multiplexers.get_mut(kind).poll_attach();
             if starting {
                 ctx.request_repaint();
