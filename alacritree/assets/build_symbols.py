@@ -24,6 +24,7 @@ from fontTools.pens.transformPen import TransformPen
 from fontTools.pens.ttGlyphPen import TTGlyphPen
 from fontTools.svgLib import SVGPath
 from fontTools.ttLib import TTFont
+from fontTools.ttLib.tables._c_m_a_p import CmapSubtable
 
 # Every codepoint drawn from DejaVu Sans.
 SANS = [
@@ -34,13 +35,17 @@ SANS = [
 # DejaVu Sans lacks the magnifier, so it comes from the Mono face.
 MONO = [0x2315]
 
+# Public codepoint to the plane 16 one alacritree's defaults are spelled at,
+# so no installed face can shadow them. Both stay in the cmap; see README.md.
+PRIVATE = {0x25EB: 0x10FF00, 0x2B21: 0x10FF01}
+
 # zellij's sidebar icon.  DejaVu draws it past the ascender and below the
 # baseline, so it is refitted to the box a capital M takes up.
-HEXAGON = 0x2B21
+HEXAGON = PRIVATE[0x2B21]
 
-# herdr's ram, drawn in herdr-ram.svg.  The first private use codepoint, so it
-# cannot shadow a glyph any installed font means as something else.
-RAM = 0xE000
+# herdr's ram, drawn in herdr-ram.svg.  No Unicode character means it, so it
+# exists only at its private codepoint.
+RAM = 0x10FF02
 RAM_SVG = Path(__file__).with_name("herdr-ram.svg")
 
 NAMES = {
@@ -102,7 +107,7 @@ def fit_to_capital_m(font: TTFont, reference: TTFont, codepoint: int) -> None:
     )
 
 
-def add_svg_glyph(font: TTFont, svg: Path, codepoint: int) -> None:
+def add_svg_glyph(font: TTFont, svg: Path, codepoint: int) -> str:
     """Add the SVG's paths as a glyph at their own size, for
     `fit_to_capital_m` to place.  SVG's y axis points down, so the outline is
     flipped, and the SVG's even-odd fill is rewritten as the nonzero winding
@@ -111,16 +116,31 @@ def add_svg_glyph(font: TTFont, svg: Path, codepoint: int) -> None:
     SVGPath(str(svg)).draw(TransformPen(path.getPen(), (1, 0, 0, -1, 0, 0)))
     path = pathops.simplify(path, clockwise=True)
 
-    name = f"uni{codepoint:04X}"
+    name = f"u{codepoint:04X}"
     pen = TTGlyphPen(None)
     path.draw(Cu2QuPen(pen, max_err=1.0, reverse_direction=False))
     font["glyf"][name] = pen.glyph()
     font["glyf"][name].recalcBounds(font["glyf"])
     font["hmtx"][name] = (0, font["glyf"][name].xMin)
     font.setGlyphOrder(font.getGlyphOrder() + [name])
-    for table in font["cmap"].tables:
-        if table.isUnicode():
-            table.cmap[codepoint] = name
+    return name
+
+
+def write_cmap(font: TTFont, mapping: dict[int, str]) -> None:
+    """Replace the cmap with a BMP table plus a full one.  Format 4 cannot
+    express a codepoint above U+FFFF, so the private spellings need format 12,
+    and a face carrying only format 12 is unreadable to some rasterizers."""
+    bmp = CmapSubtable.newSubtable(4)
+    bmp.platformID, bmp.platEncID, bmp.language = 3, 1, 0
+    bmp.cmap = {cp: name for cp, name in mapping.items() if cp <= 0xFFFF}
+
+    full = CmapSubtable.newSubtable(12)
+    full.platformID, full.platEncID, full.language = 3, 10, 0
+    full.format, full.reserved, full.length, full.nGroups = 12, 0, 0, 0
+    full.cmap = dict(mapping)
+
+    font["cmap"].tableVersion = 0
+    font["cmap"].tables = [bmp, full]
 
 
 def main() -> None:
@@ -137,7 +157,12 @@ def main() -> None:
         subset_face(args.dejavu / "DejaVuSansMono.ttf", MONO, mono, drop_math=False)
         font = Merger().merge([str(sans), str(mono)])
 
-    add_svg_glyph(font, RAM_SVG, RAM)
+    mapping = dict(font.getBestCmap())
+    mapping[RAM] = add_svg_glyph(font, RAM_SVG, RAM)
+    for public, private in PRIVATE.items():
+        mapping[private] = mapping[public]
+    write_cmap(font, mapping)
+
     reference = TTFont(args.dejavu / "DejaVuSans.ttf")
     for codepoint in (HEXAGON, RAM):
         fit_to_capital_m(font, reference, codepoint)

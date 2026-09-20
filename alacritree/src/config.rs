@@ -772,13 +772,14 @@ baked_glyphs! {
     DEFAULT_SESSION_ICON = "▪";
     /// A pane a terminal workspace manager owns rather than alacritree.  A
     /// split square says "multiplexed elsewhere" at row size, where a
-    /// vendor's logo would only say "smudge" — and it stays neutral as more
-    /// than one such manager becomes supportable.
-    DEFAULT_HERDR_ICON = "◫";
-    /// zellij's own logo is a hexagon.  The baked face refits this one to a
-    /// capital M's box, since DejaVu draws it past the ascender and below
-    /// the baseline.
-    DEFAULT_ZELLIJ_ICON = "⬡";
+    /// vendor's logo would only say "smudge", and it stays neutral as more
+    /// than one such manager becomes supportable.  Drawn as U+25EB, mapped
+    /// where only the baked face reaches it; see `PRIVATE_GLYPHS`.
+    DEFAULT_HERDR_ICON = "\u{10FF00}";
+    /// zellij's own logo is a hexagon, drawn as U+2B21.  The baked face
+    /// refits it to a capital M's box, since DejaVu draws it past the
+    /// ascender and below the baseline.
+    DEFAULT_ZELLIJ_ICON = "\u{10FF01}";
     DEFAULT_HOME_ICON = "⌂";
     DEFAULT_PROJECT_EXPANDED_ICON = "▾";
     DEFAULT_PROJECT_COLLAPSED_ICON = "▸";
@@ -795,11 +796,21 @@ baked_glyphs! {
 baked_glyphs! {
     OPT_IN_GLYPHS:
     /// herdr's ram, drawn in `assets/herdr-ram.svg`.  No default paints it;
-    /// `[integrations.herdr] icon = ""` opts in, so only the coverage
-    /// check reads the constant.
+    /// `[integrations.herdr] icon = "\u{10FF02}"` opts in, so only the
+    /// coverage check reads the constant.
     #[cfg(test)]
-    HERDR_RAM_GLYPH = "\u{E000}";
+    HERDR_RAM_GLYPH = "\u{10FF02}";
 }
+
+/// Each private codepoint and the ordinary character it draws, which the
+/// baked face has to map both of.  Nothing else on a machine maps plane 16,
+/// so a default spelled this way reaches the face that fits it to the row
+/// instead of whichever fallback claims the real character first; see
+/// `assets/README.md`.  The ram is drawn from an SVG and has no public
+/// spelling.
+#[cfg(test)]
+pub(crate) const PRIVATE_GLYPHS: &[(char, Option<char>)] =
+    &[('\u{10FF00}', Some('◫')), ('\u{10FF01}', Some('⬡')), ('\u{10FF02}', None)];
 
 baked_glyphs! {
     CHROME_GLYPHS:
@@ -3128,8 +3139,10 @@ struct RawHerdr {
     wsl_path: String,
     /// The glyph on a herdr pane's sidebar row and palette entry. A bare
     /// string sets the glyph; a table also styles its color, weight, slant
-    /// and size, the way `[ui.icons]` keys do. `""` is a ram's head
-    /// that alacritree ships in its symbol font.
+    /// and size, the way `[ui.icons]` keys do. The default draws a split
+    /// square from the bundled symbol font, and `"\u{10FF02}"` draws a ram's
+    /// head from it. An ordinary character such as `"◫"` is drawn by your own
+    /// fonts instead.
     #[schemars(default = "default_herdr_icon")]
     icon: Option<RawIconStyle>,
     /// Discover herdr servers and list their agents in the sidebar.  Inert
@@ -3223,7 +3236,9 @@ struct RawZellij {
     wsl_path: String,
     /// The glyph on a zellij pane's sidebar row and palette entry. A bare
     /// string sets the glyph; a table also styles its color, weight, slant
-    /// and size, the way `[ui.icons]` keys do.
+    /// and size, the way `[ui.icons]` keys do. The default draws a hexagon
+    /// from the bundled symbol font. An ordinary character such as `"⬡"` is
+    /// drawn by your own fonts instead.
     #[schemars(default = "default_zellij_icon")]
     icon: Option<RawIconStyle>,
     /// List the panes of every running zellij session in the sidebar.
@@ -5677,9 +5692,9 @@ program = "second"
     fn the_icon_slice_carries_exactly_the_default_icon_glyphs() {
         let mut icons: Vec<&str> = DEFAULT_ICON_GLYPHS.iter().map(|g| g.as_str()).collect();
         icons.sort_unstable();
-        let expected =
-            ["⌕", "●", "○", "▪", "◫", "⌂", "▾", "▸", "⬤", "◯", "⬤", "⬤", "✓", "⇅", "⌫", "↑"];
-        let mut expected = [expected.as_slice(), &["\u{2B21}"]].concat();
+        let expected = ["⌕", "●", "○", "▪", "⌂", "▾", "▸", "⬤", "◯", "⬤", "⬤", "✓", "⇅", "⌫", "↑"];
+        // herdr and zellij, at the plane 16 codepoints only the baked face maps.
+        let mut expected = [expected.as_slice(), &["\u{10FF00}", "\u{10FF01}"]].concat();
         expected.sort_unstable();
         assert_eq!(icons, expected);
     }

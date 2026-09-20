@@ -11,8 +11,17 @@ Built from two faces because neither covers the whole set: `DejaVuSans.ttf`
 lacks `⌕` (U+2315), and `DejaVuSansMono.ttf` lacks `⠿` (U+283F) and `⬤`
 (U+2B24).
 
-The internal family name is `Alacritree Symbols`, not `DejaVu Sans` — the
-artifact is a derivative and should not be mistaken for the real face.
+The internal family name is `Alacritree Symbols`, not `DejaVu Sans`. The artifact is a derivative and should not be mistaken for the real face.
+
+### Why the multiplexer icons live in plane 16
+
+Registering last is right for a last resort and wrong for an icon this build fits to the row. A Nerd Font maps every private codepoint below U+F1AF0 and most of the geometric shapes besides, so `◫` and `⬡` spelled as themselves are drawn by whichever `[font] fallback` entry claims them first, at that font's metrics, and the fitting done here is never seen.
+
+Plane 16 is claimed by nothing. Spelling the defaults at U+10FF00 (herdr), U+10FF01 (zellij) and U+10FF02 (the ram) leaves this face the only candidate, so it wins from last place with no reordering and no work at the paint sites. Both spellings stay in the cmap, which keeps the face a last resort for a user who types the real character.
+
+Setting `[integrations.herdr] icon` to an ordinary character is therefore how you opt back into your own fonts for it. The schema publishes the private defaults, so they read as tofu in an editor; each field's documentation names the shape it draws.
+
+A codepoint above U+FFFF needs a format 12 cmap, which `write_cmap` builds beside the format 4 one. `fonts.rs` resolves every private codepoint through `ab_glyph`, the same lookup epaint makes, so a rebuild that dropped format 12 fails the suite instead of the sidebar.
 
 ### Regenerating
 
@@ -24,11 +33,11 @@ Add the codepoint to `build_symbols.py`, then run it against DejaVu 2.37. `--dej
 
 Use Debian's or Kali's DejaVu, which is what the committed font was built from. The copy Windows ships also calls itself 2.37 but draws `◇` and `◫` differently.
 
-The script subsets both faces, merges them, adds the herdr ram from `herdr-ram.svg` at U+E000, fits it and zellij's hexagon (U+2B21) to the box a capital M takes up in DejaVu Sans, sets the names above, and writes over `alacritree-symbols.ttf`, printing each fitted glyph's transform. DejaVu draws the hexagon past the ascender and below the baseline, so unfitted it does not line up with the text beside it. A `fonts.rs` test fails if a rebuild drops the fit.
+The script subsets both faces, merges them, adds the herdr ram from `herdr-ram.svg` at U+10FF02, aliases the private codepoints onto the shapes they draw, fits the ram and zellij's hexagon to the box a capital M takes up in DejaVu Sans, sets the names above, and writes over `alacritree-symbols.ttf`, printing each fitted glyph's transform. DejaVu draws the hexagon past the ascender and below the baseline, so unfitted it does not line up with the text beside it. A `fonts.rs` test fails if a rebuild drops the fit.
 
 ## `herdr-ram.svg`
 
-The source of the ram glyph (U+E000) that `[integrations.herdr] icon` can name. Edit it in any vector editor and rebuild the font. The build reads every path, fills it even-odd, and scales it to fit, so the SVG's size and position do not matter.
+The source of the ram glyph (U+10FF02) that `[integrations.herdr] icon` can name. Edit it in any vector editor and rebuild the font. The build reads every path, fills it even-odd, and scales it to fit, so the SVG's size and position do not matter.
 
 ## `FONT-LICENSE.txt`
 

@@ -2489,6 +2489,42 @@ mod tests {
         assert_eq!(baked_glyphs().len(), 28, "assets/build_symbols.py lists the codepoints");
     }
 
+    /// A default icon is spelled at a plane 16 codepoint so no installed face
+    /// can shadow it, which only works if the whole stack carries a `char`
+    /// past the BMP.  `glyph_id` is the call epaint makes, and it treats zero
+    /// as "this face cannot draw it", so a cmap that silently dropped the
+    /// entry reads here exactly as it would on screen.
+    #[test]
+    fn epaint_resolves_the_private_codepoints_the_defaults_use() {
+        use ab_glyph::Font as _;
+        let font = ab_glyph::FontRef::try_from_slice(SYMBOLS_FONT).expect("the baked face parses");
+        for (private, _) in crate::config::PRIVATE_GLYPHS {
+            assert_ne!(
+                font.glyph_id(*private).0,
+                0,
+                "U+{:04X} is not reachable through the lookup epaint uses",
+                *private as u32
+            );
+        }
+    }
+
+    /// The face keeps the ordinary character beside the private one, so a
+    /// user who sets `icon` to the real shape still has a last-resort face
+    /// when nothing they installed draws it.
+    #[test]
+    fn the_baked_face_maps_both_spellings_of_each_private_glyph() {
+        let face = ttf_parser::Face::parse(SYMBOLS_FONT, 0).expect("the baked face parses");
+        for (private, public) in crate::config::PRIVATE_GLYPHS {
+            let Some(public) = public else { continue };
+            assert_eq!(
+                face.glyph_index(*private),
+                face.glyph_index(*public),
+                "U+{:04X} and {public} must draw the same glyph",
+                *private as u32
+            );
+        }
+    }
+
     /// The zellij hexagon and the herdr ram are fitted to a capital M's box
     /// when the face is built.  DejaVu's own hexagon runs past the ascender
     /// and below the baseline and reads as a smudge at row size, and the ram
