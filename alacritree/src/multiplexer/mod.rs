@@ -9,6 +9,8 @@
 //! the app.
 
 mod model;
+#[cfg(test)]
+mod scripted;
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -24,6 +26,8 @@ pub(crate) use self::model::{
     Managed, StateTone, ViewState, ViewStep,
 };
 pub use self::model::{Pane, PaneKey, PaneStatus};
+#[cfg(test)]
+pub(crate) use self::scripted::Scripted;
 use crate::config::{BakedGlyph, IconStyle, IntegrationsConfig};
 use crate::herdr::Herdr;
 use crate::session::SessionId;
@@ -279,6 +283,13 @@ pub(crate) trait MultiplexerSession {
 pub(crate) enum Multiplexer {
     Herdr(Herdr),
     Zellij(Zellij),
+    /// Answers from a script instead of a server, so app behaviour can be
+    /// tested at this trait rather than through one multiplexer's wire
+    /// format.  Held back from `MultiplexerKind::iter`, so `new` never builds
+    /// one, no refusal names it, and no request can reach it by name.
+    #[cfg(test)]
+    #[strum_discriminants(strum(disabled))]
+    Scripted(Scripted),
 }
 
 impl MultiplexerKind {
@@ -295,6 +306,10 @@ impl Multiplexer {
         match kind {
             MultiplexerKind::Herdr => Herdr::new(config.herdr.clone()).into(),
             MultiplexerKind::Zellij => Zellij::new(config.zellij.clone()).into(),
+            #[cfg(test)]
+            MultiplexerKind::Scripted => {
+                unreachable!("`Scripted` is held back from `MultiplexerKind::iter`")
+            },
         }
     }
 
@@ -425,6 +440,31 @@ impl Multiplexers {
             let owned = key.filter(|key| key.multiplexer == multiplexer.kind());
             multiplexer.session_closed(id, owned);
         }
+    }
+
+    /// The scripted multiplexer, built on first use.  `new` cannot make one,
+    /// since it iterates the kinds and this one is held back from that.
+    #[cfg(test)]
+    pub(crate) fn scripted_mut(&mut self) -> &mut Scripted {
+        if !self.0.iter().any(|m| m.kind() == MultiplexerKind::Scripted) {
+            self.0.push(Multiplexer::Scripted(Scripted::default()));
+        }
+        let Some(Multiplexer::Scripted(scripted)) =
+            self.0.iter_mut().find(|m| m.kind() == MultiplexerKind::Scripted)
+        else {
+            unreachable!("just pushed, and nothing else carries that kind")
+        };
+        scripted
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted(&self) -> &Scripted {
+        let Some(Multiplexer::Scripted(scripted)) =
+            self.0.iter().find(|m| m.kind() == MultiplexerKind::Scripted)
+        else {
+            panic!("`scripted_mut` builds it; call that first")
+        };
+        scripted
     }
 
     #[cfg(test)]
