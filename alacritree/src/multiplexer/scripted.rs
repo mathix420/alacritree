@@ -19,8 +19,8 @@ use super::model::{
     StateTone, ViewState, ViewStep,
 };
 use super::{
-    CreatedPane, Launch, MultiplexerKind, MultiplexerSession, Pane, PaneKey, PaneStatus, PaneTarget,
-    Side,
+    CreatedPane, Launch, MultiplexerKind, MultiplexerSession, Pane, PaneKey, PaneStatus,
+    PaneTarget, Side,
 };
 use crate::config::{BakedGlyph, DEFAULT_SESSION_ICON, IconStyle};
 use crate::session::SessionId;
@@ -127,6 +127,12 @@ impl Scripted {
 
     pub(crate) fn show_unmatched(&mut self, show: bool) -> &mut Self {
         self.show_unmatched = show;
+        self
+    }
+
+    /// The glyph a row draws for this multiplexer.
+    pub(crate) fn set_icon(&mut self, icon: IconStyle) -> &mut Self {
+        self.icon = icon;
         self
     }
 
@@ -329,10 +335,7 @@ impl MultiplexerSession for Scripted {
     }
 
     fn gone_since(&self, side: &Side, terminal_id: &str, bound_at: Instant) -> Option<Instant> {
-        self.gone
-            .get(&(side.name(), terminal_id.to_string()))
-            .copied()
-            .filter(|at| *at > bound_at)
+        self.gone.get(&(side.name(), terminal_id.to_string())).copied().filter(|at| *at > bound_at)
     }
 
     fn pane_json(&self, side: &Side, terminal_id: &str, pane: Option<&Pane>) -> Value {

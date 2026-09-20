@@ -472,6 +472,15 @@ impl Multiplexers {
     /// The scripted multiplexer, built on first use.  `new` cannot make one,
     /// since it iterates the kinds and this one is held back from that.
     #[cfg(test)]
+    /// Drop every real multiplexer, leaving the scripted one alone in the
+    /// set.  A test about what the app does with a multiplexer then answers
+    /// only for that, rather than also for which real one ships enabled.
+    pub(crate) fn only_scripted(&mut self) -> &mut Scripted {
+        self.0.retain(|m| m.kind() == MultiplexerKind::Scripted);
+        self.scripted_mut()
+    }
+
+    #[cfg(test)]
     pub(crate) fn scripted_mut(&mut self) -> &mut Scripted {
         if !self.0.iter().any(|m| m.kind() == MultiplexerKind::Scripted) {
             self.0.push(Multiplexer::Scripted(Scripted::default()));

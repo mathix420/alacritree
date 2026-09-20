@@ -4054,8 +4054,13 @@ mod tests {
             (None, None),
         );
         app.current_workspace = Some(PathBuf::from("unopened-workspace"));
-        app.multiplexers.scripted_mut().enable().show_unmatched(true);
+        app.multiplexers.only_scripted().enable().show_unmatched(true);
         app
+    }
+
+    /// An icon styled by its glyph alone.
+    fn glyph_icon(glyph: &str) -> crate::config::IconStyle {
+        crate::config::IconStyle { glyph: Some(glyph.to_string()), ..Default::default() }
     }
 
     /// What the scripted multiplexer lists on `side`, replacing whatever it
@@ -4210,7 +4215,8 @@ mod tests {
     #[test]
     fn a_wsl_side_spells_its_distro() {
         let mut app = test_app();
-        let key = herdr_pane_key(Side::Wsl("ubuntu".into()), "t1");
+        app.multiplexers.scripted_mut().enable();
+        let key = Scripted::key(&Side::Wsl("ubuntu".into()), "t1");
         let id = app.sessions.first().expect("a session").id;
         if let Some(session) = app.sessions.iter_mut().find(|s| s.id == id) {
             session.bind_pane(key, true);
@@ -4227,16 +4233,12 @@ mod tests {
     fn the_pane_listing_carries_an_unattached_pane_with_a_null_session_id() {
         let mut app = test_app();
         app.multiplexers.scripted_mut().enable();
-        adopt_panes(
-            &mut app,
-            &Side::Native,
-            vec![
-                Scripted::pane("term-loose")
-                    .with_agent("claude", PaneStatus::Working)
-                    .with_title("loose pane")
-                    .in_dir("/repo"),
-            ],
-        );
+        adopt_panes(&mut app, &Side::Native, vec![
+            Scripted::pane("term-loose")
+                .with_agent("claude", PaneStatus::Working)
+                .with_title("loose pane")
+                .in_dir("/repo"),
+        ]);
         let json = app.multiplexer_panes_json();
         let panes = json["panes"].as_array().expect("panes array");
         assert_eq!(panes.len(), 1);
@@ -4251,16 +4253,12 @@ mod tests {
         let mut app = test_app();
         let side = Side::Native;
         app.multiplexers.scripted_mut().enable();
-        adopt_panes(
-            &mut app,
-            &side,
-            vec![
-                Scripted::pane("term-held")
-                    .with_agent("claude", PaneStatus::Working)
-                    .with_title("held pane")
-                    .in_dir("/repo"),
-            ],
-        );
+        adopt_panes(&mut app, &side, vec![
+            Scripted::pane("term-held")
+                .with_agent("claude", PaneStatus::Working)
+                .with_title("held pane")
+                .in_dir("/repo"),
+        ]);
         let id = bind_pane_fixture(&mut app, &side, "term-held");
         let json = app.multiplexer_panes_json();
         let panes = json["panes"].as_array().expect("panes array");
@@ -4288,7 +4286,7 @@ mod tests {
     #[test]
     fn attaching_to_a_side_that_names_no_server_is_refused_by_name() {
         let mut app = test_app();
-        app.multiplexers.herdr_mut_for_test().config_mut_for_test().enabled = true;
+        app.multiplexers.scripted_mut().enable();
         let (reply_tx, reply_rx) = mpsc::channel();
 
         app.defer_attach_multiplexer_pane(
@@ -4307,7 +4305,7 @@ mod tests {
     #[test]
     fn attaching_to_a_pane_no_endpoint_reports_is_refused_by_name() {
         let mut app = test_app();
-        app.multiplexers.herdr_mut_for_test().config_mut_for_test().enabled = true;
+        app.multiplexers.scripted_mut().enable();
         let (reply_tx, reply_rx) = mpsc::channel();
 
         app.defer_attach_multiplexer_pane(
@@ -4368,7 +4366,7 @@ mod tests {
     #[test]
     fn attaching_through_a_multiplexer_that_does_not_exist_is_refused_by_name() {
         let mut app = test_app();
-        app.multiplexers.herdr_mut_for_test().config_mut_for_test().enabled = true;
+        app.multiplexers.scripted_mut().enable();
         let (reply_tx, reply_rx) = mpsc::channel();
 
         app.defer_attach_multiplexer_pane(
@@ -4421,17 +4419,12 @@ mod tests {
     #[test]
     fn attaching_to_a_pane_a_session_already_holds_returns_that_session() {
         let mut app = test_app();
-        app.multiplexers.herdr_mut_for_test().config_mut_for_test().enabled = true;
+        app.multiplexers.scripted_mut().enable();
         let side = Side::Native;
-        adopt_herdr_fixture(
-            &mut app,
-            side.clone(),
-            r#"{"result":{"panes":[
-                {"terminal_id":"term-held","pane_id":"w1:p1","agent":"claude","agent_status":"working","cwd":"/repo"}
-            ]}}"#,
-            Instant::now(),
-        );
-        let id = bind_herdr_fixture(&mut app, side, "term-held");
+        adopt_panes(&mut app, &side, vec![
+            Scripted::pane("term-held").with_agent("claude", PaneStatus::Working).in_dir("/repo"),
+        ]);
+        let id = bind_pane_fixture(&mut app, &side, "term-held");
         let (reply_tx, reply_rx) = mpsc::channel();
 
         app.defer_attach_multiplexer_pane(
@@ -4449,21 +4442,16 @@ mod tests {
     #[test]
     fn attaching_without_focus_to_a_held_pane_leaves_the_screen_alone() {
         let mut app = test_app();
-        app.multiplexers.herdr_mut_for_test().config_mut_for_test().enabled = true;
+        app.multiplexers.scripted_mut().enable();
         let side = Side::Native;
-        adopt_herdr_fixture(
-            &mut app,
-            side.clone(),
-            r#"{"result":{"panes":[
-                {"terminal_id":"term-held","pane_id":"w1:p1","agent":"claude","agent_status":"working","cwd":"/repo"}
-            ]}}"#,
-            Instant::now(),
-        );
+        adopt_panes(&mut app, &side, vec![
+            Scripted::pane("term-held").with_agent("claude", PaneStatus::Working).in_dir("/repo"),
+        ]);
         let asked_from = Some(PathBuf::from("elsewhere"));
         app.current_workspace = asked_from.clone();
         let tab = app.sessions[0].id;
         app.sessions.set_active(None, tab);
-        let id = bind_herdr_fixture(&mut app, side, "term-held");
+        let id = bind_pane_fixture(&mut app, &side, "term-held");
         let (reply_tx, reply_rx) = mpsc::channel();
 
         app.defer_attach_multiplexer_pane(
@@ -4478,21 +4466,15 @@ mod tests {
         assert_eq!(app.sessions.active(&None), Some(tab));
     }
 
-    /// A background attach that has to wait on herdr leaves the workspace on
-    /// screen alone, and names its own workspace as the one a refusal
-    /// restores so a late refusal cannot move the user either.
+    /// A background attach that has to wait on the multiplexer leaves the
+    /// workspace on screen alone, and names its own workspace as the one a
+    /// refusal restores so a late refusal cannot move the user either.
     #[test]
     fn attaching_without_focus_queues_an_attach_that_stays_in_the_background() {
-        let mut app = herdr_lifecycle_app();
-        app.multiplexers.herdr_mut_for_test().config_mut_for_test().attach = AttachMode::Session;
-        adopt_herdr_fixture(
-            &mut app,
-            Side::Native,
-            r#"{"result":{"panes":[
-                {"terminal_id":"term-loose","pane_id":"w1:p1","agent":"claude","agent_status":"working","cwd":"/repo"}
-            ]}}"#,
-            Instant::now(),
-        );
+        let mut app = lifecycle_app();
+        adopt_panes(&mut app, &Side::Native, vec![
+            Scripted::pane("term-loose").with_agent("claude", PaneStatus::Working).in_dir("/repo"),
+        ]);
         let asked_from = app.current_workspace.clone();
         let (reply_tx, _reply_rx) = mpsc::channel();
 
@@ -4505,8 +4487,8 @@ mod tests {
 
         let pending = app
             .multiplexers
-            .herdr_for_test()
-            .pending_attach_for_test()
+            .scripted()
+            .pending_attach()
             .first()
             .expect("the pane queued an attach");
         assert_eq!(pending.request.focus, AttachFocus::Leave);
@@ -4517,13 +4499,13 @@ mod tests {
         assert_eq!(app.current_workspace, asked_from);
     }
 
-    /// Naming a side that no herdr server answers on is a different failure
-    /// from naming one that is not a side at all, and a caller retrying the
-    /// second is retrying a typo.
+    /// Naming a side that no server answers on is a different failure from
+    /// naming one that is not a side at all, and a caller retrying the second
+    /// is retrying a typo.
     #[test]
     fn creating_a_pane_on_a_side_that_names_no_server_is_refused_by_name() {
         let mut app = test_app();
-        app.multiplexers.herdr_mut_for_test().config_mut_for_test().enabled = true;
+        app.multiplexers.scripted_mut().enable();
         let (reply_tx, reply_rx) = mpsc::channel();
 
         app.defer_create_multiplexer_pane(
@@ -4539,8 +4521,8 @@ mod tests {
             Err("`bogus` is not a side, expected `native` or `wsl:<distro>`".to_string())
         );
         assert!(
-            app.multiplexers.herdr_for_test().pending_create_for_test().is_empty(),
-            "a refused side still asked herdr"
+            app.multiplexers.scripted().pending_create().is_empty(),
+            "a refused side still asked the multiplexer"
         );
     }
 
@@ -4622,25 +4604,20 @@ mod tests {
     }
 
     /// The side of the pane already on screen is what asking for another one
-    /// means, so a focused herdr session answers the question the request
-    /// left open.
+    /// means, so a focused multiplexer session answers the question the
+    /// request left open.
     #[test]
-    fn creating_a_pane_takes_the_side_of_the_focused_herdr_session() {
+    fn creating_a_pane_takes_the_side_of_the_focused_multiplexer_session() {
         let mut app = test_app();
-        app.multiplexers.herdr_mut_for_test().config_mut_for_test().enabled = true;
-        adopt_herdr_fixture(
-            &mut app,
-            Side::Native,
-            r#"{"result":{"panes":[
-                {"terminal_id":"term-native","pane_id":"w1:p1","agent":"claude","agent_status":"idle","cwd":"/repo"}
-            ]}}"#,
-            Instant::now(),
-        );
+        app.multiplexers.scripted_mut().enable();
+        adopt_panes(&mut app, &Side::Native, vec![
+            Scripted::pane("term-native").with_agent("claude", PaneStatus::Idle).in_dir("/repo"),
+        ]);
         let side = Side::Wsl("ubuntu".into());
-        let id = bind_herdr_fixture(&mut app, side.clone(), "term-focused");
+        let id = bind_pane_fixture(&mut app, &side, "term-focused");
         app.set_active_in_current_workspace(id);
 
-        assert_eq!(app.create_target(None, None), Ok((MultiplexerKind::Herdr, side)));
+        assert_eq!(app.create_target(None, None), Ok((MultiplexerKind::Scripted, side)));
     }
 
     /// A side whose rows are still drawn through one missed poll is still
@@ -4666,12 +4643,14 @@ mod tests {
         assert_eq!(app.create_target(None, None), Ok((MultiplexerKind::Herdr, Side::Native)));
     }
 
-    /// A worktree the sidebar does not have is refused before herdr is asked,
-    /// so a typo never leaves a pane behind in the multiplexer.
+    /// A worktree the sidebar does not have is refused before the multiplexer
+    /// is asked, so a typo never leaves a pane behind in it.
     #[test]
     fn creating_a_pane_in_an_unknown_worktree_is_refused() {
         let mut app = test_app();
-        app.multiplexers.herdr_mut_for_test().config_mut_for_test().enabled = true;
+        app.multiplexers.scripted_mut().enable();
+        let id = bind_pane_fixture(&mut app, &Side::Native, "term-focused");
+        app.set_active_in_current_workspace(id);
         let unknown = PathBuf::from("no-such-worktree");
         let (reply_tx, reply_rx) = mpsc::channel();
 
@@ -4685,20 +4664,22 @@ mod tests {
 
         assert_eq!(reply_rx.try_recv().unwrap(), Err(unknown_worktree(&unknown)));
         assert!(
-            app.multiplexers.herdr_for_test().pending_create_for_test().is_empty(),
-            "an unknown worktree still asked herdr"
+            app.multiplexers.scripted().pending_create().is_empty(),
+            "an unknown worktree still asked the multiplexer"
         );
     }
 
     /// A pane opened somewhere other than the workspace would still have its
     /// session filed under that workspace, so a workspace the distro has no
-    /// path for is refused before herdr is asked and no pane is left behind.
+    /// path for is refused before the multiplexer is asked and no pane is left
+    /// behind.
     #[test]
     fn creating_a_pane_in_a_workspace_the_distro_cannot_see_is_refused() {
         let mut app = test_app();
+        app.multiplexers.scripted_mut().enable();
         let share = PathBuf::from(r"\\fileserver\share\repo");
         app.current_workspace = Some(share.clone());
-        let id = bind_herdr_fixture(&mut app, Side::Wsl("no-such-distro".into()), "term");
+        let id = bind_pane_fixture(&mut app, &Side::Wsl("no-such-distro".into()), "term");
         app.set_active_in_current_workspace(id);
 
         app.dispatch_action(
@@ -4710,26 +4691,25 @@ mod tests {
         let expected = format!("{} has no path inside the no-such-distro distro", share.display());
         assert_eq!(app.modals.error_dialog.as_deref(), Some(expected.as_str()));
         assert!(
-            app.multiplexers.herdr_for_test().pending_create_for_test().is_empty(),
-            "an untranslatable workspace still asked herdr"
+            app.multiplexers.scripted().pending_create().is_empty(),
+            "an untranslatable workspace still asked the multiplexer"
         );
     }
 
-    /// A create herdr refused must answer whoever asked for the pane, not
-    /// just leave a dialog on a window the caller cannot see.
+    /// A create the multiplexer refused must answer whoever asked for the
+    /// pane, not just leave a dialog on a window the caller cannot see.
     #[test]
-    fn poll_herdr_create_answers_the_waiter_when_herdr_refuses() {
+    fn poll_pane_create_answers_the_waiter_when_the_multiplexer_refuses() {
         let mut app = test_app();
         let (reply_tx, reply_rx) = mpsc::channel();
-        app.multiplexers.herdr_mut_for_test().pending_create_mut_for_test().push(PendingCreate {
-            job: jobs::Job::ready(Err("boom".to_string())),
-            side: Side::Native,
-            request: crate::multiplexer::CreateRequest {
-                workspace: Some(PathBuf::from("some/workspace")),
-                waiter: Some(reply_tx),
-                focus: AttachFocus::Take,
-            },
-        });
+        app.multiplexers.scripted_mut().enable().answer_create(Err("boom".to_string()));
+        app.create_multiplexer_pane(
+            &Context::default(),
+            (MultiplexerKind::Scripted, Side::Native),
+            Some(PathBuf::from("some/workspace")),
+            Some(reply_tx),
+            AttachFocus::Take,
+        );
 
         app.poll_pane_creates(&Context::default());
 
@@ -4784,6 +4764,16 @@ mod tests {
         }
     }
 
+    /// The pane a create answers with, for the tests that follow it into its
+    /// attach.
+    fn created_pane() -> CreatedPane {
+        CreatedPane {
+            terminal_id: "term-new".into(),
+            pane_id: "w1:p2".into(),
+            tab_id: "w1:t2".into(),
+        }
+    }
+
     /// `tab create` starts a shell, and every `herdr agent` subcommand
     /// refuses a pane with no agent in it, so the pane a create just made is
     /// reached through its tab even where an agent's pane would be handed
@@ -4825,26 +4815,31 @@ mod tests {
         assert!(app.multiplexers.herdr_for_test().pending_create_for_test().is_empty());
     }
 
-    /// A created pane whose gesture herdr refuses leaves the user in the
-    /// workspace they were in, not the one the create switched to on its
+    /// A created pane whose gesture the multiplexer refuses leaves the user in
+    /// the workspace they were in, not the one the create switched to on its
     /// way, and tells whoever asked for the pane why.
     #[test]
-    fn poll_herdr_create_restores_the_workspace_when_the_gesture_is_refused() {
+    fn poll_pane_create_restores_the_workspace_when_the_gesture_is_refused() {
         let mut app = test_app();
         let (reply_tx, reply_rx) = mpsc::channel();
+        let refusal = "the pane could not be focused: no such tab".to_string();
         app.multiplexers
-            .herdr_mut_for_test()
-            .pending_create_mut_for_test()
-            .push(created_pane_fixture(Some(PathBuf::from("some/workspace")), Some(reply_tx)));
+            .scripted_mut()
+            .enable()
+            .answer_create(Ok(created_pane()))
+            .answer_attach(Err(refusal.clone()));
+        app.create_multiplexer_pane(
+            &Context::default(),
+            (MultiplexerKind::Scripted, Side::Native),
+            Some(PathBuf::from("some/workspace")),
+            Some(reply_tx),
+            AttachFocus::Take,
+        );
         app.poll_pane_creates(&Context::default());
-        let queued = app
-            .multiplexers
-            .herdr_mut_for_test()
-            .pending_attach_mut_for_test()
-            .first_mut()
-            .expect("the create queued a shared view");
-        let refusal = "herdr refused to focus the pane: no such tab".to_string();
-        queued.job = Some(jobs::Job::ready(Err(refusal.clone())));
+        assert!(
+            !app.multiplexers.scripted().pending_attach().is_empty(),
+            "the create queued a shared view"
+        );
 
         app.poll_pane_attaches(&Context::default());
 
@@ -4855,32 +4850,28 @@ mod tests {
     /// The pane a create made is still unlisted when its session opens, and
     /// an unlisted pane reads as holding an agent, so a session that worked
     /// out its own kind there would record a direct attach and never follow
-    /// herdr's focus.
+    /// the multiplexer's focus.
     #[test]
     fn a_created_pane_opens_a_session_that_shares_the_view() {
         let mut app = test_app();
         // The PTY opens on the pool, so the session's record and binding land
         // here without a client having to start.
         app.config.ui.async_session_spawn = true;
-        app.multiplexers
-            .herdr_mut_for_test()
-            .pending_create_mut_for_test()
-            .push(created_pane_fixture(None, None));
+        app.multiplexers.scripted_mut().enable().answer_create(Ok(created_pane())).answer_attach(
+            Ok(Launch { program: "alacritree-test-no-such-client".into(), argv: Vec::new() }),
+        );
+        app.create_multiplexer_pane(
+            &Context::default(),
+            (MultiplexerKind::Scripted, Side::Wsl("distro".into())),
+            None,
+            None,
+            AttachFocus::Take,
+        );
         app.poll_pane_creates(&Context::default());
-        let queued = app
-            .multiplexers
-            .herdr_mut_for_test()
-            .pending_attach_mut_for_test()
-            .first_mut()
-            .expect("the create queued a shared view");
-        queued.job = Some(jobs::Job::ready(Ok(Launch {
-            program: "alacritree-test-no-such-client".into(),
-            argv: Vec::new(),
-        })));
 
         app.poll_pane_attaches(&Context::default());
 
-        let key = herdr_pane_key(Side::Wsl("distro".into()), "term-new");
+        let key = Scripted::key(&Side::Wsl("distro".into()), "term-new");
         let id = app.pane_session(&key).expect("the gesture opened a session");
         let session = app.sessions.iter().find(|session| session.id == id).unwrap();
         assert!(session.shared_view, "the created pane's session was recorded as direct");
@@ -4927,21 +4918,20 @@ mod tests {
         assert!(pending.job.is_some(), "a background request restarted the click's gesture");
     }
 
-    /// A background create herdr refused answers its client and leaves the
-    /// user's screen alone.
+    /// A background create the multiplexer refused answers its client and
+    /// leaves the user's screen alone.
     #[test]
     fn a_refused_background_create_answers_only_its_client() {
         let mut app = test_app();
         let (reply_tx, reply_rx) = mpsc::channel();
-        app.multiplexers.herdr_mut_for_test().pending_create_mut_for_test().push(PendingCreate {
-            job: jobs::Job::ready(Err("boom".to_string())),
-            side: Side::Native,
-            request: crate::multiplexer::CreateRequest {
-                workspace: None,
-                waiter: Some(reply_tx),
-                focus: AttachFocus::Leave,
-            },
-        });
+        app.multiplexers.scripted_mut().enable().answer_create(Err("boom".to_string()));
+        app.create_multiplexer_pane(
+            &Context::default(),
+            (MultiplexerKind::Scripted, Side::Native),
+            None,
+            Some(reply_tx),
+            AttachFocus::Leave,
+        );
 
         app.poll_pane_creates(&Context::default());
 
@@ -4950,8 +4940,8 @@ mod tests {
     }
 
     /// A pane created in the background opens its session behind the tab its
-    /// workspace already shows, and the view tracker never hears it is on
-    /// screen, so nothing asks herdr to focus it until the user goes there.
+    /// workspace already shows, and the multiplexer never hears it is on
+    /// screen, so nothing asks it to focus the pane until the user goes there.
     #[test]
     fn a_pane_created_without_focus_opens_behind_the_active_tab() {
         let mut app = test_app();
@@ -4960,30 +4950,36 @@ mod tests {
         app.sessions.set_active(None, tab);
         let asked_from = Some(PathBuf::from("elsewhere"));
         app.current_workspace = asked_from.clone();
-        let mut created = created_pane_fixture(None, None);
-        created.request.focus = AttachFocus::Leave;
-        app.multiplexers.herdr_mut_for_test().pending_create_mut_for_test().push(created);
+        let side = Side::Wsl("distro".into());
+        app.multiplexers.scripted_mut().enable().answer_create(Ok(created_pane()));
+        app.create_multiplexer_pane(
+            &Context::default(),
+            (MultiplexerKind::Scripted, side.clone()),
+            None,
+            None,
+            AttachFocus::Leave,
+        );
         app.poll_pane_creates(&Context::default());
         let queued = app
             .multiplexers
-            .herdr_mut_for_test()
-            .pending_attach_mut_for_test()
-            .first_mut()
+            .scripted()
+            .pending_attach()
+            .first()
             .expect("the create queued a shared view");
         assert_eq!(queued.request.focus, AttachFocus::Leave);
-        queued.job = Some(jobs::Job::ready(Ok(Launch {
+        app.multiplexers.scripted_mut().answer_attach(Ok(Launch {
             program: "alacritree-test-no-such-client".into(),
             argv: Vec::new(),
-        })));
+        }));
 
         app.poll_pane_attaches(&Context::default());
 
-        let key = herdr_pane_key(Side::Wsl("distro".into()), "term-new");
+        let key = Scripted::key(&side, "term-new");
         let id = app.pane_session(&key).expect("the gesture opened a session");
         assert_ne!(id, tab);
         assert_eq!(app.sessions.active(&None), Some(tab));
         assert_eq!(app.current_workspace, asked_from);
-        assert_eq!(app.multiplexers.herdr_mut_for_test().view_mut_for_test().visible, None);
+        assert!(app.multiplexers.scripted().attached().is_empty());
     }
 
     #[test]
@@ -5377,24 +5373,24 @@ mod tests {
         assert!(app.multiplexers.herdr_for_test().pending_attach_for_test().is_empty());
     }
 
-    /// A shared-view gesture herdr refused must still answer whoever attached
-    /// in order to read the pane, not just clear the error dialog.
+    /// A shared-view gesture the multiplexer refused must still answer whoever
+    /// attached to read the pane, not just clear the error dialog.
     #[test]
-    fn poll_herdr_attach_sends_a_refused_gestures_error_to_every_waiter() {
+    fn poll_pane_attach_sends_a_refused_gestures_error_to_every_waiter() {
         let mut app = test_app();
-        let key = herdr_pane_key(Side::Native, "t1");
+        let key = Scripted::key(&Side::Native, "t1");
         let (reply_tx, reply_rx) = mpsc::channel();
-        app.multiplexers.herdr_mut_for_test().pending_attach_mut_for_test().push(PendingAttach {
-            job: Some(jobs::Job::ready(Err("boom".to_string()))),
-            target: PaneTarget::unlisted(&key, "w1:p1"),
+        app.multiplexers.scripted_mut().enable().answer_attach(Err("boom".to_string()));
+        let unlisted = PaneTarget::unlisted(&key, "w1:p1");
+        let switch = WorkspaceSwitch { to: None, from: None };
+        app.attach_pane(
+            &Context::default(),
             key,
-            request: AttachRequest {
-                workspace: None,
-                previous: None,
-                waiters: vec![reply_tx],
-                focus: AttachFocus::Take,
-            },
-        });
+            unlisted,
+            &switch,
+            Some(reply_tx),
+            AttachFocus::Take,
+        );
 
         app.poll_pane_attaches(&Context::default());
 
@@ -5434,27 +5430,30 @@ mod tests {
     /// attach that resolves into that refusal still owes its waiters an
     /// answer, not just the error dialog.
     #[test]
-    fn poll_herdr_attach_answers_waiters_when_the_open_fails_before_any_pty() {
+    fn poll_pane_attach_answers_waiters_when_the_open_fails_before_any_pty() {
         let mut app = test_app();
-        let key = herdr_pane_key(Side::Native, "t1");
+        let key = Scripted::key(&Side::Native, "t1");
         let workspace = PathBuf::from("this/path/does/not/exist");
         let (reply_tx, reply_rx) = mpsc::channel();
-        app.multiplexers.herdr_mut_for_test().pending_attach_mut_for_test().push(PendingAttach {
-            job: Some(jobs::Job::ready(Ok(Launch { program: "herdr".into(), argv: Vec::new() }))),
-            target: PaneTarget::unlisted(&key, "w1:p1"),
+        app.multiplexers
+            .scripted_mut()
+            .enable()
+            .answer_attach(Ok(Launch { program: "scripted".into(), argv: Vec::new() }));
+        let unlisted = PaneTarget::unlisted(&key, "w1:p1");
+        let switch = WorkspaceSwitch { to: Some(workspace.clone()), from: None };
+        app.attach_pane(
+            &Context::default(),
             key,
-            request: AttachRequest {
-                workspace: Some(workspace.clone()),
-                previous: None,
-                waiters: vec![reply_tx],
-                focus: AttachFocus::Take,
-            },
-        });
+            unlisted,
+            &switch,
+            Some(reply_tx),
+            AttachFocus::Take,
+        );
 
         app.poll_pane_attaches(&Context::default());
 
         let expected = format!(
-            "failed to attach herdr agent: worktree is no longer checked out: {}",
+            "failed to attach scripted agent: worktree is no longer checked out: {}",
             workspace.display()
         );
         assert_eq!(reply_rx.try_recv().unwrap(), Err(expected));
@@ -5465,15 +5464,13 @@ mod tests {
     /// reaching `poll_pane_attaches`, and owes its waiter the same reason: a
     /// client has no window to read the dialog in.
     #[test]
-    fn attach_herdr_agent_direct_attach_answers_a_synchronous_open_failure() {
+    fn attaching_directly_answers_a_synchronous_open_failure() {
         let mut app = test_app();
-        // A WSL side with no cache entry: the unlisted target claims an agent,
-        // so this takes the direct-attach branch with no fixture setup,
-        // unlike native on this platform.
-        let key = herdr_pane_key(Side::Wsl("distro".into()), "t1");
+        app.multiplexers.scripted_mut().enable().attach_directly(true);
+        let key = Scripted::key(&Side::Wsl("distro".into()), "t1");
         let workspace = PathBuf::from("this/path/does/not/exist");
         let expected = format!(
-            "failed to attach herdr agent: worktree is no longer checked out: {}",
+            "failed to attach scripted agent: worktree is no longer checked out: {}",
             workspace.display()
         );
         let (reply_tx, reply_rx) = mpsc::channel();
@@ -5497,33 +5494,25 @@ mod tests {
     /// a batch attach would double every row it ran on.
     #[test]
     fn attaching_every_pane_skips_the_ones_already_attached() {
-        let mut app = herdr_lifecycle_app();
-        // The mode every side shares a view under, so each pane queues a
-        // gesture rather than opening a PTY of its own.
-        app.multiplexers.herdr_mut_for_test().config_mut_for_test().attach = AttachMode::Session;
+        let mut app = lifecycle_app();
         let side = Side::Native;
-        adopt_herdr_fixture(
-            &mut app,
-            side.clone(),
-            r#"{"result":{"panes":[
-                {"terminal_id":"term-held","pane_id":"w1:p1","agent":"claude","agent_status":"working","cwd":"/repo"},
-                {"terminal_id":"term-loose","pane_id":"w1:p2","agent":"claude","agent_status":"working","cwd":"/repo"}
-            ]}}"#,
-            Instant::now(),
-        );
-        let held = bind_herdr_fixture(&mut app, side.clone(), "term-held");
+        adopt_panes(&mut app, &side, vec![
+            Scripted::pane("term-held").with_agent("claude", PaneStatus::Working).in_dir("/repo"),
+            Scripted::pane("term-loose").with_agent("claude", PaneStatus::Working).in_dir("/repo"),
+        ]);
+        let held = bind_pane_fixture(&mut app, &side, "term-held");
 
         app.attach_every_multiplexer_pane(&Context::default());
 
         let queued: Vec<&str> = app
             .multiplexers
-            .herdr_for_test()
-            .pending_attach_for_test()
+            .scripted()
+            .pending_attach()
             .iter()
             .map(|pending| pending.key.terminal_id.as_str())
             .collect();
         assert_eq!(queued, ["term-loose"]);
-        let key = herdr_pane_key(side, "term-held");
+        let key = Scripted::key(&side, "term-held");
         assert_eq!(app.pane_session(&key), Some(held));
         assert_eq!(app.sessions.len(), 1, "the held pane opened no second session");
     }
@@ -5535,24 +5524,18 @@ mod tests {
     /// in would move a user who has navigated since.
     #[test]
     fn attaching_every_pane_leaves_the_user_where_the_batch_was_asked_from() {
-        let mut app = herdr_lifecycle_app();
-        app.multiplexers.herdr_mut_for_test().config_mut_for_test().attach = AttachMode::Session;
-        adopt_herdr_fixture(
-            &mut app,
-            Side::Native,
-            r#"{"result":{"panes":[
-                {"terminal_id":"term-loose","pane_id":"w1:p1","agent":"claude","agent_status":"working","cwd":"/repo"}
-            ]}}"#,
-            Instant::now(),
-        );
+        let mut app = lifecycle_app();
+        adopt_panes(&mut app, &Side::Native, vec![
+            Scripted::pane("term-loose").with_agent("claude", PaneStatus::Working).in_dir("/repo"),
+        ]);
         let asked_from = app.current_workspace.clone();
 
         app.attach_every_multiplexer_pane(&Context::default());
 
         let pending = app
             .multiplexers
-            .herdr_for_test()
-            .pending_attach_for_test()
+            .scripted()
+            .pending_attach()
             .first()
             .expect("the loose pane queued an attach");
         assert_eq!(pending.request.workspace, None, "an unmatched pane files under Home");
@@ -5563,33 +5546,32 @@ mod tests {
         assert_eq!(app.current_workspace, asked_from);
     }
 
-    /// An empty listing is not a failure: a machine with no herdr running
-    /// must not put a dialog in front of the user for pressing a key.
+    /// An empty listing is not a failure: a machine with no multiplexer
+    /// running must not put a dialog in front of the user for pressing a key.
     #[test]
     fn attaching_every_pane_with_no_panes_detected_reports_nothing() {
         let mut app = test_app();
-        assert!(
-            app.multiplexers.herdr_mut_for_test().config_mut_for_test().enabled,
-            "else the gate explains the silence"
-        );
+        app.multiplexers.scripted_mut().enable();
+        assert!(app.multiplexers.any_enabled(), "else the gate explains the silence");
 
         app.attach_every_multiplexer_pane(&Context::default());
 
         assert!(app.modals.error_dialog.is_none());
-        assert!(app.multiplexers.herdr_for_test().pending_attach_for_test().is_empty());
+        assert!(app.multiplexers.scripted().pending_attach().is_empty());
         assert_eq!(app.sessions.len(), 1);
     }
 
     /// Closing walks the same list it mutates, so the ids have to be taken
     /// before the first close or the walk steps over its own removals.
     #[test]
-    fn detaching_every_pane_ends_every_herdr_session_and_no_other() {
+    fn detaching_every_pane_ends_every_multiplexer_session_and_no_other() {
         let mut app = test_app();
         app.config.ui.confirm_session_detach = false;
+        app.multiplexers.scripted_mut().enable();
         let shell = app.sessions.first().expect("a session").id;
         let side = Side::Native;
-        bind_herdr_fixture(&mut app, side.clone(), "term-one");
-        bind_herdr_fixture(&mut app, side, "term-two");
+        bind_pane_fixture(&mut app, &side, "term-one");
+        bind_pane_fixture(&mut app, &side, "term-two");
 
         app.detach_every_multiplexer_pane(&Context::default());
 
@@ -5603,9 +5585,10 @@ mod tests {
     fn detaching_every_pane_asks_once_for_the_whole_batch() {
         let mut app = test_app();
         assert!(app.config.ui.confirm_session_detach, "the default is to ask");
+        app.multiplexers.scripted_mut().enable();
         let side = Side::Native;
-        bind_herdr_fixture(&mut app, side.clone(), "term-one");
-        bind_herdr_fixture(&mut app, side, "term-two");
+        bind_pane_fixture(&mut app, &side, "term-one");
+        bind_pane_fixture(&mut app, &side, "term-two");
 
         app.detach_every_multiplexer_pane(&Context::default());
 
@@ -5672,12 +5655,12 @@ mod tests {
     /// A session's client was settled when it attached, so the tooltip that
     /// calls it a shared view reads that record.  The listing says only what
     /// opening the pane now would give, and a created pane reads as an
-    /// agent's until herdr lists it.
+    /// agent's until the multiplexer lists it.
     #[test]
-    fn a_shared_view_session_says_so_before_herdr_lists_its_pane() {
-        let mut app = herdr_lifecycle_app();
-        app.multiplexers.herdr_mut_for_test().config_mut_for_test().attach = AttachMode::Agent;
-        bind_herdr_fixture(&mut app, Side::Wsl("ubuntu".into()), "term-new");
+    fn a_shared_view_session_says_so_before_the_multiplexer_lists_its_pane() {
+        let mut app = lifecycle_app();
+        app.multiplexers.scripted_mut().attach_directly(true);
+        bind_pane_fixture(&mut app, &Side::Wsl("ubuntu".into()), "term-new");
 
         let managed = app.session_managed(&app.sessions[0]).expect("a bound session is managed");
 
@@ -6605,21 +6588,27 @@ mod tests {
         );
     }
 
-    /// The multiplexers with herdr enabled and listing `panes` natively.
+    /// The multiplexers with the scripted one listing `panes` natively.
     fn listing_of(panes: Vec<Pane>, show_unmatched: bool) -> Multiplexers {
-        let mut config = crate::config::IntegrationsConfig::default();
-        config.herdr.enabled = true;
-        config.herdr.show_unmatched = show_unmatched;
-        let mut multiplexers = Multiplexers::new(&config);
-        multiplexers.herdr_mut_for_test().caches_mut_for_test()[0].set_agents_for_test(panes);
+        let mut multiplexers = Multiplexers::new(&crate::config::IntegrationsConfig::default());
         multiplexers
+            .scripted_mut()
+            .enable()
+            .show_unmatched(show_unmatched)
+            .set_panes(&Side::Native, panes);
+        multiplexers
+    }
+
+    /// A listed pane with an agent in it, for the bucketing cases.
+    fn listed_agent() -> Pane {
+        Scripted::pane("term-a").with_agent("claude", PaneStatus::Idle)
     }
 
     /// `show_unmatched` is the sidebar's setting, and the palette reads the same
     /// listing, so an agent it hides is hidden from both by construction.
     #[test]
     fn an_unmatched_agent_is_absent_when_show_unmatched_is_off() {
-        let panes = vec![herdr_agent(Some("claude"))];
+        let panes = vec![listed_agent()];
         assert!(listing_of(panes.clone(), false).listed(&[], &[]).is_empty());
         assert_eq!(listing_of(panes, true).listed(&[], &[]).len(), 1);
     }
@@ -6627,8 +6616,8 @@ mod tests {
     /// An agent an open session holds is not listed: its row is that session's.
     #[test]
     fn a_claimed_agent_is_absent_from_the_listing() {
-        let agent = herdr_agent(Some("claude"));
-        let claimed = [herdr_pane_key(Side::Native, &agent.terminal_id)];
+        let agent = listed_agent();
+        let claimed = [Scripted::key(&Side::Native, &agent.terminal_id)];
         assert!(listing_of(vec![agent], true).listed(&claimed, &[]).is_empty());
     }
 
@@ -6637,7 +6626,7 @@ mod tests {
     #[test]
     fn a_matched_agent_carries_its_workspace() {
         let dir = if cfg!(windows) { r"C:\p\wt" } else { "/p/wt" };
-        let multiplexers = listing_of(vec![agent_in(dir)], true);
+        let multiplexers = listing_of(vec![listed_agent().in_dir(dir)], true);
         let workspaces = vec![PathBuf::from(dir)];
         let listed = multiplexers.listed(&[], &workspaces);
         assert_eq!(listed.len(), 1);
@@ -6707,24 +6696,21 @@ mod tests {
     }
 
     #[test]
-    fn configured_workspace_labels_and_herdr_icons_reach_palette_items() {
+    fn configured_workspace_labels_and_multiplexer_icons_reach_palette_items() {
         let workspace = Some(PathBuf::from("/repo/feature"));
-        let mut app = herdr_lifecycle_app();
+        let mut app = lifecycle_app();
         let mut project = project_with("/repo", &["/repo/feature"]);
         project.label = Some("renamed".into());
         project.worktrees[1].name = "feature".into();
         app.projects.push(project);
-        app.multiplexers.herdr_mut_for_test().config_mut_for_test().icon.glyph = Some("✦".into());
+        app.multiplexers.scripted_mut().set_icon(glyph_icon("✦"));
         let side = Side::Native;
-        adopt_herdr_fixture(
-            &mut app,
-            side.clone(),
-            r#"{"result":{"panes":[
-            {"terminal_id":"configured-term","pane_id":"w1:p1","agent":"claude","agent_status":"idle","terminal_title_stripped":"claude"}
-        ]}}"#,
-            Instant::now(),
-        );
-        let id = bind_herdr_fixture(&mut app, side, "configured-term");
+        adopt_panes(&mut app, &side, vec![
+            Scripted::pane("configured-term")
+                .with_agent("claude", PaneStatus::Idle)
+                .with_title("claude"),
+        ]);
+        let id = bind_pane_fixture(&mut app, &side, "configured-term");
         app.sessions[0].working_directory = workspace;
         let items = app.palette_items();
         let item =
@@ -6735,14 +6721,14 @@ mod tests {
             ("claude", Some("✦ renamed / feature"))
         );
 
-        app.multiplexers.herdr_mut_for_test().config_mut_for_test().icon.glyph = Some("  ".into());
+        app.multiplexers.scripted_mut().set_icon(glyph_icon("  "));
         let items = app.palette_items();
         let item =
             items.iter().find(|item| item.action == PaletteAction::ActivateSession(id)).unwrap();
         assert_eq!(
             item.subtitle.as_deref(),
             Some(
-                format!("{} renamed / feature", crate::config::DEFAULT_HERDR_ICON.as_str())
+                format!("{} renamed / feature", crate::config::DEFAULT_SESSION_ICON.as_str())
                     .as_str()
             )
         );
@@ -7079,7 +7065,7 @@ mod tests {
         let wt = ws("/a/wt1");
         let listed =
             sidebar_nav::ListedRows::from([(wt.clone(), vec![sidebar_nav::WorkspaceEntry::Pane(
-                herdr_pane_key(Side::Native, "term_a"),
+                Scripted::key(&Side::Native, "term_a"),
             )])]);
         assert!(!sessions_filter_passes(&[], &listed, &wt, false));
         assert!(sessions_filter_passes(&[], &listed, &wt, true));
@@ -8192,17 +8178,17 @@ mod tests {
         );
     }
 
-    /// Same lockstep hazard, with the doomed worktree carrying a herdr row:
+    /// Same lockstep hazard, with the doomed worktree carrying a pane row:
     /// the agent rows it owns have to be stepped over as well.
     #[test]
-    fn rows_below_a_deleted_worktree_with_a_herdr_row_stay_navigable() {
+    fn rows_below_a_deleted_worktree_with_a_pane_row_stay_navigable() {
         use crate::sidebar_nav::{self, SidebarRow};
 
         let projects =
             vec![sidebar_nav::tests::project("/a", true, &["/a/wt1", "/a/wt2", "/a/wt3"])];
         let doomed = PathBuf::from("/a/wt2");
         let listed = sidebar_nav::ListedRows::from([(Some(doomed.clone()), vec![
-            sidebar_nav::WorkspaceEntry::Pane(herdr_pane_key(Side::Native, "term_doomed")),
+            sidebar_nav::WorkspaceEntry::Pane(Scripted::key(&Side::Native, "term_doomed")),
         ])]);
         let rows = sidebar_nav::visible_rows(&projects, &listed);
         let snapshot = build_sidebar_snapshot(
