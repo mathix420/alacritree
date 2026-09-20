@@ -78,9 +78,9 @@
       "wsl_path": null
     },
     "herdr": {
-      "attach": "Agent",
+      "attach": "agent",
       "enabled": true,
-      "follow_focus": "Herdr",
+      "follow_focus": "herdr",
       "icon": {
         "bold": false,
         "color": null,
@@ -243,7 +243,7 @@
       "nanos": 0,
       "secs": 0
     },
-    "confirm_session_close": "Never",
+    "confirm_session_close": "never",
     "confirm_session_detach": true,
     "decorations": {
       "strikeout_position": {
@@ -265,7 +265,7 @@
       "scratchpad": true,
       "sidebar": true,
       "spelling": {
-        "quote": "Auto",
+        "quote": "auto",
         "wsl_translate": true
       },
       "terminal": true
@@ -278,7 +278,7 @@
     },
     "focus_priority_boost": false,
     "gpu_grid": false,
-    "hold_exited_sessions": "Never",
+    "hold_exited_sessions": "never",
     "icon_tooltips": true,
     "icons": {
       "add_project": {
@@ -443,7 +443,7 @@
         "size": null
       }
     },
-    "last_session_close": "Respawn",
+    "last_session_close": "respawn",
     "notifications": true,
     "paste": {
       "files": true,
@@ -452,14 +452,14 @@
       "image_keep": 20
     },
     "path_style": {
-      "diff_title": "Full",
+      "diff_title": "full",
       "filename": {
         "bold": false,
         "color": null,
         "italic": false
       },
-      "git_header": "Full",
-      "git_rows": "Full",
+      "git_header": "full",
+      "git_rows": "full",
       "parent": {
         "bold": false,
         "color": null,
@@ -468,9 +468,9 @@
     },
     "project_name": null,
     "reap_descendants_on_close": false,
-    "scrollbar": "Floating",
-    "search_depth": "Workspaces",
-    "search_scope": "Filtered",
+    "scrollbar": "floating",
+    "search_depth": "workspaces",
+    "search_scope": "filtered",
     "session_display": {
       "palette_marks": false,
       "sidebar_always": false,
@@ -478,7 +478,7 @@
     },
     "session_reorder": {
       "drag": false,
-      "scope": "Workspace"
+      "scope": "workspace"
     },
     "sessions_filter_counts_detached": false,
     "sidebar_accent": null,
@@ -486,11 +486,11 @@
     "sidebar_background": null,
     "sidebar_border": null,
     "sidebar_click_focus": false,
-    "sidebar_focus": "Preserve",
+    "sidebar_focus": "preserve",
     "sidebar_follow_active": false,
     "sidebar_foreground": null,
-    "sidebar_scroll_align": "Minimal",
-    "sidebar_tooltips": "Elided",
+    "sidebar_scroll_align": "minimal",
+    "sidebar_tooltips": "elided",
     "upstream_status": false,
     "vsync": true,
     "worktree_liveness": true,

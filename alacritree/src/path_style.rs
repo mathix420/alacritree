@@ -9,6 +9,7 @@ use strum::{EnumIter, IntoStaticStr};
 /// How a path is spelled to the user.  `Full` is the identity and the
 /// default, so an unmodified config renders exactly what it renders today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[serde(into = "&'static str")]
 #[strum(serialize_all = "snake_case")]
 pub enum PathStyle {
     #[default]
