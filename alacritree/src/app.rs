@@ -4106,12 +4106,13 @@ mod tests {
         app.multiplexers.herdr_mut_for_test().adopt_listing_for_test(&side, json, at);
     }
 
-    /// A herdr pane's row as the sidebar builds it, with herdr opening rows
-    /// under `attach`.
-    fn herdr_row(pane: &Pane, side: Side, attach: AttachMode) -> PaneRowData {
+    /// A pane's row as the sidebar builds it.  `shared_view` is what a
+    /// multiplexer answers when opening the row shows someone else's pane
+    /// rather than handing over the pane itself.
+    fn pane_row(pane: &Pane, side: Side, shared_view: bool) -> PaneRowData {
         let mut multiplexers = Multiplexers::new(&crate::config::IntegrationsConfig::default());
-        multiplexers.herdr_mut_for_test().config_mut_for_test().attach = attach;
-        let key = herdr_pane_key(side, &pane.terminal_id);
+        multiplexers.only_scripted().enable().attach_directly(!shared_view);
+        let key = Scripted::key(&side, &pane.terminal_id);
         let managed = multiplexers.get(key.multiplexer).managed(&key.side, Some(pane));
         PaneRowData::new(key, pane, managed)
     }
@@ -4195,7 +4196,7 @@ mod tests {
     }
 
     #[test]
-    fn a_herdr_backed_session_names_its_side_and_terminal() {
+    fn a_pane_backed_session_names_its_side_and_terminal() {
         let mut app = test_app();
         let key = herdr_pane_key(Side::Native, "t7");
         let id = app.sessions.first().expect("a session").id;
@@ -6563,15 +6564,15 @@ mod tests {
         assert_eq!(session_row_title("✳ ", agent), "✳ ");
     }
 
-    use crate::test_util::{herdr_agent, titled_herdr_agent as titled};
+    use crate::test_util::{listed_agent, titled_agent as titled};
 
     /// An agent with a working directory, for the bucketing cases.
     fn agent_in(dir: &str) -> Pane {
-        Pane { cwd: Some(dir.into()), ..herdr_agent(Some("claude")) }
+        Pane { cwd: Some(dir.into()), ..listed_agent(Some("claude")) }
     }
 
     #[test]
-    fn untitled_herdr_panes_promote_their_directory() {
+    fn untitled_panes_promote_their_directory() {
         let agent = agent_in("/home/dev/Git/devkit");
         let content = pane_palette_content(
             agent.title.clone(),
@@ -6600,7 +6601,7 @@ mod tests {
     }
 
     /// A listed pane with an agent in it, for the bucketing cases.
-    fn listed_agent() -> Pane {
+    fn bucketing_agent() -> Pane {
         Scripted::pane("term-a").with_agent("claude", PaneStatus::Idle)
     }
 
@@ -6608,7 +6609,7 @@ mod tests {
     /// listing, so an agent it hides is hidden from both by construction.
     #[test]
     fn an_unmatched_agent_is_absent_when_show_unmatched_is_off() {
-        let panes = vec![listed_agent()];
+        let panes = vec![bucketing_agent()];
         assert!(listing_of(panes.clone(), false).listed(&[], &[]).is_empty());
         assert_eq!(listing_of(panes, true).listed(&[], &[]).len(), 1);
     }
@@ -6616,7 +6617,7 @@ mod tests {
     /// An agent an open session holds is not listed: its row is that session's.
     #[test]
     fn a_claimed_agent_is_absent_from_the_listing() {
-        let agent = listed_agent();
+        let agent = bucketing_agent();
         let claimed = [Scripted::key(&Side::Native, &agent.terminal_id)];
         assert!(listing_of(vec![agent], true).listed(&claimed, &[]).is_empty());
     }
@@ -6626,7 +6627,7 @@ mod tests {
     #[test]
     fn a_matched_agent_carries_its_workspace() {
         let dir = if cfg!(windows) { r"C:\p\wt" } else { "/p/wt" };
-        let multiplexers = listing_of(vec![listed_agent().in_dir(dir)], true);
+        let multiplexers = listing_of(vec![bucketing_agent().in_dir(dir)], true);
         let workspaces = vec![PathBuf::from(dir)];
         let listed = multiplexers.listed(&[], &workspaces);
         assert_eq!(listed.len(), 1);
@@ -6642,31 +6643,22 @@ mod tests {
     }
 
     #[test]
-    fn herdr_row_name_prefers_the_reported_kind() {
-        let row = herdr_row(&herdr_agent(Some("claude")), Side::Native, AttachMode::Agent);
+    fn a_row_is_named_by_the_reported_kind() {
+        let row = pane_row(&listed_agent(Some("claude")), Side::Native, false);
         assert_eq!(row.name, RowName::plain("claude".into()));
     }
 
     #[test]
-    fn herdr_row_name_falls_back_to_the_terminal_id_tail() {
-        let row = herdr_row(&herdr_agent(None), Side::Native, AttachMode::Agent);
+    fn a_row_name_falls_back_to_the_terminal_id_tail() {
+        let row = pane_row(&listed_agent(None), Side::Native, false);
         assert_eq!(row.name, RowName::plain("300361".into()));
-    }
-
-    #[test]
-    fn herdr_row_shared_view_follows_can_attach() {
-        let native = herdr_row(&herdr_agent(None), Side::Native, AttachMode::Agent);
-        assert_eq!(native.managed.shared_view, cfg!(windows));
-
-        let wsl = herdr_row(&herdr_agent(None), Side::Wsl("d".into()), AttachMode::Agent);
-        assert!(!wsl.managed.shared_view);
     }
 
     /// Asking for the session is honoured on a side that could have attached
     /// directly: the capability says what is possible, the config what to do.
     #[test]
-    fn herdr_row_shared_view_follows_the_configured_attach_mode() {
-        let row = herdr_row(&herdr_agent(None), Side::Wsl("d".into()), AttachMode::Session);
+    fn a_row_shares_the_view_when_the_multiplexer_says_so() {
+        let row = pane_row(&listed_agent(None), Side::Wsl("d".into()), true);
         assert!(row.managed.shared_view);
     }
 
@@ -6674,7 +6666,7 @@ mod tests {
     /// rather than resolving a title themselves, so pinning its output here
     /// pins what all three show.
     #[test]
-    fn herdr_display_name_prefers_the_title() {
+    fn a_display_name_prefers_the_title() {
         let agent = titled(Some("claude"), Some("primary"));
         assert_eq!(pane_display_name(&agent), RowName {
             text: "primary".into(),
@@ -6683,16 +6675,16 @@ mod tests {
     }
 
     #[test]
-    fn herdr_display_name_falls_back_to_the_kind_without_a_title() {
+    fn a_display_name_falls_back_to_the_kind_without_a_title() {
         assert_eq!(
-            pane_display_name(&herdr_agent(Some("claude"))),
+            pane_display_name(&listed_agent(Some("claude"))),
             RowName::plain("claude".into())
         );
     }
 
     #[test]
-    fn herdr_display_name_falls_back_to_the_terminal_id_tail_without_a_kind() {
-        assert_eq!(pane_display_name(&herdr_agent(None)), RowName::plain("300361".into()));
+    fn a_display_name_falls_back_to_the_terminal_id_tail_without_a_kind() {
+        assert_eq!(pane_display_name(&listed_agent(None)), RowName::plain("300361".into()));
     }
 
     #[test]
@@ -6763,7 +6755,7 @@ mod tests {
     }
 
     fn row_of(kind: Option<&str>, title: Option<&str>) -> PaneRowData {
-        herdr_row(&titled(kind, title), Side::Wsl("d".into()), AttachMode::Agent)
+        pane_row(&titled(kind, title), Side::Wsl("d".into()), false)
     }
 
     /// The kind is a category and the title is an identity, so the title takes
@@ -6814,27 +6806,20 @@ mod tests {
             status: Some(PaneStatus::Working),
             ..titled(Some("claude"), Some("Claude Code"))
         };
-        let mut row = herdr_row(&agent, Side::Wsl("d".into()), AttachMode::Agent);
-        assert_eq!(managed_tooltip(&row.managed), r#"working, herdr, `claude` "Claude Code"."#);
+        let mut row = pane_row(&agent, Side::Wsl("d".into()), false);
+        assert_eq!(managed_tooltip(&row.managed), r#"working, scripted, `claude` "Claude Code"."#);
 
         row.managed.detach = Some("Ctrl+B q".to_string());
         assert_eq!(
             managed_tooltip(&row.managed),
-            r#"working, herdr, `claude` "Claude Code". (detach with `Ctrl+B q`)"#
+            r#"working, scripted, `claude` "Claude Code". (detach with `Ctrl+B q`)"#
         );
 
         row.managed.shared_view = true;
         assert_eq!(
             managed_tooltip(&row.managed),
-            r#"working, herdr, shared view, `claude` "Claude Code". (detach with `Ctrl+B q`)"#
+            r#"working, scripted, shared view, `claude` "Claude Code". (detach with `Ctrl+B q`)"#
         );
-    }
-
-    /// A pane whose title says no more than its kind is named once.
-    #[test]
-    fn the_tooltip_does_not_say_the_kind_twice() {
-        let row = row_of(Some("codex"), Some("codex"));
-        assert_eq!(managed_tooltip(&row.managed), "idle, herdr, `codex`.");
     }
 
     /// Losing a view costs a click to get back and losing a shell costs the
@@ -6861,7 +6846,7 @@ mod tests {
     /// than folded into the workspace row, which would leave a hole in a list
     /// its neighbour is already in.
     #[test]
-    fn a_herdr_row_is_listed_whatever_the_threshold_says() {
+    fn a_pane_row_is_listed_whatever_the_threshold_says() {
         let lone = workspace_entries(&[], vec![at(0, agent_entry("t1"))], false);
         assert_eq!(lone, vec![agent_entry("t1")]);
 
@@ -8131,7 +8116,7 @@ mod tests {
     /// on the first agent row, which marks every row below it unprojected and
     /// leaves the cursor with no node to sit on.
     #[test]
-    fn herdr_rows_are_projected_under_the_workspace_they_are_listed_in() {
+    fn pane_rows_are_projected_under_the_workspace_they_are_listed_in() {
         use crate::sidebar_focus::Parent;
         use crate::sidebar_nav::{self, SidebarRow};
 
@@ -8688,7 +8673,7 @@ mod tests {
     /// here.
     #[test]
     fn session_status_mark_leaves_an_agentless_pane_unmarked() {
-        let managed = herdr_row(&shell_pane(), Side::Native, AttachMode::Agent).managed;
+        let managed = pane_row(&shell_pane(), Side::Native, false).managed;
         assert_eq!(managed.mark, None);
         let status = RowStatus {
             attention: false,
@@ -8704,7 +8689,7 @@ mod tests {
     /// managed row the way it did while every listed pane had a state.
     #[test]
     fn an_agentless_pane_falls_through_to_the_local_agent_reading() {
-        let managed = herdr_row(&shell_pane(), Side::Native, AttachMode::Agent).managed;
+        let managed = pane_row(&shell_pane(), Side::Native, false).managed;
         let activity = SessionActivity::agent(Some("claude"), LiveState::Working);
         assert_eq!(pane_backed_activity(activity, None), activity);
         let status = RowStatus { attention: false, activity, managed: Some(&managed) };
@@ -8772,16 +8757,14 @@ mod tests {
         );
     }
 
-    /// The pane is still herdr's, which is what the row's mark says; the
-    /// state is the part there is nothing to report.  Every `herdr agent`
-    /// subcommand resolves its target through the agent registry, so the
-    /// attach shares herdr's view even on a side that attaches directly.
+    /// The pane is still the multiplexer's, which is what the row says; the
+    /// state is the part there is nothing to report.
     #[test]
     fn an_agentless_pane_paints_no_state_and_shares_the_view() {
-        let row = herdr_row(&shell_pane(), Side::Wsl("d".into()), AttachMode::Agent);
+        let row = pane_row(&shell_pane(), Side::Wsl("d".into()), true);
         assert_eq!(row.managed.mark, None);
         assert!(row.managed.shared_view);
-        assert_eq!(managed_tooltip(&row.managed), r#"herdr, shared view, "~/G/g/alacritree"."#);
+        assert_eq!(managed_tooltip(&row.managed), r#"scripted, shared view, "~/G/g/alacritree"."#);
     }
 
     #[test]

@@ -1,32 +1,40 @@
 //! Shared fixtures: scratch space on disk, a real repository with worktrees,
-//! and the herdr agents the row models and the render pass both name.
+//! and the listed panes the row models and the render pass both name.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use git2::Repository;
 
-use crate::config::{AttachMode, IntegrationsConfig};
+use crate::config::IntegrationsConfig;
 use crate::herdr;
 use crate::multiplexer::{
-    Managed, MultiplexerKind, MultiplexerSession, Multiplexers, Pane, PaneKey, PaneStatus, Side,
+    Managed, MultiplexerKind, MultiplexerSession, Multiplexers, Pane, PaneKey, PaneStatus,
+    Scripted, Side,
 };
 
-/// The key a herdr pane on `side` is known by.
+/// The key a pane on `side` is known by, in the multiplexer a test scripts.
+pub(crate) fn pane_key(side: Side, terminal_id: &str) -> PaneKey {
+    Scripted::key(&side, terminal_id)
+}
+
+/// The key a herdr pane on `side` is known by, for the tests that are about
+/// herdr rather than about what the app does with a multiplexer.
 pub(crate) fn herdr_pane_key(side: Side, terminal_id: &str) -> PaneKey {
     herdr::pane_key(side, terminal_id.to_string())
 }
 
-/// How a row describes a herdr pane on `side`, with herdr opening rows under
-/// `attach` and no config read from the server yet.
-pub(crate) fn herdr_managed(pane: &Pane, side: &Side, attach: AttachMode) -> Managed {
+/// How a row describes a pane on `side`.  `shared_view` is what a multiplexer
+/// answers when opening the row shows someone else's pane rather than handing
+/// over the pane itself.
+pub(crate) fn managed(pane: &Pane, side: &Side, shared_view: bool) -> Managed {
     let mut multiplexers = Multiplexers::new(&IntegrationsConfig::default());
-    multiplexers.herdr_mut_for_test().config_mut_for_test().attach = attach;
-    multiplexers.get(MultiplexerKind::Herdr).managed(side, Some(pane))
+    multiplexers.only_scripted().enable().attach_directly(!shared_view);
+    multiplexers.get(MultiplexerKind::Scripted).managed(side, Some(pane))
 }
 
 /// An idle agent on a native endpoint, the base every other agent varies from.
-pub(crate) fn herdr_agent(kind: Option<&str>) -> Pane {
+pub(crate) fn listed_agent(kind: Option<&str>) -> Pane {
     Pane {
         terminal_id: "term_65abfc8e300361".into(),
         pane_id: "w5:p1".into(),
@@ -41,8 +49,8 @@ pub(crate) fn herdr_agent(kind: Option<&str>) -> Pane {
 }
 
 /// An agent carrying a title, for the naming cases.
-pub(crate) fn titled_herdr_agent(kind: Option<&str>, title: Option<&str>) -> Pane {
-    Pane { title: title.map(String::from), ..herdr_agent(kind) }
+pub(crate) fn titled_agent(kind: Option<&str>, title: Option<&str>) -> Pane {
+    Pane { title: title.map(String::from), ..listed_agent(kind) }
 }
 
 /// Test scratch directories are named for the process that owns them.

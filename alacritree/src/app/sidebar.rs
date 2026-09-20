@@ -2581,7 +2581,7 @@ mod tests {
     fn pane_display_name_keeps_a_short_terminal_id_whole() {
         // `saturating_sub(6)` exists precisely for ids shorter than the tail
         // it takes; a plain `- 6` would panic on this one.
-        let agent = Pane { terminal_id: "t1".into(), ..crate::test_util::herdr_agent(None) };
+        let agent = Pane { terminal_id: "t1".into(), ..crate::test_util::listed_agent(None) };
         assert_eq!(pane_display_name(&agent), RowName::plain("t1".into()));
     }
 
@@ -2620,7 +2620,7 @@ mod tests {
     fn sessions_filter_counts_a_detached_agent_bucketed_under_home() {
         let listed =
             sidebar_nav::ListedRows::from([(None, vec![sidebar_nav::WorkspaceEntry::Pane(
-                crate::test_util::herdr_pane_key(Side::Native, "term_home"),
+                crate::test_util::pane_key(Side::Native, "term_home"),
             )])]);
         assert!(sessions_filter_passes(&[], &listed, &None, true));
     }

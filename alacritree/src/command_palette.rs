@@ -759,14 +759,14 @@ mod tests {
 
     fn attach(id: &str) -> PaneAttach {
         PaneAttach {
-            key: crate::test_util::herdr_pane_key(crate::multiplexer::Side::Native, id),
+            key: crate::test_util::pane_key(crate::multiplexer::Side::Native, id),
             pane_id: "w5:p1".into(),
             workspace: None,
         }
     }
 
     #[test]
-    fn typing_herdr_ranks_attached_and_unattached_rows() {
+    fn typing_a_multiplexers_name_ranks_attached_and_unattached_rows() {
         let items = vec![
             PaletteItem::session(
                 1,
@@ -776,7 +776,7 @@ mod tests {
                 "hover".into(),
                 Some("claude"),
                 None,
-                Some(MultiplexerKind::Herdr),
+                Some(MultiplexerKind::Scripted),
             ),
             PaletteItem::pane(
                 attach("t1"),
@@ -798,7 +798,7 @@ mod tests {
             ),
         ];
         let mut palette = CommandPalette::new();
-        palette.query_mut().push_str("herdr");
+        palette.query_mut().push_str("scripted");
         let ranked = palette.rank(&items);
         assert!(ranked.contains(&0), "the attached row is missing");
         assert!(ranked.contains(&1), "the unattached row is missing");

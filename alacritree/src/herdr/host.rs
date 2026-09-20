@@ -535,6 +535,35 @@ mod tests {
         assert_eq!(herdr.open_directly(&pane(wsl, false)), None);
     }
 
+    /// A title saying no more than the kind is dropped, so the row names the
+    /// agent once rather than twice.
+    #[test]
+    fn a_title_repeating_the_kind_is_not_reported() {
+        let herdr = herdr(AttachMode::Agent);
+        let repeated = crate::test_util::titled_agent(Some("codex"), Some("codex"));
+        assert_eq!(herdr.managed(&Side::Native, Some(&repeated)).title, None);
+
+        let distinct = crate::test_util::titled_agent(Some("codex"), Some("primary"));
+        assert_eq!(
+            herdr.managed(&Side::Native, Some(&distinct)).title.as_deref(),
+            Some("primary")
+        );
+    }
+
+    /// A row shares herdr's view wherever a direct attach is impossible, and
+    /// on Windows a native pane is exactly that case.
+    #[test]
+    fn a_row_shares_the_view_wherever_a_pane_cannot_be_handed_over() {
+        let herdr = herdr(AttachMode::Agent);
+        let agent = crate::test_util::listed_agent(None);
+
+        let native = herdr.managed(&Side::Native, Some(&agent));
+        assert_eq!(native.shared_view, cfg!(windows));
+
+        let wsl = herdr.managed(&Side::Wsl("d".into()), Some(&agent));
+        assert!(!wsl.shared_view);
+    }
+
     /// The configured attach mode outranks capability in one direction only:
     /// asking for a shared view always gets one, and no user is handed a
     /// direct attach they did not ask for.

@@ -822,7 +822,7 @@ pub(super) fn not_a_side(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::herdr_agent;
+    use crate::test_util::listed_agent;
 
     /// The click switched workspace before handing the gesture over, so a
     /// failure puts the user back where the click found them.
@@ -880,7 +880,7 @@ mod tests {
         let workspaces = pane_workspaces(&projects, |path| Some(path == gone));
         assert_eq!(workspaces, vec![PathBuf::from("/a/wt1")]);
 
-        let pane = Pane { cwd: Some(gone.to_string_lossy().into_owned()), ..herdr_agent(None) };
+        let pane = Pane { cwd: Some(gone.to_string_lossy().into_owned()), ..listed_agent(None) };
         let matched = pane.workspace(&Side::Native, &workspaces);
         assert_eq!(matched, None, "a pane under a removed checkout falls back to Home");
     }

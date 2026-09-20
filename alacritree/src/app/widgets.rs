@@ -505,7 +505,7 @@ mod tests {
     use super::*;
     use crate::config::AttachMode;
     use crate::multiplexer::{Pane, PaneStatus, Side};
-    use crate::test_util::{herdr_agent, herdr_managed};
+    use crate::test_util::{listed_agent, managed};
 
     /// A native agent's mark is coloured by the state it reports, the same
     /// way a harness-backed row's mark is, so two rows in one state never
@@ -528,8 +528,8 @@ mod tests {
     /// included — a state that wants a human cannot also be quiet.
     #[test]
     fn session_status_mark_puts_attention_first() {
-        let agent = herdr_agent(Some("claude"));
-        let managed = herdr_managed(&agent, &Side::Native, AttachMode::Agent);
+        let agent = listed_agent(Some("claude"));
+        let managed = managed(&agent, &Side::Native, false);
         let status = RowStatus {
             attention: true,
             activity: SessionActivity::Shell,
@@ -545,8 +545,8 @@ mod tests {
     /// disagree about what a pane is doing.
     #[test]
     fn session_status_mark_matches_the_sidebar_for_a_pane_backed_session() {
-        let agent = Pane { status: Some(PaneStatus::Working), ..herdr_agent(Some("claude")) };
-        let managed = herdr_managed(&agent, &Side::Native, AttachMode::Agent);
+        let agent = Pane { status: Some(PaneStatus::Working), ..listed_agent(Some("claude")) };
+        let managed = managed(&agent, &Side::Native, false);
         let activity = SessionActivity::agent(Some("claude"), LiveState::Idle);
         let status = RowStatus { attention: false, activity, managed: Some(&managed) };
         let (mark, hint) =

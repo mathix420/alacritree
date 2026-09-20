@@ -1013,7 +1013,7 @@ fn shell_state_for(kind: &SessionKind, busy: bool) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{herdr_agent, herdr_pane_key, titled_herdr_agent as titled};
+    use crate::test_util::{listed_agent, pane_key, titled_agent as titled};
 
     /// The mark has a gutter of its own ahead of the description.  A gutter
     /// only as wide as the glyph leaves the label butted against the mark.
@@ -1109,7 +1109,7 @@ mod tests {
 
     #[test]
     fn untitled_herdr_panes_without_a_directory_use_home() {
-        let agent = herdr_agent(Some("claude"));
+        let agent = listed_agent(Some("claude"));
         let content = pane_palette_content(
             agent.title.clone(),
             &agent,
@@ -1155,7 +1155,7 @@ mod tests {
             );
             items.push(PaletteItem::pane(
                 command_palette::PaneAttach {
-                    key: herdr_pane_key(side.clone(), &agent.terminal_id),
+                    key: pane_key(side.clone(), &agent.terminal_id),
                     pane_id: agent.pane_id.clone(),
                     workspace,
                 },
@@ -1190,7 +1190,7 @@ mod tests {
     #[test]
     fn untitled_herdr_panes_promote_home_before_terminal_id_fallback() {
         let agent =
-            Pane { kind: None, title: None, cwd: None, foreground_cwd: None, ..herdr_agent(None) };
+            Pane { kind: None, title: None, cwd: None, foreground_cwd: None, ..listed_agent(None) };
         let content = pane_palette_content(
             agent.title.clone(),
             &agent,
@@ -1202,7 +1202,7 @@ mod tests {
         );
         let item = PaletteItem::pane(
             command_palette::PaneAttach {
-                key: herdr_pane_key(Side::Native, &agent.terminal_id),
+                key: pane_key(Side::Native, &agent.terminal_id),
                 pane_id: agent.pane_id.clone(),
                 workspace: None,
             },
@@ -1221,7 +1221,7 @@ mod tests {
     /// blank string must fall through exactly like no title at all.
     #[test]
     fn attached_untitled_herdr_panes_promote_home_and_keep_their_glyph() {
-        let agent = herdr_agent(None);
+        let agent = listed_agent(None);
         let content = pane_palette_content(
             Some(String::new()),
             &agent,
@@ -1239,7 +1239,7 @@ mod tests {
     /// title for still keeps that name instead of losing it to the workspace.
     #[test]
     fn an_attached_panes_pty_title_survives_a_titleless_herdr_report() {
-        let agent = herdr_agent(None);
+        let agent = listed_agent(None);
         let content = pane_palette_content(
             Some("vim src/main.rs".into()),
             &agent,
@@ -1257,7 +1257,7 @@ mod tests {
 
     #[test]
     fn configured_workspace_label_and_herdr_glyph_survive_untitled_rows() {
-        let agent = herdr_agent(Some("claude"));
+        let agent = listed_agent(Some("claude"));
         let content = pane_palette_content(
             agent.title.clone(),
             &agent,
