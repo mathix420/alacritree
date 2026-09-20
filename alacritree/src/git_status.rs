@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use git2::{Delta, DiffOptions, Repository, Status, StatusOptions};
 
+use crate::default_branch::{self, Evidence, WellKnown};
 use crate::repaint::Repaint;
 use crate::{jobs, wsl};
 
@@ -387,29 +388,32 @@ fn current_branch_name(repo: &Repository) -> Option<String> {
     }
 }
 
-/// Mirrors `projects::detect_default_branch` — see that function for the
-/// rationale behind the ordering.
+/// What git2 can see about this repository's default branch, ranked by
+/// [`default_branch::resolve`].
 fn detect_default_branch(repo: &Repository) -> Option<String> {
-    if let Ok(reference) = repo.find_reference("refs/remotes/origin/HEAD") {
-        if let Some(target) = reference.symbolic_target() {
-            if let Some(name) = target.strip_prefix("refs/remotes/origin/") {
-                return Some(name.to_string());
-            }
-        }
-    }
-    for c in ["main", "master", "trunk", "develop"] {
-        if repo.find_reference(&format!("refs/heads/{c}")).is_ok() {
-            return Some(c.to_string());
-        }
-    }
-    if let Ok(cfg) = repo.config() {
-        if let Ok(name) = cfg.get_string("init.defaultBranch") {
-            if !name.is_empty() && repo.find_reference(&format!("refs/heads/{name}")).is_ok() {
-                return Some(name);
-            }
-        }
-    }
-    None
+    let has = |name: &str| repo.find_reference(&format!("refs/heads/{name}")).is_ok();
+
+    let origin_head = repo
+        .find_reference("refs/remotes/origin/HEAD")
+        .ok()
+        .and_then(|r| r.symbolic_target().map(str::to_string))
+        .and_then(|t| t.strip_prefix("refs/remotes/origin/").map(str::to_string));
+
+    let present: Vec<&str> =
+        WellKnown::ALL.iter().map(|c| c.as_str()).filter(|name| has(name)).collect();
+
+    let init_default = repo
+        .config()
+        .ok()
+        .and_then(|cfg| cfg.get_string("init.defaultBranch").ok())
+        .filter(|name| !name.is_empty() && has(name));
+
+    default_branch::resolve(&Evidence {
+        origin_head: origin_head.as_deref(),
+        present,
+        init_default: init_default.as_deref(),
+        ..Evidence::default()
+    })
 }
 
 fn staged_kind(s: Status) -> Option<ChangeKind> {
@@ -522,44 +526,37 @@ fn diff_against_branch(
     Ok((accum.into_inner().stats, resolved))
 }
 
-/// Sections: 0 current branch (short OID when detached), 1 porcelain-v2
-/// status, 2 effective default branch (the hint, or detection replicating
-/// `detect_default_branch`), 3 the resolved base ref (origin-first, like
-/// `resolve_base_commit`), 4 numstat against the merge base (`...` = git's
-/// merge-base triple-dot, preserving `diff_against_branch` semantics).
-const STATUS_SCRIPT: &str = r#"
-p="$1"; hint="$2"
-sep() { printf '\n@@ALACRITREE@@\n'; }
-git -C "$p" symbolic-ref --short HEAD 2>/dev/null || git -C "$p" rev-parse --short=7 HEAD 2>/dev/null
-sep
-git -C "$p" status --porcelain=v2 -z 2>/dev/null
-sep
-if [ -z "$hint" ]; then
-  h=$(git -C "$p" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null)
-  h="${h#refs/remotes/origin/}"
-  if [ -z "$h" ]; then
-    for c in main master trunk develop; do
-      if git -C "$p" rev-parse --verify --quiet "refs/heads/$c" >/dev/null 2>&1; then h="$c"; break; fi
-    done
-  fi
-  if [ -z "$h" ]; then
-    c=$(git -C "$p" config init.defaultBranch 2>/dev/null)
-    if [ -n "$c" ] && git -C "$p" rev-parse --verify --quiet "refs/heads/$c" >/dev/null 2>&1; then h="$c"; fi
-  fi
-  hint="$h"
-fi
-printf '%s' "$hint"
-sep
-base=""
+/// Everything one refresh tick asks a WSL distro.  `$1` is the repository and
+/// `$2` a recorded base branch, empty when there is none.
+///
+/// The default branch is picked inside the round trip rather than back in
+/// Rust, because the sections after it diff against whatever it picked.
+fn status_batch() -> wsl::Batch {
+    wsl::Batch::new(r#"p="$1"; hint="$2""#)
+        .section(
+            "branch",
+            r#"git -C "$p" symbolic-ref --short HEAD 2>/dev/null || git -C "$p" rev-parse --short=7 HEAD 2>/dev/null"#,
+        )
+        .section("status", r#"git -C "$p" status --porcelain=v2 -z 2>/dev/null"#)
+        .section(
+            "default_branch",
+            format!("{}\nhint=\"$h\"\nprintf '%s' \"$hint\"", default_branch::shell_ranking()),
+        )
+        .section(
+            "base_ref",
+            r#"base=""
 if [ -n "$hint" ]; then
   for ref in "refs/remotes/origin/$hint" "refs/heads/$hint"; do
     if git -C "$p" rev-parse --verify --quiet "$ref" >/dev/null 2>&1; then base="$ref"; break; fi
   done
 fi
-printf '%s' "$base"
-sep
-if [ -n "$base" ]; then git -C "$p" diff --numstat -z "$base...HEAD" 2>/dev/null; fi
-"#;
+printf '%s' "$base""#,
+        )
+        .section(
+            "numstat",
+            r#"if [ -n "$base" ]; then git -C "$p" diff --numstat -z "$base...HEAD" 2>/dev/null; fi"#,
+        )
+}
 
 /// One wsl.exe round trip per refresh tick.  Runs on `spawn_compute`'s
 /// worker thread, so the ~400 ms round trip never blocks paint.
@@ -569,28 +566,36 @@ fn compute_wsl(
     hint: Option<&str>,
     blocking: &jobs::Blocking,
 ) -> GitStatus {
-    let stdout =
-        match wsl::run_batch(distro, STATUS_SCRIPT, &[linux_path, hint.unwrap_or("")], blocking) {
-            Ok(s) => s,
-            Err(e) => return GitStatus { error: Some(e), ..Default::default() },
-        };
-    let sections = wsl::split_sections(&stdout);
-    let text = |i: usize| {
-        sections.get(i).map(|s| String::from_utf8_lossy(s).trim().to_string()).unwrap_or_default()
-    };
+    let run = |script: &str, args: &[&str]| wsl::run_batch(distro, script, args, blocking);
+    status_from_batch(linux_path, hint, run)
+}
 
-    let branch = Some(text(0)).filter(|s| !s.is_empty());
+/// The refresh tick once the round trip is somebody else's problem, so a test
+/// can hand it recorded stdout instead of a live distro.
+fn status_from_batch(
+    linux_path: &str,
+    hint: Option<&str>,
+    run: impl Fn(&str, &[&str]) -> Result<Vec<u8>, String>,
+) -> GitStatus {
+    let batch = status_batch();
+    let stdout = match run(&batch.script(), &[linux_path, hint.unwrap_or("")]) {
+        Ok(s) => s,
+        Err(e) => return GitStatus { error: Some(e), ..Default::default() },
+    };
+    let reply = batch.read(&stdout);
+
+    let branch = Some(reply.text("branch")).filter(|s| !s.is_empty());
     if branch.is_none() {
         return GitStatus {
             error: Some(format!("could not open repository at {linux_path}")),
             ..Default::default()
         };
     }
-    let (staged, unstaged) = parse_status_v2_z(sections.get(1).copied().unwrap_or_default());
-    let default_branch = Some(text(2)).filter(|s| !s.is_empty());
-    let default_branch_resolved = Some(text(3)).filter(|s| !s.is_empty());
+    let (staged, unstaged) = parse_status_v2_z(reply.bytes("status"));
+    let default_branch = Some(reply.text("default_branch")).filter(|s| !s.is_empty());
+    let default_branch_resolved = Some(reply.text("base_ref")).filter(|s| !s.is_empty());
     let branch_diff = if default_branch_resolved.is_some() {
-        parse_numstat_z(sections.get(4).copied().unwrap_or_default())
+        parse_numstat_z(reply.bytes("numstat"))
     } else {
         Vec::new()
     };
@@ -742,6 +747,77 @@ fn parse_numstat_z(bytes: &[u8]) -> Vec<DiffStat> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a distro sends back for a batch, section by section, so a WSL
+    /// refresh can be tested without one.
+    fn recorded(sections: &[&str]) -> impl Fn(&str, &[&str]) -> Result<Vec<u8>, String> {
+        let mut stdout = Vec::new();
+        for (i, section) in sections.iter().enumerate() {
+            if i > 0 {
+                stdout.extend_from_slice(wsl::SECTION_SEP);
+            }
+            stdout.extend_from_slice(section.as_bytes());
+        }
+        move |_script, _args| Ok(stdout.clone())
+    }
+
+    #[test]
+    fn a_wsl_refresh_reads_every_section_of_a_full_reply() {
+        let status = status_from_batch(
+            "/home/lev/proj",
+            None,
+            recorded(&[
+                "feat-x",
+                "1 .M N... 100644 100644 100644 aaa bbb src/lib.rs\0",
+                "main",
+                "refs/remotes/origin/main",
+                "3\t1\tsrc/lib.rs\0",
+            ]),
+        );
+        assert_eq!(status.branch.as_deref(), Some("feat-x"));
+        assert_eq!(status.default_branch.as_deref(), Some("main"));
+        assert_eq!(status.default_branch_resolved.as_deref(), Some("refs/remotes/origin/main"));
+        assert_eq!(status.branch_diff.len(), 1);
+        assert_eq!(status.unstaged.len(), 1);
+        assert!(status.error.is_none());
+    }
+
+    #[test]
+    fn a_blank_branch_section_means_the_repository_could_not_be_opened() {
+        let status = status_from_batch("/home/lev/proj", None, recorded(&["", "", "", "", ""]));
+        assert_eq!(status.error.as_deref(), Some("could not open repository at /home/lev/proj"));
+        assert!(status.branch.is_none());
+    }
+
+    #[test]
+    fn a_batch_that_stopped_early_still_reports_the_sections_it_reached() {
+        let status = status_from_batch("/home/lev/proj", None, recorded(&["feat-x"]));
+        assert_eq!(status.branch.as_deref(), Some("feat-x"));
+        assert!(status.default_branch.is_none());
+        assert!(status.branch_diff.is_empty(), "nothing to diff against without a base ref");
+    }
+
+    #[test]
+    fn no_base_ref_leaves_the_branch_diff_empty_whatever_numstat_says() {
+        let status = status_from_batch(
+            "/home/lev/proj",
+            None,
+            recorded(&["feat-x", "", "main", "", "3\t1\tsrc/lib.rs\0"]),
+        );
+        assert_eq!(status.default_branch.as_deref(), Some("main"));
+        assert!(status.branch_diff.is_empty());
+    }
+
+    #[test]
+    fn a_round_trip_that_never_landed_is_reported_as_the_error_it_was() {
+        let status =
+            status_from_batch(
+                "/home/lev/proj",
+                None,
+                |_: &str, _: &[&str]| Err("no distro".into()),
+            );
+        assert_eq!(status.error.as_deref(), Some("no distro"));
+    }
     use crate::repaint::Recorder;
 
     #[test]

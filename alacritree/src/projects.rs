@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use git2::Repository;
 use serde_json::{Value, json};
 
+use crate::default_branch::{self, Evidence, WellKnown};
 use crate::{jobs, wsl};
 
 #[derive(Debug, Clone)]
@@ -128,10 +129,10 @@ impl Project {
         }
     }
 
-    /// One wsl.exe round trip answers everything discovery needs; sections
-    /// are split on `wsl::SECTION_SEP`.  A round trip that never landed yields
-    /// the same pseudo-worktree a non-git folder gets, but marked
-    /// non-authoritative so it cannot overwrite a known worktree list.
+    /// One wsl.exe round trip answers everything discovery needs.  A round
+    /// trip that never landed yields the same pseudo-worktree a non-git
+    /// folder gets, but marked non-authoritative so it cannot overwrite a
+    /// known worktree list.
     fn discover_wsl(
         root: PathBuf,
         name: String,
@@ -140,22 +141,32 @@ impl Project {
         upstream: bool,
         blocking: &jobs::Blocking,
     ) -> Discovered {
+        let run = |script: &str, args: &[&str]| wsl::run_batch(distro, script, args, blocking);
+        Self::discover_from_batch(root, name, distro, linux_path, upstream, run)
+    }
+
+    /// Discovery once the round trip is somebody else's problem, so a test
+    /// can hand it recorded stdout instead of a live distro.
+    fn discover_from_batch(
+        root: PathBuf,
+        name: String,
+        distro: &str,
+        linux_path: &str,
+        upstream: bool,
+        run: impl Fn(&str, &[&str]) -> Result<Vec<u8>, String>,
+    ) -> Discovered {
         let upstream_arg = if upstream { "1" } else { "0" };
-        let batch = wsl::run_batch(distro, DISCOVER_SCRIPT, &[linux_path, upstream_arg], blocking)
-            .map_err(|e| {
-                log::warn!("WSL discovery failed for {}: {e}", root.display());
-            });
-        let sections = batch.as_ref().map(|s| wsl::split_sections(s)).unwrap_or_default();
-        let text = |i: usize| {
-            sections
-                .get(i)
-                .map(|s| String::from_utf8_lossy(s).trim().to_string())
-                .unwrap_or_default()
+        let batch = discover_batch();
+        let stdout = run(&batch.script(), &[linux_path, upstream_arg]).map_err(|e| {
+            log::warn!("WSL discovery failed for {}: {e}", root.display());
+        });
+        let reply = match &stdout {
+            Ok(bytes) => batch.read(bytes),
+            Err(()) => batch.no_reply(),
         };
 
-        let records = parse_worktree_list_z(sections.get(1).copied().unwrap_or_default());
-        let upstreams =
-            crate::upstream::parse_for_each_ref(sections.get(6).copied().unwrap_or_default());
+        let records = parse_worktree_list_z(reply.bytes("worktrees"));
+        let upstreams = crate::upstream::parse_for_each_ref(reply.bytes("upstreams"));
         let worktrees: Vec<Worktree> = records
             .iter()
             .enumerate()
@@ -174,18 +185,22 @@ impl Project {
             })
             .collect();
 
-        match classify_wsl_answer(batch.is_ok(), text(0) == "yes", worktrees.len()) {
+        match classify_wsl_answer(stdout.is_ok(), reply.text("is_repo") == "yes", worktrees.len()) {
             WslAnswer::Unreachable => Discovered::unavailable(Self::placeholder(root)),
             WslAnswer::NotARepo => Discovered::found(Self::placeholder(root)),
             WslAnswer::Repo => Discovered::found(Project {
-                default_branch: default_branch_from_batch(&text(2), &text(3), &text(4)),
+                default_branch: default_branch_from_batch(
+                    &reply.text("origin_head"),
+                    &reply.text("well_known_heads"),
+                    &reply.text("init_default"),
+                ),
                 worktrees,
                 root,
                 name,
                 label: None,
                 expanded: true,
                 shell_override: None,
-                home: Some(text(5)).filter(|h| !h.is_empty()),
+                home: Some(reply.text("home")).filter(|h| !h.is_empty()),
             }),
         }
     }
@@ -330,40 +345,32 @@ fn branch_from_admin_head(repo: &Repository, worktree_name: &str) -> Option<Stri
     contents.trim().strip_prefix("ref: refs/heads/").map(str::to_string)
 }
 
-/// Best-effort detection of the repository's default branch.
-///
-/// `refs/remotes/origin/HEAD` is the source of truth when present — it's what
-/// `origin` says the default branch is.  We fall back to common local names
-/// only if the remote ref is missing.  `init.defaultBranch` is checked LAST
-/// and only if it names a branch that actually exists in this repo, because
-/// that config is about what `git init` names new repos — not the default
-/// branch of an already-cloned project (a global `init.defaultBranch=master`
-/// would otherwise hijack repos whose actual default is `main` or anything
-/// else).  Returns the branch name (without `refs/heads/`) or `None`.
+/// What git2 can see about this repository's default branch, ranked by
+/// [`default_branch::resolve`].
 fn detect_default_branch(repo: &Repository) -> Option<String> {
-    if let Ok(reference) = repo.find_reference("refs/remotes/origin/HEAD") {
-        if let Some(target) = reference.symbolic_target() {
-            if let Some(name) = target.strip_prefix("refs/remotes/origin/") {
-                return Some(name.to_string());
-            }
-        }
-    }
+    let has = |name: &str| repo.find_reference(&format!("refs/heads/{name}")).is_ok();
 
-    for candidate in ["main", "master", "trunk", "develop"] {
-        if repo.find_reference(&format!("refs/heads/{candidate}")).is_ok() {
-            return Some(candidate.to_string());
-        }
-    }
+    let origin_head = repo
+        .find_reference("refs/remotes/origin/HEAD")
+        .ok()
+        .and_then(|r| r.symbolic_target().map(str::to_string))
+        .and_then(|t| t.strip_prefix("refs/remotes/origin/").map(str::to_string));
 
-    if let Ok(cfg) = repo.config() {
-        if let Ok(name) = cfg.get_string("init.defaultBranch") {
-            if !name.is_empty() && repo.find_reference(&format!("refs/heads/{name}")).is_ok() {
-                return Some(name);
-            }
-        }
-    }
+    let present: Vec<&str> =
+        WellKnown::ALL.iter().map(|c| c.as_str()).filter(|name| has(name)).collect();
 
-    None
+    let init_default = repo
+        .config()
+        .ok()
+        .and_then(|cfg| cfg.get_string("init.defaultBranch").ok())
+        .filter(|name| !name.is_empty() && has(name));
+
+    default_branch::resolve(&Evidence {
+        origin_head: origin_head.as_deref(),
+        present,
+        init_default: init_default.as_deref(),
+        ..Evidence::default()
+    })
 }
 
 /// A label is user text: trimmed, with an empty result meaning "no label", so
@@ -398,30 +405,37 @@ macro_rules! upstream_format {
     };
 }
 
-const DISCOVER_SCRIPT: &str = concat!(
-    r#"
-p="$1"
-sep() { printf '\n@@ALACRITREE@@\n'; }
-git -C "$p" rev-parse --is-inside-work-tree >/dev/null 2>&1 && printf yes || printf no
-sep
-git -C "$p" worktree list --porcelain -z 2>/dev/null
-sep
-git -C "$p" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null
-sep
-git -C "$p" for-each-ref --format='%(refname:short)' refs/heads/main refs/heads/master refs/heads/trunk refs/heads/develop 2>/dev/null
-sep
-cfg=$(git -C "$p" config init.defaultBranch 2>/dev/null)
-if [ -n "$cfg" ] && git -C "$p" rev-parse --verify --quiet "refs/heads/$cfg" >/dev/null 2>&1; then printf '%s' "$cfg"; fi
-sep
-printf '%s' "$HOME"
-sep
-if [ "$2" = "1" ]; then
+/// Everything discovery asks a WSL distro, in one round trip.  `$1` is the
+/// repository path and `$2` is `"1"` when upstream tracking is wanted.
+fn discover_batch() -> wsl::Batch {
+    wsl::Batch::new(r#"p="$1""#)
+        .section("is_repo", r#"git -C "$p" rev-parse --is-inside-work-tree >/dev/null 2>&1 && printf yes || printf no"#)
+        .section("worktrees", r#"git -C "$p" worktree list --porcelain -z 2>/dev/null"#)
+        .section("origin_head", r#"git -C "$p" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null"#)
+        .section(
+            "well_known_heads",
+            format!(
+                r#"git -C "$p" for-each-ref --format='%(refname:short)' {} 2>/dev/null"#,
+                WellKnown::shell_head_refs()
+            ),
+        )
+        .section(
+            "init_default",
+            r#"cfg=$(git -C "$p" config init.defaultBranch 2>/dev/null)
+if [ -n "$cfg" ] && git -C "$p" rev-parse --verify --quiet "refs/heads/$cfg" >/dev/null 2>&1; then printf '%s' "$cfg"; fi"#,
+        )
+        .section("home", r#"printf '%s' "$HOME""#)
+        .section(
+            "upstreams",
+            concat!(
+                r#"if [ "$2" = "1" ]; then
   LC_ALL=C git -C "$p" for-each-ref --format='"#,
-    upstream_format!(),
-    r#"' refs/heads/ 2>/dev/null
-fi
-"#
-);
+                upstream_format!(),
+                r#"' refs/heads/ 2>/dev/null
+fi"#
+            ),
+        )
+}
 
 /// One record from `git worktree list --porcelain -z`.  The main worktree is
 /// always the first record.
@@ -468,26 +482,19 @@ fn parse_worktree_list_z(bytes: &[u8]) -> Vec<WorktreeRecord> {
     records
 }
 
-/// Replicates `detect_default_branch`'s priority from batched output — see
-/// that function for why `init.defaultBranch` comes last.
+/// The same ranking from batched output.  The script has already dropped an
+/// `init.defaultBranch` naming no branch, so `config_default` arrives verified.
 fn default_branch_from_batch(
     origin_head: &str,
     existing: &str,
     config_default: &str,
 ) -> Option<String> {
-    if let Some(name) = origin_head.trim().strip_prefix("refs/remotes/origin/") {
-        if !name.is_empty() {
-            return Some(name.to_string());
-        }
-    }
-    let present: Vec<&str> = existing.lines().map(str::trim).collect();
-    for candidate in ["main", "master", "trunk", "develop"] {
-        if present.contains(&candidate) {
-            return Some(candidate.to_string());
-        }
-    }
-    let cfg = config_default.trim();
-    (!cfg.is_empty()).then(|| cfg.to_string())
+    default_branch::resolve(&Evidence {
+        origin_head: origin_head.trim().strip_prefix("refs/remotes/origin/"),
+        present: existing.lines().map(str::trim).collect(),
+        init_default: Some(config_default),
+        ..Evidence::default()
+    })
 }
 
 #[cfg(test)]
@@ -749,20 +756,136 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
         assert_eq!(records[0].path, "/home/lev/my proj");
     }
 
-    /// The parser reads sections by position, so their order is a contract:
-    /// each index below names the command whose output belongs there.
+    /// What a distro sends back for a batch, section by section, so WSL
+    /// discovery can be tested without one.
+    fn recorded(sections: &[&[u8]]) -> impl Fn(&str, &[&str]) -> Result<Vec<u8>, String> {
+        let mut stdout = Vec::new();
+        for (i, section) in sections.iter().enumerate() {
+            if i > 0 {
+                stdout.extend_from_slice(wsl::SECTION_SEP);
+            }
+            stdout.extend_from_slice(section);
+        }
+        move |_script, _args| Ok(stdout.clone())
+    }
+
+    fn discover_recorded(sections: &[&[u8]]) -> Discovered {
+        Project::discover_from_batch(
+            PathBuf::from(r"\wsl$\Ubuntu\home\lev\proj"),
+            "proj".to_string(),
+            "Ubuntu",
+            "/home/lev/proj",
+            false,
+            recorded(sections),
+        )
+    }
+
     #[test]
-    fn the_discover_script_sections_keep_their_indices() {
-        let sections: Vec<&str> = DISCOVER_SCRIPT.split("\nsep\n").collect();
-        assert_eq!(sections.len(), 7, "six sep boundaries, seven sections");
-        assert!(sections[5].contains(r#"printf '%s' "$HOME""#), "$HOME must stay at index 5");
-        assert!(sections[6].contains("for-each-ref"), "upstream tracking is the new last section");
-        assert!(sections[6].contains("LC_ALL=C"), "the track vocabulary is localized");
-        assert!(
-            sections[6].contains(r#"if [ "$2" = "1" ]; then"#),
-            "the for-each-ref call must stay gated by the upstream flag, or the feature runs even \
-             when disabled"
+    fn wsl_discovery_reads_every_section_of_a_full_reply() {
+        let discovered = discover_recorded(&[
+            b"yes",
+            b"worktree /home/lev/proj\0HEAD abc1234\0branch refs/heads/main\0\0",
+            b"refs/remotes/origin/trunk",
+            b"main\nmaster",
+            b"",
+            b"/home/lev",
+            b"",
+        ]);
+        let project = discovered.project;
+        assert_eq!(project.default_branch.as_deref(), Some("trunk"), "origin/HEAD wins");
+        assert_eq!(project.home.as_deref(), Some("/home/lev"));
+        assert_eq!(project.worktrees.len(), 1);
+        assert_eq!(project.worktrees[0].branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn wsl_discovery_falls_back_through_the_well_known_names_then_the_config() {
+        let names = discover_recorded(&[
+            b"yes",
+            b"worktree /home/lev/proj\0HEAD abc1234\0branch refs/heads/master\0\0",
+            b"",
+            b"master\ndevelop",
+            b"mainline",
+            b"/home/lev",
+            b"",
+        ]);
+        assert_eq!(
+            names.project.default_branch.as_deref(),
+            Some("master"),
+            "a present well-known name outranks init.defaultBranch"
         );
+
+        let config = discover_recorded(&[
+            b"yes",
+            b"worktree /home/lev/proj\0HEAD abc1234\0branch refs/heads/mainline\0\0",
+            b"",
+            b"",
+            b"mainline",
+            b"/home/lev",
+            b"",
+        ]);
+        assert_eq!(config.project.default_branch.as_deref(), Some("mainline"));
+    }
+
+    #[test]
+    fn a_folder_that_is_not_a_repository_gets_the_placeholder_worktree() {
+        let discovered = discover_recorded(&[b"no", b"", b"", b"", b"", b"/home/lev", b""]);
+        let project = discovered.project;
+        assert!(project.default_branch.is_none());
+        assert_eq!(project.worktrees.len(), 1, "a non-git folder still gets a shell");
+    }
+
+    /// A truncated batch cannot be told from a repository with no worktrees,
+    /// and both mean the answer must not overwrite a known worktree list.
+    #[test]
+    fn a_truncated_batch_is_not_authoritative() {
+        let discovered = discover_recorded(&[b"yes"]);
+        assert!(!discovered.authoritative);
+    }
+
+    #[test]
+    fn a_round_trip_that_never_landed_is_not_authoritative() {
+        let discovered = Project::discover_from_batch(
+            PathBuf::from(r"\wsl$\Ubuntu\home\lev\proj"),
+            "proj".to_string(),
+            "Ubuntu",
+            "/home/lev/proj",
+            false,
+            |_: &str, _: &[&str]| Err("no distro".into()),
+        );
+        assert!(!discovered.authoritative);
+    }
+
+    /// The upstream section is the one command in the batch that must not run
+    /// when the feature is off, since `%(upstream:track)` computes divergence
+    /// for every branch even when the caller only wants the parse skipped.
+    #[test]
+    fn the_upstream_section_stays_gated_by_the_upstream_flag() {
+        let script = discover_batch().script();
+        let upstream = script
+            .rsplit(
+                "
+sep
+",
+            )
+            .next()
+            .expect("a last section");
+        assert!(upstream.contains(r#"if [ "$2" = "1" ]; then"#));
+        assert!(upstream.contains("LC_ALL=C"), "the track vocabulary is localized");
+    }
+
+    /// The candidate names reach the script from the enum, so adding one is
+    /// an edit in `default_branch` rather than in this script.
+    #[test]
+    fn the_well_known_section_asks_for_every_candidate_name() {
+        let script = discover_batch().script();
+        for candidate in WellKnown::ALL {
+            assert!(
+                script.contains(&format!("refs/heads/{}", candidate.as_str())),
+                "the script never asks about {}",
+                candidate.as_str()
+            );
+        }
     }
 
     /// A detached HEAD's `branch` holds a short OID, and a real branch can be
