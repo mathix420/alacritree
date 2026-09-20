@@ -617,6 +617,83 @@ fn parse_tool_paths(stdout: &[u8], count: usize) -> Vec<Option<String>> {
         .collect()
 }
 
+/// A batched script whose sections carry names.
+///
+/// Positional sections are read by index at every call site, so inserting a
+/// command in the middle silently renames every section after it and still
+/// compiles.  Declaring the name beside the command it runs makes the wrong
+/// name a lookup that fails loudly instead.
+pub struct Batch {
+    preamble: String,
+    sections: Vec<(&'static str, String)>,
+}
+
+impl Batch {
+    /// `preamble` runs before the first section, for binding `$1..` to names.
+    pub fn new(preamble: impl Into<String>) -> Self {
+        Self { preamble: preamble.into(), sections: Vec::new() }
+    }
+
+    pub fn section(mut self, name: &'static str, command: impl Into<String>) -> Self {
+        debug_assert!(
+            !self.sections.iter().any(|(n, _)| *n == name),
+            "batch section `{name}` declared twice"
+        );
+        self.sections.push((name, command.into()));
+        self
+    }
+
+    /// The shell script to hand [`run_batch`].
+    pub fn script(&self) -> String {
+        let mut script = self.preamble.trim_end().to_string();
+        script.push_str("\nsep() { printf '\n@@ALACRITREE@@\n'; }\n");
+        for (i, (_, command)) in self.sections.iter().enumerate() {
+            if i > 0 {
+                script.push_str("sep\n");
+            }
+            script.push_str(command.trim_end());
+            script.push('\n');
+        }
+        script
+    }
+
+    /// Pair this batch's names with what the round trip returned.
+    pub fn read<'a>(&'a self, stdout: &'a [u8]) -> Reply<'a> {
+        Reply { sections: &self.sections, parts: split_sections(stdout) }
+    }
+
+    /// A reply for a round trip that never landed, so every section is empty.
+    pub fn no_reply(&self) -> Reply<'_> {
+        Reply { sections: &self.sections, parts: Vec::new() }
+    }
+}
+
+/// What a [`Batch`] got back, addressed by the names the batch declared.
+pub struct Reply<'a> {
+    sections: &'a [(&'static str, String)],
+    parts: Vec<&'a [u8]>,
+}
+
+impl<'a> Reply<'a> {
+    /// The raw bytes of `name`, empty when the batch stopped before it ran.
+    ///
+    /// Panics on a name the batch never declared, which is a typo in the
+    /// caller rather than anything the distro could have caused.
+    pub fn bytes(&self, name: &str) -> &'a [u8] {
+        let at = self
+            .sections
+            .iter()
+            .position(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("no batch section named `{name}`"));
+        self.parts.get(at).copied().unwrap_or_default()
+    }
+
+    /// `name` as trimmed text, lossily decoded.
+    pub fn text(&self, name: &str) -> String {
+        String::from_utf8_lossy(self.bytes(name)).trim().to_string()
+    }
+}
+
 /// Split batched stdout on `SECTION_SEP`.  Always returns at least one
 /// section; a script with N separators yields N+1.
 pub fn split_sections(stdout: &[u8]) -> Vec<&[u8]> {
@@ -873,6 +950,67 @@ mod tests {
         input.extend_from_slice(SECTION_SEP);
         input.extend_from_slice(SECTION_SEP);
         assert_eq!(split_sections(&input), vec![&b""[..], &b""[..], &b""[..]]);
+    }
+
+    /// What a distro would send back for `answers`, section by section.
+    fn batched_stdout(answers: &[&str]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (i, answer) in answers.iter().enumerate() {
+            if i > 0 {
+                out.extend_from_slice(SECTION_SEP);
+            }
+            out.extend_from_slice(answer.as_bytes());
+        }
+        out
+    }
+
+    fn three_sections() -> Batch {
+        Batch::new(r#"p="$1""#)
+            .section("head", "git -C \"$p\" rev-parse HEAD")
+            .section("status", "git -C \"$p\" status --porcelain")
+            .section("home", "printf '%s' \"$HOME\"")
+    }
+
+    #[test]
+    fn a_batch_script_emits_one_separator_between_sections() {
+        let script = three_sections().script();
+        assert!(script.starts_with("p=\"$1\"\nsep() { printf '\n@@ALACRITREE@@\n'; }\n"));
+        assert_eq!(script.lines().filter(|l| *l == "sep").count(), 2);
+    }
+
+    #[test]
+    fn a_reply_answers_by_name_not_by_position() {
+        let batch = three_sections();
+        let stdout = batched_stdout(&["abc123", "?? new.rs", "/home/lev"]);
+        let reply = batch.read(&stdout);
+        assert_eq!(reply.text("head"), "abc123");
+        assert_eq!(reply.text("status"), "?? new.rs");
+        assert_eq!(reply.text("home"), "/home/lev");
+    }
+
+    #[test]
+    fn a_truncated_reply_leaves_the_sections_it_never_reached_empty() {
+        let batch = three_sections();
+        let stdout = batched_stdout(&["abc123"]);
+        let reply = batch.read(&stdout);
+        assert_eq!(reply.text("head"), "abc123");
+        assert_eq!(reply.bytes("status"), b"");
+        assert_eq!(reply.bytes("home"), b"");
+    }
+
+    #[test]
+    fn a_round_trip_that_never_landed_answers_every_section_empty() {
+        let batch = three_sections();
+        let reply = batch.no_reply();
+        assert_eq!(reply.bytes("head"), b"");
+        assert_eq!(reply.text("home"), "");
+    }
+
+    #[test]
+    #[should_panic(expected = "no batch section named `tabs`")]
+    fn a_name_the_batch_never_declared_is_a_caller_typo() {
+        let batch = three_sections();
+        let _ = batch.no_reply().bytes("tabs");
     }
 
     #[test]

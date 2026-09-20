@@ -20,6 +20,7 @@ pub(crate) mod command_palette;
 pub mod config;
 pub mod crash_log;
 pub(crate) mod decoration_sprites;
+pub mod default_branch;
 pub(crate) mod diff_viewer;
 pub(crate) mod digest;
 pub mod dll_search;

@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 
 use crate::config::WorkspaceConfig;
+use crate::default_branch::{self, Evidence, WellKnown};
 use crate::repaint::Repaint;
 use crate::tools::{self, Tool};
 use crate::{command_ext, jobs, wsl};
@@ -294,26 +295,19 @@ pub(crate) fn list_branches(cwd: &Path, _blocking: &jobs::Blocking) -> Result<Ve
         .collect())
 }
 
-/// Resolve the base branch dynamically.  Asks origin first via
-/// `git ls-remote --symref HEAD` — the only source that reflects the
-/// upstream's *current* default branch.  The caller's hint comes from
-/// `refs/remotes/origin/HEAD`, which can lag if the upstream default was
-/// renamed since the last sync; trusting it would feed a defunct branch
-/// name to `git fetch`.  Falls back to the hint and then to common names
-/// when the remote is unreachable.  Returns `(branch_name, ref_to_use)`
-/// where `ref_to_use` is what `git worktree add -b … <ref>` should branch
-/// from (prefer `origin/<branch>` so we start from the fetched remote tip).
-/// On total failure, returns the list of names we tried.
+/// Which branch a new worktree should start from, and the ref to branch off.
 ///
-/// The `ls-remote` this runs is the one network round trip in the whole
-/// function — a cancel that lands during it must not leave the caller
-/// waiting on an unreachable remote, so it goes through
-/// [`jobs::Blocking::run_cancellable`].  A cancelled query is treated the
-/// same as an unreachable one (both fold into `query_origin_head` returning
-/// `None`): the hint and candidate-name fallbacks that follow are local
-/// `rev-parse` calls, cheap enough that letting them run doesn't matter, and
-/// the caller re-checks cancellation right after this returns, before
-/// trusting either outcome.
+/// `git ls-remote --symref HEAD` is the one source reflecting the upstream's
+/// current default, so it answers ahead of the caller's cached
+/// `refs/remotes/origin/HEAD`, which lags a rename.  Everything after that is
+/// [`default_branch::resolve`].  On total failure, returns the names tried.
+///
+/// That `ls-remote` is the only network round trip here, and a cancel landing
+/// during it must not leave the caller waiting on an unreachable remote, so it
+/// goes through [`jobs::Blocking::run_cancellable`].  A cancelled query folds
+/// into the same `None` an unreachable one produces: the local `rev-parse`
+/// probes that follow are cheap, and the caller re-checks cancellation before
+/// trusting the outcome.
 fn resolve_base_branch(
     cwd: &Path,
     hint: Option<&str>,
@@ -321,39 +315,54 @@ fn resolve_base_branch(
 ) -> Result<(String, String), Vec<String>> {
     let mut tried: Vec<String> = Vec::new();
 
-    let try_branch = |name: &str, tried: &mut Vec<String>| -> Option<(String, String)> {
-        if tried.iter().any(|t| t == name) {
-            return None;
+    // A name counts as evidence only once this repository can resolve it,
+    // locally or on origin, since the caller goes on to branch from it.
+    let have = |name: &str, tried: &mut Vec<String>| -> bool {
+        if !tried.iter().any(|t| t == name) {
+            tried.push(name.to_string());
         }
-        tried.push(name.to_string());
-        if rev_parse_verify(cwd, &format!("origin/{name}")) {
-            return Some((name.to_string(), format!("origin/{name}")));
-        }
-        if rev_parse_verify(cwd, name) {
-            return Some((name.to_string(), name.to_string()));
-        }
-        None
+        rev_parse_verify(cwd, &format!("origin/{name}")) || rev_parse_verify(cwd, name)
     };
 
-    if let Some(remote_head) = query_origin_head(cwd, blocking) {
-        if let Some(found) = try_branch(&remote_head, &mut tried) {
-            return Ok(found);
-        }
-    }
+    // `hint` is a cached detection, not a choice, so it stands in for
+    // `origin/HEAD` only when the live query cannot answer.
+    let origin_head = query_origin_head(cwd, blocking)
+        .or_else(|| hint.map(str::to_string))
+        .filter(|name| have(name, &mut tried));
+    let present: Vec<&str> =
+        WellKnown::ALL.iter().map(|c| c.as_str()).filter(|name| have(name, &mut tried)).collect();
+    let init_default =
+        config_value(cwd, "init.defaultBranch").filter(|name| have(name, &mut tried));
 
-    if let Some(name) = hint {
-        if let Some(found) = try_branch(name, &mut tried) {
-            return Ok(found);
-        }
-    }
+    let Some(branch) = default_branch::resolve(&Evidence {
+        origin_head: origin_head.as_deref(),
+        present,
+        init_default: init_default.as_deref(),
+        ..Evidence::default()
+    }) else {
+        return Err(tried);
+    };
 
-    for candidate in ["main", "master", "trunk", "develop"] {
-        if let Some(found) = try_branch(candidate, &mut tried) {
-            return Ok(found);
-        }
-    }
+    // Prefer the fetched remote tip, so a stale local copy is not the base.
+    let refname = if rev_parse_verify(cwd, &format!("origin/{branch}")) {
+        format!("origin/{branch}")
+    } else {
+        branch.clone()
+    };
+    Ok((branch, refname))
+}
 
-    Err(tried)
+/// A git config value, or `None` when it is unset or empty.
+#[allow(clippy::disallowed_methods)] // Running git is this function's job.
+fn config_value(cwd: &Path, key: &str) -> Option<String> {
+    let output = git_command(cwd)
+        .args(["config", key])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 #[allow(clippy::disallowed_methods)] // Running git is this function's job.
