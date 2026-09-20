@@ -770,11 +770,9 @@ baked_glyphs! {
     DEFAULT_WORKTREE_MAIN_ICON = "●";
     DEFAULT_WORKTREE_ICON = "○";
     DEFAULT_SESSION_ICON = "▪";
-    /// A pane a terminal workspace manager owns rather than alacritree.  A
-    /// split square says "multiplexed elsewhere" at row size, where a
-    /// vendor's logo would only say "smudge", and it stays neutral as more
-    /// than one such manager becomes supportable.  Drawn as U+25EB, mapped
-    /// where only the baked face reaches it; see `PRIVATE_GLYPHS`.
+    /// herdr's ram, drawn from `assets/herdr-ram.svg`.  A geometric shape
+    /// reads as a missing glyph at row size, which is what the bisected
+    /// square used here did, so each multiplexer gets its own silhouette.
     DEFAULT_HERDR_ICON = "\u{10FF00}";
     /// zellij's own logo is a hexagon, drawn as U+2B21.  The baked face
     /// refits it to a capital M's box, since DejaVu draws it past the
@@ -793,24 +791,14 @@ baked_glyphs! {
     DEFAULT_UPSTREAM_UNTRACKED_ICON = "↑";
 }
 
-baked_glyphs! {
-    OPT_IN_GLYPHS:
-    /// herdr's ram, drawn in `assets/herdr-ram.svg`.  No default paints it;
-    /// `[integrations.herdr] icon = "\u{10FF02}"` opts in, so only the
-    /// coverage check reads the constant.
-    #[cfg(test)]
-    HERDR_RAM_GLYPH = "\u{10FF02}";
-}
-
-/// Each private codepoint and the ordinary character it draws, which the
-/// baked face has to map both of.  Nothing else on a machine maps plane 16,
-/// so a default spelled this way reaches the face that fits it to the row
-/// instead of whichever fallback claims the real character first; see
-/// `assets/README.md`.  The ram is drawn from an SVG and has no public
-/// spelling.
+/// Each private codepoint and the ordinary character it draws, where one
+/// means it.  Nothing else on a machine maps plane 16, so a default spelled
+/// this way reaches the face that fits it to the row instead of whichever
+/// fallback claims the real character first; see `assets/README.md`.  The
+/// ram comes from an SVG, so no Unicode character means it.
 #[cfg(test)]
 pub(crate) const PRIVATE_GLYPHS: &[(char, Option<char>)] =
-    &[('\u{10FF00}', Some('◫')), ('\u{10FF01}', Some('⬡')), ('\u{10FF02}', None)];
+    &[('\u{10FF00}', None), ('\u{10FF01}', Some('⬡'))];
 
 baked_glyphs! {
     CHROME_GLYPHS:
@@ -3139,10 +3127,9 @@ struct RawHerdr {
     wsl_path: String,
     /// The glyph on a herdr pane's sidebar row and palette entry. A bare
     /// string sets the glyph; a table also styles its color, weight, slant
-    /// and size, the way `[ui.icons]` keys do. The default draws a split
-    /// square from the bundled symbol font, and `"\u{10FF02}"` draws a ram's
-    /// head from it. An ordinary character such as `"◫"` is drawn by your own
-    /// fonts instead.
+    /// and size, the way `[ui.icons]` keys do. The default draws a ram's head
+    /// from the bundled symbol font. An ordinary character such as `"◫"` is
+    /// drawn by your own fonts instead.
     #[schemars(default = "default_herdr_icon")]
     icon: Option<RawIconStyle>,
     /// Discover herdr servers and list their agents in the sidebar.  Inert

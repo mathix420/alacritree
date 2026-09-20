@@ -744,7 +744,7 @@
             }
           ],
           "default": "􏼀",
-          "description": "The glyph on a herdr pane's sidebar row and palette entry. A bare\nstring sets the glyph; a table also styles its color, weight, slant\nand size, the way `[ui.icons]` keys do. The default draws a split\nsquare from the bundled symbol font, and `\"\\u{10FF02}\"` draws a ram's\nhead from it. An ordinary character such as `\"◫\"` is drawn by your own\nfonts instead."
+          "description": "The glyph on a herdr pane's sidebar row and palette entry. A bare\nstring sets the glyph; a table also styles its color, weight, slant\nand size, the way `[ui.icons]` keys do. The default draws a ram's head\nfrom the bundled symbol font. An ordinary character such as `\"◫\"` is\ndrawn by your own fonts instead."
         },
         "path": {
           "default": "herdr",

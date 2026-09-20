@@ -37,7 +37,7 @@ MONO = [0x2315]
 
 # Public codepoint to the plane 16 one alacritree's defaults are spelled at,
 # so no installed face can shadow them. Both stay in the cmap; see README.md.
-PRIVATE = {0x25EB: 0x10FF00, 0x2B21: 0x10FF01}
+PRIVATE = {0x2B21: 0x10FF01}
 
 # zellij's sidebar icon.  DejaVu draws it past the ascender and below the
 # baseline, so it is refitted to the box a capital M takes up.
@@ -45,7 +45,7 @@ HEXAGON = PRIVATE[0x2B21]
 
 # herdr's ram, drawn in herdr-ram.svg.  No Unicode character means it, so it
 # exists only at its private codepoint.
-RAM = 0x10FF02
+RAM = 0x10FF00
 RAM_SVG = Path(__file__).with_name("herdr-ram.svg")
 
 NAMES = {
