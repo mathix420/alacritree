@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 200 200">
+  <!-- Outer and inner hexagons, both regular and pointy-top, sharing a
+       center.  The even-odd fill turns the pair into a ring of even
+       thickness, which is 25 units of the 200-unit height. -->
+  <path
+     fill="#000000"
+     fill-rule="evenodd"
+     d="M 100,0 186.603,50 186.603,150 100,200 13.397,150 13.397,50 Z
+        M 100,28.868 161.603,64.434 161.603,135.566 100,171.132 38.397,135.566 38.397,64.434 Z" />
+</svg>

@@ -2498,7 +2498,7 @@ mod tests {
     fn epaint_resolves_the_private_codepoints_the_defaults_use() {
         use ab_glyph::Font as _;
         let font = ab_glyph::FontRef::try_from_slice(SYMBOLS_FONT).expect("the baked face parses");
-        for (private, _) in crate::config::PRIVATE_GLYPHS {
+        for private in crate::config::PRIVATE_GLYPHS {
             assert_ne!(
                 font.glyph_id(*private).0,
                 0,
@@ -2508,36 +2508,17 @@ mod tests {
         }
     }
 
-    /// The face keeps the ordinary character beside the private one, so a
-    /// user who sets `icon` to the real shape still has a last-resort face
-    /// when nothing they installed draws it.
-    #[test]
-    fn the_baked_face_maps_both_spellings_of_each_private_glyph() {
-        let face = ttf_parser::Face::parse(SYMBOLS_FONT, 0).expect("the baked face parses");
-        for (private, public) in crate::config::PRIVATE_GLYPHS {
-            let Some(public) = public else { continue };
-            assert_eq!(
-                face.glyph_index(*private),
-                face.glyph_index(*public),
-                "U+{:04X} and {public} must draw the same glyph",
-                *private as u32
-            );
-        }
-    }
-
-    /// Every private glyph is fitted to a capital M's box when the face is
-    /// built: DejaVu's hexagon runs past the ascender and below the baseline
-    /// and reads as a smudge at row size, and the ram comes from an SVG with
-    /// no font metrics at all.  M is not in the baked face, so its cap height
-    /// comes from the metrics the face carries over.  Driving this from
-    /// `PRIVATE_GLYPHS` rather than a list of its own keeps it from drifting
-    /// against the set `build_symbols.py` actually fits.
+    /// Every private glyph comes from an SVG carrying no font metrics at all,
+    /// so the build fits each to a capital M's box.  M is not in the baked
+    /// face, so its cap height comes from the metrics the face carries over.
+    /// Driving this from `PRIVATE_GLYPHS` rather than a list of its own keeps
+    /// it from drifting against the set `build_symbols.py` actually fits.
     #[test]
     fn the_fitted_glyphs_fill_a_capital_m_s_box() {
         let face = ttf_parser::Face::parse(SYMBOLS_FONT, 0).expect("the baked face parses");
         // DejaVu Sans 2.37's capital M spans 0..1493 units.
         const M_CAP_HEIGHT: i16 = 1493;
-        for (c, _) in crate::config::PRIVATE_GLYPHS {
+        for c in crate::config::PRIVATE_GLYPHS {
             let c = *c;
             let id = face.glyph_index(c).expect("the baked face maps the glyph");
             let bbox = face.glyph_bounding_box(id).expect("the glyph has an outline");

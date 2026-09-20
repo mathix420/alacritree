@@ -2,11 +2,11 @@
 # requires-python = ">=3.10"
 # dependencies = ["fonttools>=4.47", "skia-pathops>=0.8"]
 # ///
-"""Build alacritree-symbols.ttf from DejaVu 2.37 and herdr-ram.svg.
+"""Build alacritree-symbols.ttf from DejaVu 2.37 and the SVGs beside it.
 
 Subsets DejaVu Sans and DejaVu Sans Mono down to the glyphs alacritree
-paints, merges them, adds the herdr ram, fits the zellij hexagon and the ram
-to a capital M's box, and names the result Alacritree Symbols.
+paints, merges them, adds each multiplexer icon from its SVG fitted to a
+capital M's box, and names the result Alacritree Symbols.
 
     uv run alacritree/assets/build_symbols.py [--dejavu DIR] [--output FILE]
 """
@@ -30,23 +30,17 @@ from fontTools.ttLib.tables._c_m_a_p import CmapSubtable
 SANS = [
     0x002B, 0x00B7, 0x00D7, 0x2014, 0x2022, 0x2026, 0x2191, 0x2193, 0x21BB,
     0x21C5, 0x2302, 0x232B, 0x258C, 0x25AA, 0x25B8, 0x25BE, 0x25C7, 0x25CB,
-    0x25CF, 0x25D0, 0x25EB, 0x25EF, 0x2713, 0x283F, 0x2B21, 0x2B24,
+    0x25CF, 0x25D0, 0x25EF, 0x2713, 0x283F, 0x2B24,
 ]
 # DejaVu Sans lacks the magnifier, so it comes from the Mono face.
 MONO = [0x2315]
 
-# Public codepoint to the plane 16 one alacritree's defaults are spelled at,
-# so no installed face can shadow them. Both stay in the cmap; see README.md.
-PRIVATE = {0x2B21: 0x10FF01}
-
-# zellij's sidebar icon.  DejaVu draws it past the ascender and below the
-# baseline, so it is refitted to the box a capital M takes up.
-HEXAGON = PRIVATE[0x2B21]
-
-# herdr's ram, drawn in herdr-ram.svg.  No Unicode character means it, so it
-# exists only at its private codepoint.
-RAM = 0x10FF00
-RAM_SVG = Path(__file__).with_name("herdr-ram.svg")
+# The sidebar's multiplexer icons, each drawn from its own SVG and spelled at
+# a plane 16 codepoint so no installed face can shadow it; see README.md.
+DRAWN = {
+    0x10FF00: Path(__file__).with_name("herdr-ram.svg"),
+    0x10FF01: Path(__file__).with_name("zellij-hexagon.svg"),
+}
 
 NAMES = {
     1: "Alacritree Symbols",
@@ -116,13 +110,17 @@ def add_svg_glyph(font: TTFont, svg: Path, codepoint: int) -> str:
     SVGPath(str(svg)).draw(TransformPen(path.getPen(), (1, 0, 0, -1, 0, 0)))
     path = pathops.simplify(path, clockwise=True)
 
+    # Registering the name before the assignment, because `setGlyphOrder`
+    # hands `glyf` the same list object and `glyf` appends to it itself, so
+    # the other order adds the second glyph twice.
     name = f"u{codepoint:04X}"
+    font.setGlyphOrder(font.getGlyphOrder() + [name])
+
     pen = TTGlyphPen(None)
     path.draw(Cu2QuPen(pen, max_err=1.0, reverse_direction=False))
     font["glyf"][name] = pen.glyph()
     font["glyf"][name].recalcBounds(font["glyf"])
     font["hmtx"][name] = (0, font["glyf"][name].xMin)
-    font.setGlyphOrder(font.getGlyphOrder() + [name])
     return name
 
 
@@ -158,13 +156,12 @@ def main() -> None:
         font = Merger().merge([str(sans), str(mono)])
 
     mapping = dict(font.getBestCmap())
-    mapping[RAM] = add_svg_glyph(font, RAM_SVG, RAM)
-    for public, private in PRIVATE.items():
-        mapping[private] = mapping[public]
+    for codepoint, svg in DRAWN.items():
+        mapping[codepoint] = add_svg_glyph(font, svg, codepoint)
     write_cmap(font, mapping)
 
     reference = TTFont(args.dejavu / "DejaVuSans.ttf")
-    for codepoint in (HEXAGON, RAM):
+    for codepoint in DRAWN:
         fit_to_capital_m(font, reference, codepoint)
     for record in font["name"].names:
         if record.nameID in NAMES:

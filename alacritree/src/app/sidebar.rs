@@ -1940,8 +1940,9 @@ fn paint_managed_mark(
     theme: &Theme,
     color: Color32,
 ) -> egui::Rect {
-    // 10.0 is what the status marks beside it use, and `◫` shares its em
-    // height with `◇` and `●`, so the same size puts them on one optical line.
+    // 10.0 is what the status marks beside it use.  Both multiplexer glyphs
+    // are fitted to a capital M's box when the baked face is built, so the
+    // same size puts them on one optical line with `◇` and `●`.
     let (icon, default) = icons.pane(managed.multiplexer);
     let (glyph, font, glyph_color) = resolve_icon(icon, default, color, 10.0, 10.0, theme);
     ui.label(RichText::new(glyph).color(glyph_color).font(font)).rect

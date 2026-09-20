@@ -774,9 +774,9 @@ baked_glyphs! {
     /// reads as a missing glyph at row size, which is what the bisected
     /// square used here did, so each multiplexer gets its own silhouette.
     DEFAULT_HERDR_ICON = "\u{10FF00}";
-    /// zellij's own logo is a hexagon, drawn as U+2B21.  The baked face
-    /// refits it to a capital M's box, since DejaVu draws it past the
-    /// ascender and below the baseline.
+    /// zellij's hexagon, drawn from `assets/zellij-hexagon.svg`.  DejaVu's
+    /// U+2B21 was used here first and its hairline stroke closes up at row
+    /// size, so this one is drawn with a stroke an eighth of its height.
     DEFAULT_ZELLIJ_ICON = "\u{10FF01}";
     DEFAULT_HOME_ICON = "⌂";
     DEFAULT_PROJECT_EXPANDED_ICON = "▾";
@@ -791,14 +791,13 @@ baked_glyphs! {
     DEFAULT_UPSTREAM_UNTRACKED_ICON = "↑";
 }
 
-/// Each private codepoint and the ordinary character it draws, where one
-/// means it.  Nothing else on a machine maps plane 16, so a default spelled
-/// this way reaches the face that fits it to the row instead of whichever
-/// fallback claims the real character first; see `assets/README.md`.  The
-/// ram comes from an SVG, so no Unicode character means it.
+/// The codepoints the multiplexer icons are spelled at.  Each is drawn from
+/// an SVG beside the font, and nothing else on a machine maps plane 16, so a
+/// default spelled this way reaches the face that fits it to the row instead
+/// of whichever fallback claims a real character first; see
+/// `assets/README.md`.
 #[cfg(test)]
-pub(crate) const PRIVATE_GLYPHS: &[(char, Option<char>)] =
-    &[('\u{10FF00}', None), ('\u{10FF01}', Some('⬡'))];
+pub(crate) const PRIVATE_GLYPHS: &[char] = &['\u{10FF00}', '\u{10FF01}'];
 
 baked_glyphs! {
     CHROME_GLYPHS:
