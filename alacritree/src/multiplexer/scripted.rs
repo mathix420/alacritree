@@ -101,6 +101,14 @@ impl Scripted {
         }
     }
 
+    /// A pane on `side` in the listing, by terminal id.
+    pub(crate) fn pane_mut(&mut self, side: &Side, terminal_id: &str) -> Option<&mut Pane> {
+        self.sides
+            .iter_mut()
+            .find(|(s, _)| s == side)
+            .and_then(|(_, panes)| panes.iter_mut().find(|p| p.terminal_id == terminal_id))
+    }
+
     pub(crate) fn enable(&mut self) -> &mut Self {
         self.enabled = true;
         self
@@ -194,6 +202,54 @@ impl Scripted {
 
     fn side(&self, side: &Side) -> Option<&[Pane]> {
         self.sides.iter().find(|(s, _)| s == side).map(|(_, panes)| panes.as_slice())
+    }
+}
+
+/// Spelling a pane for a test.  Every field a multiplexer reports is public,
+/// so these only exist to keep a pane one expression at the call site.
+impl Pane {
+    pub(crate) fn with_agent(mut self, kind: &str, status: PaneStatus) -> Self {
+        self.kind = Some(kind.to_string());
+        self.status = Some(status);
+        self
+    }
+
+    /// An agent the multiplexer found but could not classify, which is a
+    /// different answer from finding none.
+    pub(crate) fn with_unclassified_agent(mut self) -> Self {
+        self.status = Some(PaneStatus::Unknown);
+        self
+    }
+
+    pub(crate) fn with_title(mut self, title: &str) -> Self {
+        self.title = Some(title.to_string());
+        self
+    }
+
+    pub(crate) fn in_dir(mut self, cwd: &str) -> Self {
+        self.cwd = Some(cwd.to_string());
+        self
+    }
+
+    /// The directory the pane's foreground job is in, which outranks its own
+    /// when the two disagree.
+    pub(crate) fn in_foreground_dir(mut self, cwd: &str) -> Self {
+        self.foreground_cwd = Some(cwd.to_string());
+        self
+    }
+
+    /// The pane the multiplexer's own window is showing.
+    pub(crate) fn with_focus(mut self) -> Self {
+        self.focused = true;
+        self
+    }
+
+    /// A pane reached through its tab rather than by its own id, which is how
+    /// a multiplexer resolving through an agent registry reaches one with no
+    /// agent in it.
+    pub(crate) fn in_tab(mut self, tab_id: Option<&str>) -> Self {
+        self.tab_id = tab_id.map(str::to_string);
+        self
     }
 }
 

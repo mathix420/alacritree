@@ -3967,7 +3967,7 @@ mod tests {
     };
     use super::widgets::agent_hint;
     use crate::herdr::{self, PendingAttach, PendingCreate};
-    use crate::multiplexer::{AttachRequest, MultiplexerKind, Pane};
+    use crate::multiplexer::{AttachRequest, MultiplexerKind, Pane, PaneStatus, Scripted};
     use crate::test_util::herdr_pane_key;
 
     fn plain_worktree_row<'a>(
@@ -4035,6 +4035,50 @@ mod tests {
         );
         app.sessions.push(session);
         app
+    }
+
+    /// An app with the scripted multiplexer on and nothing else, for the pane
+    /// lifecycle.  Its workspace is one nothing has opened, so a pane that
+    /// should land somewhere has to say where.
+    fn lifecycle_app() -> AlacritreeApp {
+        let config = Config::default();
+        let (_, notify_rx) = mpsc::channel();
+        let theme = Theme::from_config(&config);
+        let mut app = AlacritreeApp::from_parts(
+            config,
+            theme,
+            state::PersistedState::default(),
+            Vec::new(),
+            (Vec::new(), crate::fonts::FaceMetrics::default()),
+            notify_rx,
+            (None, None),
+        );
+        app.current_workspace = Some(PathBuf::from("unopened-workspace"));
+        app.multiplexers.scripted_mut().enable().show_unmatched(true);
+        app
+    }
+
+    /// What the scripted multiplexer lists on `side`, replacing whatever it
+    /// listed before.
+    fn adopt_panes(app: &mut AlacritreeApp, side: &Side, panes: Vec<Pane>) {
+        app.multiplexers.scripted_mut().set_panes(side, panes);
+    }
+
+    /// A session holding the scripted pane `terminal` on `side`.
+    fn bind_pane_fixture(app: &mut AlacritreeApp, side: &Side, terminal: &str) -> SessionId {
+        let (mut session, _) = Session::pending_shell(
+            Context::default(),
+            &app.config,
+            None,
+            TermSize { columns: 80, screen_lines: 24 },
+            (8.0, 16.0),
+            None,
+            None,
+        );
+        session.bind_pane(Scripted::key(side, terminal), true);
+        let id = session.id;
+        app.sessions.push(session);
+        id
     }
 
     fn bind_herdr_fixture(app: &mut AlacritreeApp, side: Side, terminal: &str) -> SessionId {
@@ -4182,13 +4226,16 @@ mod tests {
     #[test]
     fn the_pane_listing_carries_an_unattached_pane_with_a_null_session_id() {
         let mut app = test_app();
-        adopt_herdr_fixture(
+        app.multiplexers.scripted_mut().enable();
+        adopt_panes(
             &mut app,
-            Side::Native,
-            r#"{"result":{"panes":[
-                {"terminal_id":"term-loose","pane_id":"w1:p1","agent":"claude","agent_status":"working","terminal_title_stripped":"loose pane","cwd":"/repo"}
-            ]}}"#,
-            Instant::now(),
+            &Side::Native,
+            vec![
+                Scripted::pane("term-loose")
+                    .with_agent("claude", PaneStatus::Working)
+                    .with_title("loose pane")
+                    .in_dir("/repo"),
+            ],
         );
         let json = app.multiplexer_panes_json();
         let panes = json["panes"].as_array().expect("panes array");
@@ -4203,15 +4250,18 @@ mod tests {
     fn the_pane_listing_names_the_session_holding_a_pane() {
         let mut app = test_app();
         let side = Side::Native;
-        adopt_herdr_fixture(
+        app.multiplexers.scripted_mut().enable();
+        adopt_panes(
             &mut app,
-            side.clone(),
-            r#"{"result":{"panes":[
-                {"terminal_id":"term-held","pane_id":"w1:p1","agent":"claude","agent_status":"working","terminal_title_stripped":"held pane","cwd":"/repo"}
-            ]}}"#,
-            Instant::now(),
+            &side,
+            vec![
+                Scripted::pane("term-held")
+                    .with_agent("claude", PaneStatus::Working)
+                    .with_title("held pane")
+                    .in_dir("/repo"),
+            ],
         );
-        let id = bind_herdr_fixture(&mut app, side, "term-held");
+        let id = bind_pane_fixture(&mut app, &side, "term-held");
         let json = app.multiplexer_panes_json();
         let panes = json["panes"].as_array().expect("panes array");
         let pane = panes
@@ -4226,15 +4276,8 @@ mod tests {
     #[test]
     fn the_pane_listing_is_empty_while_the_integration_is_disabled() {
         let mut app = test_app();
-        app.multiplexers.herdr_mut_for_test().config_mut_for_test().enabled = false;
-        adopt_herdr_fixture(
-            &mut app,
-            Side::Native,
-            r#"{"result":{"panes":[
-                {"terminal_id":"term-hidden","pane_id":"w1:p1","cwd":"/repo"}
-            ]}}"#,
-            Instant::now(),
-        );
+        app.multiplexers.scripted_mut().disable();
+        adopt_panes(&mut app, &Side::Native, vec![Scripted::pane("term-hidden").in_dir("/repo")]);
         let json = app.multiplexer_panes_json();
         assert_eq!(json["panes"].as_array().expect("panes array").len(), 0);
     }
