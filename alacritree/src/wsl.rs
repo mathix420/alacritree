@@ -185,30 +185,59 @@ fn is_utility_distro(name: &str) -> bool {
     name.starts_with("docker-desktop") || name.starts_with("rancher-desktop")
 }
 
-/// The answer every caller shares once one of the two sources has produced
-/// a non-empty one.  A distro registered or unregistered afterwards is picked
-/// up only on restart; that's an acceptable trade since mid-session
-/// registration churn is rare, and a stale entry just falls through the
-/// existing spawn-failure/degrade paths.
+/// The answer every caller shares.  A distro registered or unregistered
+/// afterwards is picked up only on restart; that's an acceptable trade since
+/// mid-session registration churn is rare, and a stale entry just falls
+/// through the existing spawn-failure/degrade paths.
+#[cfg(any(windows, test))]
+struct DistroCache(OnceLock<Vec<WslDistro>>);
+
+#[cfg(any(windows, test))]
+impl DistroCache {
+    const fn new() -> Self {
+        Self(OnceLock::new())
+    }
+
+    /// An empty registry read is not cached: before the `wsl.exe` fallback
+    /// has answered, it cannot tell a machine with no distros from one whose
+    /// registry key is unreadable.
+    fn get(&self, registry: impl FnOnce() -> Option<Vec<WslDistro>>) -> Vec<WslDistro> {
+        if let Some(list) = self.0.get() {
+            return list.clone();
+        }
+        match registry() {
+            Some(list) if !list.is_empty() => self.0.get_or_init(|| list).clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Once both sources have been asked, an empty answer is final, so the
+    /// frame path stops reading the registry on machines without WSL.
+    fn settle(
+        &self,
+        registry: impl FnOnce() -> Option<Vec<WslDistro>>,
+        cli: impl FnOnce() -> Vec<WslDistro>,
+    ) {
+        if !self.get(registry).is_empty() {
+            return;
+        }
+        let _ = self.0.set(cli());
+    }
+}
+
 #[cfg(windows)]
-static DISTROS: OnceLock<Vec<WslDistro>> = OnceLock::new();
+static DISTROS: DistroCache = DistroCache::new();
 
 /// Registered distros, default first-classed.  Reading the `Lxss` registry key
 /// costs microseconds and knows which distro is the default, so it is the only
 /// source this reaches for: the `wsl -l -q` fallback spawns a process, and the
 /// sidebar asks for this list every frame.  Until
 /// [`prime_distros_from_cli`] has filled that fallback in, a machine whose
-/// registry key is unreadable sees an empty list — the same answer it gets
+/// registry key is unreadable sees an empty list, the same answer it gets
 /// with no distros installed, which leaves WSL features dormant.
 #[cfg(windows)]
 pub fn distros() -> Vec<WslDistro> {
-    if let Some(list) = DISTROS.get() {
-        return list.clone();
-    }
-    match registry_distros() {
-        Some(list) if !list.is_empty() => DISTROS.get_or_init(|| list).clone(),
-        _ => Vec::new(),
-    }
+    DISTROS.get(registry_distros)
 }
 
 #[cfg(not(windows))]
@@ -221,13 +250,7 @@ pub fn distros() -> Vec<WslDistro> {
 /// costs hundreds of milliseconds warm and seconds while a distro VM boots.
 #[cfg(windows)]
 pub fn prime_distros_from_cli(blocking: &jobs::Blocking) {
-    if !distros().is_empty() {
-        return;
-    }
-    let list = cli_distros(blocking);
-    if !list.is_empty() {
-        let _ = DISTROS.set(list);
-    }
+    DISTROS.settle(registry_distros, || cli_distros(blocking));
 }
 
 #[cfg(not(windows))]
@@ -712,6 +735,35 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::path::{Path, PathBuf};
+
+    fn distro(name: &str) -> WslDistro {
+        WslDistro { name: name.to_string(), is_default: true }
+    }
+
+    #[test]
+    fn no_distros_stops_reading_the_registry_once_the_cli_has_answered() {
+        let cache = DistroCache::new();
+        let reads = std::cell::Cell::new(0);
+        let registry = || {
+            reads.set(reads.get() + 1);
+            Some(Vec::new())
+        };
+        cache.settle(registry, Vec::new);
+        let settled = reads.get();
+
+        assert!(cache.get(registry).is_empty());
+        assert_eq!(reads.get(), settled);
+    }
+
+    #[test]
+    fn an_empty_registry_before_the_cli_answers_leaves_the_fallback_open() {
+        let cache = DistroCache::new();
+        assert!(cache.get(|| Some(Vec::new())).is_empty());
+
+        cache.settle(|| Some(Vec::new()), || vec![distro("Ubuntu")]);
+
+        assert_eq!(cache.get(|| None), vec![distro("Ubuntu")]);
+    }
 
     #[test]
     fn drain_capped_rejects_output_that_fills_the_cap() {
