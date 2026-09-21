@@ -6,8 +6,8 @@ use alacritty_terminal::term::search::Match;
 use alacritty_terminal::term::{Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, CursorStyle};
 use egui::{
-    Color32, CursorIcon, Event, FontFamily, FontId, ImeEvent, Modifiers, MouseWheelUnit,
-    PointerButton, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2,
+    Color32, CursorIcon, Event, FontId, ImeEvent, Modifiers, MouseWheelUnit, PointerButton, Pos2,
+    Rect, Response, Sense, Stroke, Ui, Vec2,
 };
 
 use crate::builtin_font::{BuiltinGlyphCache, Metrics, is_builtin_glyph};
@@ -17,7 +17,6 @@ use crate::colors::{TerminalColors, default_background, resolve, rgb_to_color32}
 use crate::config::{Config, Palette};
 use crate::cursor::anim::{Corners, within};
 use crate::cursor::{self};
-use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
 use crate::glyph_cache::{Face, GlyphCache, MAX_EXTRA_CELLS, growth_offset, may_grow};
 use crate::grid_gl::{Frame as GridFrame, GpuGrid};
 use crate::grid_instances::RunView;
@@ -210,7 +209,19 @@ pub(crate) fn show(
         ),
     }
     if let Some(cursor) = &snapshot.cursor {
-        paint_cursor(&painter, rect, cursor, smear.as_ref(), cell_w, cell_h, &font_id);
+        let mut sources = GlyphPainter {
+            ctx: ui.ctx(),
+            config,
+            metrics: &metrics,
+            builtin: builtin_glyphs,
+            color: color_glyphs,
+            galleys: glyphs,
+            cell_w,
+            cell_h,
+            ppp,
+            size: font_id.size,
+        };
+        paint_cursor(&painter, rect, cursor, smear.as_ref(), cell_w, cell_h, &mut sources);
     }
     // Nothing else wakes egui while the cursor moves or blinks on its own.
     if let Some(after) = session.cursor.repaint_in() {
@@ -1487,18 +1498,6 @@ fn is_selected(range: Option<&SelectionRange>, line: Line, column: Column) -> bo
     range.is_some_and(|r| r.contains(Point::new(line, column)))
 }
 
-fn font_for_flags(flags: Flags, normal: &FontId) -> FontId {
-    let bold = flags.contains(Flags::BOLD);
-    let italic = flags.contains(Flags::ITALIC);
-    let family = match (bold, italic) {
-        (true, true) => FontFamily::Name(BOLD_ITALIC_FAMILY.into()),
-        (true, false) => FontFamily::Name(BOLD_FAMILY.into()),
-        (false, true) => FontFamily::Name(ITALIC_FAMILY.into()),
-        (false, false) => return normal.clone(),
-    };
-    FontId::new(normal.size, family)
-}
-
 /// The cells `style` covers, in screen points.
 fn run_rect(rect: Rect, run: &str, style: &Run, cell_w: f32, cell_h: f32) -> Rect {
     let width = run.chars().count() as f32 * cell_w;
@@ -1521,6 +1520,83 @@ fn paint_run_background(
 ) {
     if style.bg != default_bg || style.selected {
         painter.rect_filled(run_rect(rect, run, style, cell_w, cell_h), 0.0, style.bg);
+    }
+}
+
+/// The three places a character's artwork can come from, tried in the order
+/// the grid tries them: a hand-drawn box-drawing glyph, a colour font's
+/// sprite, then the font's own outline through the galley cache.
+///
+/// The cursor redraws the cell it covers, so it resolves characters through
+/// this too rather than through `Painter::text`, which only ever finds the
+/// outline.
+struct GlyphPainter<'a> {
+    ctx: &'a egui::Context,
+    config: &'a Config,
+    metrics: &'a Metrics,
+    builtin: &'a mut BuiltinGlyphCache,
+    color: &'a mut ColorGlyphCache,
+    galleys: &'a mut GlyphCache,
+    cell_w: f32,
+    cell_h: f32,
+    ppp: f32,
+    size: f32,
+}
+
+impl GlyphPainter<'_> {
+    /// Draw `ch` in the cell whose top-left corner is `at`.  `rest` is what
+    /// follows it on the same run; its leading blanks are the cells an
+    /// over-wide icon may grow across, and an empty one grows nothing.
+    fn paint(
+        &mut self,
+        painter: &egui::Painter,
+        ch: char,
+        face: Face,
+        fg: Color32,
+        at: Pos2,
+        rest: &str,
+    ) {
+        if self.config.font.builtin_box_drawing
+            && is_builtin_glyph(ch)
+            && let Some(cached) = self.builtin.get(
+                self.ctx,
+                ch,
+                self.metrics,
+                &self.config.font.offset,
+                &self.config.font.glyph_offset,
+            )
+        {
+            paint_builtin_glyph(painter, cached, at.x, at.y, self.cell_h, self.ppp, fg);
+            return;
+        }
+        // Emoji are resolved against the normal chain whatever the cell's
+        // style: colour fonts ship one set of artwork, and a bold or italic
+        // variant of it would be synthesized rather than drawn.
+        if self.config.font.color_glyphs
+            && let Some(cached) = self.color.get(self.ctx, ch, self.metrics, char_cells(ch))
+        {
+            paint_color_glyph(painter, cached, at.x, at.y, self.ppp);
+            return;
+        }
+        let galley = self.galleys.get(self.ctx, ch, face, self.size);
+        // A private-use icon wider than its cell is drawn across the blanks
+        // that follow rather than over the top of them, centred on the span it
+        // ends up with, the way kitty grows one.
+        let grow_dx = if may_grow(ch) {
+            let spare = rest.chars().take(MAX_EXTRA_CELLS).take_while(|c| *c == ' ').count();
+            growth_offset(galley.size().x, self.cell_w, spare)
+        } else {
+            0.0
+        };
+        let offset = &self.config.font.glyph_offset;
+        painter.add(
+            egui::epaint::TextShape::new(
+                Pos2::new(at.x + offset.x as f32 + grow_dx, at.y + offset.y as f32),
+                galley,
+                fg,
+            )
+            .with_override_text_color(fg),
+        );
     }
 }
 
@@ -1550,57 +1626,24 @@ fn paint_run_glyphs(
         // with zoom).
         let face =
             Face::new(style.flags.contains(Flags::BOLD), style.flags.contains(Flags::ITALIC));
-        let glyph_dx = config.font.glyph_offset.x as f32;
-        let glyph_dy = config.font.glyph_offset.y as f32;
+        let mut sources = GlyphPainter {
+            ctx,
+            config,
+            metrics,
+            builtin: builtin_glyphs,
+            color: color_glyphs,
+            galleys: glyphs,
+            cell_w,
+            cell_h,
+            ppp,
+            size: font_id.size,
+        };
         for (i, (byte, ch)) in run.char_indices().enumerate() {
             if ch == ' ' {
                 continue;
             }
-            let cell_x = x + i as f32 * cell_w;
-            if config.font.builtin_box_drawing
-                && is_builtin_glyph(ch)
-                && let Some(cached) = builtin_glyphs.get(
-                    ctx,
-                    ch,
-                    metrics,
-                    &config.font.offset,
-                    &config.font.glyph_offset,
-                )
-            {
-                paint_builtin_glyph(painter, cached, cell_x, y, cell_h, ppp, fg);
-                continue;
-            }
-            // Emoji are resolved against the normal chain whatever the cell's
-            // style: colour fonts ship one set of artwork, and a bold or italic
-            // variant of it would be synthesized rather than drawn.
-            if config.font.color_glyphs
-                && let Some(cached) = color_glyphs.get(ctx, ch, metrics, char_cells(ch))
-            {
-                paint_color_glyph(painter, cached, cell_x, y, ppp);
-                continue;
-            }
-            let galley = glyphs.get(ctx, ch, face, font_id.size);
-            // A private-use icon wider than its cell is drawn across the
-            // blanks that follow rather than over the top of them, centred on
-            // the span it ends up with, the way kitty grows one.
-            let grow_dx = if may_grow(ch) {
-                let spare = run[byte + ch.len_utf8()..]
-                    .chars()
-                    .take(MAX_EXTRA_CELLS)
-                    .take_while(|c| *c == ' ')
-                    .count();
-                growth_offset(galley.size().x, cell_w, spare)
-            } else {
-                0.0
-            };
-            painter.add(
-                egui::epaint::TextShape::new(
-                    Pos2::new(cell_x + glyph_dx + grow_dx, y + glyph_dy),
-                    galley,
-                    fg,
-                )
-                .with_override_text_color(fg),
-            );
+            let rest = &run[byte + ch.len_utf8()..];
+            sources.paint(painter, ch, face, fg, Pos2::new(x + i as f32 * cell_w, y), rest);
         }
     }
 
@@ -1632,7 +1675,7 @@ fn paint_cursor(
     smear: Option<&Corners>,
     cell_w: f32,
     cell_h: f32,
-    font_id: &FontId,
+    sources: &mut GlyphPainter<'_>,
 ) {
     use alacritty_terminal::vte::ansi::CursorShape::*;
 
@@ -1673,15 +1716,12 @@ fn paint_cursor(
         Hidden => return,
     }
 
-    // The solid block covers the glyph; redraw it in inverted color so it stays legible.
+    // The solid block covers the glyph; redraw it in inverted color so it stays
+    // legible.  No trailing run: the grid already drew whatever an over-wide
+    // icon grew across, and this redraws only the cell under the cursor.
     if let Some((ch, flags, color)) = cursor.glyph {
-        painter.text(
-            Pos2::new(x, y),
-            egui::Align2::LEFT_TOP,
-            ch.to_string(),
-            font_for_flags(flags, font_id),
-            color,
-        );
+        let face = Face::new(flags.contains(Flags::BOLD), flags.contains(Flags::ITALIC));
+        sources.paint(painter, ch, face, color, Pos2::new(x, y), "");
     }
 }
 
@@ -1835,9 +1875,10 @@ fn paint_builtin_glyph(
 mod tests {
     use alacritty_terminal::term::Config as TermConfig;
     use alacritty_terminal::vte::ansi::{Processor, Rgb, StdSyncHandler};
-    use egui::Key;
+    use egui::{FontFamily, Key};
 
     use super::*;
+    use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
     use crate::repaint::Recorder;
 
     fn term_running(output: &[u8]) -> Term<EventProxy<Recorder>> {
@@ -2621,6 +2662,35 @@ mod tests {
         assert_eq!(at("I").family, FontFamily::Name(ITALIC_FAMILY.into()), "an italic cell");
 
         assert_ne!(at("C").color, fg, "SGR 31 painted in the default foreground");
+    }
+
+    /// The cursor redraws the cell it covers, so it has to resolve that
+    /// character through the same three sources the grid did.  A box-drawing
+    /// glyph comes from the hand-drawn cache, which paints an image rather
+    /// than text.
+    #[test]
+    fn the_cursor_redraws_a_box_drawing_cell_from_the_cache_the_grid_used() {
+        let mut config = Config::default();
+        config.font.builtin_box_drawing = true;
+        let ctx = ctx_with_terminal_faces();
+        let (mut session, _dir) = headless_session(&ctx, &config);
+        let mut caches = Caches::new();
+        let screen = Vec2::new(640.0, 480.0);
+
+        painted_cells(&ctx, &mut session, &config, &mut caches, screen);
+        let (cols, rows) = (session.size.columns, session.size.screen_lines);
+        {
+            let mut term = session.term.lock();
+            term.resize(TermSize::new(cols, rows));
+            // The carriage return parks the cursor back on the glyph.
+            Processor::<StdSyncHandler>::new().advance(&mut *term, "│\r".as_bytes());
+        }
+
+        let (glyphs, _) = painted_cells(&ctx, &mut session, &config, &mut caches, screen);
+        assert!(
+            !glyphs.iter().any(|g| g.ch == "│"),
+            "the cursor drew the font's outline over the hand-drawn glyph: {glyphs:?}"
+        );
     }
 
     /// With no selection colours configured a selected cell swaps its pair.
