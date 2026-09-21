@@ -460,7 +460,7 @@ fn run_due(due: Vec<Member>, blocking: &jobs::Blocking) -> BatchResult {
         let found = query_group(
             &group,
             |cwd, query| run_graphql(cwd, query, blocking),
-            |m| query_gh(&m.path, &m.branch, blocking),
+            |m, head_owner| query_gh(&m.path, &m.branch, head_owner, blocking),
         );
         for m in &group.members {
             out.insert(m.path.clone(), found.get(&m.branch).cloned());
@@ -477,6 +477,8 @@ struct Group {
     cwd: PathBuf,
     slug: Option<(String, String)>,
     members: Vec<Member>,
+    /// The owner each branch pushes to, where one could be read.
+    head_owners: HashMap<String, String>,
 }
 
 /// One request per repository, chunked, plus one per path that cannot be
@@ -497,24 +499,35 @@ fn groups_with(
     let mut by_repo: HashMap<(String, String), Group> = HashMap::new();
     let mut ungrouped = Vec::new();
     for m in due {
-        let slug = match wsl::classify(&m.path) {
-            wsl::Location::Windows(p) => origin_slug(&p),
+        let (slug, head_owner) = match wsl::classify(&m.path) {
+            wsl::Location::Windows(p) => read_remotes(&p, &m.branch),
             // Nothing here can read a repository inside a distro, and its
             // `gh` runs as a script rather than a `Command`.
-            wsl::Location::Wsl { .. } => None,
+            wsl::Location::Wsl { .. } => (None, None),
         };
-        match slug {
-            Some((owner, name)) => by_repo
-                .entry((owner.clone(), name.clone()))
-                .or_insert_with(|| Group {
+        let group = match slug {
+            Some((owner, name)) => {
+                by_repo.entry((owner.clone(), name.clone())).or_insert_with(|| Group {
                     cwd: m.path.clone(),
                     slug: Some((owner, name)),
                     members: Vec::new(),
+                    head_owners: HashMap::new(),
                 })
-                .members
-                .push(m),
-            None => ungrouped.push(Group { cwd: m.path.clone(), slug: None, members: vec![m] }),
+            },
+            None => {
+                ungrouped.push(Group {
+                    cwd: m.path.clone(),
+                    slug: None,
+                    members: Vec::new(),
+                    head_owners: HashMap::new(),
+                });
+                ungrouped.last_mut().expect("just pushed")
+            },
+        };
+        if let Some(owner) = head_owner {
+            group.head_owners.insert(m.branch.clone(), owner);
         }
+        group.members.push(m);
     }
     by_repo
         .into_values()
@@ -527,7 +540,12 @@ fn groups_with(
             g.slug = resolve(&g.cwd);
             g.members
                 .chunks(pr_query::CHUNK)
-                .map(|c| Group { cwd: g.cwd.clone(), slug: g.slug.clone(), members: c.to_vec() })
+                .map(|c| Group {
+                    cwd: g.cwd.clone(),
+                    slug: g.slug.clone(),
+                    members: c.to_vec(),
+                    head_owners: g.head_owners.clone(),
+                })
                 .collect::<Vec<_>>()
         })
         .chain(ungrouped)
@@ -549,18 +567,23 @@ fn groups_with(
 fn query_group(
     group: &Group,
     request: impl Fn(&Path, &str) -> Option<Vec<u8>>,
-    per_branch: impl Fn(&Member) -> Option<PrInfo>,
+    per_branch: impl Fn(&Member, Option<&str>) -> Option<PrInfo>,
 ) -> HashMap<String, PrInfo> {
     let branches: Vec<String> = group.members.iter().map(|m| m.branch.clone()).collect();
+    let head_owner = |branch: &str| group.head_owners.get(branch).map(String::as_str);
     if let Some((owner, name)) = &group.slug {
         let query = pr_query::build(owner, name, &branches);
         if let Some(stdout) = request(&group.cwd, &query) {
-            if let Some(parsed) = pr_query::parse(&stdout, &branches, Some(owner)) {
+            if let Some(parsed) = pr_query::parse(&stdout, &branches, head_owner) {
                 return parsed;
             }
         }
     }
-    group.members.iter().filter_map(|m| per_branch(m).map(|i| (m.branch.clone(), i))).collect()
+    group
+        .members
+        .iter()
+        .filter_map(|m| per_branch(m, head_owner(&m.branch)).map(|i| (m.branch.clone(), i)))
+        .collect()
 }
 
 /// Run one GraphQL document through `gh`, returning its stdout.
@@ -625,7 +648,12 @@ fn pr_state(state: &str, is_draft: bool) -> PrState {
 /// the head ref name alone, which both layouts share, and `--state all` keeps
 /// the merged and closed badges that `pr list` would otherwise drop.
 #[allow(clippy::disallowed_methods)] // Running `gh` is this function's job.
-fn query_gh(path: &Path, branch: &str, blocking: &jobs::Blocking) -> Option<PrInfo> {
+fn query_gh(
+    path: &Path,
+    branch: &str,
+    head_owner: Option<&str>,
+    blocking: &jobs::Blocking,
+) -> Option<PrInfo> {
     const PR_JSON_FIELDS: &str = "number,baseRefName,url,state,isDraft,headRepositoryOwner";
     // `--head` matches the ref name in every head repository and `--state all`
     // keeps the closed and merged ones, so a generic branch name in a busy base
@@ -634,7 +662,6 @@ fn query_gh(path: &Path, branch: &str, blocking: &jobs::Blocking) -> Option<PrIn
     const PR_LIMIT: &str = "100";
     match wsl::classify(path) {
         wsl::Location::Windows(p) => {
-            let owner = origin_slug(&p).map(|(owner, _)| owner);
             let output = command_ext::hidden(tools::program(Tool::Gh))
                 .current_dir(p)
                 .args([
@@ -657,19 +684,23 @@ fn query_gh(path: &Path, branch: &str, blocking: &jobs::Blocking) -> Option<PrIn
             if !output.status.success() {
                 return None;
             }
-            parse_gh_output(&output.stdout, owner.as_deref())
+            parse_gh_output(&output.stdout, head_owner)
         },
         // WSL gh needs distro-local auth; the registry keeps helper-resolved
         // per-user installs that the default `--exec` PATH cannot find.
         wsl::Location::Wsl { distro, linux_path } => {
             let gh = tools::wsl_in_job(Tool::Gh, &distro, blocking);
-            // The `origin` URL rides along on the first line: git2 cannot read
-            // a repository that lives inside the distro, and a second round
-            // trip would double the cost of a badge that already forks `gh`.
-            // The substitution collapses a missing remote to a blank line, so
-            // the JSON always starts after exactly one newline.
+            // The push remote's URL rides along on the first line: git2 cannot
+            // read a repository that lives inside the distro, and a second
+            // round trip would double the cost of a badge that already forks
+            // `gh`.  The remote is chosen in git's own push order, as
+            // `read_remotes` does natively.  The substitution collapses a
+            // missing remote to a blank line, so the JSON always starts after
+            // exactly one newline.
             let script = r#"cd "$1" || exit 1
-printf '%s\n' "$(git config --get remote.origin.url 2>/dev/null)"
+r=$(git config --get "branch.$3.pushRemote" || git config --get remote.pushDefault || git config --get "branch.$3.remote")
+case "$r" in ''|.) r=origin ;; esac
+printf '%s\n' "$(git config --get "remote.$r.url" 2>/dev/null)"
 exec "$2" pr list --head "$3" --state all --limit "$4" --json "$5""#;
             let stdout = wsl::run_batch(
                 &distro,
@@ -678,16 +709,16 @@ exec "$2" pr list --head "$3" --state all --limit "$4" --json "$5""#;
                 blocking,
             )
             .ok()?;
-            let (origin_url, json) = split_origin_url_line(&stdout);
-            let owner = origin_url.and_then(github_slug_from_url).map(|(owner, _)| owner);
+            let (push_url, json) = split_remote_url_line(&stdout);
+            let owner = push_url.and_then(github_slug_from_url).map(|(owner, _)| owner);
             parse_gh_output(json, owner.as_deref())
         },
     }
 }
 
-/// Split the WSL batch's leading `origin` URL off the JSON that follows it.
-/// An empty first line means the worktree has no readable `origin`.
-fn split_origin_url_line(stdout: &[u8]) -> (Option<&str>, &[u8]) {
+/// Split the WSL batch's leading push remote URL off the JSON that follows
+/// it.  An empty first line means the branch has no readable push remote.
+fn split_remote_url_line(stdout: &[u8]) -> (Option<&str>, &[u8]) {
     let Some(end) = stdout.iter().position(|b| *b == b'\n') else {
         // Nothing ran far enough to emit the line; hand the payload to the
         // JSON parser, which rejects it the way it rejects any non-JSON.
@@ -728,15 +759,34 @@ fn parse_name_with_owner(stdout: &[u8]) -> Option<(String, String)> {
     (!owner.is_empty() && !name.is_empty()).then(|| (owner.to_string(), name.to_string()))
 }
 
-/// The GitHub `(owner, repository)` of this worktree's `origin`, read straight
-/// from the repository config.  This is the grouping key — which worktrees
-/// share a repository — not what the request asks about; `resolve_repo`
-/// decides that.  `None` for a missing, unreadable or non-GitHub remote, which
-/// leaves the path on the per-branch path.
-fn origin_slug(path: &Path) -> Option<(String, String)> {
-    let repo = git2::Repository::open(path).ok()?;
-    let remote = repo.find_remote("origin").ok()?;
-    github_slug_from_url(remote.url()?)
+/// Two answers from one `git2` open.  First, the GitHub `(owner, repository)`
+/// of `origin`, the grouping key for which worktrees share a repository.
+/// `resolve_repo` decides what the request asks about.  Second, the owner
+/// `branch` pushes to, which is whose PR the branch can have.  Either is
+/// `None` for a missing, unreadable or non-GitHub remote.
+fn read_remotes(path: &Path, branch: &str) -> (Option<(String, String)>, Option<String>) {
+    let Ok(repo) = git2::Repository::open(path) else { return (None, None) };
+    let slug_of = |name: &str| {
+        let remote = repo.find_remote(name).ok()?;
+        github_slug_from_url(remote.url()?)
+    };
+    let head_owner = slug_of(&push_remote(&repo, branch)).map(|(owner, _)| owner);
+    (slug_of("origin"), head_owner)
+}
+
+/// The remote `git push` sends `branch` to, in git's own order.  `.` names the
+/// local repository, which pushes nowhere, so it reads as unset.
+fn push_remote(repo: &git2::Repository, branch: &str) -> String {
+    let Ok(config) = repo.config() else { return "origin".to_string() };
+    [
+        format!("branch.{branch}.pushRemote"),
+        "remote.pushDefault".into(),
+        format!("branch.{branch}.remote"),
+    ]
+    .iter()
+    .filter_map(|key| config.get_string(key).ok())
+    .find(|name| !name.is_empty() && name != ".")
+    .unwrap_or_else(|| "origin".to_string())
 }
 
 /// Owner and repository of a GitHub remote URL, for the shapes git accepts:
@@ -790,10 +840,10 @@ fn is_github_host(host: &str) -> bool {
 ///
 /// `--head` matches the ref name across *every* head repository, so a generic
 /// branch name ("dev", "patch-1") also collects PRs strangers opened from their
-/// own forks.  A head repo owned by the same account as this worktree's
-/// `origin` is the one this checkout actually pushed, so it outranks a
-/// stranger's however live that one is.  Without a readable owner, or with no
-/// candidate matching it, every PR stays in the running.
+/// own forks, and upstream-sync PRs whose head is the upstream's `main`.  With
+/// `head_owner`, the account the branch pushes to, only that account's PRs
+/// and ones reporting no owner stay in the running, and a branch with none of
+/// its own gets no badge.  Without a readable owner, every PR stays in.
 ///
 /// Among what survives, `gh pr list` answers newest first and a branch
 /// accumulates PRs over its life; an open one is the live PR, so it outranks a
@@ -801,11 +851,13 @@ fn is_github_host(host: &str) -> bool {
 /// Mirrors how `gh pr view` orders its own candidates.
 fn select_pr<'a>(
     prs: &'a [serde_json::Value],
-    origin_owner: Option<&str>,
+    head_owner: Option<&str>,
 ) -> Option<&'a serde_json::Value> {
-    origin_owner
-        .and_then(|owner| open_or_newest(prs.iter().filter(|pr| head_owner_is(pr, owner))))
-        .or_else(|| open_or_newest(prs.iter()))
+    open_or_newest(prs.iter().filter(|pr| {
+        head_owner.is_none_or(|owner| {
+            pr_head_owner(pr).is_none_or(|login| login.eq_ignore_ascii_case(owner))
+        })
+    }))
 }
 
 fn open_or_newest<'a>(
@@ -821,16 +873,15 @@ fn open_or_newest<'a>(
     newest
 }
 
-fn head_owner_is(pr: &serde_json::Value, owner: &str) -> bool {
-    pr.get("headRepositoryOwner")
-        .and_then(|o| o.get("login"))
-        .and_then(|l| l.as_str())
-        .is_some_and(|login| login.eq_ignore_ascii_case(owner))
+/// `None` from a `gh` too old to report it, or a head repository since
+/// deleted.  Neither is evidence the PR belongs to someone else.
+fn pr_head_owner(pr: &serde_json::Value) -> Option<&str> {
+    pr.get("headRepositoryOwner")?.get("login")?.as_str()
 }
 
-fn parse_gh_output(stdout: &[u8], origin_owner: Option<&str>) -> Option<PrInfo> {
+fn parse_gh_output(stdout: &[u8], head_owner: Option<&str>) -> Option<PrInfo> {
     let list: serde_json::Value = serde_json::from_slice(stdout).ok()?;
-    select_and_build(list.as_array()?, origin_owner)
+    select_and_build(list.as_array()?, head_owner)
 }
 
 /// Select the winning PR from a candidate list and build the `PrInfo` for it.
@@ -838,9 +889,9 @@ fn parse_gh_output(stdout: &[u8], origin_owner: Option<&str>) -> Option<PrInfo> 
 /// so a change to selection or field reads applies to both by construction.
 pub(crate) fn select_and_build(
     prs: &[serde_json::Value],
-    origin_owner: Option<&str>,
+    head_owner: Option<&str>,
 ) -> Option<PrInfo> {
-    let value = select_pr(prs, origin_owner)?;
+    let value = select_pr(prs, head_owner)?;
     let number = value.get("number")?.as_u64()?;
     let base = value.get("baseRefName")?.as_str()?.to_string();
     let url = value.get("url")?.as_str()?.to_string();
@@ -1043,13 +1094,13 @@ mod tests {
     /// branch name ("dev", "patch-1") collects strangers' PRs.  Theirs must not
     /// decide this worktree's badge or diff base, however live they are.
     #[test]
-    fn select_pr_prefers_the_origin_owners_pr_over_a_strangers_open_one() {
+    fn select_pr_prefers_the_head_owners_pr_over_a_strangers_open_one() {
         let prs = [pr(9, "OPEN", "stranger"), pr(4, "MERGED", "me")];
         assert_eq!(number_of(select_pr(&prs, Some("me"))), Some(4));
     }
 
     #[test]
-    fn select_pr_prefers_an_open_pr_among_the_origin_owners_own() {
+    fn select_pr_prefers_an_open_pr_among_the_head_owners_own() {
         let prs = [pr(9, "MERGED", "me"), pr(7, "OPEN", "stranger"), pr(4, "OPEN", "me")];
         assert_eq!(number_of(select_pr(&prs, Some("me"))), Some(4));
     }
@@ -1063,9 +1114,15 @@ mod tests {
     }
 
     #[test]
-    fn select_pr_falls_back_to_the_plain_policy_when_no_owner_matches() {
+    fn select_pr_takes_nothing_when_every_pr_is_another_owners() {
         let prs = [pr(9, "MERGED", "stranger"), pr(4, "OPEN", "other")];
-        assert_eq!(number_of(select_pr(&prs, Some("me"))), Some(4));
+        assert!(select_pr(&prs, Some("me")).is_none());
+    }
+
+    #[test]
+    fn select_pr_keeps_every_pr_without_a_readable_owner() {
+        let prs = [pr(9, "MERGED", "stranger"), pr(4, "OPEN", "other")];
+        assert_eq!(number_of(select_pr(&prs, None)), Some(4));
     }
 
     /// A `gh` too old to report the head owner must not filter every candidate
@@ -1085,7 +1142,7 @@ mod tests {
     /// stranger on the same branch name, still carrying the base branch the
     /// repository has since renamed away from.
     #[test]
-    fn the_origin_owners_pr_decides_the_diff_base() {
+    fn the_head_owners_pr_decides_the_diff_base() {
         let stdout = br#"[
             {"baseRefName":"master","number":9,"url":"u9","state":"OPEN","isDraft":false,"headRepositoryOwner":{"login":"stranger"}},
             {"baseRefName":"main","number":4,"url":"u4","state":"MERGED","isDraft":false,"headRepositoryOwner":{"login":"me"}}
@@ -1142,14 +1199,14 @@ mod tests {
 
     #[test]
     fn the_wsl_batch_line_carries_the_origin_url() {
-        let (url, json) = split_origin_url_line(b"gh:me/repo.git\n[]");
+        let (url, json) = split_remote_url_line(b"gh:me/repo.git\n[]");
         assert_eq!(url, Some("gh:me/repo.git"));
         assert_eq!(json, b"[]".as_slice());
     }
 
     #[test]
     fn a_worktree_without_a_remote_leaves_the_wsl_line_blank() {
-        let (url, json) = split_origin_url_line(b"\n[]");
+        let (url, json) = split_remote_url_line(b"\n[]");
         assert_eq!(url, None);
         assert_eq!(json, b"[]".as_slice());
     }
@@ -1627,6 +1684,7 @@ mod tests {
                 .iter()
                 .map(|b| Member { path: PathBuf::from("/repo"), branch: (*b).to_string() })
                 .collect(),
+            head_owners: HashMap::new(),
         }
     }
 
@@ -1644,7 +1702,7 @@ mod tests {
             |_, _| {
                 Some(br#"{"data":{"repository":{"b0":{"nodes":[]},"b1":{"nodes":[]}}}}"#.to_vec())
             },
-            |_| {
+            |_, _| {
                 sweeps.fetch_add(1, Ordering::Relaxed);
                 Some(sample_info())
             },
@@ -1665,7 +1723,7 @@ mod tests {
         let found = query_group(
             &group,
             |_, _| Some(br#"{"data":{"repository":null},"errors":[{"message":"nope"}]}"#.to_vec()),
-            |_| {
+            |_, _| {
                 sweeps.fetch_add(1, Ordering::Relaxed);
                 Some(sample_info())
             },
@@ -1685,7 +1743,7 @@ mod tests {
         let found = query_group(
             &group,
             |_, _| panic!("a group with no repository has nothing to ask about"),
-            |_| Some(sample_info()),
+            |_, _| Some(sample_info()),
         );
 
         assert_eq!(found.len(), 1);
@@ -1829,6 +1887,76 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(out[0].slug.is_none());
         assert_eq!(out[0].members.len(), 1);
+    }
+
+    /// A GraphQL answer carrying `nodes` as the only branch's PRs.
+    fn graphql_answer(nodes: &[serde_json::Value]) -> Vec<u8> {
+        let nodes: Vec<_> = nodes
+            .iter()
+            .map(|pr| {
+                let mut pr = pr.clone();
+                pr["url"] = "u".into();
+                pr["baseRefName"] = "main".into();
+                pr
+            })
+            .collect();
+        serde_json::json!({ "data": { "repository": { "b0": { "nodes": nodes } } } })
+            .to_string()
+            .into_bytes()
+    }
+
+    /// Group `branch` of a repository with `remotes`, and ask with `answer`
+    /// standing in for GitHub.
+    fn ask_as_github(
+        remotes: &[(&str, &str)],
+        config: &[(&str, &str)],
+        branch: &str,
+        answer: Vec<u8>,
+    ) -> HashMap<String, PrInfo> {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = init_repo(dir.path());
+        for (name, url) in remotes {
+            repo.remote(name, url).expect("remote");
+        }
+        for (key, value) in config {
+            repo.config().unwrap().set_str(key, value).unwrap();
+        }
+        let due = vec![Member { path: dir.path().to_path_buf(), branch: branch.into() }];
+        let groups = groups_with(due, |_| Some(("upstream".to_string(), "repo".to_string())));
+        assert_eq!(groups.len(), 1);
+        query_group(&groups[0], |_, _| Some(answer.clone()), |_, _| panic!("the batch answered"))
+    }
+
+    /// An upstream-sync PR opened from the upstream's `main` matches a fork's
+    /// `main` by head ref name.  It is not the fork's PR, and a branch with no
+    /// PR of its own gets no badge.
+    #[test]
+    fn a_branch_with_only_another_owners_pr_gets_no_badge() {
+        let found = ask_as_github(
+            &[("origin", "gh:me/repo.git")],
+            &[],
+            "main",
+            graphql_answer(&[pr(12, "CLOSED", "upstream")]),
+        );
+
+        assert!(found.is_empty(), "matched another owner's PR: {found:?}");
+    }
+
+    /// A branch pushed to a fork while `origin` names the upstream has its PR
+    /// under the fork's owner, however live the upstream's own PR is.
+    #[test]
+    fn a_branch_pushed_to_a_fork_keeps_the_forks_pr() {
+        let found = ask_as_github(
+            &[
+                ("origin", "https://github.com/upstream/repo.git"),
+                ("fork", "https://github.com/me/repo.git"),
+            ],
+            &[("branch.topic.pushRemote", "fork")],
+            "topic",
+            graphql_answer(&[pr(9, "OPEN", "upstream"), pr(4, "OPEN", "me")]),
+        );
+
+        assert_eq!(found.get("topic").map(|i| i.number), Some(4));
     }
 
     #[test]

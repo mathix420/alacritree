@@ -71,10 +71,10 @@ pub(crate) fn body(query: &str) -> String {
 /// that no branch in this repository has a PR.  The two have to stay
 /// distinguishable, or the common "nobody here has a PR" answer costs a
 /// per-branch sweep that finds the same nothing.
-pub(crate) fn parse(
+pub(crate) fn parse<'a>(
     stdout: &[u8],
     branches: &[String],
-    origin_owner: Option<&str>,
+    head_owner: impl Fn(&str) -> Option<&'a str>,
 ) -> Option<HashMap<String, PrInfo>> {
     let v: serde_json::Value = serde_json::from_slice(stdout).ok()?;
     let repo = v.pointer("/data/repository")?;
@@ -87,7 +87,7 @@ pub(crate) fn parse(
             continue;
         };
         let Some(list) = nodes.as_array() else { continue };
-        if let Some(info) = crate::pr_status::select_and_build(list, origin_owner) {
+        if let Some(info) = crate::pr_status::select_and_build(list, head_owner(branch)) {
             found.insert(branch.clone(), info);
         }
     }
@@ -149,7 +149,7 @@ mod tests {
                             "isDraft":false,"headRepositoryOwner":{"login":"me"}}]},
             "b1":null}},
             "errors":[{"message":"something went wrong"}]}"#;
-        let found = parse(stdout, &["main".into(), "topic".into()], Some("me"))
+        let found = parse(stdout, &["main".into(), "topic".into()], |_| Some("me"))
             .expect("a response carrying a repository is an answer");
         assert_eq!(found.get("main").map(|p| p.number), Some(7));
         assert!(!found.contains_key("topic"));
@@ -162,7 +162,7 @@ mod tests {
     #[test]
     fn a_response_with_no_prs_is_still_an_answer() {
         let stdout = br#"{"data":{"repository":{"b0":{"nodes":[]},"b1":{"nodes":[]}}}}"#;
-        let found = parse(stdout, &["main".into(), "topic".into()], Some("me"));
+        let found = parse(stdout, &["main".into(), "topic".into()], |_| Some("me"));
         assert_eq!(found, Some(HashMap::new()));
     }
 
@@ -173,7 +173,7 @@ mod tests {
     fn a_null_repository_is_not_an_answer() {
         let stdout = br#"{"data":{"repository":null},
             "errors":[{"message":"Could not resolve to a Repository"}]}"#;
-        assert!(parse(stdout, &["main".into()], Some("me")).is_none());
+        assert!(parse(stdout, &["main".into()], |_| Some("me")).is_none());
     }
 
     /// A whole-selection failure — a timeout on a full chunk, say — comes back
@@ -184,26 +184,26 @@ mod tests {
     fn a_response_whose_aliases_all_failed_is_not_an_answer() {
         let stdout = br#"{"data":{"repository":{"b0":null,"b1":null}},
             "errors":[{"message":"upstream timeout"}]}"#;
-        assert!(parse(stdout, &["main".into(), "topic".into()], Some("me")).is_none());
+        assert!(parse(stdout, &["main".into(), "topic".into()], |_| Some("me")).is_none());
     }
 
     #[test]
     fn malformed_output_is_not_an_answer() {
-        assert!(parse(b"", &["main".into()], None).is_none());
-        assert!(parse(b"not json", &["main".into()], None).is_none());
-        assert!(parse(b"{}", &["main".into()], None).is_none());
+        assert!(parse(b"", &["main".into()], |_| None).is_none());
+        assert!(parse(b"not json", &["main".into()], |_| None).is_none());
+        assert!(parse(b"{}", &["main".into()], |_| None).is_none());
     }
 
     /// A head ref name matches across head repositories, so several PRs can come
-    /// back and the local origin's owner is what picks this checkout's own.
+    /// back and the owner the branch pushes to is what picks this checkout's own.
     #[test]
-    fn the_origin_owner_breaks_a_tie() {
+    fn the_head_owner_breaks_a_tie() {
         let stdout = br#"{"data":{"repository":{"b0":{"nodes":[
             {"number":1,"baseRefName":"master","url":"a","state":"OPEN",
              "isDraft":false,"headRepositoryOwner":{"login":"someone-else"}},
             {"number":2,"baseRefName":"master","url":"b","state":"OPEN",
              "isDraft":false,"headRepositoryOwner":{"login":"me"}}]}}}}"#;
-        let found = parse(stdout, &["main".into()], Some("me")).expect("an answer");
+        let found = parse(stdout, &["main".into()], |_| Some("me")).expect("an answer");
         assert_eq!(found.get("main").map(|p| p.number), Some(2));
     }
 }
