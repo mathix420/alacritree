@@ -52,6 +52,52 @@ pub(crate) fn probe(path: &Path) -> Liveness {
     }
 }
 
+/// What one probe learned about a checkout: whether it is there, and the raw
+/// contents of its `HEAD` when that could be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Probe {
+    pub(crate) liveness: Liveness,
+    pub(crate) head: Option<String>,
+}
+
+/// [`probe`], plus the checkout's `HEAD`, read with two plain file reads
+/// because opening a `git2` repository costs far more.  `.git` is read as a
+/// file first: a linked worktree's names its admin directory, answering both
+/// questions at once, and the main checkout's directory fails that read fast.
+pub(crate) fn probe_checkout(path: &Path) -> Probe {
+    let dot_git = path.join(".git");
+    let (head_path, liveness) = match std::fs::read_to_string(&dot_git) {
+        Ok(link) => match link.trim().strip_prefix("gitdir:") {
+            // `join` keeps an absolute gitdir as is and resolves a relative
+            // one against the checkout, the two forms git writes.
+            Some(gitdir) => (path.join(gitdir.trim()).join("HEAD"), Some(Liveness::Present)),
+            None => return Probe { liveness: Liveness::Present, head: None },
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Probe { liveness: Liveness::Missing, head: None };
+        },
+        Err(_) => (dot_git.join("HEAD"), None),
+    };
+    match std::fs::read_to_string(head_path) {
+        Ok(head) => Probe { liveness: Liveness::Present, head: Some(head) },
+        Err(_) => Probe { liveness: liveness.unwrap_or_else(|| probe(path)), head: None },
+    }
+}
+
+/// The branch a `HEAD` file names, spelled the way discovery records it: the
+/// shorthand for a branch, the first seven hex digits of a detached commit.
+pub(crate) fn head_branch(head: &str) -> Option<&str> {
+    let head = head.trim();
+    match head.strip_prefix("ref:") {
+        Some(target) => {
+            let target = target.trim();
+            Some(target.strip_prefix("refs/heads/").unwrap_or(target))
+        },
+        None if head.len() >= 40 && head.bytes().all(|b| b.is_ascii_hexdigit()) => head.get(..7),
+        None => None,
+    }
+}
+
 /// Whether git would call this checkout gone.  The single question the row,
 /// the activate guard, the spawn guard and discovery all ask, so a greyed row
 /// and a refused shell never disagree about the same directory.  A probe that
@@ -67,6 +113,9 @@ pub(crate) fn is_gone(path: &Path) -> bool {
 #[derive(Default)]
 pub(crate) struct LivenessCache {
     states: HashMap<PathBuf, Liveness>,
+    /// The `HEAD` each path last asked for a refresh under, so one that
+    /// discovery reads differently, an unborn branch say, asks only once.
+    refreshed_heads: HashMap<PathBuf, String>,
     /// `None` until the first batch lands, which is what makes the first
     /// painted frame probe rather than wait out an interval.
     next_probe: Option<Instant>,
@@ -100,7 +149,20 @@ impl LivenessCache {
     /// buy nothing.
     pub(crate) fn batch(&mut self, visible: &[PathBuf]) -> Vec<PathBuf> {
         self.states.retain(|path, _| visible.contains(path));
+        self.refreshed_heads.retain(|path, _| visible.contains(path));
         visible.to_vec()
+    }
+
+    /// Whether `head`, just read from `path`, names a branch other than
+    /// `known`, the one discovery recorded, under a `HEAD` no refresh has
+    /// been asked for yet.  Allocates only when it answers `true`.
+    pub(crate) fn branch_moved(&mut self, path: &Path, head: &str, known: Option<&str>) -> bool {
+        let Some(branch) = head_branch(head) else { return false };
+        if Some(branch) == known || self.refreshed_heads.get(path).is_some_and(|h| h == head) {
+            return false;
+        }
+        self.refreshed_heads.insert(path.to_path_buf(), head.to_string());
+        true
     }
 
     /// An `Unknown` result replaces the last answer rather than preserving
@@ -111,7 +173,11 @@ impl LivenessCache {
     ///
     /// A round that probed nothing still restarts the interval, so a frame
     /// with no eligible rows cannot leave `wants_probe` true forever.
-    pub(crate) fn adopt(&mut self, results: Vec<(PathBuf, Liveness)>, now: Instant) {
+    pub(crate) fn adopt(
+        &mut self,
+        results: impl IntoIterator<Item = (PathBuf, Liveness)>,
+        now: Instant,
+    ) {
         for (path, state) in results {
             self.states.insert(path, state);
         }
@@ -163,6 +229,50 @@ mod tests {
         drop(dir);
 
         assert_eq!(probe(&path), Liveness::Missing);
+    }
+
+    #[test]
+    fn a_linked_checkout_reads_head_through_its_gitdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::test_util::init_repo(&dir.path().join("main"));
+        let linked = crate::test_util::add_worktree(&repo, "topic");
+
+        let found = probe_checkout(&linked);
+
+        assert_eq!(found.liveness, Liveness::Present);
+        assert_eq!(found.head.as_deref().and_then(head_branch), Some("topic"));
+    }
+
+    #[test]
+    fn a_detached_head_reads_as_discovery_spells_it() {
+        let oid = "0123456789abcdef0123456789abcdef01234567\n";
+        assert_eq!(head_branch(oid), Some("0123456"));
+        assert_eq!(head_branch("ref: refs/heads/feat/x\n"), Some("feat/x"));
+        assert_eq!(head_branch("garbage"), None);
+    }
+
+    /// An unborn branch has a `HEAD` discovery reads as no branch at all, so
+    /// the two never agree.  Asking once is the most that can help.
+    #[test]
+    fn a_moved_head_asks_for_one_refresh() {
+        let mut cache = LivenessCache::default();
+        let head = "ref: refs/heads/other\n";
+
+        assert!(!cache.branch_moved(&p("/a"), head, Some("other")), "discovery agrees");
+        assert!(cache.branch_moved(&p("/a"), head, Some("main")));
+        assert!(!cache.branch_moved(&p("/a"), head, Some("main")), "already asked");
+        assert!(cache.branch_moved(&p("/a"), "ref: refs/heads/third\n", Some("main")));
+    }
+
+    #[test]
+    fn a_path_the_sidebar_stopped_drawing_can_ask_again() {
+        let mut cache = LivenessCache::default();
+        let head = "ref: refs/heads/other\n";
+        assert!(cache.branch_moved(&p("/a"), head, None));
+
+        cache.batch(&[]);
+
+        assert!(cache.branch_moved(&p("/a"), head, None));
     }
 
     #[test]

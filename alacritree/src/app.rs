@@ -449,7 +449,7 @@ pub struct AlacritreeApp {
     liveness: worktree_liveness::LivenessCache,
     /// The probe job in flight, if any.  One at a time: a path slower than
     /// the interval stretches freshness rather than queueing more work.
-    liveness_probe: Option<jobs::Job<Vec<(PathBuf, worktree_liveness::Liveness)>>>,
+    liveness_probe: Option<jobs::Job<Vec<(PathBuf, worktree_liveness::Probe)>>>,
     /// When the user last gave the app an event.  Timed wake-ups are armed
     /// only just after one, so an app left open overnight goes fully quiet.
     last_input: Instant,
@@ -785,7 +785,9 @@ impl AlacritreeApp {
         let now = Instant::now();
         match self.liveness_probe.as_ref().map(|job| (job.poll(), job.failed())) {
             Some((Some(results), _)) => {
-                self.liveness.adopt(results, now);
+                self.refresh_moved_branches(ctx, &results);
+                self.liveness
+                    .adopt(results.into_iter().map(|(path, probe)| (path, probe.liveness)), now);
                 self.liveness_probe = None;
                 // This runs after the rows painted, so the answers that just
                 // landed are one frame late. Without asking for that frame the
@@ -817,8 +819,10 @@ impl AlacritreeApp {
             } else {
                 let ctx = ctx.clone();
                 let job = jobs::pool().spawn(jobs::Priority::Background, move |_blocking| {
-                    let results: Vec<_> =
-                        batch.iter().map(|p| (p.clone(), worktree_liveness::probe(p))).collect();
+                    let results: Vec<_> = batch
+                        .iter()
+                        .map(|p| (p.clone(), worktree_liveness::probe_checkout(p)))
+                        .collect();
                     ctx.request_repaint();
                     results
                 });
@@ -840,6 +844,39 @@ impl AlacritreeApp {
     fn refresh_all_projects(&mut self, ctx: &Context) {
         for idx in 0..self.projects.len() {
             self.refresh_project(ctx, idx);
+        }
+    }
+
+    /// Re-discover every project holding a checkout whose `HEAD` has left the
+    /// branch discovery recorded.  That branch keys the PR badge and the row
+    /// label, and discovery otherwise runs only when something asks for it.
+    fn refresh_moved_branches(
+        &mut self,
+        ctx: &Context,
+        results: &[(PathBuf, worktree_liveness::Probe)],
+    ) {
+        let mut moved: Vec<&Path> = Vec::new();
+        for (path, probe) in results {
+            let Some(head) = probe.head.as_deref() else { continue };
+            let known = self
+                .projects
+                .iter()
+                .flat_map(|p| &p.worktrees)
+                .find(|wt| wt.path == *path)
+                .map(|wt| wt.branch.as_deref());
+            if let Some(known) = known
+                && self.liveness.branch_moved(path, head, known)
+            {
+                moved.push(path);
+            }
+        }
+        if moved.is_empty() {
+            return;
+        }
+        for idx in 0..self.projects.len() {
+            if self.projects[idx].worktrees.iter().any(|wt| moved.contains(&wt.path.as_path())) {
+                self.refresh_project(ctx, idx);
+            }
         }
     }
 
@@ -4216,6 +4253,48 @@ mod tests {
         assert_eq!(json["agent"], Value::Null);
         assert_eq!(json["multiplexer"], Value::Null);
         assert!(json["busy"].is_boolean());
+    }
+
+    /// A checkout switched outside the app, from a terminal or another tool,
+    /// reaches the row's branch without a manual refresh.  The PR badge is
+    /// keyed to that branch, so a stale one keeps painting the old branch's PR.
+    #[test]
+    fn a_branch_switched_outside_the_app_reaches_the_sidebar() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::test_util::init_repo(&dir.path().join("main"));
+        let linked = crate::test_util::add_worktree(&repo, "topic");
+        let root = repo.workdir().unwrap().to_path_buf();
+        let mut app = test_app();
+        app.projects
+            .push(jobs::on_this_thread(|b| Project::discover(root.clone(), false, b)).project);
+
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        for (checkout, branch) in [(&root, "switched-main"), (&linked, "switched-linked")] {
+            repo.branch(branch, &head, false).unwrap();
+            git2::Repository::open(checkout)
+                .unwrap()
+                .set_head(&format!("refs/heads/{branch}"))
+                .unwrap();
+        }
+
+        let branches = |app: &AlacritreeApp| {
+            let mut branches: Vec<String> =
+                app.projects[0].worktrees.iter().filter_map(|wt| wt.branch.clone()).collect();
+            branches.sort();
+            branches
+        };
+        let drawn: Vec<PathBuf> =
+            app.projects[0].worktrees.iter().map(|wt| wt.path.clone()).collect();
+        let ctx = Context::default();
+        app.poll_worktree_liveness(&ctx, true, &drawn);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while branches(&app) != ["switched-linked", "switched-main"] && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            app.poll_worktree_liveness(&ctx, false, &[]);
+            app.poll_project_refreshes();
+        }
+
+        assert_eq!(branches(&app), ["switched-linked", "switched-main"]);
     }
 
     #[test]
