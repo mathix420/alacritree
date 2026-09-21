@@ -1073,6 +1073,47 @@ impl AlacritreeApp {
         self.focus_terminal();
     }
 
+    fn toggle_tasks_tab(&mut self, ctx: &Context) {
+        let workspace = self.current_workspace.clone();
+        if let Some(index) = self.tasks_session_index(&workspace) {
+            let id = self.sessions[index].id;
+            if self.sessions.active(&workspace) == Some(id) {
+                // Taskwarrior holds every task, so there is nothing to lose.
+                self.close_session(ctx, id);
+                return;
+            }
+            self.sessions.set_active(workspace, id);
+        } else {
+            let (project, worktree) = self.project_and_worktree(&workspace);
+            let scope = crate::tasks::view::Scope::for_workspace(project, worktree);
+            let session = Session::spawn_tasks(
+                ctx.clone(),
+                &self.config,
+                workspace.clone(),
+                TermSize::new(80, 24),
+                (8.0, 16.0),
+                crate::tasks::view::TasksView::new(scope),
+            );
+            let id = session.id;
+            self.sessions.push(session);
+            self.sessions.set_active(workspace, id);
+        }
+        self.focus_terminal();
+    }
+
+    /// Home has neither. A folder that is not a repository has a project but
+    /// no worktree, since its placeholder has no branch to key a workspace on.
+    fn project_and_worktree(&self, ws: &WorkspaceKey) -> (Option<&Project>, Option<&Worktree>) {
+        let Some(path) = ws else { return (None, None) };
+        self.projects
+            .iter()
+            .find_map(|p| {
+                let wt = p.worktrees.iter().find(|wt| wt.path == *path)?;
+                Some((Some(p), p.default_branch.is_some().then_some(wt)))
+            })
+            .unwrap_or((None, None))
+    }
+
     fn spawn_scratchpad(
         &mut self,
         ctx: &Context,
@@ -1437,6 +1478,9 @@ impl AlacritreeApp {
         if matches!(&self.sessions[idx].kind, SessionKind::Scratchpad { .. }) {
             return Err("scratchpads belong to their backing workspace and cannot be moved".into());
         }
+        if matches!(&self.sessions[idx].kind, SessionKind::Tasks) {
+            return Err("a tasks tab shows the lists of the workspace it was opened in".into());
+        }
         // A workspace's diff pane is found by workspace plus kind, so a pane
         // carried elsewhere becomes the one the next git click closes while
         // the workspace it left opens a second.
@@ -1548,7 +1592,7 @@ impl AlacritreeApp {
         let origin = self.sessions[idx].working_directory.clone();
         if matches!(
             &self.sessions[idx].kind,
-            SessionKind::Scratchpad { .. } | SessionKind::Diff { .. }
+            SessionKind::Scratchpad { .. } | SessionKind::Diff { .. } | SessionKind::Tasks
         ) {
             return Some((origin.clone(), vec![origin]));
         }
@@ -1663,6 +1707,12 @@ impl AlacritreeApp {
         if let Some(root) = root {
             self.set_project_expanded(&root, true);
         }
+    }
+
+    fn tasks_session_index(&self, ws: &WorkspaceKey) -> Option<usize> {
+        self.sessions.iter().position(|session| {
+            session.working_directory == *ws && matches!(&session.kind, SessionKind::Tasks)
+        })
     }
 
     fn scratchpad_session_index(&self, ws: &WorkspaceKey) -> Option<usize> {
@@ -3194,6 +3244,16 @@ impl AlacritreeApp {
                         editor,
                         allow_focus,
                         theme.ui_scale,
+                        editor_text,
+                        editor_hint,
+                        editor_error,
+                    )
+                } else if let Some(view) = session.tasks.as_mut() {
+                    self.ime.clear();
+                    crate::tasks::view::show(
+                        ui,
+                        view,
+                        allow_focus,
                         editor_text,
                         editor_hint,
                         editor_error,

@@ -251,6 +251,14 @@ impl Action for action::OpenScratchpad {
     }
 }
 
+impl Action for action::OpenTasks {
+    fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
+        if app.config.integrations.taskwarrior.enabled {
+            app.toggle_tasks_tab(ctx);
+        }
+    }
+}
+
 impl Action for action::AddProject {
     fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
         app.add_project_via_dialog(ctx);

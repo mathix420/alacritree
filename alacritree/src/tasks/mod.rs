@@ -7,3 +7,4 @@ pub(crate) mod hook;
 pub(crate) mod scope;
 pub(crate) mod taskwarrior;
 pub(crate) mod tree;
+pub(crate) mod view;

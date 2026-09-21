@@ -43,6 +43,7 @@ impl AlacritreeApp {
                 SessionKind::Shell => "shell",
                 SessionKind::Diff { .. } => "diff",
                 SessionKind::Scratchpad { .. } => "scratchpad",
+                SessionKind::Tasks => "tasks",
             },
             "columns": session.size.columns,
             "lines": session.size.screen_lines,

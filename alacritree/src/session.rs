@@ -139,6 +139,9 @@ pub(crate) enum SessionKind {
     Scratchpad {
         path: PathBuf,
     },
+    /// Task lists kept in taskwarrior, drawn as checklist rows. No PTY, and
+    /// nothing to save: taskwarrior holds every task.
+    Tasks,
 }
 
 /// What an agent is doing right now.  Mutually exclusive and recomputed from
@@ -318,6 +321,7 @@ pub(crate) struct Session<R: Repaint> {
     pub term: Arc<FairMutex<Term<EventProxy<R>>>>,
     pub events: mpsc::Receiver<TermEvent>,
     pub scratchpad: Option<scratchpad::Editor>,
+    pub tasks: Option<crate::tasks::view::TasksView>,
     /// Latched ping: the terminal rang while the user was not looking.
     /// Cleared when the user views this session.
     pub needs_attention: bool,
@@ -746,6 +750,7 @@ impl<R: Repaint> Session<R> {
             term,
             events,
             scratchpad: Some(editor),
+            tasks: None,
             needs_attention: false,
             done: false,
             pending_attention: None,
@@ -764,6 +769,47 @@ impl<R: Repaint> Session<R> {
             pane_bound_at: None,
             shared_view: false,
         })
+    }
+
+    pub(crate) fn spawn_tasks(
+        repaint: R,
+        config: &Config,
+        working_directory: Option<PathBuf>,
+        size: TermSize,
+        cell_size: (f32, f32),
+        view: crate::tasks::view::TasksView,
+    ) -> Self {
+        let (proxy, events) = EventProxy::new(repaint);
+        let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, proxy.clone())));
+        Self {
+            id: next_session_id(),
+            title: "tasks".to_string(),
+            working_directory,
+            kind: SessionKind::Tasks,
+            size,
+            cell_size,
+            term,
+            events,
+            scratchpad: None,
+            tasks: Some(view),
+            needs_attention: false,
+            done: false,
+            pending_attention: None,
+            accumulated_scroll: (0.0, 0.0),
+            last_report_cell: None,
+            cursor: Default::default(),
+            probe: ProbeHandle::new(None, None),
+            wsl_probe: None,
+            priority_job: None,
+            notifier: None,
+            sender: None,
+            pending_writes: None,
+            proxy,
+            exit_status: None,
+            pane_key: None,
+            pane_bound_at: None,
+            shared_view: false,
+        }
     }
 
     /// A session running `program args` instead of the user's shell, opened
@@ -922,6 +968,7 @@ impl<R: Repaint> Session<R> {
             term: term.clone(),
             events,
             scratchpad: None,
+            tasks: None,
             needs_attention: false,
             done: false,
             pending_attention: None,
@@ -1134,7 +1181,7 @@ impl<R: Repaint> Session<R> {
     /// waiting agent; a Braille title takes precedence because it signals
     /// active work even for an agent the process list does not recognize.
     pub(crate) fn activity(&self) -> SessionActivity {
-        if self.scratchpad.is_some() {
+        if self.scratchpad.is_some() || self.tasks.is_some() {
             return SessionActivity::Shell;
         }
         let signals = self.probe.signals();
@@ -1147,7 +1194,7 @@ impl<R: Repaint> Session<R> {
     /// foreground process is a recognized agent, or its title is in a
     /// spinner state — the signal the close-confirmation policy keys on.
     pub(crate) fn is_busy(&self) -> bool {
-        if self.scratchpad.is_some() {
+        if self.scratchpad.is_some() || self.tasks.is_some() {
             return false;
         }
         let signals = self.probe.signals();
@@ -1163,7 +1210,10 @@ impl<R: Repaint> Session<R> {
     /// own title until vim re-emits it.  A direct herdr attach is excluded:
     /// it runs as `herdr` but draws one agent with no splits to hand back.
     pub(crate) fn nav_tui_running(&self) -> bool {
-        if self.scratchpad.is_some() || (self.pane_key.is_some() && !self.shared_view) {
+        if self.scratchpad.is_some()
+            || self.tasks.is_some()
+            || (self.pane_key.is_some() && !self.shared_view)
+        {
             return false;
         }
         self.probe.signals().nav_tui
@@ -1189,6 +1239,11 @@ impl<R: Repaint> Session<R> {
             let cursor_line = lines.len() - 1;
             let cursor_column = lines[cursor_line].chars().count();
             return ScreenSnapshot { lines, cursor_line, cursor_column, history_size: 0 };
+        }
+        if let Some(view) = &self.tasks {
+            let lines = view.plain_lines();
+            let cursor_line = lines.len().saturating_sub(1);
+            return ScreenSnapshot { lines, cursor_line, cursor_column: 0, history_size: 0 };
         }
         use alacritty_terminal::index::{Column, Line};
         use alacritty_terminal::term::cell::Flags;
@@ -1549,6 +1604,7 @@ mod tests {
             term,
             events,
             scratchpad: None,
+            tasks: None,
             needs_attention: false,
             done: false,
             pending_attention: None,

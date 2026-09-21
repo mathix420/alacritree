@@ -246,6 +246,8 @@ pub enum NamedAction {
     SelectPreviousWorkspace(action::SelectPreviousWorkspace),
     /// Open/select the current workspace's scratchpad, or close it when active.
     OpenScratchpad(action::OpenScratchpad),
+    /// Open/select the current workspace's task list, or close it when active.
+    OpenTasks(action::OpenTasks),
     ToggleLeftSidebar(action::ToggleLeftSidebar),
     ToggleRightSidebar(action::ToggleRightSidebar),
     AddProject(action::AddProject),
@@ -531,6 +533,7 @@ impl NamedAction {
             Self::SelectNextWorkspace(_) => "Switch to the next workspace".into(),
             Self::SelectPreviousWorkspace(_) => "Switch to the previous workspace".into(),
             Self::OpenScratchpad(_) => "Toggle the workspace scratchpad tab".into(),
+            Self::OpenTasks(_) => "Toggle the workspace tasks tab".into(),
             Self::AddProject(_) => "Add a project to the sidebar".into(),
             Self::ToggleSidebarFocus(_) => {
                 "Toggle keyboard focus between terminal and sidebar".into()
@@ -839,6 +842,11 @@ fn default_bindings() -> Vec<KeyBinding> {
             key: Key::Backtick,
             mods: ctrl,
             action: BindingAction::Named(OpenScratchpad(action::OpenScratchpad)),
+        },
+        KeyBinding {
+            key: Key::Backtick,
+            mods: ctrl_shift,
+            action: BindingAction::Named(OpenTasks(action::OpenTasks)),
         },
         KeyBinding {
             key: Key::Tab,
@@ -1795,6 +1803,7 @@ mod tests {
             (Key::B, ctrl, ToggleLeftSidebar(action::ToggleLeftSidebar)),
             (Key::G, ctrl, ToggleRightSidebar(action::ToggleRightSidebar)),
             (Key::Backtick, ctrl, OpenScratchpad(action::OpenScratchpad)),
+            (Key::Backtick, ctrl_shift, OpenTasks(action::OpenTasks)),
             (Key::Tab, ctrl, SelectNextTab(action::SelectNextTab)),
             (Key::Tab, ctrl_shift, SelectPreviousTab(action::SelectPreviousTab)),
             (Key::ArrowRight, alt, SelectNextWorkspace(action::SelectNextWorkspace)),
@@ -2042,6 +2051,7 @@ mod tests {
             Paste(action::Paste),
             Copy(action::Copy),
             OpenScratchpad(action::OpenScratchpad),
+            OpenTasks(action::OpenTasks),
             CloseSession(action::CloseSession),
             Quit(action::Quit),
         ] {
@@ -2119,6 +2129,18 @@ mod tests {
         // The F1 shortcuts window is gone and the palette lists every action,
         // so the old `ShowShortcuts` name is no longer recognized.
         assert!(matches!(parse_action("ShowShortcuts"), BindingAction::Unsupported(_)));
+    }
+
+    #[test]
+    fn tasks_tab_is_a_default_ctrl_shift_backtick_binding_and_parses() {
+        let b = parse_bindings(Vec::new());
+        assert_eq!(named_matches(&b, Key::Backtick, Modifiers::CTRL | Modifiers::SHIFT), vec![
+            NamedAction::OpenTasks(action::OpenTasks)
+        ]);
+        assert!(matches!(
+            parse_action("OpenTasks"),
+            BindingAction::Named(NamedAction::OpenTasks(action::OpenTasks))
+        ));
     }
 
     #[test]

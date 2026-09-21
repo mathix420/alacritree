@@ -42,6 +42,7 @@ unit_actions!(
     SelectNextWorkspace,
     SelectPreviousWorkspace,
     OpenScratchpad,
+    OpenTasks,
     AddProject,
     ToggleSidebarFocus,
     CloseSession,

@@ -88,6 +88,7 @@ impl Taskwarrior {
         Self { side, program, env: Vec::new() }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_env(mut self, key: &str, value: &str) -> Self {
         self.env.push((key.to_string(), value.to_string()));
         self

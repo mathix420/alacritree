@@ -133,7 +133,7 @@ fn section_of(a: NamedAction) -> PaletteSection {
         RefreshPrStatus(_) => Sidebar,
         IncreaseFontSize(_) | DecreaseFontSize(_) | ResetFontSize(_) => Window,
         ToggleFullscreen(_) | ToggleMaximized(_) | Minimize(_) | Quit(_) => Window,
-        OpenScratchpad(_) | TogglePalette(_) => Window,
+        OpenScratchpad(_) | OpenTasks(_) | TogglePalette(_) => Window,
         PaletteTop(_) | PaletteBottom(_) | PalettePageUp(_) | PalettePageDown(_) => Window,
         NoOp(_) | ReceiveChar(_) => Window,
     }
@@ -311,11 +311,15 @@ fn is_hidden(a: NamedAction) -> bool {
 /// run and so only exist as concrete bindings. Actions no binding names are
 /// listed too, keyless: runnable from here all the same, and that is how the
 /// full vocabulary stays discoverable without the docs.
-pub(crate) fn action_items(shortcuts: &Shortcuts) -> Vec<PaletteItem> {
-    let mut order: Vec<NamedAction> = NamedAction::iter().filter(|a| !is_hidden(*a)).collect();
+pub(crate) fn action_items(shortcuts: &Shortcuts, tasks_enabled: bool) -> Vec<PaletteItem> {
+    // A tasks action while the integration is off would open nothing.
+    let listed = |a: &NamedAction| {
+        !is_hidden(*a) && (tasks_enabled || !matches!(a, NamedAction::OpenTasks(_)))
+    };
+    let mut order: Vec<NamedAction> = NamedAction::iter().filter(listed).collect();
     for action in shortcuts.actions() {
         if let BindingAction::Named(a) = action {
-            if !is_hidden(*a) && !order.contains(a) {
+            if listed(a) && !order.contains(a) {
                 order.push(*a);
             }
         }
@@ -501,8 +505,16 @@ mod tests {
     }
 
     #[test]
+    fn the_tasks_action_is_listed_only_while_the_integration_is_on() {
+        let tasks = PaletteAction::Run(NamedAction::OpenTasks(action::OpenTasks));
+        let has_tasks = |items: &[PaletteItem]| items.iter().any(|i| i.action == tasks);
+        assert!(!has_tasks(&action_items(&shortcuts(vec![]), false)));
+        assert!(has_tasks(&action_items(&shortcuts(vec![]), true)));
+    }
+
+    #[test]
     fn action_items_carry_keys_for_bound_actions() {
-        let items = action_items(&shortcuts(vec![]));
+        let items = action_items(&shortcuts(vec![]), true);
         let close = find(&items, "CloseSession").expect("CloseSession missing");
         assert_eq!(close.keys, "Ctrl+Shift+W");
         assert_eq!(
@@ -514,7 +526,7 @@ mod tests {
 
     #[test]
     fn action_items_list_unbound_actions_without_keys() {
-        let items = action_items(&shortcuts(vec![]));
+        let items = action_items(&shortcuts(vec![]), true);
         // FocusTerminal has no default binding: present, discoverable, keyless.
         let focus = find(&items, "FocusTerminal").expect("FocusTerminal missing");
         assert!(focus.keys.is_empty());
@@ -522,7 +534,7 @@ mod tests {
 
     #[test]
     fn palette_lists_the_new_multiplexer_pane_action_among_sessions() {
-        let items = action_items(&shortcuts(vec![]));
+        let items = action_items(&shortcuts(vec![]), true);
         let row = find(&items, "NewMultiplexerPane").expect("NewMultiplexerPane missing");
         assert_eq!(row.section, PaletteSection::Sessions);
         assert!(row.keys.is_empty(), "NewMultiplexerPane ships with no default key");
@@ -530,7 +542,7 @@ mod tests {
 
     #[test]
     fn palette_lists_the_whole_set_multiplexer_actions_among_sessions() {
-        let items = action_items(&shortcuts(vec![]));
+        let items = action_items(&shortcuts(vec![]), true);
         for name in ["AttachAllMultiplexerPanes", "DetachAllMultiplexerPanes"] {
             let row = find(&items, name).unwrap_or_else(|| panic!("{name} missing"));
             assert_eq!(row.section, PaletteSection::Sessions);
@@ -540,7 +552,7 @@ mod tests {
 
     #[test]
     fn palette_lists_the_sidebar_search_actions() {
-        let items = action_items(&shortcuts(vec![]));
+        let items = action_items(&shortcuts(vec![]), true);
         for name in ["SidebarSearchConfirm", "SidebarSearchCancel", "SidebarSearchCancelToTerminal"]
         {
             assert!(items.iter().any(|i| i.secondary == name), "{name} should be a palette row");
@@ -552,7 +564,7 @@ mod tests {
     #[test]
     fn a_multi_bound_action_is_one_row_listing_every_key() {
         let bindings = shortcuts(vec![]);
-        let items = action_items(&bindings);
+        let items = action_items(&bindings, true);
         let rows: Vec<_> = items.iter().filter(|i| i.secondary == "IncreaseFontSize").collect();
         assert_eq!(rows.len(), 1, "IncreaseFontSize should be a single row");
         let expected = keys_for(&bindings, NamedAction::IncreaseFontSize(action::IncreaseFontSize));
@@ -564,7 +576,7 @@ mod tests {
     /// close the palette it is meant to scroll.
     #[test]
     fn palette_nav_actions_are_not_rows() {
-        let items = action_items(&shortcuts(vec![]));
+        let items = action_items(&shortcuts(vec![]), true);
         for name in ["PaletteTop", "PaletteBottom", "PalettePageUp", "PalettePageDown"] {
             assert!(!items.iter().any(|i| i.secondary == name), "{name} must not be a row");
         }
@@ -572,7 +584,7 @@ mod tests {
 
     #[test]
     fn sections_follow_the_best_match_and_hold_natural_order_unfiltered() {
-        let items = action_items(&shortcuts(vec![]));
+        let items = action_items(&shortcuts(vec![]), true);
         let mut palette = CommandPalette::new();
 
         let sections: Vec<_> =
@@ -622,7 +634,7 @@ mod tests {
     fn palette_never_offers_to_toggle_itself() {
         // TogglePalette is bound to Ctrl+K by default, yet must not appear as a
         // row — running it from inside the palette would only reopen it.
-        let items = action_items(&shortcuts(vec![]));
+        let items = action_items(&shortcuts(vec![]), true);
         assert!(
             !items.iter().any(|i| i.action
                 == PaletteAction::Run(NamedAction::TogglePalette(action::TogglePalette)))
@@ -647,7 +659,7 @@ mod tests {
 
     #[test]
     fn empty_query_keeps_every_item_in_order() {
-        let items = action_items(&shortcuts(vec![]));
+        let items = action_items(&shortcuts(vec![]), true);
         let mut palette = CommandPalette::new();
         assert_eq!(palette.rank(&items), (0..items.len()).collect::<Vec<_>>());
     }
@@ -668,7 +680,7 @@ mod tests {
 
     #[test]
     fn filter_actions_are_listed_under_their_own_section() {
-        let items = action_items(&shortcuts(vec![]));
+        let items = action_items(&shortcuts(vec![]), true);
         for name in [
             "ToggleSessionsFilter",
             "ToggleDetachedSessionsFilter",
@@ -706,7 +718,7 @@ mod tests {
     /// discoverable until a user binds them.
     #[test]
     fn pr_filter_actions_are_listed_without_keys() {
-        let items = action_items(&shortcuts(vec![]));
+        let items = action_items(&shortcuts(vec![]), true);
         assert_eq!(find(&items, "TogglePrOpenFilter").unwrap().keys, "");
         assert_eq!(find(&items, "ToggleSessionsFilter").unwrap().keys, "S");
     }
@@ -736,7 +748,7 @@ mod tests {
     #[test]
     fn bound_spawn_profile_produces_no_generic_action_row() {
         let bindings = shortcuts(vec![bind_spawn_profile(2)]);
-        let items = action_items(&bindings);
+        let items = action_items(&bindings, true);
         assert!(
             !items.iter().any(|i| i.action
                 == PaletteAction::Run(NamedAction::SpawnProfile(action::SpawnProfile(2)))),

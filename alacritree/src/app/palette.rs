@@ -153,7 +153,10 @@ impl AlacritreeApp {
     /// then each switchable workspace.  Rebuilt each frame — cheap beside
     /// ranking, and always current as sessions and worktrees come and go.
     pub(super) fn palette_items(&self) -> Vec<PaletteItem> {
-        let mut items = command_palette::action_items(&self.shortcuts);
+        let mut items = command_palette::action_items(
+            &self.shortcuts,
+            self.config.integrations.taskwarrior.enabled,
+        );
         for (i, profile) in self.config.profiles.iter().enumerate() {
             let index = i + 1;
             // SpawnProfile only binds indices 1..=9; past that there is no
@@ -992,6 +995,7 @@ fn session_fallback_kind(kind: &SessionKind) -> &'static str {
         SessionKind::Shell => "shell",
         SessionKind::Diff { .. } => "diff",
         SessionKind::Scratchpad { .. } => "scratchpad",
+        SessionKind::Tasks => "tasks",
     }
 }
 
@@ -1001,7 +1005,7 @@ fn session_fallback_kind(kind: &SessionKind) -> &'static str {
 fn shell_state_for(kind: &SessionKind, busy: bool) -> Option<&'static str> {
     match kind {
         SessionKind::Shell => Some(if busy { "busy" } else { "idle" }),
-        SessionKind::Diff { .. } | SessionKind::Scratchpad { .. } => None,
+        SessionKind::Diff { .. } | SessionKind::Scratchpad { .. } | SessionKind::Tasks => None,
     }
 }
 
