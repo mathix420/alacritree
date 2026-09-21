@@ -193,7 +193,7 @@ pub(super) fn braille_loader(ui: &mut egui::Ui, size: f32, color: Color32) -> eg
 }
 
 /// The glyph a state draws when `[ui.icons]` leaves it unset, its colour, and
-/// whether it paints bold at the larger size.  `None` is the braille loader.
+/// whether it paints bold.  `None` is the braille loader.
 ///
 /// Colour comes from the state, not from the row: an idle agent reads the
 /// same on a selected row as on a quiet one, and a native session reads the
@@ -215,7 +215,7 @@ fn default_mark(
         ShownState::Done => (Some(DEFAULT_DONE_SYMBOL.as_str()), colors.done, false),
         ShownState::Unknown if dots => (Some(DEFAULT_HOLLOW_MARK.as_str()), colors.unknown, false),
         // ASCII, so every UI font draws it and the baked face need not.
-        // Bold and larger, since a bare `?` at mark size reads as a speck.
+        // Bold, since a thin `?` reads as a speck even at the circle's size.
         ShownState::Unknown => (Some("?"), colors.unknown, true),
     }
 }
@@ -232,7 +232,15 @@ fn state_icon(state: ShownState, icons: &Icons<Color32>) -> &IconStyle<Color32> 
 }
 
 const MARK_PX: f32 = 10.0;
-const EMPHASIZED_MARK_PX: f32 = 12.0;
+
+/// How much of the circle's height a symbol's ink spans.  A cross or tick
+/// reaching into the corners of the circle's box reads larger than the
+/// circle, so it stops short of it.
+const SYMBOL_FILL: f32 = 0.9;
+
+/// Size the symbols are measured at.  Ink boxes snap to whole pixels, so a
+/// large size keeps that rounding out of the ratio.
+const MEASURE_PX: f32 = 64.0;
 
 /// A state's mark as it paints: the glyph (`None` for the loader), its font
 /// and its colour.  A glyph set in `[ui.icons]` wins over both indicator sets,
@@ -243,13 +251,42 @@ fn resolve_mark<'a>(
     theme: &Theme,
 ) -> (Option<&'a str>, egui::FontId, Color32) {
     let style = state_icon(state, icons);
-    let (default_glyph, default_color, emphasized) =
-        default_mark(state, theme.status_indicators, theme);
+    let (default_glyph, default_color, bold) = default_mark(state, theme.status_indicators, theme);
     let glyph = style.glyph.as_deref().map(str::trim).filter(|g| !g.is_empty()).or(default_glyph);
-    let default_px = if emphasized { EMPHASIZED_MARK_PX } else { MARK_PX };
-    let size = style.size.unwrap_or(default_px).min(ROW_STATUS_ICON_H) * theme.ui_scale;
-    let family = crate::fonts::ui_variant_family(style.bold || emphasized, style.italic);
+    let size = style.size.unwrap_or(MARK_PX).min(ROW_STATUS_ICON_H) * theme.ui_scale;
+    let family = crate::fonts::ui_variant_family(style.bold || bold, style.italic);
     (glyph, egui::FontId::new(size, family), style.color.unwrap_or(default_color))
+}
+
+/// Whether a state paints one of the symbols set's own shapes at its default
+/// size, the only marks sized against the circle.  A glyph or size set in
+/// `[ui.icons]` is taken as written.
+fn sized_to_the_circle(state: ShownState, icons: &Icons<Color32>, theme: &Theme) -> bool {
+    let style = state_icon(state, icons);
+    theme.status_indicators == StatusIndicators::Symbols
+        && matches!(state, ShownState::Blocked | ShownState::Done | ShownState::Unknown)
+        && style.glyph.as_deref().is_none_or(|g| g.trim().is_empty())
+        && style.size.is_none()
+}
+
+/// The size at which `glyph`'s ink spans `SYMBOL_FILL` of the filled circle's
+/// height at `font`'s size.  Measured from the laid-out ink rather than the
+/// baked face, since the UI font ahead of it in the chain may draw the glyph.
+fn size_to_the_circle(ui: &egui::Ui, glyph: &str, font: &egui::FontId, theme: &Theme) -> f32 {
+    let ink = |text: &str, family: egui::FontFamily| {
+        let font = egui::FontId::new(MEASURE_PX, family);
+        let galley = ui.fonts(|f| f.layout_no_wrap(text.to_owned(), font, Color32::WHITE));
+        galley.rows.first().and_then(|row| row.glyphs.first()).map(|g| g.uv_rect.size)
+    };
+    let circle = ink(DEFAULT_FILLED_MARK.as_str(), egui::FontFamily::Proportional);
+    let own = ink(glyph, font.family.clone());
+    match (circle, own) {
+        (Some(circle), Some(own)) if own.max_elem() > 0.0 => {
+            let size = font.size * SYMBOL_FILL * circle.y / own.max_elem();
+            size.min(ROW_STATUS_ICON_H * theme.ui_scale)
+        },
+        _ => font.size,
+    }
 }
 
 /// Draw a state's mark into an already-allocated slot.
@@ -260,9 +297,12 @@ pub(super) fn paint_status_mark(
     rect: egui::Rect,
     theme: &Theme,
 ) {
-    let (glyph, font, color) = resolve_mark(state, icons, theme);
+    let (glyph, mut font, color) = resolve_mark(state, icons, theme);
     match glyph {
         Some(glyph) => {
+            if sized_to_the_circle(state, icons, theme) {
+                font.size = size_to_the_circle(ui, glyph, &font, theme);
+            }
             ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, glyph, font, color);
         },
         None => paint_braille_loader(ui, rect, font.size, color),
@@ -599,16 +639,15 @@ mod tests {
         }
     }
 
-    /// Symbols' unknown is an ASCII `?`, which reads as a speck at mark size
-    /// unless it paints bold and larger.
+    /// Symbols' unknown is an ASCII `?`, which reads as a speck unless it
+    /// paints bold.
     #[test]
-    fn the_unknown_symbol_paints_bold_and_larger() {
+    fn the_unknown_symbol_paints_bold() {
         let theme = theme_with(StatusIndicators::Symbols);
         let icons = Icons::default().map_colors(rgb_to_color32);
         let (glyph, font, _) = resolve_mark(ShownState::Unknown, &icons, &theme);
         assert_eq!(glyph, Some("?"));
         assert_eq!(font.family, crate::fonts::ui_variant_family(true, false));
-        assert_eq!(font.size, EMPHASIZED_MARK_PX * theme.ui_scale);
     }
 
     /// Blocked and done outrank a ping; a ping outranks working and idle.
