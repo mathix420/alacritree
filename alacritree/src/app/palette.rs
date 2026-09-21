@@ -18,7 +18,7 @@ impl AlacritreeApp {
         // never steals Enter (run), Esc (clear then close), the arrows, or the
         // bound cursor jumps.  Ctrl+K shuts the palette with the same key that
         // opened it.
-        let (cancel, confirm) = consume_modal_keys(ctx);
+        let (cancel, confirm) = consume_modal_keys(ctx, &self.modals.gate, ModalKind::Palette);
         let (up, down) = ctx.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),

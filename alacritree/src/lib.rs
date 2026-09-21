@@ -46,6 +46,7 @@ pub(crate) mod links;
 pub mod logdir;
 pub mod logging;
 pub(crate) mod mcp;
+pub(crate) mod modal_gate;
 pub(crate) mod mouse;
 pub(crate) mod mouse_hide;
 pub mod multiplexer;

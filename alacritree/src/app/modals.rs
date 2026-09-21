@@ -32,6 +32,9 @@ pub(super) struct Modals {
     /// it counted rather than whatever is attached by the time it is
     /// answered.
     pub(super) pending_detach_all: Option<Vec<SessionId>>,
+    /// Whether the modal on screen was already in front of the user when
+    /// the keys arriving now were pressed.
+    pub(super) gate: ModalGate,
 }
 
 impl AlacritreeApp {
@@ -56,7 +59,8 @@ impl AlacritreeApp {
             .pending_delete
             .as_ref()
             .is_some_and(|req| delete_confirm_ready(req.dirty.as_ref(), req.force));
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modals.gate, ModalKind::Delete);
         if confirm_via_key && confirm_ready {
             self.run_pending_delete(ctx);
             return;
@@ -151,7 +155,9 @@ impl AlacritreeApp {
                         let delete = ui
                             .add_enabled_ui(ready, |ui| modal_button(ui, &theme, verb, danger))
                             .inner;
-                        if delete.clicked() {
+                        // A click was aimed at the dialog as last painted,
+                        // so it answers to the same judgement as a key.
+                        if delete.clicked() && confirm_ready {
                             confirmed = true;
                         }
                         if modal_button(ui, &theme, "Cancel", theme.text_dim).clicked() {
@@ -209,7 +215,8 @@ impl AlacritreeApp {
         };
         let busy = session.is_busy() && !managed;
 
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modals.gate, ModalKind::CloseSession);
         let frame = modal_frame(&theme);
         let mut confirmed = false;
         let mut cancelled = false;
@@ -282,7 +289,8 @@ impl AlacritreeApp {
             if count == 1 { "pane" } else { "panes" }
         );
 
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modals.gate, ModalKind::DetachAll);
         let frame = modal_frame(&theme);
         let mut confirmed = false;
         let mut cancelled = false;
@@ -332,7 +340,8 @@ impl AlacritreeApp {
         };
         let title = format!("Remove `{}` from the sidebar?", state.name);
 
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modals.gate, ModalKind::RemoveProject);
         let frame = modal_frame(&theme);
         let mut confirmed = false;
         let mut cancelled = false;
@@ -398,7 +407,8 @@ impl AlacritreeApp {
         };
 
         // Enter and Esc both just dismiss — there's nothing to confirm.
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modals.gate, ModalKind::Error);
         let frame = modal_frame(&theme);
         let mut dismissed = false;
 
@@ -630,7 +640,8 @@ impl AlacritreeApp {
             return;
         };
         let theme = self.theme;
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modals.gate, ModalKind::Rename);
         let frame = modal_frame(&theme);
         let mut rename_clicked = false;
         let mut cancelled = false;
@@ -708,7 +719,8 @@ impl AlacritreeApp {
         }
         let theme = self.theme;
         let danger = self.theme.error;
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modals.gate, ModalKind::BaseBranchPicker);
         let (up, down) = ctx.input_mut(|i| {
             (
                 i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
@@ -899,7 +911,8 @@ impl AlacritreeApp {
         let default_branch = self.projects[project_idx].default_branch.clone();
         let project_root = self.projects[project_idx].root.clone();
 
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modals.gate, ModalKind::CreatePrompt);
         let frame = modal_frame(&theme);
         let mut create_clicked = false;
         let mut cancelled = false;
@@ -999,7 +1012,8 @@ impl AlacritreeApp {
         let project_name = self.projects[project_idx].display_name().to_string();
         let frame = modal_frame(&theme);
         let s = theme.ui_scale;
-        let (minimize_via_esc, minimize_via_enter) = consume_modal_keys(ctx);
+        let (minimize_via_esc, minimize_via_enter) =
+            consume_modal_keys(ctx, &self.modals.gate, ModalKind::CreateRunning);
         let modal = egui::Modal::new(egui::Id::new("alacritree_create_dialog")).frame(frame).show(
             ctx,
             |ui| {
@@ -1047,7 +1061,8 @@ impl AlacritreeApp {
         let project_name = self.projects[project_idx].display_name().to_string();
         let frame = modal_frame(&theme);
         let mut close = false;
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modals.gate, ModalKind::CreateDone);
 
         let s = theme.ui_scale;
         let modal = egui::Modal::new(egui::Id::new("alacritree_create_dialog")).frame(frame).show(
@@ -1097,7 +1112,8 @@ impl AlacritreeApp {
         let danger = self.theme.error;
         let n = self.sessions.len();
 
-        let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
+        let (cancel_via_key, confirm_via_key) =
+            consume_modal_keys(ctx, &self.modals.gate, ModalKind::Quit);
         let frame = modal_frame(&theme);
         let mut quit_clicked = false;
         let mut cancel_clicked = false;

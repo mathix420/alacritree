@@ -29,6 +29,7 @@ use crate::crash_log::{self, ExitReason};
 use crate::git_nav::{self, GitSection, SectionCount};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
 use crate::in_flight::{Finished, InFlight};
+use crate::modal_gate::{ModalGate, ModalKind};
 use crate::multiplexer::{
     AttachFocus, HarnessMark, Managed, MultiplexerSession, Multiplexers, PaneKey, PaneStatus,
     PaneTarget, Side, StateTone,
@@ -2479,12 +2480,18 @@ fn modal_frame(theme: &Theme) -> Frame {
         .inner_margin(Margin { left: pad_x, right: pad_x, top: pad_y, bottom: pad_y })
 }
 
-fn consume_modal_keys(ctx: &Context) -> (bool, bool) {
+/// Take Escape and Enter for the modal now painting.
+///
+/// The keys leave the queue whether or not the modal may act on them: they
+/// were aimed at a screen that is no longer in front of the user, and letting
+/// one fall through would type it into a shell they can no longer see.  The
+/// gate decides only whether the modal answers them.
+fn consume_modal_keys(ctx: &Context, gate: &ModalGate, modal: ModalKind) -> (bool, bool) {
+    let accepts = gate.accepts(modal);
     ctx.input_mut(|i| {
-        (
-            i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
-            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
-        )
+        let escape = i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+        let enter = i.consume_key(egui::Modifiers::NONE, egui::Key::Enter);
+        (accepts && escape, accepts && enter)
     })
 }
 
@@ -3182,6 +3189,7 @@ impl AlacritreeApp {
         if self.palette.is_open() && !modal_open {
             self.show_command_palette(ctx);
         }
+        self.modals.gate.end_frame();
         self.phases.mark("dialogs");
     }
 
@@ -6072,9 +6080,32 @@ mod tests {
         }
     }
 
+    /// One frame of the dialogs, fed `events`.  The dialog under test has
+    /// to be on screen for a frame before a key can reach it, the same as it
+    /// would for a user.
+    fn dialog_frame(app: &mut AlacritreeApp, ctx: &Context, events: Vec<egui::Event>) {
+        let input = egui::RawInput { events, ..Default::default() };
+        let _ = ctx.run(input, |ctx| app.paint_dialogs(ctx, true));
+    }
+
     fn press_in_delete_dialog(app: &mut AlacritreeApp, key: egui::Key) {
-        let input = egui::RawInput { events: vec![key_ev(key, true)], ..Default::default() };
-        let _ = Context::default().run(input, |ctx| app.show_delete_dialog(ctx));
+        let ctx = Context::default();
+        dialog_frame(app, &ctx, Vec::new());
+        dialog_frame(app, &ctx, vec![key_ev(key, true)]);
+    }
+
+    #[test]
+    fn an_enter_pressed_before_the_delete_dialog_appeared_deletes_nothing() {
+        let mut app = test_app();
+        app.projects.push(project_with("/repo", &["/repo/wt"]));
+        let idx = app.projects.len() - 1;
+        app.modals.pending_delete =
+            Some(delete_request(idx, "/repo/wt", Some(DirtyCounts::default())));
+
+        dialog_frame(&mut app, &Context::default(), vec![key_ev(egui::Key::Enter, true)]);
+
+        assert!(app.modals.pending_deletes.is_empty(), "the dialog answered an unseen key");
+        assert!(app.modals.pending_delete.is_some());
     }
 
     #[test]
