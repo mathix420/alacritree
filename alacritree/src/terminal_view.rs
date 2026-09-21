@@ -15,6 +15,7 @@ use crate::clipboard::{self, Target};
 use crate::color_glyph::{CachedColorGlyph, ColorGlyphCache};
 use crate::colors::{TerminalColors, default_background, resolve, rgb_to_color32};
 use crate::config::{Config, Palette};
+use crate::cursor_anim::{self, Corners};
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
 use crate::glyph_cache::{Face, GlyphCache, MAX_EXTRA_CELLS, growth_offset, may_grow};
 use crate::grid_gl::{Frame as GridFrame, GpuGrid};
@@ -148,6 +149,17 @@ pub(crate) fn show(
         // (alacritty hides it the same way, display/content.rs).
         ime.preedit().is_some(),
     );
+    // Between the capture and the paint that reads it: the glide is this
+    // session's, and it needs the cell the capture just recorded.
+    let corners = session.cursor_anim.place(
+        &config.cursor.motion,
+        snapshot.cursor.as_ref().map(|c| (c.column as f32, c.row as f32)),
+        snapshot.display_offset,
+        std::time::Instant::now(),
+    );
+    // A settled cursor is its own cell, and drawing a quad over the rect that
+    // already covers it would only put an antialiased edge around it.
+    let smear = corners.filter(|_| !session.cursor_anim.settled());
     match gpu.filter(|gpu| config.ui.gpu_grid && !gpu.unavailable()) {
         Some(gpu) => {
             paint_grid_gpu(
@@ -169,9 +181,6 @@ pub(crate) fn show(
                 glyphs,
                 ui.ctx(),
             );
-            if let Some(cursor) = &snapshot.cursor {
-                paint_cursor(&painter, rect, cursor, cell_w, cell_h, &font_id);
-            }
         },
         None => paint_grid(
             &painter,
@@ -188,6 +197,13 @@ pub(crate) fn show(
             glyphs,
             ui.ctx(),
         ),
+    }
+    if let Some(cursor) = &snapshot.cursor {
+        paint_cursor(&painter, rect, cursor, smear.as_ref(), cell_w, cell_h, &font_id);
+    }
+    // Nothing else wakes egui while the cursor moves on its own.
+    if !session.cursor_anim.settled() {
+        ui.ctx().request_repaint();
     }
 
     let preedit_caret = ime.preedit().map(|p| p.to_owned()).and_then(|p| {
@@ -882,6 +898,10 @@ pub(crate) struct GridSnapshot {
     /// The terminal's background as of the last capture, and the configured
     /// one before the first.
     default_bg: Color32,
+    /// Scrollback position of the last capture.  Scrolling renumbers every row
+    /// at once, which is how the cursor animation tells a jump the screen made
+    /// from one the cursor made.
+    display_offset: i32,
     /// Rows the last capture rewrote, merged into one span.
     dirty_rows: std::ops::Range<usize>,
     /// Scratch for the rows a capture is about to walk, reused so reading
@@ -939,6 +959,7 @@ impl GridSnapshot {
             cursor: None,
             caret: None,
             default_bg: colors.bg,
+            display_offset: 0,
             dirty_rows: 0..0,
             damaged: Vec::new(),
             context: CaptureContext::default(),
@@ -1071,6 +1092,7 @@ impl GridSnapshot {
         self.caret = None;
 
         let display_offset = term.grid().display_offset() as i32;
+        self.display_offset = display_offset;
         let screen_lines = term.grid().screen_lines();
         let cols = term.grid().columns();
         let selection_range = term.selection.as_ref().and_then(|s| s.to_range(term));
@@ -1448,10 +1470,6 @@ fn paint_grid(
             ctx,
         );
     }
-
-    if let Some(cursor) = &snapshot.cursor {
-        paint_cursor(painter, rect, cursor, cell_w, cell_h, font_id);
-    }
 }
 
 /// The cursor shape the terminal wants drawn, mirroring alacritty's
@@ -1604,19 +1622,33 @@ fn paint_run_glyphs(
     }
 }
 
+/// How thick a beam or an underline cursor is drawn, in points.
+const BAR_THICKNESS: f32 = 2.0;
+
+/// Draw the cursor in the cell the snapshot recorded.  `smear` is the quad the
+/// animation has it stretched across while it catches up, and `None` once it
+/// has, so with the animation off the cursor is the rect it always was.
 fn paint_cursor(
     painter: &egui::Painter,
     rect: Rect,
     cursor: &CursorSnapshot,
+    smear: Option<&Corners>,
     cell_w: f32,
     cell_h: f32,
     font_id: &FontId,
 ) {
     use alacritty_terminal::vte::ansi::CursorShape::*;
 
+    if matches!(cursor.shape, Hidden) {
+        return;
+    }
     let x = rect.min.x + cursor.column as f32 * cell_w;
     let y = rect.min.y + cursor.row as f32 * cell_h;
     let cursor_rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(cell_w, cell_h));
+
+    if let Some(corners) = smear {
+        paint_smear(painter, rect, cursor, corners, cell_w, cell_h);
+    }
 
     match cursor.shape {
         Block => {
@@ -1631,11 +1663,14 @@ fn paint_cursor(
             );
         },
         Beam => {
-            let bar = Rect::from_min_size(Pos2::new(x, y), Vec2::new(2.0, cell_h));
+            let bar = Rect::from_min_size(Pos2::new(x, y), Vec2::new(BAR_THICKNESS, cell_h));
             painter.rect_filled(bar, 0.0, cursor.color);
         },
         Underline => {
-            let bar = Rect::from_min_size(Pos2::new(x, y + cell_h - 2.0), Vec2::new(cell_w, 2.0));
+            let bar = Rect::from_min_size(
+                Pos2::new(x, y + cell_h - BAR_THICKNESS),
+                Vec2::new(cell_w, BAR_THICKNESS),
+            );
             painter.rect_filled(bar, 0.0, cursor.color);
         },
         Hidden => return,
@@ -1651,6 +1686,41 @@ fn paint_cursor(
             color,
         );
     }
+}
+
+/// Fill the ground the cursor is still covering, behind the cursor itself.
+/// `corners` spans from where the eye last saw it to the cell it is in now, so
+/// one stretched quad stands in for the frames a jump has no time to draw.
+fn paint_smear(
+    painter: &egui::Painter,
+    rect: Rect,
+    cursor: &CursorSnapshot,
+    corners: &Corners,
+    cell_w: f32,
+    cell_h: f32,
+) {
+    use alacritty_terminal::vte::ansi::CursorShape::*;
+
+    // A beam or an underline covers part of its cell, so its trail is cut out
+    // of the quad at the same fractions rather than spanning the whole of it.
+    let (u, v) = match cursor.shape {
+        Beam => (0.0..(BAR_THICKNESS / cell_w).min(1.0), 0.0..1.0),
+        Underline => (0.0..1.0, (1.0 - (BAR_THICKNESS / cell_h).min(1.0))..1.0),
+        _ => (0.0..1.0, 0.0..1.0),
+    };
+    let at = |u: f32, v: f32| {
+        let (col, row) = cursor_anim::within(corners, u, v);
+        Pos2::new(rect.min.x + col * cell_w, rect.min.y + row * cell_h)
+    };
+    let points =
+        vec![at(u.start, v.start), at(u.end, v.start), at(u.end, v.end), at(u.start, v.end)];
+
+    let (fill, stroke) = if matches!(cursor.shape, HollowBlock) {
+        (Color32::TRANSPARENT, Stroke::new(1.0_f32, cursor.color))
+    } else {
+        (cursor.color, Stroke::NONE)
+    };
+    painter.add(egui::Shape::convex_polygon(points, fill, stroke));
 }
 
 /// Draw the in-progress IME composition at the cursor, mirroring alacritty's

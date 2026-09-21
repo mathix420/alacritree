@@ -263,6 +263,9 @@ pub(crate) struct Session<R: Repaint> {
     /// Last grid cell reported to a mouse-tracking app, so pointer motion emits
     /// at most one report per cell crossed instead of one per pixel.
     pub last_report_cell: Option<Point>,
+    /// Where this session's cursor is drawn while it catches up with the cell
+    /// it is really in, under `[ui.cursor] animate`.
+    pub cursor_anim: crate::cursor_anim::CursorAnimation,
     /// Shell pid spawned for this PTY.  Used to walk to the foreground
     /// process group when identifying which agent is running.  None on
     /// platforms where we don't yet capture it.
@@ -631,6 +634,7 @@ impl<R: Repaint> Session<R> {
             pending_attention: None,
             accumulated_scroll: (0.0, 0.0),
             last_report_cell: None,
+            cursor_anim: Default::default(),
             probe: ProbeHandle::new(None, None),
             wsl_probe: None,
             priority_job: None,
@@ -805,6 +809,7 @@ impl<R: Repaint> Session<R> {
             pending_attention: None,
             accumulated_scroll: (0.0, 0.0),
             last_report_cell: None,
+            cursor_anim: Default::default(),
             probe: ProbeHandle::new(None, wsl_probe.clone()),
             wsl_probe,
             priority_job: None,
@@ -1426,6 +1431,7 @@ mod tests {
             pending_attention: None,
             accumulated_scroll: (0.0, 0.0),
             last_report_cell: None,
+            cursor_anim: Default::default(),
             probe: ProbeHandle::new(None, None),
             wsl_probe: None,
             priority_job: None,

@@ -1,6 +1,14 @@
 {
   "cursor": {
     "blinking": false,
+    "motion": {
+      "animate": false,
+      "duration": {
+        "nanos": 80000000,
+        "secs": 0
+      },
+      "min_cells": 2.0
+    },
     "shape": "Block",
     "unfocused_hollow": true
   },

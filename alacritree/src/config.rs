@@ -273,6 +273,20 @@ pub struct CursorConfig {
     pub shape: CursorShape,
     pub blinking: bool,
     pub unfocused_hollow: bool,
+    pub motion: CursorMotion,
+}
+
+/// How the cursor gets from one cell to the next, from `[ui.cursor]`.  Its own
+/// table because alacritty has no equivalent keys and warns about ones it does
+/// not know, so these cannot ride in the shared `[cursor]`.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct CursorMotion {
+    /// Glide the cursor to its new cell instead of redrawing it there.
+    pub animate: bool,
+    /// How long that glide takes.
+    pub duration: Duration,
+    /// Cells the cursor has to jump before the glide is worth playing.
+    pub min_cells: f32,
 }
 
 /// The part of alacritty's `[mouse]` section alacritree acts on.
@@ -1581,7 +1595,18 @@ impl Default for FontConfig {
 /// overlays whatever the config file set on top of these values.
 impl Default for CursorConfig {
     fn default() -> Self {
-        Self { shape: CursorShape::Block, blinking: false, unfocused_hollow: true }
+        Self {
+            shape: CursorShape::Block,
+            blinking: false,
+            unfocused_hollow: true,
+            motion: CursorMotion::default(),
+        }
+    }
+}
+
+impl Default for CursorMotion {
+    fn default() -> Self {
+        RawUiCursor::default().resolve()
     }
 }
 
@@ -2270,6 +2295,38 @@ enum RawCursorStyle {
         /// mode, so `On` and `Always` both blink and the other two do not.
         blinking: Option<String>,
     },
+}
+
+/// `[ui.cursor]`: the cursor keys alacritty has no equivalent for.  Upstream
+/// warns about keys it does not know, so these live in `alacritree.toml`
+/// rather than beside `[cursor]` in the shared file.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(default)]
+struct RawUiCursor {
+    /// Glide the cursor to its new cell instead of redrawing it there.
+    animate: bool,
+    /// How long that glide takes, in milliseconds.  Zero draws every cell
+    /// directly, the same as leaving `animate` off.
+    animation_ms: u64,
+    /// Cells the cursor has to jump before the glide is worth playing.  Below
+    /// this it snaps, which keeps ordinary typing from smearing.
+    animation_min_cells: u8,
+}
+
+impl Default for RawUiCursor {
+    fn default() -> Self {
+        Self { animate: false, animation_ms: 80, animation_min_cells: 2 }
+    }
+}
+
+impl RawUiCursor {
+    fn resolve(self) -> CursorMotion {
+        CursorMotion {
+            animate: self.animate,
+            duration: Duration::from_millis(self.animation_ms),
+            min_cells: f32::from(self.animation_min_cells),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -3482,6 +3539,8 @@ struct RawUi {
     /// Name of the profile new sessions use.  Must match a `[[ui.profiles]]`
     /// entry, or it is ignored with a warning.
     default_profile: Option<String>,
+    /// Cursor movement, which alacritty's `[cursor]` has no keys for.
+    cursor: RawUiCursor,
     /// Outline drawn around whichever pane holds keyboard focus.
     focus_outline: RawFocusOutline,
     /// Clicking a sidebar moves keyboard focus to it.
@@ -3545,6 +3604,7 @@ impl Default for RawUi {
             wsl: RawUiWsl::default(),
             profiles: Vec::new(),
             default_profile: None,
+            cursor: RawUiCursor::default(),
             focus_outline: RawFocusOutline::default(),
             sidebar_click_focus: false,
             focus_priority_boost: false,
@@ -3844,6 +3904,7 @@ impl RawConfig {
         if let Some(v) = self.cursor.unfocused_hollow {
             cursor.unfocused_hollow = v;
         }
+        cursor.motion = self.ui.cursor.resolve();
 
         // ---- Scrolling ----
         let scrolling = self.scrolling.resolve();
@@ -5392,6 +5453,22 @@ program = "second"
     fn reap_descendants_on_close_parses() {
         let ui = ui_from_toml("[ui]\nreap_descendants_on_close = true");
         assert!(ui.reap_descendants_on_close);
+    }
+
+    #[test]
+    fn cursor_animation_defaults_off_and_parses() {
+        let stock = config_from("").cursor.motion;
+        assert!(!stock.animate);
+        assert_eq!(stock.duration, Duration::from_millis(80));
+        assert_eq!(stock.min_cells, 2.0);
+
+        let set =
+            config_from("[ui.cursor]\nanimate = true\nanimation_ms = 250\nanimation_min_cells = 5")
+                .cursor
+                .motion;
+        assert!(set.animate);
+        assert_eq!(set.duration, Duration::from_millis(250));
+        assert_eq!(set.min_cells, 5.0);
     }
 
     #[test]

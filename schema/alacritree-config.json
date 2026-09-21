@@ -1474,6 +1474,10 @@
           "description": "Whether the sidebar × on a harness-managed row asks before detaching,\nand whether DetachAllMultiplexerPanes asks once for the whole batch.\nSeparate from `confirm_session_close` because a detach leaves the\npane running and its row listed again.",
           "type": "boolean"
         },
+        "cursor": {
+          "$ref": "#/$defs/RawUiCursor",
+          "description": "Cursor movement, which alacritty's `[cursor]` has no keys for."
+        },
         "decorations": {
           "$ref": "#/$defs/RawDecorations",
           "description": "Corrections to the underline and strikeout the font placed\n([`RawDecorations`])."
@@ -1743,6 +1747,32 @@
         "wsl": {
           "$ref": "#/$defs/RawUiWsl",
           "description": "Deprecated WSL options, superseded by the top-level `[wsl]` table."
+        }
+      },
+      "type": "object"
+    },
+    "RawUiCursor": {
+      "description": "`[ui.cursor]`: the cursor keys alacritty has no equivalent for.  Upstream\nwarns about keys it does not know, so these live in `alacritree.toml`\nrather than beside `[cursor]` in the shared file.",
+      "properties": {
+        "animate": {
+          "default": false,
+          "description": "Glide the cursor to its new cell instead of redrawing it there.",
+          "type": "boolean"
+        },
+        "animation_min_cells": {
+          "default": 2,
+          "description": "Cells the cursor has to jump before the glide is worth playing.  Below\nthis it snaps, which keeps ordinary typing from smearing.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "animation_ms": {
+          "default": 80,
+          "description": "How long that glide takes, in milliseconds.  Zero draws every cell\ndirectly, the same as leaving `animate` off.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "type": "object"
