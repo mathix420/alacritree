@@ -52,6 +52,66 @@ Files live in `$XDG_CONFIG_HOME/alacritree/scratchpads/` (normally
 Windows. Home uses `home.md`; worktrees use a readable leaf name plus a stable
 path digest so same-named worktrees cannot collide.
 
+### Workspace tasks
+
+`Ctrl+Shift+Backtick` (`OpenTasks`) opens a tab with the task lists for the current workspace, kept in [taskwarrior](https://taskwarrior.org) 3. Agents write the same lists with `task`, so the people and the agents working in a worktree share one checklist. The tab stays off until the integration is turned on:
+
+```toml
+[integrations.taskwarrior]
+enabled = true
+```
+
+With it off, the binding does nothing and the command palette leaves the action out. `path` and `wsl_path` point at a `task` binary that is not on `PATH`, as in the other `[integrations]` tables.
+
+Every task belongs to one taskwarrior project, and the project name says which scope holds it:
+
+| Scope | Project |
+|---|---|
+| Global | `global` |
+| Project | `<repo>` |
+| Workspace | `<repo>.<branch>` |
+| Agent session | `<repo>.<branch>.claude-<id>` or `<repo>.<branch>.codex-<id>` |
+
+`.`, `/` and `\` inside a name become `-`, so the branch `feat/v1.2` is `feat-v1-2` and never adds a level. A session is the agent's own conversation, keyed by the harness's session id, so resuming a Claude Code or codex conversation finds its tasks again. `alacritree task scope` prints the project for the current directory and agent, and answers with no window running.
+
+Subtasks and ordering use two user-defined attributes: `subof` holds the parent's uuid and `order` places a task among its siblings. Run `alacritree task setup` once per machine. It declares both in the taskrc on Windows and in every WSL distro, so an agent calling `task` directly stores them instead of folding them into the description. While the tab is on, `alacritree doctor` reports whether each side has them.
+
+The tab shows the global section, the project, the workspace, and one section for each agent session under the workspace. Home shows only the global section. Clicking a section header collapses it. In a row:
+
+- the checkbox completes the task, and clearing it makes the task pending again
+- Enter starts a new row below, and "+ add a task" starts one at the end of a section
+- Tab nests the row under the one above it, and Shift+Tab moves it back out
+- Backspace on an empty row deletes the task
+- right-click starts or stops the task
+
+The tab reloads from taskwarrior every second while it is shown, so tasks an agent adds appear on their own. A project inside WSL reads and writes that distro's taskwarrior.
+
+#### Agent hooks
+
+`alacritree hook <event> --harness <claude|codex>` gives an agent its lists when a session starts, and again before a prompt whenever they changed. It prints one JSON object for the harness to add to the model's context, or nothing, and always exits 0, so a missing `task` never blocks a turn. The agent sees its own session's list and every scope above it, never another agent's.
+
+Claude Code, in `settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "alacritree hook session-start --harness claude" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "alacritree hook user-prompt-submit --harness claude" }] }]
+  }
+}
+```
+
+codex, in `hooks.json` next to its `config.toml`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "alacritree hook session-start --harness codex" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "alacritree hook user-prompt-submit --harness codex" }] }]
+  }
+}
+```
+
 Each terminal session has its own background read/write thread, a unique
 `window_id` (so OSC 7 / signal events route correctly), and forwards terminal
 events through an `EventProxy` that requests an egui repaint on every PTY
