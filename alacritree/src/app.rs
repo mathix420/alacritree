@@ -15,16 +15,16 @@ use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
 use crate::config::{
-    BakedGlyph, Config, DEFAULT_ADD_ICON, DEFAULT_ATTENTION_MARK, DEFAULT_BLOCKED_SYMBOL,
-    DEFAULT_CLOSE_ICON, DEFAULT_DONE_SYMBOL, DEFAULT_DOTS_FILLED_MARK, DEFAULT_DOTS_UNKNOWN_MARK,
-    DEFAULT_HOME_ICON, DEFAULT_IDLE_MARK, DEFAULT_PR_CLOSED_ICON, DEFAULT_PR_DRAFT_ICON,
-    DEFAULT_PR_MERGED_ICON, DEFAULT_PR_OPEN_ICON, DEFAULT_PROJECT_COLLAPSED_ICON,
-    DEFAULT_PROJECT_EXPANDED_ICON, DEFAULT_REFRESH_ICON, DEFAULT_REORDER_ICON, DEFAULT_SEARCH_ICON,
-    DEFAULT_SESSION_ICON, DEFAULT_UPSTREAM_DIVERGED_ICON, DEFAULT_UPSTREAM_GONE_ICON,
-    DEFAULT_UPSTREAM_LEVEL_ICON, DEFAULT_UPSTREAM_UNTRACKED_ICON, DEFAULT_WORKTREE_ICON,
-    DEFAULT_WORKTREE_MAIN_ICON, FontConfig, IconStyle, Icons, LastSessionClose, PathStyleConfig,
-    ScrollAlign, ScrollbarStyle, SearchDepth, SearchScope, SidebarFocus, SidebarTooltips,
-    StatusIndicators, TextEmphasis, UiFont, UiTheme, profile_command,
+    BakedGlyph, Config, DEFAULT_ADD_ICON, DEFAULT_BLOCKED_SYMBOL, DEFAULT_CLOSE_ICON,
+    DEFAULT_DONE_SYMBOL, DEFAULT_FILLED_MARK, DEFAULT_HOLLOW_MARK, DEFAULT_HOME_ICON,
+    DEFAULT_PR_CLOSED_ICON, DEFAULT_PR_DRAFT_ICON, DEFAULT_PR_MERGED_ICON, DEFAULT_PR_OPEN_ICON,
+    DEFAULT_PROJECT_COLLAPSED_ICON, DEFAULT_PROJECT_EXPANDED_ICON, DEFAULT_REFRESH_ICON,
+    DEFAULT_REORDER_ICON, DEFAULT_SEARCH_ICON, DEFAULT_SESSION_ICON,
+    DEFAULT_UPSTREAM_DIVERGED_ICON, DEFAULT_UPSTREAM_GONE_ICON, DEFAULT_UPSTREAM_LEVEL_ICON,
+    DEFAULT_UPSTREAM_UNTRACKED_ICON, DEFAULT_WORKTREE_ICON, DEFAULT_WORKTREE_MAIN_ICON, FontConfig,
+    IconStyle, Icons, LastSessionClose, PathStyleConfig, ScrollAlign, ScrollbarStyle, SearchDepth,
+    SearchScope, SidebarFocus, SidebarTooltips, StatusIndicators, TextEmphasis, UiFont, UiTheme,
+    profile_command,
 };
 use crate::crash_log::{self, ExitReason};
 use crate::git_nav::{self, GitSection, SectionCount};
@@ -8138,7 +8138,11 @@ mod tests {
                 session_row(ui, &agent, false, false, false, &icons, &theme);
             };
             assert_eq!(
-                hint_painted_over(&mut agent_row, DEFAULT_IDLE_MARK.as_str(), "claude is running"),
+                hint_painted_over(
+                    &mut agent_row,
+                    DEFAULT_HOLLOW_MARK.as_str(),
+                    "claude is running"
+                ),
                 want,
                 "agent status, icon_tooltips = {icon_tooltips}"
             );
@@ -8146,7 +8150,7 @@ mod tests {
             let probe =
                 frames_while_hovering_at(egui::Pos2::new(-100.0, -100.0), WIDTH, &mut agent_row);
             let slot = painted_glyph_positions(probe.last().expect("the row painted"))
-                [DEFAULT_IDLE_MARK.as_str()];
+                [DEFAULT_HOLLOW_MARK.as_str()];
 
             let loading =
                 session(false, SessionActivity::agent(Some("claude"), LiveState::Working));

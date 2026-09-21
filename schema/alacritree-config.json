@@ -836,7 +836,7 @@
               "$ref": "#/$defs/RawIconStyle"
             }
           ],
-          "description": "An agent held at a dialog it needs a human to answer.  Unset follows\n`[ui] status_indicators`: `●` for dots, `×` for symbols."
+          "description": "An agent held at a dialog it needs a human to answer.  Unset follows\n`[ui] status_indicators`: `⬤` for dots, `×` for symbols."
         },
         "agent_done": {
           "anyOf": [
@@ -844,7 +844,7 @@
               "$ref": "#/$defs/RawIconStyle"
             }
           ],
-          "description": "An agent that finished a turn while nobody was looking.  Unset follows\n`[ui] status_indicators`: `●` for dots, `✓` for symbols."
+          "description": "An agent that finished a turn while nobody was looking.  Unset follows\n`[ui] status_indicators`: `⬤` for dots, `✓` for symbols."
         },
         "agent_idle": {
           "anyOf": [
@@ -860,7 +860,7 @@
               "$ref": "#/$defs/RawIconStyle"
             }
           ],
-          "description": "An agent nothing could read a state from.  Unset follows\n`[ui] status_indicators`: `○` for dots, `?` for symbols."
+          "description": "An agent nothing could read a state from.  Unset follows\n`[ui] status_indicators`: `◯` for dots, `?` for symbols."
         },
         "agent_working": {
           "anyOf": [
@@ -1779,7 +1779,7 @@
         },
         "status_indicators": {
           "default": "dots",
-          "description": "Glyph set for agent status marks, on native and multiplexer rows\nalike: \"dots\" | \"symbols\".  Dots tells states apart by fill, size and\ncolour, symbols by shape.  `[ui.icons]` overrides one state at a time.",
+          "description": "Glyph set for agent status marks, on native and multiplexer rows\nalike: \"dots\" | \"symbols\".  Dots draws two same-sized circles, hollow\nand filled, and tells states apart by colour; symbols by shape.  `[ui.icons]` overrides one\nstate at a time.",
           "enum": [
             "dots",
             "symbols"

@@ -2484,6 +2484,22 @@ mod tests {
         );
     }
 
+    /// Every agent status circle is the hollow or the filled mark, and the
+    /// two must fill one box, or one state would read as smaller than the
+    /// rest.
+    #[test]
+    fn the_status_circles_share_one_size() {
+        use crate::config::{DEFAULT_FILLED_MARK, DEFAULT_HOLLOW_MARK};
+        let face = ttf_parser::Face::parse(SYMBOLS_FONT, 0).expect("the baked face parses");
+        let size = |mark: crate::config::BakedGlyph| {
+            let c = mark.as_str().chars().next().expect("a mark is one char");
+            let id = face.glyph_index(c).expect("the baked face maps every mark");
+            let bbox = face.glyph_bounding_box(id).expect("a circle has an outline");
+            (bbox.width(), bbox.height())
+        };
+        assert_eq!(size(DEFAULT_HOLLOW_MARK), size(DEFAULT_FILLED_MARK));
+    }
+
     #[test]
     fn the_baked_glyph_set_is_the_documented_size() {
         assert_eq!(baked_glyphs().len(), 25, "assets/build_symbols.py lists the codepoints");

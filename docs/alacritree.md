@@ -382,9 +382,10 @@ attention_grace_ms = 0      # hold pings this long and drop them if the session
                             # resumes work (agents that continue between tasks);
                             # 0 pings immediately
 status_indicators  = "dots" # agent status marks, on native and herdr rows
-                            # alike. "dots" tells states apart by fill, size and
-                            # colour: idle ◯, blocked and done ●, unknown ○,
-                            # pinged ⬤. "symbols" gives each its own shape:
+                            # alike. "dots" draws two same-sized circles and
+                            # tells states apart by colour: ◯ for idle and
+                            # unknown, ⬤ for pinged, blocked and done.
+                            # "symbols" gives each its own shape:
                             # blocked ×, done ✓, unknown ?. Working is the
                             # braille loader in both. A row shows its loudest
                             # state: blocked, done, pinged, working, idle,
@@ -606,9 +607,9 @@ refresh = "↻"
 reorder = "⇅"
 # agent_idle = "◯"          # agent status marks. Unset, each follows
 # agent_working = "⠋"       # [ui] status_indicators; a glyph set here wins
-# agent_blocked = "●"       # in both sets, on native and herdr rows alike.
-# agent_done = "●"          # agent_working unset draws the braille loader,
-# agent_unknown = "○"       # and a glyph replaces it
+# agent_blocked = "⬤"       # in both sets, on native and herdr rows alike.
+# agent_done = "⬤"          # agent_working unset draws the braille loader,
+# agent_unknown = "◯"       # and a glyph replaces it
 # attention = "⬤"
 
 [ui.drop]                   # what dragging files onto the window does

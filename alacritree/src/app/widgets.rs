@@ -206,18 +206,14 @@ fn default_mark(
     let dots = set == StatusIndicators::Dots;
     let colors = &theme.state_colors;
     match state {
-        ShownState::Idle => (Some(DEFAULT_IDLE_MARK.as_str()), colors.idle, false),
+        ShownState::Idle => (Some(DEFAULT_HOLLOW_MARK.as_str()), colors.idle, false),
         ShownState::Working => (None, theme.accent, false),
-        ShownState::Pinged => (Some(DEFAULT_ATTENTION_MARK.as_str()), theme.attention, false),
-        ShownState::Blocked if dots => {
-            (Some(DEFAULT_DOTS_FILLED_MARK.as_str()), colors.blocked, false)
-        },
+        ShownState::Pinged => (Some(DEFAULT_FILLED_MARK.as_str()), theme.attention, false),
+        ShownState::Blocked if dots => (Some(DEFAULT_FILLED_MARK.as_str()), colors.blocked, false),
         ShownState::Blocked => (Some(DEFAULT_BLOCKED_SYMBOL.as_str()), colors.blocked, false),
-        ShownState::Done if dots => (Some(DEFAULT_DOTS_FILLED_MARK.as_str()), colors.done, false),
+        ShownState::Done if dots => (Some(DEFAULT_FILLED_MARK.as_str()), colors.done, false),
         ShownState::Done => (Some(DEFAULT_DONE_SYMBOL.as_str()), colors.done, false),
-        ShownState::Unknown if dots => {
-            (Some(DEFAULT_DOTS_UNKNOWN_MARK.as_str()), colors.unknown, false)
-        },
+        ShownState::Unknown if dots => (Some(DEFAULT_HOLLOW_MARK.as_str()), colors.unknown, false),
         // ASCII, so every UI font draws it and the baked face need not.
         // Bold and larger, since a bare `?` at mark size reads as a speck.
         ShownState::Unknown => (Some("?"), colors.unknown, true),
@@ -548,22 +544,30 @@ mod tests {
         assert_eq!(marks[2], (ShownState::Working, None));
     }
 
-    /// Dots trades shape for colour in one place only: blocked and done share
-    /// the filled circle.  The ping's large filled circle stays its own.
+    /// Dots draws every state but working as one of two same-sized circles,
+    /// hollow or filled, and leaves the rest to colour.
     #[test]
-    fn dots_share_a_glyph_only_between_blocked_and_done() {
+    fn dots_draw_two_circles_and_tell_states_apart_by_colour() {
         let marks = glyphs(StatusIndicators::Dots);
         let glyph = |state| marks.iter().find(|(s, _)| *s == state).unwrap().1.clone();
-        assert_eq!(glyph(ShownState::Blocked), glyph(ShownState::Done));
-        for (i, (a, ga)) in marks.iter().enumerate() {
-            for (b, gb) in &marks[i + 1..] {
-                if (*a, *b) != (ShownState::Done, ShownState::Blocked) {
-                    assert_ne!(ga, gb, "{a:?} and {b:?} draw the same mark");
-                }
+        let hollow = Some(DEFAULT_HOLLOW_MARK.as_str().to_owned());
+        let filled = Some(DEFAULT_FILLED_MARK.as_str().to_owned());
+        assert_eq!(glyph(ShownState::Idle), hollow);
+        assert_eq!(glyph(ShownState::Unknown), hollow);
+        assert_eq!(glyph(ShownState::Pinged), filled);
+        assert_eq!(glyph(ShownState::Blocked), filled);
+        assert_eq!(glyph(ShownState::Done), filled);
+        assert_eq!(glyph(ShownState::Working), None);
+
+        let theme = theme_with(StatusIndicators::Dots);
+        let icons = Icons::default().map_colors(rgb_to_color32);
+        let colors: Vec<Color32> =
+            EVERY_STATE.iter().map(|&state| resolve_mark(state, &icons, &theme).2).collect();
+        for (i, a) in colors.iter().enumerate() {
+            for (j, b) in colors.iter().enumerate().skip(i + 1) {
+                assert_ne!(a, b, "{:?} and {:?} share a colour", EVERY_STATE[i], EVERY_STATE[j]);
             }
         }
-        assert_eq!(glyph(ShownState::Pinged).as_deref(), Some(DEFAULT_ATTENTION_MARK.as_str()));
-        assert_eq!(glyph(ShownState::Idle).as_deref(), Some(DEFAULT_IDLE_MARK.as_str()));
     }
 
     /// Colour comes from the state, so a native session and a multiplexer

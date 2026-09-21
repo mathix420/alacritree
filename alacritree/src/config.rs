@@ -416,7 +416,7 @@ pub struct Palette {
 #[serde(into = "&'static str")]
 #[strum(serialize_all = "snake_case")]
 pub enum StatusIndicators {
-    /// Circles told apart by fill, size and colour.
+    /// Two same-sized circles, hollow and filled, told apart by colour.
     #[default]
     Dots,
     /// One distinct glyph per state.
@@ -887,14 +887,12 @@ baked_glyphs! {
     /// visual grammar.  Each codepoint is one the baked face already carries
     /// for another icon, so the set costs no rebuild.
     ///
-    /// Idle is the large empty circle and a ping the large filled one, in
-    /// both indicator sets, so neither shares a shape with anything else.
-    DEFAULT_IDLE_MARK = "◯";
-    DEFAULT_ATTENTION_MARK = "⬤";
-    /// The dots set: blocked and done share the filled circle and differ by
-    /// colour, and unknown is the small empty one.
-    DEFAULT_DOTS_FILLED_MARK = "●";
-    DEFAULT_DOTS_UNKNOWN_MARK = "○";
+    /// Every circle is one of the two large ones, so no state reads as
+    /// smaller than another.  The hollow circle is idle in both sets and
+    /// unknown in dots; the filled one is a ping in both sets and blocked and
+    /// done in dots.  Within a shape, colour tells the states apart.
+    DEFAULT_HOLLOW_MARK = "◯";
+    DEFAULT_FILLED_MARK = "⬤";
     /// The symbols set, herdr's own shapes for these states.
     DEFAULT_BLOCKED_SYMBOL = "×";
     DEFAULT_DONE_SYMBOL = "✓";
@@ -2810,15 +2808,15 @@ struct RawIcons {
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_working: Option<RawIconStyle>,
     /// An agent held at a dialog it needs a human to answer.  Unset follows
-    /// `[ui] status_indicators`: `●` for dots, `×` for symbols.
+    /// `[ui] status_indicators`: `⬤` for dots, `×` for symbols.
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_blocked: Option<RawIconStyle>,
     /// An agent that finished a turn while nobody was looking.  Unset follows
-    /// `[ui] status_indicators`: `●` for dots, `✓` for symbols.
+    /// `[ui] status_indicators`: `⬤` for dots, `✓` for symbols.
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_done: Option<RawIconStyle>,
     /// An agent nothing could read a state from.  Unset follows
-    /// `[ui] status_indicators`: `○` for dots, `?` for symbols.
+    /// `[ui] status_indicators`: `◯` for dots, `?` for symbols.
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_unknown: Option<RawIconStyle>,
     /// A session that rang while nobody was looking.  Unset draws `⬤` in
@@ -3579,8 +3577,9 @@ struct RawUi {
     /// session that resumes work inside it swallows the ping.
     attention_grace_ms: u64,
     /// Glyph set for agent status marks, on native and multiplexer rows
-    /// alike: "dots" | "symbols".  Dots tells states apart by fill, size and
-    /// colour, symbols by shape.  `[ui.icons]` overrides one state at a time.
+    /// alike: "dots" | "symbols".  Dots draws two same-sized circles, hollow
+    /// and filled, and tells states apart by colour; symbols by shape.  `[ui.icons]` overrides one
+    /// state at a time.
     status_indicators: ClosedSet<StatusIndicators>,
     /// When the sidebar × on a session row asks before killing the PTY:
     /// "never" | "busy" | "always".
@@ -5933,7 +5932,7 @@ program = "second"
         }
         // The status marks share codepoints with icons in the other slice, so
         // that slice's own multiset check cannot notice one going missing.
-        for g in ["◯", "⬤", "●", "○", "✓"] {
+        for g in ["◯", "⬤", "✓"] {
             assert!(chrome.contains(&g), "{g} is missing from CHROME_GLYPHS");
         }
     }
