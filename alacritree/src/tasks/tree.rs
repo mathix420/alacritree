@@ -152,17 +152,22 @@ fn order_mod(order: i64) -> String {
 }
 
 /// The `order` for a new sibling placed after `list[index]`, or first when
-/// `index` is `None`. When no integer fits between the neighbours, the whole
-/// set is renumbered at the stride first.
+/// `index` is `None`. When no integer fits between the neighbours, or a
+/// sibling has no `order` to place against, the whole set is renumbered at
+/// the stride first.
 fn slot(list: &[&Task], index: Option<usize>) -> (Vec<Edit>, i64) {
-    let at = |i: usize| list[i].order.unwrap_or((i as i64 + 1) * STRIDE);
-    let low = index.map_or(0, at);
-    let next = index.map_or(0, |i| i + 1);
-    let high = (next < list.len()).then(|| at(next));
-    match high {
-        None => (Vec::new(), low + STRIDE),
-        Some(high) if high - low >= 2 => (Vec::new(), low + (high - low) / 2),
-        Some(_) => {
+    let ordered: Option<Vec<i64>> = list.iter().map(|t| t.order).collect();
+    let gap = ordered.and_then(|orders| {
+        let low = index.map_or(0, |i| orders[i]);
+        match orders.get(index.map_or(0, |i| i + 1)) {
+            None => Some(low + STRIDE),
+            Some(&high) if high - low >= 2 => Some(low + (high - low) / 2),
+            Some(_) => None,
+        }
+    });
+    match gap {
+        Some(order) => (Vec::new(), order),
+        None => {
             let renumber = list
                 .iter()
                 .enumerate()
@@ -256,6 +261,31 @@ mod tests {
 
     fn refs(tasks: &[Task]) -> Vec<&Task> {
         tasks.iter().collect()
+    }
+
+    /// `tasks` after taskwarrior applies `edits`, a new task taking its
+    /// description as its uuid.
+    fn applied(tasks: &[Task], edits: &[Edit]) -> Vec<Task> {
+        let mut out = tasks.to_vec();
+        for edit in edits {
+            match edit {
+                Edit::Add { project, description, subof, order } => {
+                    out.push(task(description, project, subof.as_deref(), Some(*order)));
+                },
+                Edit::Modify { uuid, mods } => {
+                    let t = out.iter_mut().find(|t| &t.uuid == uuid).unwrap();
+                    for m in mods {
+                        match m.split_once(':').unwrap() {
+                            ("order", n) => t.order = Some(n.parse().unwrap()),
+                            ("subof", "") => t.subof = None,
+                            ("subof", p) => t.subof = Some(p.into()),
+                            other => panic!("{other:?}"),
+                        }
+                    }
+                },
+            }
+        }
+        out
     }
 
     #[test]
@@ -363,6 +393,26 @@ mod tests {
         ]);
         let Edit::Add { order, .. } = &edits[2] else { panic!() };
         assert_eq!(*order, 1536);
+    }
+
+    #[test]
+    fn a_task_added_after_an_unordered_sibling_lands_below_it() {
+        let t = [task("a", "r", None, Some(5000)), task("b", "r", None, None)];
+        let edits = insert_after(&refs(&t), "r", Some("b"), "new");
+        let got = applied(&t, &edits);
+        assert_eq!(shape(&rows(&refs(&got))), [("a", 0), ("b", 0), ("new", 0)]);
+    }
+
+    #[test]
+    fn indent_under_unordered_children_lands_last() {
+        let t = [
+            task("a", "r", None, Some(1024)),
+            task("a1", "r", Some("a"), Some(5000)),
+            task("a2", "r", Some("a"), None),
+            task("b", "r", None, Some(2048)),
+        ];
+        let got = applied(&t, &indent(&refs(&t), "b"));
+        assert_eq!(shape(&rows(&refs(&got))), [("a", 0), ("a1", 1), ("a2", 1), ("b", 1)]);
     }
 
     #[test]
