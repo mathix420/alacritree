@@ -111,6 +111,11 @@
       "show_unmatched": true,
       "wsl_path": null
     },
+    "taskwarrior": {
+      "enabled": false,
+      "path": "task",
+      "wsl_path": null
+    },
     "tuicr": {
       "path": "tuicr",
       "wsl_path": null
