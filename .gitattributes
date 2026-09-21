@@ -1,7 +1,7 @@
-# `alacritree schema` writes LF and the drift tests compare the committed
-# documents byte for byte.  Windows checkouts default to converting them to
-# CRLF, which reports a schema as stale, or a default as moved, when the file
-# is identical.
-schema/*.json text eol=lf
-docs/config-reference.md text eol=lf
-alacritree/tests/stock-config.json text eol=lf
+# Text files check out with LF everywhere. The drift tests compare generated
+# documents byte for byte, and a Windows checkout converting them to CRLF
+# reports an identical file as stale.
+* text=auto eol=lf
+
+# Raw PTY captures, where a CRLF is terminal input rather than a line ending.
+*.recording -text
