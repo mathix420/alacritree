@@ -3,6 +3,7 @@
 //! `task`, and shapes the result for the tab and the agent hooks.
 
 pub(crate) mod facts;
+pub(crate) mod hook;
 pub(crate) mod scope;
 pub(crate) mod taskwarrior;
 pub(crate) mod tree;

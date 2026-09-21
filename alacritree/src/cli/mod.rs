@@ -145,6 +145,17 @@ enum Command {
         command: task::TaskCommand,
     },
 
+    /// Run what a harness hook event needs. Called from Claude Code's and
+    /// codex's hook config; prints one JSON object or nothing.
+    Hook {
+        event: crate::tasks::hook::Event,
+        /// Which harness is calling. Hook processes do not inherit the
+        /// variables a harness gives its own shell commands, so this cannot
+        /// be read from the environment.
+        #[arg(long, value_parser = ["claude", "codex"])]
+        harness: String,
+    },
+
     /// Crashed and indeterminate sessions, newest first.  Clean exits and
     /// still-running sessions are hidden unless `--all` is given.
     Crashes {
@@ -353,6 +364,21 @@ pub fn run(cli: Cli) -> Option<i32> {
         // pane with no alacritree running.
         Command::Task { command } => {
             return Some(task::run(command, cli.json, cli.config_dir.as_deref(), &cli.options));
+        },
+        // A harness waits on this before the model sees the turn, so it
+        // answers from disk with no window and never fails the hook.
+        Command::Hook { event, harness } => {
+            let mut stdin = String::new();
+            let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin);
+            let harness = crate::tasks::scope::Harness::parse(&harness)
+                .expect("clap restricts --harness to known names");
+            task::configure_tools(cli.config_dir.as_deref(), &cli.options);
+            let state_dir = cli.config_dir.clone().or_else(crate::state::config_dir);
+            if let Some(out) = crate::tasks::hook::run(event, harness, &stdin, state_dir.as_deref())
+            {
+                println!("{out}");
+            }
+            return Some(0);
         },
         // Reads files rather than asking an instance, so it answers when
         // nothing is running — which is exactly when a crash is being chased.
@@ -594,6 +620,7 @@ fn to_request(command: Command) -> IpcRequest {
         | Command::Mcp
         | Command::Doctor
         | Command::Task { .. }
+        | Command::Hook { .. }
         | Command::Crashes { .. }
         | Command::Install { .. } => {
             unreachable!("handled before dispatch")

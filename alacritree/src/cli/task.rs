@@ -25,12 +25,18 @@ pub(super) fn run(
     config_dir: Option<&Path>,
     overrides: &[toml::Value],
 ) -> i32 {
-    let (config, _) = config::load(config_dir, overrides);
-    tools::configure(config.integrations.tool_paths());
+    configure_tools(config_dir, overrides);
     match command {
         TaskCommand::Scope => scope(json),
         TaskCommand::Setup => setup(json),
     }
+}
+
+/// Points `task` and `git` at the configured programs, so
+/// `[integrations.taskwarrior] path` and `-o` reach every call.
+pub(super) fn configure_tools(config_dir: Option<&Path>, overrides: &[toml::Value]) {
+    let (config, _) = config::load(config_dir, overrides);
+    tools::configure(config.integrations.tool_paths());
 }
 
 fn scope(json: bool) -> i32 {
