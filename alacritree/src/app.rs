@@ -1360,9 +1360,8 @@ impl AlacritreeApp {
         // dialog opens at once and fills in.
         //
         // A resolved dirty count preloads `force` so a known-dirty tree goes
-        // straight to a forced removal, as it always has — the unforced
-        // first attempt is reserved for a genuinely unknown count, where
-        // git's own refusal decides instead.
+        // straight to a forced removal. The dialog does not confirm until a
+        // count is known, so no removal runs against an unknown tree.
         let (dirty, dirty_job, force) = if prunable {
             (Some(DirtyCounts::default()), None, false)
         } else if let Some(counts) = self
@@ -6057,6 +6056,77 @@ mod tests {
 
     fn ws(p: &str) -> WorkspaceKey {
         Some(PathBuf::from(p))
+    }
+
+    fn delete_request(project_idx: usize, path: &str, dirty: Option<DirtyCounts>) -> DeleteRequest {
+        DeleteRequest {
+            project_idx,
+            worktree_path: PathBuf::from(path),
+            worktree_name: path.to_string(),
+            branch: None,
+            dirty,
+            dirty_job: None,
+            prunable: false,
+            delete_branch: true,
+            force: false,
+        }
+    }
+
+    fn press_in_delete_dialog(app: &mut AlacritreeApp, key: egui::Key) {
+        let input = egui::RawInput { events: vec![key_ev(key, true)], ..Default::default() };
+        let _ = Context::default().run(input, |ctx| app.show_delete_dialog(ctx));
+    }
+
+    #[test]
+    fn enter_deletes_nothing_until_the_dirty_count_is_known() {
+        let mut app = test_app();
+        app.projects.push(project_with("/repo", &["/repo/wt"]));
+        let idx = app.projects.len() - 1;
+        app.modals.pending_delete = Some(delete_request(idx, "/repo/wt", None));
+
+        press_in_delete_dialog(&mut app, egui::Key::Enter);
+
+        assert!(app.modals.pending_deletes.is_empty(), "an unforced removal ran blind");
+        assert!(app.modals.pending_delete.is_some());
+    }
+
+    #[test]
+    fn enter_deletes_once_the_dirty_count_is_known() {
+        let mut app = test_app();
+        app.projects.push(project_with("/repo", &["/repo/wt"]));
+        let idx = app.projects.len() - 1;
+        app.modals.pending_delete =
+            Some(delete_request(idx, "/repo/wt", Some(DirtyCounts::default())));
+
+        press_in_delete_dialog(&mut app, egui::Key::Enter);
+
+        assert_eq!(app.modals.pending_deletes.len(), 1);
+        assert!(app.modals.pending_delete.is_none());
+    }
+
+    #[test]
+    fn every_delete_failure_in_a_batch_stays_readable() {
+        let mut app = test_app();
+        app.projects.push(project_with("/repo", &["/repo/wt1", "/repo/wt2"]));
+        let idx = app.projects.len() - 1;
+        for (path, reason) in [("/repo/wt1", "wt1 is locked"), ("/repo/wt2", "wt2 is busy")] {
+            app.modals.pending_deletes.push(modals::DeleteTask {
+                project_idx: idx,
+                worktree_path: PathBuf::from(path),
+                worktree_name: path.to_string(),
+                branch: None,
+                dirty: None,
+                delete_branch: true,
+                prunable: false,
+                job: jobs::Job::ready(Err(reason.to_string())),
+            });
+        }
+
+        app.poll_pending_deletes(&Context::default());
+
+        let shown = app.modals.error_dialog.expect("the failures are reported");
+        assert!(shown.contains("wt1 is locked"), "{shown}");
+        assert!(shown.contains("wt2 is busy"), "{shown}");
     }
 
     #[test]

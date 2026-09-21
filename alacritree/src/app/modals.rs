@@ -40,17 +40,24 @@ impl AlacritreeApp {
             return;
         }
 
-        // Consume Enter/Escape, and act on a confirm, before adopting a
+        // Consume Enter/Escape, and judge a confirm, before adopting a
         // dirty count below: adoption can flip `force` from `false` to
         // `true` this same frame, but the keypress was the user's reaction
         // to what was already painted (a previous frame's "checking…", read
-        // as `force: false`). Executing the confirm here, against the
-        // request as it stands before this frame's adoption runs, is what
-        // keeps "the `force` a confirm executes" equal to "the `force` the
-        // user was shown" — held Enter (key repeat) would otherwise hit the
-        // race on the exact frame the probe lands.
+        // as `force: false`). Judging the confirm here, against the request
+        // as it stands before this frame's adoption runs, is what keeps
+        // "what a confirm executes" equal to "what the user was shown", since
+        // held Enter (key repeat) would otherwise hit the race on the exact
+        // frame the probe lands. The key is consumed whether or not the
+        // confirm may act on it: it was aimed at this dialog, and letting it
+        // fall through would type it into the shell behind.
+        let confirm_ready = self
+            .modals
+            .pending_delete
+            .as_ref()
+            .is_some_and(|req| delete_confirm_ready(req.dirty.as_ref(), req.force));
         let (cancel_via_key, confirm_via_key) = consume_modal_keys(ctx);
-        if confirm_via_key {
+        if confirm_via_key && confirm_ready {
             self.run_pending_delete(ctx);
             return;
         }
@@ -100,10 +107,16 @@ impl AlacritreeApp {
             )
         };
         let warning = dirty_warning(req.dirty.as_ref(), req.force, req.dirty_job.is_some());
+        let ready = delete_confirm_ready(req.dirty.as_ref(), req.force);
+        // The probe finished without leaving a count, so waiting longer buys
+        // nothing; offer the check again rather than stranding the dialog
+        // behind a confirm that will never enable.
+        let recheckable = !ready && req.dirty_job.is_none();
 
         let frame = modal_frame(&theme);
         let mut confirmed = false;
         let mut cancelled = false;
+        let mut recheck = false;
 
         let s = theme.ui_scale;
         let modal = egui::Modal::new(egui::Id::new("alacritree_delete_dialog")).frame(frame).show(
@@ -128,18 +141,26 @@ impl AlacritreeApp {
                 }
                 ui.add_space(4.0 * s);
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("Enter to {} · Esc to cancel", verb.to_lowercase()))
-                            .color(theme.text_muted)
-                            .small(),
-                    );
+                    let hint = if ready {
+                        format!("Enter to {} | Esc to cancel", verb.to_lowercase())
+                    } else {
+                        "Esc to cancel".to_string()
+                    };
+                    ui.label(RichText::new(hint).color(theme.text_muted).small());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let delete = modal_button(ui, &theme, verb, danger);
+                        let delete = ui
+                            .add_enabled_ui(ready, |ui| modal_button(ui, &theme, verb, danger))
+                            .inner;
                         if delete.clicked() {
                             confirmed = true;
                         }
                         if modal_button(ui, &theme, "Cancel", theme.text_dim).clicked() {
                             cancelled = true;
+                        }
+                        if recheckable
+                            && modal_button(ui, &theme, "Check again", theme.text).clicked()
+                        {
+                            recheck = true;
                         }
                         focus_default(ui.ctx(), delete.id);
                     });
@@ -147,6 +168,16 @@ impl AlacritreeApp {
             },
         );
 
+        if recheck {
+            if let Some(req) = self.modals.pending_delete.as_mut() {
+                let path = req.worktree_path.clone();
+                req.dirty_job =
+                    Some(jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
+                        git_status::dirty_counts(&path, blocking)
+                    }));
+            }
+            return;
+        }
         if confirmed {
             self.run_pending_delete(ctx);
             return;
@@ -426,10 +457,10 @@ impl AlacritreeApp {
             }
         } else {
             // `req.force` already reflects a resolved dirty count (set in
-            // `request_worktree_delete` or when its probe landed); a count
-            // that never resolved before the confirm leaves it `false`, and
-            // `poll_pending_deletes` retries with `force: true` once git
-            // itself refuses the tree as dirty.
+            // `request_worktree_delete` or when its probe landed), since the
+            // dialog refuses to confirm before one is known. A tree that went
+            // dirty after a clean count still gets git's refusal, which
+            // `poll_pending_deletes` reopens as a forced retry.
             wt::DeleteJob::Remove {
                 worktree_path: req.worktree_path,
                 branch: req.branch,
@@ -534,12 +565,12 @@ impl AlacritreeApp {
                             force: true,
                         });
                     } else {
-                        self.modals.error_dialog = Some(format!("Delete failed.\n\n{e}"));
+                        push_error(&mut self.modals.error_dialog, format!("Delete failed.\n\n{e}"));
                     }
                 },
                 Err(e) => {
                     let action = if f.prunable { "Prune" } else { "Delete" };
-                    self.modals.error_dialog = Some(format!("{action} failed.\n\n{e}"));
+                    push_error(&mut self.modals.error_dialog, format!("{action} failed.\n\n{e}"));
                 },
             }
             self.refresh_project(ctx, f.project_idx);
@@ -1266,6 +1297,33 @@ pub(super) fn refused_for_unsaved_work(message: &str) -> bool {
     let reason = tail.rsplit_once('\'').map_or(tail, |(_, after)| after).to_ascii_lowercase();
     reason.contains("contains modified or untracked files, use --force")
         || reason.contains("is dirty, use --force")
+}
+
+/// Whether the delete confirm may execute.
+///
+/// A removal is only safe to run once the dirty count is resolved.  The
+/// sessions living in the worktree are torn down before `git worktree
+/// remove` runs, so an unforced attempt that git refuses as dirty has
+/// already cost the user their shells by the time the refusal arrives.  A
+/// resolved count presets `--force`, which git will not refuse for
+/// dirtiness; a forced retry has already been through that refusal.
+fn delete_confirm_ready(counts: Option<&DirtyCounts>, force: bool) -> bool {
+    force || counts.is_some()
+}
+
+/// Fold a failure into the single-slot error dialog rather than replacing
+/// what it holds.  One frame can finish several background deletes, and the
+/// dialog shows one message: replacing it would leave only the last
+/// failure, with the earlier explanations gone before the user ever read
+/// them.
+fn push_error(slot: &mut Option<String>, message: String) {
+    match slot {
+        Some(shown) => {
+            shown.push_str("\n\n");
+            shown.push_str(&message);
+        },
+        None => *slot = Some(message),
+    }
 }
 
 pub(super) fn dirty_parts(counts: &DirtyCounts) -> String {
