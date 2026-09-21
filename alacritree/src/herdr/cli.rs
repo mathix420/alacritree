@@ -1,8 +1,7 @@
 //! Running the `herdr` binary.
 //!
-//! Everything goes through the CLI rather than herdr's socket, so a missing
-//! binary or an absent server is a silent no-op and no wire protocol is
-//! pinned.  This is the only file that knows how to reach a herdr server.
+//! A missing binary or an absent server is a silent no-op.  This is the only
+//! file that builds a herdr command line, the event stream's bridge included.
 
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -22,6 +21,13 @@ pub(super) fn program(side: &Side) -> String {
         Side::Native => tools::program(Tool::Herdr),
         Side::Wsl(_) => tools::wsl_program(Tool::Herdr),
     }
+}
+
+/// The long-lived relay an event stream reads through.  herdr resolves the
+/// socket itself, so the stream reaches the same server every other call
+/// here does.
+pub(super) fn bridge_command(side: &Side) -> (String, Vec<String>) {
+    side.command(&program(side), &["remote-api-bridge"])
 }
 
 /// Direct attach to one agent.  Unsupported on native Windows, where
@@ -59,6 +65,10 @@ pub(super) fn attaches_directly(side: &Side, mode: AttachMode, has_agent: bool) 
 /// behind an on-access scanner and still keeps a wedged server from taking
 /// the window with it.
 const GESTURE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How every gesture that ran out [`GESTURE_TIMEOUT`] begins its refusal, so
+/// a herdr that went silent can be told from one that said no.
+pub(super) const NO_ANSWER: &str = "herdr did not answer";
 
 /// Runs `f` on a worker thread and gives up on it after [`GESTURE_TIMEOUT`].
 /// `Command::output` has no timeout of its own, so the bound comes from this
@@ -111,7 +121,7 @@ pub(super) fn focus_pane(side: &Side, focus: &[String]) -> Result<(), String> {
             .output()
     };
     let Some(output) = bounded(run) else {
-        return Err("herdr did not answer while focusing the pane".to_string());
+        return Err(format!("{NO_ANSWER} while focusing the pane"));
     };
     let output = output.map_err(|e| format!("failed to focus herdr pane: {e}"))?;
     if !output.status.success() {
@@ -141,7 +151,7 @@ pub(super) fn running_session_name(side: &Side) -> Result<String, String> {
     };
     let fallback = || "default".to_string();
     let Some(output) = bounded(run) else {
-        return Err("herdr did not answer while listing its sessions".to_string());
+        return Err(format!("{NO_ANSWER} while listing its sessions"));
     };
     let Ok(output) = output else {
         return Ok(fallback());
@@ -195,7 +205,7 @@ pub(super) fn create_pane(
             .output()
     };
     let Some(output) = bounded(run) else {
-        return Err("herdr did not answer while creating the pane".to_string());
+        return Err(format!("{NO_ANSWER} while creating the pane"));
     };
     let output = output.map_err(|e| format!("failed to create a herdr pane: {e}"))?;
     if !output.status.success() {

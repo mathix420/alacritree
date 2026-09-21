@@ -20,9 +20,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-/// How long a piloted assertion waits for the window to catch up. The poll
-/// interval puts up to two seconds of age on a focus change before alacritree
-/// can see it at all, and an attach on Windows costs more.
+/// How long a piloted assertion waits for the window to catch up. A focus
+/// change reaches alacritree on herdr's event stream, and an attach on
+/// Windows costs more than the event does.
 const SETTLE: Duration = Duration::from_secs(15);
 
 /// How long `drop` waits for `herdr server stop` before killing it outright,
@@ -290,8 +290,8 @@ fn the_default_mode_does_not_follow_from_a_native_session() {
     let before = active_terminal(&harness.sessions());
     let created = harness.herdr(&["tab", "create", "--focus"]);
     assert!(created.status.success(), "tab create failed: {created:?}");
-    // Long enough for two poll intervals plus the quiet gap, so a follow that
-    // was going to happen has happened.
+    // Long enough for the event, the listing it starts and the quiet gap, so a
+    // follow that was going to happen has happened.
     std::thread::sleep(Duration::from_secs(6));
     assert_eq!(active_terminal(&harness.sessions()), before, "the window followed herdr");
 }

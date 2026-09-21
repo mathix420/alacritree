@@ -728,8 +728,6 @@ pub struct HerdrConfig {
     pub icon: IconStyle,
     /// Discover herdr servers and list their agents in the sidebar.
     pub enabled: bool,
-    /// How often a reachable herdr server is re-polled for agent state.
-    pub poll_interval: Duration,
     /// List panes whose working directory matches no worktree, under Home.
     pub show_unmatched: bool,
     /// List every pane a herdr server owns, not only the ones it detected an
@@ -3414,9 +3412,11 @@ struct RawHerdr {
     icon: Option<RawIconStyle>,
     /// Discover herdr servers and list their agents in the sidebar.  Inert
     /// when no herdr binary or server is present.
+    ///
+    /// Changes arrive on herdr's event stream, read through `herdr
+    /// remote-api-bridge`.  0.9.1 has it and 0.8.2 does not; a herdr without
+    /// it lists nothing.
     enabled: bool,
-    /// How often a reachable herdr server is re-polled for agent state.
-    poll_interval_ms: u64,
     /// List panes whose working directory matches no worktree, under Home.
     show_unmatched: bool,
     /// List every pane a herdr server owns, not only the ones it detected an
@@ -3458,7 +3458,6 @@ impl Default for RawHerdr {
             wsl_path: String::new(),
             icon: None,
             enabled: true,
-            poll_interval_ms: 2000,
             show_unmatched: true,
             show_panes: false,
             attach: ClosedSet::default(),
@@ -3481,7 +3480,6 @@ impl RawHerdr {
                 .unwrap_or_else(default_herdr_icon)
                 .into(),
             enabled: self.enabled,
-            poll_interval: Duration::from_millis(self.poll_interval_ms),
             show_unmatched: self.show_unmatched,
             show_panes: self.show_panes,
             attach: self.attach.get(),
@@ -4441,10 +4439,9 @@ mod tests {
     }
 
     #[test]
-    fn herdr_defaults_to_enabled_with_a_two_second_poll() {
+    fn herdr_defaults_to_enabled() {
         let config = Config::default();
         assert!(config.integrations.herdr.enabled);
-        assert_eq!(config.integrations.herdr.poll_interval, Duration::from_millis(2000));
         assert!(config.integrations.herdr.show_unmatched);
         assert!(!config.integrations.herdr.show_panes);
         assert_eq!(config.integrations.herdr.attach, AttachMode::Agent);
@@ -4452,10 +4449,18 @@ mod tests {
 
     #[test]
     fn herdr_can_be_turned_off() {
-        let toml = "[integrations.herdr]\nenabled = false\npoll_interval_ms = 5000\n";
-        let config = config_from(toml);
+        let config = config_from("[integrations.herdr]\nenabled = false\n");
         assert!(!config.integrations.herdr.enabled);
-        assert_eq!(config.integrations.herdr.poll_interval, Duration::from_millis(5000));
+    }
+
+    /// herdr's changes arrive on an event stream, so the interval the poll
+    /// once ran on means nothing, and a config that still sets it loads as
+    /// if it did not.
+    #[test]
+    fn a_config_setting_the_old_herdr_poll_interval_still_loads() {
+        let config =
+            config_from("[integrations.herdr]\npoll_interval_ms = 5000\nshow_panes = true\n");
+        assert!(config.integrations.herdr.show_panes);
     }
 
     /// Panes with no agent in them are opt-in: the key needs a herdr that
@@ -4538,8 +4543,8 @@ show_panes = true
     #[test]
     fn a_written_key_still_beats_its_default() {
         let config =
-            config_from("[integrations.herdr]\npoll_interval_ms = 500\nshow_unmatched = false\n");
-        assert_eq!(config.integrations.herdr.poll_interval, Duration::from_millis(500));
+            config_from("[integrations.herdr]\nshow_panes = true\nshow_unmatched = false\n");
+        assert!(config.integrations.herdr.show_panes);
         assert!(!config.integrations.herdr.show_unmatched);
         // A key the file did not mention keeps the default it now owns.
         assert!(config.integrations.herdr.enabled);

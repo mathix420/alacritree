@@ -728,7 +728,7 @@
         },
         "enabled": {
           "default": true,
-          "description": "Discover herdr servers and list their agents in the sidebar.  Inert\nwhen no herdr binary or server is present.",
+          "description": "Discover herdr servers and list their agents in the sidebar.  Inert\nwhen no herdr binary or server is present.\n\nChanges arrive on herdr's event stream, read through `herdr\nremote-api-bridge`.  0.9.1 has it and 0.8.2 does not; a herdr without\nit lists nothing.",
           "type": "boolean"
         },
         "follow_focus": {
@@ -754,13 +754,6 @@
           "default": "herdr",
           "description": "The program to run on Windows or natively. Its own name is looked up\non PATH; any other value runs as written.",
           "type": "string"
-        },
-        "poll_interval_ms": {
-          "default": 2000,
-          "description": "How often a reachable herdr server is re-polled for agent state.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
         },
         "show_panes": {
           "default": false,

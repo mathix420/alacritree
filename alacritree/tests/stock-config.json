@@ -107,10 +107,6 @@
         "size": null
       },
       "path": "herdr",
-      "poll_interval": {
-        "nanos": 0,
-        "secs": 2
-      },
       "show_panes": false,
       "show_unmatched": true,
       "wsl_path": null

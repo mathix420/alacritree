@@ -73,6 +73,24 @@ impl Herdr {
         self.cache(side).map(EndpointCache::settings).unwrap_or_default()
     }
 
+    /// A gesture that timed out is the only sign of a herdr that hung with
+    /// its streams still open, so that side's streams start over.
+    fn note_gesture<T>(&mut self, side: &Side, result: &Result<T, String>) {
+        if result.as_ref().is_err_and(|e| e.starts_with(cli::NO_ANSWER))
+            && let Some(cache) = self.endpoints.cache_mut(side)
+        {
+            cache.restart();
+        }
+    }
+
+    /// A user reaching for a side is the moment its herdr being up matters,
+    /// so a side waiting out its backoff reconnects now.
+    fn reconnect_now(&mut self, side: &Side) {
+        if let Some(cache) = self.endpoints.cache_mut(side) {
+            cache.reconnect_now();
+        }
+    }
+
     /// Where herdr's focus goes for the pane a session is bound to.  The
     /// displayed listing drops a pane with no agent in it unless panes are
     /// shown, so a bound shell pane is found through what the side's full
@@ -162,11 +180,7 @@ impl MultiplexerSession for Herdr {
         if !self.config.enabled {
             return;
         }
-        self.endpoints.poll(
-            self.config.poll_interval,
-            Listing::wanted(self.config.show_panes),
-            attached,
-        );
+        self.endpoints.poll(Listing::wanted(self.config.show_panes), attached);
     }
 
     fn generation(&self) -> u64 {
@@ -307,6 +321,7 @@ impl MultiplexerSession for Herdr {
     /// Every one of herdr's app clients draws the same focused pane, so a
     /// shared view shows a row's pane only while herdr is focused there.
     fn queue_attach(&mut self, key: PaneKey, target: PaneTarget, request: AttachRequest) {
+        self.reconnect_now(&key.side);
         if let Some(pending) = self.pending_attach.iter_mut().find(|p| p.key == key) {
             pending.request.waiters.extend(request.waiters);
             if request.focus.takes() && !pending.request.focus.takes() {
@@ -351,6 +366,7 @@ impl MultiplexerSession for Herdr {
         };
         let answer = match answer {
             Some(launch) => {
+                self.note_gesture(&pending.key.side, &launch);
                 Some(AttachAnswer { key: pending.key, request: pending.request, launch })
             },
             None => {
@@ -363,6 +379,7 @@ impl MultiplexerSession for Herdr {
     }
 
     fn queue_create(&mut self, side: Side, cwd: Option<String>, request: CreateRequest) {
+        self.reconnect_now(&side);
         let asked = side.clone();
         let focus = request.focus.takes();
         let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
@@ -384,6 +401,7 @@ impl MultiplexerSession for Herdr {
                 return None;
             },
         };
+        self.note_gesture(&pending.side, &pane);
         Some(CreateAnswer { side: pending.side, request: pending.request, pane })
     }
 
@@ -406,6 +424,7 @@ impl MultiplexerSession for Herdr {
             }
             match pending.job.poll() {
                 Some(result) => {
+                    self.note_gesture(&pending.key.side, &result);
                     let succeeded = result.is_ok();
                     if let Err(e) = result {
                         log::warn!("{e}");

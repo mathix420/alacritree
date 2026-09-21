@@ -1,13 +1,14 @@
 //! herdr as a multiplexer alacritree hosts panes from.
 //!
 //! herdr owns its own PTYs and detects the agent in each pane; alacritree
-//! only asks what it has and can hand one to a shell.  Everything here goes
-//! through the `herdr` CLI rather than its socket, so a missing binary or an
-//! absent server is a silent no-op and no wire protocol is pinned.  herdr
-//! prints success on stdout and errors on stderr, which is why callers
-//! capture both.
+//! only asks what it has and can hand one to a shell.  Commands and listings
+//! go through the `herdr` CLI, and changes arrive on an event stream read
+//! through herdr's own socket bridge, so a missing binary or an absent server
+//! is a silent no-op.  herdr prints success on stdout and errors on stderr,
+//! which is why callers capture both.
 
 mod cli;
+mod events;
 mod host;
 mod model;
 mod poll;

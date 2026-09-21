@@ -28,10 +28,16 @@ impl Listing {
     }
 }
 
+/// One pane in the shape `pane list` prints each entry, which is also what
+/// herdr's pane events carry.
+pub(super) fn parse_pane_info(value: serde_json::Value) -> Option<Pane> {
+    serde_json::from_value::<RawPane>(value).ok()?.into_agent(Listing::Panes)
+}
+
 /// herdr's word for an agent's state.  An unrecognised string is `Unknown`, so
 /// a value herdr adds later renders as a plain row instead of dropping the
 /// agent.
-fn parse_status(raw: &str) -> PaneStatus {
+pub(super) fn parse_status(raw: &str) -> PaneStatus {
     match raw {
         "idle" => PaneStatus::Idle,
         "working" => PaneStatus::Working,

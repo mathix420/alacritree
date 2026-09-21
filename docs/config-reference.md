@@ -231,7 +231,7 @@ The git CLI, for the commands alacritree spawns. Repository reads go through lib
 Agents running under a herdr server.
 
 - `attach` ("agent" | "session", default `"agent"`): Whether opening a row attaches to that agent's pane directly ("agent") or to the herdr session around it with the pane focused ("session"). "session" hands the mouse to herdr's own client, where a selection joins soft-wrapped rows and copy mode works; a direct attach is repainted row by row, so the host terminal sees every wrap as a line break. Honoured per side: the native side of a Windows host always attaches to the session, because herdr implements no direct attach there.
-- `enabled` (boolean, default `true`): Discover herdr servers and list their agents in the sidebar. Inert when no herdr binary or server is present.
+- `enabled` (boolean, default `true`): Discover herdr servers and list their agents in the sidebar. Inert when no herdr binary or server is present. Changes arrive on herdr's event stream, read through `herdr remote-api-bridge`. 0.9.1 has it and 0.8.2 does not; a herdr without it lists nothing.
 - `follow_focus` ("off" | "herdr" | "always", default `"herdr"`): Whether a focus change made inside herdr moves alacritree to the matching session. "off" never moves it. "herdr" moves it only while the active session is already showing herdr's view, which is what an unmodified config has always done. "always" also moves it from a plain native session, on any reachable side, after a gap in typing.
 - `icon` (string or table, default `"􏼀"`): The glyph on a herdr pane's sidebar row and palette entry. A bare string sets the glyph; a table also styles its color, weight, slant and size, the way `[ui.icons]` keys do. The default draws a ram's head from the bundled symbol font. An ordinary character such as `"◫"` is drawn by your own fonts instead.
   - `bold` (boolean, default `false`): Draw the glyph bold.
@@ -240,7 +240,6 @@ Agents running under a herdr server.
   - `italic` (boolean, default `false`): Draw the glyph italic.
   - `size` (number): Point size, clamped to a minimum of `1.0`. Unset uses the sidebar font size.
 - `path` (string, default `"herdr"`): The program to run on Windows or natively. Its own name is looked up on PATH; any other value runs as written.
-- `poll_interval_ms` (integer, default `2000`): How often a reachable herdr server is re-polled for agent state.
 - `show_panes` (boolean, default `false`): List every pane a herdr server owns, not only the ones it detected an agent in. A pane running a plain shell gets a row named by its own title, carrying no status, and opening it shares herdr's view of the tab that holds it rather than attaching to the pane. Needs a herdr that knows `pane list` (0.8.2 does). An older one answers with a usage error, which reads as no herdr on that side. A side that has never answered is then abandoned for the process lifetime; one that answered before this was turned on keeps retrying and recovers when it goes back off.
 - `show_unmatched` (boolean, default `true`): List panes whose working directory matches no worktree, under Home.
 - `wsl_path` (string, default `""`): The program to run inside every WSL distro, as written. Empty finds it by name through the distro's login shell.

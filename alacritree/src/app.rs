@@ -4850,10 +4850,8 @@ mod tests {
             Instant::now(),
         );
 
-        app.multiplexers.herdr_mut_for_test().caches_mut_for_test()[0].fail_listing_for_test(
-            herdr::PollError::Absent("spawn_failed"),
-            Duration::from_secs(2),
-        );
+        app.multiplexers.herdr_mut_for_test().caches_mut_for_test()[0]
+            .fail_listing_for_test(herdr::PollError::Absent("spawn_failed"));
 
         assert_eq!(app.create_target(None, None), Ok((MultiplexerKind::Herdr, Side::Native)));
     }
@@ -5453,10 +5451,8 @@ mod tests {
         );
         let id = bind_herdr_fixture(&mut app, side, "term-kept");
 
-        app.multiplexers.herdr_mut_for_test().caches_mut_for_test()[0].fail_listing_for_test(
-            herdr::PollError::Absent("spawn_failed"),
-            Duration::from_secs(2),
-        );
+        app.multiplexers.herdr_mut_for_test().caches_mut_for_test()[0]
+            .fail_listing_for_test(herdr::PollError::Absent("spawn_failed"));
 
         assert_eq!(app.session_pane_status(&app.sessions[0]), Some(PaneStatus::Working));
         let items = app.palette_items();

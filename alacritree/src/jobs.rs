@@ -250,6 +250,13 @@ impl<T> Job<T> {
     pub fn failed(&self) -> bool {
         self.failed.get()
     }
+
+    /// A job still running and never finishing, standing in for work a test
+    /// build must not start.
+    pub fn never() -> Self {
+        let (_, rx) = mpsc::channel();
+        Job { rx, cancel: Arc::new(Cancel::default()), failed: Cell::new(false) }
+    }
 }
 
 impl<T> Drop for Job<T> {
@@ -308,6 +315,14 @@ impl Pool {
     /// registration wins; later ones are ignored.
     pub(crate) fn set_waker(&self, wake: impl Fn() + Send + Sync + 'static) {
         let _ = self.shared.wake_ui.set(Box::new(wake));
+    }
+
+    /// Runs the registered wake-up outside any job, for a thread of this
+    /// crate's own that learns something the UI has to draw.
+    pub(crate) fn wake_ui(&self) {
+        if let Some(wake) = self.shared.wake_ui.get() {
+            wake();
+        }
     }
 
     #[must_use = "dropping the handle cancels the job"]
