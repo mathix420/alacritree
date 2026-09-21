@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::digest::stable_digest;
-use crate::jobs;
 use crate::tasks::scope::{GLOBAL, Harness, Place, SessionRef, node, sanitize};
 use crate::tasks::taskwarrior::{Status, Task, Taskwarrior};
 use crate::tasks::{facts, tree};
+use crate::{jobs, wsl};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum Event {
@@ -94,6 +94,22 @@ fn digest_path(state_dir: &Path, session: &SessionRef) -> PathBuf {
     state_dir.join("task-hooks").join(name)
 }
 
+/// A harness inside WSL reports a Linux cwd, while this Windows process
+/// starts in the same directory's `\\wsl.localhost` form. The distro comes
+/// from there, since WSL passes no variable naming it to Windows processes.
+fn on_this_host(cwd: PathBuf, here: Option<PathBuf>) -> Option<PathBuf> {
+    let linux = cfg!(windows) && cwd.to_str().is_some_and(|s| s.starts_with('/'));
+    if !linux {
+        return Some(cwd);
+    }
+    match here.as_deref().map(wsl::classify) {
+        Some(wsl::Location::Wsl { distro, .. }) => {
+            Some(wsl::linux_to_windows(cwd.to_str()?, &distro))
+        },
+        _ => here,
+    }
+}
+
 /// `None` means print nothing, which is where every failure lands.
 pub(crate) fn run(
     event: Event,
@@ -102,7 +118,11 @@ pub(crate) fn run(
     state_dir: Option<&Path>,
 ) -> Option<String> {
     let payload: Payload = serde_json::from_str(stdin).unwrap_or_default();
-    let cwd = payload.cwd.or_else(|| std::env::current_dir().ok())?;
+    let here = std::env::current_dir().ok();
+    let cwd = match payload.cwd {
+        Some(cwd) => on_this_host(cwd, here)?,
+        None => here?,
+    };
     let session =
         payload.session_id.filter(|id| !id.trim().is_empty()).map(|id| SessionRef { harness, id });
     let (place, tasks) = jobs::on_this_thread(|b| {

@@ -88,6 +88,7 @@ fn hook(sandbox: &Sandbox, args: &[&str], stdin: &str) -> Output {
         .env("APPDATA", home)
         .env("LOCALAPPDATA", home)
         .env("HOME", home)
+        .current_dir(&sandbox.repo)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -114,6 +115,22 @@ fn session_start_prints_one_json_object_for_both_harnesses() {
         let ctx = json["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
         assert!(ctx.contains(&format!("myrepo.main.{harness}-")), "{ctx}");
     }
+}
+
+/// A harness inside WSL reports its cwd as a Linux path, and the Windows
+/// binary it runs through interop starts in the same directory's UNC form.
+#[test]
+fn a_linux_cwd_from_inside_wsl_names_the_workspace() {
+    let Some(sandbox) = with_task() else { return };
+    let Some(linux) = alacritree::wsl::windows_to_linux(&sandbox.repo) else { return };
+    if !linux.starts_with('/') || !cfg!(windows) {
+        return;
+    }
+    let args = ["hook", "session-start", "--harness", "claude"];
+    let out = hook(&sandbox, &args, &fixture("claude-session-start.json", Path::new(&linux)));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let ctx = json["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+    assert!(ctx.contains("myrepo.main.claude-"), "{ctx}");
 }
 
 #[test]
