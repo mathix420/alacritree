@@ -19,7 +19,7 @@ pub mod command_ext;
 pub(crate) mod command_palette;
 pub mod config;
 pub mod crash_log;
-pub(crate) mod cursor_anim;
+pub(crate) mod cursor;
 pub(crate) mod decoration_sprites;
 pub mod default_branch;
 pub(crate) mod diff_viewer;

@@ -8,11 +8,8 @@
 
 use std::time::{Duration, Instant};
 
+use super::CellPos;
 use crate::config::CursorMotion;
-
-/// Fractional column and row in the viewport.  Whole numbers are cell corners,
-/// which is where the cursor sits whenever it is not moving.
-pub(crate) type CellPos = (f32, f32);
 
 /// The cursor's four corners, clockwise from the top-left of its cell.
 pub(crate) type Corners = [CellPos; 4];
@@ -22,7 +19,7 @@ pub(crate) type Corners = [CellPos; 4];
 const OFFSETS: Corners = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
 
 #[derive(Debug, Default)]
-pub(crate) struct CursorAnimation {
+pub(crate) struct Animation {
     glide: Option<Glide>,
 }
 
@@ -48,7 +45,7 @@ struct Corner {
     duration: Duration,
 }
 
-impl CursorAnimation {
+impl Animation {
     /// The cursor's corners for this frame.  `target` is the cell the terminal
     /// has it in, or `None` while it is hidden or scrolled out of view, which
     /// also clears the glide so its next appearance starts where it appears.
@@ -212,7 +209,7 @@ mod tests {
 
     #[test]
     fn the_first_frame_covers_the_cell_the_cursor_is_in() {
-        let mut anim = CursorAnimation::default();
+        let mut anim = Animation::default();
         let now = Instant::now();
         let drawn = anim.place(&motion(true), Some((4.0, 2.0)), 0, now);
         assert_eq!(drawn, Some([(4.0, 2.0), (5.0, 2.0), (5.0, 3.0), (4.0, 3.0)]));
@@ -224,7 +221,7 @@ mod tests {
     /// so what gets drawn spans the gap rather than sitting somewhere in it.
     #[test]
     fn the_leading_edge_arrives_while_the_trailing_edge_is_still_coming() {
-        let mut anim = CursorAnimation::default();
+        let mut anim = Animation::default();
         let now = Instant::now();
         let cfg = motion(true);
         anim.place(&cfg, Some((0.0, 0.0)), 0, now);
@@ -242,7 +239,7 @@ mod tests {
 
     #[test]
     fn the_glide_ends_on_the_cell_exactly() {
-        let mut anim = CursorAnimation::default();
+        let mut anim = Animation::default();
         let now = Instant::now();
         let cfg = motion(true);
         anim.place(&cfg, Some((0.0, 0.0)), 0, now);
@@ -258,7 +255,7 @@ mod tests {
 
     #[test]
     fn a_short_hop_snaps() {
-        let mut anim = CursorAnimation::default();
+        let mut anim = Animation::default();
         let now = Instant::now();
         let cfg = motion(true);
         anim.place(&cfg, Some((0.0, 0.0)), 0, now);
@@ -270,7 +267,7 @@ mod tests {
 
     #[test]
     fn a_destination_that_moves_mid_glide_replays_from_the_drawn_quad() {
-        let mut anim = CursorAnimation::default();
+        let mut anim = Animation::default();
         let now = Instant::now();
         let cfg = motion(true);
         anim.place(&cfg, Some((0.0, 0.0)), 0, now);
@@ -283,7 +280,7 @@ mod tests {
 
     #[test]
     fn scrolling_moves_the_cursor_without_animating_it() {
-        let mut anim = CursorAnimation::default();
+        let mut anim = Animation::default();
         let now = Instant::now();
         let cfg = motion(true);
         anim.place(&cfg, Some((3.0, 20.0)), 0, now);
@@ -296,7 +293,7 @@ mod tests {
 
     #[test]
     fn the_option_being_off_draws_every_cell_directly() {
-        let mut anim = CursorAnimation::default();
+        let mut anim = Animation::default();
         let now = Instant::now();
         let cfg = motion(false);
         anim.place(&cfg, Some((0.0, 0.0)), 0, now);
@@ -307,7 +304,7 @@ mod tests {
 
     #[test]
     fn a_zero_duration_draws_every_cell_directly() {
-        let mut anim = CursorAnimation::default();
+        let mut anim = Animation::default();
         let now = Instant::now();
         let mut cfg = motion(true);
         cfg.duration = Duration::ZERO;
@@ -319,7 +316,7 @@ mod tests {
 
     #[test]
     fn a_hidden_cursor_reappears_where_it_reappears() {
-        let mut anim = CursorAnimation::default();
+        let mut anim = Animation::default();
         let now = Instant::now();
         let cfg = motion(true);
         anim.place(&cfg, Some((0.0, 0.0)), 0, now);

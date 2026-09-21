@@ -271,9 +271,49 @@ fn cursor_shape_name<S: serde::Serializer>(
 pub struct CursorConfig {
     #[serde(serialize_with = "cursor_shape_name")]
     pub shape: CursorShape,
-    pub blinking: bool,
+    pub blink: CursorBlink,
     pub unfocused_hollow: bool,
     pub motion: CursorMotion,
+}
+
+/// How the cursor blinks, from alacritty's `[cursor]`.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct CursorBlink {
+    pub blinking: CursorBlinking,
+    /// One show or one hide, not a full cycle.
+    pub interval: Duration,
+    /// How long blinking runs before the cursor is left solid.  `ZERO` blinks
+    /// for as long as the window keeps focus.
+    pub timeout: Duration,
+}
+
+/// `[cursor] style.blinking`, mirroring alacritty's `CursorBlinking`.  A
+/// program can ask for a blinking cursor over DECSCUSR, and these four values
+/// say whether it gets to: `Never` and `Always` overrule it, `Off` and `On`
+/// only choose the state it starts in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub enum CursorBlinking {
+    Never,
+    #[default]
+    Off,
+    On,
+    Always,
+}
+
+impl CursorBlinking {
+    /// `Some` when the config refuses to let the program decide.
+    pub fn blinking_override(self) -> Option<bool> {
+        match self {
+            Self::Never => Some(false),
+            Self::Off | Self::On => None,
+            Self::Always => Some(true),
+        }
+    }
+
+    /// Whether the terminal starts out blinking, before any program asks.
+    pub fn starts_on(self) -> bool {
+        matches!(self, Self::On | Self::Always)
+    }
 }
 
 /// How the cursor gets from one cell to the next, from `[ui.cursor]`.  Its own
@@ -334,7 +374,7 @@ pub struct SelectionConfig {
 
 impl Config {
     pub fn cursor_style(&self) -> CursorStyle {
-        CursorStyle { shape: self.cursor.shape, blinking: self.cursor.blinking }
+        CursorStyle { shape: self.cursor.shape, blinking: self.cursor.blink.blinking.starts_on() }
     }
 
     pub fn profile(&self, name: &str) -> Option<&Profile> {
@@ -1597,10 +1637,16 @@ impl Default for CursorConfig {
     fn default() -> Self {
         Self {
             shape: CursorShape::Block,
-            blinking: false,
-            unfocused_hollow: true,
+            blink: CursorBlink::default(),
+            unfocused_hollow: RawCursor::default().unfocused_hollow,
             motion: CursorMotion::default(),
         }
+    }
+}
+
+impl Default for CursorBlink {
+    fn default() -> Self {
+        RawCursor::default().resolve_blink(CursorBlinking::default())
     }
 }
 
@@ -2258,26 +2304,49 @@ impl RawFontDelta {
     }
 }
 
-#[derive(Debug, Default, Deserialize, JsonSchema)]
+/// alacritty's floor on the blink interval, below which a cursor flickers
+/// rather than blinks.
+const MIN_BLINK_INTERVAL_MS: u64 = 10;
+
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawCursor {
     /// Cursor shape and blinking.  Older alacritty configs write just
     /// `style = "Block"` rather than `style.shape = "Block"`; both are
     /// accepted.
     style: Option<RawCursorStyle>,
-    /// Render the cursor as a hollow box when the window is not focused.
-    /// Accepted for alacritty compatibility: alacritree paints the same
-    /// cursor whether or not the window has focus, so the real alacritty
-    /// acts on this and nothing here does.
-    unfocused_hollow: Option<bool>,
-    /// Blink interval in milliseconds.  Accepted for alacritty
-    /// compatibility: alacritree does not blink the cursor, so the real
-    /// alacritty acts on this and nothing here does.
-    blink_interval: Option<u64>,
-    /// Seconds after which the cursor stops blinking; `0` never stops.
-    /// Accepted for alacritty compatibility: alacritree does not blink the
-    /// cursor, so the real alacritty acts on this and nothing here does.
-    blink_timeout: Option<u64>,
+    /// Render the cursor as a hollow box while the window is not focused.
+    unfocused_hollow: bool,
+    /// How long one show or one hide of the blink lasts, in milliseconds.
+    /// Anything under 10 is raised to 10, which is where alacritty stops
+    /// calling it a blink.
+    blink_interval: u64,
+    /// Seconds of blinking after which the cursor is left solid; `0` blinks
+    /// forever.  A timeout that would cut the first blink short is stretched
+    /// to one full show and hide.
+    blink_timeout: u8,
+}
+
+impl Default for RawCursor {
+    fn default() -> Self {
+        Self { style: None, unfocused_hollow: true, blink_interval: 750, blink_timeout: 5 }
+    }
+}
+
+impl RawCursor {
+    /// `blinking` comes from `style`, which is parsed separately because the
+    /// same key also carries the shape.
+    fn resolve_blink(&self, blinking: CursorBlinking) -> CursorBlink {
+        let interval = Duration::from_millis(self.blink_interval.max(MIN_BLINK_INTERVAL_MS));
+        CursorBlink {
+            blinking,
+            interval,
+            timeout: match self.blink_timeout {
+                0 => Duration::ZERO,
+                secs => Duration::from_secs(u64::from(secs)).max(interval * 2),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2291,8 +2360,9 @@ enum RawCursorStyle {
         /// `"Block"`, `"Underline"`, `"Beam"`, `"HollowBlock"` or `"Hidden"`.
         /// Lowercase spellings are accepted too.
         shape: Option<String>,
-        /// `"Never"`, `"Off"`, `"On"` or `"Always"`.  alacritree has no vi
-        /// mode, so `On` and `Always` both blink and the other two do not.
+        /// `"Never"`, `"Off"`, `"On"` or `"Always"`.  Lowercase spellings are
+        /// accepted too.  `Never` and `Always` overrule what the running
+        /// program asks for; `Off` and `On` only choose the starting state.
         blinking: Option<String>,
     },
 }
@@ -3898,11 +3968,10 @@ impl RawConfig {
 
         // ---- Cursor ----
         let mut cursor = config.cursor;
+        cursor.unfocused_hollow = self.cursor.unfocused_hollow;
+        cursor.blink = self.cursor.resolve_blink(cursor.blink.blinking);
         if let Some(style) = self.cursor.style {
             apply_cursor_style(&mut cursor, style);
-        }
-        if let Some(v) = self.cursor.unfocused_hollow {
-            cursor.unfocused_hollow = v;
         }
         cursor.motion = self.ui.cursor.resolve();
 
@@ -4043,7 +4112,16 @@ fn apply_cursor_style(cursor: &mut CursorConfig, style: RawCursorStyle) {
         };
     }
     if let Some(b) = blinking.as_deref() {
-        cursor.blinking = matches!(b, "On" | "on" | "Always" | "always");
+        cursor.blink.blinking = match b {
+            "Never" | "never" => CursorBlinking::Never,
+            "Off" | "off" => CursorBlinking::Off,
+            "On" | "on" => CursorBlinking::On,
+            "Always" | "always" => CursorBlinking::Always,
+            other => {
+                log::warn!("unknown cursor blinking: {other}");
+                cursor.blink.blinking
+            },
+        };
     }
 }
 
@@ -5469,6 +5547,70 @@ program = "second"
         assert!(set.animate);
         assert_eq!(set.duration, Duration::from_millis(250));
         assert_eq!(set.min_cells, 5.0);
+    }
+
+    #[test]
+    fn blinking_defaults_to_letting_the_program_decide() {
+        let stock = config_from("").cursor.blink;
+        assert_eq!(stock.blinking, CursorBlinking::Off);
+        assert_eq!(stock.blinking.blinking_override(), None);
+        assert!(!stock.blinking.starts_on());
+        assert_eq!(stock.interval, Duration::from_millis(750));
+        assert_eq!(stock.timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn each_blinking_spelling_resolves_to_its_override() {
+        for (written, blinking, over) in [
+            ("Never", CursorBlinking::Never, Some(false)),
+            ("off", CursorBlinking::Off, None),
+            ("On", CursorBlinking::On, None),
+            ("always", CursorBlinking::Always, Some(true)),
+        ] {
+            let got =
+                config_from(&format!("[cursor.style]\nblinking = \"{written}\"")).cursor.blink;
+            assert_eq!(got.blinking, blinking, "{written}");
+            assert_eq!(got.blinking.blinking_override(), over, "{written}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_blinking_value_leaves_the_default_alone() {
+        let got = config_from("[cursor.style]\nblinking = \"sometimes\"").cursor.blink;
+        assert_eq!(got.blinking, CursorBlinking::Off);
+    }
+
+    #[test]
+    fn a_bare_shape_leaves_blinking_to_the_program() {
+        let got = config_from("[cursor]\nstyle = \"Beam\"").cursor;
+        assert_eq!(got.shape, CursorShape::Beam);
+        assert_eq!(got.blink.blinking.blinking_override(), None);
+    }
+
+    #[test]
+    fn a_flickering_interval_is_raised_to_ten_milliseconds() {
+        let blink = config_from("[cursor]\nblink_interval = 1").cursor.blink;
+        assert_eq!(blink.interval, Duration::from_millis(10));
+    }
+
+    #[test]
+    fn a_zero_timeout_blinks_forever() {
+        let blink = config_from("[cursor]\nblink_timeout = 0").cursor.blink;
+        assert_eq!(blink.timeout, Duration::ZERO);
+    }
+
+    #[test]
+    fn a_timeout_shorter_than_one_blink_is_stretched_to_one() {
+        // A 4 s interval against a 1 s timeout would stop before the cursor
+        // had hidden once, so the timeout takes the full show-and-hide.
+        let blink = config_from("[cursor]\nblink_interval = 4000\nblink_timeout = 1").cursor.blink;
+        assert_eq!(blink.timeout, Duration::from_secs(8));
+    }
+
+    #[test]
+    fn unfocused_hollow_defaults_on_and_parses_off() {
+        assert!(config_from("").cursor.unfocused_hollow);
+        assert!(!config_from("[cursor]\nunfocused_hollow = false").cursor.unfocused_hollow);
     }
 
     #[test]

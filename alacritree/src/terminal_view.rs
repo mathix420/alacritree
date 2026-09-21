@@ -4,7 +4,7 @@ use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::search::Match;
 use alacritty_terminal::term::{Term, TermDamage, TermMode};
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape};
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, CursorStyle};
 use egui::{
     Color32, CursorIcon, Event, FontFamily, FontId, ImeEvent, Modifiers, MouseWheelUnit,
     PointerButton, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2,
@@ -15,7 +15,8 @@ use crate::clipboard::{self, Target};
 use crate::color_glyph::{CachedColorGlyph, ColorGlyphCache};
 use crate::colors::{TerminalColors, default_background, resolve, rgb_to_color32};
 use crate::config::{Config, Palette};
-use crate::cursor_anim::{self, Corners};
+use crate::cursor::anim::{Corners, within};
+use crate::cursor::{self};
 use crate::fonts::{BOLD_FAMILY, BOLD_ITALIC_FAMILY, ITALIC_FAMILY};
 use crate::glyph_cache::{Face, GlyphCache, MAX_EXTRA_CELLS, growth_offset, may_grow};
 use crate::grid_gl::{Frame as GridFrame, GpuGrid};
@@ -140,26 +141,36 @@ pub(crate) fn show(
     };
     // The guard is a temporary so it is dropped at the end of this statement:
     // nothing below may run while the terminal is locked.
+    let now = std::time::Instant::now();
+    // Ahead of the capture: whether a cursor is recorded at all depends on it.
+    // `viewport().focused` is `None` on platforms that don't report focus, and
+    // an unknown focus should not hollow out every cursor.
+    let cursor_shape = session.cursor.resolve(
+        &config.cursor,
+        cursor::Inputs {
+            shown: peek.mode.contains(TermMode::SHOW_CURSOR),
+            shape: peek.cursor_style.shape,
+            blinking: peek.cursor_style.blinking,
+            window_focused: ui.input(|i| i.viewport().focused).unwrap_or(true),
+            composing: ime.preedit().is_some(),
+        },
+        now,
+    );
     snapshot.capture(
         &mut session.term.lock(),
         config,
         session.id,
         peek.link.as_ref().map(|l| &l.bounds),
-        // The preedit overlay replaces the cursor while composing
-        // (alacritty hides it the same way, display/content.rs).
-        ime.preedit().is_some(),
+        cursor_shape,
     );
     // Between the capture and the paint that reads it: the glide is this
     // session's, and it needs the cell the capture just recorded.
-    let corners = session.cursor_anim.place(
-        &config.cursor.motion,
+    let smear = session.cursor.place(
+        &config.cursor,
         snapshot.cursor.as_ref().map(|c| (c.column as f32, c.row as f32)),
         snapshot.display_offset,
-        std::time::Instant::now(),
+        now,
     );
-    // A settled cursor is its own cell, and drawing a quad over the rect that
-    // already covers it would only put an antialiased edge around it.
-    let smear = corners.filter(|_| !session.cursor_anim.settled());
     match gpu.filter(|gpu| config.ui.gpu_grid && !gpu.unavailable()) {
         Some(gpu) => {
             paint_grid_gpu(
@@ -201,9 +212,9 @@ pub(crate) fn show(
     if let Some(cursor) = &snapshot.cursor {
         paint_cursor(&painter, rect, cursor, smear.as_ref(), cell_w, cell_h, &font_id);
     }
-    // Nothing else wakes egui while the cursor moves on its own.
-    if !session.cursor_anim.settled() {
-        ui.ctx().request_repaint();
+    // Nothing else wakes egui while the cursor moves or blinks on its own.
+    if let Some(after) = session.cursor.repaint_in() {
+        ui.ctx().request_repaint_after(after);
     }
 
     let preedit_caret = ime.preedit().map(|p| p.to_owned()).and_then(|p| {
@@ -270,6 +281,7 @@ fn dispatch_input(
                     // so the user sees their input — matches alacritty's
                     // on_terminal_input_start.
                     paste::on_terminal_input_start(session);
+                    session.cursor.typed(std::time::Instant::now());
                     crate::frame_log::keystroke_sent();
                     session.write(bytes);
                 },
@@ -331,6 +343,8 @@ fn pointer_owns_grid(
 /// keeps a burst of output from costing the frame one parse per handler.
 struct TermPeek {
     mode: TermMode,
+    /// Shape and blink the running program asked for over DECSCUSR.
+    cursor_style: CursorStyle,
     display_offset: i32,
     /// Link under the mouse pointer.  `None` when the pointer is outside the
     /// grid, when no link covers that cell, or when the pointer is driving a
@@ -362,7 +376,7 @@ fn peek_term(
         let (point, _) = cell_at_pos(pos, rect, cell_w, cell_h, cols, rows, display_offset);
         links::link_at(&term, point)
     });
-    TermPeek { mode: *term.mode(), display_offset, link }
+    TermPeek { mode: *term.mode(), cursor_style: term.cursor_style(), display_offset, link }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1086,7 +1100,7 @@ impl GridSnapshot {
         config: &Config,
         session: SessionId,
         link_bounds: Option<&Match>,
-        cursor_hidden: bool,
+        cursor_shape: Option<CursorShape>,
     ) {
         self.cursor = None;
         self.caret = None;
@@ -1159,10 +1173,7 @@ impl GridSnapshot {
         let in_view = cursor_row >= 0 && cursor_row < screen_lines as i32;
         self.caret = in_view.then_some((cursor_point.column.0, cursor_row));
 
-        let shape = cursor_shape(term);
-        if cursor_hidden || matches!(shape, CursorShape::Hidden) || !in_view {
-            return;
-        }
+        let Some(shape) = cursor_shape.filter(|_| in_view) else { return };
 
         let cell = &grid[Line(cursor_point.line.0)][cursor_point.column];
         let color = runtime_palette[alacritty_terminal::vte::ansi::NamedColor::Cursor]
@@ -1472,20 +1483,6 @@ fn paint_grid(
     }
 }
 
-/// The cursor shape the terminal wants drawn, mirroring alacritty's
-/// `RenderableCursor::new`.  `cursor_style()` reports the configured shape and
-/// never `Hidden`, so DECTCEM has to be read off the mode: full-screen apps
-/// hide the cursor while they repaint and leave it parked wherever their last
-/// write landed, and drawing it regardless puts a block in an arbitrary spot
-/// on top of their UI.
-fn cursor_shape(term: &Term<EventProxy<impl Repaint>>) -> CursorShape {
-    if term.mode().contains(TermMode::SHOW_CURSOR) {
-        term.cursor_style().shape
-    } else {
-        CursorShape::Hidden
-    }
-}
-
 fn is_selected(range: Option<&SelectionRange>, line: Line, column: Column) -> bool {
     range.is_some_and(|r| r.contains(Point::new(line, column)))
 }
@@ -1709,7 +1706,7 @@ fn paint_smear(
         _ => (0.0..1.0, 0.0..1.0),
     };
     let at = |u: f32, v: f32| {
-        let (col, row) = cursor_anim::within(corners, u, v);
+        let (col, row) = within(corners, u, v);
         Pos2::new(rect.min.x + col * cell_w, rect.min.y + row * cell_h)
     };
     let points =
@@ -2102,7 +2099,7 @@ mod tests {
         let mut term = term_running(b"\x1b[31mA\x1b[39m \x1b[31mB");
         let mut snapshot = GridSnapshot::new(&Config::default().palette);
 
-        snapshot.capture(&mut term, &Config::default(), 0, None, true);
+        snapshot.capture(&mut term, &Config::default(), 0, None, None);
 
         let (text, _) =
             snapshot.runs().find(|(text, _)| text.starts_with('A')).expect("a run holding 'A'");
@@ -2116,7 +2113,7 @@ mod tests {
         let mut term = term_running(b"hello");
         let mut snapshot = GridSnapshot::new(&Config::default().palette);
 
-        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+        snapshot.capture(&mut term, &Config::default(), 0, None, Some(CursorShape::Block));
 
         assert_eq!(snapshot.dirty_rows(), 0..24);
     }
@@ -2128,10 +2125,10 @@ mod tests {
     fn writing_one_line_dirties_only_that_line() {
         let mut term = term_running(b"first\r\nsecond");
         let mut snapshot = GridSnapshot::new(&Config::default().palette);
-        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+        snapshot.capture(&mut term, &Config::default(), 0, None, Some(CursorShape::Block));
 
         Processor::<StdSyncHandler>::new().advance(&mut term, b"!");
-        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+        snapshot.capture(&mut term, &Config::default(), 0, None, Some(CursorShape::Block));
 
         assert_eq!(snapshot.dirty_rows(), 1..2);
     }
@@ -2142,10 +2139,10 @@ mod tests {
     fn an_undamaged_row_keeps_its_text() {
         let mut term = term_running(b"first\r\nsecond");
         let mut snapshot = GridSnapshot::new(&Config::default().palette);
-        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+        snapshot.capture(&mut term, &Config::default(), 0, None, Some(CursorShape::Block));
 
         Processor::<StdSyncHandler>::new().advance(&mut term, b"!");
-        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+        snapshot.capture(&mut term, &Config::default(), 0, None, Some(CursorShape::Block));
 
         assert!(
             snapshot.runs().any(|(text, run)| run.row == 0 && text.starts_with("first")),
@@ -2159,10 +2156,10 @@ mod tests {
     fn switching_session_rewrites_every_row() {
         let mut term = term_running(b"first\r\nsecond");
         let mut snapshot = GridSnapshot::new(&Config::default().palette);
-        snapshot.capture(&mut term, &Config::default(), 7, None, false);
+        snapshot.capture(&mut term, &Config::default(), 7, None, Some(CursorShape::Block));
         Processor::<StdSyncHandler>::new().advance(&mut term, b"!");
 
-        snapshot.capture(&mut term, &Config::default(), 9, None, false);
+        snapshot.capture(&mut term, &Config::default(), 9, None, Some(CursorShape::Block));
 
         assert_eq!(snapshot.dirty_rows(), 0..24);
     }
@@ -2174,13 +2171,13 @@ mod tests {
     fn a_new_selection_dirties_the_rows_it_covers() {
         let mut term = term_running(b"first\r\nsecond\r\nthird\r\nfourth");
         let mut snapshot = GridSnapshot::new(&Config::default().palette);
-        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+        snapshot.capture(&mut term, &Config::default(), 0, None, Some(CursorShape::Block));
 
         let mut selection =
             Selection::new(SelectionType::Simple, Point::new(Line(1), Column(0)), Side::Left);
         selection.update(Point::new(Line(2), Column(3)), Side::Right);
         term.selection = Some(selection);
-        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+        snapshot.capture(&mut term, &Config::default(), 0, None, Some(CursorShape::Block));
 
         let dirty = snapshot.dirty_rows();
         assert!(dirty.start <= 1 && dirty.end >= 3, "selection rows 1..3 missing from {dirty:?}");
@@ -2193,10 +2190,10 @@ mod tests {
     fn only_the_damaged_rows_are_re_read_for_the_upload() {
         let mut term = term_running(b"first\r\nsecond\r\nthird");
         let mut snapshot = GridSnapshot::new(&Config::default().palette);
-        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+        snapshot.capture(&mut term, &Config::default(), 0, None, Some(CursorShape::Block));
 
         Processor::<StdSyncHandler>::new().advance(&mut term, b"\x1b[1;1Hone\x1b[3;1Hthree");
-        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+        snapshot.capture(&mut term, &Config::default(), 0, None, Some(CursorShape::Block));
 
         let read: Vec<&str> = snapshot
             .runs_in_rows(snapshot.damaged_rows().iter().copied())
@@ -2265,7 +2262,7 @@ mod tests {
         let mut term = term_running("\x1b[41m\u{4f60}\u{597d}".as_bytes());
         let mut snapshot = GridSnapshot::new(&Config::default().palette);
 
-        snapshot.capture(&mut term, &Config::default(), 0, None, true);
+        snapshot.capture(&mut term, &Config::default(), 0, None, None);
 
         let (text, _) = snapshot
             .runs()
@@ -2282,7 +2279,7 @@ mod tests {
         let mut term = term_running(b"\x1b[4;31mA\x1b[39m \x1b[31mB");
         let mut snapshot = GridSnapshot::new(&Config::default().palette);
 
-        snapshot.capture(&mut term, &Config::default(), 0, None, true);
+        snapshot.capture(&mut term, &Config::default(), 0, None, None);
 
         let (text, _) =
             snapshot.runs().find(|(text, _)| text.starts_with('A')).expect("a run holding 'A'");
@@ -2298,9 +2295,9 @@ mod tests {
         let mut term = term_running(b"\x1b[?25labc");
         let mut snapshot = GridSnapshot::new(&Config::default().palette);
 
-        snapshot.capture(&mut term, &Config::default(), 0, None, false);
+        snapshot.capture(&mut term, &Config::default(), 0, None, None);
 
-        assert!(snapshot.cursor.is_none(), "a hidden cursor was drawn");
+        assert!(snapshot.cursor.is_none(), "a cursor the caller did not resolve was drawn");
         assert_eq!(snapshot.caret, Some((3, 0)), "the caret lost the cursor cell");
         assert_eq!(
             cursor_cell_rect(
@@ -3301,32 +3298,32 @@ mod tests {
     }
 
     /// Full-screen apps hide the cursor with DECTCEM while they repaint, then
-    /// leave it parked wherever their last write landed.  Drawing it anyway
-    /// drops a block into an arbitrary spot on top of their UI.
+    /// leave it parked wherever their last write landed.  `cursor_style()`
+    /// never reports `Hidden`, so the mode is the only place that says so, and
+    /// it is what `show` reads before deciding to draw a cursor at all.
     #[test]
-    fn a_cursor_the_app_hid_is_not_drawn() {
+    fn an_app_that_hid_the_cursor_clears_show_cursor() {
         let term = term_running(b"\x1b[?25l\x1b[10;40Hrepainting");
 
-        assert_eq!(
-            cursor_shape(&term),
-            CursorShape::Hidden,
-            "the app asked for the cursor to be hidden, but it is still painted at {:?}",
+        assert!(
+            !term.mode().contains(TermMode::SHOW_CURSOR),
+            "the app asked for the cursor to be hidden, but it is still shown at {:?}",
             term.grid().cursor.point,
         );
     }
 
     #[test]
-    fn a_cursor_the_app_unhid_is_drawn_again() {
+    fn an_app_that_unhid_the_cursor_sets_show_cursor_again() {
         let term = term_running(b"\x1b[?25l\x1b[?25h");
 
-        assert_ne!(cursor_shape(&term), CursorShape::Hidden);
+        assert!(term.mode().contains(TermMode::SHOW_CURSOR));
     }
 
     #[test]
-    fn a_cursor_no_app_touched_is_drawn() {
+    fn a_terminal_no_app_touched_shows_its_cursor() {
         let term = term_running(b"$ ");
 
-        assert_ne!(cursor_shape(&term), CursorShape::Hidden);
+        assert!(term.mode().contains(TermMode::SHOW_CURSOR));
     }
 
     /// Two frames so egui's layer memory settles: areas register during a

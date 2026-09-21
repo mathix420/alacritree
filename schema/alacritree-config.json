@@ -280,14 +280,17 @@
     "RawCursor": {
       "properties": {
         "blink_interval": {
-          "description": "Blink interval in milliseconds.  Accepted for alacritty\ncompatibility: alacritree does not blink the cursor, so the real\nalacritty acts on this and nothing here does.",
+          "default": 750,
+          "description": "How long one show or one hide of the blink lasts, in milliseconds.\nAnything under 10 is raised to 10, which is where alacritty stops\ncalling it a blink.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "blink_timeout": {
-          "description": "Seconds after which the cursor stops blinking; `0` never stops.\nAccepted for alacritty compatibility: alacritree does not blink the\ncursor, so the real alacritty acts on this and nothing here does.",
-          "format": "uint64",
+          "default": 5,
+          "description": "Seconds of blinking after which the cursor is left solid; `0` blinks\nforever.  A timeout that would cut the first blink short is stretched\nto one full show and hide.",
+          "format": "uint8",
+          "maximum": 255,
           "minimum": 0,
           "type": "integer"
         },
@@ -300,7 +303,8 @@
           "description": "Cursor shape and blinking.  Older alacritty configs write just\n`style = \"Block\"` rather than `style.shape = \"Block\"`; both are\naccepted."
         },
         "unfocused_hollow": {
-          "description": "Render the cursor as a hollow box when the window is not focused.\nAccepted for alacritty compatibility: alacritree paints the same\ncursor whether or not the window has focus, so the real alacritty\nacts on this and nothing here does.",
+          "default": true,
+          "description": "Render the cursor as a hollow box while the window is not focused.",
           "type": "boolean"
         }
       },
@@ -316,7 +320,7 @@
           "description": "Shape and blinking together.",
           "properties": {
             "blinking": {
-              "description": "`\"Never\"`, `\"Off\"`, `\"On\"` or `\"Always\"`.  alacritree has no vi\nmode, so `On` and `Always` both blink and the other two do not.",
+              "description": "`\"Never\"`, `\"Off\"`, `\"On\"` or `\"Always\"`.  Lowercase spellings are\naccepted too.  `Never` and `Always` overrule what the running\nprogram asks for; `Off` and `On` only choose the starting state.",
               "type": "string"
             },
             "shape": {

@@ -15,10 +15,7 @@ RawBinding.command
 RawBinding.key
 RawBinding.mode
 RawBinding.mods
-RawCursor.blink_interval
-RawCursor.blink_timeout
 RawCursor.style
-RawCursor.unfocused_hollow
 RawCursorStyle.blinking
 RawCursorStyle.shape
 RawDebug.log_dir

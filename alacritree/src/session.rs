@@ -52,7 +52,12 @@ impl<R: Repaint> EventProxy<R> {
 /// PTY replies are what the asking program is blocked on until a frame drains
 /// them.
 fn carries_payload(event: &TermEvent) -> bool {
-    !matches!(event, TermEvent::Wakeup | TermEvent::MouseCursorDirty)
+    // `CursorBlinkingChange` is the same shape: the blink it announces is
+    // already on the cursor style the next frame reads anyway.
+    !matches!(
+        event,
+        TermEvent::Wakeup | TermEvent::MouseCursorDirty | TermEvent::CursorBlinkingChange
+    )
 }
 
 /// How long a background session's spinner frame may wait for the loop.
@@ -263,9 +268,8 @@ pub(crate) struct Session<R: Repaint> {
     /// Last grid cell reported to a mouse-tracking app, so pointer motion emits
     /// at most one report per cell crossed instead of one per pixel.
     pub last_report_cell: Option<Point>,
-    /// Where this session's cursor is drawn while it catches up with the cell
-    /// it is really in, under `[ui.cursor] animate`.
-    pub cursor_anim: crate::cursor_anim::CursorAnimation,
+    /// Whether this session's cursor is drawn, in what shape, and where.
+    pub cursor: crate::cursor::Cursor,
     /// Shell pid spawned for this PTY.  Used to walk to the foreground
     /// process group when identifying which agent is running.  None on
     /// platforms where we don't yet capture it.
@@ -634,7 +638,7 @@ impl<R: Repaint> Session<R> {
             pending_attention: None,
             accumulated_scroll: (0.0, 0.0),
             last_report_cell: None,
-            cursor_anim: Default::default(),
+            cursor: Default::default(),
             probe: ProbeHandle::new(None, None),
             wsl_probe: None,
             priority_job: None,
@@ -809,7 +813,7 @@ impl<R: Repaint> Session<R> {
             pending_attention: None,
             accumulated_scroll: (0.0, 0.0),
             last_report_cell: None,
-            cursor_anim: Default::default(),
+            cursor: Default::default(),
             probe: ProbeHandle::new(None, wsl_probe.clone()),
             wsl_probe,
             priority_job: None,
@@ -1431,7 +1435,7 @@ mod tests {
             pending_attention: None,
             accumulated_scroll: (0.0, 0.0),
             last_report_cell: None,
-            cursor_anim: Default::default(),
+            cursor: Default::default(),
             probe: ProbeHandle::new(None, None),
             wsl_probe: None,
             priority_job: None,

@@ -1,6 +1,16 @@
 {
   "cursor": {
-    "blinking": false,
+    "blink": {
+      "blinking": "Off",
+      "interval": {
+        "nanos": 750000000,
+        "secs": 0
+      },
+      "timeout": {
+        "nanos": 0,
+        "secs": 5
+      }
+    },
     "motion": {
       "animate": false,
       "duration": {
