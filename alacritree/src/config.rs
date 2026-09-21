@@ -409,6 +409,20 @@ pub struct Palette {
     pub draw_bold_with_bright: bool,
 }
 
+/// Which glyph set an agent's status mark draws from.  Both sets share the
+/// braille loader for working, and `[ui.icons]` overrides either one state
+/// at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
+#[serde(into = "&'static str")]
+#[strum(serialize_all = "snake_case")]
+pub enum StatusIndicators {
+    /// Circles told apart by fill, size and colour.
+    #[default]
+    Dots,
+    /// One distinct glyph per state.
+    Symbols,
+}
+
 /// When the sidebar's per-session `×` asks before killing the PTY.
 /// Confirmations otherwise exist only at worktree/app level, so the
 /// default keeps session close immediate.
@@ -868,16 +882,22 @@ pub(crate) const PRIVATE_GLYPHS: &[char] = &['\u{10FF00}', '\u{10FF01}'];
 
 baked_glyphs! {
     CHROME_GLYPHS:
-    /// Every recognized agent shares one status mark; identity belongs in the
-    /// tooltip and title instead of changing the sidebar's visual grammar.
-    DEFAULT_AGENT_ICON = "◇";
-    /// An agent held at a dialog it needs a human to answer.  Solid against
-    /// the idle diamond's outline, so the two read apart before the attention
-    /// color does any work.  Deliberately the codepoint
-    /// `DEFAULT_WORKTREE_MAIN_ICON` already carries: the two never share a
-    /// slot, and a new one would mean rebuilding the baked face for a shape
-    /// it already has.
-    DEFAULT_BLOCKED_ICON = "●";
+    /// Agent status marks.  Every recognized agent shares them; identity
+    /// belongs in the tooltip and title instead of changing the sidebar's
+    /// visual grammar.  Each codepoint is one the baked face already carries
+    /// for another icon, so the set costs no rebuild.
+    ///
+    /// Idle is the large empty circle and a ping the large filled one, in
+    /// both indicator sets, so neither shares a shape with anything else.
+    DEFAULT_IDLE_MARK = "◯";
+    DEFAULT_ATTENTION_MARK = "⬤";
+    /// The dots set: blocked and done share the filled circle and differ by
+    /// colour, and unknown is the small empty one.
+    DEFAULT_DOTS_FILLED_MARK = "●";
+    DEFAULT_DOTS_UNKNOWN_MARK = "○";
+    /// The symbols set, herdr's own shapes for these states.
+    DEFAULT_BLOCKED_SYMBOL = "×";
+    DEFAULT_DONE_SYMBOL = "✓";
     /// Action buttons.  Each takes a config key of its own; the glyphs are
     /// declared here because coverage is owed regardless of who names them.
     DEFAULT_ADD_ICON = "+";
@@ -903,13 +923,6 @@ baked_glyphs! {
     DEFAULT_DRAG_HANDLE_GLYPH = "⠿";
     #[cfg(test)]
     DEFAULT_CURSOR_BLOCK_GLYPH = "▌";
-    /// herdr's "working" mark in the symbol set it offers alongside its dots.
-    /// A harness-owned row paints the state its harness reports in that
-    /// harness's vocabulary, so the glyph ships even though no alacritree
-    /// default names it.  The rest of that vocabulary is `● ○ · × ✓`, which
-    /// the slices above already carry.
-    #[cfg(test)]
-    DEFAULT_HALF_CIRCLE_GLYPH = "◐";
 }
 
 /// What happens when the on-screen workspace stops having sessions, whether a
@@ -1171,6 +1184,14 @@ pub struct Icons<C = Rgb> {
     pub close_session: IconStyle<C>,
     pub refresh: IconStyle<C>,
     pub reorder: IconStyle<C>,
+    /// Agent status marks.  An unset glyph follows `[ui] status_indicators`.
+    pub agent_idle: IconStyle<C>,
+    /// Replaces the braille loader once it carries a glyph.
+    pub agent_working: IconStyle<C>,
+    pub agent_blocked: IconStyle<C>,
+    pub agent_done: IconStyle<C>,
+    pub agent_unknown: IconStyle<C>,
+    pub attention: IconStyle<C>,
 }
 
 impl<C: Copy> Icons<C> {
@@ -1199,6 +1220,12 @@ impl<C: Copy> Icons<C> {
             close_session: self.close_session.map_color(f),
             refresh: self.refresh.map_color(f),
             reorder: self.reorder.map_color(f),
+            agent_idle: self.agent_idle.map_color(f),
+            agent_working: self.agent_working.map_color(f),
+            agent_blocked: self.agent_blocked.map_color(f),
+            agent_done: self.agent_done.map_color(f),
+            agent_unknown: self.agent_unknown.map_color(f),
+            attention: self.attention.map_color(f),
         }
     }
 }
@@ -1394,6 +1421,8 @@ pub struct UiTheme {
     /// How long an attention trigger must survive without the session going
     /// back to work before it pings.  Zero pings on the trigger itself.
     pub attention_grace: Duration,
+    /// Which glyph set agent status marks draw from.
+    pub status_indicators: StatusIndicators,
     /// Ask before the sidebar's per-session `×` kills the PTY.
     pub confirm_session_close: ConfirmSessionClose,
     /// Ask before the sidebar's `×` detaches from a harness-managed pane, and
@@ -1524,6 +1553,7 @@ impl Default for UiTheme {
             sidebar_attention: None,
             notifications: true,
             attention_grace: Duration::ZERO,
+            status_indicators: StatusIndicators::Dots,
             confirm_session_close: ConfirmSessionClose::Never,
             confirm_session_detach: true,
             sessions_filter_counts_detached: false,
@@ -2771,6 +2801,30 @@ struct RawIcons {
     refresh: RawIconStyle,
     /// The drag handle a row is reordered by.
     reorder: RawIconStyle,
+    /// An agent waiting with nothing in flight.  Unset follows
+    /// `[ui] status_indicators`: `◯` in both sets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_idle: Option<RawIconStyle>,
+    /// An agent at work.  Unset draws the braille loader; a glyph replaces
+    /// it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_working: Option<RawIconStyle>,
+    /// An agent held at a dialog it needs a human to answer.  Unset follows
+    /// `[ui] status_indicators`: `●` for dots, `×` for symbols.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_blocked: Option<RawIconStyle>,
+    /// An agent that finished a turn while nobody was looking.  Unset follows
+    /// `[ui] status_indicators`: `●` for dots, `✓` for symbols.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_done: Option<RawIconStyle>,
+    /// An agent nothing could read a state from.  Unset follows
+    /// `[ui] status_indicators`: `○` for dots, `?` for symbols.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_unknown: Option<RawIconStyle>,
+    /// A session that rang while nobody was looking.  Unset draws `⬤` in
+    /// both sets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attention: Option<RawIconStyle>,
 }
 
 /// A default icon is the glyph alone — no colour, no weight, no size.
@@ -2805,6 +2859,12 @@ impl Default for RawIcons {
             close_session: raw_glyph(DEFAULT_CLOSE_ICON),
             refresh: raw_glyph(DEFAULT_REFRESH_ICON),
             reorder: raw_glyph(DEFAULT_REORDER_ICON),
+            agent_idle: None,
+            agent_working: None,
+            agent_blocked: None,
+            agent_done: None,
+            agent_unknown: None,
+            attention: None,
         }
     }
 }
@@ -2834,6 +2894,12 @@ fn build_icons(raw: RawIcons) -> Icons {
         close_session: raw.close_session.into(),
         refresh: raw.refresh.into(),
         reorder: raw.reorder.into(),
+        agent_idle: raw.agent_idle.map(Into::into).unwrap_or_default(),
+        agent_working: raw.agent_working.map(Into::into).unwrap_or_default(),
+        agent_blocked: raw.agent_blocked.map(Into::into).unwrap_or_default(),
+        agent_done: raw.agent_done.map(Into::into).unwrap_or_default(),
+        agent_unknown: raw.agent_unknown.map(Into::into).unwrap_or_default(),
+        attention: raw.attention.map(Into::into).unwrap_or_default(),
     }
 }
 
@@ -3512,6 +3578,10 @@ struct RawUi {
     /// Grace window in milliseconds before an attention trigger pings; a
     /// session that resumes work inside it swallows the ping.
     attention_grace_ms: u64,
+    /// Glyph set for agent status marks, on native and multiplexer rows
+    /// alike: "dots" | "symbols".  Dots tells states apart by fill, size and
+    /// colour, symbols by shape.  `[ui.icons]` overrides one state at a time.
+    status_indicators: ClosedSet<StatusIndicators>,
     /// When the sidebar × on a session row asks before killing the PTY:
     /// "never" | "busy" | "always".
     confirm_session_close: ClosedSet<ConfirmSessionClose>,
@@ -3645,6 +3715,7 @@ impl Default for RawUi {
             sidebar_attention: None,
             notifications: true,
             attention_grace_ms: 0,
+            status_indicators: ClosedSet::default(),
             confirm_session_close: ClosedSet::default(),
             confirm_session_detach: true,
             sessions_filter_counts_detached: false,
@@ -3875,6 +3946,7 @@ impl RawConfig {
             sidebar_attention: self.ui.sidebar_attention.map(|v| v.0),
             notifications: self.ui.notifications,
             attention_grace: Duration::from_millis(self.ui.attention_grace_ms),
+            status_indicators: self.ui.status_indicators.get(),
             confirm_session_close: self.ui.confirm_session_close.get(),
             confirm_session_detach: self.ui.confirm_session_detach,
             sessions_filter_counts_detached: self.ui.sessions_filter_counts_detached,
@@ -5856,13 +5928,14 @@ program = "second"
     #[test]
     fn the_chrome_slice_carries_the_action_and_decorative_glyphs() {
         let chrome: Vec<&str> = CHROME_GLYPHS.iter().map(|g| g.as_str()).collect();
-        for g in ["◇", "+", "×", "↻", "⇅", "·", "—", "•", "…", "↓", "⠿", "▌", "◐"]
-        {
+        for g in ["+", "×", "↻", "⇅", "·", "—", "•", "…", "↓", "⠿", "▌"] {
             assert!(chrome.contains(&g), "{g} is missing from CHROME_GLYPHS");
         }
-        // The blocked mark shares `DEFAULT_WORKTREE_MAIN_ICON`'s codepoint, so
-        // the icon slice's own multiset check cannot notice it going missing.
-        assert!(chrome.contains(&"●"), "● is missing from CHROME_GLYPHS");
+        // The status marks share codepoints with icons in the other slice, so
+        // that slice's own multiset check cannot notice one going missing.
+        for g in ["◯", "⬤", "●", "○", "✓"] {
+            assert!(chrome.contains(&g), "{g} is missing from CHROME_GLYPHS");
+        }
     }
 
     /// A derived `Default` on a bare `bool` would make this false and silently

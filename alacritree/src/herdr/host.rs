@@ -8,15 +8,15 @@ use serde_json::{Value, json};
 
 use super::view::{HerdrViewAction, HerdrViewFocus, HerdrViewSync, ViewInputs};
 use super::{
-    EndpointCache, Endpoints, Indicators, Listing, Settings, attaches_directly, cli, focus_args,
-    focus_pane, pane_key, program, unattached,
+    EndpointCache, Endpoints, Listing, Settings, attaches_directly, cli, focus_args, focus_pane,
+    pane_key, program, unattached,
 };
 use crate::config::{BakedGlyph, DEFAULT_HERDR_ICON, HerdrConfig, IconStyle};
 use crate::jobs;
 use crate::multiplexer::{
-    AttachAnswer, AttachRequest, CreateAnswer, CreateRequest, CreatedPane, HarnessMark, Launch,
-    ListedPane, Managed, MultiplexerKind, MultiplexerSession, Pane, PaneKey, PaneStatus,
-    PaneTarget, Side, StateTone, ViewState, ViewStep,
+    AttachAnswer, AttachRequest, CreateAnswer, CreateRequest, CreatedPane, Launch, ListedPane,
+    Managed, MultiplexerKind, MultiplexerSession, Pane, PaneKey, PaneTarget, Side, ViewState,
+    ViewStep,
 };
 use crate::session::SessionId;
 
@@ -276,14 +276,10 @@ impl MultiplexerSession for Herdr {
             multiplexer: MultiplexerKind::Herdr,
             detach: settings.detach.clone(),
             shared_view: !self.attaches_directly(side, pane.is_none_or(|a| a.status.is_some())),
-            mark: pane.and_then(|a| a.status).map(|status| mark(status, settings.indicators)),
+            status: pane.and_then(|a| a.status),
             kind,
             title,
         }
-    }
-
-    fn mark(&self, side: &Side, status: PaneStatus) -> HarnessMark {
-        mark(status, self.settings(side).indicators)
     }
 
     fn attaches_directly(&self, side: &Side, has_agent: bool) -> bool {
@@ -475,29 +471,6 @@ impl MultiplexerSession for Herdr {
     }
 }
 
-/// herdr's state vocabulary, taken from its own `state_icon_symbol` and
-/// `state_label_color`.  Which of the two sets applies is herdr's `[ui]
-/// status_indicators`, so a user who picked one in herdr gets it here too.
-///
-/// `done` is `idle` on herdr's internal axis and a status of its own over its
-/// API, which is the axis alacritree reads, so the two arrive already
-/// distinguished.
-fn mark(status: PaneStatus, indicators: Indicators) -> HarnessMark {
-    use Indicators::{Dots, Symbols};
-    use PaneStatus::{Blocked, Done, Idle, Unknown, Working};
-    let (glyph, tone) = match (indicators, status) {
-        (_, Idle) => ("○", StateTone::Idle),
-        (_, Unknown) => ("·", StateTone::Unclear),
-        (Dots, Blocked) => ("●", StateTone::Blocked),
-        (Dots, Working) => ("●", StateTone::Working),
-        (Dots, Done) => ("●", StateTone::Done),
-        (Symbols, Blocked) => ("×", StateTone::Blocked),
-        (Symbols, Working) => ("◐", StateTone::Working),
-        (Symbols, Done) => ("✓", StateTone::Done),
-    };
-    HarnessMark { glyph, tone, label: status.label() }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
@@ -609,53 +582,6 @@ mod tests {
         assert!(second_rx.try_recv().is_err());
     }
 
-    /// herdr distinguishes four live states and says so on its own panes.
-    /// Collapsing any pair onto one mark would make the sidebar say less
-    /// about a pane than the window it came from.
-    #[test]
-    fn herdr_marks_keep_its_four_states_apart() {
-        for set in [Indicators::Dots, Indicators::Symbols] {
-            let marks: Vec<HarnessMark> =
-                [PaneStatus::Blocked, PaneStatus::Working, PaneStatus::Done, PaneStatus::Idle]
-                    .into_iter()
-                    .map(|status| mark(status, set))
-                    .collect();
-            for (i, a) in marks.iter().enumerate() {
-                for b in &marks[i + 1..] {
-                    assert_ne!(a, b, "{set:?} draws two states the same");
-                }
-            }
-        }
-    }
-
-    /// Taken from herdr's own `state_icon_symbol`, so a pane carries one mark
-    /// whether it is read in herdr or in the sidebar.
-    #[test]
-    fn herdr_marks_are_the_ones_herdr_paints() {
-        let dots = |status| mark(status, Indicators::Dots).glyph;
-        assert_eq!(dots(PaneStatus::Blocked), "●");
-        assert_eq!(dots(PaneStatus::Working), "●");
-        assert_eq!(dots(PaneStatus::Done), "●");
-        assert_eq!(dots(PaneStatus::Idle), "○");
-
-        let symbols = |status| mark(status, Indicators::Symbols).glyph;
-        assert_eq!(symbols(PaneStatus::Blocked), "×");
-        assert_eq!(symbols(PaneStatus::Working), "◐");
-        assert_eq!(symbols(PaneStatus::Done), "✓");
-        assert_eq!(symbols(PaneStatus::Idle), "○");
-    }
-
-    /// A status alacritree does not recognise is herdr declining to say, and
-    /// the row says that rather than claiming the agent is idle.
-    #[test]
-    fn an_unknown_herdr_status_is_drawn_as_no_reading() {
-        for set in [Indicators::Dots, Indicators::Symbols] {
-            let mark = mark(PaneStatus::Unknown, set);
-            assert_eq!(mark.glyph, "·");
-            assert_eq!(mark.tone, StateTone::Unclear);
-        }
-    }
-
     /// A created pane runs a shell, and the displayed listing drops a pane
     /// with no agent in it unless panes are shown.  Coming back to that pane's
     /// session has to find its tab through the side's full listing, or herdr
@@ -695,6 +621,6 @@ mod tests {
         herdr.caches_mut_for_test().push(cache);
         let managed = herdr.managed(&side, None);
         assert_eq!(managed.detach.as_deref(), Some("Ctrl+B q"));
-        assert_eq!((managed.mark, managed.kind, managed.title), (None, None, None));
+        assert_eq!((managed.status, managed.kind, managed.title), (None, None, None));
     }
 }

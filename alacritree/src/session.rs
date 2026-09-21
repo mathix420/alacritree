@@ -142,14 +142,18 @@ pub(crate) enum SessionKind {
 }
 
 /// What an agent is doing right now.  Mutually exclusive and recomputed from
-/// whatever signal the session has, so nothing here latches — the flag that
-/// does, `Session::needs_attention`, is a separate axis and coexists with all
-/// three.
+/// whatever signal the session has, so nothing here latches.  The two flags
+/// that do, `Session::done` and `Session::needs_attention`, are a separate
+/// axis; [`ShownState`] folds them into the one mark a row draws.
 ///
 /// Ordered by how much a state wants a human, which is what an aggregate row
 /// ranks by when several sessions report at once.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum LiveState {
+    /// Something says an agent is here, but nothing could say what it is
+    /// doing: the title carries an agent's glyph and the process probe had
+    /// no answer.
+    Unknown,
     /// Present and waiting on you, with nothing in flight.
     #[default]
     Idle,
@@ -186,9 +190,67 @@ impl LiveState {
     /// does.
     pub(crate) fn label(self) -> &'static str {
         match self {
+            Self::Unknown => "unknown",
             Self::Idle => "idle",
             Self::Working => "working",
             Self::Blocked => "blocked",
+        }
+    }
+}
+
+/// The one mark a status slot draws: the live state and the two latches,
+/// folded.  Ordered quietest first, so the loudest thing true of a session is
+/// the `max`.  A latch that a louder state hides stays set, and shows once
+/// that state clears unless the user looks first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ShownState {
+    Unknown,
+    Idle,
+    Working,
+    /// The terminal rang while nobody was looking.
+    Pinged,
+    /// The agent finished a turn while nobody was looking.
+    Done,
+    Blocked,
+}
+
+impl ShownState {
+    /// `None` only for a plain shell with nothing latched.  A shell can be
+    /// pinged, but `done` belongs to an agent's turn, so it needs `live`.
+    pub(crate) fn of(live: Option<LiveState>, done: bool, pinged: bool) -> Option<Self> {
+        let done = (done && live.is_some()).then_some(Self::Done);
+        let pinged = pinged.then_some(Self::Pinged);
+        [live.map(Self::from), done, pinged].into_iter().flatten().max()
+    }
+
+    /// The states that want a human: what the attention filter keeps and
+    /// what a workspace row lifts above its active session's own reading.
+    pub(crate) fn wants_attention(self) -> bool {
+        self >= Self::Pinged
+    }
+}
+
+/// A multiplexer latches `done` on its own side, so its status maps onto the
+/// shown states directly.  `unknown` is the multiplexer declining to say.
+impl From<PaneStatus> for ShownState {
+    fn from(status: PaneStatus) -> Self {
+        match status {
+            PaneStatus::Idle => Self::Idle,
+            PaneStatus::Working => Self::Working,
+            PaneStatus::Blocked => Self::Blocked,
+            PaneStatus::Done => Self::Done,
+            PaneStatus::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<LiveState> for ShownState {
+    fn from(live: LiveState) -> Self {
+        match live {
+            LiveState::Unknown => Self::Unknown,
+            LiveState::Idle => Self::Idle,
+            LiveState::Working => Self::Working,
+            LiveState::Blocked => Self::Blocked,
         }
     }
 }
@@ -256,11 +318,16 @@ pub(crate) struct Session<R: Repaint> {
     pub term: Arc<FairMutex<Term<EventProxy<R>>>>,
     pub events: mpsc::Receiver<TermEvent>,
     pub scratchpad: Option<scratchpad::Editor>,
-    /// Latched attention flag, cleared when the user views this session.
+    /// Latched ping: the terminal rang while the user was not looking.
+    /// Cleared when the user views this session.
     pub needs_attention: bool,
-    /// When a not-yet-surfaced attention trigger arrived.  `None` once it
-    /// fires, cancels, or the user views the session.
-    pub pending_attention: Option<Instant>,
+    /// Latched finish: the agent's spinner stopped while the user was not
+    /// looking.  Cleared when the user views this session or the agent goes
+    /// back to work.
+    pub done: bool,
+    /// Triggers not yet surfaced.  `None` once they fire, cancel, or the user
+    /// views the session.
+    pub pending_attention: Option<PendingAttention>,
     /// Sub-cell wheel residue (logical points), retained across frames so that
     /// trackpad pixel-deltas accumulate into whole-line scrolls instead of
     /// being dropped when each frame's delta is smaller than a cell.
@@ -322,9 +389,10 @@ pub(crate) struct ScreenSnapshot {
 
 #[derive(Default)]
 pub(crate) struct DrainOutcome {
-    /// Set if any event in this batch warrants flagging the session: BEL, or
-    /// a title transitioning out of a spinner state.
-    pub attention: bool,
+    /// A title went from a spinner to a plain one: the agent finished a turn.
+    pub finished: bool,
+    /// The terminal rang (BEL).
+    pub rang: bool,
     /// Text the app copied with OSC 52.  Carried out to the caller rather than
     /// written here so the drain — which runs once per frame for every session
     /// — stays free of OS clipboard access.
@@ -371,6 +439,39 @@ fn is_spinner_title(title: &str) -> bool {
     })
 }
 
+/// Triggers that arrived while the user was not looking, held through the
+/// grace window before they latch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingAttention {
+    pub since: Instant,
+    pub finished: bool,
+    pub rang: bool,
+}
+
+impl PendingAttention {
+    /// Folds one frame's triggers into what is already held.  The earliest
+    /// arrival is kept, so a stream of bells cannot keep restarting the grace
+    /// window.
+    pub(crate) fn merge(
+        held: Option<Self>,
+        finished: bool,
+        rang: bool,
+        now: Instant,
+    ) -> Option<Self> {
+        if !finished && !rang {
+            return held;
+        }
+        Some(match held {
+            Some(held) => Self {
+                since: held.since,
+                finished: held.finished || finished,
+                rang: held.rang || rang,
+            },
+            None => Self { since: now, finished, rang },
+        })
+    }
+}
+
 /// Outcome of polling a pending attention trigger.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum AttentionVerdict {
@@ -378,26 +479,27 @@ pub(crate) enum AttentionVerdict {
     Fire,
     /// Still inside the grace window; poll again after the returned delay.
     Wait(Duration),
-    /// The session went back to work — drop the trigger without notifying.
+    /// The session went back to work, so drop the trigger without notifying.
     Cancel,
 }
 
 /// Debounce for attention triggers.  Agent CLIs driven by an orchestrator
 /// (e.g. Claude Code running a multi-task workflow) ring BEL and drop their
-/// spinner title at every task boundary, then resume on their own — an
-/// immediate ping per boundary is noise.  A trigger only fires if the title
-/// stays out of its spinner state for the whole grace window.  Zero grace
-/// disables the debounce and fires on the trigger frame, spinner or not.
+/// spinner title at every task boundary, then resume on their own, so an
+/// immediate ping per boundary is noise.  A trigger only fires if the session
+/// stays out of `Working` for the whole grace window.  `Blocked` does not
+/// cancel: a dialog waiting on the user is a reason to ping, not a sign of
+/// work.  Zero grace disables the debounce and fires on the trigger frame.
 pub(crate) fn poll_attention_debounce(
     since: Instant,
     now: Instant,
-    title: &str,
+    live: Option<LiveState>,
     grace: Duration,
 ) -> AttentionVerdict {
     if grace.is_zero() {
         return AttentionVerdict::Fire;
     }
-    if is_spinner_title(title) {
+    if live == Some(LiveState::Working) {
         return AttentionVerdict::Cancel;
     }
     let elapsed = now.saturating_duration_since(since);
@@ -424,11 +526,21 @@ fn title_decorative_glyph(title: &str) -> Option<char> {
     Some(first)
 }
 
-fn session_activity(agent_name: Option<&'static str>, title: &str) -> SessionActivity {
+/// `probe_answered` separates "the probe found no agent" from "nobody could
+/// look": a decorative title that no probe could confirm is an agent in an
+/// unknown state rather than an idle one.
+fn session_activity(
+    agent_name: Option<&'static str>,
+    title: &str,
+    probe_answered: bool,
+) -> SessionActivity {
     if is_spinner_title(title) {
         SessionActivity::agent(agent_name, LiveState::Working)
-    } else if agent_name.is_some() || title_decorative_glyph(title).is_some() {
+    } else if agent_name.is_some() {
         SessionActivity::agent(agent_name, LiveState::Idle)
+    } else if title_decorative_glyph(title).is_some() {
+        let live = if probe_answered { LiveState::Idle } else { LiveState::Unknown };
+        SessionActivity::agent(None, live)
     } else {
         SessionActivity::Shell
     }
@@ -635,6 +747,7 @@ impl<R: Repaint> Session<R> {
             events,
             scratchpad: Some(editor),
             needs_attention: false,
+            done: false,
             pending_attention: None,
             accumulated_scroll: (0.0, 0.0),
             last_report_cell: None,
@@ -810,6 +923,7 @@ impl<R: Repaint> Session<R> {
             events,
             scratchpad: None,
             needs_attention: false,
+            done: false,
             pending_attention: None,
             accumulated_scroll: (0.0, 0.0),
             last_report_cell: None,
@@ -900,6 +1014,13 @@ impl<R: Repaint> Session<R> {
     /// Pull every pending event out of the PTY channel.  Called once per frame
     /// for every session — including background ones — so bells, title
     /// changes, and child-exits from non-visible sessions don't pile up.
+    /// Hands the session an event as if its terminal had raised it, for a
+    /// test about what the app does with the drained result.
+    #[cfg(test)]
+    pub(crate) fn inject_for_test(&self, event: TermEvent) {
+        self.proxy.send_event(event);
+    }
+
     pub(crate) fn drain_events(&mut self, palette: &Palette) -> DrainOutcome {
         let mut outcome = DrainOutcome::default();
         // Derived rather than stored: a `title_pinned` field set at spawn is a
@@ -1016,7 +1137,8 @@ impl<R: Repaint> Session<R> {
         if self.scratchpad.is_some() {
             return SessionActivity::Shell;
         }
-        session_activity(self.process_agent_name(), &self.title)
+        let signals = self.probe.signals();
+        session_activity(signals.agent, &self.title, signals.answered)
     }
 
     /// A session "looks busy" when a process is running in the terminal
@@ -1030,10 +1152,6 @@ impl<R: Repaint> Session<R> {
         }
         let signals = self.probe.signals();
         signals.foreground_job || looks_busy(signals.agent, &self.title)
-    }
-
-    fn process_agent_name(&self) -> Option<&'static str> {
-        self.probe.signals().agent
     }
 
     /// Whether a split-managing TUI (vim, tmux) is running in this terminal
@@ -1144,9 +1262,9 @@ fn apply_term_event(
         TermEvent::Title(t) if !pinned => {
             // A spinner-shaped title transitioning to a non-spinner one
             // is how Claude Code (and similar tools that don't ring
-            // BEL) signal "done — your turn".  Treat it like a bell.
+            // BEL) signal "done, your turn".
             if is_spinner_title(title) && !is_spinner_title(&t) {
-                outcome.attention = true;
+                outcome.finished = true;
             }
             *title = t;
         },
@@ -1154,7 +1272,7 @@ fn apply_term_event(
             *exit_status = Some(status);
             outcome.exited = true;
         },
-        TermEvent::Bell => outcome.attention = true,
+        TermEvent::Bell => outcome.rang = true,
         // OSC 52.  Apps that copy this way (Claude Code, tmux, vim) get no
         // acknowledgement, so dropping it leaves them reporting a successful
         // copy while the system clipboard keeps its previous contents.
@@ -1432,6 +1550,7 @@ mod tests {
             events,
             scratchpad: None,
             needs_attention: false,
+            done: false,
             pending_attention: None,
             accumulated_scroll: (0.0, 0.0),
             last_report_cell: None,
@@ -1512,7 +1631,7 @@ mod tests {
             &mut outcome,
         );
 
-        assert!(outcome.attention);
+        assert!(outcome.rang);
         assert_eq!(exit_status, Some(status));
         assert_eq!(title, "diff: src/app.rs");
     }
@@ -1684,20 +1803,32 @@ mod tests {
     fn zero_grace_fires_on_the_trigger_frame() {
         let now = Instant::now();
         assert_eq!(
-            poll_attention_debounce(now, now, "⠋ working", Duration::ZERO),
+            poll_attention_debounce(now, now, Some(LiveState::Working), Duration::ZERO),
             AttentionVerdict::Fire
         );
     }
 
-    /// An orchestrated agent that resumes after a task boundary brings its
-    /// spinner title back — that resumption is what must eat the ping.
+    /// An orchestrated agent that resumes after a task boundary goes back to
+    /// work, and that resumption is what must eat the ping.
     #[test]
-    fn a_returning_spinner_cancels_a_pending_trigger() {
+    fn going_back_to_work_cancels_a_pending_trigger() {
         let since = Instant::now();
         let grace = Duration::from_secs(2);
         assert_eq!(
-            poll_attention_debounce(since, since + grace, "⠋ working", grace),
+            poll_attention_debounce(since, since + grace, Some(LiveState::Working), grace),
             AttentionVerdict::Cancel
+        );
+    }
+
+    /// A dialog waiting on the user is the reason to ping, not a sign of
+    /// work, so it lets the trigger through.
+    #[test]
+    fn a_blocked_session_does_not_cancel_a_pending_trigger() {
+        let since = Instant::now();
+        let grace = Duration::from_secs(2);
+        assert_eq!(
+            poll_attention_debounce(since, since + grace, Some(LiveState::Blocked), grace),
+            AttentionVerdict::Fire
         );
     }
 
@@ -1709,11 +1840,11 @@ mod tests {
         let since = Instant::now();
         let grace = Duration::from_secs(2);
         assert_eq!(
-            poll_attention_debounce(since, since + Duration::from_secs(1), "~/repo", grace),
+            poll_attention_debounce(since, since + Duration::from_secs(1), None, grace),
             AttentionVerdict::Wait(Duration::from_secs(1))
         );
         assert_eq!(
-            poll_attention_debounce(since, since + grace, "~/repo", grace),
+            poll_attention_debounce(since, since + grace, None, grace),
             AttentionVerdict::Fire
         );
     }
@@ -2134,32 +2265,125 @@ mod tests {
         assert_eq!(LiveState::Idle.label(), "idle");
         assert_eq!(LiveState::Working.label(), "working");
         assert_eq!(LiveState::Blocked.label(), "blocked");
+        assert_eq!(LiveState::Unknown.label(), "unknown");
+    }
+
+    /// One mark per row, the loudest thing true of the session.  A latch
+    /// hidden by a louder state is still there once that state clears.
+    #[test]
+    fn shown_state_ranks_blocked_then_done_then_pinged() {
+        use LiveState::{Blocked, Idle, Unknown, Working};
+        let of = ShownState::of;
+        assert_eq!(of(Some(Blocked), true, true), Some(ShownState::Blocked));
+        assert_eq!(of(Some(Idle), true, true), Some(ShownState::Done));
+        assert_eq!(of(Some(Working), false, true), Some(ShownState::Pinged));
+        assert_eq!(of(Some(Idle), false, true), Some(ShownState::Pinged));
+        assert_eq!(of(Some(Working), false, false), Some(ShownState::Working));
+        assert_eq!(of(Some(Idle), false, false), Some(ShownState::Idle));
+        assert_eq!(of(Some(Unknown), false, false), Some(ShownState::Unknown));
+        assert_eq!(of(Some(Unknown), false, true), Some(ShownState::Pinged));
+    }
+
+    /// A finished turn belongs to an agent, so a plain shell never shows
+    /// done.  It can still be pinged.
+    #[test]
+    fn a_shell_shows_only_a_ping() {
+        assert_eq!(ShownState::of(None, false, false), None);
+        assert_eq!(ShownState::of(None, true, false), None);
+        assert_eq!(ShownState::of(None, true, true), Some(ShownState::Pinged));
+    }
+
+    /// The attention filter keeps what wants a human and nothing quieter.
+    #[test]
+    fn blocked_done_and_pinged_want_attention() {
+        assert!(ShownState::Blocked.wants_attention());
+        assert!(ShownState::Done.wants_attention());
+        assert!(ShownState::Pinged.wants_attention());
+        assert!(!ShownState::Working.wants_attention());
+        assert!(!ShownState::Idle.wants_attention());
+        assert!(!ShownState::Unknown.wants_attention());
+    }
+
+    /// A spinner stopping is a finished turn and a bell is a ring: the two
+    /// latch different flags, so each has to arrive on its own.
+    #[test]
+    fn a_settling_title_finishes_and_a_bell_rings() {
+        let mut title = "⠋ working".to_owned();
+        let mut exit_status = None;
+        let mut outcome = DrainOutcome::default();
+        apply_term_event(
+            TermEvent::Title("✳ done".into()),
+            &mut title,
+            false,
+            &mut exit_status,
+            &mut outcome,
+        );
+        assert!(outcome.finished);
+        assert!(!outcome.rang);
+
+        let mut outcome = DrainOutcome::default();
+        apply_term_event(TermEvent::Bell, &mut title, false, &mut exit_status, &mut outcome);
+        assert!(outcome.rang);
+        assert!(!outcome.finished);
+    }
+
+    /// Triggers held through the grace window keep their first arrival, so a
+    /// stream of bells cannot restart the wait, and gather every kind seen.
+    #[test]
+    fn pending_triggers_keep_the_first_arrival_and_every_kind() {
+        let first = Instant::now();
+        let later = first + Duration::from_secs(1);
+        let held = PendingAttention::merge(None, true, false, first);
+        assert_eq!(held, Some(PendingAttention { since: first, finished: true, rang: false }));
+        let held = PendingAttention::merge(held, false, true, later);
+        assert_eq!(held, Some(PendingAttention { since: first, finished: true, rang: true }));
+        assert_eq!(PendingAttention::merge(None, false, false, later), None);
     }
 
     #[test]
     fn session_activity_uses_one_cross_agent_status_set() {
-        assert_eq!(session_activity(None, "zsh"), SessionActivity::Shell);
+        assert_eq!(session_activity(None, "zsh", true), SessionActivity::Shell);
         assert_eq!(
-            session_activity(Some("claude"), "✳ waiting"),
+            session_activity(Some("claude"), "✳ waiting", true),
             SessionActivity::agent(Some("claude"), LiveState::Idle)
         );
         assert_eq!(
-            session_activity(None, "✦ waiting"),
+            session_activity(None, "✦ waiting", true),
             SessionActivity::agent(None, LiveState::Idle)
         );
         assert_eq!(
-            session_activity(Some("codex"), "⠋ working"),
+            session_activity(Some("codex"), "⠋ working", true),
             SessionActivity::agent(Some("codex"), LiveState::Working)
         );
         assert_eq!(
-            session_activity(None, "⠋ working"),
+            session_activity(None, "⠋ working", true),
             SessionActivity::agent(None, LiveState::Working)
         );
         // No native signal reaches inside a pane, so nothing here reports
         // blocked; herdr is the only source of that state today.
         for title in ["zsh", "✳ waiting", "⠋ working", "✦ Allow this edit? (y/n)"] {
-            assert_ne!(session_activity(None, title).live(), Some(LiveState::Blocked));
+            assert_ne!(session_activity(None, title, true).live(), Some(LiveState::Blocked));
         }
+    }
+
+    /// An agent's title glyph that no probe could confirm is an agent in an
+    /// unknown state.  Once the probe answers without finding one, the title
+    /// alone reads idle as before, and a spinner is working either way.
+    #[test]
+    fn an_unconfirmed_agent_title_reads_unknown_until_the_probe_answers() {
+        assert_eq!(
+            session_activity(None, "✳ waiting", false),
+            SessionActivity::agent(None, LiveState::Unknown)
+        );
+        assert_eq!(
+            session_activity(None, "✳ waiting", true),
+            SessionActivity::agent(None, LiveState::Idle)
+        );
+        assert_eq!(session_activity(None, "zsh", false), SessionActivity::Shell);
+        assert_eq!(
+            session_activity(None, "⠋ working", false),
+            SessionActivity::agent(None, LiveState::Working)
+        );
     }
 
     #[test]

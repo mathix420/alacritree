@@ -387,11 +387,10 @@ impl AlacritreeApp {
         // rule the project row applies when expanded.  Aggregates therefore
         // apply only while the list is hidden (fewer than two sessions).
         let home_lists_sessions = WorkspaceRowData::any_session(&home_rows);
-        let home_attention = !home_lists_sessions && self.workspace_needs_attention(&None);
-        let home_activity = if home_lists_sessions {
-            SessionActivity::Shell
+        let home_status = if home_lists_sessions {
+            RowStatus::live(SessionActivity::Shell)
         } else {
-            self.workspace_activity(&None)
+            self.workspace_status(&None)
         };
         let projects = self.project_views(ctx, &listed);
 
@@ -409,8 +408,7 @@ impl AlacritreeApp {
             filtered_empty,
             home_rows,
             home_active: self.current_workspace.is_none(),
-            home_attention,
-            home_activity,
+            home_status,
             projects,
             // Worktrees whose background removal is still running: their rows show
             // a spinner instead of the delete/new-shell controls.
@@ -483,11 +481,10 @@ impl AlacritreeApp {
                 // After `pr` so `$pr` sees this frame's PR number.
                 worktrees.push(WorktreeView {
                     label: self.row_labels.worktree_label(wt, pr.as_ref()),
-                    attention: !lists_sessions && self.workspace_needs_attention(&ws),
-                    activity: if lists_sessions {
-                        SessionActivity::Shell
+                    status: if lists_sessions {
+                        RowStatus::live(SessionActivity::Shell)
                     } else {
-                        self.workspace_activity(&ws)
+                        self.workspace_status(&ws)
                     },
                     is_active: current_workspace == Some(wt.path.as_path()),
                     missing: self.liveness.missing(&wt.path),
@@ -645,8 +642,7 @@ struct SidebarView {
     filtered_empty: bool,
     home_rows: Vec<WorkspaceRowData>,
     home_active: bool,
-    home_attention: bool,
-    home_activity: SessionActivity,
+    home_status: RowStatus<'static>,
     projects: Vec<ProjectView>,
     deleting_paths: HashSet<PathBuf>,
     creating: Vec<(usize, String)>,
@@ -772,8 +768,7 @@ struct WorktreeView {
     label: String,
     pr: Option<PrInfo>,
     rows: Vec<WorkspaceRowData>,
-    attention: bool,
-    activity: SessionActivity,
+    status: RowStatus<'static>,
     is_active: bool,
     /// What the liveness probe has seen since discovery ran, if anything.
     missing: Option<bool>,
@@ -917,11 +912,7 @@ fn paint_home_group(ui: &mut egui::Ui, paint: SidebarPaint<'_>, requests: &mut S
         paint.view.home_active,
         is_cursor,
         paint.view.scrolls(is_cursor) || paint.view.follows_home(),
-        RowStatus {
-            attention: paint.view.home_attention,
-            activity: paint.view.home_activity,
-            managed: None,
-        },
+        paint.view.home_status,
         paint.icons,
         &paint.view.theme,
     );
@@ -1105,7 +1096,7 @@ fn project_row_title(
 }
 
 /// The project row's trailing buttons: remove, refresh, new worktree, and the
-/// attention dot.
+/// attention mark.
 fn project_row_controls(
     ui: &mut egui::Ui,
     paint: SidebarPaint<'_>,
@@ -1146,7 +1137,7 @@ fn project_row_controls(
         requests.create = Some(idx);
     }
     if show_attention {
-        icon_tooltip(attention_dot(ui, theme), ATTENTION_HINT, theme.icon_tooltips);
+        icon_tooltip(attention_mark(ui, icons, theme), ATTENTION_HINT, theme.icon_tooltips);
     }
 }
 
@@ -1271,8 +1262,7 @@ fn paint_worktree(
         is_active: state.is_active,
         is_cursor,
         scroll_into_view: scroll,
-        attention: state.attention,
-        activity: state.activity,
+        status: state.status,
         deleting: is_deleting,
         profiles: &paint.view.worktree_profiles,
         icons: paint.icons,
@@ -1333,6 +1323,7 @@ pub(super) fn home_row(
                     status_hint = paint_row_status_icon(
                         ui,
                         theme,
+                        icons,
                         status,
                         &icons.home,
                         DEFAULT_HOME_ICON,
@@ -1513,8 +1504,7 @@ pub(super) struct WorktreeRowView<'a> {
     pub(super) is_active: bool,
     pub(super) is_cursor: bool,
     pub(super) scroll_into_view: bool,
-    pub(super) attention: bool,
-    pub(super) activity: SessionActivity,
+    pub(super) status: RowStatus<'static>,
     pub(super) deleting: bool,
     // Shell profiles offered in the row's "Open session" menu: `.0` is the
     // profile name (spawned and shown as the button label), `.1` is the
@@ -1634,7 +1624,8 @@ fn worktree_row_name(
     let status_hint = paint_row_status_icon(
         ui,
         theme,
-        RowStatus { attention: row.attention, activity: row.activity, managed: None },
+        icons,
+        row.status,
         default_icon,
         default_glyph,
         row.is_active,
@@ -1805,8 +1796,10 @@ pub(super) fn session_row(
                     status_hint = paint_row_status_icon(
                         ui,
                         theme,
+                        icons,
                         RowStatus {
-                            attention: row.needs_attention,
+                            pinged: row.needs_attention,
+                            done: row.done,
                             activity: row.activity,
                             managed: row.managed.as_ref(),
                         },
@@ -1975,7 +1968,9 @@ fn pane_row(
                 |ui| {
                     let (rect, _) =
                         ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
-                    paint_harness_mark(ui, row.managed.mark, rect, theme);
+                    if let Some(status) = row.managed.status {
+                        paint_status_mark(ui, ShownState::from(status), icons, rect, theme);
+                    }
                     paint_managed_mark(ui, icons, &row.managed, theme, theme.text_dim);
                     let text = row_name_text(ui, &row.name, theme.text_dim, theme.text_muted);
                     let _ = truncating_label(ui, text, theme.text_dim, egui::Sense::hover());
@@ -2298,6 +2293,7 @@ pub(super) struct SessionRowData {
     pub(super) id: SessionId,
     pub(super) name: RowName,
     pub(super) needs_attention: bool,
+    pub(super) done: bool,
     pub(super) activity: SessionActivity,
     /// This workspace's remembered active session (accent icon).
     pub(super) is_active: bool,

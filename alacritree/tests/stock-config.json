@@ -309,6 +309,48 @@
         "italic": false,
         "size": null
       },
+      "agent_blocked": {
+        "bold": false,
+        "color": null,
+        "glyph": null,
+        "italic": false,
+        "size": null
+      },
+      "agent_done": {
+        "bold": false,
+        "color": null,
+        "glyph": null,
+        "italic": false,
+        "size": null
+      },
+      "agent_idle": {
+        "bold": false,
+        "color": null,
+        "glyph": null,
+        "italic": false,
+        "size": null
+      },
+      "agent_unknown": {
+        "bold": false,
+        "color": null,
+        "glyph": null,
+        "italic": false,
+        "size": null
+      },
+      "agent_working": {
+        "bold": false,
+        "color": null,
+        "glyph": null,
+        "italic": false,
+        "size": null
+      },
+      "attention": {
+        "bold": false,
+        "color": null,
+        "glyph": null,
+        "italic": false,
+        "size": null
+      },
       "close_session": {
         "bold": false,
         "color": null,
@@ -512,6 +554,7 @@
     "sidebar_foreground": null,
     "sidebar_scroll_align": "minimal",
     "sidebar_tooltips": "elided",
+    "status_indicators": "dots",
     "upstream_status": false,
     "vsync": true,
     "worktree_liveness": true,

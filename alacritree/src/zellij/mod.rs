@@ -20,9 +20,9 @@ use serde_json::{Value, json};
 
 use crate::config::{BakedGlyph, DEFAULT_ZELLIJ_ICON, IconStyle, ZellijConfig};
 use crate::multiplexer::{
-    AttachAnswer, AttachRequest, CreateAnswer, CreateRequest, CreatedPane, HarnessMark, Launch,
-    ListedPane, Managed, MultiplexerKind, MultiplexerSession, Pane, PaneKey, PaneStatus,
-    PaneTarget, Side, StateTone, ViewState, ViewStep,
+    AttachAnswer, AttachRequest, CreateAnswer, CreateRequest, CreatedPane, Launch, ListedPane,
+    Managed, MultiplexerKind, MultiplexerSession, Pane, PaneKey, PaneTarget, Side, ViewState,
+    ViewStep,
 };
 use crate::session::SessionId;
 use crate::{jobs, wsl};
@@ -254,14 +254,8 @@ impl MultiplexerSession for Zellij {
             shared_view: true,
             kind: None,
             title: pane.and_then(|pane| pane.title.clone()),
-            mark: None,
+            status: None,
         }
-    }
-
-    /// zellij reports no agent state, so no pane of its own ever asks for a
-    /// mark; one handed over anyway reads as no reading.
-    fn mark(&self, _side: &Side, status: PaneStatus) -> HarnessMark {
-        HarnessMark { glyph: "·", tone: StateTone::Unclear, label: status.label() }
     }
 
     fn attaches_directly(&self, _side: &Side, _has_agent: bool) -> bool {

@@ -785,8 +785,8 @@ pub(super) fn pane_workspaces(
 /// one of ours, so it has to reach the row the user is sitting in.
 pub(super) fn managed_tooltip(managed: &Managed) -> String {
     let mut parts = Vec::new();
-    if let Some(mark) = managed.mark {
-        parts.push(mark.label.to_owned());
+    if let Some(status) = managed.status {
+        parts.push(status.label().to_owned());
     }
     parts.push(managed.multiplexer.to_string());
     if managed.shared_view {
@@ -865,7 +865,7 @@ mod tests {
             shared_view: false,
             kind: None,
             title: None,
-            mark: None,
+            status: None,
         };
         assert_eq!(managed_tooltip(&managed), "herdr. (detach with `Ctrl+B q`)");
     }

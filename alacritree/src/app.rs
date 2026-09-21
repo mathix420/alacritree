@@ -15,15 +15,16 @@ use crate::clipboard::{self, Target};
 use crate::colors::rgb_to_color32;
 use crate::command_palette::{self, CommandPalette, PaletteAction, PaletteItem};
 use crate::config::{
-    BakedGlyph, Config, DEFAULT_ADD_ICON, DEFAULT_AGENT_ICON, DEFAULT_BLOCKED_ICON,
-    DEFAULT_CLOSE_ICON, DEFAULT_HOME_ICON, DEFAULT_PR_CLOSED_ICON, DEFAULT_PR_DRAFT_ICON,
+    BakedGlyph, Config, DEFAULT_ADD_ICON, DEFAULT_ATTENTION_MARK, DEFAULT_BLOCKED_SYMBOL,
+    DEFAULT_CLOSE_ICON, DEFAULT_DONE_SYMBOL, DEFAULT_DOTS_FILLED_MARK, DEFAULT_DOTS_UNKNOWN_MARK,
+    DEFAULT_HOME_ICON, DEFAULT_IDLE_MARK, DEFAULT_PR_CLOSED_ICON, DEFAULT_PR_DRAFT_ICON,
     DEFAULT_PR_MERGED_ICON, DEFAULT_PR_OPEN_ICON, DEFAULT_PROJECT_COLLAPSED_ICON,
     DEFAULT_PROJECT_EXPANDED_ICON, DEFAULT_REFRESH_ICON, DEFAULT_REORDER_ICON, DEFAULT_SEARCH_ICON,
     DEFAULT_SESSION_ICON, DEFAULT_UPSTREAM_DIVERGED_ICON, DEFAULT_UPSTREAM_GONE_ICON,
     DEFAULT_UPSTREAM_LEVEL_ICON, DEFAULT_UPSTREAM_UNTRACKED_ICON, DEFAULT_WORKTREE_ICON,
     DEFAULT_WORKTREE_MAIN_ICON, FontConfig, IconStyle, Icons, LastSessionClose, PathStyleConfig,
     ScrollAlign, ScrollbarStyle, SearchDepth, SearchScope, SidebarFocus, SidebarTooltips,
-    TextEmphasis, UiFont, UiTheme, profile_command,
+    StatusIndicators, TextEmphasis, UiFont, UiTheme, profile_command,
 };
 use crate::crash_log::{self, ExitReason};
 use crate::git_nav::{self, GitSection, SectionCount};
@@ -31,16 +32,15 @@ use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, St
 use crate::in_flight::{Finished, InFlight};
 use crate::modal_gate::{ModalGate, ModalKind};
 use crate::multiplexer::{
-    AttachFocus, HarnessMark, Managed, MultiplexerSession, Multiplexers, PaneKey, PaneStatus,
-    PaneTarget, Side, StateTone,
+    AttachFocus, Managed, MultiplexerSession, Multiplexers, PaneKey, PaneStatus, PaneTarget, Side,
 };
 use crate::panel_filter::{self, PanelFilter};
 use crate::path_style::PathStyle;
 use crate::pr_status::{self, PrCache, PrInfo, PrState};
 use crate::projects::{Discovered, Project, Worktree, project_json};
 use crate::session::{
-    self, Attachment, AttentionVerdict, LiveState, Session, SessionActivity, SessionId,
-    SessionKind, TermSize, poll_attention_debounce,
+    self, Attachment, AttentionVerdict, LiveState, PendingAttention, Session, SessionActivity,
+    SessionId, SessionKind, ShownState, TermSize, poll_attention_debounce,
 };
 use crate::shell_decision::{ShellDecision, shell_decision};
 use crate::sidebar_nav::{self, SidebarRow, StepTarget};
@@ -76,11 +76,11 @@ use sidebar::{
     project_filter_toggles, session_row_name,
 };
 use widgets::{
-    ATTENTION_HINT, ICON_CLUSTER_SPACING, IconHints, ROW_STATUS_ICON_W, RowStatus, SessionMark,
-    agent_mark, apply_scrollbar_style, attention_dot, braille_loader, icon_tooltip, name_tooltip,
-    paint_agent_mark, paint_attention_dot, paint_cursor_outline, paint_harness_mark,
-    paint_row_status_icon, path_text, resolve_icon, row_status_icon_size, row_with_trailing,
-    session_status_mark, styled_icon_button, truncating_label,
+    ATTENTION_HINT, ICON_CLUSTER_SPACING, IconHints, ROW_STATUS_ICON_W, RowStatus,
+    apply_scrollbar_style, attention_mark, braille_loader, icon_tooltip, name_tooltip,
+    paint_cursor_outline, paint_row_status_icon, paint_status_mark, path_text, resolve_icon,
+    row_status_icon_size, row_with_trailing, session_status_mark, styled_icon_button,
+    truncating_label,
 };
 
 #[derive(Clone, Copy)]
@@ -115,9 +115,11 @@ struct Theme {
     upstream_diverged: Color32,
     upstream_gone: Color32,
     upstream_untracked: Color32,
-    /// Colors for a harness's own state vocabulary, mapped from the ANSI
-    /// palette the way the PR and upstream badges are.
-    harness_state: StateColors,
+    /// Colors for agent status marks, mapped from the ANSI palette the way
+    /// the PR and upstream badges are.
+    state_colors: StateColors,
+    /// Which glyph set agent status marks draw from.
+    status_indicators: StatusIndicators,
     /// Logical-pixel size for headings (titles like "Projects", "Git").
     /// `FontConfig::UI_HEADING_RATIO` of the terminal font size.
     font_heading: f32,
@@ -160,27 +162,15 @@ struct GitColors {
     conflicted: Color32,
 }
 
-/// One color per [`StateTone`], since a multiplexer names its states rather
-/// than its colors and alacritree owns the palette they land in.
+/// One colour per agent state that has one of its own.  Working paints in the
+/// accent and a ping in the attention colour, both of which the rest of the
+/// sidebar already uses.
 #[derive(Debug, Clone, Copy)]
 struct StateColors {
     blocked: Color32,
-    working: Color32,
     done: Color32,
     idle: Color32,
-    unclear: Color32,
-}
-
-impl StateColors {
-    fn of(&self, tone: StateTone) -> Color32 {
-        match tone {
-            StateTone::Blocked => self.blocked,
-            StateTone::Working => self.working,
-            StateTone::Done => self.done,
-            StateTone::Idle => self.idle,
-            StateTone::Unclear => self.unclear,
-        }
-    }
+    unknown: Color32,
 }
 
 impl Theme {
@@ -215,13 +205,13 @@ impl Theme {
             upstream_diverged: rgb_to_color32(config.palette.normal[3]), // yellow
             upstream_gone: rgb_to_color32(config.palette.normal[1]), // red
             upstream_untracked: rgb_to_color32(config.palette.normal[4]), // blue
-            harness_state: StateColors {
+            state_colors: StateColors {
                 blocked: rgb_to_color32(config.palette.normal[1]), // red
-                working: rgb_to_color32(config.palette.normal[3]), // yellow
                 done: rgb_to_color32(config.palette.normal[6]),    // cyan, herdr's teal
                 idle: rgb_to_color32(config.palette.normal[2]),    // green
-                unclear: text_muted,
+                unknown: text_muted,
             },
+            status_indicators: config.ui.status_indicators,
             font_heading,
             font_normal,
             ui_scale: font_normal / 11.25,
@@ -2718,7 +2708,7 @@ impl AlacritreeApp {
     fn process_session_events(&mut self, ctx: &Context) {
         let visible_idx = self.active_session_index();
         // `viewport().focused` is `None` on platforms that don't report focus;
-        // treat unknown as "focused" so we don't pile up stale attention dots.
+        // treat unknown as "focused" so we don't pile up stale attention marks.
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
 
         // Only the session on screen, and only while the window has focus:
@@ -2764,31 +2754,47 @@ impl AlacritreeApp {
                 );
                 self.sessions[idx].write_hold_notice(chord.as_deref());
             }
+            let live = self.session_activity(&self.sessions[idx]).live();
+            if live == Some(LiveState::Working) {
+                // A finished turn stops describing anything once the next
+                // one starts.
+                self.sessions[idx].done = false;
+            }
             let is_visible_to_user = Some(idx) == visible_idx && focused;
             if is_visible_to_user {
                 // Nothing pending survives the user already looking at it.
                 self.sessions[idx].pending_attention = None;
                 continue;
             }
-            if outcome.attention && self.sessions[idx].pending_attention.is_none() {
-                self.sessions[idx].pending_attention = Some(Instant::now());
-            }
-            let Some(since) = self.sessions[idx].pending_attention else {
+            let now = Instant::now();
+            let pending = PendingAttention::merge(
+                self.sessions[idx].pending_attention,
+                outcome.finished,
+                outcome.rang,
+                now,
+            );
+            self.sessions[idx].pending_attention = pending;
+            let Some(pending) = pending else {
                 continue;
             };
-            match poll_attention_debounce(since, Instant::now(), &self.sessions[idx].title, grace) {
+            match poll_attention_debounce(pending.since, now, live, grace) {
                 AttentionVerdict::Cancel => self.sessions[idx].pending_attention = None,
                 // A quiet PTY repaints nothing on its own, so the wake-up
                 // that decides the ping has to be scheduled here.
                 AttentionVerdict::Wait(remaining) => ctx.request_repaint_after(remaining),
                 AttentionVerdict::Fire => {
                     self.sessions[idx].pending_attention = None;
-                    // Only toast on the *transition* into needs_attention — otherwise
-                    // BEL + title-transition firing in the same idle cycle would
-                    // produce two toasts for the same "Claude is done" event.
-                    let was_attending = self.sessions[idx].needs_attention;
-                    self.sessions[idx].needs_attention = true;
-                    if !was_attending && self.config.ui.notifications {
+                    // A spinner stopping on a plain shell is a finished
+                    // command rather than an agent's turn, so it pings.
+                    let is_agent = live.is_some();
+                    let session = &mut self.sessions[idx];
+                    let was_latched = session.done || session.needs_attention;
+                    session.done |= pending.finished && is_agent;
+                    session.needs_attention |= pending.rang || (pending.finished && !is_agent);
+                    // Only toast on the transition into a latch: BEL and the
+                    // title settling in the same idle cycle are one "Claude is
+                    // done" event, not two.
+                    if !was_latched && self.config.ui.notifications {
                         notify::attention(&self.sessions[idx], ctx);
                     }
                 },
@@ -2801,16 +2807,56 @@ impl AlacritreeApp {
         if focused {
             if let Some(idx) = visible_idx {
                 self.sessions[idx].needs_attention = false;
+                self.sessions[idx].done = false;
             }
         }
     }
 
+    /// A session's live reading with its multiplexer's status folded in.
+    fn session_activity(&self, s: &AppSession) -> SessionActivity {
+        pane_backed_activity(s.activity(), self.session_pane_status(s))
+    }
+
+    /// The mark a session's row draws, from its live reading and its latches.
+    fn session_shown_state(&self, s: &AppSession) -> Option<ShownState> {
+        let pane_done = self.session_pane_status(s) == Some(PaneStatus::Done);
+        ShownState::of(self.session_activity(s).live(), s.done || pane_done, s.needs_attention)
+    }
+
+    /// Whether any session in `ws` is blocked, done or pinged: what the
+    /// attention filter keeps.
     fn workspace_needs_attention(&self, ws: &WorkspaceKey) -> bool {
-        self.sessions.iter().any(|s| s.working_directory == *ws && s.needs_attention)
+        self.sessions.iter().any(|s| {
+            s.working_directory == *ws
+                && self.session_shown_state(s).is_some_and(ShownState::wants_attention)
+        })
     }
 
     fn project_needs_attention(&self, project: &Project) -> bool {
         project.worktrees.iter().any(|wt| self.workspace_needs_attention(&Some(wt.path.clone())))
+    }
+
+    /// What a collapsed workspace row draws.  A session that is blocked, done
+    /// or pinged wins wherever it sits, loudest first, since the collapsed row
+    /// is the only place it can surface.  Otherwise the live reading follows
+    /// [`Self::workspace_activity`].
+    fn workspace_status(&self, ws: &WorkspaceKey) -> RowStatus<'static> {
+        let loudest = self
+            .sessions
+            .iter()
+            .filter(|s| s.working_directory == *ws)
+            .filter_map(|s| Some((self.session_shown_state(s)?, s)))
+            .filter(|(state, _)| state.wants_attention())
+            .max_by_key(|(state, _)| *state);
+        match loudest {
+            Some((_, s)) => RowStatus {
+                pinged: s.needs_attention,
+                done: s.done || self.session_pane_status(s) == Some(PaneStatus::Done),
+                activity: self.session_activity(s),
+                managed: None,
+            },
+            None => RowStatus::live(self.workspace_activity(ws)),
+        }
     }
 
     /// Prefer the active session's status so parallel agents do not fight over
@@ -2919,6 +2965,7 @@ impl AlacritreeApp {
                         id: s.id,
                         name: session_row_name(&s.title, activity, self.session_pane(s)),
                         needs_attention: s.needs_attention,
+                        done: s.done,
                         activity,
                         is_active: active == Some(s.id),
                         is_displayed: is_current && active == Some(s.id),
@@ -4043,8 +4090,7 @@ mod tests {
             is_active: true,
             is_cursor: false,
             scroll_into_view: false,
-            attention: false,
-            activity: SessionActivity::Shell,
+            status: RowStatus::live(SessionActivity::Shell),
             deleting: false,
             profiles: &[],
             icons,
@@ -4095,6 +4141,72 @@ mod tests {
         );
         app.sessions.push(session);
         app
+    }
+
+    /// `test_app` with its one session in a workspace nobody is looking at,
+    /// the only place an attention trigger can latch.  Desktop notifications
+    /// are off so a latch does not reach the OS.
+    fn app_with_a_background_session(title: &str) -> AlacritreeApp {
+        let mut app = test_app();
+        app.config.ui.notifications = false;
+        app.current_workspace = Some(PathBuf::from("elsewhere"));
+        app.sessions[0].title = title.to_owned();
+        app
+    }
+
+    fn drain(app: &mut AlacritreeApp, event: alacritty_terminal::event::Event) {
+        app.sessions[0].inject_for_test(event);
+        app.process_session_events(&Context::default());
+    }
+
+    /// An agent's spinner stopping while nobody is looking is a finished
+    /// turn: the row shows done, not a ping, and the attention filter keeps
+    /// its workspace.  A bell on top pings underneath, and looking at the
+    /// session clears both.
+    #[test]
+    fn a_background_agent_that_finishes_shows_done_until_viewed() {
+        use alacritty_terminal::event::Event;
+        let mut app = app_with_a_background_session("\u{280b} claude");
+        drain(&mut app, Event::Title("\u{2733} claude".into()));
+        assert!(app.sessions[0].done);
+        assert!(!app.sessions[0].needs_attention);
+        assert_eq!(app.session_shown_state(&app.sessions[0]), Some(ShownState::Done));
+        assert!(app.workspace_needs_attention(&None));
+
+        drain(&mut app, Event::Bell);
+        assert!(app.sessions[0].needs_attention);
+        assert_eq!(app.session_shown_state(&app.sessions[0]), Some(ShownState::Done));
+
+        app.current_workspace = None;
+        app.set_active_in_current_workspace(app.sessions[0].id);
+        app.process_session_events(&Context::default());
+        assert!(!app.sessions[0].done);
+        assert!(!app.sessions[0].needs_attention);
+    }
+
+    /// A spinner stopping on a plain shell is a finished command, not an
+    /// agent's turn, so it pings the way it always has.
+    #[test]
+    fn a_background_shell_whose_spinner_stops_is_pinged() {
+        use alacritty_terminal::event::Event;
+        let mut app = app_with_a_background_session("\u{280b} cargo build");
+        drain(&mut app, Event::Title("cargo build".into()));
+        assert!(!app.sessions[0].done);
+        assert!(app.sessions[0].needs_attention);
+        assert_eq!(app.session_shown_state(&app.sessions[0]), Some(ShownState::Pinged));
+    }
+
+    /// Going back to work retires a finished turn: the next one has started,
+    /// so "done" no longer describes anything.
+    #[test]
+    fn going_back_to_work_clears_done() {
+        use alacritty_terminal::event::Event;
+        let mut app = app_with_a_background_session("\u{280b} claude");
+        drain(&mut app, Event::Title("\u{2733} claude".into()));
+        assert!(app.sessions[0].done);
+        drain(&mut app, Event::Title("\u{2819} claude".into()));
+        assert!(!app.sessions[0].done);
+        assert_eq!(app.session_shown_state(&app.sessions[0]), Some(ShownState::Working));
     }
 
     /// An app with the scripted multiplexer on and nothing else, for the pane
@@ -7910,6 +8022,7 @@ mod tests {
                 id: 1,
                 name: RowName::plain("zsh".to_owned()),
                 needs_attention: false,
+                done: false,
                 activity: SessionActivity::Shell,
                 is_active: true,
                 is_displayed: true,
@@ -7930,7 +8043,7 @@ mod tests {
                     true,
                     false,
                     false,
-                    RowStatus { attention: false, activity: SessionActivity::Shell, managed: None },
+                    RowStatus::live(SessionActivity::Shell),
                     &icons,
                     &theme,
                 );
@@ -7994,9 +8107,8 @@ mod tests {
 
     /// The slot a row leads with is a report rather than a button: it stands
     /// for the agent running in the session, or for the session asking to be
-    /// looked at. Both say so on hover. The dot paints no text to aim at, so
-    /// it is found through the slot the glyph occupies — one replaces the
-    /// other in place.
+    /// looked at. Both say so on hover, and each replaces the other in the
+    /// same slot, so the ping is found where the idle glyph painted.
     #[test]
     fn icon_tooltips_gate_the_status_slot_hint() {
         const WIDTH: f32 = 220.0;
@@ -8008,6 +8120,7 @@ mod tests {
             id: 1,
             name: RowName::plain("zsh".to_owned()),
             needs_attention: attention,
+            done: false,
             activity,
             is_active: true,
             is_displayed: true,
@@ -8025,7 +8138,7 @@ mod tests {
                 session_row(ui, &agent, false, false, false, &icons, &theme);
             };
             assert_eq!(
-                hint_painted_over(&mut agent_row, DEFAULT_AGENT_ICON.as_str(), "claude is running",),
+                hint_painted_over(&mut agent_row, DEFAULT_IDLE_MARK.as_str(), "claude is running"),
                 want,
                 "agent status, icon_tooltips = {icon_tooltips}"
             );
@@ -8033,7 +8146,7 @@ mod tests {
             let probe =
                 frames_while_hovering_at(egui::Pos2::new(-100.0, -100.0), WIDTH, &mut agent_row);
             let slot = painted_glyph_positions(probe.last().expect("the row painted"))
-                [DEFAULT_AGENT_ICON.as_str()];
+                [DEFAULT_IDLE_MARK.as_str()];
 
             let loading =
                 session(false, SessionActivity::agent(Some("claude"), LiveState::Working));
@@ -8053,7 +8166,7 @@ mod tests {
             assert_eq!(
                 texts.iter().flatten().any(|(text, _)| text == "needs attention"),
                 want,
-                "attention dot, icon_tooltips = {icon_tooltips}"
+                "attention mark, icon_tooltips = {icon_tooltips}"
             );
         }
     }
@@ -8236,6 +8349,7 @@ mod tests {
             id: 1,
             name: RowName::plain("cargo test --workspace --all-features -- --nocapture".to_owned()),
             needs_attention: false,
+            done: false,
             activity: SessionActivity::Shell,
             is_active: true,
             is_displayed: true,
@@ -8457,6 +8571,7 @@ mod tests {
     ) -> (HashMap<String, PaintedPaletteText>, egui::Rect) {
         let ctx = egui::Context::default();
         let theme = Theme::from_config(&Config::default());
+        let icons = Icons::default().map_colors(rgb_to_color32);
         let mut row_rect = None;
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -8472,8 +8587,9 @@ mod tests {
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         let cols = PaletteColumns::new(theme.ui_scale, width);
-                        row_rect =
-                            Some(paint_palette_row(ui, &theme, &cols, item, None, 0, false).rect);
+                        row_rect = Some(
+                            paint_palette_row(ui, &theme, &icons, &cols, item, None, 0, false).rect,
+                        );
                     },
                 );
             });
@@ -8583,11 +8699,12 @@ mod tests {
     #[test]
     fn palette_session_hover_owns_the_whole_row_including_the_status_mark() {
         let item = palette_session("shell", "◆ home", "shell", "persistent session details");
-        let mark = (SessionMark::Attention, "competing status hint".to_owned());
+        let mark = (ShownState::Pinged, "competing status hint".to_owned());
         let theme = Theme::from_config(&Config::default());
+        let icons = Icons::default().map_colors(rgb_to_color32);
         let texts = texts_while_hovering_at(egui::pos2(23.0, 20.0), 760.0, |ui| {
             let cols = PaletteColumns::new(theme.ui_scale, 760.0);
-            paint_palette_row(ui, &theme, &cols, &item, Some(&mark), 0, false);
+            paint_palette_row(ui, &theme, &icons, &cols, &item, Some(&mark), 0, false);
         });
 
         assert!(texts.iter().flatten().any(|(text, _)| text == "persistent session details"));
@@ -8597,11 +8714,12 @@ mod tests {
     #[test]
     fn action_palette_rows_keep_elided_only_hover() {
         let theme = Theme::from_config(&Config::default());
+        let icons = Icons::default().map_colors(rgb_to_color32);
         let short =
             PaletteItem::profile("Open config".into(), "Config".into(), "Ctrl+C".into(), "");
         let short_frames = texts_while_hovering(760.0, |ui| {
             let cols = PaletteColumns::new(theme.ui_scale, 760.0);
-            paint_palette_row(ui, &theme, &cols, &short, None, 0, false);
+            paint_palette_row(ui, &theme, &icons, &cols, &short, None, 0, false);
         });
         assert!(!tooltip_shown(&short_frames, &short.primary));
 
@@ -8613,7 +8731,7 @@ mod tests {
         );
         let long_frames = texts_while_hovering(760.0, |ui| {
             let cols = PaletteColumns::new(theme.ui_scale, 760.0);
-            paint_palette_row(ui, &theme, &cols, &long, None, 0, false);
+            paint_palette_row(ui, &theme, &icons, &cols, &long, None, 0, false);
         });
         assert!(row_elided(&long_frames, &long.secondary));
         assert!(tooltip_shown(&long_frames, &long.secondary));
@@ -8862,36 +8980,31 @@ mod tests {
         assert_eq!(workspace_entries(&[1, 3], Vec::new(), false), entries(&[1, 3]));
     }
 
-    /// A herdr pane with no agent in it reports no state, so the harness rung
-    /// of the ladder is empty and a plain shell in one carries no mark at all.
-    /// The palette reads `managed.mark` directly while the sidebar goes
-    /// through the ladder, so the two only agree while both answer "none"
-    /// here.
+    /// A herdr pane with no agent in it reports no state, so a plain shell in
+    /// one carries no mark at all.  The palette reads `managed.status`
+    /// directly while the sidebar goes through `session_status_mark`, so the
+    /// two only agree while both answer "none" here.
     #[test]
     fn session_status_mark_leaves_an_agentless_pane_unmarked() {
         let managed = pane_row(&shell_pane(), Side::Native, false).managed;
-        assert_eq!(managed.mark, None);
-        let status = RowStatus {
-            attention: false,
-            activity: SessionActivity::Shell,
-            managed: Some(&managed),
-        };
+        assert_eq!(managed.status, None);
+        let status =
+            RowStatus { managed: Some(&managed), ..RowStatus::live(SessionActivity::Shell) };
         assert!(session_status_mark(&status).is_none());
     }
 
     /// A pane herdr reports no agent in can still be running one alacritree's
-    /// own title heuristic recognises.  The harness rung is empty, so the
-    /// ladder falls through to the live axis rather than stopping at a
-    /// managed row the way it did while every listed pane had a state.
+    /// own title heuristic recognises.  The multiplexer has no status to
+    /// report, so the mark falls through to alacritree's own reading.
     #[test]
     fn an_agentless_pane_falls_through_to_the_local_agent_reading() {
         let managed = pane_row(&shell_pane(), Side::Native, false).managed;
         let activity = SessionActivity::agent(Some("claude"), LiveState::Working);
         assert_eq!(pane_backed_activity(activity, None), activity);
-        let status = RowStatus { attention: false, activity, managed: Some(&managed) };
+        let status = RowStatus { managed: Some(&managed), ..RowStatus::live(activity) };
         let (mark, hint) = session_status_mark(&status).expect("the live axis still has one");
-        assert_eq!(mark, SessionMark::Agent(LiveState::Working));
-        assert_eq!(hint, agent_hint(LiveState::Working, Some("claude")));
+        assert_eq!(mark, ShownState::Working);
+        assert_eq!(hint, agent_hint(ShownState::Working, Some("claude")));
     }
 
     #[test]
@@ -8958,7 +9071,7 @@ mod tests {
     #[test]
     fn an_agentless_pane_paints_no_state_and_shares_the_view() {
         let row = pane_row(&shell_pane(), Side::Wsl("d".into()), true);
-        assert_eq!(row.managed.mark, None);
+        assert_eq!(row.managed.status, None);
         assert!(row.managed.shared_view);
         assert_eq!(managed_tooltip(&row.managed), r#"scripted, shared view, "~/G/g/alacritree"."#);
     }

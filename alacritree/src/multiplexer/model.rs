@@ -159,10 +159,10 @@ pub(crate) struct Managed {
     pub kind: Option<String>,
     /// The pane's own title, when it says something the kind does not.
     pub title: Option<String>,
-    /// How the multiplexer draws the state it reports.  `None` when it is no
-    /// longer reporting one: a pane alacritree still holds open after its
-    /// multiplexer stopped listing it.
-    pub mark: Option<HarnessMark>,
+    /// The agent state the multiplexer reports.  `None` when it is not
+    /// reporting one: a multiplexer with no agent detection, or a pane
+    /// alacritree still holds open after its multiplexer stopped listing it.
+    pub status: Option<PaneStatus>,
 }
 
 impl Managed {
@@ -176,29 +176,6 @@ impl Managed {
             (None, None) => None,
         }
     }
-}
-
-/// The mark a multiplexer paints for the state it reports, in its own
-/// vocabulary.  Resolved once per row, so a pane reads the same whether it is
-/// listed or attached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HarnessMark {
-    pub glyph: &'static str,
-    pub tone: StateTone,
-    /// The multiplexer's own word for this state, for the hover text.
-    pub label: &'static str,
-}
-
-/// What a multiplexer means by a state's color.  Named rather than carried as
-/// a `Color32` so the palette stays alacritree's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StateTone {
-    Blocked,
-    Working,
-    Done,
-    Idle,
-    /// The multiplexer reported something alacritree does not recognise.
-    Unclear,
 }
 
 /// Whether opening a pane's session brings it in front of the user.  Every

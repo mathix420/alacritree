@@ -23,7 +23,7 @@ pub(in crate::herdr) use poll::ListingReply;
 use cli::{attaches_directly, focus_args, focus_pane, program, running_session_name};
 pub(crate) use model::pane_key;
 use model::unattached;
-pub use model::{Indicators, Listing, PollError, Settings};
+pub use model::{Listing, PollError, Settings};
 pub use poll::{EndpointCache, Endpoints};
 use settings::settings;
 pub use view::{HerdrViewAction, HerdrViewFocus, HerdrViewSync, ViewInputs};

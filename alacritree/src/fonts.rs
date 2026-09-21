@@ -2486,7 +2486,7 @@ mod tests {
 
     #[test]
     fn the_baked_glyph_set_is_the_documented_size() {
-        assert_eq!(baked_glyphs().len(), 27, "assets/build_symbols.py lists the codepoints");
+        assert_eq!(baked_glyphs().len(), 25, "assets/build_symbols.py lists the codepoints");
     }
 
     /// A default icon is spelled at a plane 16 codepoint so no installed face

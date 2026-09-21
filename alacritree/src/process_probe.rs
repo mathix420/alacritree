@@ -23,6 +23,11 @@ pub(crate) struct Signals {
     pub(crate) foreground_job: bool,
     /// A split-managing TUI such as vim or tmux is running.
     pub(crate) nav_tui: bool,
+    /// The probe could ask about this terminal at all.  False before a shell
+    /// pid is known, before the Windows refresher has scanned the shell, and
+    /// while a WSL session's helper gives no answer, so a caller can tell "no
+    /// agent here" from "nobody could look".
+    pub(crate) answered: bool,
 }
 
 /// The probe for one session, holding what it needs to ask and what it last
@@ -70,16 +75,20 @@ impl ProbeHandle {
                 agent: cached.agent_name,
                 foreground_job: cached.foreground_job,
                 nav_tui: cached.nav_tui,
+                answered: cached.answered,
             };
         }
         let agent = self.shell_pid.and_then(foreground_agent_name);
-        let (foreground_job, nav_tui) = match &self.wsl {
+        let (foreground_job, nav_tui, answered) = match &self.wsl {
             Some(probe) => {
-                wsl_probe_signals(wsl_helper::foreground_comm(&probe.distro, &probe.key).as_deref())
+                let comm = wsl_helper::foreground_comm(&probe.distro, &probe.key);
+                let (foreground_job, nav_tui) = wsl_probe_signals(comm.as_deref());
+                (foreground_job, nav_tui, comm.is_some())
             },
             None => (
                 self.shell_pid.is_some_and(shell_has_foreground_job),
                 self.shell_pid.is_some_and(foreground_nav_tui),
+                self.shell_pid.is_some_and(probe_has_answered),
             ),
         };
         self.cache.set(AgentCache {
@@ -87,8 +96,9 @@ impl ProbeHandle {
             agent_name: agent,
             foreground_job,
             nav_tui,
+            answered,
         });
-        Signals { agent, foreground_job, nav_tui }
+        Signals { agent, foreground_job, nav_tui, answered }
     }
 }
 
@@ -107,6 +117,7 @@ struct AgentCache {
     /// Whether a split-managing TUI (vim, tmux) is running in the terminal;
     /// see [`Session::nav_tui_running`].
     nav_tui: bool,
+    answered: bool,
 }
 
 const AGENT_CACHE_TTL: Duration = Duration::from_millis(1000);
@@ -482,6 +493,19 @@ fn foreground_group_has_nav_tui(pgid: u32) -> bool {
         .any(|pid| comm_for_pid(pid).is_some_and(|comm| is_nav_tui_name(comm.trim())))
 }
 
+/// Windows reads the process table on a background thread, so a shell it has
+/// not scanned yet has no answer rather than an empty one.
+#[cfg(windows)]
+fn probe_has_answered(shell_pid: u32) -> bool {
+    windows_process_probe::has_scanned(shell_pid)
+}
+
+/// Every other platform reads the process table on the calling thread.
+#[cfg(not(windows))]
+fn probe_has_answered(_shell_pid: u32) -> bool {
+    true
+}
+
 /// Windows has no foreground process group, so "a job is running" is
 /// approximated as the shell having any descendant process — the same
 /// approximation the agent probe uses.
@@ -672,6 +696,10 @@ mod windows_process_probe {
             WANTED.notify_one();
         }
         signals.unwrap_or_default()
+    }
+
+    pub(super) fn has_scanned(shell_pid: u32) -> bool {
+        SHARED.lock().unwrap_or_else(PoisonError::into_inner).published.contains_key(&shell_pid)
     }
 
     #[cfg(test)]

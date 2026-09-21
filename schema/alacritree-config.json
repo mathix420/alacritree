@@ -830,6 +830,54 @@
           "default": "+",
           "description": "The \"add project\" button."
         },
+        "agent_blocked": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "An agent held at a dialog it needs a human to answer.  Unset follows\n`[ui] status_indicators`: `●` for dots, `×` for symbols."
+        },
+        "agent_done": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "An agent that finished a turn while nobody was looking.  Unset follows\n`[ui] status_indicators`: `●` for dots, `✓` for symbols."
+        },
+        "agent_idle": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "An agent waiting with nothing in flight.  Unset follows\n`[ui] status_indicators`: `◯` in both sets."
+        },
+        "agent_unknown": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "An agent nothing could read a state from.  Unset follows\n`[ui] status_indicators`: `○` for dots, `?` for symbols."
+        },
+        "agent_working": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "An agent at work.  Unset draws the braille loader; a glyph replaces\nit."
+        },
+        "attention": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RawIconStyle"
+            }
+          ],
+          "description": "A session that rang while nobody was looking.  Unset draws `⬤` in\nboth sets."
+        },
         "close_session": {
           "$ref": "#/$defs/RawIconStyle",
           "default": "×",
@@ -1726,6 +1774,15 @@
             "off",
             "elided",
             "always"
+          ],
+          "type": "string"
+        },
+        "status_indicators": {
+          "default": "dots",
+          "description": "Glyph set for agent status marks, on native and multiplexer rows\nalike: \"dots\" | \"symbols\".  Dots tells states apart by fill, size and\ncolour, symbols by shape.  `[ui.icons]` overrides one state at a time.",
+          "enum": [
+            "dots",
+            "symbols"
           ],
           "type": "string"
         },

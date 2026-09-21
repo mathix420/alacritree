@@ -3,22 +3,10 @@
 
 use crate::multiplexer::{MultiplexerKind, Pane, PaneKey, Side};
 
-/// Which of herdr's two indicator sets its config selects.  Rows follow the
-/// user's own choice, so a pane's mark in the sidebar is the mark it carries
-/// in herdr itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Indicators {
-    #[default]
-    Dots,
-    Symbols,
-}
-
-/// What alacritree reads out of herdr's config: how to leave a pane, and how
-/// herdr draws the state it reports.
+/// What alacritree reads out of herdr's config: how to leave a pane.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
     pub detach: Option<String>,
-    pub indicators: Indicators,
 }
 
 /// Which herdr listing a poll asks for.  `agent list` answers with the panes

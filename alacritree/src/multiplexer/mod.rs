@@ -22,8 +22,8 @@ use serde_json::Value;
 use strum::{Display, EnumDiscriminants, EnumIter, EnumString, IntoEnumIterator};
 
 pub(crate) use self::model::{
-    AttachAnswer, AttachFocus, AttachRequest, CreateAnswer, CreateRequest, HarnessMark, ListedPane,
-    Managed, StateTone, ViewState, ViewStep,
+    AttachAnswer, AttachFocus, AttachRequest, CreateAnswer, CreateRequest, ListedPane, Managed,
+    ViewState, ViewStep,
 };
 pub use self::model::{Pane, PaneKey, PaneStatus};
 #[cfg(test)]
@@ -219,9 +219,6 @@ pub(crate) trait MultiplexerSession {
     /// How a row describes a pane on `side`.  `pane` is `None` once the
     /// listing stops carrying it.
     fn managed(&self, side: &Side, pane: Option<&Pane>) -> Managed;
-
-    /// The mark this multiplexer paints for `status` on `side`.
-    fn mark(&self, side: &Side, status: PaneStatus) -> HarnessMark;
 
     /// Whether opening a pane's row attaches to that pane on its own rather
     /// than sharing the multiplexer's whole view.

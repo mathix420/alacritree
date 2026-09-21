@@ -104,6 +104,7 @@ impl AlacritreeApp {
                                     let resp = paint_palette_row(
                                         ui,
                                         &theme,
+                                        &self.icons,
                                         &cols,
                                         &items[i],
                                         marks[i].as_ref(),
@@ -213,7 +214,7 @@ impl AlacritreeApp {
                 managed.title = agent
                     .and_then(|agent| agent.title.clone())
                     .filter(|title| Some(title.as_str()) != kind);
-                managed.mark = status.map(|status| multiplexer.mark(&key.side, status));
+                managed.status = status;
                 let side = key.side.label().unwrap_or_else(|| "native".to_string());
                 let hover = palette_hover(
                     &content.title_for_hover,
@@ -340,10 +341,11 @@ impl AlacritreeApp {
     /// that is neither a session nor a multiplexer's pane.
     ///
     /// Such a pane has no `Session` of its own, so unlike a session row it
-    /// carries no attention flag or live-state axis: the harness mark is all
-    /// there is, and its hover is `managed_tooltip` — what the sidebar's own
-    /// unattached-agent row shows too.
-    fn palette_marks(&self, items: &[PaletteItem]) -> Vec<Option<(SessionMark, String)>> {
+    /// carries no latches or live reading of its own: the status its
+    /// multiplexer reports is all there is, and its hover is
+    /// `managed_tooltip`, what the sidebar's own unattached-agent row shows
+    /// too.
+    fn palette_marks(&self, items: &[PaletteItem]) -> Vec<Option<(ShownState, String)>> {
         if !self.config.ui.session_display.palette_marks {
             return vec![None; items.len()];
         }
@@ -352,20 +354,19 @@ impl AlacritreeApp {
             .map(|item| match &item.action {
                 PaletteAction::ActivateSession(id) => {
                     let session = self.sessions.iter().find(|s| s.id == *id)?;
-                    let activity =
-                        pane_backed_activity(session.activity(), self.session_pane_status(session));
                     let managed = self.session_managed(session);
                     session_status_mark(&RowStatus {
-                        attention: session.needs_attention,
-                        activity,
+                        pinged: session.needs_attention,
+                        done: session.done,
+                        activity: self.session_activity(session),
                         managed: managed.as_ref(),
                     })
                 },
                 PaletteAction::AttachPane(attach) => {
                     let pane = self.find_pane(&attach.key)?;
                     let managed = self.pane_managed(&attach.key, pane);
-                    let mark = managed.mark?;
-                    Some((SessionMark::Harness(mark), managed_tooltip(&managed)))
+                    let status = managed.status?;
+                    Some((ShownState::from(status), managed_tooltip(&managed)))
                 },
                 _ => None,
             })
@@ -571,12 +572,14 @@ fn paint_palette_section(ui: &mut egui::Ui, theme: &Theme, cols: &PaletteColumns
 /// their title and middle cell, reserve a location line, and use their detail
 /// tooltip across the entire hit target. Action rows retain their existing
 /// layout and elided-text tooltip.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn paint_palette_row(
     ui: &mut egui::Ui,
     theme: &Theme,
+    icons: &Icons<Color32>,
     cols: &PaletteColumns,
     item: &PaletteItem,
-    mark: Option<&(SessionMark, String)>,
+    mark: Option<&(ShownState, String)>,
     item_index: usize,
     selected: bool,
 ) -> egui::Response {
@@ -685,15 +688,7 @@ pub(super) fn paint_palette_row(
             egui::pos2(cols.mark_x(left), top),
             row_status_icon_size(theme),
         );
-        match *mark {
-            SessionMark::Attention => paint_attention_dot(ui, mark_rect, theme),
-            SessionMark::Harness(harness_mark) => {
-                paint_harness_mark(ui, Some(harness_mark), mark_rect, theme)
-            },
-            SessionMark::Agent(live) => {
-                paint_agent_mark(ui, agent_mark(live, theme), mark_rect, theme)
-            },
-        }
+        paint_status_mark(ui, *mark, icons, mark_rect, theme);
         if item.hover.is_none() {
             let mark_id = ui.id().with(("palette_status_mark", item_index));
             ui.interact(mark_rect, mark_id, egui::Sense::hover()).on_hover_text(hint.clone());

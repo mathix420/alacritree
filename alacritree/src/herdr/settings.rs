@@ -1,5 +1,5 @@
 //! Reading herdr's own configuration, so alacritree can name the chord that
-//! detaches a session and draw the indicator set herdr draws.
+//! detaches a session.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -7,8 +7,8 @@ use std::process::Stdio;
 use crate::{command_ext, jobs, wsl};
 use serde::Deserialize;
 
+use super::Settings;
 use super::cli::bounded;
-use super::{Indicators, Settings};
 use crate::multiplexer::Side;
 
 const DEFAULT_PREFIX: &str = "ctrl+b";
@@ -18,13 +18,6 @@ const DEFAULT_DETACH: &str = "prefix+q";
 struct RawHerdrConfig {
     #[serde(default)]
     keys: RawKeys,
-    #[serde(default)]
-    ui: RawUi,
-}
-
-#[derive(Deserialize, Default)]
-struct RawUi {
-    status_indicators: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -102,16 +95,8 @@ fn detach_chord_from(config: &str) -> Option<String> {
     })
 }
 
-fn indicators_from(config: &str) -> Indicators {
-    let parsed: RawHerdrConfig = toml::from_str(config).unwrap_or_default();
-    match parsed.ui.status_indicators.as_deref() {
-        Some("symbols") => Indicators::Symbols,
-        _ => Indicators::Dots,
-    }
-}
-
 fn settings_from(config: &str) -> Settings {
-    Settings { detach: detach_chord_from(config), indicators: indicators_from(config) }
+    Settings { detach: detach_chord_from(config) }
 }
 
 /// Where herdr looks for its config, mirroring its own resolution so both
@@ -247,47 +232,5 @@ detach = []
     #[test]
     fn an_unparseable_config_falls_back_to_the_defaults() {
         assert_eq!(detach_chord_from("[keys"), Some("Ctrl+B q".to_string()));
-    }
-
-    #[test]
-    fn the_indicator_set_follows_herdrs_own_choice() {
-        assert_eq!(indicators_from(""), Indicators::Dots);
-        assert_eq!(
-            indicators_from(
-                "[ui]
-status_indicators = \"symbols\"
-"
-            ),
-            Indicators::Symbols
-        );
-        assert_eq!(
-            indicators_from(
-                "[ui]
-status_indicators = \"dots\"
-"
-            ),
-            Indicators::Dots
-        );
-    }
-
-    #[test]
-    fn an_unknown_indicator_set_keeps_the_shipped_one() {
-        let cfg = "[ui]
-status_indicators = \"runes\"
-";
-        assert_eq!(indicators_from(cfg), Indicators::Dots);
-    }
-
-    #[test]
-    fn settings_carry_both_halves_of_the_config() {
-        let cfg = "[keys]
-prefix = \"f12\"
-[ui]
-status_indicators = \"symbols\"
-";
-        assert_eq!(settings_from(cfg), Settings {
-            detach: Some("F12 q".into()),
-            indicators: Indicators::Symbols
-        });
     }
 }

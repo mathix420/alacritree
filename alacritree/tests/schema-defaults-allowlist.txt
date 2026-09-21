@@ -28,6 +28,12 @@ RawGh.pr_status_concurrency
 RawIconStyle.color
 RawIconStyle.glyph
 RawIconStyle.size
+RawIcons.agent_blocked
+RawIcons.agent_done
+RawIcons.agent_idle
+RawIcons.agent_unknown
+RawIcons.agent_working
+RawIcons.attention
 RawIcons.herdr
 RawIndexed.color
 RawIndexed.index

@@ -15,8 +15,8 @@ use std::time::Instant;
 use serde_json::{Value, json};
 
 use super::model::{
-    AttachAnswer, AttachRequest, CreateAnswer, CreateRequest, HarnessMark, ListedPane, Managed,
-    StateTone, ViewState, ViewStep,
+    AttachAnswer, AttachRequest, CreateAnswer, CreateRequest, ListedPane, Managed, ViewState,
+    ViewStep,
 };
 use super::{
     CreatedPane, Launch, MultiplexerKind, MultiplexerSession, Pane, PaneKey, PaneStatus,
@@ -287,26 +287,15 @@ impl MultiplexerSession for Scripted {
         })
     }
 
-    fn managed(&self, side: &Side, pane: Option<&Pane>) -> Managed {
+    fn managed(&self, _side: &Side, pane: Option<&Pane>) -> Managed {
         Managed {
             multiplexer: MultiplexerKind::Scripted,
             detach: None,
             shared_view: !self.direct,
             kind: pane.and_then(|pane| pane.kind.clone()),
             title: pane.and_then(|pane| pane.title.clone()),
-            mark: pane.and_then(|pane| pane.status).map(|status| self.mark(side, status)),
+            status: pane.and_then(|pane| pane.status),
         }
-    }
-
-    fn mark(&self, _side: &Side, status: PaneStatus) -> HarnessMark {
-        let tone = match status {
-            PaneStatus::Blocked => StateTone::Blocked,
-            PaneStatus::Working => StateTone::Working,
-            PaneStatus::Done => StateTone::Done,
-            PaneStatus::Idle => StateTone::Idle,
-            PaneStatus::Unknown => StateTone::Unclear,
-        };
-        HarnessMark { glyph: "*", tone, label: status.label() }
     }
 
     fn attaches_directly(&self, _side: &Side, _has_agent: bool) -> bool {

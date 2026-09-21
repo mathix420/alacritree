@@ -33,7 +33,8 @@ impl AlacritreeApp {
     /// and a session owning its PTY belongs to no multiplexer.
     pub(super) fn session_json(&self, session: &AppSession, is_active_tab: bool) -> Value {
         let key = session.pane_key.as_ref();
-        let activity = pane_backed_activity(session.activity(), self.session_pane_status(session));
+        let activity = self.session_activity(session);
+        let done = session.done || self.session_pane_status(session) == Some(PaneStatus::Done);
         json!({
             "id": session.id,
             "title": session.title,
@@ -47,7 +48,7 @@ impl AlacritreeApp {
             "lines": session.size.screen_lines,
             "is_active_tab": is_active_tab,
             "needs_attention": session.needs_attention,
-            "agent": activity_json(activity),
+            "agent": activity_json(activity, done),
             "busy": key.is_none().then(|| session.is_busy()),
             "multiplexer": key.map(|key| self.session_multiplexer_json(key)),
         })
@@ -307,12 +308,15 @@ impl AlacritreeApp {
 
 /// `SessionActivity` as the reply spells it.  A plain shell is null rather
 /// than an object, so a consumer testing for presence needs no second field.
-fn activity_json(activity: SessionActivity) -> Value {
+///
+/// `state` is the live reading, except that a finished turn nobody has looked
+/// at yet reads `done`, the word herdr uses for the same thing.
+fn activity_json(activity: SessionActivity, done: bool) -> Value {
     match activity {
         SessionActivity::Shell => Value::Null,
         SessionActivity::Agent { name, live } => json!({
             "name": name,
-            "state": live.label(),
+            "state": if done { "done" } else { live.label() },
         }),
     }
 }
