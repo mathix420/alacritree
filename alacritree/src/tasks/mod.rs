@@ -5,3 +5,4 @@
 pub(crate) mod facts;
 pub(crate) mod scope;
 pub(crate) mod taskwarrior;
+pub(crate) mod tree;
