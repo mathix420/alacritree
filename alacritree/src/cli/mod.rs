@@ -9,6 +9,7 @@
 //! `state.toml` and git directly.  Commands that are meaningless without a
 //! window (anything about sessions) fail there rather than pretending.
 
+mod config_reference;
 mod crashes;
 mod doctor;
 mod install;
@@ -24,6 +25,7 @@ use clap_complete::Shell;
 
 use crate::ipc::protocol::{IpcRequest, LocalSocket, SendError, Transport};
 
+pub use config_reference::document as config_reference_document;
 pub use schema::document as schema_document;
 
 /// Redistributing the embedded subset obliges us to carry its notice, and

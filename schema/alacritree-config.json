@@ -1552,7 +1552,7 @@
         },
         "focus_priority_boost": {
           "default": false,
-          "description": "Put the session on screen one scheduling class above normal — its\nshell and every process that shell starts — so a busy machine cannot\nstarve what the user is typing into.  Follows focus.  Windows only.",
+          "description": "Put the session on screen, its shell and every process that shell\nstarts, one scheduling class above normal, so a busy machine cannot\nstarve what the user is typing into. Follows focus. Windows only;\nchanging it requires a restart.",
           "type": "boolean"
         },
         "font": {
@@ -1651,12 +1651,12 @@
           "type": "array"
         },
         "project_name": {
-          "description": "Template for a project row's label.",
+          "description": "Template for a project row's label, taking `$name` and `$path`. A\nmanual rename always wins over it.",
           "type": "string"
         },
         "reap_descendants_on_close": {
           "default": false,
-          "description": "End everything a session started when that session closes, at any\ndepth, except processes that ask to break away.  Windows only.",
+          "description": "End everything a session started when that session closes, at any\ndepth, except processes that ask to break away. Windows only;\nchanging it requires a restart.",
           "type": "boolean"
         },
         "scrollbar": {
@@ -1788,12 +1788,12 @@
         },
         "upstream_status": {
           "default": false,
-          "description": "Paint a badge on each worktree row for its branch's upstream state.\nLocal refs only: nothing fetches, so a branch deleted on the remote\nreads as tracked until something prunes locally.",
+          "description": "Paint a badge on each worktree row for its branch's upstream state.\nLocal refs only: nothing fetches, so a branch deleted on the remote\nreads as tracked until something prunes locally. A linked worktree\nthat overrides `branch.*` in its own `config.worktree` is read from the\nproject root, so that override is not seen.",
           "type": "boolean"
         },
         "vsync": {
           "default": true,
-          "description": "Wait for the display's refresh before showing a finished frame.",
+          "description": "Wait for the display's refresh before showing a finished frame. Off\ntrades tearing for lower keystroke-to-screen delay. Changing it\nrequires a restart.",
           "type": "boolean"
         },
         "worktree_liveness": {
@@ -1802,7 +1802,7 @@
           "type": "boolean"
         },
         "worktree_name": {
-          "description": "Template for a worktree row's label, e.g. `\"$branch $pr\"`.",
+          "description": "Template for a worktree row's label, e.g. `\"$branch $pr\"`. Takes\n`$name`, `$branch`, `$path`, `$pr` (as `#123`, needs\n`[integrations.gh] pr_status`) and `${var:fallback}`. Unset keeps the\nplain worktree name.",
           "type": "string"
         },
         "wsl": {
@@ -1852,7 +1852,7 @@
         },
         "quote": {
           "default": "auto",
-          "description": "How a path is quoted for the shell that receives it.  The five concrete\nmodes are wezterm's `quote_dropped_files` values.",
+          "description": "How a path is quoted for the shell that receives it. `\"auto\"` is POSIX\ninside a distro and the host's own style elsewhere; the five concrete\nmodes are wezterm's `quote_dropped_files` values. Only `\"posix\"` makes\nan arbitrary filename inert.",
           "enum": [
             "auto",
             "none",
@@ -1935,7 +1935,7 @@
         },
         "image_keep": {
           "default": 20,
-          "description": "How many pasted images to keep before the oldest are removed.",
+          "description": "How many pasted images to keep before the oldest are removed, at least\none. A directory named by `image_dir` is never swept.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"

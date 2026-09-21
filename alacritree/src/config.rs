@@ -3066,8 +3066,10 @@ struct RawUiDrop {
     sidebar: bool,
     /// Write a dropped file's path into the workspace scratchpad.
     scratchpad: bool,
-    /// How a path is quoted for the shell that receives it.  The five concrete
-    /// modes are wezterm's `quote_dropped_files` values.
+    /// How a path is quoted for the shell that receives it. `"auto"` is POSIX
+    /// inside a distro and the host's own style elsewhere; the five concrete
+    /// modes are wezterm's `quote_dropped_files` values. Only `"posix"` makes
+    /// an arbitrary filename inert.
     quote: ClosedSet<Quoting>,
     /// Rewrite a Windows path to its distro spelling when the session runs
     /// inside WSL.
@@ -3100,7 +3102,8 @@ struct RawUiPaste {
     image: bool,
     /// Where pasted images are written.  Unset uses a cache directory.
     image_dir: Option<String>,
-    /// How many pasted images to keep before the oldest are removed.
+    /// How many pasted images to keep before the oldest are removed, at least
+    /// one. A directory named by `image_dir` is never swept.
     image_keep: usize,
 }
 
@@ -3649,7 +3652,9 @@ struct RawUi {
     pr_status: Option<bool>,
     /// Paint a badge on each worktree row for its branch's upstream state.
     /// Local refs only: nothing fetches, so a branch deleted on the remote
-    /// reads as tracked until something prunes locally.
+    /// reads as tracked until something prunes locally. A linked worktree
+    /// that overrides `branch.*` in its own `config.worktree` is read from the
+    /// project root, so that override is not seen.
     upstream_status: bool,
     /// Re-check on a 1.5 s tick whether each listed worktree's checkout is
     /// still on disk, so a `git worktree remove` typed into one of our own
@@ -3662,9 +3667,13 @@ struct RawUi {
     pr_status_concurrency: Option<usize>,
     /// The font sidebars, tabs and dialogs are drawn with.
     font: RawUiFont,
-    /// Template for a worktree row's label, e.g. `"$branch $pr"`.
+    /// Template for a worktree row's label, e.g. `"$branch $pr"`. Takes
+    /// `$name`, `$branch`, `$path`, `$pr` (as `#123`, needs
+    /// `[integrations.gh] pr_status`) and `${var:fallback}`. Unset keeps the
+    /// plain worktree name.
     worktree_name: Option<String>,
-    /// Template for a project row's label.
+    /// Template for a project row's label, taking `$name` and `$path`. A
+    /// manual rename always wins over it.
     project_name: Option<String>,
     /// Deprecated WSL options, superseded by the top-level `[wsl]` table.
     wsl: RawUiWsl,
@@ -3679,17 +3688,21 @@ struct RawUi {
     focus_outline: RawFocusOutline,
     /// Clicking a sidebar moves keyboard focus to it.
     sidebar_click_focus: bool,
-    /// Put the session on screen one scheduling class above normal — its
-    /// shell and every process that shell starts — so a busy machine cannot
-    /// starve what the user is typing into.  Follows focus.  Windows only.
+    /// Put the session on screen, its shell and every process that shell
+    /// starts, one scheduling class above normal, so a busy machine cannot
+    /// starve what the user is typing into. Follows focus. Windows only;
+    /// changing it requires a restart.
     focus_priority_boost: bool,
     /// Open a session's PTY on a worker rather than in the frame that asked
     /// for it, so spawning does not stutter.
     async_session_spawn: bool,
     /// End everything a session started when that session closes, at any
-    /// depth, except processes that ask to break away.  Windows only.
+    /// depth, except processes that ask to break away. Windows only;
+    /// changing it requires a restart.
     reap_descendants_on_close: bool,
-    /// Wait for the display's refresh before showing a finished frame.
+    /// Wait for the display's refresh before showing a finished frame. Off
+    /// trades tearing for lower keystroke-to-screen delay. Changing it
+    /// requires a restart.
     vsync: bool,
     /// How paths are abbreviated where the UI writes them.
     path_style: RawPathStyle,

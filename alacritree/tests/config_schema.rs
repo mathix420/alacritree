@@ -1,32 +1,43 @@
-//! The committed `schema/alacritree-config.json` must match what
-//! `alacritree schema` generates.  A stale schema is worse than none: editors
-//! would report valid config as invalid, and stay quiet about the keys it does
-//! not know about.
+//! The committed `schema/alacritree-config.json` and `docs/config-reference.md`
+//! must match what the config types generate.  A stale schema is worse than
+//! none: editors would report valid config as invalid, and stay quiet about the
+//! keys it does not know about.
 //!
 //! `ALACRITREE_UPDATE_SCHEMA=1 cargo test -p alacritree --test config_schema`
-//! rewrites the file instead of failing, so the run that catches the drift is
+//! rewrites both files instead of failing, so the run that catches the drift is
 //! also the one that fixes it.
 
 use std::path::PathBuf;
 
-use alacritree::cli::schema_document;
+use alacritree::cli::{config_reference_document, schema_document};
+
+/// A path relative to the repository root, which sits beside the manifest dir.
+fn repo_path(relative: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join(relative)
+}
 
 fn schema_path() -> PathBuf {
-    // The manifest dir is `alacritree/`; the schema is published from the
-    // repository root beside it.
-    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../schema/alacritree-config.json"))
+    repo_path("schema/alacritree-config.json")
 }
 
 #[test]
 fn the_committed_schema_matches_the_config_types() {
-    let generated = schema_document();
-    let committed = std::fs::read_to_string(schema_path()).unwrap_or_default();
+    assert_current(schema_path(), &schema_document());
+}
+
+#[test]
+fn the_committed_config_reference_matches_the_schema() {
+    assert_current(repo_path("docs/config-reference.md"), &config_reference_document());
+}
+
+fn assert_current(path: PathBuf, generated: &str) {
+    let committed = std::fs::read_to_string(&path).unwrap_or_default();
     if committed == generated {
         return;
     }
     if std::env::var("ALACRITREE_UPDATE_SCHEMA").as_deref() == Ok("1") {
-        std::fs::create_dir_all(schema_path().parent().unwrap()).unwrap();
-        std::fs::write(schema_path(), &generated).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, generated).unwrap();
         return;
     }
     // Which key moved is what tells the reader whether the config types changed
@@ -40,10 +51,10 @@ fn the_committed_schema_matches_the_config_types() {
         .find(|(_, (a, b))| a != b)
         .map_or((0, "", ""), |(i, (a, b))| (i + 1, a, b));
     panic!(
-        "schema/alacritree-config.json is stale — regenerate with `ALACRITREE_UPDATE_SCHEMA=1 \
-         cargo test -p alacritree --test config_schema` (or `cargo run -p alacritree -- schema > \
-         schema/alacritree-config.json`)\n\nfirst difference at line {line}:\n  committed: \
-         {was}\n  generated: {now}"
+        "{} is stale, regenerate with `ALACRITREE_UPDATE_SCHEMA=1 cargo test -p alacritree --test \
+         config_schema`\n\nfirst difference at line {line}:\n  committed: {was}\n  generated: \
+         {now}",
+        path.display()
     );
 }
 
