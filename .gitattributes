@@ -3,4 +3,5 @@
 # CRLF, which reports a schema as stale, or a default as moved, when the file
 # is identical.
 schema/*.json text eol=lf
+docs/config-reference.md text eol=lf
 alacritree/tests/stock-config.json text eol=lf
