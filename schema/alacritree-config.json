@@ -74,6 +74,7 @@
                 "SelectNextWorkspace",
                 "SelectPreviousWorkspace",
                 "OpenScratchpad",
+                "OpenTasks",
                 "ToggleLeftSidebar",
                 "ToggleRightSidebar",
                 "AddProject",
