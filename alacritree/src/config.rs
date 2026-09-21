@@ -48,8 +48,8 @@ pub struct Config {
     pub shell: Option<ShellConfig>,
     pub selection: SelectionConfig,
     pub bindings: Vec<KeyBinding>,
-    /// Offer the IPC socket that `alacritree mcp` connects to.  Mirrors
-    /// alacritty's `[general] ipc_socket` (default on).
+    /// Offer the IPC socket that `alacritree mcp` connects to. Mirrors
+    /// alacritty's `[general] ipc_socket`.
     pub ipc_socket: bool,
     pub debug: DebugConfig,
     /// Start dir for sessions with no explicit workspace (the home tab);
@@ -138,21 +138,21 @@ fn changes(mine: &serde_json::Value, stock: &serde_json::Value) -> Option<serde_
 /// alacritty's `[debug]` section, plus one alacritree-only key.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DebugConfig {
-    /// alacritree-only, set in `alacritree.toml`.  Default on: a crash that
-    /// leaves no record is the failure this exists to prevent.
+    /// alacritree-only, set in `alacritree.toml`. A crash that leaves no
+    /// record is the failure this exists to prevent.
     pub crash_log: bool,
     /// Upstream's name and upstream's default.
     pub persistent_logging: bool,
     /// alacritree-only, set in `alacritree.toml`.  Log what the GPU grid's
     /// paint callback costs: the wall time of issuing a frame, and the GPU's
-    /// own time for the upload and each of the three draws.  Off by default;
-    /// timer queries are cheap but not free, and the line is only meaningful
-    /// to someone reading it.  Needs `[ui] gpu_grid` and a GL 3.3 context.
+    /// own time for the upload and each of the three draws. Timer queries are
+    /// cheap but not free, and the line is only meaningful to someone reading
+    /// it.  Needs `[ui] gpu_grid` and a GL 3.3 context.
     /// Keeps this session's log file for as long as it is on, since the
     /// report has nowhere else to go.
     pub gpu_timing: bool,
-    /// alacritree-only, set in `alacritree.toml`.  Off by default;
-    /// `ALACRITREE_FRAME_LOG` overrides it.
+    /// alacritree-only, set in `alacritree.toml`. `ALACRITREE_FRAME_LOG`
+    /// overrides it.
     pub frame_log: bool,
     /// alacritree-only, set in `alacritree.toml`.  Crash artifacts and session
     /// logs go here.  `None` means whatever `logdir::log_dir` resolves.
@@ -187,8 +187,8 @@ pub struct FontConfig {
     /// this offset (they already align to the cell), matching alacritty.
     pub glyph_offset: FontDelta,
     /// When true, render box drawing / block / Powerline / Symbols-for-Legacy-
-    /// Computing characters from the built-in renderer instead of the font.
-    /// Default `true` matches alacritty.
+    /// Computing characters from the built-in renderer instead of the font,
+    /// as alacritty does.
     pub builtin_box_drawing: bool,
     /// Ordered fallback families or font file paths, consulted after the four
     /// primary faces and before the automatic system fallback chain.
@@ -366,9 +366,9 @@ pub struct Profile {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SelectionConfig {
     pub semantic_escape_chars: String,
-    /// Mirror auto-copy of selections to the regular clipboard.  Off by default
-    /// (matches alacritty); when off, drag-select still writes to the X11
-    /// PRIMARY / Wayland primary-selection buffer for middle-click paste.
+    /// Mirror auto-copy of selections to the regular clipboard, as alacritty
+    /// does. When off, drag-select still writes to the X11 PRIMARY / Wayland
+    /// primary-selection buffer for middle-click paste.
     pub save_to_clipboard: bool,
 }
 
@@ -530,9 +530,8 @@ impl Default for PathSpelling {
     }
 }
 
-/// `[ui.drop]`: what dragging files onto the window does.  Every target
-/// accepts drops by default; each one can be switched off on its own, and
-/// `enabled` turns the lot off.
+/// `[ui.drop]`: what dragging files onto the window does. Each target can be
+/// switched off on its own, and `enabled` turns the lot off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct DropConfig {
     /// Master switch; false ignores every drop.
@@ -752,7 +751,7 @@ impl Default for HerdrConfig {
 
 /// `[integrations.zellij]`: whether alacritree lists the panes of running
 /// zellij sessions in the sidebar, where a new one opens, and the glyph that
-/// marks them.  Off unless enabled.
+/// marks them.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ZellijConfig {
     /// The native zellij binary.
@@ -1115,8 +1114,8 @@ pub struct SessionDisplay {
 }
 
 /// alacritree-only `[ui.font]`: font family/size for the chrome (sidebars,
-/// modals — everything that isn't the terminal grid).  Both fields default
-/// to deriving from `[font]`, so an absent table changes nothing.
+/// modals, everything that isn't the terminal grid). An unset family or size
+/// derives from `[font]`, so an absent table changes nothing.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct UiFont {
     pub family: Option<String>,
@@ -1129,8 +1128,8 @@ pub struct UiFont {
     /// Family used for bold-italic chrome text; falls back to `family` when unset.
     pub bold_italic_family: Option<String>,
     /// Register the bundled symbol face as the last resort in each chrome
-    /// family.  On by default: it is only ever reached for a glyph no earlier
-    /// face could draw, so it cannot change a chrome that already renders.
+    /// family. It is only ever reached for a glyph no earlier face could draw,
+    /// so it cannot change a chrome that already renders.
     pub builtin_symbols: bool,
 }
 
@@ -1229,9 +1228,8 @@ impl<C: Copy> Icons<C> {
 }
 
 /// `[ui.focus_outline]`: stroke a border around a panel while it owns
-/// keyboard focus.  Per-panel toggles (`sidebar` covers both side panels),
-/// shared color/thickness; both toggles default off so unmodified config
-/// keeps today's look.
+/// keyboard focus. Per-panel toggles (`sidebar` covers both side panels),
+/// shared color/thickness.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct FocusOutline {
     pub sidebar: bool,
@@ -1303,7 +1301,7 @@ impl<C: Copy> TextEmphasis<C> {
 }
 
 /// `[ui.path_style]`: how each site spells a path, plus the two emphases the
-/// `Zed` style paints with.  Every field defaults to today's rendering.
+/// `Zed` style paints with.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct PathStyleConfig<C = Rgb> {
     /// The `diff: <path>` pane title.
@@ -1377,8 +1375,7 @@ fn finite(raw: &str) -> Option<f32> {
 }
 
 /// `[ui.decorations]`: corrections to what the font reports for its underline
-/// and strikeout, for a face whose tables are wrong.  Every knob is a no-op by
-/// default, so an unmodified config draws what the face asked for.
+/// and strikeout, for a face whose tables are wrong.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct Decorations {
     pub underline_position: Adjust,
@@ -1433,10 +1430,9 @@ pub struct UiTheme {
     pub confirm_session_detach: bool,
     /// Whether the sidebar's sessions toggle also counts a listed but
     /// unattached herdr row as occupying a workspace — an agent nothing is
-    /// attached to, and, once `show_panes` is on, an agentless pane.  Off by
-    /// default: such a row is a `WorkspaceEntry::Pane`, not a
-    /// [`crate::session::Session`], so `false` reproduces the toggle's
-    /// original session-only behavior.
+    /// attached to, and, once `show_panes` is on, an agentless pane. Such a
+    /// row is a `WorkspaceEntry::Pane`, not a [`crate::session::Session`], so
+    /// `false` reproduces the toggle's original session-only behavior.
     pub sessions_filter_counts_detached: bool,
     /// What closing the last session in the on-screen workspace does.
     pub last_session_close: LastSessionClose,
@@ -1468,9 +1464,9 @@ pub struct UiTheme {
     pub session_reorder: SessionReorder,
     /// Draw the terminal grid through an OpenGL paint callback instead of
     /// handing epaint a mesh: one twelve-byte record per cell, and the vertex
-    /// shader derives the quads.  Off by default — it needs a GL 3 context and
-    /// bypasses the renderer every other panel goes through, so an unmodified
-    /// config keeps the path that has always drawn the grid.  A context too
+    /// shader derives the quads. It needs a GL 3 context and bypasses the
+    /// renderer every other panel goes through, so an unmodified config keeps
+    /// the path that has always drawn the grid.  A context too
     /// old for instanced arrays logs once, costs the frame it was found on,
     /// and paints the mesh from the next one.
     pub gpu_grid: bool,
@@ -1478,48 +1474,48 @@ pub struct UiTheme {
     /// ([`Decorations`]).  Only the GPU grid reads these; the mesh path draws
     /// a straight rule at a fixed offset either way.
     pub decorations: Decorations,
-    /// Paint a badge showing each worktree branch's upstream state.  Off by
-    /// default so an unmodified config does no extra ref work.  The state comes
+    /// Paint a badge showing each worktree branch's upstream state. An
+    /// unmodified config does no extra ref work.  The state comes
     /// from local refs only — nothing fetches, so a branch deleted on the remote
     /// still reads as tracked until something prunes.
     pub upstream_status: bool,
     /// Re-check on a 1.5 s tick whether each listed worktree's checkout is
     /// still on disk, so a `git worktree remove` typed into one of our own
-    /// sessions greys the row without waiting for a manual refresh.  On by
-    /// default; the escape hatch exists because the probe is a `stat` per
-    /// listed row and an exotic filesystem could make that expensive.
+    /// sessions greys the row without waiting for a manual refresh. The probe
+    /// is a `stat` per listed row, which an exotic filesystem can make
+    /// expensive.
     pub worktree_liveness: bool,
     pub icons: Icons,
     pub focus_outline: FocusOutline,
-    /// `[ui] scrollbar`: sidebar scrollbar style, "floating" (default) or
-    /// "solid" (reserved gutter, never covers row icons).
+    /// `[ui] scrollbar`: sidebar scrollbar style, "floating" or "solid"
+    /// (reserved gutter, never covers row icons).
     pub scrollbar: ScrollbarStyle,
     /// `[ui] sidebar_click_focus`: clicking a sidebar moves keyboard focus to
-    /// it (so filter typing works without the focus shortcut).  Off by default
-    /// so unmodified configs keep click-through-to-terminal behavior.
+    /// it (so filter typing works without the focus shortcut). An unmodified
+    /// config keeps click-through-to-terminal behavior.
     pub sidebar_click_focus: bool,
     /// `[ui] focus_priority_boost`: put the session on screen one scheduling
     /// class above normal — its shell and every process that shell starts, at
     /// any depth — so a build saturating the machine cannot starve what the
     /// user is typing into.  Follows focus, and raises nothing while the
-    /// window is in the background.  Off by default.  Windows only.
+    /// window is in the background. Windows only.
     pub focus_priority_boost: bool,
     /// `[ui] async_session_spawn`: open a session's PTY on a worker instead
     /// of inside the frame that asked for it.  Creating a console process
     /// costs milliseconds when the machine is idle and hundreds when it is
     /// busy, and the frame pays all of it, so the click that opens a tab is
     /// what stutters.  The tab appears at once and starts painting when its
-    /// PTY attaches; anything typed in between is replayed.  Off by default.
+    /// PTY attaches; anything typed in between is replayed.
     pub async_session_spawn: bool,
     /// `[ui] reap_descendants_on_close`: end everything a session started when
     /// that session closes, at any depth.  The console reaps only the clients
     /// attached to it, so a process that left the console — an editor's search
     /// helper, anything started detached — otherwise outlives the terminal.  A
     /// process that means to survive can still say so with
-    /// `CREATE_BREAKAWAY_FROM_JOB`.  Off by default.  Windows only.
+    /// `CREATE_BREAKAWAY_FROM_JOB`. Windows only.
     pub reap_descendants_on_close: bool,
-    /// `[ui] vsync`: block each present until the display's next refresh.  On
-    /// by default, as upstream eframe has it.  Turning it off presents a
+    /// `[ui] vsync`: block each present until the display's next refresh, as
+    /// upstream eframe does. Turning it off presents a
     /// finished frame immediately, trading tearing for the queueing delay
     /// between a keystroke's frame and the screen.
     pub vsync: bool,
@@ -1532,8 +1528,7 @@ pub struct UiTheme {
     /// `[ui] project_name`: template for project row labels (`$name`, `$path`).
     /// A manual rename (`Project.label`) always wins over the template.
     pub project_name: Option<String>,
-    /// `[ui.path_style]`: per-site path abbreviation.  All `Full` by default,
-    /// which renders every path byte-for-byte as it does today.
+    /// `[ui.path_style]`: per-site path abbreviation.
     pub path_style: PathStyleConfig,
     /// `[ui.drop]`: what a file dragged onto the window does.
     pub drop: DropConfig,

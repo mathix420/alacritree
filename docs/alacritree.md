@@ -80,7 +80,7 @@ herdr is a terminal workspace manager for coding agents. When a herdr server is 
 
 - **Panes with no agent.** `[integrations.herdr] show_panes` widens the listing from the panes herdr detected an agent in to every pane it owns, so a herdr pane running a plain shell gets a row too. Such a row is named by the pane's own title and carries no status word, since `unknown` is what herdr calls an agent it cannot classify rather than a way of saying there is none. Opening one shares herdr's view of the tab that holds it: every `herdr agent` subcommand resolves its target through the agent registry, which holds nothing for such a pane, so a direct attach is never offered for it whatever `attach` says. The unit herdr can be pointed at is the tab, so in a tab holding several panes the attach lands on the whole split: the pane is drawn, but keyboard focus sits wherever herdr last left it, and herdr's own pane chord moves it.
 - **Attaching.** Enter or a click opens a session attached to that agent, and the row is replaced by the session's own row, which keeps the herdr mark so an attached agent still says where it lives. Hovering either row spells out the same sentence — the state, the harness, and what herdr calls the pane, with the way out after them. Detaching is herdr's own chord, not one of alacritree's, read from herdr's `config.toml` so a rebound `keys.prefix` or `keys.detach` is what you are told. The row's `×` ends the attach and leaves the pane running under herdr, so it offers to detach rather than to close, and the agent's own row comes back. Whether it asks first is `[ui] confirm_session_detach`, a switch of its own: a detach destroys nothing, so the busy question `confirm_session_close` asks has no answer here, and turning one off says nothing about the other. The same attach is reachable from outside the window too, as `alacritree multiplexer attach <side> <terminal-id>` and as the `attach_multiplexer_pane` MCP tool, both naming the pane by the side and terminal id `multiplexer list` reports and both waiting to reply until the session can be read. A pane can also be created from outside the window, as `alacritree multiplexer create` and as the `create_multiplexer_pane` MCP tool: the side defaults to the one the focused session's own pane belongs to and the workspace to the focused one, and the new pane appears in the sidebar under the workspace its directory matches, like any other. A workspace a WSL side has no path for, such as one on a network share, is refused before herdr is asked, so no pane opens somewhere else under its name. The new pane runs a shell, so its session shares herdr's view of the tab holding it, as for any pane with no agent. The same create is bindable as `NewMultiplexerPane` and reachable from the command palette (`Ctrl+K`). The whole set moves at once too: `AttachAllMultiplexerPanes` opens a session on every listed pane nothing holds yet and leaves the user in the workspace they asked from, and `DetachAllMultiplexerPanes` ends every session attached to a pane, asking `confirm_session_detach` once for the batch rather than once per session. Neither carries a default key binding.
-- **Finding an agent by name.** The command palette (`Ctrl+K`) lists agents alongside sessions: an attached one sits under *Open sessions*, named the way its sidebar row is, and one nothing is attached to sits under *Herdr agents*, where Enter attaches it in the workspace its working directory matched. Typing `herdr` brings up both kinds. The sidebar's own search (`/`) reaches agents and session titles too when `[ui] search_depth` is `"sessions"`, so a query naming one agent shows that agent rather than its whole workspace; at the default `"workspaces"` a query only ever matches project and worktree names, and a query naming the workspace still shows everything under it. A session the sidebar does not list has no row to match — by default a workspace's only shell is folded into its workspace row, which `session_display.sidebar_always` turns off.
+- **Finding an agent by name.** The command palette (`Ctrl+K`) lists agents alongside sessions: an attached one sits under *Open sessions*, named the way its sidebar row is, and one nothing is attached to sits under *Herdr agents*, where Enter attaches it in the workspace its working directory matched. Typing `herdr` brings up both kinds. The sidebar's own search (`/`) reaches agents and session titles too when `[ui] search_depth` is `"sessions"`, so a query naming one agent shows that agent rather than its whole workspace; at `"workspaces"` a query only ever matches project and worktree names, and a query naming the workspace still shows everything under it. A session the sidebar does not list has no row to match. Unless `session_display.sidebar_always` is on, a workspace's only shell is folded into its workspace row.
 - **Order.** A workspace draws its own shell sessions first, then every herdr pane it holds — the sessions attached to one and the agents nothing is attached to alike — in herdr's own order. Attaching therefore changes how a pane is drawn and never where it sits, and neither does detaching or a restart. Reordering is for alacritree's own sessions: a herdr pane's place belongs to herdr, so drag and `MoveSessionUp` / `MoveSessionDown` pass over one. Sort the panes in herdr and the sidebar follows within a poll.
 - **Status.** A herdr row draws the same status marks as a native session, from alacritree's own `[ui] status_indicators` set, so a pane and a native session in the same state look the same. herdr reports blocked, working, done and idle, and the row keeps all four apart. A status alacritree does not recognise shows as unknown rather than idle. An attached agent's session row takes herdr's word too, so a dialog the pane title never mentions still reaches the sidebar.
 - **Native Windows.** herdr cannot attach a single agent there, so attaching focuses the pane in your own herdr window and shares the whole herdr session — the view resizes with the alacritree pane, and the tooltip says `shared view`. Each row still gets its own session, so every attached agent keeps its `×` and its place in the tab cycle. Every one of herdr's clients draws the same focused pane, though, so alacritree points herdr at the pane of whichever shared view you are looking at: switching to a session moves herdr's focus, in your own herdr window too. Moving that focus inside herdr rather than from the sidebar leaves the session showing a pane its row does not name, until you pick a row again. Both the focus and the session-name lookup are herdr processes, so they always run off the UI thread and the window keeps painting while herdr answers. `[integrations.herdr] attach = "session"` asks for that same shared view on every side, which is worth having where a direct attach costs you something: herdr repaints an attached pane row by row, so the terminal sees each soft wrap as a line break and a selection copies a wrapped command broken across lines, while herdr's own client knows where the wraps are.
@@ -108,7 +108,7 @@ background thread and streams progress steps back to the UI:
    the terminal — every other key in the file is preserved.
 
 Worktrees are created under
-`<base>/<project>-<hash>/<branch>`, where `<base>` defaults to
+`<base>/<project>-<hash>/<branch>`, where an unset `<base>` is
 `~/.alacritree/worktrees` so they never clutter the repo's parent directory
 and stay grouped per app. The base is configurable per `[workspace]` in
 `alacritree.toml` (see Configuration below); changing it never moves existing
@@ -141,7 +141,7 @@ so the panel stays responsive even on large repos. A faster cheap path
 and just counts what `git worktree remove` would reject.
 
 Clicking a file opens its diff in a pane, and clicking it again closes the
-pane. `[integrations.diff_viewer]` picks what that pane runs: delta by default,
+pane. `[integrations.diff_viewer]` picks what that pane runs: delta,
 tuicr for a review whose comments agents can read, or a custom command. With
 `section_buttons = true` each section header also gets a button that opens the
 whole section at once; the `ReviewStaged`, `ReviewUnstaged` and `ReviewBranch`
@@ -324,7 +324,7 @@ Alacritty's config surface.
 
 ### `builtin_symbols`
 
-`true` by default. Alacritree bundles a small font carrying only the glyphs
+Alacritree bundles a small font carrying only the glyphs
 it paints itself (`⌂`, `⌫`, `⇅`, `✓` and about 25 others), registered as the
 **last** entry in each chrome font family.
 
@@ -390,41 +390,41 @@ status_indicators  = "dots" # agent status marks, on native and herdr rows
                             # braille loader in both. A row shows its loudest
                             # state: blocked, done, pinged, working, idle,
                             # unknown
-scrollbar          = "floating"  # sidebar scrollbar: "floating" (default, thin
-                                 # overlay that expands over the row icons on
-                                 # hover) or "solid" (reserved gutter that
-                                 # never covers the icons)
+scrollbar          = "floating"  # sidebar scrollbar: "floating" (thin overlay
+                                 # that expands over the row icons on hover)
+                                 # or "solid" (reserved gutter that never
+                                 # covers the icons)
 sidebar_click_focus = true  # clicking a sidebar moves keyboard focus to it;
                             # picking a session/worktree focuses the terminal
-                            # instead (default false)
+                            # instead
 sidebar_focus      = "preserve"  # how far the projects sidebar goes when the
                                   # cursor's row stops being rendered.
-                                  # "preserve" (default): a filtered-out cursor
-                                  # climbs to its nearest visible ancestor and
-                                  # returns when the filter widens; a deleted row
-                                  # slides to a sibling bounded by its parent.
+                                  # "preserve": a filtered-out cursor climbs to
+                                  # its nearest visible ancestor and returns
+                                  # when the filter widens; a deleted row slides
+                                  # to a sibling bounded by its parent.
                                   # "follow": also moves the terminal to a delete
                                   # landing that has a live session, and lands a
                                   # closed session on its neighbour instead of on
                                   # the workspace's first session
 sidebar_follow_active = false  # scroll the projects sidebar to the session on
                                 # screen whenever it changes — a cycling key, a
-                                # click, the palette, an IPC request (default
-                                # false); the cursor is left where it was
+                                # click, the palette, an IPC request; the
+                                # cursor is left where it was
 sidebar_scroll_align = "minimal"  # where a row a sidebar scrolled to is
-                                   # parked. "minimal" (default) rests it
-                                   # against whichever edge it entered from.
+                                   # parked. "minimal" rests it against
+                                   # whichever edge it entered from.
                                    # "center" re-centres the list on every
                                    # cursor step, and scrolls a clicked row
                                    # out from under the pointer — not a
                                    # scrolloff, the row always lands mid-panel
 vsync              = true   # restart required — wait for the display's refresh
-                            # before showing a finished frame (default true).
+                            # before showing a finished frame.
                             # false presents each frame as soon as it is drawn,
                             # trading tearing for lower keystroke-to-screen delay
 focus_priority_boost = false  # Windows only, restart required — put the
                               # session on screen one scheduling class above
-                              # normal (default false).
+                              # normal.
                               # A program that redraws its line as you type
                               # needs CPU for every keystroke, and at normal
                               # priority a build saturating every core starves
@@ -436,7 +436,7 @@ focus_priority_boost = false  # Windows only, restart required — put the
                               # in the background
 async_session_spawn = false   # open a session's PTY on a worker rather than
                               # in the frame that asked for it, so spawning
-                              # does not stutter (default false).
+                              # does not stutter.
                               # Creating a console process costs milliseconds
                               # when the machine is idle and hundreds when it is
                               # busy, and the frame pays all of it. The tab
@@ -444,7 +444,7 @@ async_session_spawn = false   # open a session's PTY on a worker rather than
                               # attaches; anything typed in between is replayed
 reap_descendants_on_close = false  # Windows only, restart required — when a
                               # session closes, end everything it started at
-                              # any depth (default false).
+                              # any depth.
                               # The console reaps only the programs attached to
                               # it, so a helper that left the console — an
                               # editor's background search, anything started
@@ -456,19 +456,19 @@ reap_descendants_on_close = false  # Windows only, restart required — when a
                               # with CREATE_BREAKAWAY_FROM_JOB
 search_scope       = "filtered"  # whether a sidebar search is confined by the
                                  # active toggle filters
-                                 # "filtered" (default): a query narrows what
+                                 # "filtered": a query narrows what
                                  # the toggles already allow
                                  # "all": a query reaches every row; the
                                  # toggles resume when it empties
 search_depth       = "workspaces"  # how far a sidebar query reaches
-                                   # "workspaces" (default): matches project
+                                   # "workspaces": matches project
                                    # and worktree names only
                                    # "sessions": also matches session titles
                                    # and herdr agent names
 sidebar_tooltips   = "elided"    # when a sidebar row spells its full name out
                                  # on hover — both sidebars, so a git panel
                                  # path answers to it like a worktree name
-                                 # "elided" (default): only where the row had
+                                 # "elided": only where the row had
                                  # to cut the name off
                                  # "always": on every row — a row without a
                                  # tooltip ends the run in which egui reopens
@@ -476,7 +476,7 @@ sidebar_tooltips   = "elided"    # when a sidebar row spells its full name out
                                  # list stalls on each name that fits
                                  # "off": never
 icon_tooltips      = true        # whether a sidebar icon explains itself on
-                                 # hover (default true) — what a button does
+                                 # hover: what a button does
                                  # ("add project", "close session", …) and what
                                  # a status badge reports: the agent running in
                                  # a row, a row asking to be looked at, a
@@ -486,7 +486,7 @@ icon_tooltips      = true        # whether a sidebar icon explains itself on
                                  # about a name the row had to cut off: an
                                  # icon's hint never depends on panel width
 confirm_session_close = "never"  # when the sidebar × asks before killing a PTY:
-                                 # "never" (default) | "busy" | "always"
+                                 # "never" | "busy" | "always"
 confirm_session_detach = true    # whether the × on a harness-managed row, or
                                  # detaching every multiplexer pane, asks
                                  # before detaching. Its own switch, since a
@@ -495,18 +495,17 @@ confirm_session_detach = true    # whether the × on a harness-managed row, or
 sessions_filter_counts_detached = false  # whether the sidebar's sessions
                                          # toggle also counts a listed detached
                                          # herdr agent as occupying a workspace
-                                         # (default false)
 last_session_close = "respawn"   # what happens when the on-screen workspace
                                  # stops having sessions, whether the last one
                                  # closed or the worktree was deleted:
-                                 # "respawn" (default) starts a fresh one,
+                                 # "respawn" starts a fresh one,
                                  # "navigate" moves to another workspace,
                                  # "ring_global" and "ring_project" move to the
                                  # nearest surviving session in the ring, else
                                  # home
 hold_exited_sessions = "never"   # whether a session whose child has exited
                                  # stays on screen instead of closing with it
-                                 # "never" (default): every exit closes its
+                                 # "never": every exit closes its
                                  # session
                                  # "on_error": a non-zero exit is held, so the
                                  # error the child printed survives
@@ -520,9 +519,8 @@ hold_exited_sessions = "never"   # whether a session whose child has exited
                                  # of what happened.
 upstream_status    = false  # paint a badge on each worktree row for its
                             # branch's upstream state — level, diverged, gone,
-                            # or untracked (default false; also gates whether
-                            # the state is computed at all, so it costs
-                            # nothing when off)
+                            # or untracked. Also gates whether the state is
+                            # computed at all, so it costs nothing when off.
                             # Local refs only: nothing fetches, so a branch
                             # deleted on the remote still reads as tracked
                             # until something prunes locally.
@@ -557,13 +555,13 @@ drag  = false               # drag a session row with the mouse to reorder it
 scope = "workspace"         # how far a reorder may carry a session:
                             # "workspace" | "project" | "anywhere"
 
-[ui.focus_outline]          # off by default, which keeps the current look
+[ui.focus_outline]          # outline the panel that has keyboard focus
 sidebar   = false           # outline the projects sidebar when it has focus
 terminal  = false           # outline the terminal when it has focus
 color     = "#6a9fb5"       # unset falls back to the theme accent
 thickness = 1.0             # logical pixels, not scaled by ui_scale
 
-[ui.path_style]             # per-site path abbreviation, all "full" by default
+[ui.path_style]             # per-site path abbreviation
 diff_title = "full"         # "full" | "fish" (a/b/c) | "zed" (leading dirs cut)
 git_rows   = "full"
 git_header = "full"
@@ -632,8 +630,9 @@ files       = true          # paste the paths of files and folders copied in a
                             # file manager, as Windows Terminal does
 image       = true          # write a clipboard bitmap (a Win+Shift+S capture)
                             # to a PNG and paste its path
-image_dir   = "~/shots"     # where those PNGs go (default: the per-user cache
-                            # on Unix; %TEMP%/alacritree/clipboard on Windows).
+image_dir   = "~/shots"     # where those PNGs go. Unset uses the per-user
+                            # cache on Unix, %TEMP%/alacritree/clipboard on
+                            # Windows.
                             # A directory you name here is never swept — set it
                             # and you keep every image and clean up yourself
 image_keep  = 20            # how many PNGs the default directory keeps.
@@ -730,7 +729,7 @@ attach           = "agent"  # what opening a row attaches to. "agent" opens the
                             # attach there
 
 [workspace]
-worktree_dir = "~/dev/worktrees"   # base dir for new worktrees (default ~/.alacritree/worktrees)
+worktree_dir = "~/dev/worktrees"   # base dir for new worktrees; unset uses ~/.alacritree/worktrees
 
 [[workspace.overrides]]            # optional per-project override
 project = "~/Git/github/alacritree"
@@ -738,8 +737,8 @@ worktree_dir = "D:/wt"
 
 [wsl]                       # how the app talks to distros, not presentation
 resident_helper = true      # keep one helper process per distro for foreground
-                            # probes, batched git queries, and tool discovery
-                            # (default true). false restores one-shot wsl.exe
+                            # probes, batched git queries, and tool discovery.
+                            # false restores one-shot wsl.exe
                             # spawns; WSL sessions then always report "no TUI",
                             # so FocusLeft/FocusRight always move panel focus
 automount_root = "/mnt"     # distro-side mount point for Windows drives,

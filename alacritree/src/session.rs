@@ -1796,9 +1796,8 @@ mod tests {
         assert!(hold_notice(Some("Ctrl+Shift+W")).contains("press Ctrl+Shift+W to close it"));
     }
 
-    /// Zero grace is the config default and must keep the pre-debounce
-    /// behavior: the trigger frame latches, even mid-spinner (a BEL from a
-    /// still-working agent latched before the debounce existed too).
+    /// Zero grace keeps the pre-debounce behavior: the trigger frame latches,
+    /// even mid-spinner.
     #[test]
     fn zero_grace_fires_on_the_trigger_frame() {
         let now = Instant::now();
