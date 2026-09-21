@@ -5017,12 +5017,7 @@ mod tests {
             .expect("the create queued a shared view");
         let side = Side::Wsl("distro".into());
         assert_eq!(queued.key, herdr_pane_key(side.clone(), "term-new"));
-        assert_eq!(queued.target, PaneTarget {
-            side,
-            pane_id: "w1:p2".into(),
-            tab_id: Some("w1:t2".into()),
-            has_agent: false,
-        });
+        assert_eq!(queued.target, PaneTarget { side, pane_id: "w1:p2".into(), has_agent: false });
         assert_eq!(queued.request.workspace, workspace);
         assert_eq!(app.current_workspace, workspace);
         assert!(app.multiplexers.herdr_for_test().pending_create_for_test().is_empty());
@@ -5108,12 +5103,8 @@ mod tests {
         };
         app.multiplexers.herdr_mut_for_test().pending_attach_mut_for_test()[0].job = running();
         let key = herdr_pane_key(Side::Wsl("distro".into()), "term-new");
-        let unlisted = PaneTarget {
-            side: key.side.clone(),
-            pane_id: "w1:p2".into(),
-            tab_id: Some("w1:t2".into()),
-            has_agent: false,
-        };
+        let unlisted =
+            PaneTarget { side: key.side.clone(), pane_id: "w1:p2".into(), has_agent: false };
         let switch = WorkspaceSwitch { to: None, from: None };
         let ctx = Context::default();
 

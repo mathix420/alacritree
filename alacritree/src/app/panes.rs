@@ -182,12 +182,10 @@ impl AlacritreeApp {
             match answer.pane {
                 Ok(pane) => {
                     // A new pane starts a shell, so nothing is in it for an
-                    // agent registry to resolve until an agent starts there,
-                    // and until then the tab is its only handle.
+                    // agent registry to resolve until an agent starts there.
                     let unlisted = PaneTarget {
                         side: answer.side.clone(),
                         pane_id: pane.pane_id,
-                        tab_id: Some(pane.tab_id),
                         has_agent: false,
                     };
                     let key = self.multiplexers.get(kind).key(&answer.side, &pane.terminal_id);

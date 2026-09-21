@@ -3,11 +3,15 @@
 //! A missing binary or an absent server is a silent no-op.  This is the only
 //! file that builds a herdr command line, the event stream's bridge included.
 
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use serde::Deserialize;
+use serde_json::{Value, json};
+
 use crate::config::AttachMode;
-use crate::multiplexer::{CreatedPane, PaneTarget, Side};
+use crate::multiplexer::{CreatedPane, Side};
 use crate::tools::{self, Tool};
 use crate::{command_ext, jobs};
 
@@ -86,49 +90,80 @@ pub(super) fn bounded<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static)
     rx.recv_timeout(GESTURE_TIMEOUT).ok()
 }
 
-/// The `herdr` subcommand that brings `target`'s pane to the front of the
-/// user's own herdr window.  `agent focus` resolves its target through the
-/// agent registry and answers `agent_not_found` for a pane with no agent in
-/// it, so such a pane is reached by focusing the tab that holds it.
-pub(super) fn focus_args(target: &PaneTarget) -> Vec<String> {
-    match (target.has_agent, &target.tab_id) {
-        (false, Some(tab_id)) => vec!["tab".into(), "focus".into(), tab_id.clone()],
-        _ => focus_pane_args(&target.pane_id),
-    }
+/// The socket request that brings one pane to the front of the user's own
+/// herdr window.  The CLI has no way to name a pane with no agent in it:
+/// `agent focus` refuses one, and `tab focus` lands on whichever pane of the
+/// tab herdr last focused.
+fn focus_request(pane_id: &str) -> String {
+    let request = json!({
+        "id": "alacritree:focus",
+        "method": "pane.focus",
+        "params": { "pane_id": pane_id },
+    });
+    format!("{request}\n")
 }
 
-/// The `herdr` subcommand that focuses one pane by id.
-pub(super) fn focus_pane_args(pane_id: &str) -> Vec<String> {
-    vec!["agent".into(), "focus".into(), pane_id.into()]
+/// herdr's answer to a one-shot request, or the message it refused with.
+fn decode_answer(line: &str) -> Result<(), String> {
+    #[derive(Deserialize)]
+    struct Answer {
+        result: Option<Value>,
+        error: Option<Refusal>,
+    }
+    #[derive(Deserialize)]
+    struct Refusal {
+        message: String,
+    }
+    match serde_json::from_str::<Answer>(line) {
+        Ok(Answer { error: Some(refusal), .. }) => Err(refusal.message),
+        Ok(Answer { result: Some(_), .. }) => Ok(()),
+        _ => Err(line.trim().to_string()),
+    }
 }
 
 /// Focuses one pane in the user's own herdr window, the first half of the
-/// native-Windows attach fallback.  A non-zero exit carries herdr's stderr
-/// verbatim rather than `error_code`'s parsed code, since a user-facing
-/// message wants herdr's human-readable text, not its machine code, and a
-/// server that does not answer inside [`GESTURE_TIMEOUT`] refuses the same
-/// way.
-pub(super) fn focus_pane(side: &Side, focus: &[String]) -> Result<(), String> {
-    let borrowed: Vec<&str> = focus.iter().map(String::as_str).collect();
-    let (program, args) = side.command(&program(side), &borrowed);
-    #[allow(clippy::disallowed_methods)] // Running herdr is this function's job.
-    let run = move || {
-        command_ext::hidden(program)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-    };
-    let Some(output) = bounded(run) else {
+/// native-Windows attach fallback.  A refusal carries herdr's message rather
+/// than its code, since it is shown to the user, and a server that does not
+/// answer inside [`GESTURE_TIMEOUT`] refuses the same way.
+pub(super) fn focus_pane(side: &Side, pane_id: &str) -> Result<(), String> {
+    let request = focus_request(pane_id);
+    let (program, args) = bridge_command(side);
+    let Some(answer) = bounded(move || ask(program, args, &request)) else {
         return Err(format!("{NO_ANSWER} while focusing the pane"));
     };
-    let output = output.map_err(|e| format!("failed to focus herdr pane: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("herdr refused to focus the pane: {stderr}"));
+    let answer = answer.map_err(|e| format!("failed to focus herdr pane: {e}"))?;
+    decode_answer(&answer).map_err(|message| format!("herdr refused to focus the pane: {message}"))
+}
+
+/// Sends one request down a fresh bridge and reads herdr's one-line answer.
+/// stdin stays open until the answer is in, since herdr's Windows bridge
+/// stops relaying at EOF.  A bridge that answers nothing, because no server
+/// is running, leaves its reason on stderr.
+fn ask(program: String, args: Vec<String>, request: &str) -> io::Result<String> {
+    #[allow(clippy::disallowed_methods)] // Running herdr is this function's job.
+    let mut child = command_ext::hidden(program)
+        .args(args)
+        .env("WSL_UTF8", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let (Some(mut stdin), Some(stdout), Some(mut stderr)) =
+        (child.stdin.take(), child.stdout.take(), child.stderr.take())
+    else {
+        return Err(io::Error::other("herdr's bridge started without its pipes"));
+    };
+    let mut answer = String::new();
+    let _ = stdin.write_all(request.as_bytes()).and_then(|()| stdin.flush());
+    let read = BufReader::new(stdout).read_line(&mut answer);
+    let _ = child.kill();
+    let _ = child.wait();
+    read?;
+    if answer.is_empty() {
+        stderr.read_to_string(&mut answer)?;
+        return Err(io::Error::other(answer.trim().to_string()));
     }
-    Ok(())
+    Ok(answer)
 }
 
 /// The running session to attach to on this side.  `herdr session list
@@ -266,14 +301,14 @@ pub(super) type HerdrAttachResult = Result<(String, Vec<String>), String>;
 /// refusal.
 pub(super) fn herdr_attach_gesture(
     side: &Side,
-    focus: Option<&[String]>,
+    focus: Option<&str>,
     cached_name: Option<String>,
 ) -> HerdrAttachResult {
     // Two argv spawns, no shell: the only shell a `Native` command could
     // reach on this side is cmd.exe, which does not understand `sh_quote`'s
     // single-quoting.
-    if let Some(focus) = focus {
-        focus_pane(side, focus)?;
+    if let Some(pane_id) = focus {
+        focus_pane(side, pane_id)?;
     }
     let session = match cached_name {
         Some(session) => session,
@@ -284,16 +319,23 @@ pub(super) fn herdr_attach_gesture(
 
 #[cfg(test)]
 mod tests {
-    use super::super::wire::PANES;
     use super::*;
 
-    /// `herdr agent focus` answers `agent_not_found` for a pane with no agent
-    /// in it, so the tab is the only handle such a pane has.
     #[test]
-    fn a_pane_with_no_agent_is_focused_through_its_tab() {
-        let panes = Listing::Panes.parse(PANES);
-        assert_eq!(focus_args(&panes[0].target(&Side::Native)), vec!["agent", "focus", "w1:p1"]);
-        assert_eq!(focus_args(&panes[1].target(&Side::Native)), vec!["tab", "focus", "w1:t4"]);
+    fn a_focus_names_the_pane_to_the_socket() {
+        let request: Value = serde_json::from_str(&focus_request("w1:p4")).unwrap();
+        assert_eq!(request["method"], "pane.focus");
+        assert_eq!(request["params"]["pane_id"], "w1:p4");
+    }
+
+    /// Answers captured from herdr 0.9.1's socket.
+    #[test]
+    fn a_focus_answer_is_a_pane_or_herdr_s_refusal() {
+        let focused = r#"{"id":"alacritree:focus","result":{"type":"pane_info","pane":{"pane_id":"w11:p7","focused":true}}}"#;
+        assert_eq!(decode_answer(focused), Ok(()));
+        let refused = r#"{"id":"alacritree:focus","error":{"code":"pane_not_found","message":"pane w99:p9 not found"}}"#;
+        assert_eq!(decode_answer(refused), Err("pane w99:p9 not found".to_string()));
+        assert_eq!(decode_answer("garbage\n"), Err("garbage".to_string()));
     }
 
     /// A pane herdr detected no agent in has nothing `herdr agent attach`

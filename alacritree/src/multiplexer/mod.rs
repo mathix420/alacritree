@@ -130,8 +130,6 @@ fn sh_quote(arg: &str) -> String {
 pub struct PaneTarget {
     pub side: Side,
     pub pane_id: String,
-    /// The tab holding the pane, where the multiplexer reports one.
-    pub tab_id: Option<String>,
     /// Whether the multiplexer reports an agent in this pane.  Some of them
     /// resolve a target through an agent registry, which holds nothing for a
     /// pane running a plain shell, so such a pane is reached another way.
@@ -142,7 +140,7 @@ impl PaneTarget {
     /// A pane the listing no longer carries.  Claiming an agent is in it
     /// keeps every caller on the path it took before the pane went.
     pub(crate) fn unlisted(key: &PaneKey, pane_id: &str) -> Self {
-        Self { side: key.side.clone(), pane_id: pane_id.to_string(), tab_id: None, has_agent: true }
+        Self { side: key.side.clone(), pane_id: pane_id.to_string(), has_agent: true }
     }
 }
 

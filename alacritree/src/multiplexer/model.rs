@@ -79,7 +79,6 @@ impl Pane {
         PaneTarget {
             side: side.clone(),
             pane_id: self.pane_id.clone(),
-            tab_id: self.tab_id.clone(),
             has_agent: self.status.is_some(),
         }
     }

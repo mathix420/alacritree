@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 
 use super::view::{HerdrViewAction, HerdrViewFocus, HerdrViewSync, ViewInputs};
 use super::{
-    EndpointCache, Endpoints, Listing, Settings, attaches_directly, cli, focus_args, focus_pane,
-    pane_key, program, unattached,
+    EndpointCache, Endpoints, Listing, Settings, attaches_directly, cli, focus_pane, pane_key,
+    program, unattached,
 };
 use crate::config::{BakedGlyph, DEFAULT_HERDR_ICON, HerdrConfig, IconStyle};
 use crate::jobs;
@@ -365,8 +365,8 @@ impl MultiplexerSession for Herdr {
                 let focus = pending.request.focus.takes();
                 pending.job =
                     Some(jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
-                        let focus = focus.then(|| focus_args(&target));
-                        cli::herdr_attach_gesture(&target.side, focus.as_deref(), name)
+                        let focus = focus.then_some(target.pane_id.as_str());
+                        cli::herdr_attach_gesture(&target.side, focus, name)
                             .map(|(program, argv)| Launch { program, argv })
                     }));
                 None
@@ -461,10 +461,10 @@ impl MultiplexerSession for Herdr {
                     return ViewStep::default();
                 };
                 let Some(target) = self.focus_target(key) else { return ViewStep::default() };
-                let focus = focus_args(&target);
                 let side = key.side.clone();
-                let job = jobs::pool()
-                    .spawn(jobs::Priority::Interactive, move |_blocking| focus_pane(&side, &focus));
+                let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
+                    focus_pane(&side, &target.pane_id)
+                });
                 self.view_focus = Some(HerdrViewFocus { session: id, key: key.clone(), job });
                 ViewStep::default()
             },
@@ -517,7 +517,7 @@ mod tests {
     }
 
     fn pane(side: Side, has_agent: bool) -> PaneTarget {
-        PaneTarget { side, pane_id: "w1:p1".into(), tab_id: Some("w1:t1".into()), has_agent }
+        PaneTarget { side, pane_id: "w1:p1".into(), has_agent }
     }
 
     fn request(waiters: Vec<mpsc::Sender<crate::ipc::protocol::IpcResult>>) -> AttachRequest {
@@ -615,19 +615,19 @@ mod tests {
         assert!(second_rx.try_recv().is_err());
     }
 
-    /// A created pane runs a shell, and the displayed listing drops a pane
-    /// with no agent in it unless panes are shown.  Coming back to that pane's
-    /// session has to find its tab through the side's full listing, or herdr
-    /// goes on showing whatever it last focused.
+    /// A shell pane, left out of the displayed listing, is found through the
+    /// side's full one, and by its own id rather than its tab's, which would
+    /// land on whichever of the tab's panes herdr last focused.
     #[test]
-    fn a_bound_shell_pane_is_refocused_through_its_tab() {
+    fn a_bound_shell_pane_sharing_a_tab_is_refocused_by_its_own_id() {
         let mut herdr = herdr(AttachMode::Agent);
         assert!(!herdr.config.show_panes, "the default display");
         let side = Side::Native;
         herdr.adopt_listing_for_test(
             &side,
             r#"{"result":{"panes":[
-            {"terminal_id":"term-shell","pane_id":"w1:p2","tab_id":"w1:t2","agent_status":"unknown"}
+            {"terminal_id":"term-shell","pane_id":"w1:p2","tab_id":"w1:t2","agent_status":"unknown"},
+            {"terminal_id":"term-other","pane_id":"w1:p3","tab_id":"w1:t2","focused":true,"agent_status":"unknown"}
         ]}}"#,
             Instant::now(),
         );
@@ -636,7 +636,7 @@ mod tests {
 
         let target = herdr.focus_target(&key).expect("a bound shell pane has nowhere to focus");
 
-        assert_eq!(focus_args(&target), ["tab", "focus", "w1:t2"]);
+        assert_eq!(target.pane_id, "w1:p2");
     }
 
     /// A session alacritree still holds open after herdr stopped listing its
