@@ -860,7 +860,7 @@ mod tests {
     /// error is ever shown.
     #[test]
     fn a_distro_without_git_warns() {
-        assert_eq!(wsl_distro_check("Ubuntu", &probe(&[None; 6])).status, Status::Warn);
+        assert_eq!(wsl_distro_check("Ubuntu", &probe(&[None; 7])).status, Status::Warn);
         let git_only = probe(&[Some("/usr/bin/git"), None, None, None, None, None]);
         assert_eq!(wsl_distro_check("Ubuntu", &git_only).status, Status::Ok);
     }
@@ -882,7 +882,7 @@ mod tests {
                 "Ubuntu".to_string(),
                 probe(&[None, None, None, Some("/usr/bin/doppler"), None, None]),
             ),
-            ("kali-linux".to_string(), probe(&[None; 6])),
+            ("kali-linux".to_string(), probe(&[None; 7])),
         ];
         let check = wsl_doppler_check(&probes).expect("a warning about the unused doppler");
         assert_eq!(check.status, Status::Warn);
@@ -892,7 +892,7 @@ mod tests {
 
     #[test]
     fn no_distro_has_doppler_and_nothing_is_said() {
-        let probes = vec![("Ubuntu".to_string(), probe(&[None; 6]))];
+        let probes = vec![("Ubuntu".to_string(), probe(&[None; 7]))];
         assert!(wsl_doppler_check(&probes).is_none());
     }
 

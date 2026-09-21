@@ -1441,7 +1441,7 @@ mod tests {
         let _lock = crate::tools::test_configuration_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        struct RestoreToolConfiguration([crate::tools::ToolPaths; 6]);
+        struct RestoreToolConfiguration([crate::tools::ToolPaths; 7]);
         impl Drop for RestoreToolConfiguration {
             fn drop(&mut self) {
                 crate::tools::configure(self.0.clone());

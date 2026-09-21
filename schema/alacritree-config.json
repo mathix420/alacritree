@@ -1038,6 +1038,10 @@
           "$ref": "#/$defs/RawHerdr",
           "description": "Agents running under a herdr server."
         },
+        "taskwarrior": {
+          "$ref": "#/$defs/RawTaskwarrior",
+          "description": "Task lists kept in taskwarrior."
+        },
         "tuicr": {
           "$ref": "#/$defs/RawTuicr",
           "description": "The review TUI the tuicr diff viewer runs."
@@ -1438,6 +1442,26 @@
           "type": "object"
         }
       ]
+    },
+    "RawTaskwarrior": {
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Show task lists kept in taskwarrior in a tab (`OpenTasks`, Ctrl+~).\nAgents write the same lists with `task` and read them through\n`alacritree hook`. Off leaves the binding inert and the palette entry\nout.",
+          "type": "boolean"
+        },
+        "path": {
+          "default": "task",
+          "description": "The program to run on Windows or natively. Its own name is looked up\non PATH; any other value runs as written.",
+          "type": "string"
+        },
+        "wsl_path": {
+          "default": "",
+          "description": "The program to run inside every WSL distro, as written. Empty finds it\nby name through the distro's login shell.",
+          "type": "string"
+        }
+      },
+      "type": "object"
     },
     "RawTerminal": {
       "properties": {

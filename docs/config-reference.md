@@ -244,6 +244,14 @@ Agents running under a herdr server.
 - `show_unmatched` (boolean, default `true`): List panes whose working directory matches no worktree, under Home.
 - `wsl_path` (string, default `""`): The program to run inside every WSL distro, as written. Empty finds it by name through the distro's login shell.
 
+### `[integrations.taskwarrior]`
+
+Task lists kept in taskwarrior.
+
+- `enabled` (boolean, default `false`): Show task lists kept in taskwarrior in a tab (`OpenTasks`, Ctrl+~). Agents write the same lists with `task` and read them through `alacritree hook`. Off leaves the binding inert and the palette entry out.
+- `path` (string, default `"task"`): The program to run on Windows or natively. Its own name is looked up on PATH; any other value runs as written.
+- `wsl_path` (string, default `""`): The program to run inside every WSL distro, as written. Empty finds it by name through the distro's login shell.
+
 ### `[integrations.tuicr]`
 
 The review TUI the tuicr diff viewer runs.

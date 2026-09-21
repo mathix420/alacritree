@@ -14,7 +14,7 @@ pub const PROTOCOL_VERSION: &str = "2";
 
 /// The programs the hello resolves, in the order its fields carry them.
 /// `HELPER_SCRIPT` spells the same list.
-pub const HELLO_TOOLS: [&str; 6] = ["git", "gh", "delta", "doppler", "herdr", "tuicr"];
+pub const HELLO_TOOLS: [&str; 7] = ["git", "gh", "delta", "doppler", "herdr", "tuicr", "task"];
 
 /// Login-shell-resolved tool paths and the distro-side runtime dir, from
 /// the helper's hello line.

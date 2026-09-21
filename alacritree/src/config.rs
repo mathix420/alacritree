@@ -605,6 +605,7 @@ pub struct IntegrationsConfig {
     pub zellij: ZellijConfig,
     pub delta: ToolConfig,
     pub tuicr: ToolConfig,
+    pub taskwarrior: TaskwarriorConfig,
     pub diff_viewer: DiffViewerConfig,
 }
 
@@ -643,12 +644,13 @@ impl IntegrationsConfig {
             Tool::Doppler => (&self.doppler.path, &self.doppler.wsl_path),
             Tool::Herdr => (&self.herdr.path, &self.herdr.wsl_path),
             Tool::Tuicr => (&self.tuicr.path, &self.tuicr.wsl_path),
+            Tool::Task => (&self.taskwarrior.path, &self.taskwarrior.wsl_path),
         };
         ToolPaths { native: native.clone(), wsl: wsl.clone() }
     }
 
     /// Indexed like [`Tool::ALL`], the shape `tools::configure` takes.
-    pub fn tool_paths(&self) -> [ToolPaths; 6] {
+    pub fn tool_paths(&self) -> [ToolPaths; 7] {
         Tool::ALL.map(|tool| self.paths(tool))
     }
 }
@@ -745,6 +747,15 @@ impl Default for HerdrConfig {
     fn default() -> Self {
         RawHerdr::default().resolve(None)
     }
+}
+
+/// `[integrations.taskwarrior]`: where `task` lives on each side, and
+/// whether the tasks tab is on.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct TaskwarriorConfig {
+    pub path: String,
+    pub wsl_path: Option<String>,
+    pub enabled: bool,
 }
 
 /// `[integrations.zellij]`: whether alacritree lists the panes of running
@@ -3129,6 +3140,8 @@ struct RawIntegrations {
     delta: RawDelta,
     /// The review TUI the tuicr diff viewer runs.
     tuicr: RawTuicr,
+    /// Task lists kept in taskwarrior.
+    taskwarrior: RawTaskwarrior,
     /// What the git panel's diff pane runs.
     diff_viewer: RawDiffViewer,
 }
@@ -3338,6 +3351,7 @@ impl RawIntegrations {
             zellij: self.zellij.resolve(),
             delta: delta_config(self.delta.path, self.delta.wsl_path, moved.delta_path),
             tuicr: tool_config(self.tuicr.path, self.tuicr.wsl_path, Tool::Tuicr),
+            taskwarrior: self.taskwarrior.resolve(),
             diff_viewer: self.diff_viewer.resolve(),
         }
     }
@@ -3485,6 +3499,35 @@ impl RawHerdr {
             attach: self.attach.get(),
             follow_focus: self.follow_focus.get(),
         }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(default)]
+struct RawTaskwarrior {
+    /// The program to run on Windows or natively. Its own name is looked up
+    /// on PATH; any other value runs as written.
+    path: String,
+    /// The program to run inside every WSL distro, as written. Empty finds it
+    /// by name through the distro's login shell.
+    wsl_path: String,
+    /// Show task lists kept in taskwarrior in a tab (`OpenTasks`, Ctrl+~).
+    /// Agents write the same lists with `task` and read them through
+    /// `alacritree hook`. Off leaves the binding inert and the palette entry
+    /// out.
+    enabled: bool,
+}
+
+impl Default for RawTaskwarrior {
+    fn default() -> Self {
+        Self { path: "task".to_string(), wsl_path: String::new(), enabled: false }
+    }
+}
+
+impl RawTaskwarrior {
+    fn resolve(self) -> TaskwarriorConfig {
+        let tool = tool_config(self.path, self.wsl_path, Tool::Task);
+        TaskwarriorConfig { path: tool.path, wsl_path: tool.wsl_path, enabled: self.enabled }
     }
 }
 
@@ -4705,6 +4748,29 @@ show_panes = true
         for tool in Tool::ALL {
             assert_eq!(config.integrations.paths(tool), ToolPaths::named(tool), "{tool:?}");
         }
+    }
+
+    #[test]
+    fn taskwarrior_is_off_and_named_by_default() {
+        let config = config_from("");
+        assert!(!config.integrations.taskwarrior.enabled);
+        assert_eq!(config.integrations.paths(Tool::Task), ToolPaths::named(Tool::Task));
+    }
+
+    #[test]
+    fn taskwarrior_table_sets_both_sides() {
+        let config = config_from(
+            "[integrations.taskwarrior]
+enabled = true
+path = 'C:/bin/task.exe'
+wsl_path =              '/usr/bin/task'
+",
+        );
+        assert!(config.integrations.taskwarrior.enabled);
+        assert_eq!(
+            config.integrations.paths(Tool::Task),
+            paths("C:/bin/task.exe", Some("/usr/bin/task"))
+        );
     }
 
     #[test]

@@ -21,12 +21,13 @@ pub enum Tool {
     Doppler,
     Herdr,
     Tuicr,
+    Task,
 }
 
 impl Tool {
     /// Declaration order, which `configure` indexes by.
-    pub const ALL: [Tool; 6] =
-        [Tool::Git, Tool::Gh, Tool::Delta, Tool::Doppler, Tool::Herdr, Tool::Tuicr];
+    pub const ALL: [Tool; 7] =
+        [Tool::Git, Tool::Gh, Tool::Delta, Tool::Doppler, Tool::Herdr, Tool::Tuicr, Tool::Task];
 
     /// The program's name, which is also its default path.
     pub fn name(self) -> &'static str {
@@ -37,6 +38,7 @@ impl Tool {
             Tool::Doppler => "doppler",
             Tool::Herdr => "herdr",
             Tool::Tuicr => "tuicr",
+            Tool::Task => "task",
         }
     }
 }
@@ -61,19 +63,19 @@ impl ToolPaths {
     }
 }
 
-fn configured() -> &'static RwLock<[ToolPaths; 6]> {
-    static PATHS: OnceLock<RwLock<[ToolPaths; 6]>> = OnceLock::new();
+fn configured() -> &'static RwLock<[ToolPaths; 7]> {
+    static PATHS: OnceLock<RwLock<[ToolPaths; 7]>> = OnceLock::new();
     PATHS.get_or_init(|| RwLock::new(Tool::ALL.map(ToolPaths::named)))
 }
 
 /// Publish the configured paths of every tool, indexed like [`Tool::ALL`].
 /// Runs once at startup, before anything spawns a tool.
-pub fn configure(paths: [ToolPaths; 6]) {
+pub fn configure(paths: [ToolPaths; 7]) {
     *configured().write().unwrap_or_else(|e| e.into_inner()) = paths;
 }
 
 #[cfg(test)]
-pub(crate) fn test_configuration() -> [ToolPaths; 6] {
+pub(crate) fn test_configuration() -> [ToolPaths; 7] {
     configured().read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
