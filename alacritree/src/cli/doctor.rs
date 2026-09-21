@@ -23,7 +23,9 @@ use crate::config::{self, Config, ConfigDiagnosis, ConfigFile, Profile, ShellCon
 use crate::crash_log::{Verdict, classify};
 use crate::diff_viewer::{Program, Viewer};
 use crate::ipc::protocol::{self, IpcRequest, SendError};
+use crate::multiplexer::Side;
 use crate::shell_decision::{ShellDecision, shell_decision};
+use crate::tasks::taskwarrior::{TaskError, Taskwarrior};
 use crate::wsl::{self, ShellChoice};
 use crate::{command_ext, jobs, state, tools};
 
@@ -113,6 +115,9 @@ fn report(
     checks.extend(diff_viewer_check(&config.integrations.diff_viewer.viewer));
     checks.push(shell_check(config.shell.as_ref()));
     checks.extend(wsl_checks(&wsl::distros()));
+    if config.integrations.taskwarrior.enabled {
+        checks.extend(taskwarrior_checks(&wsl::distros()));
+    }
     checks.extend(config_checks(&config::diagnose(config_dir, overrides)));
     checks.extend(persisted_state_checks(&config));
     checks.extend(ipc_checks(socket, config.ipc_socket));
@@ -682,6 +687,45 @@ fn version_of(program: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Agents call `task` directly, and a taskrc without the UDAs folds `subof:`
+/// and `order:` into the description instead of storing them.
+fn taskwarrior_checks(distros: &[wsl::WslDistro]) -> Vec<Check> {
+    let sides =
+        std::iter::once(Side::Native).chain(distros.iter().map(|d| Side::Wsl(d.name.clone())));
+    sides
+        .map(|side| {
+            let name = side.name();
+            let declared = jobs::on_this_thread(|b| {
+                let tw = Taskwarrior::for_side(side, b);
+                Ok::<_, TaskError>((
+                    tw.rc_value("uda.subof.type", b)?,
+                    tw.rc_value("uda.order.type", b)?,
+                ))
+            });
+            let declared = match &declared {
+                Ok((subof, order)) => Ok((subof.as_deref(), order.as_deref())),
+                Err(e) => Err(e.to_string()),
+            };
+            uda_check(&name, declared)
+        })
+        .collect()
+}
+
+fn uda_check(side: &str, declared: Result<(Option<&str>, Option<&str>), String>) -> Check {
+    match declared {
+        Ok((Some("uuid"), Some("numeric"))) => {
+            check("taskwarrior", side, Status::Ok, "subof and order declared")
+        },
+        Ok(_) => check(
+            "taskwarrior",
+            side,
+            Status::Warn,
+            "subof and order are not declared; run `alacritree task setup`",
+        ),
+        Err(e) => check("taskwarrior", side, Status::Warn, e),
+    }
+}
+
 fn check(
     section: &'static str,
     name: impl Into<String>,
@@ -863,6 +907,16 @@ mod tests {
         assert_eq!(wsl_distro_check("Ubuntu", &probe(&[None; 7])).status, Status::Warn);
         let git_only = probe(&[Some("/usr/bin/git"), None, None, None, None, None]);
         assert_eq!(wsl_distro_check("Ubuntu", &git_only).status, Status::Ok);
+    }
+
+    #[test]
+    fn uda_check_warns_until_both_are_declared() {
+        assert_eq!(uda_check("native", Ok((Some("uuid"), Some("numeric")))).status, Status::Ok);
+        assert_eq!(uda_check("native", Ok((Some("uuid"), None))).status, Status::Warn);
+        assert_eq!(uda_check("wsl:Ubuntu", Ok((None, None))).status, Status::Warn);
+        let missing = uda_check("native", Err("taskwarrior not found: task".into()));
+        assert_eq!(missing.status, Status::Warn);
+        assert!(missing.detail.contains("not found"), "{:?}", missing.detail);
     }
 
     #[test]

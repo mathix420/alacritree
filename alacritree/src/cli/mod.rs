@@ -16,6 +16,7 @@ mod install;
 mod offline;
 mod render;
 mod schema;
+mod task;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -137,6 +138,12 @@ enum Command {
 
     /// Check the external tools, config and state alacritree depends on.
     Doctor,
+
+    /// Task lists kept in taskwarrior. Runs without a window.
+    Task {
+        #[command(subcommand)]
+        command: task::TaskCommand,
+    },
 
     /// Crashed and indeterminate sessions, newest first.  Clean exits and
     /// still-running sessions are hidden unless `--all` is given.
@@ -341,6 +348,11 @@ pub fn run(cli: Cli) -> Option<i32> {
                 cli.config_dir.as_deref(),
                 &cli.options,
             ));
+        },
+        // Reads git and taskwarrior directly, so it answers in a bare herdr
+        // pane with no alacritree running.
+        Command::Task { command } => {
+            return Some(task::run(command, cli.json, cli.config_dir.as_deref(), &cli.options));
         },
         // Reads files rather than asking an instance, so it answers when
         // nothing is running — which is exactly when a crash is being chased.
@@ -581,6 +593,7 @@ fn to_request(command: Command) -> IpcRequest {
         | Command::Schema { .. }
         | Command::Mcp
         | Command::Doctor
+        | Command::Task { .. }
         | Command::Crashes { .. }
         | Command::Install { .. } => {
             unreachable!("handled before dispatch")
