@@ -83,6 +83,14 @@ impl Herdr {
         }
     }
 
+    /// Tells the side's cache that alacritree just moved herdr's focus to
+    /// `target`, so focus events older than the move are not followed.
+    fn note_own_focus(&mut self, target: &PaneTarget) {
+        if let Some(cache) = self.endpoints.cache_mut(&target.side) {
+            cache.focus_moved(target.pane_id.clone(), Instant::now());
+        }
+    }
+
     /// A user reaching for a side is the moment its herdr being up matters,
     /// so a side waiting out its backoff reconnects now.
     fn reconnect_now(&mut self, side: &Side) {
@@ -367,6 +375,9 @@ impl MultiplexerSession for Herdr {
         let answer = match answer {
             Some(launch) => {
                 self.note_gesture(&pending.key.side, &launch);
+                if launch.is_ok() && pending.request.focus.takes() {
+                    self.note_own_focus(&pending.target);
+                }
                 Some(AttachAnswer { key: pending.key, request: pending.request, launch })
             },
             None => {
@@ -431,6 +442,9 @@ impl MultiplexerSession for Herdr {
                     }
                     if succeeded {
                         self.focused_view.moved_focus(&pending.key, Instant::now());
+                        if let Some(target) = self.focus_target(&pending.key) {
+                            self.note_own_focus(&target);
+                        }
                     }
                     self.focused_view.settled(pending.session, succeeded, Instant::now());
                 },

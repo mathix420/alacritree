@@ -147,6 +147,15 @@ enum Link {
     Abandoned,
 }
 
+/// A focus move alacritree made itself.  herdr delivers focus events in
+/// order, so one arriving before herdr's echo of this move predates it.
+struct OwnFocus {
+    /// The pane herdr will echo.  A move made through a tab may echo another
+    /// pane of it, which reads as stale until a listing settles it.
+    pane_id: String,
+    at: Instant,
+}
+
 /// The per-pane status subscription and the pane ids it names.
 struct StatusLink {
     pane_ids: Vec<String>,
@@ -195,6 +204,7 @@ pub struct EndpointCache {
     /// Patches that landed while a listing was in flight.  They are newer than
     /// that listing, so they go on top of it once it lands.
     held: Vec<Event>,
+    own_focus: Option<OwnFocus>,
     /// When a run of failed listings stops being worth waiting out.  Set on
     /// the first failure of the run and cleared by the next answer.
     blank_at: Option<Instant>,
@@ -219,6 +229,7 @@ impl EndpointCache {
             listing_due: None,
             listed_for: None,
             held: Vec::new(),
+            own_focus: None,
             blank_at: None,
             sampled_at: None,
             inventory: None,
@@ -333,6 +344,9 @@ impl EndpointCache {
     fn adopt_reply(&mut self, reply: ListingReply, display: Listing, attached: bool) {
         let mut agents = reply.agents;
         self.sampled_at = Some(reply.sampled_at);
+        if self.own_focus.as_ref().is_some_and(|own| own.at < reply.sampled_at) {
+            self.own_focus = None;
+        }
         if let Some(inventory) = reply.inventory.filter(|_| attached) {
             match inventory {
                 Ok(terminal_ids) => {
@@ -536,6 +550,15 @@ impl EndpointCache {
         self.sync_status();
     }
 
+    /// Records that alacritree moved herdr's focus to `pane_id`, which landed
+    /// at `at`.  Focus events stay distrusted until herdr echoes that move or
+    /// a listing sampled after it lands, which stands in for an echo herdr
+    /// sends none of when the pane was already focused.
+    pub fn focus_moved(&mut self, pane_id: String, at: Instant) {
+        self.own_focus = Some(OwnFocus { pane_id, at });
+        self.listing_due = Some(at);
+    }
+
     /// Reconnects a side that has no stream, now rather than on the backoff.
     /// For a user action aimed at the side, which is the moment herdr being
     /// up matters most.
@@ -681,6 +704,16 @@ impl EndpointCache {
     /// well when a listing is in flight, since that listing may have sampled
     /// herdr before the change and would otherwise undo it.
     fn receive(&mut self, event: Event, now: Instant) {
+        if let (Event::Focused { pane_id }, Some(own)) = (&event, &self.own_focus) {
+            if &own.pane_id != pane_id {
+                // Older than our own move, so only a listing can say what
+                // herdr shows now.  Never held, or landing that listing would
+                // replay it.
+                self.listing_due = Some(now);
+                return;
+            }
+            self.own_focus = None;
+        }
         if self.pending.is_some() && !matches!(event, Event::Changed) {
             self.held.push(event.clone());
         }
@@ -1267,6 +1300,64 @@ mod tests {
         send(&tx, &mut cache, Event::Focused { pane_id: "w1:p2".into() });
 
         assert!(cache.sampled_at().unwrap() > listed);
+    }
+
+    /// herdr delivers focus events in order, so one that arrives after
+    /// alacritree moved herdr's focus but before herdr's echo of that move
+    /// happened before it.  Applying it would follow the user off the pane
+    /// alacritree just chose.
+    #[test]
+    fn a_focus_event_older_than_our_own_move_is_not_applied() {
+        let (tx, mut cache) = live(TWO_AGENTS);
+        cache.focus_moved("w1:p1".into(), Instant::now());
+
+        send(&tx, &mut cache, Event::Focused { pane_id: "w1:p2".into() });
+
+        assert!(cache.agents()[0].focused, "the stale event moved focus");
+        assert!(cache.pending.is_some(), "a listing settles what herdr now shows");
+    }
+
+    /// The echo of alacritree's own move is the last word on everything
+    /// before it, so focus events after it are trusted again.
+    #[test]
+    fn our_own_echo_ends_the_distrust() {
+        let (tx, mut cache) = live(TWO_AGENTS);
+        cache.focus_moved("w1:p2".into(), Instant::now());
+
+        send(&tx, &mut cache, Event::Focused { pane_id: "w1:p2".into() });
+        assert!(cache.agents()[1].focused);
+        send(&tx, &mut cache, Event::Focused { pane_id: "w1:p1".into() });
+
+        assert!(cache.agents()[0].focused, "a move after the echo is the user's");
+    }
+
+    /// herdr echoes nothing when alacritree focuses the pane it already
+    /// shows, so a listing sampled after the move stands in for the echo.
+    #[test]
+    fn a_listing_after_our_own_move_ends_the_distrust() {
+        let (tx, mut cache) = live(TWO_AGENTS);
+        cache.focus_moved("w1:p1".into(), Instant::now() - Duration::from_secs(1));
+        cache.poll(Listing::Panes, true);
+        land(&mut cache, TWO_AGENTS);
+
+        send(&tx, &mut cache, Event::Focused { pane_id: "w1:p2".into() });
+
+        assert!(cache.agents()[1].focused);
+    }
+
+    /// A stale event that arrives while a listing is in flight must not be
+    /// held for replay, or landing that listing would apply it after all.
+    #[test]
+    fn a_distrusted_focus_event_is_not_replayed_after_the_listing() {
+        let (tx, mut cache) = live(TWO_AGENTS);
+        cache.focus_moved("w1:p1".into(), Instant::now() - Duration::from_secs(1));
+        send(&tx, &mut cache, Event::Changed);
+
+        send(&tx, &mut cache, Event::Focused { pane_id: "w1:p2".into() });
+        land(&mut cache, TWO_AGENTS);
+
+        assert!(cache.agents()[0].focused);
+        assert!(!cache.agents()[1].focused);
     }
 
     /// herdr streams no status a pane already had, so the gap between a
