@@ -4,7 +4,7 @@
 //! them.
 
 use std::io;
-use std::process::Output;
+use std::process::{Output, Stdio};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -94,12 +94,20 @@ impl Taskwarrior {
     }
 
     /// One attempt, no overrides: what `task` itself would do with `args`.
-    fn spawn(&self, args: &[String], blocking: &Blocking) -> Result<Output, TaskError> {
+    fn spawn(&self, args: &[String]) -> Result<Output, TaskError> {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let (program, argv) = self.side.command(&self.program, &refs);
-        let mut cmd = hidden(program);
-        cmd.args(argv).envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-        let output = match blocking.run_cancellable(&mut cmd) {
+        // `output` drains both pipes while the child runs, which an export
+        // larger than a pipe buffer needs; `run_cancellable` reads them only
+        // after exit.  A closed stdin answers any prompt taskwarrior still
+        // raises.
+        #[allow(clippy::disallowed_methods)] // Running `task` is this function's job.
+        let output = hidden(program)
+            .args(argv)
+            .envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdin(Stdio::null())
+            .output();
+        let output = match output {
             Ok(output) => output,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return Err(TaskError::Missing { program: self.program.clone() });
@@ -114,14 +122,14 @@ impl Taskwarrior {
     }
 
     // Runs on a pool worker, where waiting out a busy lock is the point.
-    fn run(&self, args: &[String], blocking: &Blocking) -> Result<Output, TaskError> {
+    fn run(&self, args: &[String], _blocking: &Blocking) -> Result<Output, TaskError> {
         let mut argv: Vec<String> =
             UDA_DECLARATIONS.iter().map(|(k, v)| format!("rc.{k}={v}")).collect();
         argv.push("rc.confirmation=off".into());
         argv.extend(args.iter().cloned());
         let mut retries = BUSY_RETRIES.iter();
         loop {
-            let output = self.spawn(&argv, blocking)?;
+            let output = self.spawn(&argv)?;
             if output.status.success() {
                 return Ok(output);
             }
@@ -204,8 +212,12 @@ impl Taskwarrior {
 
     /// Skips `run` on purpose: its overrides would make every declaration
     /// look present, and setup needs to know what the taskrc holds.
-    pub(crate) fn rc_value(&self, key: &str, b: &Blocking) -> Result<Option<String>, TaskError> {
-        let output = self.spawn(&["_get".to_string(), format!("rc.{key}")], b)?;
+    pub(crate) fn rc_value(
+        &self,
+        key: &str,
+        _blocking: &Blocking,
+    ) -> Result<Option<String>, TaskError> {
+        let output = self.spawn(&["_get".to_string(), format!("rc.{key}")])?;
         let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
         Ok((!value.is_empty()).then_some(value))
     }
@@ -251,7 +263,11 @@ mod tests {
             if is_wsl {
                 tw = tw.with_env("WSLENV", "TASKRC:TASKDATA");
             }
-            jobs::on_this_thread(|b| tw.export(&[], b)).is_ok().then_some(tw)
+            // Only a missing program skips; any other failure is the adapter's.
+            match jobs::on_this_thread(|b| tw.export(&[], b)) {
+                Err(TaskError::Missing { .. }) => None,
+                result => Some(result.map(|_| tw).expect("a private taskwarrior exports")),
+            }
         })?;
         Some((dir, tw))
     }
@@ -317,6 +333,18 @@ mod tests {
         jobs::on_this_thread(|b| tw.set_config("uda.subof.type", "uuid", b)).unwrap();
         let after = jobs::on_this_thread(|b| tw.rc_value("uda.subof.type", b)).unwrap();
         assert_eq!(after.as_deref(), Some("uuid"));
+    }
+
+    #[test]
+    fn an_export_larger_than_a_pipe_buffer_is_read_whole() {
+        let Some((_dir, tw)) = private() else { return };
+        let text = "x".repeat(10_000);
+        for _ in 0..8 {
+            jobs::on_this_thread(|b| tw.add("r", &text, None, 1024, b)).unwrap();
+        }
+        let tasks = jobs::on_this_thread(|b| tw.export(&[], b)).unwrap();
+        assert_eq!(tasks.len(), 8);
+        assert!(tasks.iter().all(|t| t.description == text));
     }
 
     #[test]
