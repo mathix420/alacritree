@@ -5,6 +5,7 @@
 //! its own copy.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use egui::{Color32, Key, Modifiers, Response, RichText, ScrollArea, Sense, TextEdit, Ui};
@@ -12,6 +13,7 @@ use egui::{Color32, Key, Modifiers, Response, RichText, ScrollArea, Sense, TextE
 use crate::jobs::{self, Blocking, Job, Priority};
 use crate::multiplexer::Side;
 use crate::projects::{Project, Worktree};
+use crate::tasks::facts;
 use crate::tasks::scope::{GLOBAL, Place, node};
 use crate::tasks::taskwarrior::{Status, Task, TaskError, Taskwarrior};
 use crate::tasks::tree::{self, Edit, Row, Section};
@@ -28,8 +30,8 @@ pub(crate) struct Scope {
 }
 
 impl Scope {
-    /// Reads the sidebar's model, never git: a WSL worktree is a UNC path
-    /// Windows-side git reads wrongly, and the sidebar already has both names.
+    /// The names the sidebar already has, so the tab opens without waiting
+    /// on git. `adopt` replaces them once git has answered.
     pub(crate) fn for_workspace(project: Option<&Project>, worktree: Option<&Worktree>) -> Self {
         let side = match project.map(|p| wsl::classify(&p.root)) {
             Some(wsl::Location::Wsl { distro, .. }) => Side::Wsl(distro),
@@ -41,6 +43,16 @@ impl Scope {
         });
         let repo = project.map(|p| node(&Place::Project { repo: p.name.clone() }, None));
         Self { side, repo, workspace }
+    }
+
+    /// Takes the names `task scope` gives the worktree, which follow git's
+    /// own view of a detached or shared checkout where the sidebar's labels
+    /// do not.
+    pub(crate) fn adopt(&mut self, place: &Place) {
+        if let Place::Workspace { repo, .. } = place {
+            self.repo = Some(node(&Place::Project { repo: repo.clone() }, None));
+            self.workspace = Some(node(place, None));
+        }
     }
 
     /// `project:` is a left match, so `project:r` alone would also return a
@@ -108,6 +120,8 @@ struct NewRow {
 
 pub(crate) struct TasksView {
     scope: Scope,
+    /// The worktree's names as `task scope` reads them from git.
+    resolving: Option<Job<Place>>,
     tasks: Vec<Task>,
     load_error: Option<String>,
     /// A failed add has no row to show on; it stays until the next write.
@@ -133,9 +147,15 @@ pub(crate) struct TasksView {
 }
 
 impl TasksView {
-    pub(crate) fn new(scope: Scope) -> Self {
+    /// Shows `scope` at once, and switches to the names git gives `worktree`
+    /// once they are read.
+    pub(crate) fn new(scope: Scope, worktree: Option<PathBuf>) -> Self {
+        let resolving = worktree.map(|dir| {
+            jobs::pool().spawn(Priority::Interactive, move |b| facts::place_for(&dir, b).1)
+        });
         Self {
             scope,
+            resolving,
             tasks: Vec::new(),
             load_error: None,
             write_error: None,
@@ -268,6 +288,11 @@ impl TasksView {
     /// Spawns queued writes, drains finished jobs, and reloads after any
     /// write or once a second.
     fn tick(&mut self) {
+        if let Some(place) = self.resolving.as_ref().and_then(Job::poll) {
+            self.resolving = None;
+            self.scope.adopt(&place);
+            self.stale = true;
+        }
         for (row, op) in std::mem::take(&mut self.outbox) {
             let side = self.scope.side.clone();
             let job = jobs::pool()
@@ -578,6 +603,25 @@ mod tests {
     }
 
     #[test]
+    fn a_detached_checkout_names_the_node_task_scope_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("review");
+        let repo = git2::Repository::init(&root).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        let tree = repo.find_tree(repo.treebuilder(None).unwrap().write().unwrap()).unwrap();
+        let oid = repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+        repo.set_head_detached(oid).unwrap();
+
+        let project = jobs::on_this_thread(|b| Project::discover(root.clone(), false, b)).project;
+        let worktree = &project.worktrees[0];
+        let (_, place) =
+            jobs::on_this_thread(|b| crate::tasks::facts::place_for(&worktree.path, b));
+        let mut scope = Scope::for_workspace(Some(&project), Some(worktree));
+        scope.adopt(&place);
+        assert_eq!(scope.workspace.as_deref(), Some("review.review"));
+    }
+
+    #[test]
     fn a_non_git_root_has_a_project_section_only() {
         let s = Scope::for_workspace(Some(&project("C:/notes", "notes")), None);
         assert_eq!((s.repo.as_deref(), s.workspace), (Some("notes"), None));
@@ -649,7 +693,7 @@ mod tests {
     impl Harness {
         fn new(tasks: Vec<Task>) -> Self {
             let ctx = egui::Context::default();
-            let mut view = TasksView::new(Scope::for_workspace(None, None));
+            let mut view = TasksView::new(Scope::for_workspace(None, None), None);
             view.tasks = tasks;
             let mut h =
                 Self { ctx, view, ops: Vec::new(), texts: Vec::new(), background_clicked: false };

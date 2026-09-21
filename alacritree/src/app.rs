@@ -1092,7 +1092,7 @@ impl AlacritreeApp {
                 workspace.clone(),
                 TermSize::new(80, 24),
                 (8.0, 16.0),
-                crate::tasks::view::TasksView::new(scope),
+                crate::tasks::view::TasksView::new(scope, worktree.map(|w| w.path.clone())),
             );
             let id = session.id;
             self.sessions.push(session);
