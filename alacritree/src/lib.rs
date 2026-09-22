@@ -84,6 +84,7 @@ pub(crate) mod worktree;
 pub(crate) mod worktree_liveness;
 pub mod wsl;
 pub mod wsl_helper;
+pub mod wsl_spare;
 pub mod zellij;
 
 /// The timing reports inside unit tests read allocation counts too.

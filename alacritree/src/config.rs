@@ -63,6 +63,7 @@ pub struct Config {
     pub state_dir: Option<PathBuf>,
     pub wsl_automount_root: String,
     pub wsl_resident_helper: bool,
+    pub wsl_warm_spare: bool,
     pub profiles: Vec<Profile>,
     /// Validated at load: always names an entry in `profiles` when `Some`.
     pub default_profile: Option<String>,
@@ -1650,6 +1651,7 @@ impl Default for Config {
             state_dir: None,
             wsl_automount_root: "/mnt".to_string(),
             wsl_resident_helper: true,
+            wsl_warm_spare: false,
             profiles: Vec::new(),
             default_profile: None,
             integrations: IntegrationsConfig::default(),
@@ -2739,11 +2741,17 @@ struct RawWsl {
     /// key stays optional so the deprecated `[ui.wsl]` spelling can still win
     /// when this one is absent.
     automount_root: Option<String>,
+    /// Keep one pre-launched terminal per distro a session has opened in, and
+    /// hand it to the next WSL session there instead of launching `wsl.exe`.
+    /// A launch can hang for half a minute while WSL compacts memory; a spare
+    /// is already past that point.  Costs one idle `wsl.exe` and `sh` per
+    /// distro.  Read at startup.
+    warm_spare: bool,
 }
 
 impl Default for RawWsl {
     fn default() -> Self {
-        Self { resident_helper: true, automount_root: None }
+        Self { resident_helper: true, automount_root: None, warm_spare: false }
     }
 }
 
@@ -4142,6 +4150,7 @@ impl RawConfig {
             .filter(|r| r.starts_with('/') && r.len() > 1)
             .unwrap_or_else(|| "/mnt".to_string());
         let wsl_resident_helper = self.wsl.resident_helper;
+        let wsl_warm_spare = self.wsl.warm_spare;
 
         // ---- UI Font ----
         let ui_font = UiFont {
@@ -4206,6 +4215,7 @@ impl RawConfig {
                 .and_then(|raw| parse_config_path(raw, "general.state_dir")),
             wsl_automount_root,
             wsl_resident_helper,
+            wsl_warm_spare,
             profiles,
             default_profile,
             integrations: self.integrations.resolve(moved),

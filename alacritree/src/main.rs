@@ -7,7 +7,7 @@ use alacritree::app::AlacritreeApp;
 use alacritree::win_session;
 use alacritree::{
     cli, config, crash_log, dll_search, frame_log, logdir, logging, startup_log, state, tools, wsl,
-    wsl_helper,
+    wsl_helper, wsl_spare,
 };
 use clap::Parser;
 
@@ -104,6 +104,7 @@ fn main() -> eframe::Result<()> {
     }
     wsl::set_automount_root(config.wsl_automount_root.clone());
     wsl_helper::set_enabled(config.wsl_resident_helper);
+    wsl_spare::set_enabled(config.wsl_warm_spare);
     tools::configure(config.integrations.tool_paths());
     let translucent = config.window.opacity < 1.0;
 
@@ -137,6 +138,7 @@ fn main() -> eframe::Result<()> {
     // resumes it outside the window procedure — so the hook is what records
     // that case.
     crash_log::record_exit(&result);
+    wsl_spare::shutdown();
     result
 }
 

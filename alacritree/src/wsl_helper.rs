@@ -369,7 +369,7 @@ pub fn wrap_exec_argv(program: &str, args: &[String], probe_key: &str) -> Option
     Some(wrapped)
 }
 
-fn is_wsl_program(program: &str) -> bool {
+pub(crate) fn is_wsl_program(program: &str) -> bool {
     // The argv comes from a Windows host, so the program path uses Windows
     // separators. Split on them explicitly rather than via `Path`, whose
     // separator set depends on the compilation target.
@@ -384,7 +384,9 @@ fn is_wsl_program(program: &str) -> bool {
 /// distro they name, and whatever follows them.  A flag missing its value
 /// gets `None`: the rest of the argv then means something this parser
 /// cannot see.
-fn split_leading_flags(args: &[String]) -> Option<(Vec<String>, Option<String>, &[String])> {
+pub(crate) fn split_leading_flags(
+    args: &[String],
+) -> Option<(Vec<String>, Option<String>, &[String])> {
     let mut distro = None;
     let mut flags = Vec::new();
     let mut rest = args;

@@ -2034,6 +2034,11 @@
           "default": true,
           "description": "Keep a resident helper process per distro for foreground probes,\nbatched git queries, and tool discovery.  `false` restores one-shot\nwsl.exe spawns everywhere; WSL sessions then always report \"no\nTUI\", so FocusLeft/FocusRight always move panel focus.",
           "type": "boolean"
+        },
+        "warm_spare": {
+          "default": false,
+          "description": "Keep one pre-launched terminal per distro a session has opened in, and\nhand it to the next WSL session there instead of launching `wsl.exe`.\nA launch can hang for half a minute while WSL compacts memory; a spare\nis already past that point.  Costs one idle `wsl.exe` and `sh` per\ndistro.  Read at startup.",
+          "type": "boolean"
         }
       },
       "type": "object"

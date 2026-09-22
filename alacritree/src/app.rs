@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use alacritty_terminal::tty::Shell;
 use eframe::CreationContext;
 use egui::{Color32, Context, Frame, Margin, RichText, ScrollArea, SidePanel, Stroke};
 
@@ -40,7 +39,7 @@ use crate::pr_status::{self, PrCache, PrInfo, PrState};
 use crate::projects::{Discovered, Project, Worktree, project_json};
 use crate::session::{
     self, Attachment, AttentionVerdict, LiveState, PendingAttention, Session, SessionActivity,
-    SessionId, SessionKind, ShownState, TermSize, poll_attention_debounce,
+    SessionId, SessionKind, ShellCommand, ShownState, TermSize, poll_attention_debounce,
 };
 use crate::shell_decision::{ShellDecision, shell_decision};
 use crate::sidebar_nav::{self, SidebarRow, StepTarget};
@@ -1017,7 +1016,7 @@ impl AlacritreeApp {
         &mut self,
         ctx: &Context,
         working_directory: WorkspaceKey,
-        shell: Option<Shell>,
+        shell: Option<ShellCommand>,
         wsl_probe: Option<WslProbe>,
     ) -> std::io::Result<SessionId> {
         if let Some(dir) = &working_directory {
@@ -1198,7 +1197,7 @@ impl AlacritreeApp {
     /// shell with its OS-guaranteed fallback.  The home tab (`None`
     /// workspace) has no project or location, so only the default profile can
     /// apply there.
-    fn resolve_shell(&self, workspace: &WorkspaceKey) -> (Option<Shell>, Option<WslProbe>) {
+    fn resolve_shell(&self, workspace: &WorkspaceKey) -> (Option<ShellCommand>, Option<WslProbe>) {
         let path = workspace.as_deref();
         let choice = path.and_then(|p| {
             self.projects
@@ -3619,20 +3618,20 @@ fn frame_holds_self_boost(boosts: impl Iterator<Item = SessionBoost>) -> bool {
     boosts.fold(false, |held, session| held | holds_self_boost(session))
 }
 
-fn wsl_shell(distro: &str, workdir: &Path) -> Shell {
+fn wsl_shell(distro: &str, workdir: &Path) -> ShellCommand {
     let (program, args) = wsl::shell_invocation(distro, workdir);
-    Shell::new(program, args)
+    ShellCommand::new(program, args)
 }
 
 /// Shimmed when the resident helper is on; the plain wsl.exe login-shell
 /// launch (and an unknown probe) otherwise.
-fn wsl_session_shell(distro: &str, workdir: &Path) -> (Option<Shell>, Option<WslProbe>) {
+fn wsl_session_shell(distro: &str, workdir: &Path) -> (Option<ShellCommand>, Option<WslProbe>) {
     if !wsl_helper::enabled() {
         return (Some(wsl_shell(distro, workdir)), None);
     }
     let key = wsl_helper::new_probe_key();
     let (program, args) = wsl_helper::shim_invocation(distro, workdir, &key);
-    (Some(Shell::new(program, args)), Some(WslProbe { distro: distro.to_string(), key }))
+    (Some(ShellCommand::new(program, args)), Some(WslProbe { distro: distro.to_string(), key }))
 }
 
 /// The probe shim for any user-supplied wsl.exe argv (profile or
@@ -3640,7 +3639,7 @@ fn wsl_session_shell(distro: &str, workdir: &Path) -> (Option<Shell>, Option<Wsl
 /// a distro name is known — the probe registry needs one, so a wrapped
 /// default-distro launch resolves it via enumeration.  Anything exotic
 /// runs unmodified and probes as unknown.
-fn shimmed_wsl_argv(program: &str, args: &[String]) -> Option<(Shell, WslProbe)> {
+fn shimmed_wsl_argv(program: &str, args: &[String]) -> Option<(ShellCommand, WslProbe)> {
     if !wsl_helper::enabled() {
         return None;
     }
@@ -3648,7 +3647,7 @@ fn shimmed_wsl_argv(program: &str, args: &[String]) -> Option<(Shell, WslProbe)>
     let (args, distro) = wsl_helper::wrap_profile_argv(program, args, &key)?;
     let distro =
         distro.or_else(|| wsl::distros().into_iter().find(|d| d.is_default).map(|d| d.name))?;
-    Some((Shell::new(program.to_string(), args), WslProbe { distro, key }))
+    Some((ShellCommand::new(program.to_string(), args), WslProbe { distro, key }))
 }
 
 /// The probe shim for a multiplexer attach, which launches a command rather
@@ -3673,7 +3672,9 @@ pub(crate) fn multiplexer_attach_probe(
     Some((wrapped, WslProbe { distro: distro.clone(), key }))
 }
 
-fn profile_session_shell(profile: &crate::config::Profile) -> (Option<Shell>, Option<WslProbe>) {
+fn profile_session_shell(
+    profile: &crate::config::Profile,
+) -> (Option<ShellCommand>, Option<WslProbe>) {
     match shimmed_wsl_argv(&profile.program, &profile.args) {
         Some((shell, probe)) => (Some(shell), Some(probe)),
         None => (Some(profile_shell(profile)), None),
@@ -3683,7 +3684,9 @@ fn profile_session_shell(profile: &crate::config::Profile) -> (Option<Shell>, Op
 /// `[terminal.shell] program = "wsl.exe"` gets the same shim as a wsl.exe
 /// profile; any other config shell (or none) spawns unchanged through
 /// `Session::pending_shell`'s own config-shell default.
-fn config_session_shell(config: &crate::config::Config) -> (Option<Shell>, Option<WslProbe>) {
+fn config_session_shell(
+    config: &crate::config::Config,
+) -> (Option<ShellCommand>, Option<WslProbe>) {
     match &config.shell {
         Some(s) => match shimmed_wsl_argv(&s.program, &s.args) {
             Some((shell, probe)) => (Some(shell), Some(probe)),
@@ -3693,8 +3696,8 @@ fn config_session_shell(config: &crate::config::Config) -> (Option<Shell>, Optio
     }
 }
 
-fn profile_shell(profile: &crate::config::Profile) -> Shell {
-    Shell::new(profile.program.clone(), profile.args.clone())
+fn profile_shell(profile: &crate::config::Profile) -> ShellCommand {
+    ShellCommand::new(profile.program.clone(), profile.args.clone())
 }
 
 /// The modal frame's horizontal inner margin.  Any width budgeted against the

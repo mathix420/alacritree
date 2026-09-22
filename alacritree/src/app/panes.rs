@@ -314,9 +314,7 @@ impl AlacritreeApp {
             Some((wrapped, probe)) => (wrapped, Some(probe)),
             None => (launch.argv, None),
         };
-        // `alacritty_terminal::tty::Shell`'s fields are crate-private, so
-        // this goes through the constructor rather than a struct literal.
-        let shell = Shell::new(launch.program, argv);
+        let shell = ShellCommand::new(launch.program, argv);
         let kept_tab = self
             .sessions
             .active(&workspace)

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use alacritty_terminal::event::{Event as TermEvent, EventListener, Notify, WindowSize};
+use alacritty_terminal::event::{Event as TermEvent, EventListener, Notify, OnResize, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, Notifier};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::Point;
@@ -21,7 +21,7 @@ use crate::multiplexer::{PaneKey, PaneStatus};
 use crate::process_probe::{self, ProbeHandle};
 use crate::repaint::Repaint;
 use crate::wsl_helper::{self, WslProbe};
-use crate::{colors, scratchpad};
+use crate::{colors, scratchpad, wsl_spare};
 
 #[derive(Clone)]
 pub(crate) struct EventProxy<R> {
@@ -626,6 +626,20 @@ fn session_env(
     env
 }
 
+/// A program and its arguments.  `tty::Shell` keeps both private, and
+/// [`open`] has to read a wsl.exe launch back to hand it to a warm spare.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShellCommand {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+impl ShellCommand {
+    pub(crate) fn new(program: String, args: Vec<String>) -> Self {
+        Self { program, args }
+    }
+}
+
 /// Everything opening a PTY needs, and nothing that has to stay on the UI
 /// thread.  Built by [`Session::pending`], consumed by [`open`].
 pub(crate) struct OpenRequest<R> {
@@ -637,6 +651,7 @@ pub(crate) struct OpenRequest<R> {
     proxy: EventProxy<R>,
     boost: bool,
     reap: bool,
+    spare: Option<wsl_spare::Launch>,
 }
 
 /// The half of a session that only exists once its PTY does.  Applied by
@@ -679,26 +694,40 @@ impl Drop for Attachment {
 /// it must be callable from a thread that holds no `Session`.
 pub(crate) fn open<R: Repaint>(request: OpenRequest<R>) -> std::io::Result<Attachment> {
     let started = std::time::Instant::now();
-    let OpenRequest { id, window_id, pty_options, window_size, term, proxy, boost, reap } = request;
+    let OpenRequest { id, window_id, pty_options, window_size, term, proxy, boost, reap, spare } =
+        request;
 
     ensure_working_directory(pty_options.working_directory.as_deref())?;
 
-    // `tty::new` is where `LoadLibraryW("conpty.dll")` happens, and the
-    // module it loads answers every later one for the life of the process.
-    #[cfg(windows)]
-    crate::dll_search::harden_dll_search_path();
+    let template = wsl_spare::Template::new(&pty_options.env, boost, reap);
+    let claimed = spare.and_then(|launch| wsl_spare::claim(&launch, &id.to_string(), &template));
+    let (pty, shell_pid, priority_job, line) = match claimed {
+        Some(mut claimed) => {
+            claimed.pty.on_resize(window_size);
+            Processor::<StdSyncHandler>::new().advance(&mut *term.lock(), &claimed.preamble);
+            crate::frame_log::spawn_phase(Some(id), "spare", started.elapsed());
+            (claimed.pty, claimed.shell_pid, claimed.priority_job, Some(claimed.line))
+        },
+        None => {
+            // `tty::new` is where `LoadLibraryW("conpty.dll")` happens, and the
+            // module it loads answers every later one for the life of the process.
+            #[cfg(windows)]
+            crate::dll_search::harden_dll_search_path();
 
-    let pty = tty::new(&pty_options, window_size, window_id)?;
-    crate::frame_log::spawn_phase(Some(id), "pty", started.elapsed());
-    let shell_pid = process_probe::shell_pid_of(&pty);
+            let pty = tty::new(&pty_options, window_size, window_id)?;
+            crate::frame_log::spawn_phase(Some(id), "pty", started.elapsed());
+            let shell_pid = process_probe::shell_pid_of(&pty);
 
-    // Jobbed here rather than on focus: a process joins a job when it is
-    // created, so anything the shell starts before the job exists escapes
-    // it for its whole life.  One job serves both settings, so it is
-    // created when either wants it.
-    let priority_job = shell_pid
-        .filter(|_| boost || reap)
-        .and_then(|pid| crate::focus_priority::PriorityJob::adopt(pid, reap));
+            // Jobbed here rather than on focus: a process joins a job when it is
+            // created, so anything the shell starts before the job exists escapes
+            // it for its whole life.  One job serves both settings, so it is
+            // created when either wants it.
+            let priority_job = shell_pid
+                .filter(|_| boost || reap)
+                .and_then(|pid| crate::focus_priority::PriorityJob::adopt(pid, reap));
+            (pty, shell_pid, priority_job, None)
+        },
+    };
 
     #[cfg(windows)]
     let pty = crate::pty_rearm::RearmingPty::new(pty);
@@ -706,6 +735,9 @@ pub(crate) fn open<R: Repaint>(request: OpenRequest<R>) -> std::io::Result<Attac
     let event_loop = EventLoop::new(term, proxy, pty, pty_options.drain_on_exit, false)?;
     let sender = event_loop.channel();
     event_loop.spawn();
+    if let Some(line) = line {
+        let _ = sender.send(Msg::Input(line.into()));
+    }
     crate::frame_log::spawn_phase(Some(id), "open", started.elapsed());
 
     Ok(Attachment { shell_pid, priority_job, sender: Some(sender) })
@@ -850,7 +882,7 @@ impl<R: Repaint> Session<R> {
         working_directory: Option<PathBuf>,
         size: TermSize,
         cell_size: (f32, f32),
-        shell_override: Option<Shell>,
+        shell_override: Option<ShellCommand>,
         wsl_probe: Option<WslProbe>,
     ) -> (Self, OpenRequest<R>) {
         // Overrides are argv built in code (`wsl.exe -d <distro> --cd <dir>`),
@@ -858,7 +890,7 @@ impl<R: Repaint> Session<R> {
         // shells stay raw to match upstream alacritty.
         let escape_args = shell_override.is_some();
         let shell = shell_override.or_else(|| {
-            config.shell.as_ref().map(|s| Shell::new(s.program.clone(), s.args.clone()))
+            config.shell.as_ref().map(|s| ShellCommand::new(s.program.clone(), s.args.clone()))
         });
         let title = working_directory
             .as_ref()
@@ -899,7 +931,7 @@ impl<R: Repaint> Session<R> {
             working_directory,
             size,
             cell_size,
-            Some(Shell::new(program, args)),
+            Some(ShellCommand::new(program, args)),
             title,
             kind,
             true,
@@ -916,7 +948,7 @@ impl<R: Repaint> Session<R> {
         working_directory: Option<PathBuf>,
         size: TermSize,
         cell_size: (f32, f32),
-        shell: Option<Shell>,
+        shell: Option<ShellCommand>,
         title: String,
         kind: SessionKind,
         escape_args: bool,
@@ -933,10 +965,14 @@ impl<R: Repaint> Session<R> {
         let id = next_session_id();
         let env = session_env(&config.env, &kind, id);
 
+        let spare = shell.as_ref().filter(|_| wsl_spare::enabled()).and_then(|shell| {
+            wsl_spare::Launch::parse(&shell.program, &shell.args, pty_cwd.as_deref())
+        });
+
         #[cfg(not(windows))]
         let _ = escape_args;
         let pty_options = PtyOptions {
-            shell,
+            shell: shell.map(|shell| Shell::new(shell.program, shell.args)),
             working_directory: pty_cwd,
             // Without this the loop drops whatever the child wrote and it had
             // not yet read: the last output a held session exists to show.
@@ -997,6 +1033,7 @@ impl<R: Repaint> Session<R> {
             proxy,
             boost: config.ui.focus_priority_boost,
             reap: config.ui.reap_descendants_on_close,
+            spare,
         };
 
         (session, request)
@@ -2557,6 +2594,32 @@ mod tests {
         let alpha = text.find("alpha").expect("the write made before attach was dropped");
         let beta = text.find("beta").expect("the write made after attach was dropped");
         assert!(alpha < beta, "buffered input was replayed out of order");
+    }
+
+    /// A WSL launch opens cold while its distro has no spare ready, so a
+    /// spare that is still starting never holds a tab up.
+    #[cfg(windows)]
+    #[test]
+    fn a_launch_with_no_spare_ready_opens_cold() {
+        let (mut session, mut request) = Session::pending_command(
+            Recorder::default(),
+            &Config::default(),
+            std::env::current_dir().ok(),
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            "cmd.exe".to_string(),
+            vec!["/q".to_string(), "/k".to_string(), "echo opened cold".to_string()],
+            "probe".to_string(),
+            SessionKind::Shell,
+        );
+        request.spare = Some(wsl_spare::launch_with_no_spare_ready("spare-less"));
+
+        session.attach(open(request).expect("open the pty"));
+
+        assert!(
+            grid_contains(&session, "opened cold", Duration::from_secs(20)),
+            "the cold launch never ran"
+        );
     }
 
     /// A pending session's grid tracks the pane it is drawn in.  Without

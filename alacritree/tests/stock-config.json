@@ -580,5 +580,6 @@
     "worktree_dir": null
   },
   "wsl_automount_root": "/mnt",
-  "wsl_resident_helper": true
+  "wsl_resident_helper": true,
+  "wsl_warm_spare": false
 }
