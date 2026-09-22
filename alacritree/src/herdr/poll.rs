@@ -333,6 +333,11 @@ impl EndpointCache {
         tx
     }
 
+    #[cfg(test)]
+    pub(super) fn stream_up_for_test(&self) -> bool {
+        matches!(self.link, Link::Up(_))
+    }
+
     /// Ages the current run of failures past its grace period, so a test
     /// reaches the state a side that stopped answering ends up in without
     /// waiting the polls out.
@@ -566,17 +571,6 @@ impl EndpointCache {
         if let Link::Down { retry_at, .. } = &mut self.link {
             *retry_at = Instant::now();
         }
-    }
-
-    /// Drops this side's streams and reconnects at once.  For a herdr that
-    /// stopped answering commands without closing its streams, which is the
-    /// one way a hung server can be noticed.
-    pub fn restart(&mut self) {
-        if matches!(self.link, Link::Abandoned) {
-            return;
-        }
-        self.status = None;
-        self.link = Link::Down { failures: 0, retry_at: Instant::now() };
     }
 
     /// Reads the lifecycle stream, and starts one when a reconnect is due.

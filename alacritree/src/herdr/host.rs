@@ -73,17 +73,15 @@ impl Herdr {
         self.cache(side).map(EndpointCache::settings).unwrap_or_default()
     }
 
-    /// Logs a failed gesture.  One that timed out is the only sign of a herdr
-    /// that hung with its streams still open, so that side's streams start
-    /// over.
+    /// Logs a failed gesture.  One that timed out says the call was slow to
+    /// reach herdr, which on a loaded WSL side is the `wsl.exe` launch rather
+    /// than herdr, so a live stream is left alone and only a side already
+    /// down skips the rest of its backoff.
     fn note_gesture<T>(&mut self, side: &Side, result: &Result<T, String>) {
         let Err(error) = result else { return };
         log::warn!("herdr ({side:?}): {error}");
-        if error.starts_with(cli::NO_ANSWER)
-            && let Some(cache) = self.endpoints.cache_mut(side)
-        {
-            log::warn!("herdr ({side:?}): restarting its streams");
-            cache.restart();
+        if error.starts_with(cli::NO_ANSWER) {
+            self.reconnect_now(side);
         }
     }
 
@@ -614,6 +612,28 @@ mod tests {
             Err("the session behind this pane was closed before the attach finished".to_string())
         );
         assert!(second_rx.try_recv().is_err());
+    }
+
+    /// A gesture that times out says the call was slow to reach herdr, which
+    /// on a loaded WSL side is the `wsl.exe` launch, not herdr.  A stream
+    /// herdr is still feeding stays up rather than being torn down and
+    /// relaunched through the same stall.
+    #[test]
+    fn a_timed_out_gesture_leaves_a_live_stream_up() {
+        let side = Side::Wsl("d".into());
+        let mut herdr = herdr(AttachMode::Session);
+        let mut cache = EndpointCache::new(side.clone());
+        let stream = cache.connect_for_test();
+        stream.send(super::super::events::Message::Started).unwrap();
+        cache.poll(Listing::Panes, false);
+        assert!(cache.stream_up_for_test());
+        herdr.caches_mut_for_test().push(cache);
+
+        let timed_out: Result<(), String> =
+            Err(format!("{} while focusing the pane", cli::NO_ANSWER));
+        herdr.note_gesture(&side, &timed_out);
+
+        assert!(herdr.cache(&side).unwrap().stream_up_for_test(), "a live stream was restarted");
     }
 
     /// A shell pane, left out of the displayed listing, is found through the
