@@ -133,7 +133,7 @@ pub(crate) fn run(
             .collect::<Vec<_>>()
             .join(" or ");
         let filter = [format!("({scopes})"), "(status:pending or status:completed)".to_string()];
-        let tasks = Taskwarrior::for_side(side, b).export(&filter, b);
+        let tasks = Taskwarrior::for_project(side, b).export(&filter, b);
         tasks.map(|tasks| (place, tasks))
     })
     .ok()?;

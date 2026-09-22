@@ -84,7 +84,7 @@ The tab shows the global section, the project, the workspace, and one section fo
 - Backspace on an empty row deletes the task
 - right-click starts or stops the task
 
-The tab reloads from taskwarrior every second while it is shown, so tasks an agent adds appear on their own. A project inside WSL reads and writes that distro's taskwarrior.
+The tab reloads from taskwarrior every second while it is shown, so tasks an agent adds appear on their own. A project inside WSL reads and writes that distro's taskwarrior. Taskwarrior 3 has no Windows build, so a Windows project uses the default distro's taskwarrior when `task` is not on the Windows `PATH`. Linux and macOS always use the native install.
 
 #### Agent hooks
 

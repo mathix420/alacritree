@@ -295,8 +295,9 @@ impl TasksView {
         }
         for (row, op) in std::mem::take(&mut self.outbox) {
             let side = self.scope.side.clone();
-            let job = jobs::pool()
-                .spawn(Priority::Interactive, move |b| op.run(&Taskwarrior::for_side(side, b), b));
+            let job = jobs::pool().spawn(Priority::Interactive, move |b| {
+                op.run(&Taskwarrior::for_project(side, b), b)
+            });
             self.writes.push((row, job));
         }
         let mut finished = Vec::new();
@@ -321,7 +322,7 @@ impl TasksView {
             self.stale = false;
             let scope = self.scope.clone();
             let job = jobs::pool().spawn(Priority::Background, move |b| {
-                Taskwarrior::for_side(scope.side.clone(), b).export(&scope.filter(), b)
+                Taskwarrior::for_project(scope.side.clone(), b).export(&scope.filter(), b)
             });
             self.reload = Some((self.reload_epoch(), job));
             self.last_reload = Some(Instant::now());

@@ -88,6 +88,20 @@ impl Taskwarrior {
         Self { side, program, env: Vec::new() }
     }
 
+    /// The taskwarrior holding the tasks of a project on `side`. Taskwarrior 3
+    /// has no Windows build, so a Windows project uses the default distro's
+    /// when no `task` is found on Windows.
+    pub(crate) fn for_project(side: Side, blocking: &Blocking) -> Self {
+        let side = match side {
+            Side::Native if cfg!(windows) => native_or_default_distro(
+                tools::locate(&tools::program(Tool::Task)).is_some(),
+                crate::wsl::distros().into_iter().find(|d| d.is_default).map(|d| d.name),
+            ),
+            side => side,
+        };
+        Self::for_side(side, blocking)
+    }
+
     #[cfg(test)]
     pub(crate) fn with_env(mut self, key: &str, value: &str) -> Self {
         self.env.push((key.to_string(), value.to_string()));
@@ -228,6 +242,14 @@ impl Taskwarrior {
     }
 }
 
+/// With neither, native stays so the error names the program that is missing.
+fn native_or_default_distro(native_found: bool, default_distro: Option<String>) -> Side {
+    match default_distro {
+        Some(distro) if !native_found => Side::Wsl(distro),
+        _ => Side::Native,
+    }
+}
+
 fn is_busy(stderr: &str) -> bool {
     let lower = stderr.to_ascii_lowercase();
     lower.contains("database is locked") || lower.contains("sqlite_busy")
@@ -354,6 +376,14 @@ mod tests {
         tw.program = "alacritree-no-such-task-binary".into();
         let err = jobs::on_this_thread(|b| tw.export(&[], b)).unwrap_err();
         assert!(matches!(err, TaskError::Missing { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_windows_project_without_task_uses_the_default_distro() {
+        let ubuntu = || Some("Ubuntu".to_string());
+        assert_eq!(native_or_default_distro(false, ubuntu()), Side::Wsl("Ubuntu".into()));
+        assert_eq!(native_or_default_distro(true, ubuntu()), Side::Native);
+        assert_eq!(native_or_default_distro(false, None), Side::Native);
     }
 
     #[test]

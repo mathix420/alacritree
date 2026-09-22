@@ -154,6 +154,8 @@ fn a_missing_task_binary_prints_nothing_and_exits_zero() {
     let args = [
         "-o",
         "integrations.taskwarrior.path='alacritree-no-such-task-binary'",
+        "-o",
+        "integrations.taskwarrior.wsl_path='alacritree-no-such-task-binary'",
         "hook",
         "session-start",
         "--harness",
