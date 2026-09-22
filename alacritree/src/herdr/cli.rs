@@ -6,7 +6,7 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -153,6 +153,13 @@ enum Transport {
     Spawn,
 }
 
+/// Refuses a job the helper reached after its caller stopped waiting.  `$1`
+/// is that moment in Unix seconds, or `-` for a caller that waits forever.
+/// The helper cannot be told to drop a job it has queued, so this check is
+/// what keeps a late focus move or a duplicate pane from landing.
+const HELPER_DEADLINE: &str =
+    r#"d=$1; shift; [ "$d" = - ] || [ "$(date +%s)" -le "$d" ] || exit 124; "#;
+
 /// Prints what a command wrote to stdout, and on failure what it wrote to
 /// stderr after it, with the command's own exit status.  The helper keeps
 /// only a script's stdout.
@@ -160,16 +167,17 @@ const HELPER_COMMAND: &str =
     r#"{ e=$("$@" 2>&1 1>&3); r=$?; } 3>&1; [ "$r" -eq 0 ] || printf '%s' "$e"; exit "$r""#;
 
 /// Writes the request in `$1` to the command after it and prints the first
-/// line back.  herdr's Linux bridge answers after its stdin closes, and its
-/// connect failure is folded into that line so the caller can show it.
-const HELPER_REQUEST: &str = r#"r=$1; shift; printf '%s\n' "$r" | "$@" 2>&1 | head -n 1"#;
+/// line back.  herdr's Linux bridge answers after its stdin closes.  What it
+/// printed on stderr, a connect failure for one, stands in only when no
+/// answer came, so a warning cannot pass for the answer.
+const HELPER_REQUEST: &str = r#"r=$1; shift; f=$(mktemp) || exit 1; o=$(printf '%s\n' "$r" | "$@" 2>"$f" | head -n 1); if [ -n "$o" ]; then printf '%s\n' "$o"; else head -c 1000 "$f"; fi; rm -f "$f""#;
 
 /// Runs `herdr <args>` on `side`, writing `request` to its stdin as one line
 /// when given.  A WSL side goes through the distro's resident helper while it
 /// is up, which skips the `wsl.exe` launch and login shell a one-shot pays;
 /// under load that launch has stalled for longer than any gesture waits.
-/// `limit` bounds the wait, and a one-shot that runs out is killed, so a
-/// request given up on never reaches herdr later.
+/// `limit` bounds the wait.  A helper job reached after it is refused, and a
+/// one-shot that runs out is killed.
 fn call(
     side: &Side,
     args: &[&str],
@@ -215,10 +223,18 @@ fn via_helper(
 ) -> Option<Result<Reply, CallError>> {
     let client = wsl_helper::client(distro)?;
     let program = tools::wsl_located(Tool::Herdr, distro, blocking)?;
-    let script = if request.is_some() { HELPER_REQUEST } else { HELPER_COMMAND };
-    let argv: Vec<String> = request
-        .map(|request| request.trim_end().to_string())
-        .into_iter()
+    let body = if request.is_some() { HELPER_REQUEST } else { HELPER_COMMAND };
+    let script = format!("{HELPER_DEADLINE}{body}");
+    // Rounded up, so a job the helper reaches in time is never refused.
+    let deadline = limit.map_or_else(
+        || "-".to_string(),
+        |limit| {
+            let at = SystemTime::now() + limit;
+            (at.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() + 1).to_string()
+        },
+    );
+    let argv: Vec<String> = std::iter::once(deadline)
+        .chain(request.map(|request| request.trim_end().to_string()))
         .chain(std::iter::once(program))
         .chain(args.iter().map(|arg| (*arg).to_string()))
         .collect();
@@ -227,7 +243,7 @@ fn via_helper(
         .name("alacritree-herdr-helper".into())
         .spawn(move || {
             let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
-            let _ = tx.send(client.run(script, &borrowed));
+            let _ = tx.send(client.run(&script, &borrowed));
         })
         .ok()?;
     let answer = match limit {
@@ -264,7 +280,8 @@ fn spawned(
 
 /// Runs `command` to completion, or, given a `request`, until it answers one
 /// line.  stdin stays open until then, since herdr's Windows bridge stops
-/// relaying at EOF.  A child that runs out `limit` is killed.
+/// relaying at EOF.  A child that runs out `limit` is killed.  On a WSL side
+/// that is `wsl.exe`: a herdr already started inside the distro runs on.
 #[allow(clippy::disallowed_methods)] // Every caller is a pool job.
 fn run_child(
     mut command: Command,
@@ -518,17 +535,22 @@ mod tests {
     #[test]
     #[allow(clippy::disallowed_methods)] // Runs the scripts the helper runs.
     fn helper_scripts_carry_what_the_caller_reads() {
-        let run = |script: &str, args: &[&str]| {
+        let run = |body: &str, args: &[&str]| {
+            let script = format!("{HELPER_DEADLINE}{body}");
             let output = Command::new("sh").arg("-c").arg(script).arg("sh").args(args).output();
             let output = output.unwrap();
             (output.status.code(), String::from_utf8_lossy(&output.stdout).into_owned())
         };
-        assert_eq!(run(HELPER_COMMAND, &["sh", "-c", "echo out"]), (Some(0), "out\n".into()));
+        assert_eq!(run(HELPER_COMMAND, &["-", "sh", "-c", "echo out"]), (Some(0), "out\n".into()));
         assert_eq!(
-            run(HELPER_COMMAND, &["sh", "-c", "echo refused >&2; exit 3"]),
+            run(HELPER_COMMAND, &["-", "sh", "-c", "echo refused >&2; exit 3"]),
             (Some(3), "refused".into())
         );
-        assert_eq!(run(HELPER_REQUEST, &["{\"id\":1}", "cat"]), (Some(0), "{\"id\":1}\n".into()));
+        let warns_then_answers = ["-", "{\"id\":1}", "sh", "-c", "echo warning >&2; cat"];
+        assert_eq!(run(HELPER_REQUEST, &warns_then_answers), (Some(0), "{\"id\":1}\n".into()));
+        let unreachable = ["-", "{}", "sh", "-c", "echo failed to connect >&2"];
+        assert_eq!(run(HELPER_REQUEST, &unreachable), (Some(0), "failed to connect\n".into()));
+        assert_eq!(run(HELPER_COMMAND, &["1", "sh", "-c", "echo late"]), (Some(124), "".into()));
     }
 
     #[test]
