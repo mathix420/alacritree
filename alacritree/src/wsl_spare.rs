@@ -335,7 +335,7 @@ fn without_ready_title(seen: &[u8]) -> Option<Vec<u8>> {
 
 /// A launch into `distro` whose spare is forever launching: it is never
 /// ready to take, and claiming it starts no replacement.
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(crate) fn launch_with_no_spare_ready(distro: &str) -> Launch {
     assert!(pool().reserve(distro), "the distro is this test's alone");
     Launch { distro: distro.to_string(), probe_key: None, dir: String::new(), argv: Vec::new() }
@@ -475,6 +475,7 @@ mod tests {
         assert_eq!(Launch::parse("pwsh.exe", &strings(&["-d", "Ubuntu"]), None), None);
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_windows_directory_is_spelled_the_way_the_distro_sees_it() {
         let args = strings(&["-d", "Ubuntu", "--cd", r"C:\Users\me"]);
@@ -576,7 +577,10 @@ mod tests {
             .stdout(Stdio::piped())
             .spawn()
             .expect("sh runs");
-        child.stdin.take().expect("stdin").write_all(&launch.line("7").expect("encodes")).unwrap();
+        // A terminal's `icrnl` ends the line; a pipe passes the `\r` through.
+        let mut line = launch.line("7").expect("encodes");
+        line.push(b'\n');
+        child.stdin.take().expect("stdin").write_all(&line).unwrap();
         let output = child.wait_with_output().expect("the script exits");
 
         let stdout = String::from_utf8(output.stdout).expect("utf-8");
