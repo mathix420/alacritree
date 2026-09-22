@@ -275,7 +275,9 @@ mod tests {
 
     #[test]
     fn the_helper_hello_probes_the_registry_in_order() {
-        assert_eq!(crate::wsl_helper::HELLO_TOOLS, Tool::ALL.map(Tool::name));
+        let (registry, rest) = crate::wsl_helper::HELLO_TOOLS.split_at(Tool::ALL.len());
+        assert_eq!(registry, Tool::ALL.map(Tool::name));
+        assert_eq!(rest, ["zellij"]);
     }
 
     #[test]

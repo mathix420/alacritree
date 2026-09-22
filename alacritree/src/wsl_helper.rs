@@ -12,9 +12,11 @@ use base64::engine::general_purpose::STANDARD as B64;
 /// on one-shot spawns.
 pub const PROTOCOL_VERSION: &str = "2";
 
-/// The programs the hello resolves, in the order its fields carry them.
+/// The programs the hello resolves, in the order its fields carry them: the
+/// tool registry's, then zellij, which has a config table of its own.
 /// `HELPER_SCRIPT` spells the same list.
-pub const HELLO_TOOLS: [&str; 7] = ["git", "gh", "delta", "doppler", "herdr", "tuicr", "task"];
+pub const HELLO_TOOLS: [&str; 8] =
+    ["git", "gh", "delta", "doppler", "herdr", "tuicr", "task", "zellij"];
 
 /// Login-shell-resolved tool paths and the distro-side runtime dir, from
 /// the helper's hello line.
@@ -166,11 +168,11 @@ set -u
 b64() { printf %s "$1" | base64 | tr -d '\n'; }
 s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)
 [ -x "$s" ] || s=${SHELL:-/bin/sh}
-caps=$("$s" -lc 'command -v git || echo; command -v gh || echo; command -v delta || echo; command -v doppler || echo; command -v herdr || echo; command -v tuicr || echo; command -v task || echo' 2>/dev/null)
+caps=$("$s" -lc 'command -v git || echo; command -v gh || echo; command -v delta || echo; command -v doppler || echo; command -v herdr || echo; command -v tuicr || echo; command -v task || echo; command -v zellij || echo' 2>/dev/null)
 rt=${XDG_RUNTIME_DIR:-/tmp}/alacritree
 printf 'hello\t2'
 i=1
-while [ "$i" -le 7 ]; do
+while [ "$i" -le 8 ]; do
   printf '\t%s' "$(b64 "$(printf %s "$caps" | sed -n "${i}p")")"
   i=$((i + 1))
 done
@@ -933,7 +935,7 @@ mod tests {
 
     /// A hello `parse_hello` accepts: protocol 2, every tool field and the
     /// runtime dir empty.
-    const HELLO_LINE: &str = "hello\t2\t\t\t\t\t\t\t\t\n";
+    const HELLO_LINE: &str = "hello\t2\t\t\t\t\t\t\t\t\t\n";
 
     /// One end of a pipe pair standing in for the helper's stdio.
     struct FakePipe {
@@ -1026,7 +1028,8 @@ mod tests {
     #[test]
     fn parses_hello_with_missing_tools() {
         // git and runtime dir present, every other tool absent.
-        let line = "hello\t2\tL3Vzci9iaW4vZ2l0\t\t\t\t\t\t\tL3J1bi91c2VyLzEwMDAvYWxhY3JpdHJlZQ==\n";
+        let line =
+            "hello\t2\tL3Vzci9iaW4vZ2l0\t\t\t\t\t\t\t\tL3J1bi91c2VyLzEwMDAvYWxhY3JpdHJlZQ==\n";
         let caps = parse_hello(line).unwrap();
         assert_eq!(caps.path("git"), Some("/usr/bin/git"));
         assert_eq!(caps.path("delta"), None);

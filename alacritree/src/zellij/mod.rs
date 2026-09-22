@@ -12,9 +12,9 @@ mod listing;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-pub use cli::{SideListing, attach, create_pane, focus_pane, list_side};
+pub use cli::{CallError, SideListing, attach, create_pane, focus_pane, list_side};
 pub use listing::{split_terminal_id, terminal_id};
 use serde_json::{Value, json};
 
@@ -35,6 +35,15 @@ struct PendingAttach {
     request: AttachRequest,
 }
 
+/// How long a side that said it has no zellij goes unasked.  Asking a WSL
+/// side can launch a `wsl.exe`, and a distro without zellij would otherwise
+/// pay for one every poll, forever.
+const ABSENT_RECHECK: Duration = Duration::from_secs(60);
+
+/// What each side answered in one poll, a side skipped for having no zellij
+/// left out.
+type Polled = Vec<(Side, Result<SideListing, CallError>)>;
+
 struct PendingCreate {
     job: jobs::Job<Result<CreatedPane, String>>,
     side: Side,
@@ -46,8 +55,10 @@ pub(crate) struct Zellij {
     /// What each side answered in the last poll that landed.  A side that
     /// did not answer is absent rather than empty.
     sides: Vec<SideListing>,
-    listing: Option<jobs::Job<Vec<SideListing>>>,
+    listing: Option<jobs::Job<Polled>>,
     last_poll: Option<Instant>,
+    /// When each side last said it has no zellij.
+    absent: Vec<(Side, Instant)>,
     pending_attach: Vec<PendingAttach>,
     pending_create: Vec<PendingCreate>,
 }
@@ -59,6 +70,7 @@ impl Zellij {
             sides: Vec::new(),
             listing: None,
             last_poll: None,
+            absent: Vec::new(),
             pending_attach: Vec::new(),
             pending_create: Vec::new(),
         }
@@ -109,14 +121,37 @@ impl Zellij {
         }
     }
 
-    fn adopt(&mut self, sides: Vec<SideListing>) {
-        self.sides = sides;
+    /// Keeps what answered, and notes the sides that said they have no
+    /// zellij.  A side that did not answer in time keeps its note as it was.
+    fn adopt(&mut self, polled: Polled, at: Instant) {
+        self.sides.clear();
+        for (side, listed) in polled {
+            match listed {
+                Ok(listing) => {
+                    self.absent.retain(|(absent, _)| *absent != side);
+                    self.sides.push(listing);
+                },
+                Err(CallError::Absent(why)) => {
+                    log::debug!("zellij: {why}; asking {} again in a minute", side.name());
+                    self.absent.retain(|(absent, _)| *absent != side);
+                    self.absent.push((side, at));
+                },
+                Err(CallError::NoAnswer) => {},
+            }
+        }
+    }
+
+    /// Whether a poll starting `now` asks `side`.
+    fn due(&self, side: &Side, now: Instant) -> bool {
+        !self.absent.iter().any(|(absent, at)| {
+            absent == side && now.saturating_duration_since(*at) < ABSENT_RECHECK
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn adopt_for_test(&mut self, sides: Vec<SideListing>) {
         self.config.enabled = true;
-        self.adopt(sides);
+        self.sides = sides;
     }
 }
 
@@ -135,7 +170,7 @@ impl MultiplexerSession for Zellij {
         }
         if let Some(job) = &self.listing {
             match job.poll() {
-                Some(sides) => self.adopt(sides),
+                Some(polled) => self.adopt(polled, Instant::now()),
                 None if job.failed() => {},
                 None => return,
             }
@@ -144,16 +179,26 @@ impl MultiplexerSession for Zellij {
         if self.last_poll.is_some_and(|at| at.elapsed() < self.config.poll_interval) {
             return;
         }
-        self.last_poll = Some(Instant::now());
+        let now = Instant::now();
+        self.last_poll = Some(now);
         let native = self.program(&Side::Native);
         let inside_wsl = self.wsl_program();
+        let skipped: Vec<Side> = self
+            .absent
+            .iter()
+            .map(|(side, _)| side)
+            .filter(|side| !self.due(side, now))
+            .cloned()
+            .collect();
         self.listing = Some(jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
             let distros = wsl::running_distros(blocking).unwrap_or_default();
             std::iter::once(Side::Native)
                 .chain(distros.into_iter().map(Side::Wsl))
-                .filter_map(|side| {
+                .filter(|side| !skipped.contains(side))
+                .map(|side| {
                     let program = if side == Side::Native { &native } else { &inside_wsl };
-                    list_side(program, &side).ok()
+                    let listed = list_side(program, &side);
+                    (side, listed)
                 })
                 .collect()
         }));
@@ -395,6 +440,34 @@ mod tests {
         let mut zellij = Zellij::new(ZellijConfig::default());
         zellij.adopt_for_test(sides);
         zellij
+    }
+
+    /// A side with no zellij is asked again once a minute rather than every
+    /// poll, since each ask on WSL can launch a `wsl.exe`.
+    #[test]
+    fn a_side_with_no_zellij_is_checked_once_a_minute() {
+        let wsl = Side::Wsl("d".into());
+        let mut zellij = zellij(Vec::new());
+        let at = Instant::now();
+        zellij.adopt(vec![(wsl.clone(), Err(CallError::Absent("no zellij".into())))], at);
+
+        assert!(!zellij.due(&wsl, at + Duration::from_secs(2)));
+        assert!(zellij.due(&wsl, at + Duration::from_secs(61)));
+        assert!(zellij.due(&Side::Native, at + Duration::from_secs(2)));
+    }
+
+    /// A side that did not answer in time may well have zellij, so it is
+    /// asked again on the next poll.
+    #[test]
+    fn a_side_that_did_not_answer_is_asked_again() {
+        let wsl = Side::Wsl("d".into());
+        let mut zellij = zellij(Vec::new());
+        let at = Instant::now();
+        zellij.adopt(vec![(wsl.clone(), Err(CallError::Absent("no zellij".into())))], at);
+        let later = at + Duration::from_secs(61);
+        zellij.adopt(vec![(wsl.clone(), Err(CallError::NoAnswer))], later);
+
+        assert!(zellij.due(&wsl, later + Duration::from_secs(2)));
     }
 
     #[test]
