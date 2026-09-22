@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.13.0](https://github.com/mathix420/alacritree/compare/v0.12.0...v0.13.0) (2026-09-22)
+
+
+### Features
+
+* **cli:** resolve project refresh from a path, add --all ([#225](https://github.com/mathix420/alacritree/issues/225)) ([f051b77](https://github.com/mathix420/alacritree/commit/f051b774df3fcf4b65030b5a776404fc80b657ef))
+* **cursor:** blink the cursor and hollow it unfocused [43] ([#264](https://github.com/mathix420/alacritree/issues/264)) ([2032106](https://github.com/mathix420/alacritree/commit/20321064f8bf8d4d643b829ffd3998f97f6e7c27))
+* **cursor:** smear the cursor to its new cell ([#263](https://github.com/mathix420/alacritree/issues/263)) ([42b220e](https://github.com/mathix420/alacritree/commit/42b220eaaff53811fc1ad5d7085496fb14f9c416))
+* **diff:** choose the diff pane viewer [23] ([#233](https://github.com/mathix420/alacritree/issues/233)) ([3b28b0e](https://github.com/mathix420/alacritree/commit/3b28b0ed5e729ecf6fafbff8ccf5f530a1048853))
+* **integrations:** add zellij multiplexer [32] ([#251](https://github.com/mathix420/alacritree/issues/251)) ([42d8ccb](https://github.com/mathix420/alacritree/commit/42d8ccb250ef81b179b22faeb8b225eeaae12ed8))
+* **ipc:** attach multiplexer panes without focus [29] ([#239](https://github.com/mathix420/alacritree/issues/239)) ([17132cb](https://github.com/mathix420/alacritree/commit/17132cb95de39699c3d9950ad79e0b41f8d33cb9))
+* **mouse:** hide the pointer while typing ([#262](https://github.com/mathix420/alacritree/issues/262)) ([0a6fa2c](https://github.com/mathix420/alacritree/commit/0a6fa2cfd5497bb218e6b96ef88b5705b55efd63))
+* **sidebar:** show done and unknown agent states [45] ([#271](https://github.com/mathix420/alacritree/issues/271)) ([9896188](https://github.com/mathix420/alacritree/commit/9896188e5a19833e28a0943b7b809b6f18008d25))
+* **tasks:** track tasks in taskwarrior [49] ([#276](https://github.com/mathix420/alacritree/issues/276)) ([ef7de57](https://github.com/mathix420/alacritree/commit/ef7de57b02bf61896e138b3d5da9c3f9eac183ca))
+* **wsl:** keep a warm spare terminal per distro [53] ([#281](https://github.com/mathix420/alacritree/issues/281)) ([13e03cd](https://github.com/mathix420/alacritree/commit/13e03cddec73ab14d0646a89ac3f38ed267a0f12))
+
+
+### Bug Fixes
+
+* **herdr:** attach every pane in the background ([#277](https://github.com/mathix420/alacritree/issues/277)) ([a310241](https://github.com/mathix420/alacritree/commit/a310241236bc67fe22c22f6b48182f4e0dbbb3a8)), closes [#124](https://github.com/mathix420/alacritree/issues/124)
+* **herdr:** keep the WSL herdr link up under load [51] ([#278](https://github.com/mathix420/alacritree/issues/278)) ([2a02778](https://github.com/mathix420/alacritree/commit/2a02778806e6d3de55dc966def4f30f259db8d5e))
+* **herdr:** restore WSL pane navigation [28] ([#238](https://github.com/mathix420/alacritree/issues/238)) ([d48ddb8](https://github.com/mathix420/alacritree/commit/d48ddb85afc5d83a15cb0d83cc5681eb9632f46d))
+* **modal:** ignore keys aimed at the frame before it ([#268](https://github.com/mathix420/alacritree/issues/268)) ([2869d7e](https://github.com/mathix420/alacritree/commit/2869d7e6909c4b0ba4b42f4970ac7cf0d12facc3))
+* **session:** forward focus keys to zellij and herdr ([#232](https://github.com/mathix420/alacritree/issues/232)) ([c6602ad](https://github.com/mathix420/alacritree/commit/c6602ad0740d736a0c7880ba569afd9da49a49a7))
+* **sidebar:** keep PR badges on the branch they belong to [44] ([#270](https://github.com/mathix420/alacritree/issues/270)) ([09fe709](https://github.com/mathix420/alacritree/commit/09fe7092589ae5b602fa83df91121bf7f0d0fc7d))
+* **worktree:** honor [workspace] for every create ([#245](https://github.com/mathix420/alacritree/issues/245)) ([d8c4317](https://github.com/mathix420/alacritree/commit/d8c4317501ea57550b757ce0dcd5c98b4583b624)), closes [#107](https://github.com/mathix420/alacritree/issues/107)
+* **worktree:** stop a refused delete losing work ([#267](https://github.com/mathix420/alacritree/issues/267)) ([9fd3842](https://github.com/mathix420/alacritree/commit/9fd3842e60f87438d67a3fab0e23c5aae722484b))
+* **zellij:** poll WSL through the resident helper ([#280](https://github.com/mathix420/alacritree/issues/280)) ([8efb72a](https://github.com/mathix420/alacritree/commit/8efb72a1aedb781c86c9f1aad4d64ef28f5dacdb))
+
+
+### Performance Improvements
+
+* **herdr:** follow herdr through its event stream [48] ([#275](https://github.com/mathix420/alacritree/issues/275)) ([b51ae38](https://github.com/mathix420/alacritree/commit/b51ae38d39a7d197324458d9bc663c3587723f9a))
+* **wsl:** cache an empty distro list once settled ([#266](https://github.com/mathix420/alacritree/issues/266)) ([0fb2151](https://github.com/mathix420/alacritree/commit/0fb2151cf004049781b0de5f041ceef4f7e392d6))
+
 ## [0.12.0](https://github.com/mathix420/alacritree/compare/v0.11.0...v0.12.0) (2026-09-12)
 
 
