@@ -73,12 +73,16 @@ impl Herdr {
         self.cache(side).map(EndpointCache::settings).unwrap_or_default()
     }
 
-    /// A gesture that timed out is the only sign of a herdr that hung with
-    /// its streams still open, so that side's streams start over.
+    /// Logs a failed gesture.  One that timed out is the only sign of a herdr
+    /// that hung with its streams still open, so that side's streams start
+    /// over.
     fn note_gesture<T>(&mut self, side: &Side, result: &Result<T, String>) {
-        if result.as_ref().is_err_and(|e| e.starts_with(cli::NO_ANSWER))
+        let Err(error) = result else { return };
+        log::warn!("herdr ({side:?}): {error}");
+        if error.starts_with(cli::NO_ANSWER)
             && let Some(cache) = self.endpoints.cache_mut(side)
         {
+            log::warn!("herdr ({side:?}): restarting its streams");
             cache.restart();
         }
     }
@@ -437,9 +441,6 @@ impl MultiplexerSession for Herdr {
                 Some(result) => {
                     self.note_gesture(&pending.key.side, &result);
                     let succeeded = result.is_ok();
-                    if let Err(e) = result {
-                        log::warn!("{e}");
-                    }
                     if succeeded {
                         self.focused_view.moved_focus(&pending.key, Instant::now());
                         if let Some(target) = self.focus_target(&pending.key) {

@@ -39,8 +39,18 @@ pub(super) enum Message {
     /// herdr accepted the subscription, and events follow.
     Started,
     Event(Event),
-    /// The stream is over.  A stream that never started says why.
-    Ended(Option<PollError>),
+    /// The stream is over.  A stream that never started says why, and
+    /// `stderr` is whatever the bridge printed before it exited.
+    Ended {
+        reason: Option<PollError>,
+        stderr: String,
+    },
+}
+
+impl Message {
+    fn ended(reason: PollError) -> Self {
+        Self::Ended { reason: Some(reason), stderr: String::new() }
+    }
 }
 
 /// One event, reduced to what the endpoint does about it.
@@ -171,7 +181,7 @@ impl Stream {
     /// never start a real bridge.
     pub(super) fn unreachable() -> Self {
         let (tx, rx) = mpsc::channel();
-        let _ = tx.send(Message::Ended(Some(PollError::Absent("no_herdr_in_tests"))));
+        let _ = tx.send(Message::ended(PollError::Absent("no_herdr_in_tests")));
         Self::Open(Bridge { rx, child: None })
     }
 
@@ -187,7 +197,7 @@ impl Stream {
     /// exit path to handle.  Never blocks.
     pub(super) fn messages(&mut self) -> Vec<Message> {
         if let Self::Opening(job) = self {
-            let ended = |error| vec![Message::Ended(Some(error))];
+            let ended = |error| vec![Message::ended(error)];
             let (next, messages) = match job.poll() {
                 Some(Ok(bridge)) => (Self::Open(bridge), Vec::new()),
                 Some(Err(error)) => (Self::Closed, ended(error)),
@@ -289,15 +299,13 @@ fn relay(stdout: ChildStdout, mut stderr: ChildStderr, tx: &mpsc::Sender<Message
             return;
         }
     }
+    let mut text = String::new();
+    let _ = stderr.read_to_string(&mut text);
     let reason = (!started).then(|| match refusal {
         Some(code) => PollError::Server(code),
-        None => {
-            let mut text = String::new();
-            let _ = stderr.read_to_string(&mut text);
-            classify_exit(&text)
-        },
+        None => classify_exit(&text),
     });
-    send(Message::Ended(reason));
+    send(Message::Ended { reason, stderr: text.trim().to_string() });
 }
 
 #[cfg(test)]
