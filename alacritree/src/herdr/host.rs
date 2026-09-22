@@ -366,9 +366,9 @@ impl MultiplexerSession for Herdr {
                     .map_or_else(|| pending.target.clone(), |agent| agent.target(&side));
                 let focus = pending.request.focus.takes();
                 pending.job =
-                    Some(jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
+                    Some(jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
                         let focus = focus.then_some(target.pane_id.as_str());
-                        cli::herdr_attach_gesture(&target.side, focus, name)
+                        cli::herdr_attach_gesture(&target.side, focus, name, blocking)
                             .map(|(program, argv)| Launch { program, argv })
                     }));
                 None
@@ -395,8 +395,8 @@ impl MultiplexerSession for Herdr {
         self.reconnect_now(&side);
         let asked = side.clone();
         let focus = request.focus.takes();
-        let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
-            cli::create_pane(&asked, cwd, focus)
+        let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
+            cli::create_pane(&asked, cwd, focus, blocking)
         });
         self.pending_create.push(PendingCreate { job, side, request });
     }
@@ -461,8 +461,8 @@ impl MultiplexerSession for Herdr {
                 };
                 let Some(target) = self.focus_target(key) else { return ViewStep::default() };
                 let side = key.side.clone();
-                let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
-                    focus_pane(&side, &target.pane_id)
+                let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
+                    focus_pane(&side, &target.pane_id, blocking)
                 });
                 self.view_focus = Some(HerdrViewFocus { session: id, key: key.clone(), job });
                 ViewStep::default()

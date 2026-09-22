@@ -126,20 +126,23 @@ pub fn wsl_program(tool: Tool) -> String {
 /// The program to name for `tool` inside `distro` from a pool job. It uses a
 /// configured WSL path, a cached lookup, the resident helper, or the bare name.
 /// This runs off the UI thread because reaching the helper can start it.
-pub fn wsl_in_job(tool: Tool, distro: &str, _blocking: &jobs::Blocking) -> String {
+pub fn wsl_in_job(tool: Tool, distro: &str, blocking: &jobs::Blocking) -> String {
+    wsl_located(tool, distro, blocking).unwrap_or_else(|| tool.name().to_string())
+}
+
+/// Where `tool` is inside `distro` when that is known without a login shell:
+/// the configured path, a cached lookup, or the resident helper's. `None`
+/// otherwise, which [`wsl_in_job`] turns into the bare name.
+pub fn wsl_located(tool: Tool, distro: &str, _blocking: &jobs::Blocking) -> Option<String> {
     if let Some(path) = wsl_override(tool) {
-        return path;
+        return Some(path);
     }
     if let Some(path) = lock(lookups()).cached(distro, tool) {
-        return path;
+        return Some(path);
     }
-    match wsl_helper::capability(distro, tool.name()) {
-        Some(path) => {
-            lock(lookups()).found.insert((distro.to_string(), tool), path.clone());
-            path
-        },
-        None => tool.name().to_string(),
-    }
+    let path = wsl_helper::capability(distro, tool.name())?;
+    lock(lookups()).found.insert((distro.to_string(), tool), path.clone());
+    Some(path)
 }
 
 /// Resolve `program` the way the OS would: an explicit path as itself, a bare

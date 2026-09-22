@@ -454,10 +454,10 @@ impl EndpointCache {
             return;
         }
         let side = self.side.clone();
-        self.session_name = Read::Pending(
-            jobs::pool()
-                .spawn(jobs::Priority::Background, move |_| running_session_name(&side).ok()),
-        );
+        self.session_name =
+            Read::Pending(jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
+                running_session_name(&side, blocking).ok()
+            }));
     }
 
     /// Adopt a landed config read.  Both halves are part of what a row
