@@ -26,6 +26,7 @@ use crate::ipc::protocol::{self, IpcRequest, SendError};
 use crate::multiplexer::Side;
 use crate::shell_decision::{ShellDecision, shell_decision};
 use crate::tasks::taskwarrior::{TaskError, Taskwarrior};
+use crate::tools::locate;
 use crate::wsl::{self, ShellChoice};
 use crate::{command_ext, jobs, state, tools};
 
@@ -620,45 +621,6 @@ fn running_alacritree_processes() -> Vec<AlacritreeProcess> {
     processes
 }
 
-/// Resolve `program` the way the OS would: an explicit path as itself, a bare
-/// name against each directory on the search path, trying each executable
-/// extension (`PATHEXT` on Windows, none elsewhere).
-fn locate_in(program: &str, dirs: &[PathBuf], exts: &[String]) -> Option<PathBuf> {
-    if program.contains('/') || program.contains('\\') {
-        let path = PathBuf::from(program);
-        return path.is_file().then_some(path);
-    }
-    dirs.iter().find_map(|dir| {
-        exts.iter().find_map(|ext| {
-            let candidate = dir.join(format!("{program}{ext}"));
-            candidate.is_file().then_some(candidate)
-        })
-    })
-}
-
-fn locate(program: &str) -> Option<PathBuf> {
-    let dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).collect())
-        .unwrap_or_default();
-    locate_in(program, &dirs, &executable_extensions())
-}
-
-/// The empty extension comes last on Windows too: `PATHEXT` covers `git.exe`,
-/// but a bare extensionless file is still executable if it is there.
-#[cfg(windows)]
-fn executable_extensions() -> Vec<String> {
-    let mut exts: Vec<String> = std::env::var("PATHEXT")
-        .map(|v| v.split(';').map(str::to_lowercase).filter(|e| !e.is_empty()).collect())
-        .unwrap_or_else(|_| vec![".exe".to_string()]);
-    exts.push(String::new());
-    exts
-}
-
-#[cfg(not(windows))]
-fn executable_extensions() -> Vec<String> {
-    vec![String::new()]
-}
-
 fn find(program: &str) -> Option<Found> {
     let path = locate(program)?;
     let version = version_of(&path);
@@ -809,10 +771,6 @@ mod tests {
 
     fn names(checks: &[Check]) -> Vec<&str> {
         checks.iter().map(|c| c.name.as_str()).collect()
-    }
-
-    fn touch(path: &Path) {
-        std::fs::write(path, "").expect("write");
     }
 
     /// git is not optional: `worktree create` shells out to it, so a machine
@@ -973,51 +931,6 @@ mod tests {
         assert_eq!(check.status, Status::Ok);
         assert!(check.detail.contains("2.51.0"), "{:?} lacks the version", check.detail);
         assert!(check.detail.contains("/usr/bin/git"), "{:?} lacks the path", check.detail);
-    }
-
-    #[test]
-    fn a_bare_name_is_found_on_the_search_path() {
-        let dir = TempDir::new().unwrap();
-        let exe = dir.path().join("tool.exe");
-        touch(&exe);
-
-        let found = locate_in("tool", &[dir.path().to_path_buf()], &[".exe".to_string()]);
-
-        assert_eq!(found, Some(exe));
-    }
-
-    /// Unix has no executable extension, so the empty one has to be tried too —
-    /// otherwise nothing is ever found there.
-    #[test]
-    fn a_bare_name_is_found_without_an_extension() {
-        let dir = TempDir::new().unwrap();
-        let exe = dir.path().join("tool");
-        touch(&exe);
-
-        let found = locate_in("tool", &[dir.path().to_path_buf()], &[String::new()]);
-
-        assert_eq!(found, Some(exe));
-    }
-
-    #[test]
-    fn a_name_that_is_not_on_the_path_is_not_found() {
-        let dir = TempDir::new().unwrap();
-
-        assert_eq!(locate_in("tool", &[dir.path().to_path_buf()], &[String::new()]), None);
-    }
-
-    /// A configured shell is usually an absolute path (`C:\...\pwsh.exe`), which
-    /// must be checked where it points rather than hunted for on the path.
-    #[test]
-    fn a_program_with_a_path_is_not_searched_for_on_the_path() {
-        let dir = TempDir::new().unwrap();
-        let exe = dir.path().join("shell");
-        touch(&exe);
-
-        let found = locate_in(&exe.to_string_lossy(), &[], &[String::new()]);
-
-        assert_eq!(found, Some(exe));
-        assert_eq!(locate_in("/nowhere/shell", &[], &[String::new()]), None);
     }
 
     fn diagnosis(files: Vec<ConfigFile>, schema_error: Option<String>) -> ConfigDiagnosis {

@@ -9,6 +9,7 @@
 //! `~/.cargo/bin`.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use crate::{jobs, wsl, wsl_helper};
@@ -139,6 +140,45 @@ pub fn wsl_in_job(tool: Tool, distro: &str, _blocking: &jobs::Blocking) -> Strin
         },
         None => tool.name().to_string(),
     }
+}
+
+/// Resolve `program` the way the OS would: an explicit path as itself, a bare
+/// name against each directory on the search path, trying each executable
+/// extension (`PATHEXT` on Windows, none elsewhere).
+fn locate_in(program: &str, dirs: &[PathBuf], exts: &[String]) -> Option<PathBuf> {
+    if program.contains('/') || program.contains('\\') {
+        let path = PathBuf::from(program);
+        return path.is_file().then_some(path);
+    }
+    dirs.iter().find_map(|dir| {
+        exts.iter().find_map(|ext| {
+            let candidate = dir.join(format!("{program}{ext}"));
+            candidate.is_file().then_some(candidate)
+        })
+    })
+}
+
+pub fn locate(program: &str) -> Option<PathBuf> {
+    let dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    locate_in(program, &dirs, &executable_extensions())
+}
+
+/// The empty extension comes last on Windows too: `PATHEXT` covers `git.exe`,
+/// but a bare extensionless file is still executable if it is there.
+#[cfg(windows)]
+fn executable_extensions() -> Vec<String> {
+    let mut exts: Vec<String> = std::env::var("PATHEXT")
+        .map(|v| v.split(';').map(str::to_lowercase).filter(|e| !e.is_empty()).collect())
+        .unwrap_or_else(|_| vec![".exe".to_string()]);
+    exts.push(String::new());
+    exts
+}
+
+#[cfg(not(windows))]
+fn executable_extensions() -> Vec<String> {
+    vec![String::new()]
 }
 
 type Probe = Arc<dyn Fn(&str, Tool, &jobs::Blocking) -> Option<String> + Send + Sync>;
@@ -287,5 +327,50 @@ mod tests {
         let (found, heard) = mpsc::channel();
         lookups.resolve("Ubuntu", Tool::Git, Box::new(move || found.send(()).unwrap()));
         heard.recv_timeout(Duration::from_secs(5)).expect("on_found runs when the probe lands");
+    }
+
+    #[test]
+    fn a_bare_name_is_found_on_the_search_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let exe = dir.path().join("tool.exe");
+        std::fs::write(&exe, "").unwrap();
+
+        let found = locate_in("tool", &[dir.path().to_path_buf()], &[".exe".to_string()]);
+
+        assert_eq!(found, Some(exe));
+    }
+
+    /// Unix has no executable extension, so the empty one has to be tried too,
+    /// or nothing is ever found there.
+    #[test]
+    fn a_bare_name_is_found_without_an_extension() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let exe = dir.path().join("tool");
+        std::fs::write(&exe, "").unwrap();
+
+        let found = locate_in("tool", &[dir.path().to_path_buf()], &[String::new()]);
+
+        assert_eq!(found, Some(exe));
+    }
+
+    #[test]
+    fn a_name_that_is_not_on_the_path_is_not_found() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        assert_eq!(locate_in("tool", &[dir.path().to_path_buf()], &[String::new()]), None);
+    }
+
+    /// A configured shell is usually an absolute path (`C:\...\pwsh.exe`), which
+    /// must be checked where it points rather than hunted for on the path.
+    #[test]
+    fn a_program_with_a_path_is_not_searched_for_on_the_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let exe = dir.path().join("shell");
+        std::fs::write(&exe, "").unwrap();
+
+        let found = locate_in(&exe.to_string_lossy(), &[], &[String::new()]);
+
+        assert_eq!(found, Some(exe));
+        assert_eq!(locate_in("/nowhere/shell", &[], &[String::new()]), None);
     }
 }
