@@ -177,8 +177,8 @@ impl Managed {
     }
 }
 
-/// Whether opening a pane's session brings it in front of the user.  Every
-/// gesture a person makes takes focus; a script attaching in the background
+/// Whether opening a pane's session brings it in front of the user. A gesture
+/// on one pane takes focus; a script or a batch attaching in the background
 /// leaves it, so the workspace on screen, each workspace's active tab and the
 /// multiplexer's own focus all stay where they were.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

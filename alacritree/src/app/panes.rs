@@ -90,9 +90,9 @@ impl AlacritreeApp {
     /// is the one the sidebar and the palette both draw, so this opens exactly
     /// the rows the user could have opened one at a time.
     ///
-    /// The batch was asked for the whole set rather than for one pane, so it
-    /// switches to none of them: each session files under the workspace its
-    /// own pane belongs to and the workspace on screen is left alone.
+    /// The batch attaches in the background: each session files under its own
+    /// pane's workspace, and neither the screen nor the multiplexer's focus
+    /// moves. Focusing a herdr pane clears its notification.
     pub(super) fn attach_every_multiplexer_pane(&mut self, ctx: &Context) {
         if !self.multiplexers.any_enabled() {
             self.modals.error_dialog = Some(self.multiplexers.disabled_reason().to_string());
@@ -109,7 +109,7 @@ impl AlacritreeApp {
             // user who navigated while the gesture was still running.
             let switch = WorkspaceSwitch { to: workspace.clone(), from: workspace };
             let unlisted = PaneTarget::unlisted(&key, &pane_id);
-            self.attach_pane(ctx, key, unlisted, &switch, None, AttachFocus::Take);
+            self.attach_pane(ctx, key, unlisted, &switch, None, AttachFocus::Leave);
         }
     }
 

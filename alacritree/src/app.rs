@@ -5808,6 +5808,29 @@ mod tests {
         assert_eq!(app.current_workspace, asked_from);
     }
 
+    /// Focusing a herdr pane clears its notification, so a batch that took
+    /// focus would walk herdr across every pane and wipe the done and
+    /// attention state of each agent it attached.
+    #[test]
+    fn attaching_every_pane_leaves_the_multiplexer_focus_alone() {
+        let mut app = lifecycle_app();
+        adopt_panes(&mut app, &Side::Native, vec![
+            Scripted::pane("term-one").with_agent("claude", PaneStatus::Done).in_dir("/repo"),
+            Scripted::pane("term-two").with_agent("claude", PaneStatus::Blocked).in_dir("/repo"),
+        ]);
+
+        app.attach_every_multiplexer_pane(&Context::default());
+
+        let queued: Vec<(&str, AttachFocus)> = app
+            .multiplexers
+            .scripted()
+            .pending_attach()
+            .iter()
+            .map(|pending| (pending.key.terminal_id.as_str(), pending.request.focus))
+            .collect();
+        assert_eq!(queued, [("term-one", AttachFocus::Leave), ("term-two", AttachFocus::Leave)]);
+    }
+
     /// An empty listing is not a failure: a machine with no multiplexer
     /// running must not put a dialog in front of the user for pressing a key.
     #[test]
