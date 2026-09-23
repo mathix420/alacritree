@@ -51,31 +51,25 @@ pub trait CheckoutHook {
     /// alacritree just created `event.checkout` as a worktree of `event.main`.
     fn on_created(
         &self,
-        _event: &::alacritree_checkout_hooks::Checkout<'_>,
-        _blocking: &::alacritree_common::jobs::Blocking,
-    ) -> ::alacritree_checkout_hooks::Outcome {
-        Ok(None)
-    }
+        event: &::alacritree_checkout_hooks::Checkout<'_>,
+        blocking: &::alacritree_common::jobs::Blocking,
+    ) -> ::alacritree_checkout_hooks::Outcome;
 
     /// This process opened its first shell in a linked worktree. Fires again
     /// after a restart, so implementations must be idempotent.
     fn on_opened(
         &self,
-        _event: &::alacritree_checkout_hooks::Checkout<'_>,
-        _blocking: &::alacritree_common::jobs::Blocking,
-    ) -> ::alacritree_checkout_hooks::Outcome {
-        Ok(None)
-    }
+        event: &::alacritree_checkout_hooks::Checkout<'_>,
+        blocking: &::alacritree_common::jobs::Blocking,
+    ) -> ::alacritree_checkout_hooks::Outcome;
 
     /// The worktree at `event.checkout` was removed. The path was resolved
     /// before git deleted the directory, which cannot be canonicalized after.
     fn on_removed(
         &self,
-        _event: &::alacritree_checkout_hooks::Checkout<'_>,
-        _blocking: &::alacritree_common::jobs::Blocking,
-    ) -> ::alacritree_checkout_hooks::Outcome {
-        Ok(None)
-    }
+        event: &::alacritree_checkout_hooks::Checkout<'_>,
+        blocking: &::alacritree_common::jobs::Blocking,
+    ) -> ::alacritree_checkout_hooks::Outcome;
 }
 
 /// Every event run on each hook in order. One hook failing does not stop
