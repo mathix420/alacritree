@@ -1155,8 +1155,8 @@ impl AlacritreeApp {
         let hooks = crate::checkout_hooks::from_config(&self.config.integrations);
         self.detached_jobs.push(jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
             let event = Checkout { main: &main_checkout, checkout: &worktree };
-            crate::checkout_hooks::report(hooks.opened(&event, blocking), |line| {
-                log::info!("{line} ({})", worktree.display())
+            crate::checkout_hooks::report(hooks.opened(&event, blocking), |level, line| {
+                log::log!(level, "{line} ({})", worktree.display())
             });
         }));
     }

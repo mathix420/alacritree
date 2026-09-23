@@ -25,14 +25,16 @@ pub(crate) fn from_config(integrations: &IntegrationsConfig) -> Vec<Hook> {
     hooks
 }
 
-/// Hand each outcome to `line` as one progress line: a hook's own report,
-/// or the error that stopped it.  Hooks with nothing to say add nothing.
-pub(crate) fn report(outcomes: Vec<Outcome>, mut line: impl FnMut(&str)) {
+/// Hand each outcome to `line` as one progress line: a hook's own report at
+/// `Info`, or the error that stopped it at `Warn`, so a caller that logs
+/// rather than shows the lines still surfaces a failing hook.  Hooks with
+/// nothing to say add nothing.
+pub(crate) fn report(outcomes: Vec<Outcome>, mut line: impl FnMut(log::Level, &str)) {
     for outcome in outcomes {
         match outcome {
-            Ok(Some(text)) => line(&text),
+            Ok(Some(text)) => line(log::Level::Info, &text),
             Ok(None) => {},
-            Err(e) => line(&format!("Hook failed: {e}")),
+            Err(e) => line(log::Level::Warn, &format!("Hook failed: {e}")),
         }
     }
 }
@@ -58,8 +60,11 @@ mod tests {
             Err(HookError::Spawn { hook: "mise".into(), source: std::io::Error::other("x") }),
         ];
         let mut lines = Vec::new();
-        report(outcomes, |l| lines.push(l.to_string()));
-        assert_eq!(lines, ["Linked 2 Doppler scope(s)", "Hook failed: could not run mise"]);
+        report(outcomes, |level, l| lines.push((level, l.to_string())));
+        assert_eq!(lines, [
+            (log::Level::Info, "Linked 2 Doppler scope(s)".to_string()),
+            (log::Level::Warn, "Hook failed: could not run mise".to_string()),
+        ]);
     }
 
     #[test]

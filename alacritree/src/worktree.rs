@@ -176,7 +176,7 @@ pub(crate) fn create<H: CheckoutHooks + ?Sized>(
     }
 
     let event = Checkout { main: &req.project_root, checkout: &target };
-    crate::checkout_hooks::report(hooks.created(&event, blocking), &mut *send);
+    crate::checkout_hooks::report(hooks.created(&event, blocking), |_, line| send(line));
 
     Ok(target)
 }
@@ -589,8 +589,8 @@ pub(crate) fn delete_worktree<H: CheckoutHooks + ?Sized>(
         let _ = run_git(project_root, &["branch", "-D", branch]);
     }
     let event = Checkout { main: project_root, checkout: &scope_root };
-    crate::checkout_hooks::report(hooks.removed(&event, blocking), |line| {
-        log::info!("{line} (removed {})", scope_root.display())
+    crate::checkout_hooks::report(hooks.removed(&event, blocking), |level, line| {
+        log::log!(level, "{line} (removed {})", scope_root.display())
     });
     Ok(())
 }
