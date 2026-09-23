@@ -1441,14 +1441,15 @@ mod tests {
         let _lock = crate::tools::test_configuration_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        struct RestoreToolConfiguration([crate::tools::ToolPaths; 7]);
+        use strum::EnumCount;
+        struct RestoreToolConfiguration([crate::tools::ToolPaths; crate::tools::Tool::COUNT]);
         impl Drop for RestoreToolConfiguration {
             fn drop(&mut self) {
                 crate::tools::configure(self.0.clone());
             }
         }
         let _restore = RestoreToolConfiguration(crate::tools::test_configuration());
-        let mut configured = crate::tools::Tool::ALL.map(crate::tools::ToolPaths::named);
+        let mut configured = crate::tools::Tool::table(crate::tools::ToolPaths::named);
         configured[crate::tools::Tool::Git as usize] = crate::tools::ToolPaths {
             native: "C:/native/git.exe".to_string(),
             wsl: Some("/opt/wsl/bin/git".to_string()),

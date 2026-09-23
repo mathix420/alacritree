@@ -18,6 +18,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use strum::VariantArray;
 
 use crate::config::{self, Config, ConfigDiagnosis, ConfigFile, Profile, ShellConfig};
 use crate::crash_log::{Verdict, classify};
@@ -181,8 +182,9 @@ fn diff_viewer_check(viewer: &Viewer) -> Option<Check> {
 /// A registry tool's configured path, which `locate` resolves as a path when
 /// it is one; other programs are looked up by their own name.
 fn configured_program(program: &str) -> String {
-    tools::Tool::ALL
-        .into_iter()
+    tools::Tool::VARIANTS
+        .iter()
+        .copied()
         .find(|tool| tool.name() == program)
         .map_or_else(|| program.to_string(), tools::program)
 }
@@ -245,7 +247,7 @@ fn gh_auth_check() -> Option<Check> {
 /// tell.
 const WSL_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// What a probe of one distro found. It has a path per entry of [`tools::Tool::ALL`], or
+/// What a probe of one distro found. It has a path per [`tools::Tool`], by discriminant, or
 /// why the distro could not be asked.
 type Probe = Result<Vec<Option<String>>, String>;
 
@@ -274,7 +276,7 @@ fn wsl_checks(distros: &[wsl::WslDistro]) -> Vec<Check> {
 /// it inside a distro, because [`wsl_doppler_check`] is the only place that says so.
 fn probe_distros(distros: &[wsl::WslDistro]) -> Vec<(String, Probe)> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let names = tools::Tool::ALL.map(tools::Tool::name);
+    let names = tools::Tool::table(tools::Tool::name);
     for distro in distros {
         let tx = tx.clone();
         let name = distro.name.clone();
@@ -318,7 +320,7 @@ fn wsl_distro_check(name: &str, probe: &Probe) -> Check {
 
     let mut present = Vec::new();
     let mut missing = Vec::new();
-    for tool in tools::Tool::ALL {
+    for &tool in tools::Tool::VARIANTS {
         match tool_path(found, tool) {
             Some(path) => present.push(format!("{} {path}", tool.name())),
             None => missing.push(tool.name()),
@@ -361,11 +363,10 @@ fn wsl_doppler_check(probes: &[(String, Probe)]) -> Option<Check> {
 }
 
 /// Where a probe put `tool`, by tool rather than by index, so
-/// [`tools::Tool::ALL`] can be reordered without silently renaming
+/// [`tools::Tool`]'s variants can be reordered without silently renaming
 /// everyone's results.
 fn tool_path(found: &[Option<String>], tool: tools::Tool) -> Option<&str> {
-    let slot = tools::Tool::ALL.iter().position(|t| *t == tool)?;
-    found.get(slot)?.as_deref()
+    found.get(tool as usize)?.as_deref()
 }
 
 /// A configured shell that cannot be resolved takes every session with it: the
@@ -748,6 +749,7 @@ fn to_json(checks: &[Check]) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use strum::EnumCount;
     use tempfile::TempDir;
 
     use super::*;
@@ -862,7 +864,10 @@ mod tests {
     /// error is ever shown.
     #[test]
     fn a_distro_without_git_warns() {
-        assert_eq!(wsl_distro_check("Ubuntu", &probe(&[None; 7])).status, Status::Warn);
+        assert_eq!(
+            wsl_distro_check("Ubuntu", &probe(&[None; tools::Tool::COUNT])).status,
+            Status::Warn
+        );
         let git_only = probe(&[Some("/usr/bin/git"), None, None, None, None, None]);
         assert_eq!(wsl_distro_check("Ubuntu", &git_only).status, Status::Ok);
     }
@@ -894,7 +899,7 @@ mod tests {
                 "Ubuntu".to_string(),
                 probe(&[None, None, None, Some("/usr/bin/doppler"), None, None]),
             ),
-            ("kali-linux".to_string(), probe(&[None; 7])),
+            ("kali-linux".to_string(), probe(&[None; tools::Tool::COUNT])),
         ];
         let check = wsl_doppler_check(&probes).expect("a warning about the unused doppler");
         assert_eq!(check.status, Status::Warn);
@@ -904,7 +909,7 @@ mod tests {
 
     #[test]
     fn no_distro_has_doppler_and_nothing_is_said() {
-        let probes = vec![("Ubuntu".to_string(), probe(&[None; 7]))];
+        let probes = vec![("Ubuntu".to_string(), probe(&[None; tools::Tool::COUNT]))];
         assert!(wsl_doppler_check(&probes).is_none());
     }
 

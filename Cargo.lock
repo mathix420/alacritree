@@ -117,6 +117,7 @@ dependencies = [
  "base64",
  "log",
  "serde",
+ "strum",
  "tempfile",
  "windows-sys 0.59.0",
  "winreg",

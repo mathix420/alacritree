@@ -16,6 +16,7 @@ test-support = []
 base64 = "0.22"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
+strum = { version = "0.26", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"

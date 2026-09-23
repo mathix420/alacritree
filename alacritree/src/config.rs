@@ -20,12 +20,12 @@ use std::time::Duration;
 use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Rgb};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use strum::{EnumIter, IntoEnumIterator, IntoStaticStr};
+use strum::{EnumCount, EnumIter, IntoEnumIterator, IntoStaticStr};
 
 use crate::bindings::{self, KeyBinding};
 use crate::diff_viewer::{Program, Templates, Viewer};
 use crate::path_style::PathStyle;
-use crate::tools::{Tool, ToolPaths};
+use crate::tools::{Tool, ToolConfig, ToolPaths, tool_config};
 
 /// `[env]` carries whatever the user's environment carries, and a config dump
 /// ends up attached to bug reports.  Key names survive: that `FOO` was set is
@@ -650,21 +650,10 @@ impl IntegrationsConfig {
         ToolPaths { native: native.clone(), wsl: wsl.clone() }
     }
 
-    /// Indexed like [`Tool::ALL`], the shape `tools::configure` takes.
-    pub fn tool_paths(&self) -> [ToolPaths; 7] {
-        Tool::ALL.map(|tool| self.paths(tool))
+    /// Indexed by [`Tool`] discriminant, the shape `tools::configure` takes.
+    pub fn tool_paths(&self) -> [ToolPaths; Tool::COUNT] {
+        Tool::table(|tool| self.paths(tool))
     }
-}
-
-/// `[integrations.<tool>]` for a tool with nothing to configure but where
-/// it lives.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct ToolConfig {
-    /// The tool's own name, or a native path that runs as written.
-    pub path: String,
-    /// A path that runs as written inside every WSL distro, or `None` to
-    /// find the tool by name there.
-    pub wsl_path: Option<String>,
 }
 
 /// `[integrations.gh]`: where the GitHub CLI lives and whether the sidebar
@@ -3385,15 +3374,6 @@ fn moved_key<T>(new: Option<T>, old: Option<T>, from: &str, to: &str) -> Option<
     new.or(old)
 }
 
-/// A blank path means the side's default: the tool's name natively, and
-/// discovery inside WSL.
-fn tool_config(path: String, wsl_path: String, tool: Tool) -> ToolConfig {
-    ToolConfig {
-        path: if path.trim().is_empty() { tool.name().to_string() } else { path },
-        wsl_path: Some(wsl_path).filter(|path| !path.trim().is_empty()),
-    }
-}
-
 /// `[ui] delta_path` was one path used on both sides. It still fills each
 /// side `[integrations.delta]` leaves at its default, because raw config
 /// structs accept unknown keys and dropping it would lose the override.
@@ -4755,7 +4735,8 @@ show_panes = true
     #[test]
     fn tool_paths_default_to_their_names_and_discovery_inside_wsl() {
         let config = config_from("");
-        for tool in Tool::ALL {
+        use strum::VariantArray;
+        for &tool in Tool::VARIANTS {
             assert_eq!(config.integrations.paths(tool), ToolPaths::named(tool), "{tool:?}");
         }
     }

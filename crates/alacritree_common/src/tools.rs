@@ -12,9 +12,24 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
+use strum::{EnumCount, VariantArray};
+
 use crate::{jobs, wsl, wsl_helper};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    strum::EnumCount,
+    strum::VariantArray,
+    strum::IntoStaticStr,
+    strum::Display,
+)]
+#[strum(serialize_all = "lowercase")]
 pub enum Tool {
     Git,
     Gh,
@@ -26,21 +41,15 @@ pub enum Tool {
 }
 
 impl Tool {
-    /// Declaration order, which `configure` indexes by.
-    pub const ALL: [Tool; 7] =
-        [Tool::Git, Tool::Gh, Tool::Delta, Tool::Doppler, Tool::Herdr, Tool::Tuicr, Tool::Task];
-
     /// The program's name, which is also its default path.
     pub fn name(self) -> &'static str {
-        match self {
-            Tool::Git => "git",
-            Tool::Gh => "gh",
-            Tool::Delta => "delta",
-            Tool::Doppler => "doppler",
-            Tool::Herdr => "herdr",
-            Tool::Tuicr => "tuicr",
-            Tool::Task => "task",
-        }
+        self.into()
+    }
+
+    /// One value per tool, indexed by discriminant: the shape the paths
+    /// table and `configure` take.
+    pub fn table<T>(mut f: impl FnMut(Tool) -> T) -> [T; Tool::COUNT] {
+        std::array::from_fn(|i| f(Tool::VARIANTS[i]))
     }
 }
 
@@ -64,19 +73,39 @@ impl ToolPaths {
     }
 }
 
-fn configured() -> &'static RwLock<[ToolPaths; 7]> {
-    static PATHS: OnceLock<RwLock<[ToolPaths; 7]>> = OnceLock::new();
-    PATHS.get_or_init(|| RwLock::new(Tool::ALL.map(ToolPaths::named)))
+/// `[integrations.<tool>]` for a tool with nothing to configure but where
+/// it lives.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ToolConfig {
+    /// The tool's own name, or a native path that runs as written.
+    pub path: String,
+    /// A path that runs as written inside every WSL distro, or `None` to
+    /// find the tool by name there.
+    pub wsl_path: Option<String>,
 }
 
-/// Publish the configured paths of every tool, indexed like [`Tool::ALL`].
+/// A blank path means the side's default: the tool's name natively, and
+/// discovery inside WSL.
+pub fn tool_config(path: String, wsl_path: String, tool: Tool) -> ToolConfig {
+    ToolConfig {
+        path: if path.trim().is_empty() { tool.name().to_string() } else { path },
+        wsl_path: Some(wsl_path).filter(|path| !path.trim().is_empty()),
+    }
+}
+
+fn configured() -> &'static RwLock<[ToolPaths; Tool::COUNT]> {
+    static PATHS: OnceLock<RwLock<[ToolPaths; Tool::COUNT]>> = OnceLock::new();
+    PATHS.get_or_init(|| RwLock::new(Tool::table(ToolPaths::named)))
+}
+
+/// Publish the configured paths of every tool, indexed by [`Tool`] discriminant.
 /// Runs once at startup, before anything spawns a tool.
-pub fn configure(paths: [ToolPaths; 7]) {
+pub fn configure(paths: [ToolPaths; Tool::COUNT]) {
     *configured().write().unwrap_or_else(|e| e.into_inner()) = paths;
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn test_configuration() -> [ToolPaths; 7] {
+pub fn test_configuration() -> [ToolPaths; Tool::COUNT] {
     configured().read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
@@ -263,7 +292,33 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
+    use strum::{EnumCount, VariantArray};
+
     use super::*;
+
+    #[test]
+    fn tool_names_are_the_lowercase_program_names() {
+        let names: Vec<&str> = Tool::VARIANTS.iter().map(|t| t.name()).collect();
+        assert_eq!(names, ["git", "gh", "delta", "doppler", "herdr", "tuicr", "task"]);
+        assert_eq!(Tool::Doppler.to_string(), "doppler");
+    }
+
+    #[test]
+    fn the_table_is_indexed_by_discriminant() {
+        assert_eq!(Tool::COUNT, Tool::VARIANTS.len());
+        let table = Tool::table(|t| t);
+        for (i, tool) in table.iter().enumerate() {
+            assert_eq!(*tool as usize, i);
+        }
+    }
+
+    #[test]
+    fn an_empty_path_falls_back_to_the_tool_name() {
+        let config = tool_config("  ".into(), "".into(), Tool::Doppler);
+        assert_eq!(config, ToolConfig { path: "doppler".into(), wsl_path: None });
+        let config = tool_config("/opt/doppler".into(), "/usr/bin/doppler".into(), Tool::Doppler);
+        assert_eq!(config.wsl_path.as_deref(), Some("/usr/bin/doppler"));
+    }
 
     fn wait_until(mut done: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -275,8 +330,8 @@ mod tests {
 
     #[test]
     fn the_helper_hello_probes_the_registry_in_order() {
-        let (registry, rest) = crate::wsl_helper::HELLO_TOOLS.split_at(Tool::ALL.len());
-        assert_eq!(registry, Tool::ALL.map(Tool::name));
+        let (registry, rest) = crate::wsl_helper::HELLO_TOOLS.split_at(Tool::COUNT);
+        assert_eq!(registry, Tool::table(Tool::name));
         assert_eq!(rest, ["zellij"]);
     }
 
