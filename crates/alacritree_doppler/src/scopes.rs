@@ -43,10 +43,10 @@ pub(crate) fn mirror_scopes(
 ) -> usize {
     let main_at = locate(main_checkout);
     let wt_at = locate(worktree);
-    let side = side_for(&wt_at);
+    let side = Side::from_location(&wt_at);
     // A main checkout and a worktree on different sides share no doppler
     // config, so there is nothing to copy between them.
-    if side_for(&main_at) != side {
+    if Side::from_location(&main_at) != side {
         return 0;
     }
     let main = scope_path(&main_at);
@@ -96,7 +96,7 @@ pub(crate) fn mirror_scopes(
 /// from the UI thread.
 pub(crate) fn forget_scopes(worktree: &Path, blocking: &jobs::Blocking) -> usize {
     let wt_at = locate(worktree);
-    let side = side_for(&wt_at);
+    let side = Side::from_location(&wt_at);
     let worktree = scope_path(&wt_at);
     let Some(scopes) = all_scopes(&side, blocking) else {
         return 0;
@@ -124,11 +124,6 @@ pub(crate) fn forget_scopes(worktree: &Path, blocking: &jobs::Blocking) -> usize
 fn rebase_scope(scope: &str, main: &Path, worktree: &Path) -> Option<PathBuf> {
     let rel = Path::new(scope).strip_prefix(main).ok()?;
     if rel.as_os_str().is_empty() { Some(worktree.to_path_buf()) } else { Some(worktree.join(rel)) }
-}
-
-/// Where doppler runs for a checkout at `location`.
-fn side_for(location: &Location) -> Side {
-    Side::from_location(location)
 }
 
 /// The path doppler keys a scope by on the checkout's own side.
@@ -216,12 +211,6 @@ mod tests {
             scope_path(&Location::Windows(PathBuf::from("/srv/wt"))),
             PathBuf::from("/srv/wt")
         );
-    }
-
-    #[test]
-    fn a_wsl_checkout_runs_the_distros_doppler() {
-        assert_eq!(side_for(&in_distro("/home/u/wt")), Side::Wsl { distro: "Ubuntu".into() });
-        assert_eq!(side_for(&Location::Windows(PathBuf::from("C:/wt"))), Side::Native);
     }
 
     #[test]
