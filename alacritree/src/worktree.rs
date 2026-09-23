@@ -11,7 +11,8 @@ use std::sync::mpsc::{self, Receiver};
 
 use alacritree_checkout_hooks::{Checkout, CheckoutHook, CheckoutHooks};
 
-use crate::config::WorkspaceConfig;
+use crate::checkout_hooks::Hook;
+use crate::config::{Config, WorkspaceConfig};
 use crate::default_branch::{self, Evidence, WellKnown};
 use crate::repaint::Repaint;
 use crate::tools::{self, Tool};
@@ -21,6 +22,23 @@ use crate::{command_ext, jobs, wsl};
 pub(crate) enum Progress {
     Step(String),
     Done(Result<PathBuf, String>),
+}
+
+/// What a create from IPC or the offline CLI reads from config: where the
+/// worktree goes, and the hooks that run once it exists.
+#[derive(Clone, Default)]
+pub(crate) struct CreateConfig {
+    pub(crate) workspace: WorkspaceConfig,
+    pub(crate) hooks: Vec<Hook>,
+}
+
+impl CreateConfig {
+    pub(crate) fn new(config: &Config) -> Self {
+        Self {
+            workspace: config.workspace.clone(),
+            hooks: crate::checkout_hooks::from_config(&config.integrations),
+        }
+    }
 }
 
 pub(crate) struct CreateRequest {

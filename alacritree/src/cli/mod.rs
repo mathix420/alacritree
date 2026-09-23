@@ -541,11 +541,11 @@ fn dispatch(
             // a request a running instance answers never needs the config.
             let resolved = crate::config::load(config.dir, config.overrides).0;
             crate::tools::configure(resolved.integrations.tool_paths());
+            let create = crate::worktree::CreateConfig::new(&resolved);
             if let Some(dir) = resolved.state_dir {
                 crate::state::set_dir(dir);
             }
-            let hooks = crate::checkout_hooks::from_config(&resolved.integrations);
-            offline::handle(request, &resolved.workspace, &hooks).map_err(SendError::Failed)
+            offline::handle(request, &create).map_err(SendError::Failed)
         },
         result => result,
     }

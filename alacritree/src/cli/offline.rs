@@ -13,31 +13,20 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use crate::checkout_hooks::Hook;
-use crate::config::WorkspaceConfig;
 use crate::ipc::protocol::{self, IpcRequest, IpcResult};
 use crate::projects::{self, Project, project_json};
 use crate::state::{self, PersistedProject, PersistedState};
-use crate::worktree::{self as wt, CreateRequest};
+use crate::worktree::{self as wt, CreateConfig, CreateRequest};
 use crate::{git_status, jobs, scratchpad};
 
-pub(super) fn handle(
-    request: &IpcRequest,
-    workspace: &WorkspaceConfig,
-    hooks: &[Hook],
-) -> IpcResult {
+pub(super) fn handle(request: &IpcRequest, config: &CreateConfig) -> IpcResult {
     let Some(path) = state::config_path() else {
         return Err("could not locate alacritree's state file".to_string());
     };
-    handle_at(&path, request, workspace, hooks)
+    handle_at(&path, request, config)
 }
 
-fn handle_at(
-    state_path: &Path,
-    request: &IpcRequest,
-    workspace: &WorkspaceConfig,
-    hooks: &[Hook],
-) -> IpcResult {
+fn handle_at(state_path: &Path, request: &IpcRequest, config: &CreateConfig) -> IpcResult {
     match request {
         IpcRequest::ListProjects => Ok(json!({
             // No window means no focused workspace — the same value the app
@@ -74,7 +63,7 @@ fn handle_at(
             })))
         },
         IpcRequest::CreateWorktree { project_root, branch } => {
-            create_worktree(project_root.clone(), branch.clone(), workspace, hooks)
+            create_worktree(project_root.clone(), branch.clone(), config)
         },
         IpcRequest::ReadScratchpad { workspace } => match workspace.as_deref() {
             None | Some("current") => {
@@ -151,17 +140,12 @@ fn discover_all(state_path: &Path) -> Vec<Project> {
 /// The app's create also asks the sidebar to re-scan afterwards; here there is
 /// no sidebar to tell, and the next `project list` discovers the new worktree
 /// from git anyway.
-fn create_worktree(
-    project_root: PathBuf,
-    branch: String,
-    workspace: &WorkspaceConfig,
-    hooks: &[Hook],
-) -> IpcResult {
+fn create_worktree(project_root: PathBuf, branch: String, config: &CreateConfig) -> IpcResult {
     wt::validate_branch_name(&branch)?;
-    let request = CreateRequest::new(project_root, None, branch, workspace);
+    let request = CreateRequest::new(project_root, None, branch, &config.workspace);
     let mut steps = Vec::new();
     let path = jobs::on_this_thread(|blocking| {
-        wt::create(&request, hooks, |step| steps.push(step.to_string()), blocking)
+        wt::create(&request, config.hooks.as_slice(), |step| steps.push(step.to_string()), blocking)
     })?;
     Ok(json!({ "path": path, "steps": steps }))
 }
@@ -178,7 +162,7 @@ mod tests {
     use crate::test_util::{clone_with_origin, workspace_under};
 
     fn serve(state_path: &Path, request: &IpcRequest) -> IpcResult {
-        handle_at(state_path, request, &WorkspaceConfig::default(), &[])
+        handle_at(state_path, request, &CreateConfig::default())
     }
 
     fn state_file(dir: &TempDir) -> PathBuf {
@@ -360,8 +344,8 @@ mod tests {
         let base = dir.path().join("worktrees");
         let request = IpcRequest::CreateWorktree { project_root: project, branch: "topic".into() };
 
-        let reply = handle_at(&state_file(&dir), &request, &workspace_under(&base), &[])
-            .expect("create succeeds");
+        let config = CreateConfig { workspace: workspace_under(&base), ..CreateConfig::default() };
+        let reply = handle_at(&state_file(&dir), &request, &config).expect("create succeeds");
 
         let path = PathBuf::from(reply["path"].as_str().expect("a path"));
         assert!(path.starts_with(&base), "{} is not under {}", path.display(), base.display());
