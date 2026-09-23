@@ -166,6 +166,7 @@ background thread and streams progress steps back to the UI:
 6. Set `preferredNotifChannel: terminal_bell` in
    `.claude/settings.local.json` so Claude Code's completion bell fires through
    the terminal — every other key in the file is preserved.
+7. Run the [checkout hooks](#checkout-hooks).
 
 Worktrees are created under
 `<base>/<project>-<hash>/<branch>`, where an unset `<base>` is
@@ -183,7 +184,63 @@ The delete modal pre-computes a cheap dirty-status summary (staged / modified
 / untracked counts) so the user can see what would be lost before confirming.
 Confirmation runs `git worktree remove` (with `--force` if requested) and then
 `git branch -D <branch>` — the branch deletion is best-effort so a detached
-HEAD doesn't block worktree cleanup.
+HEAD doesn't block worktree cleanup. The [checkout hooks](#checkout-hooks)
+run after that, from the main checkout.
+
+### Checkout hooks
+
+Checkout hooks run when alacritree creates a worktree, the first time this
+process opens a shell in one, and after it removes one. Opening covers
+worktrees made outside alacritree, such as a plain `git worktree add`. It runs
+again after a restart, so an opening hook must be safe to repeat.
+
+Two kinds of hook exist, and the built-in one runs first:
+
+- **Doppler.** When the main checkout has `doppler setup` scopes, a new or
+  opened worktree gets the same scopes, and a removed one gives them back.
+  Without this, `doppler run` in a worktree fails with "You must specify a
+  project". For a worktree inside a WSL distro, the distro's own `doppler`
+  does this, so `doppler run` inside the distro sees the scopes. Turn it off
+  with `[integrations.doppler] enabled = false`.
+- **Your own commands**, one table each under
+  `[integrations.checkout_hooks.command]`, run in name order:
+
+  ```toml
+  [integrations.checkout_hooks.command.mise]
+  path = "mise"
+  on_created = ["trust", "{checkout}"]
+  on_opened = ["trust", "{checkout}"]
+
+  [integrations.checkout_hooks.command.cleanup]
+  path = "forget-checkout"
+  on_removed = ["{checkout}", "{main}"]
+  ```
+
+  `{checkout}` is the worktree and `{main}` the project's main checkout. Each
+  placeholder becomes exactly one argument, however many spaces or quotes the
+  path holds, since no shell is involved. An event whose list is empty is
+  skipped. Creation and opening run the command in the worktree; removal
+  runs it in the main checkout, since the worktree is gone.
+
+  For a worktree inside a WSL distro, the command runs in that distro, with
+  Linux paths. Set `wsl_path` to the program there; left empty, alacritree
+  looks up the file name of `path` through the distro's login shell and skips
+  the hook in a distro that doesn't have it. A Windows `path` is never run
+  inside the distro.
+
+  The hooks are tables keyed by name rather than a list so `alacritree.toml`
+  can change or switch off one defined in `alacritty.toml`:
+
+  ```toml
+  [integrations.checkout_hooks.command.mise]
+  enabled = false
+  ```
+
+A hook that fails does not stop the ones after it. Its error shows up as a
+"Hook failed" step while a worktree is being created, and in the log at `warn`
+for opening and removal. A hook still running after five minutes is killed
+and reported as timed out. Hooks read the config alacritree started with, so
+a new hook needs a restart.
 
 ## Right sidebar — git status
 
