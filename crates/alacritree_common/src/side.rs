@@ -79,9 +79,9 @@ pub enum Ran {
 /// The status a POSIX shell exits with for a command it could not find.
 const NOT_FOUND: i32 = 127;
 
-/// The distro user's own login shell, resolved the way custom diff viewers
-/// resolve it, since `wsl.exe --exec` sees only the system PATH.
-const LOGIN_SHELL: &str = r#"s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=${SHELL:-/bin/sh}"#;
+/// Shell code that sets `$s` to the distro user's own login shell, since
+/// `wsl.exe --exec` sees only the system PATH.
+pub const LOGIN_SHELL: &str = r#"s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=${SHELL:-/bin/sh}"#;
 
 pub fn invocation(side: &Side, program: &Program, args: &[String]) -> Invocation {
     let (program, mut argv, via_login_shell) = match (side, &program.wsl) {

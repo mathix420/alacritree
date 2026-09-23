@@ -7,6 +7,8 @@
 
 use std::path::Path;
 
+use alacritree_common::side::LOGIN_SHELL;
+
 use crate::tools::Tool;
 
 /// Which `git diff` flavor a git panel row opens.
@@ -292,8 +294,6 @@ pub(crate) fn native_pager_command(
     args.extend(git_args.iter().cloned());
     (git.to_string(), args)
 }
-
-const LOGIN_SHELL: &str = r#"s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=${SHELL:-/bin/sh}"#;
 
 const PAGER_SCRIPT: &str =
     r#"export LESS="${LESS-R}"; g=$1; p=$2; shift 2; exec "$g" -c "core.pager=$p" "$@""#;
