@@ -5,9 +5,10 @@ This file provides guidance to coding agents when working with code in this repo
 
 ## Repository layout
 
-This is a Cargo workspace. There are five crates, but only one is original work:
+This is a Cargo workspace. `alacritree/` and the crates under `crates/` are original work; the `alacritty*` crates are vendored:
 
-- `alacritree/` — **the only crate this fork actually changes.** A small egui/eframe app that hosts `alacritty_terminal` and adds a worktree-aware sidebar. All agent-edited code should live here unless the user explicitly says otherwise.
+- `alacritree/` — the app. A small egui/eframe app that hosts `alacritty_terminal` and adds a worktree-aware sidebar. Agent-edited code lives here or under `crates/` unless the user explicitly says otherwise.
+- `crates/` — alacritree's own library crates, split out of `alacritree/` so the compiler enforces their boundaries. `alacritree_common` holds process spawning, the job pool, WSL support and tool paths. Each integration type gets a crate holding its trait, shared models, error type and a test fake (`alacritree_checkout_hooks`), and each backend gets its own crate (`alacritree_doppler`). Only the `alacritree` app depends on specific backends. `crates/clippy.toml` carries the same `disallowed-methods` list as `alacritree/clippy.toml`.
 - `alacritty/`, `alacritty_terminal/`, `alacritty_config/`, `alacritty_config_derive/` — vendored upstream alacritty. Treat as read-only dependencies. The `alacritty` GUI binary (winit/OpenGL) is **not** what this fork ships; we only use `alacritty_terminal` (the headless PTY + VT parser + grid).
 
 `egui-winit/` sits alongside them but is not a workspace member — it is a vendored `egui-winit` carrying a one-line change, wired in through `[patch.crates-io]` in the root `Cargo.toml` so Ctrl+V falls through to a key event when the clipboard holds something other than text.
@@ -20,8 +21,10 @@ This is a Cargo workspace. There are five crates, but only one is original work:
 cargo run -p alacritree            # debug build of the GUI
 cargo build -p alacritree --release
 cargo check -p alacritree          # fast type-check loop
-cargo fmt                          # rustfmt is enforced (see rustfmt.toml)
+cargo +nightly fmt                 # rustfmt.toml uses nightly-only options; revert anything it touches under alacritty*/
 cargo test -p alacritree           # unit tests live in-module under #[cfg(test)]
+# What CI runs: the app and crates/, without the vendored crates.
+cargo test --workspace --exclude alacritty --exclude alacritty_terminal --exclude alacritty_config --exclude alacritty_config_derive
 ```
 
 The workspace MSRV is 1.85 (edition 2024). The root `Makefile` is upstream alacritty's macOS bundling script; it is **not** wired up to alacritree.
@@ -56,20 +59,24 @@ There is a `[patch.crates-io]` pin on `x11-clipboard` in the root `Cargo.toml` (
 - `command_palette.rs` — data model and fuzzy ranking for the Ctrl+K palette. `panel_filter.rs` holds the equivalent per-panel search state for the sidebars.
 - `scratchpad.rs` — persistent per-workspace notes and their built-in editor. Closing the tab or deleting a worktree must never delete the notes.
 - `tasks/` holds task lists kept in taskwarrior. `scope.rs` names project nodes, `facts.rs` reads git on the cwd's side, `taskwarrior.rs` is the only code that runs `task`, `tree.rs` is the tab's pure model, `hook.rs` backs `alacritree hook`, and `view.rs` draws the tab. Off unless `[integrations.taskwarrior] enabled`.
-- `wsl.rs` — the only module that knows WSL exists: distro enumeration, Windows ↔ Linux path translation, `wsl.exe` command construction. `wsl_helper.rs` keeps one long-lived `sh` per distro so batch scripts don't pay process startup per call. `wsl_spare.rs`, under `[wsl] warm_spare`, keeps one launched `wsl.exe` per distro parked on a terminal and hands it to the next session that opens there, so a launch stalled by WSL never holds up a tab.
+- `alacritree_common::wsl` — the only module that knows WSL exists: distro enumeration, Windows ↔ Linux path translation, `wsl.exe` command construction. `alacritree_common::wsl_helper` keeps one long-lived `sh` per distro so batch scripts don't pay process startup per call. `wsl_spare.rs`, under `[wsl] warm_spare`, keeps one launched `wsl.exe` per distro parked on a terminal and hands it to the next session that opens there, so a launch stalled by WSL never holds up a tab.
 - `clipboard.rs`, `paste.rs`, `links.rs`, `mouse.rs`, `ime.rs`, `file_drop.rs` — the input/interaction surface around the grid: the two clipboards, bracketed paste, link detection, mouse-report encodings mirroring alacritty's, IME composition state, and where a dropped file goes.
 - `glyph_cache.rs`, `color_glyph.rs`, `builtin_font.rs` — the paint path's caches: reused single-character galleys, emoji rasterized from a font's colour tables, and hand-drawn box-drawing glyphs that must fully cover their cell.
 - `sidebar_nav.rs`, `git_nav.rs`, `row_label.rs`, `path_style.rs` — pure models behind the sidebars (cursor movement, row templating, abbreviated paths), deliberately free of egui so they can be unit-tested.
-- `command_ext.rs` — alacritree is a GUI-subsystem binary with no console, so every `git`/`gh`/`cmd` child needs a flag to avoid flashing a console window on Windows. Spawn children through this, not `Command` directly.
+- `checkout_hooks.rs` — the app's `Hook` enum over every checkout hook backend (`#[derive(ambassador::Delegate)]`) and `from_config`, which decides which run. Worktree create, first shell open, and removal run the list; `worktree.rs` sees only the `CheckoutHooks` trait. Doppler scope mirroring (`alacritree_doppler`) and user-defined `[integrations.checkout_hooks.command.<name>]` hooks are its backends.
+- `alacritree_common::command_ext` — alacritree is a GUI-subsystem binary with no console, so every `git`/`gh`/`cmd` child needs a flag to avoid flashing a console window on Windows. Spawn children through this, not `Command` directly.
 
 ## Conventions specific to this fork
 
 - Mirror upstream alacritty wherever possible. Before implementing input handling, config parsing, terminal behavior, key bindings, clipboard, scrolling, selection, or anything else that alacritty already solves, look at how `alacritty/` does it and follow the same approach. This fork swaps the renderer (egui instead of winit/OpenGL) but should otherwise behave like alacritty — divergence is a last resort, not the default, and should be justified in a comment when unavoidable.
-- Two TOML files: `alacritty.toml` (shared with the alacritty terminal — palette, cursor, scrolling, shell, key bindings) and `alacritree.toml` (alacritree-only options under `[ui]` and `[workspace]`). When adding a config field, decide whether it belongs in the shared file or the alacritree-only file, and document it with a doc comment on the relevant `Raw*` struct in `config.rs` — those doc comments are the hover text the published JSON Schema carries. Regenerate the schema afterwards with `ALACRITREE_UPDATE_SCHEMA=1 cargo test -p alacritree --test config_schema`; the test fails the build while `schema/alacritree-config.json` or `docs/config-reference.md`, which is rendered from it, is stale.
+- Two TOML files: `alacritty.toml` (shared with the alacritty terminal — palette, cursor, scrolling, shell, key bindings) and `alacritree.toml` (alacritree-only options under `[ui]` and `[workspace]`). When adding a config field, decide whether it belongs in the shared file or the alacritree-only file, and document it with a doc comment on the relevant `Raw*` struct in `config.rs`, or in the integration crate that owns the section — those doc comments are the hover text the published JSON Schema carries. Regenerate the schema afterwards with `ALACRITREE_UPDATE_SCHEMA=1 cargo test -p alacritree --test config_schema`; the test fails the build while `schema/alacritree-config.json` or `docs/config-reference.md`, which is rendered from it, is stale.
 - Schema defaults: a config key's default lives only in its `Raw*` type's `Default` impl under `#[serde(default)]`, which the schema publishes, and a key with no fixed value goes in `alacritree/tests/schema-defaults-allowlist.txt`. Docs and doc comments say what a setting does, never its default.
 - Sessions outlive workspace switches. Don't introduce code that drops a `Session` just because it isn't visible.
 - `EventProxy::send_event` calls `request_repaint` — this is what wakes the egui loop on PTY output. Anything that produces terminal events on a background thread must go through an `EventProxy` (or otherwise call `request_repaint`) or it will appear to hang until the next input event.
 - Logs use the `log` crate. `egui_winit::clipboard=error` is filtered down by default in `main.rs` because cold X11 clipboard probes warn noisily; keep that filter unless you have a reason to remove it.
 - Comments in `alacritree/` follow the "explain the *why*, not the *what*" pattern already in the file headers (e.g. `state.rs`, `config.rs`, `projects.rs`). Match that style — short, reason-giving, no rote restatements of the code.
 - Always follow clean code practices: clear naming, small focused functions, no dead code, no premature abstractions. Never add useless comments (rote what-restatements, "added by X", task references), and never remove existing comments unless they are demonstrably wrong or made obsolete by the change you are making.
+- Integration traits are `#[ambassador::delegatable_trait]` and the app dispatches through a `#[derive(Delegate)]` enum. Not `enum_dispatch`, which cannot link a trait and an enum in different crates, and not `Box<dyn>`. Trait signatures name types by absolute path, because ambassador copies them into the crate that derives. Closed sets of names use strum derives.
+- New crates report errors with `thiserror` enums, not `String`. See #135 for the rest of the app.
+- A config section belongs to the crate of the integration it configures. The app's `RawIntegrations` names it with one field.
 - Always use [Conventional Commits](https://www.conventionalcommits.org/) for commit messages (`feat:`, `fix:`, `refactor:`, `docs:`, `chore:`, etc., with an optional scope like `feat(sidebar):`). Keep the subject line imperative and under ~72 chars.

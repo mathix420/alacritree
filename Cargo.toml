@@ -5,7 +5,9 @@ members = [
     "alacritty_terminal",
     "alacritty_config",
     "alacritty_config_derive",
-    "crates/*",
+    # Not `crates/*`: release-please's cargo-workspace plugin globs files too,
+    # and would take crates/clippy.toml for a crate.
+    "crates/alacritree_*",
 ]
 resolver = "2"
 
