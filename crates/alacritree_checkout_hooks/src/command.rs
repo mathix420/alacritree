@@ -99,12 +99,26 @@ pub struct CommandHook {
 /// Fill `{checkout}` and `{main}` with each path as the checkout's side
 /// spells it.  Each template word stays one argument.
 pub fn expand(template: &[String], event: &Checkout<'_>) -> Vec<String> {
-    let checkout = side::spelling(&wsl::classify(event.checkout));
-    let main = side::spelling(&wsl::classify(event.main));
+    let spell = |path| {
+        let spelled = side::spelling(&wsl::classify(path));
+        if cfg!(windows) { without_verbatim(&spelled) } else { spelled }
+    };
+    let checkout = spell(event.checkout);
+    let main = spell(event.main);
     template
         .iter()
         .map(|word| word.replace("{checkout}", &checkout).replace("{main}", &main))
         .collect()
+}
+
+/// Removal is handed a canonicalized path, which on Windows carries a `\\?\`
+/// prefix that the other events' paths lack and many programs reject.
+fn without_verbatim(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
+    }
 }
 
 fn first_line(stderr: &[u8]) -> String {
@@ -248,6 +262,17 @@ mod tests {
         let err = hook("sleep", &["30"]).outcome(Ok(Ran::TimedOut)).unwrap_err();
         assert!(matches!(err, HookError::TimedOut { ref hook } if hook == "test"), "{err:?}");
         assert_eq!(err.to_string(), "test did not finish within 300s");
+    }
+
+    /// Removal hands over the path Windows canonicalized, which carries a
+    /// verbatim prefix that create and open never show and that many
+    /// programs reject.
+    #[test]
+    fn verbatim_prefixes_are_dropped() {
+        assert_eq!(without_verbatim(r"\\?\C:\src\wt"), r"C:\src\wt");
+        assert_eq!(without_verbatim(r"\\?\UNC\server\share\wt"), r"\\server\share\wt");
+        assert_eq!(without_verbatim(r"C:\src\wt"), r"C:\src\wt");
+        assert_eq!(without_verbatim("/home/u/wt"), "/home/u/wt");
     }
 
     #[test]

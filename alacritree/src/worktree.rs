@@ -175,6 +175,7 @@ pub(crate) fn create<H: CheckoutHooks + ?Sized>(
         send("Enabled Claude Code terminal bell");
     }
 
+    bail_if_cancelled!();
     let event = Checkout { main: &req.project_root, checkout: &target };
     crate::checkout_hooks::report(hooks.created(&event, blocking), |_, line| send(line));
 
@@ -936,6 +937,41 @@ mod tests {
             Ok(Ok(path)) => panic!("create finished a worktree nobody was waiting for: {path:?}"),
             Err(e) => panic!("create never returned: {e}"),
         }
+    }
+
+    /// A caller that gave up before the hooks must not have them started only
+    /// for the cancel to kill each one.
+    #[test]
+    fn create_runs_no_hook_once_cancelled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = crate::test_util::clone_with_origin(tmp.path());
+        let req = CreateRequest {
+            project_root: project,
+            default_branch: None,
+            branch: "abandoned".into(),
+            base_dir: Some(tmp.path().join("worktrees")),
+        };
+        let hook = FakeHook::reporting("Linked 1 fake scope");
+        let job_hook = hook.clone();
+        let (tx, rx) = mpsc::channel();
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
+            // Park on the last step before the hooks until the handle is gone.
+            let on_step = |step: &str| {
+                if step.starts_with("Enabled Claude Code") {
+                    let _ = reached_tx.send(());
+                    let _ = gate_rx.recv();
+                }
+            };
+            let _ = tx.send(create(&req, &[job_hook][..], on_step, blocking));
+        });
+        reached_rx.recv_timeout(Duration::from_secs(30)).expect("create never reached the hooks");
+        drop(job);
+        let _ = gate_tx.send(());
+        let result = rx.recv_timeout(Duration::from_secs(10)).expect("create never returned");
+        assert!(matches!(result, Err(ref msg) if msg.contains("cancelled")), "{result:?}");
+        assert_eq!(hook.events(), []);
     }
 
     #[test]

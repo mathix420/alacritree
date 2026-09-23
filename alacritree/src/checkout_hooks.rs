@@ -69,18 +69,20 @@ mod tests {
 
     #[test]
     fn command_hooks_follow_the_built_in_ones() {
-        let mut integrations = crate::config::IntegrationsConfig::default();
-        integrations.checkout_hooks = vec![alacritree_checkout_hooks::CommandHook {
-            name: "mise".into(),
-            program: alacritree_common::side::Program {
-                native: "mise".into(),
-                wsl: None,
+        let integrations = crate::config::IntegrationsConfig {
+            checkout_hooks: vec![alacritree_checkout_hooks::CommandHook {
                 name: "mise".into(),
-            },
-            on_created: vec!["trust".into()],
-            on_opened: Vec::new(),
-            on_removed: Vec::new(),
-        }];
+                program: alacritree_common::side::Program {
+                    native: "mise".into(),
+                    wsl: None,
+                    name: "mise".into(),
+                },
+                on_created: vec!["trust".into()],
+                on_opened: Vec::new(),
+                on_removed: Vec::new(),
+            }],
+            ..Default::default()
+        };
         assert!(matches!(from_config(&integrations)[..], [Hook::Doppler(_), Hook::Command(_)]));
     }
 }

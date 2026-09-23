@@ -34,7 +34,7 @@ pub type Outcome = Result<Option<String>, HookError>;
 /// command hook's table key is what the user can find in their config.
 #[derive(Debug, thiserror::Error)]
 pub enum HookError {
-    #[error("{hook} failed ({status}): {stderr}")]
+    #[error("{hook} failed ({status}){}", if stderr.is_empty() { String::new() } else { format!(": {stderr}") })]
     Failed { hook: String, status: ExitStatus, stderr: String },
     #[error("could not run {hook}")]
     Spawn {
@@ -103,6 +103,19 @@ impl<H: CheckoutHook> CheckoutHooks for [H] {
 
 #[cfg(test)]
 mod tests {
+    /// A program that fails silently still reads as a finished sentence.
+    #[test]
+    fn a_failure_without_stderr_has_no_dangling_colon() {
+        #[cfg(unix)]
+        let status = std::os::unix::process::ExitStatusExt::from_raw(2 << 8);
+        #[cfg(windows)]
+        let status = std::os::windows::process::ExitStatusExt::from_raw(2);
+        let failed =
+            |stderr: &str| HookError::Failed { hook: "mise".into(), status, stderr: stderr.into() };
+        assert_eq!(failed("").to_string(), format!("mise failed ({status})"));
+        assert_eq!(failed("no config").to_string(), format!("mise failed ({status}): no config"));
+    }
+
     use super::*;
     use crate::fake::{Event, FakeHook};
     use alacritree_common::jobs;
