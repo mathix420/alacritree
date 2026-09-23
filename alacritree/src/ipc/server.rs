@@ -24,6 +24,7 @@ use super::protocol::{
     IpcRequest, IpcResult, SOCKET_ENV, git_status_json, socket_dir, unlink_socket,
 };
 use super::route::{AppRequest, ConnectionRequest, DeferredRequest, Route};
+use crate::checkout_hooks::Hook;
 use crate::config::WorkspaceConfig;
 use crate::repaint::Repaint;
 use crate::worktree::{self as wt, CreateRequest, Progress};
@@ -78,8 +79,9 @@ impl Drop for SocketHandle {
 pub(crate) fn spawn_listener(
     repaint: impl Repaint,
     workspace: WorkspaceConfig,
+    hooks: Vec<Hook>,
 ) -> std::io::Result<(SocketHandle, Receiver<AppCall>)> {
-    let listener = listen_at(socket_path(), repaint, workspace)?;
+    let listener = listen_at(socket_path(), repaint, workspace, hooks)?;
 
     // Advertise the socket to child PTYs, like alacritty does with
     // ALACRITTY_SOCKET.  Startup runs before the first session spawns, so
@@ -138,6 +140,7 @@ fn listen_at(
     path: PathBuf,
     repaint: impl Repaint,
     workspace: WorkspaceConfig,
+    hooks: Vec<Hook>,
 ) -> std::io::Result<(SocketHandle, Receiver<AppCall>)> {
     // A leftover socket file at our pid (crashed predecessor) blocks bind; only
     // remove it once we've confirmed nothing is listening.
@@ -150,6 +153,7 @@ fn listen_at(
 
     let (tx, rx) = mpsc::channel();
     let workspace = Arc::new(workspace);
+    let hooks = Arc::new(hooks);
     std::thread::Builder::new().name("alacritree-ipc".into()).spawn(move || {
         // A Windows pipe accepts new connections only while the listener is
         // between accepts, so this loop must never stop calling `accept`; the
@@ -159,9 +163,10 @@ fn listen_at(
             let tx = tx.clone();
             let repaint = repaint.clone();
             let workspace = Arc::clone(&workspace);
+            let hooks = Arc::clone(&hooks);
             std::thread::Builder::new()
                 .name("alacritree-ipc-conn".into())
-                .spawn(move || handle_connection(stream, tx, repaint, &workspace))
+                .spawn(move || handle_connection(stream, tx, repaint, &workspace, &hooks))
                 .ok();
         }
     })?;
@@ -174,6 +179,7 @@ fn handle_connection(
     app_tx: Sender<AppCall>,
     repaint: impl Repaint,
     workspace: &WorkspaceConfig,
+    hooks: &[Hook],
 ) {
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
@@ -182,7 +188,7 @@ fn handle_connection(
         Ok(_) => {},
     }
     let result = match serde_json::from_str::<IpcRequest>(&line) {
-        Ok(request) => dispatch(request, &app_tx, &repaint, workspace),
+        Ok(request) => dispatch(request, &app_tx, &repaint, workspace, hooks),
         Err(e) => Err(format!("invalid IPC request: {e}")),
     };
     let reply = match &result {
@@ -200,6 +206,7 @@ fn dispatch(
     app_tx: &Sender<AppCall>,
     repaint: &impl Repaint,
     workspace: &WorkspaceConfig,
+    hooks: &[Hook],
 ) -> IpcResult {
     match Route::from(request) {
         // `compute` walks the working tree — the same work StatusCache
@@ -212,7 +219,7 @@ fn dispatch(
             })))
         },
         Route::Connection(ConnectionRequest::CreateWorktree { project_root, branch }) => {
-            create_worktree(project_root, branch, app_tx, repaint, workspace)
+            create_worktree(project_root, branch, app_tx, repaint, workspace, hooks)
         },
         Route::App(request) => call_app(request, app_tx, repaint),
     }
@@ -238,10 +245,11 @@ fn create_worktree(
     app_tx: &Sender<AppCall>,
     repaint: &impl Repaint,
     workspace: &WorkspaceConfig,
+    hooks: &[Hook],
 ) -> IpcResult {
     wt::validate_branch_name(&branch)?;
     let req = CreateRequest::new(project_root.clone(), None, branch, workspace);
-    let (rx, job) = wt::spawn_create(req, repaint.clone());
+    let (rx, job) = wt::spawn_create(req, hooks.to_vec(), repaint.clone());
     let outcome = drain_create(&rx, IPC_CREATE_BUDGET);
     // Dropping on every path, including the deadline, is what ends the fetch
     // and returns the worker.  Holding it would leave the pool one worker
@@ -313,7 +321,7 @@ impl<R: Repaint> super::protocol::Transport for InMemory<R> {
         request: &IpcRequest,
         _timeout: Duration,
     ) -> Result<serde_json::Value, super::protocol::SendError> {
-        dispatch(request.clone(), &self.app_tx, &self.repaint, &WorkspaceConfig::default())
+        dispatch(request.clone(), &self.app_tx, &self.repaint, &WorkspaceConfig::default(), &[])
             .map_err(super::protocol::SendError::Failed)
     }
 }
@@ -377,8 +385,8 @@ mod tests {
     #[test]
     fn round_trip_over_the_socket() {
         let repaint = Recorder::default();
-        let (handle, rx) =
-            spawn_listener(repaint.clone(), WorkspaceConfig::default()).expect("listener");
+        let (handle, rx) = spawn_listener(repaint.clone(), WorkspaceConfig::default(), Vec::new())
+            .expect("listener");
 
         let app = std::thread::spawn(move || {
             let call = rx.recv().expect("request reached the app thread");
@@ -413,9 +421,13 @@ mod tests {
         let path = socket_dir().join(format!("alacritree-create-test-{}.sock", std::process::id()));
         // With no app thread on the other end, the refresh after the create
         // fails at once instead of waiting out the reply timeout.
-        let (handle, rx) =
-            listen_at(path, Recorder::default(), crate::test_util::workspace_under(&base))
-                .expect("listener");
+        let (handle, rx) = listen_at(
+            path,
+            Recorder::default(),
+            crate::test_util::workspace_under(&base),
+            Vec::new(),
+        )
+        .expect("listener");
         drop(rx);
 
         let request = IpcRequest::CreateWorktree { project_root: project, branch: "topic".into() };

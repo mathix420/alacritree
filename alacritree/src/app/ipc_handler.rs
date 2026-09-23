@@ -12,7 +12,8 @@ impl AlacritreeApp {
     ) -> (Option<ipc::server::SocketHandle>, Option<Receiver<ipc::server::AppCall>>) {
         // Before the first PTY spawn so children inherit ALACRITREE_SOCKET.
         if config.ipc_socket {
-            match ipc::server::spawn_listener(ctx.clone(), config.workspace.clone()) {
+            let hooks = crate::checkout_hooks::from_config(&config.integrations);
+            match ipc::server::spawn_listener(ctx.clone(), config.workspace.clone(), hooks) {
                 Ok((handle, rx)) => {
                     log::info!("IPC socket: {}", handle.path().display());
                     (Some(handle), Some(rx))

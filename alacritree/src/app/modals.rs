@@ -452,7 +452,7 @@ impl AlacritreeApp {
         // would otherwise block the directory removal on some filesystems.
         self.close_worktree_sessions(ctx, &req.worktree_path);
 
-        // The git removal (shellouts, branch delete, doppler cleanup) is slow
+        // The git removal (shellouts, branch delete, checkout hooks) is slow
         // enough to stutter paint, so run it off-thread and adopt the result in
         // `poll_pending_deletes`; the dialog closes immediately either way and
         // the sidebar row shows a spinner meanwhile.
@@ -477,7 +477,8 @@ impl AlacritreeApp {
                 force: req.force,
             }
         };
-        let job = wt::spawn_delete(project_root, delete_job, ctx.clone());
+        let hooks = crate::checkout_hooks::from_config(&self.config.integrations);
+        let job = wt::spawn_delete(project_root, delete_job, hooks, ctx.clone());
         self.modals.pending_deletes.push(DeleteTask {
             project_idx: req.project_idx,
             worktree_path,
@@ -985,7 +986,8 @@ impl AlacritreeApp {
                 canonical.clone(),
                 &self.config.workspace,
             );
-            let (rx, job) = wt::spawn_create(req, ctx.clone());
+            let hooks = crate::checkout_hooks::from_config(&self.config.integrations);
+            let (rx, job) = wt::spawn_create(req, hooks, ctx.clone());
             return Some(CreateState::Running {
                 project_idx,
                 branch: canonical,

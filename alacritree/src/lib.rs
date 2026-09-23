@@ -10,6 +10,7 @@ pub mod alloc_count;
 pub mod app;
 pub(crate) mod bindings;
 pub(crate) mod builtin_font;
+pub(crate) mod checkout_hooks;
 pub mod cli;
 pub(crate) mod clipboard;
 pub(crate) mod clipboard_image;

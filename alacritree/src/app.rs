@@ -4,8 +4,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use alacritree_checkout_hooks::{Checkout, CheckoutHook};
-use alacritree_doppler::DopplerHook;
+use alacritree_checkout_hooks::{Checkout, CheckoutHooks};
 use eframe::CreationContext;
 use egui::{Color32, Context, Frame, Margin, RichText, ScrollArea, SidePanel, Stroke};
 
@@ -380,10 +379,10 @@ pub struct AlacritreeApp {
     /// `config.bindings` with its keys converted for matching.
     shortcuts: crate::shortcut::Shortcuts,
     modals: modals::Modals,
-    /// Worktrees already given a Doppler scope pass this app run, so opening
-    /// more shells there doesn't re-invoke the doppler CLI.
-    doppler_synced: HashSet<PathBuf>,
-    /// Fire-and-forget jobs whose result nothing reads — Doppler scope syncs,
+    /// Worktrees whose checkout hooks already ran `on_opened` this app run, so
+    /// opening more shells there doesn't re-run every hooked tool.
+    hooks_opened: HashSet<PathBuf>,
+    /// Fire-and-forget jobs whose result nothing reads — checkout hook runs,
     /// image-cache sweeps, link opens.  Held anyway: dropping a `Job` cancels
     /// work that has not started yet, and a submission followed immediately
     /// by drop would race the pool for nothing.  Drained once a frame.
@@ -506,7 +505,7 @@ impl AlacritreeApp {
             config,
             theme,
             modals: modals::Modals::default(),
-            doppler_synced: HashSet::new(),
+            hooks_opened: HashSet::new(),
             detached_jobs: Vec::new(),
             notify_rx,
             ipc_rx,
@@ -1034,12 +1033,12 @@ impl AlacritreeApp {
             }
             // Called synchronously, so the once-per-worktree guard is set
             // before a second rapid spawn for the same worktree can see it
-            // unset. The scope mirror itself runs off-thread, so a shell in
-            // a worktree git already knows about can still start before the
-            // mirrored scopes land, racing `doppler run` against the write.
+            // unset. The hooks themselves run off-thread, so a shell in a
+            // worktree git already knows about can still start before they
+            // land, racing a hooked tool such as `doppler run` against the write.
             // That costs one retryable "You must specify a project" failure,
             // not lost work.
-            self.sync_doppler_scopes(dir.clone());
+            self.sync_checkout_hooks(dir.clone());
         }
         let (size, cell_size) = self.next_spawn_geometry();
         let (session, request) = Session::pending_shell(
@@ -1135,12 +1134,12 @@ impl AlacritreeApp {
         Ok(id)
     }
 
-    /// Mirror Doppler scopes into a worktree the first time a shell opens
-    /// there.  The create-time hook in `worktree.rs` covers worktrees we
-    /// make; this lazy pass covers ones created outside alacritree, which
-    /// otherwise hit "Doppler Error: You must specify a project".
-    fn sync_doppler_scopes(&mut self, worktree: PathBuf) {
-        if !self.doppler_synced.insert(worktree.clone()) {
+    /// Run every checkout hook's `on_opened` the first time this process
+    /// opens a shell in a linked worktree.  The create path covers worktrees
+    /// alacritree makes; this covers ones created outside it, which would
+    /// otherwise lack, for example, their Doppler scopes.
+    fn sync_checkout_hooks(&mut self, worktree: PathBuf) {
+        if !self.hooks_opened.insert(worktree.clone()) {
             return;
         }
         let main_checkout = self.projects.iter().find_map(|p| {
@@ -1153,11 +1152,12 @@ impl AlacritreeApp {
         let Some(main_checkout) = main_checkout else {
             return;
         };
+        let hooks = crate::checkout_hooks::from_config(&self.config.integrations);
         self.detached_jobs.push(jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
             let event = Checkout { main: &main_checkout, checkout: &worktree };
-            if let Ok(Some(line)) = DopplerHook.on_opened(&event, blocking) {
-                log::info!("{line} into {}", worktree.display());
-            }
+            crate::checkout_hooks::report(hooks.opened(&event, blocking), |line| {
+                log::info!("{line} ({})", worktree.display())
+            });
         }));
     }
 
@@ -4180,6 +4180,17 @@ mod tests {
         );
         app.current_workspace = Some(PathBuf::from("unopened-workspace"));
         app
+    }
+
+    #[test]
+    fn checkout_hooks_open_once_per_worktree_per_process() {
+        let mut app = test_app();
+        let wt = PathBuf::from("/not/a/project/worktree");
+        app.sync_checkout_hooks(wt.clone());
+        app.sync_checkout_hooks(wt.clone());
+        assert!(app.hooks_opened.contains(&wt));
+        assert_eq!(app.hooks_opened.len(), 1);
+        assert!(app.detached_jobs.is_empty(), "no project owns it, so nothing runs");
     }
 
     /// An app with one plain shell session, for tests that need nothing

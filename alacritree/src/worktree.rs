@@ -9,8 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 
-use alacritree_checkout_hooks::{Checkout, CheckoutHook};
-use alacritree_doppler::DopplerHook;
+use alacritree_checkout_hooks::{Checkout, CheckoutHook, CheckoutHooks};
 
 use crate::config::WorkspaceConfig;
 use crate::default_branch::{self, Evidence, WellKnown};
@@ -86,14 +85,16 @@ pub(crate) fn validate_branch_name(name: &str) -> Result<(), String> {
 /// streamed progress travels over the channel; the returned `Job` carries no
 /// result of its own and exists only to be held — dropping it would cancel
 /// the create before it starts.
-pub(crate) fn spawn_create(
+pub(crate) fn spawn_create<H: CheckoutHook + Send + 'static>(
     req: CreateRequest,
+    hooks: Vec<H>,
     repaint: impl Repaint,
 ) -> (Receiver<Progress>, jobs::Job<()>) {
     let (tx, rx) = mpsc::channel();
     let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
         let result = create(
             &req,
+            hooks.as_slice(),
             |step| {
                 let _ = tx.send(Progress::Step(step.to_string()));
                 repaint.wake();
@@ -111,8 +112,9 @@ pub(crate) fn spawn_create(
 /// Nothing here needs a window, so callers without one (the CLI, with no
 /// running app to talk to) drive this directly through [`jobs::on_this_thread`]
 /// rather than through [`spawn_create`].
-pub(crate) fn create(
+pub(crate) fn create<H: CheckoutHooks + ?Sized>(
     req: &CreateRequest,
+    hooks: &H,
     mut on_step: impl FnMut(&str),
     blocking: &jobs::Blocking,
 ) -> Result<PathBuf, String> {
@@ -174,9 +176,7 @@ pub(crate) fn create(
     }
 
     let event = Checkout { main: &req.project_root, checkout: &target };
-    if let Ok(Some(line)) = DopplerHook.on_created(&event, blocking) {
-        send(&line);
-    }
+    crate::checkout_hooks::report(hooks.created(&event, blocking), &mut *send);
 
     Ok(target)
 }
@@ -565,16 +565,17 @@ fn copy_path(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
 }
 
-pub(crate) fn delete_worktree(
+pub(crate) fn delete_worktree<H: CheckoutHooks + ?Sized>(
     project_root: &Path,
     worktree_path: &Path,
     branch: Option<&str>,
     force: bool,
+    hooks: &H,
     blocking: &jobs::Blocking,
 ) -> Result<(), String> {
     let path_arg = git_path_arg(project_root, worktree_path)?;
     // Resolve before removal: canonicalize needs the directory to still
-    // exist, and the doppler cleanup below runs after git has deleted it.
+    // exist, and the checkout hooks below run after git has deleted it.
     let scope_root =
         std::fs::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.to_path_buf());
     let mut args: Vec<&str> = vec!["worktree", "remove"];
@@ -588,9 +589,9 @@ pub(crate) fn delete_worktree(
         let _ = run_git(project_root, &["branch", "-D", branch]);
     }
     let event = Checkout { main: project_root, checkout: &scope_root };
-    if let Ok(Some(line)) = DopplerHook.on_removed(&event, blocking) {
-        log::info!("{line} under {}", scope_root.display());
-    }
+    crate::checkout_hooks::report(hooks.removed(&event, blocking), |line| {
+        log::info!("{line} (removed {})", scope_root.display())
+    });
     Ok(())
 }
 
@@ -603,19 +604,28 @@ pub(crate) enum DeleteJob {
 }
 
 /// Run a [`DeleteJob`] on the pool, waking the window when it finishes. The
-/// git shellouts and doppler cleanup are slow enough to stutter paint, so the
+/// git shellouts and checkout hooks are slow enough to stutter paint, so the
 /// caller confirms the dialog, hands the work here, and adopts the result (an
 /// error to surface, or nothing) from the returned handle — the sidebar row
 /// shows a spinner until it lands, so this runs at interactive priority.
-pub(crate) fn spawn_delete(
+pub(crate) fn spawn_delete<H: CheckoutHook + Send + 'static>(
     project_root: PathBuf,
     job: DeleteJob,
+    hooks: Vec<H>,
     repaint: impl Repaint,
 ) -> jobs::Job<Result<(), String>> {
     jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
         let result = match job {
             DeleteJob::Remove { worktree_path, branch, force } => {
-                delete_worktree(&project_root, &worktree_path, branch.as_deref(), force, blocking)
+                let hooks = hooks.as_slice();
+                delete_worktree(
+                    &project_root,
+                    &worktree_path,
+                    branch.as_deref(),
+                    force,
+                    hooks,
+                    blocking,
+                )
             },
             DeleteJob::Prune { worktree_name, branch, delete_branch } => {
                 prune_worktree(&project_root, &worktree_name, branch.as_deref(), delete_branch)
@@ -666,6 +676,7 @@ mod tests {
     use super::*;
     use crate::repaint::Recorder;
     use crate::test_util::{add_worktree, init_repo};
+    use alacritree_checkout_hooks::fake::{Event, FakeHook};
 
     fn abs(tail: &str) -> PathBuf {
         if cfg!(windows) {
@@ -707,7 +718,7 @@ mod tests {
             force: false,
         };
         let repaint = Recorder::default();
-        let handle = spawn_delete(repo_dir, job, repaint.clone());
+        let handle = spawn_delete(repo_dir, job, Vec::<FakeHook>::new(), repaint.clone());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let result = loop {
             if let Some(result) = handle.poll() {
@@ -848,7 +859,7 @@ mod tests {
             // missing remote instead.
             let _ = started_tx.send(());
             let _ = gate_rx.recv();
-            let _ = tx.send(create(&req, |_| {}, blocking));
+            let _ = tx.send(create(&req, &[] as &[FakeHook], |_| {}, blocking));
         });
         started_rx.recv_timeout(Duration::from_secs(5)).expect("the job never started");
         drop(job);
@@ -910,7 +921,7 @@ mod tests {
         };
         let (tx, rx) = mpsc::channel();
         let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
-            let _ = tx.send(create(&req, |_| {}, blocking));
+            let _ = tx.send(create(&req, &[] as &[FakeHook], |_| {}, blocking));
         });
         // Cancelling only once the fake remote has observed a connection
         // proves the job is genuinely blocked in `ls-remote`, not merely
@@ -925,5 +936,66 @@ mod tests {
             Ok(Ok(path)) => panic!("create finished a worktree nobody was waiting for: {path:?}"),
             Err(e) => panic!("create never returned: {e}"),
         }
+    }
+
+    #[test]
+    fn create_hands_the_new_checkout_to_every_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = crate::test_util::clone_with_origin(tmp.path());
+        let req = CreateRequest {
+            project_root: project.clone(),
+            default_branch: None,
+            branch: "hooked".into(),
+            base_dir: Some(tmp.path().join("worktrees")),
+        };
+        let hook = FakeHook::reporting("Linked 1 fake scope");
+        let mut steps = Vec::new();
+        let target = jobs::on_this_thread(|b| {
+            create(&req, &[hook.clone()][..], |s| steps.push(s.to_string()), b)
+        })
+        .expect("create succeeds");
+        assert_eq!(hook.events(), [Event::Created { main: project, checkout: target }]);
+        assert!(steps.iter().any(|s| s == "Linked 1 fake scope"), "{steps:?}");
+    }
+
+    #[test]
+    fn a_failing_hook_shows_in_the_steps_and_does_not_fail_the_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = crate::test_util::clone_with_origin(tmp.path());
+        let req = CreateRequest {
+            project_root: project,
+            default_branch: None,
+            branch: "hook-fails".into(),
+            base_dir: Some(tmp.path().join("worktrees")),
+        };
+        let mut steps = Vec::new();
+        let result = jobs::on_this_thread(|b| {
+            create(&req, &[FakeHook::failing()][..], |s| steps.push(s.to_string()), b)
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            steps.iter().any(|s| s.starts_with("Hook failed: could not run fake")),
+            "{steps:?}"
+        );
+    }
+
+    /// Doppler keys scopes by canonical path, and a removed directory can no
+    /// longer be canonicalized, so the hook must get the path resolved first.
+    #[cfg(unix)]
+    #[test]
+    fn removal_hands_hooks_the_path_resolved_before_git_deleted_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let repo = crate::test_util::init_repo(&repo_dir);
+        let wt_path = crate::test_util::add_worktree(&repo, "linked");
+        let canonical = wt_path.canonicalize().unwrap();
+        let link = tmp.path().join("via-link");
+        std::os::unix::fs::symlink(&wt_path, &link).unwrap();
+        let hook = FakeHook::silent();
+        jobs::on_this_thread(|b| {
+            delete_worktree(&repo_dir, &link, Some("linked"), true, &[hook.clone()][..], b)
+        })
+        .expect("delete succeeds");
+        assert_eq!(hook.events(), [Event::Removed { main: repo_dir, checkout: canonical }]);
     }
 }

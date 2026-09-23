@@ -544,7 +544,8 @@ fn dispatch(
             if let Some(dir) = resolved.state_dir {
                 crate::state::set_dir(dir);
             }
-            offline::handle(request, &resolved.workspace).map_err(SendError::Failed)
+            let hooks = crate::checkout_hooks::from_config(&resolved.integrations);
+            offline::handle(request, &resolved.workspace, &hooks).map_err(SendError::Failed)
         },
         result => result,
     }
