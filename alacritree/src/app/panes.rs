@@ -158,7 +158,7 @@ impl AlacritreeApp {
         waiter: Option<mpsc::Sender<ipc::protocol::IpcResult>>,
         focus: AttachFocus,
     ) {
-        let cwd = match side.cwd_for(workspace.as_deref()) {
+        let cwd = match crate::multiplexer::cwd_for(&side, workspace.as_deref()) {
             Ok(cwd) => cwd,
             Err(e) => {
                 self.refuse_multiplexer_request(waiter, e, focus);

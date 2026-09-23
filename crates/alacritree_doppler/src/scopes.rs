@@ -142,7 +142,7 @@ fn locate(path: &Path) -> Location {
 fn doppler_on(side: &Side, blocking: &jobs::Blocking) -> Program {
     let wsl = match side {
         Side::Native => None,
-        Side::Wsl { distro } => tools::wsl_located(Tool::Doppler, distro, blocking),
+        Side::Wsl(distro) => tools::wsl_located(Tool::Doppler, distro, blocking),
     };
     Program { native: tools::program(Tool::Doppler), wsl, name: Tool::Doppler.name().into() }
 }

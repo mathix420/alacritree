@@ -25,6 +25,8 @@ pub(crate) use self::model::{
     AttachAnswer, AttachFocus, AttachRequest, CreateAnswer, CreateRequest, ListedPane, Managed,
     ViewState, ViewStep,
 };
+pub use alacritree_common::side::Side;
+
 pub use self::model::{Pane, PaneKey, PaneStatus};
 #[cfg(test)]
 pub(crate) use self::scripted::Scripted;
@@ -34,93 +36,22 @@ use crate::session::SessionId;
 use crate::wsl;
 use crate::zellij::Zellij;
 
-/// Which server a pane belongs to.  Two servers on one machine cannot see
-/// each other, so this is part of a pane's identity.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Side {
-    Native,
-    /// Named distro, as `wsl.exe -d` spells it.
-    Wsl(String),
-}
-
-impl Side {
-    /// How a side is spelled outside the process: `native`, or `wsl:<distro>`
-    /// as `wsl.exe -d` names it.  Two servers on one machine cannot see each
-    /// other, so a pane named to a client without its side is not named at
-    /// all.
-    pub fn name(&self) -> String {
-        match self {
-            Self::Native => "native".to_string(),
-            Self::Wsl(distro) => format!("wsl:{distro}"),
-        }
+/// The directory a new pane opens in, spelled where the multiplexer resolves
+/// it: the distro's own path on a WSL side, the Windows path on the native
+/// one. `None` leaves the choice to the multiplexer. A workspace with no
+/// spelling inside the distro is an `Err`, since a pane opened anywhere else
+/// would still have its session filed under it.
+pub(crate) fn cwd_for(
+    side: &Side,
+    workspace: Option<&std::path::Path>,
+) -> Result<Option<String>, String> {
+    let Some(path) = workspace else { return Ok(None) };
+    match side {
+        Side::Native => Ok(Some(path.display().to_string())),
+        Side::Wsl(distro) => wsl::windows_to_linux(path)
+            .map(Some)
+            .ok_or_else(|| format!("{} has no path inside the {distro} distro", path.display())),
     }
-
-    /// Read back what `name` wrote.  A `wsl:` with nothing after it names no
-    /// server, so it is refused rather than resolving to a distro called the
-    /// empty string.
-    pub fn parse(name: &str) -> Option<Self> {
-        if name == "native" {
-            return Some(Self::Native);
-        }
-        match name.strip_prefix("wsl:") {
-            None | Some("") => None,
-            Some(distro) => Some(Self::Wsl(distro.to_string())),
-        }
-    }
-
-    /// How a row names this side.  `None` on the native one, whose name would
-    /// be the same word on every row of a machine that has only it.
-    pub fn label(&self) -> Option<String> {
-        match self {
-            Self::Native => None,
-            Self::Wsl(distro) => Some(format!("wsl:{distro}")),
-        }
-    }
-
-    /// Program and argv that run `program <args>` on this side.  WSL goes
-    /// through a login shell because these binaries install to
-    /// `~/.local/bin`, which is not on the PATH `wsl.exe -e` inherits.
-    pub fn command(&self, program: &str, args: &[&str]) -> (String, Vec<String>) {
-        match self {
-            Self::Native => (program.to_string(), args.iter().map(|a| (*a).to_string()).collect()),
-            Self::Wsl(distro) => {
-                let script = std::iter::once(sh_quote(program))
-                    .chain(args.iter().map(|a| sh_quote(a)))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                // The login shell supplies PATH; exec preserves the PID
-                // recorded by the foreground probe.
-                wsl::exec_invocation(distro, &["sh", "-lc", &format!("exec {script}")])
-            },
-        }
-    }
-
-    /// The directory a new pane opens in, spelled where the multiplexer
-    /// resolves it: the distro's own path on a WSL side, the Windows path on
-    /// the native one.  `None` leaves the choice to the multiplexer.  A
-    /// workspace with no spelling inside the distro is an `Err`, since a pane
-    /// opened anywhere else would still have its session filed under it.
-    pub(crate) fn cwd_for(
-        &self,
-        workspace: Option<&std::path::Path>,
-    ) -> Result<Option<String>, String> {
-        let Some(path) = workspace else { return Ok(None) };
-        match self {
-            Self::Native => Ok(Some(path.display().to_string())),
-            Self::Wsl(distro) => wsl::windows_to_linux(path).map(Some).ok_or_else(|| {
-                format!("{} has no path inside the {distro} distro", path.display())
-            }),
-        }
-    }
-}
-
-/// Single-quote a POSIX argument, since WSL invocations are one `sh -lc`
-/// string rather than an argv.
-fn sh_quote(arg: &str) -> String {
-    if !arg.is_empty() && arg.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=".contains(c)) {
-        return arg.to_string();
-    }
-    format!("'{}'", arg.replace('\'', r"'\''"))
 }
 
 /// A pane alacritree wants a session on, in the terms the multiplexer that
@@ -529,56 +460,6 @@ mod tests {
 
     use super::*;
 
-    /// A side has two spellings and they are not interchangeable: `label` is
-    /// a row's word for it and stays silent on the native side, while a
-    /// client that cannot see the row needs the side named every time.
-    #[test]
-    fn a_side_names_itself_on_both_sides_of_the_wire() {
-        assert_eq!(Side::Native.name(), "native");
-        assert_eq!(Side::Wsl("Ubuntu-24.04".into()).name(), "wsl:Ubuntu-24.04");
-    }
-
-    /// A client names a pane by the side it read out of a listing, so a side
-    /// that does not survive the round trip points an attach at the wrong
-    /// server or at none.
-    #[test]
-    fn a_side_reads_back_as_the_side_it_spelled() {
-        for side in [Side::Native, Side::Wsl("Ubuntu-24.04".into())] {
-            assert_eq!(Side::parse(&side.name()), Some(side));
-        }
-    }
-
-    #[test]
-    fn a_side_that_names_no_server_is_refused() {
-        for name in ["", "wsl", "wsl:", "Native", "tmux:0"] {
-            assert_eq!(Side::parse(name), None, "{name} named a server");
-        }
-    }
-
-    #[test]
-    fn native_runs_the_program_directly() {
-        let (program, args) = Side::Native.command("herdr", &["agent", "list"]);
-        assert_eq!(program, "herdr");
-        assert_eq!(args, vec!["agent", "list"]);
-    }
-
-    /// These binaries install to ~/.local/bin, which reaches PATH only under
-    /// a login shell.  `wsl.exe -e herdr` fails with execvpe ENOENT.
-    #[test]
-    fn wsl_wraps_in_a_login_shell() {
-        let side = Side::Wsl("kali-linux".into());
-        let (program, args) = side.command("herdr", &["agent", "list"]);
-        assert_eq!(program, "wsl.exe");
-        assert_eq!(args, vec!["-d", "kali-linux", "--exec", "sh", "-lc", "exec herdr agent list"]);
-    }
-
-    #[test]
-    fn wsl_quotes_arguments_that_need_it() {
-        let side = Side::Wsl("d".into());
-        let (_, args) = side.command("herdr", &["agent", "attach", "w1:p1"]);
-        assert_eq!(args.last().unwrap(), "exec herdr agent attach 'w1:p1'");
-    }
-
     /// A client reads a multiplexer's name off a reply and may send it back,
     /// so the two spellings have to agree.  `herdr` is lowercase because that
     /// is the string already on the wire.
@@ -599,11 +480,11 @@ mod tests {
     fn a_new_pane_opens_in_the_workspace_spelled_for_its_own_side() {
         let workspace = PathBuf::from(r"\\wsl.localhost\ubuntu\home\dev\repo");
         assert_eq!(
-            Side::Wsl("ubuntu".into()).cwd_for(Some(&workspace)),
+            cwd_for(&Side::Wsl("ubuntu".into()), Some(&workspace)),
             Ok(Some("/home/dev/repo".to_string()))
         );
         assert_eq!(
-            Side::Native.cwd_for(Some(&workspace)),
+            cwd_for(&Side::Native, Some(&workspace)),
             Ok(Some(workspace.display().to_string()))
         );
     }
@@ -612,8 +493,8 @@ mod tests {
     /// default rather than being handed an empty path.
     #[test]
     fn a_new_pane_in_the_home_workspace_names_no_directory() {
-        assert_eq!(Side::Native.cwd_for(None), Ok(None));
-        assert_eq!(Side::Wsl("ubuntu".into()).cwd_for(None), Ok(None));
+        assert_eq!(cwd_for(&Side::Native, None), Ok(None));
+        assert_eq!(cwd_for(&Side::Wsl("ubuntu".into()), None), Ok(None));
     }
 
     /// Each multiplexer that fronts a server is built once, so every kind a

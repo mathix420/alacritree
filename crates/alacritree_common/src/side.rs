@@ -14,11 +14,14 @@ use std::time::Duration;
 use crate::jobs::Blocking;
 use crate::{command_ext, wsl};
 
-/// Which side of a Windows and WSL installation a checkout lives on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Which side of a Windows and WSL installation a checkout or a server lives
+/// on. Two servers on one machine cannot see each other, so a multiplexer
+/// pane's identity includes its side.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Side {
     Native,
-    Wsl { distro: String },
+    /// Named distro, as `wsl.exe -d` spells it.
+    Wsl(String),
 }
 
 impl Side {
@@ -29,9 +32,68 @@ impl Side {
     pub fn from_location(location: &wsl::Location) -> Self {
         match location {
             wsl::Location::Windows(_) => Side::Native,
-            wsl::Location::Wsl { distro, .. } => Side::Wsl { distro: distro.clone() },
+            wsl::Location::Wsl { distro, .. } => Side::Wsl(distro.clone()),
         }
     }
+
+    /// How a side is spelled outside the process: `native`, or `wsl:<distro>`
+    /// as `wsl.exe -d` names it. A pane named to a client without its side
+    /// is not named at all.
+    pub fn name(&self) -> String {
+        match self {
+            Self::Native => "native".to_string(),
+            Self::Wsl(distro) => format!("wsl:{distro}"),
+        }
+    }
+
+    /// Read back what `name` wrote. A `wsl:` with nothing after it names no
+    /// server, so it is refused rather than resolving to a distro called the
+    /// empty string.
+    pub fn parse(name: &str) -> Option<Self> {
+        if name == "native" {
+            return Some(Self::Native);
+        }
+        match name.strip_prefix("wsl:") {
+            None | Some("") => None,
+            Some(distro) => Some(Self::Wsl(distro.to_string())),
+        }
+    }
+
+    /// How a row names this side. `None` on the native one, whose name would
+    /// be the same word on every row of a machine that has only it.
+    pub fn label(&self) -> Option<String> {
+        match self {
+            Self::Native => None,
+            Self::Wsl(distro) => Some(format!("wsl:{distro}")),
+        }
+    }
+
+    /// Program and argv that run `program <args>` on this side. WSL goes
+    /// through a login shell because these binaries install to
+    /// `~/.local/bin`, which is not on the PATH `wsl.exe -e` inherits.
+    pub fn command(&self, program: &str, args: &[&str]) -> (String, Vec<String>) {
+        match self {
+            Self::Native => (program.to_string(), args.iter().map(|a| (*a).to_string()).collect()),
+            Self::Wsl(distro) => {
+                let script = std::iter::once(sh_quote(program))
+                    .chain(args.iter().map(|a| sh_quote(a)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                // The login shell supplies PATH; exec preserves the PID
+                // recorded by the foreground probe.
+                wsl::exec_invocation(distro, &["sh", "-lc", &format!("exec {script}")])
+            },
+        }
+    }
+}
+
+/// Single-quote a POSIX argument, since WSL invocations are one `sh -lc`
+/// string rather than an argv.
+fn sh_quote(arg: &str) -> String {
+    if !arg.is_empty() && arg.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=".contains(c)) {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', r"'\''"))
 }
 
 /// A path as a program on its own side spells it: unchanged natively, the
@@ -86,8 +148,8 @@ pub const LOGIN_SHELL: &str = r#"s=$(getent passwd "$(id -un)" 2>/dev/null | cut
 pub fn invocation(side: &Side, program: &Program, args: &[String]) -> Invocation {
     let (program, mut argv, via_login_shell) = match (side, &program.wsl) {
         (Side::Native, _) => (program.native.clone(), Vec::new(), false),
-        (Side::Wsl { .. }, Some(path)) => (path.clone(), Vec::new(), false),
-        (Side::Wsl { .. }, None) => {
+        (Side::Wsl(_), Some(path)) => (path.clone(), Vec::new(), false),
+        (Side::Wsl(_), None) => {
             let script = format!(r#"{LOGIN_SHELL}; exec "$s" -lc 'exec "$@"' "$s" "$@""#);
             ("sh".to_string(), vec!["-c".into(), script, "sh".into(), program.name.clone()], true)
         },
@@ -134,7 +196,7 @@ fn run_within(
             }
             cmd
         },
-        Side::Wsl { distro } => {
+        Side::Wsl(distro) => {
             let mut cmd = wsl::command(distro, cwd);
             cmd.arg(&inv.program);
             cmd
@@ -166,13 +228,64 @@ mod tests {
 
     #[test]
     fn a_wsl_location_runs_in_its_distro() {
-        assert_eq!(Side::from_location(&wsl_location("Ubuntu", "/home/u/wt")), Side::Wsl {
-            distro: "Ubuntu".into()
-        });
+        assert_eq!(
+            Side::from_location(&wsl_location("Ubuntu", "/home/u/wt")),
+            Side::Wsl("Ubuntu".into())
+        );
         assert_eq!(
             Side::from_location(&wsl::Location::Windows(PathBuf::from("C:/wt"))),
             Side::Native
         );
+    }
+
+    /// A side has two spellings and they are not interchangeable: `label` is
+    /// a row's word for it and stays silent on the native side, while a
+    /// client that cannot see the row needs the side named every time.
+    #[test]
+    fn a_side_names_itself_on_both_sides_of_the_wire() {
+        assert_eq!(Side::Native.name(), "native");
+        assert_eq!(Side::Wsl("Ubuntu-24.04".into()).name(), "wsl:Ubuntu-24.04");
+    }
+
+    /// A client names a pane by the side it read out of a listing, so a side
+    /// that does not survive the round trip points an attach at the wrong
+    /// server or at none.
+    #[test]
+    fn a_side_reads_back_as_the_side_it_spelled() {
+        for side in [Side::Native, Side::Wsl("Ubuntu-24.04".into())] {
+            assert_eq!(Side::parse(&side.name()), Some(side));
+        }
+    }
+
+    #[test]
+    fn a_side_that_names_no_server_is_refused() {
+        for name in ["", "wsl", "wsl:", "Native", "tmux:0"] {
+            assert_eq!(Side::parse(name), None, "{name} named a server");
+        }
+    }
+
+    #[test]
+    fn native_runs_the_program_directly() {
+        let (program, args) = Side::Native.command("herdr", &["agent", "list"]);
+        assert_eq!(program, "herdr");
+        assert_eq!(args, vec!["agent", "list"]);
+    }
+
+    /// These binaries install to ~/.local/bin, which reaches PATH only under
+    /// a login shell. `wsl.exe -e herdr` fails with execvpe ENOENT.
+    #[test]
+    fn wsl_wraps_in_a_login_shell() {
+        let side = Side::Wsl("kali-linux".into());
+        let (program, args) = side.command("herdr", &["agent", "list"]);
+        assert_eq!(program, "wsl.exe");
+        assert_eq!(args, vec!["-d", "kali-linux", "--exec", "sh", "-lc", "exec herdr agent list"]);
+    }
+
+    #[test]
+    fn wsl_quotes_arguments_that_need_it() {
+        let side = Side::Wsl("d".into());
+        let (_, args) = side.command("herdr", &["agent", "attach", "w1:p1"]);
+        assert_eq!(args.last().unwrap(), "exec herdr agent attach 'w1:p1'");
     }
 
     #[test]
@@ -195,7 +308,7 @@ mod tests {
 
     #[test]
     fn a_configured_wsl_path_is_executed_directly() {
-        let side = Side::Wsl { distro: "Ubuntu".into() };
+        let side = Side::Wsl("Ubuntu".into());
         let inv =
             invocation(&side, &program("mise", Some("/usr/bin/mise"), "mise"), &["trust".into()]);
         assert_eq!(inv.program, "/usr/bin/mise");
@@ -205,7 +318,7 @@ mod tests {
 
     #[test]
     fn an_unconfigured_wsl_program_goes_through_the_login_shell() {
-        let side = Side::Wsl { distro: "Ubuntu".into() };
+        let side = Side::Wsl("Ubuntu".into());
         let inv = invocation(&side, &program("mise", None, "mise"), &[
             "trust".into(),
             "/home/u/wt".into(),
@@ -221,7 +334,7 @@ mod tests {
     /// the login shell would exit 127 and silently skip the hook.
     #[test]
     fn a_native_path_is_not_handed_to_the_distro() {
-        let side = Side::Wsl { distro: "Ubuntu".into() };
+        let side = Side::Wsl("Ubuntu".into());
         let inv = invocation(&side, &program(r"C:\Tools\doppler.exe", None, "doppler"), &[]);
         assert_eq!(&inv.args[2..], ["sh", "doppler"]);
         assert!(!inv.args.iter().any(|a| a.contains(r"C:\Tools")), "{:?}", inv.args);
