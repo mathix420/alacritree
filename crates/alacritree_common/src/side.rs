@@ -122,10 +122,10 @@ pub struct Program {
 /// a login shell, whose exit status 127 means the program was not found.
 /// Inside a distro this is what follows `wsl.exe -d <distro> --exec`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Invocation {
-    pub program: String,
-    pub args: Vec<String>,
-    pub via_login_shell: bool,
+struct Invocation {
+    program: String,
+    args: Vec<String>,
+    via_login_shell: bool,
 }
 
 /// What running a program came to.
@@ -145,7 +145,7 @@ const NOT_FOUND: i32 = 127;
 /// `wsl.exe --exec` sees only the system PATH.
 pub const LOGIN_SHELL: &str = r#"s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=${SHELL:-/bin/sh}"#;
 
-pub fn invocation(side: &Side, program: &Program, args: &[String]) -> Invocation {
+fn invocation(side: &Side, program: &Program, args: &[String]) -> Invocation {
     let (program, mut argv, via_login_shell) = match (side, &program.wsl) {
         (Side::Native, _) => (program.native.clone(), Vec::new(), false),
         (Side::Wsl(_), Some(path)) => (path.clone(), Vec::new(), false),

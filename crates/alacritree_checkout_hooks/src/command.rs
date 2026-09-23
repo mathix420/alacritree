@@ -97,8 +97,8 @@ pub struct CommandHook {
 }
 
 /// Fill `{checkout}` and `{main}` with each path as the checkout's side
-/// spells it.  Each template word stays one argument.
-pub fn expand(template: &[String], event: &Checkout<'_>) -> Vec<String> {
+/// spells it. Each template word stays one argument.
+fn expand(template: &[String], event: &Checkout<'_>) -> Vec<String> {
     let spell = |path| {
         let spelled = side::spelling(&wsl::classify(path));
         if cfg!(windows) { without_verbatim(&spelled) } else { spelled }
