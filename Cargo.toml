@@ -5,6 +5,7 @@ members = [
     "alacritty_terminal",
     "alacritty_config",
     "alacritty_config_derive",
+    "crates/*",
 ]
 resolver = "2"
 
@@ -23,6 +24,9 @@ inherits = "release"
 lto = "thin"
 
 [workspace.dependencies]
+alacritree_common = { path = "crates/alacritree_common" }
+ambassador = "0.5.1"
+thiserror = "2"
 toml = "0.9.11"
 toml_edit = "0.24.0"
 

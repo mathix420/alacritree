@@ -15,6 +15,7 @@ rust-version.workspace = true
 dist = true
 
 [dependencies]
+alacritree_common.workspace = true
 alacritty_terminal = { path = "../alacritty_terminal" }
 base64 = "0.22"
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
@@ -71,6 +72,7 @@ enum_dispatch = "0.3"
 strum = { version = "0.26", features = ["derive"] }
 
 [dev-dependencies]
+alacritree_common = { workspace = true, features = ["test-support"] }
 # Throwaway repos and state files for worktree, prune, and persistence tests.
 tempfile = "3"
 # Integration tests parse the `--json` output of the real binary.

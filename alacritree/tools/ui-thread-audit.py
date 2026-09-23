@@ -51,7 +51,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(sys.argv[1])
-SRC = "alacritree/src"
+SRCS = ["alacritree/src", "crates"]
 
 # Work that can hold the caller for an unbounded time.  Deliberately narrow: a
 # config file read blocks too, but it is not what stalls a dialog for seconds
@@ -97,11 +97,11 @@ def sg(args):
 
 def by_kind(kind):
     rule = "id: k\nlanguage: rust\nrule:\n  kind: " + kind
-    return sg(["ast-grep", "scan", "--inline-rules", rule, SRC, "--json=compact"])
+    return sg(["ast-grep", "scan", "--inline-rules", rule, *SRCS, "--json=compact"])
 
 
 def by_pattern(pat):
-    return sg(["ast-grep", "-p", pat, "-l", "rust", SRC, "--json=compact"])
+    return sg(["ast-grep", "-p", pat, "-l", "rust", *SRCS, "--json=compact"])
 
 
 def extent(m):
@@ -131,7 +131,7 @@ for m in by_kind("impl_item"):
         impl_regions[f].append((s_, e_, hit.group(1)))
 
 aliases = collections.defaultdict(dict)
-for path in (ROOT / SRC).rglob("*.rs"):
+for path in (p for src in SRCS for p in (ROOT / src).rglob("*.rs")):
     rel = str(path.relative_to(ROOT)).replace("\\", "/")
     text = path.read_text(encoding="utf-8", errors="replace")
     for target, alias in ALIAS.findall(text):
@@ -185,7 +185,7 @@ live = [f for f in fns if not f.is_test]
 # ast-grep whose output format moved, a half-finished install, a wrong root.
 # Without this the report would read "0 blocking leaves" and pass.
 if not live:
-    scan_failed("ast-grep matched no functions under %s" % SRC)
+    scan_failed("ast-grep matched no functions under %s" % ", ".join(SRCS))
 by_key = {f.key: f for f in live}
 by_name = collections.defaultdict(list)
 in_file = collections.defaultdict(lambda: collections.defaultdict(list))

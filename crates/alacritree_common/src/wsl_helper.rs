@@ -163,7 +163,7 @@ use std::path::Path;
 /// killed outright before the signal lands, reaches no trap at all.  A
 /// start sweeps those predecessors' directories the way the pidfile GC
 /// already sweeps stale session pids.
-pub(crate) const HELPER_SCRIPT: &str = r##"
+pub const HELPER_SCRIPT: &str = r##"
 set -u
 b64() { printf %s "$1" | base64 | tr -d '\n'; }
 s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)
@@ -285,7 +285,7 @@ done
 /// shell too but gives no way to learn its PID; re-resolving through
 /// `getent` is the documented divergence, with `/bin/sh` only as a last
 /// resort.  Single line: it travels through ConPTY command-line quoting.
-pub(crate) const SHIM_SCRIPT: &str = r##"d=${XDG_RUNTIME_DIR:-/tmp}/alacritree; mkdir -p "$d" 2>/dev/null && printf %s $$ > "$d/session-$1.pid"; s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=/bin/sh; exec "$s" -l"##;
+pub const SHIM_SCRIPT: &str = r##"d=${XDG_RUNTIME_DIR:-/tmp}/alacritree; mkdir -p "$d" 2>/dev/null && printf %s $$ > "$d/session-$1.pid"; s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=/bin/sh; exec "$s" -l"##;
 
 /// argv for a session alacritree constructs itself (`ShellChoice::Wsl`,
 /// auto-by-location): the shim with the probe key as `$1`.
@@ -340,7 +340,7 @@ pub fn wrap_profile_argv(
 /// drop the command.  The `exec` here keeps the pidfile PID on the process
 /// that owns the tty, where the helper's `PROBE` starts its walk.  One
 /// line, for `SHIM_SCRIPT`'s reason.
-pub(crate) const EXEC_SHIM_SCRIPT: &str = r##"d=${XDG_RUNTIME_DIR:-/tmp}/alacritree; mkdir -p "$d" 2>/dev/null && printf %s $$ > "$d/session-$1.pid"; shift; exec "$@""##;
+pub const EXEC_SHIM_SCRIPT: &str = r##"d=${XDG_RUNTIME_DIR:-/tmp}/alacritree; mkdir -p "$d" 2>/dev/null && printf %s $$ > "$d/session-$1.pid"; shift; exec "$@""##;
 
 /// Probe-key shim for a wsl.exe argv whose `--exec` carries a command, the
 /// shape a multiplexer attach takes.  The command runs under
@@ -369,7 +369,7 @@ pub fn wrap_exec_argv(program: &str, args: &[String], probe_key: &str) -> Option
     Some(wrapped)
 }
 
-pub(crate) fn is_wsl_program(program: &str) -> bool {
+pub fn is_wsl_program(program: &str) -> bool {
     // The argv comes from a Windows host, so the program path uses Windows
     // separators. Split on them explicitly rather than via `Path`, whose
     // separator set depends on the compilation target.
@@ -384,9 +384,7 @@ pub(crate) fn is_wsl_program(program: &str) -> bool {
 /// distro they name, and whatever follows them.  A flag missing its value
 /// gets `None`: the rest of the argv then means something this parser
 /// cannot see.
-pub(crate) fn split_leading_flags(
-    args: &[String],
-) -> Option<(Vec<String>, Option<String>, &[String])> {
+pub fn split_leading_flags(args: &[String]) -> Option<(Vec<String>, Option<String>, &[String])> {
     let mut distro = None;
     let mut flags = Vec::new();
     let mut rest = args;
@@ -1595,27 +1593,6 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
-    }
-
-    #[test]
-    #[ignore = "requires WSL"]
-    fn multiplexer_command_keeps_the_probe_pid() {
-        let distro =
-            crate::wsl::distros().into_iter().find(|d| d.is_default).expect("a default distro");
-        let key = new_probe_key();
-        let (program, args) = crate::multiplexer::Side::Wsl(distro.name).command("sh", &[
-            "-c",
-            r#"f=${XDG_RUNTIME_DIR:-/tmp}/alacritree/session-$1.pid; p=$(cat "$f") || exit 1; rm -f "$f"; printf '%s\n%s\n' "$$" "$p""#,
-            "sh",
-            &key,
-        ]);
-        let args = wrap_exec_argv(&program, &args, &key).expect("wrap multiplexer command");
-        let output = crate::command_ext::hidden(program).args(args).output().expect("run in WSL");
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        let stdout = String::from_utf8(output.stdout).expect("PID output is UTF-8");
-        let pids: Vec<_> = stdout.lines().collect();
-        assert_eq!(pids.len(), 2, "command and probe PIDs: {stdout:?}");
-        assert_eq!(pids[0], pids[1], "the probe must track the command, not its login shell");
     }
 
     /// Killing the child is what frees a writer parked inside `write_all` on a

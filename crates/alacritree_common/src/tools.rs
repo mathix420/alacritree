@@ -75,13 +75,13 @@ pub fn configure(paths: [ToolPaths; 7]) {
     *configured().write().unwrap_or_else(|e| e.into_inner()) = paths;
 }
 
-#[cfg(test)]
-pub(crate) fn test_configuration() -> [ToolPaths; 7] {
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_configuration() -> [ToolPaths; 7] {
     configured().read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-#[cfg(test)]
-pub(crate) fn test_configuration_lock() -> &'static Mutex<()> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn test_configuration_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }

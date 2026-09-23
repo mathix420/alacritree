@@ -62,6 +62,7 @@ name = "alacritree"
 version = "0.13.0"
 dependencies = [
  "ab_glyph",
+ "alacritree_common",
  "alacritty_terminal",
  "arboard",
  "base64",
@@ -107,6 +108,18 @@ dependencies = [
  "windows-sys 0.59.0",
  "winreg",
  "xdg",
+]
+
+[[package]]
+name = "alacritree_common"
+version = "0.0.0"
+dependencies = [
+ "base64",
+ "log",
+ "serde",
+ "tempfile",
+ "windows-sys 0.59.0",
+ "winreg",
 ]
 
 [[package]]

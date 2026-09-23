@@ -27,10 +27,10 @@ jobs:
         run: rustup show && rustup component add clippy
 
       - name: Build
-        run: cargo build -p alacritree --locked
+        run: cargo build --workspace --exclude alacritty --exclude alacritty_terminal --exclude alacritty_config --exclude alacritty_config_derive --locked
 
       - name: Test
-        run: cargo test -p alacritree --locked
+        run: cargo test --workspace --exclude alacritty --exclude alacritty_terminal --exclude alacritty_config --exclude alacritty_config_derive --locked
 
       # --no-deps keeps clippy on our own crate. The vendored alacritty_terminal
       # is #![deny(clippy::all)], so a newer toolchain that adds a lint (e.g.
@@ -43,7 +43,7 @@ jobs:
       # a lint that only warns lets one ship. Every other lint stays a warning so
       # unrelated code does not fail the build.
       - name: Clippy
-        run: cargo clippy -p alacritree --all-targets --locked --no-deps -- -D clippy::disallowed_methods
+        run: cargo clippy --workspace --exclude alacritty --exclude alacritty_terminal --exclude alacritty_config --exclude alacritty_config_derive --all-targets --locked --no-deps -- -D clippy::disallowed_methods
 
       # Pinned: the audit parses ast-grep's JSON, and an upgrade that moves that
       # format would leave it inspecting nothing. The script exits 2 on an empty
@@ -78,7 +78,7 @@ jobs:
       # job: the macOS arms of links.rs and session.rs are lint-visible nowhere
       # else.  --all-targets is what reaches session.rs's macOS-only test.
       - name: Clippy
-        run: cargo clippy -p alacritree --all-targets --locked --no-deps -- -D clippy::disallowed_methods
+        run: cargo clippy --workspace --exclude alacritty --exclude alacritty_terminal --exclude alacritty_config --exclude alacritty_config_derive --all-targets --locked --no-deps -- -D clippy::disallowed_methods
 
   # Clipboard file/image fallbacks and WSL path handling are primarily
   # Windows-facing. Compile and run their pure tests before those cfg branches
@@ -93,11 +93,12 @@ jobs:
         run: rustup show && rustup component add clippy
 
       # Clippy in place of a plain check: it compiles the same cfg branches and
-      # is the only run that lints them. Most of the crate's process spawning
-      # lives behind #[cfg(windows)] — wsl.rs, wsl_helper.rs, the Windows arm of
-      # links.rs — which a Linux-only lint never sees.
+      # is the only run that lints them. Most of the process spawning lives
+      # behind #[cfg(windows)] — alacritree_common's wsl.rs and wsl_helper.rs,
+      # the Windows arm of alacritree's links.rs — which a Linux-only lint never
+      # sees.
       - name: Clippy
-        run: cargo clippy -p alacritree --all-targets --locked --no-deps -- -D clippy::disallowed_methods
+        run: cargo clippy --workspace --exclude alacritty --exclude alacritty_terminal --exclude alacritty_config --exclude alacritty_config_derive --all-targets --locked --no-deps -- -D clippy::disallowed_methods
 
       - name: Test
-        run: cargo test -p alacritree --locked
+        run: cargo test --workspace --exclude alacritty --exclude alacritty_terminal --exclude alacritty_config --exclude alacritty_config_derive --locked

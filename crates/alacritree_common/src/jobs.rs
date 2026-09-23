@@ -17,7 +17,7 @@ use std::time::Duration;
 
 /// Whether anything on screen is waiting for the job.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Priority {
+pub enum Priority {
     /// A pending state is showing until this lands.
     Interactive,
     /// Housekeeping nobody is looking at: status polls, PR lookups, liveness.
@@ -203,7 +203,7 @@ struct Shared {
 /// no shutdown path — a dropped `Pool` leaks its threads, parked forever on
 /// the empty queue. Harmless for the process-wide singleton this crate uses;
 /// don't construct one you intend to drop.
-pub(crate) struct Pool {
+pub struct Pool {
     shared: Arc<Shared>,
 }
 
@@ -224,7 +224,7 @@ pub struct Job<T> {
 /// A job's closure unwound instead of returning.  Carries no data — the
 /// panic itself is already logged from the pool worker that caught it, so
 /// `Job::failed` is only ever asked "did it happen", not "with what".
-pub(crate) struct JobFailed;
+pub struct JobFailed;
 
 impl<T> Job<T> {
     /// The result if it has landed.  Never blocks.
@@ -267,7 +267,7 @@ impl<T> Drop for Job<T> {
 
 /// Handles that already carry their outcome, so a module built on `Job` can
 /// test its own logic without a pool and the scheduling that comes with one.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl<T> Job<T> {
     pub fn ready(value: T) -> Self {
         Self::settled(Ok(value))
@@ -289,7 +289,7 @@ impl<T> Job<T> {
 impl Pool {
     /// `workers` is clamped to at least two: each class's ceiling needs one
     /// worker beyond the one it holds free.
-    pub(crate) fn new(workers: usize) -> Self {
+    pub fn new(workers: usize) -> Self {
         let workers = workers.max(2);
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
@@ -307,26 +307,26 @@ impl Pool {
     /// The most background tasks this pool runs at once.  Callers that keep
     /// their own admission count clamp against this rather than inventing a
     /// number that a differently sized pool would make wrong.
-    pub(crate) fn background_ceiling(&self) -> usize {
+    pub fn background_ceiling(&self) -> usize {
         self.shared.workers - 1
     }
 
     /// Register the wake-up this pool runs after every job.  The first
     /// registration wins; later ones are ignored.
-    pub(crate) fn set_waker(&self, wake: impl Fn() + Send + Sync + 'static) {
+    pub fn set_waker(&self, wake: impl Fn() + Send + Sync + 'static) {
         let _ = self.shared.wake_ui.set(Box::new(wake));
     }
 
     /// Runs the registered wake-up outside any job, for a thread of this
     /// crate's own that learns something the UI has to draw.
-    pub(crate) fn wake_ui(&self) {
+    pub fn wake_ui(&self) {
         if let Some(wake) = self.shared.wake_ui.get() {
             wake();
         }
     }
 
     #[must_use = "dropping the handle cancels the job"]
-    pub(crate) fn spawn<T, F>(&self, priority: Priority, f: F) -> Job<T>
+    pub fn spawn<T, F>(&self, priority: Priority, f: F) -> Job<T>
     where
         F: FnOnce(&Blocking) -> T + Send + 'static,
         T: Send + 'static,
@@ -448,7 +448,7 @@ fn lower_this_thread(_background: bool) {}
 /// screen waiting on them, so blocking is correct there.  A named entry point
 /// rather than a public constructor, so the exception is one reviewable call
 /// instead of a habit.
-pub(crate) fn on_this_thread<T>(f: impl FnOnce(&Blocking) -> T) -> T {
+pub fn on_this_thread<T>(f: impl FnOnce(&Blocking) -> T) -> T {
     // Nothing holds this `Cancel`, so `run_cancellable` here behaves exactly
     // like a plain run.
     f(&Blocking(Arc::new(Cancel::default())))
@@ -459,7 +459,7 @@ pub(crate) fn on_this_thread<T>(f: impl FnOnce(&Blocking) -> T) -> T {
 /// is chosen for concurrency headroom rather than derived from core count;
 /// `available_parallelism` only seeds where in that range a given machine
 /// starts.
-pub(crate) fn pool() -> &'static Pool {
+pub fn pool() -> &'static Pool {
     static POOL: OnceLock<Pool> = OnceLock::new();
     POOL.get_or_init(|| {
         let workers = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(4, 8));

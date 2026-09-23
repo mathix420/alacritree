@@ -15,7 +15,7 @@ pub(crate) mod clipboard;
 pub(crate) mod clipboard_image;
 pub(crate) mod color_glyph;
 pub(crate) mod colors;
-pub mod command_ext;
+pub use alacritree_common::command_ext;
 pub(crate) mod command_palette;
 pub mod config;
 pub mod crash_log;
@@ -41,7 +41,7 @@ pub(crate) mod ime;
 pub mod in_flight;
 pub(crate) mod input;
 pub(crate) mod ipc;
-pub(crate) mod jobs;
+pub(crate) use alacritree_common::jobs;
 pub(crate) mod links;
 pub mod logdir;
 pub mod logging;
@@ -75,15 +75,14 @@ pub(crate) mod tasks;
 pub(crate) mod terminal_view;
 #[cfg(test)]
 mod test_util;
-pub mod tools;
+pub use alacritree_common::tools;
 pub(crate) mod upstream;
 #[cfg(windows)]
 pub mod win_session;
 pub(crate) mod workspace;
 pub(crate) mod worktree;
 pub(crate) mod worktree_liveness;
-pub mod wsl;
-pub mod wsl_helper;
+pub use alacritree_common::{wsl, wsl_helper};
 pub mod wsl_spare;
 pub mod zellij;
 

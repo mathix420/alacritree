@@ -1,0 +1,25 @@
+[package]
+name = "alacritree_common"
+version = "0.0.0"
+license = "Apache-2.0"
+description = "Process, job pool, WSL and tool-path plumbing shared by alacritree's crates"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+# Exposes the tool-table and ready-made `Job` test helpers to other crates'
+# tests; `cfg(test)` only covers this crate's own.
+test-support = []
+
+[dependencies]
+base64 = "0.22"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
