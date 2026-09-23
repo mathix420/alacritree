@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 
+use alacritree_checkout_hooks::{Checkout, CheckoutHook};
+use alacritree_doppler::DopplerHook;
+
 use crate::config::WorkspaceConfig;
 use crate::default_branch::{self, Evidence, WellKnown};
 use crate::repaint::Repaint;
@@ -170,9 +173,9 @@ pub(crate) fn create(
         send("Enabled Claude Code terminal bell");
     }
 
-    let linked = crate::doppler::mirror_scopes(&req.project_root, &target, blocking);
-    if linked > 0 {
-        send(&format!("Linked {linked} Doppler scope(s)"));
+    let event = Checkout { main: &req.project_root, checkout: &target };
+    if let Ok(Some(line)) = DopplerHook.on_created(&event, blocking) {
+        send(&line);
     }
 
     Ok(target)
@@ -584,9 +587,9 @@ pub(crate) fn delete_worktree(
         // Branch may already be gone (e.g. detached HEAD) — ignore errors here.
         let _ = run_git(project_root, &["branch", "-D", branch]);
     }
-    let cleaned = crate::doppler::forget_scopes(&scope_root, blocking);
-    if cleaned > 0 {
-        log::info!("dropped {cleaned} doppler scope(s) under {}", scope_root.display());
+    let event = Checkout { main: project_root, checkout: &scope_root };
+    if let Ok(Some(line)) = DopplerHook.on_removed(&event, blocking) {
+        log::info!("{line} under {}", scope_root.display());
     }
     Ok(())
 }

@@ -64,6 +64,7 @@ dependencies = [
  "ab_glyph",
  "alacritree_checkout_hooks",
  "alacritree_common",
+ "alacritree_doppler",
  "alacritty_terminal",
  "ambassador",
  "arboard",
@@ -133,6 +134,21 @@ dependencies = [
  "tempfile",
  "windows-sys 0.59.0",
  "winreg",
+]
+
+[[package]]
+name = "alacritree_doppler"
+version = "0.0.0"
+dependencies = [
+ "alacritree_checkout_hooks",
+ "alacritree_common",
+ "log",
+ "schemars",
+ "serde",
+ "serde_json",
+ "strum",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]

@@ -25,7 +25,6 @@ pub mod default_branch;
 pub(crate) mod diff_viewer;
 pub(crate) mod digest;
 pub mod dll_search;
-pub(crate) mod doppler;
 pub(crate) mod file_drop;
 pub(crate) mod focus_priority;
 pub(crate) mod fonts;

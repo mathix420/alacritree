@@ -207,6 +207,7 @@ The viewer `preset = "custom"` runs.
 
 The Doppler CLI behind scope mirroring for new worktrees.
 
+- `enabled` (boolean, default `true`): Copy the main checkout's Doppler scopes into each new worktree, and drop them again when the worktree is removed.
 - `path` (string, default `"doppler"`): The program to run on Windows or natively. Its own name is looked up on PATH; any other value runs as written.
 - `wsl_path` (string, default `""`): The program to run inside every WSL distro, as written. Empty finds it by name through the distro's login shell.
 

@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use crate::tools::{self, Tool};
-use crate::{command_ext, jobs};
+use alacritree_common::tools::{self, Tool};
+use alacritree_common::{command_ext, jobs};
 
 /// `enclave.*` is doppler's on-disk spelling of the `project`/`config`
 /// options (a leftover from when the product was called Enclave).

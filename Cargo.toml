@@ -26,6 +26,7 @@ lto = "thin"
 [workspace.dependencies]
 alacritree_checkout_hooks = { path = "crates/alacritree_checkout_hooks" }
 alacritree_common = { path = "crates/alacritree_common" }
+alacritree_doppler = { path = "crates/alacritree_doppler" }
 ambassador = "0.5.1"
 thiserror = "2"
 toml = "0.9.11"

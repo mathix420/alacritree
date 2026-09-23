@@ -82,6 +82,7 @@
       }
     },
     "doppler": {
+      "enabled": true,
       "path": "doppler",
       "wsl_path": null
     },

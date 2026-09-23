@@ -519,15 +519,21 @@
       "type": "object"
     },
     "RawDoppler": {
+      "description": "`[integrations.doppler]`.",
       "properties": {
+        "enabled": {
+          "default": true,
+          "description": "Copy the main checkout's Doppler scopes into each new worktree, and\ndrop them again when the worktree is removed.",
+          "type": "boolean"
+        },
         "path": {
           "default": "doppler",
-          "description": "The program to run on Windows or natively. Its own name is\nlooked up on PATH; any other value runs as written.",
+          "description": "The program to run on Windows or natively. Its own name is looked up\non PATH; any other value runs as written.",
           "type": "string"
         },
         "wsl_path": {
           "default": "",
-          "description": "The program to run inside every WSL distro, as written. Empty\nfinds it by name through the distro's login shell.",
+          "description": "The program to run inside every WSL distro, as written. Empty finds it\nby name through the distro's login shell.",
           "type": "string"
         }
       },

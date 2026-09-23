@@ -1,0 +1,22 @@
+[package]
+name = "alacritree_doppler"
+version = "0.0.0"
+license = "Apache-2.0"
+description = "Mirrors Doppler CLI scopes into alacritree's worktrees"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+alacritree_common.workspace = true
+alacritree_checkout_hooks.workspace = true
+log = "0.4"
+schemars = "1.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+alacritree_common = { workspace = true, features = ["test-support"] }
+strum = "0.26"
+tempfile = "3"
+toml = { workspace = true }

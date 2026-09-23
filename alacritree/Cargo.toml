@@ -17,6 +17,7 @@ dist = true
 [dependencies]
 alacritree_checkout_hooks.workspace = true
 alacritree_common.workspace = true
+alacritree_doppler.workspace = true
 ambassador.workspace = true
 alacritty_terminal = { path = "../alacritty_terminal" }
 base64 = "0.22"

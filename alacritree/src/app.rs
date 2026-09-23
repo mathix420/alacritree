@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
+use alacritree_checkout_hooks::{Checkout, CheckoutHook};
+use alacritree_doppler::DopplerHook;
 use eframe::CreationContext;
 use egui::{Color32, Context, Frame, Margin, RichText, ScrollArea, SidePanel, Stroke};
 
@@ -50,8 +52,8 @@ use crate::worktree::{self as wt, CreateRequest, Progress};
 use crate::wsl::{self, ShellChoice};
 use crate::wsl_helper::{self, WslProbe};
 use crate::{
-    clipboard_image, doppler, file_drop, ipc, jobs, mouse_hide, notify, paste, path_style,
-    scratchpad, sidebar_focus, terminal_view, worktree_liveness,
+    clipboard_image, file_drop, ipc, jobs, mouse_hide, notify, paste, path_style, scratchpad,
+    sidebar_focus, terminal_view, worktree_liveness,
 };
 
 mod actions;
@@ -1152,9 +1154,9 @@ impl AlacritreeApp {
             return;
         };
         self.detached_jobs.push(jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
-            let linked = doppler::mirror_scopes(&main_checkout, &worktree, blocking);
-            if linked > 0 {
-                log::info!("linked {linked} doppler scope(s) into {}", worktree.display());
+            let event = Checkout { main: &main_checkout, checkout: &worktree };
+            if let Ok(Some(line)) = DopplerHook.on_opened(&event, blocking) {
+                log::info!("{line} into {}", worktree.display());
             }
         }));
     }

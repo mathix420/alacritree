@@ -208,7 +208,7 @@ fn tool_check(tool: &Tool, found: Option<Found>) -> Check {
 
 /// Doppler scope mirroring only matters to someone who uses Doppler, and the
 /// only evidence of that is its config file — the CLI writes one on first
-/// `doppler setup`, and `doppler.rs` reads scopes straight out of it.
+/// `doppler setup`, and `alacritree_doppler` reads scopes straight out of it.
 fn doppler_need(configured: bool) -> Need {
     if configured { Need::Optional } else { Need::Unused }
 }
@@ -820,7 +820,7 @@ mod tests {
     }
 
     /// The evidence is Doppler's own config file: it is written on `doppler
-    /// setup`, and it is where `doppler.rs` reads scopes from.  Someone who has
+    /// setup`, and it is where `alacritree_doppler` reads scopes from.  Someone who has
     /// set Doppler up and then lost the binary does want to hear about it.
     #[test]
     fn doppler_is_only_worth_warning_about_once_it_has_been_set_up() {

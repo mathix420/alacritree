@@ -601,7 +601,7 @@ impl PasteConfig {
 pub struct IntegrationsConfig {
     pub git: ToolConfig,
     pub gh: GhConfig,
-    pub doppler: ToolConfig,
+    pub doppler: alacritree_doppler::DopplerConfig,
     pub herdr: HerdrConfig,
     pub zellij: ZellijConfig,
     pub delta: ToolConfig,
@@ -3128,7 +3128,7 @@ struct RawIntegrations {
     /// The GitHub CLI behind PR badges and diff base branches.
     gh: RawGh,
     /// The Doppler CLI behind scope mirroring for new worktrees.
-    doppler: RawDoppler,
+    doppler: alacritree_doppler::RawDoppler,
     /// Agents running under a herdr server.
     herdr: RawHerdr,
     /// Panes of running zellij sessions.
@@ -3224,7 +3224,6 @@ impl RawGh {
         }
     }
 }
-raw_tool_table!(RawDoppler, "doppler");
 raw_tool_table!(RawDelta, "delta");
 raw_tool_table!(RawTuicr, "tuicr");
 
@@ -3343,7 +3342,7 @@ impl RawIntegrations {
         IntegrationsConfig {
             git: tool_config(self.git.path, self.git.wsl_path, Tool::Git),
             gh: self.gh.resolve(&moved),
-            doppler: tool_config(self.doppler.path, self.doppler.wsl_path, Tool::Doppler),
+            doppler: self.doppler.resolve(),
             herdr: self.herdr.resolve(moved.herdr_icon),
             zellij: self.zellij.resolve(),
             delta: delta_config(self.delta.path, self.delta.wsl_path, moved.delta_path),
