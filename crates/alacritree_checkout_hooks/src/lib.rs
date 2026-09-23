@@ -1,5 +1,5 @@
 //! Steps other tools need when alacritree creates, first opens, or removes a
-//! linked worktree.  Several tools bind settings to absolute directory paths
+//! linked worktree. Several tools bind settings to absolute directory paths
 //! (doppler scopes, `mise trust`, `direnv allow`), so a fresh worktree starts
 //! without them; each hook carries one such tool's step.
 
@@ -57,7 +57,7 @@ pub trait CheckoutHook {
         Ok(None)
     }
 
-    /// This process opened its first shell in a linked worktree.  Fires again
+    /// This process opened its first shell in a linked worktree. Fires again
     /// after a restart, so implementations must be idempotent.
     fn on_opened(
         &self,
@@ -67,7 +67,7 @@ pub trait CheckoutHook {
         Ok(None)
     }
 
-    /// The worktree at `event.checkout` was removed.  The path was resolved
+    /// The worktree at `event.checkout` was removed. The path was resolved
     /// before git deleted the directory, which cannot be canonicalized after.
     fn on_removed(
         &self,
@@ -78,7 +78,7 @@ pub trait CheckoutHook {
     }
 }
 
-/// Every event run on each hook in order.  One hook failing does not stop
+/// Every event run on each hook in order. One hook failing does not stop
 /// the next: each carries an unrelated tool, and a broken `mise` must not keep
 /// doppler from scoping the worktree.
 pub trait CheckoutHooks {

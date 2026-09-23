@@ -329,7 +329,7 @@
         },
         "wsl_path": {
           "default": "",
-          "description": "The program to run inside a WSL distro for a worktree there, as\nwritten. Empty looks up the file name of `path`, without directory or\nextension, through the distro's login shell, and a distro where that\nfinds nothing skips the hook.  A Windows `path` is never run there.",
+          "description": "The program to run inside a WSL distro for a worktree there, as\nwritten. Empty looks up the file name of `path`, without directory or\nextension, through the distro's login shell, and a distro where that\nfinds nothing skips the hook. A Windows `path` is never run there.",
           "type": "string"
         }
       },

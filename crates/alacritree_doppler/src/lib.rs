@@ -1,5 +1,5 @@
 //! Doppler as a checkout hook: a new worktree gets the main checkout's
-//! scopes, a removed one gives them back.  See `scopes` for why doppler needs
+//! scopes, a removed one gives them back. See `scopes` for why doppler needs
 //! this at all.
 
 mod scopes;

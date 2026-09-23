@@ -1,5 +1,5 @@
 //! A hook that records what it receives, for tests on either side of the
-//! trait.  Clones share one log, so a test keeps a clone to read after
+//! trait. Clones share one log, so a test keeps a clone to read after
 //! handing the hook away.
 
 use std::path::PathBuf;

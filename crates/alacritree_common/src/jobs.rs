@@ -168,7 +168,7 @@ impl Blocking {
     }
 }
 
-/// How much of each stream [`Blocking::run_drained`] keeps.  The rest is
+/// How much of each stream [`Blocking::run_drained`] keeps. The rest is
 /// read and dropped, so the child never blocks on a full pipe.
 pub const DRAIN_CAP: u64 = 1 << 20;
 

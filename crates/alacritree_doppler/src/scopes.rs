@@ -160,8 +160,8 @@ fn all_scopes(side: &Side, blocking: &jobs::Blocking) -> Option<Scopes> {
 }
 
 /// Run doppler on `side` with `args`, returning stdout on success and `None`
-/// on any failure — including the binary not being installed there, which is
-/// the common case and must stay quiet.
+/// on any failure. That includes the binary not being installed there, which
+/// is the common case and must stay quiet.
 fn run(
     side: &Side,
     args: &[&str],

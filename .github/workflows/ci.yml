@@ -94,9 +94,9 @@ jobs:
 
       # Clippy in place of a plain check: it compiles the same cfg branches and
       # is the only run that lints them. Most of the process spawning lives
-      # behind #[cfg(windows)] — alacritree_common's wsl.rs and wsl_helper.rs,
-      # the Windows arm of alacritree's links.rs — which a Linux-only lint never
-      # sees.
+      # behind #[cfg(windows)], in alacritree_common's wsl.rs and wsl_helper.rs
+      # and the Windows arm of alacritree's links.rs, which a Linux-only lint
+      # never sees.
       - name: Clippy
         run: cargo clippy --workspace --exclude alacritty --exclude alacritty_terminal --exclude alacritty_config --exclude alacritty_config_derive --all-targets --locked --no-deps -- -D clippy::disallowed_methods
 

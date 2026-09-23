@@ -382,10 +382,10 @@ pub struct AlacritreeApp {
     /// Worktrees whose checkout hooks already ran `on_opened` this app run, so
     /// opening more shells there doesn't re-run every hooked tool.
     hooks_opened: HashSet<PathBuf>,
-    /// Fire-and-forget jobs whose result nothing reads — checkout hook runs,
-    /// image-cache sweeps, link opens.  Held anyway: dropping a `Job` cancels
-    /// work that has not started yet, and a submission followed immediately
-    /// by drop would race the pool for nothing.  Drained once a frame.
+    /// Fire-and-forget jobs whose result nothing reads, such as checkout hook
+    /// runs, image-cache sweeps and link opens. Held because dropping a `Job`
+    /// cancels work not yet started, and dropping right after submitting
+    /// would race the pool for nothing. Drained once a frame.
     detached_jobs: Vec<jobs::Job<()>>,
     notify_rx: Receiver<SessionId>,
     /// Requests from IPC connection threads, drained once per frame.
@@ -1135,7 +1135,7 @@ impl AlacritreeApp {
     }
 
     /// Run every checkout hook's `on_opened` the first time this process
-    /// opens a shell in a linked worktree.  The create path covers worktrees
+    /// opens a shell in a linked worktree. The create path covers worktrees
     /// alacritree makes; this covers ones created outside it, which would
     /// otherwise lack, for example, their Doppler scopes.
     fn sync_checkout_hooks(&mut self, worktree: PathBuf) {

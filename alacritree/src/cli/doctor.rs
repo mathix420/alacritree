@@ -796,7 +796,7 @@ mod tests {
     }
 
     /// The evidence is Doppler's own config file: it is written on `doppler
-    /// setup`, and it is where `alacritree_doppler` reads scopes from.  Someone who has
+    /// setup`, and it is where `alacritree_doppler` reads scopes from. Someone who has
     /// set Doppler up and then lost the binary does want to hear about it.
     #[test]
     fn doppler_is_only_worth_warning_about_once_it_has_been_set_up() {

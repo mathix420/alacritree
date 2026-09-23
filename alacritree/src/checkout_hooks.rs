@@ -27,7 +27,7 @@ pub(crate) fn from_config(integrations: &IntegrationsConfig) -> Vec<Hook> {
 
 /// Hand each outcome to `line` as one progress line: a hook's own report at
 /// `Info`, or the error that stopped it at `Warn`, so a caller that logs
-/// rather than shows the lines still surfaces a failing hook.  Hooks with
+/// rather than shows the lines still surfaces a failing hook. Hooks with
 /// nothing to say add nothing.
 pub(crate) fn report(outcomes: Vec<Outcome>, mut line: impl FnMut(log::Level, &str)) {
     for outcome in outcomes {

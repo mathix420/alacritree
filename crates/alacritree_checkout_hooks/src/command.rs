@@ -35,7 +35,7 @@ pub struct RawCommandHook {
     /// The program to run inside a WSL distro for a worktree there, as
     /// written. Empty looks up the file name of `path`, without directory or
     /// extension, through the distro's login shell, and a distro where that
-    /// finds nothing skips the hook.  A Windows `path` is never run there.
+    /// finds nothing skips the hook. A Windows `path` is never run there.
     #[serde(default)]
     pub wsl_path: String,
     /// Arguments when alacritree creates a worktree. `{checkout}` is the new
