@@ -62,8 +62,10 @@ name = "alacritree"
 version = "0.13.0"
 dependencies = [
  "ab_glyph",
+ "alacritree_checkout_hooks",
  "alacritree_common",
  "alacritty_terminal",
+ "ambassador",
  "arboard",
  "base64",
  "block2 0.6.2",
@@ -108,6 +110,16 @@ dependencies = [
  "windows-sys 0.59.0",
  "winreg",
  "xdg",
+]
+
+[[package]]
+name = "alacritree_checkout_hooks"
+version = "0.0.0"
+dependencies = [
+ "alacritree_common",
+ "ambassador",
+ "log",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
@@ -208,6 +220,18 @@ dependencies = [
  "unicode-width 0.2.2",
  "vte",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "ambassador"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd3d4da7fddbc6567cbd7b5c30364f91313701b1857ab5b925eb3acf06162eed"
+dependencies = [
+ "itertools",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
 ]
 
 [[package]]
@@ -2019,6 +2043,15 @@ name = "is_terminal_polyfill"
 version = "1.70.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7943c866cc5cd64cbc25b2e01621d07fa8eb2a1a23160ee81ce38704e97b8ecf"
+
+[[package]]
+name = "itertools"
+version = "0.10.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
+dependencies = [
+ "either",
+]
 
 [[package]]
 name = "itoa"

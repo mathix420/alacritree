@@ -15,7 +15,9 @@ rust-version.workspace = true
 dist = true
 
 [dependencies]
+alacritree_checkout_hooks.workspace = true
 alacritree_common.workspace = true
+ambassador.workspace = true
 alacritty_terminal = { path = "../alacritty_terminal" }
 base64 = "0.22"
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
@@ -72,6 +74,7 @@ enum_dispatch = "0.3"
 strum = { version = "0.26", features = ["derive"] }
 
 [dev-dependencies]
+alacritree_checkout_hooks = { workspace = true, features = ["test-support"] }
 alacritree_common = { workspace = true, features = ["test-support"] }
 # Throwaway repos and state files for worktree, prune, and persistence tests.
 tempfile = "3"

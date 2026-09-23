@@ -1,0 +1,17 @@
+[package]
+name = "alacritree_checkout_hooks"
+version = "0.0.0"
+license = "Apache-2.0"
+description = "Steps other tools need when alacritree creates, opens or removes a worktree"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+test-support = []
+
+[dependencies]
+alacritree_common.workspace = true
+ambassador.workspace = true
+thiserror.workspace = true
+log = "0.4"
