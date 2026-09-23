@@ -9,6 +9,7 @@
 use std::io;
 use std::path::Path;
 use std::process::{Output, Stdio};
+use std::time::Duration;
 
 use crate::jobs::Blocking;
 use crate::{command_ext, wsl};
@@ -71,6 +72,8 @@ pub enum Ran {
     /// The program is not installed on this side.
     Missing,
     Finished(Output),
+    /// The program ran past its limit and was killed.
+    TimedOut,
 }
 
 /// The status a POSIX shell exits with for a command it could not find.
@@ -93,14 +96,32 @@ pub fn invocation(side: &Side, program: &Program, args: &[String]) -> Invocation
     Invocation { program, args: argv, via_login_shell }
 }
 
-/// Run `program` on `side`, killing it if the job is cancelled.  Blocks, so
-/// it takes the pool's token: call it from a job, never the UI thread.
+/// Run `program` on `side`, killing it if the job is cancelled or it runs
+/// past [`LIMIT`].  Blocks, so it takes the pool's token: call it from a job,
+/// never the UI thread.
 pub fn run(
     side: &Side,
     program: &Program,
     cwd: Option<&Path>,
     args: &[String],
     blocking: &Blocking,
+) -> io::Result<Ran> {
+    run_within(side, program, cwd, args, blocking, LIMIT)
+}
+
+/// How long a program may run before it is killed.  Generous, because a
+/// user's hook may install dependencies; bounded, because a worktree removal
+/// or first open has no cancel, and a hook that never exits would otherwise
+/// hold a pool worker, and a sidebar spinner, until the app quits.
+pub const LIMIT: Duration = Duration::from_secs(300);
+
+fn run_within(
+    side: &Side,
+    program: &Program,
+    cwd: Option<&Path>,
+    args: &[String],
+    blocking: &Blocking,
+    limit: Duration,
 ) -> io::Result<Ran> {
     let inv = invocation(side, program, args);
     // `wsl::command` sets WSL_UTF8, without which wsl.exe's own errors (a
@@ -120,7 +141,8 @@ pub fn run(
         },
     };
     cmd.args(&inv.args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    match blocking.run_cancellable(&mut cmd) {
+    match blocking.run_drained(&mut cmd, limit) {
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => Ok(Ran::TimedOut),
         Err(e) if e.kind() == io::ErrorKind::NotFound && *side == Side::Native => Ok(Ran::Missing),
         Err(e) => Err(e),
         Ok(output) if inv.via_login_shell && output.status.code() == Some(NOT_FOUND) => {
@@ -240,6 +262,43 @@ mod tests {
         let begun = Instant::now();
         drop(job);
         rx.recv_timeout(Duration::from_secs(10)).expect("run never returned after cancel");
+        assert!(begun.elapsed() < Duration::from_secs(10));
+    }
+
+    /// A hook as chatty as a dependency install must not stall on a full pipe
+    /// and leave the create waiting on it forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_program_that_fills_a_pipe_still_finishes() {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let program = program("sh", None, "sh");
+            let args =
+                ["-c".into(), "head -c 200000 /dev/zero; head -c 200000 /dev/zero >&2".into()];
+            let ran = jobs::on_this_thread(|b| run(&Side::Native, &program, None, &args, b));
+            let _ = tx.send(matches!(ran, Ok(Ran::Finished(ref out)) if out.status.success()));
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)), Ok(true), "the program stalled");
+    }
+
+    /// A hook that never exits is stopped, not waited on until the app quits.
+    #[test]
+    fn a_program_past_its_limit_is_timed_out() {
+        let program = if cfg!(windows) {
+            program("ping", None, "ping")
+        } else {
+            program("sleep", None, "sleep")
+        };
+        let args: Vec<String> = if cfg!(windows) {
+            vec!["-n".into(), "31".into(), "127.0.0.1".into()]
+        } else {
+            vec!["30".into()]
+        };
+        let begun = Instant::now();
+        let ran = jobs::on_this_thread(|b| {
+            run_within(&Side::Native, &program, None, &args, b, Duration::from_millis(200))
+        });
+        assert!(matches!(ran, Ok(Ran::TimedOut)), "{ran:?}");
         assert!(begun.elapsed() < Duration::from_secs(10));
     }
 }

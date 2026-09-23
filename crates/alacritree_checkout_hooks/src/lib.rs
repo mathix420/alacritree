@@ -42,6 +42,8 @@ pub enum HookError {
         #[source]
         source: std::io::Error,
     },
+    #[error("{hook} did not finish within {}s", alacritree_common::side::LIMIT.as_secs())]
+    TimedOut { hook: String },
 }
 
 #[ambassador::delegatable_trait]

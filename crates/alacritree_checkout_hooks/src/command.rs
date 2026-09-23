@@ -125,7 +125,11 @@ impl CommandHook {
         let side = Side::of(event.checkout);
         let cwd_spelled = std::path::PathBuf::from(side::spelling(&wsl::classify(cwd)));
         let cwd = if side == Side::Native { cwd } else { cwd_spelled.as_path() };
-        match side::run(&side, &self.program, Some(cwd), &expand(template, event), blocking) {
+        self.outcome(side::run(&side, &self.program, Some(cwd), &expand(template, event), blocking))
+    }
+
+    fn outcome(&self, ran: std::io::Result<Ran>) -> Outcome {
+        match ran {
             Err(source) => Err(HookError::Spawn { hook: self.name.clone(), source }),
             Ok(Ran::Missing) => {
                 log::debug!(
@@ -135,6 +139,7 @@ impl CommandHook {
                 );
                 Ok(None)
             },
+            Ok(Ran::TimedOut) => Err(HookError::TimedOut { hook: self.name.clone() }),
             Ok(Ran::Finished(output)) if output.status.success() => {
                 Ok(Some(format!("Ran {}", self.name)))
             },
@@ -234,6 +239,15 @@ mod tests {
             },
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    /// A hook killed for running too long says so, rather than reading as a
+    /// program that could not start.
+    #[test]
+    fn a_hook_past_its_limit_fails_as_timed_out() {
+        let err = hook("sleep", &["30"]).outcome(Ok(Ran::TimedOut)).unwrap_err();
+        assert!(matches!(err, HookError::TimedOut { ref hook } if hook == "test"), "{err:?}");
+        assert_eq!(err.to_string(), "test did not finish within 300s");
     }
 
     #[test]

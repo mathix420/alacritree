@@ -8,12 +8,12 @@
 
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::io;
+use std::io::{self, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process::{Child, Command, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Whether anything on screen is waiting for the job.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -74,12 +74,38 @@ impl Blocking {
     ///
     /// The pipes are not drained until the child exits, so this suits a child
     /// whose output is bounded.  A child that fills a pipe would block on the
-    /// write and never reach the exit this waits for.
+    /// write and never reach the exit this waits for; use
+    /// [`Blocking::run_drained`] for one whose output nobody bounds.
     #[allow(clippy::disallowed_methods)] // Spawning the child is this method's job.
     pub fn run_cancellable(&self, cmd: &mut Command) -> io::Result<Output> {
         let child = cmd.spawn()?;
+        self.wait_registered(child, None)?.wait_with_output()
+    }
+
+    /// [`Blocking::run_cancellable`] for a child whose output is unbounded,
+    /// such as a program the user configured: its stdout and stderr are read
+    /// while it runs, each kept up to [`DRAIN_CAP`] bytes, and it is killed
+    /// once `limit` passes, which reads as [`io::ErrorKind::TimedOut`].
+    #[allow(clippy::disallowed_methods)] // Spawning the child is this method's job.
+    pub fn run_drained(&self, cmd: &mut Command, limit: Duration) -> io::Result<Output> {
+        let mut child = cmd.spawn()?;
+        let stdout = child.stdout.take().map(|pipe| std::thread::spawn(move || drain(pipe)));
+        let stderr = child.stderr.take().map(|pipe| std::thread::spawn(move || drain(pipe)));
+        // On a kill the readers are left to finish on their own: a grandchild
+        // that inherited a pipe can hold it open past the child's death.
+        let mut child = self.wait_registered(child, Some(Instant::now() + limit))?;
+        let status = child.wait()?;
+        let collect = |reader: Option<std::thread::JoinHandle<Vec<u8>>>| {
+            reader.map(|r| r.join().unwrap_or_default()).unwrap_or_default()
+        };
+        Ok(Output { status, stdout: collect(stdout), stderr: collect(stderr) })
+    }
+
+    /// Register `child` for a cancel to kill, then wait for it to exit or for
+    /// `deadline` to pass, returning it reaped.
+    fn wait_registered(&self, child: Child, deadline: Option<Instant>) -> io::Result<Child> {
         *self.0.child.lock().expect("the cancel slot is poisoned") = Some(child);
-        // The handle can drop between the spawn above and the registration, in
+        // The handle can drop between the spawn and the registration, in
         // which case `cancel` ran while there was nothing to kill.  Killing
         // here does not skip the loop below: reaping stays there regardless
         // of which path did the killing.
@@ -108,7 +134,14 @@ impl Blocking {
                         let _ = child.wait();
                         return Err(io::Error::new(io::ErrorKind::Interrupted, "job cancelled"));
                     }
-                    return child.wait_with_output();
+                    return Ok(child);
+                },
+                Ok(None) if deadline.is_some_and(|at| Instant::now() >= at) => {
+                    let mut child = slot.take().expect("observed present on this iteration");
+                    drop(slot);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "ran past its limit"));
                 },
                 Ok(None) => {
                     drop(slot);
@@ -133,6 +166,18 @@ impl Blocking {
             }
         }
     }
+}
+
+/// How much of each stream [`Blocking::run_drained`] keeps.  The rest is
+/// read and dropped, so the child never blocks on a full pipe.
+pub const DRAIN_CAP: u64 = 1 << 20;
+
+fn drain(pipe: impl Read) -> Vec<u8> {
+    let mut kept = Vec::new();
+    let mut pipe = pipe;
+    let _ = (&mut pipe).take(DRAIN_CAP).read_to_end(&mut kept);
+    let _ = io::copy(&mut pipe, &mut io::sink());
+    kept
 }
 
 /// How often `run_cancellable` asks whether its child has exited.  The killer
@@ -771,5 +816,30 @@ mod tests {
             Ok(Some(io::ErrorKind::Interrupted)),
             "the child outlived a cancel that landed before it was registered"
         );
+    }
+
+    /// More output than a pipe buffer holds must not stall the child: a
+    /// drained run reads both pipes while it waits.
+    #[cfg(unix)]
+    #[test]
+    fn a_drained_child_that_fills_a_pipe_still_finishes() {
+        let mut cmd = command_ext::hidden("sh");
+        cmd.args(["-c", "head -c 200000 /dev/zero; head -c 200000 /dev/zero >&2"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = on_this_thread(|b| b.run_drained(&mut cmd, Duration::from_secs(10)))
+            .expect("the child finishes");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 200_000);
+        assert_eq!(output.stderr.len(), 200_000);
+    }
+
+    #[test]
+    fn a_drained_child_past_its_limit_is_killed() {
+        let begun = Instant::now();
+        let result =
+            on_this_thread(|b| b.run_drained(&mut long_sleep(), Duration::from_millis(200)));
+        assert_eq!(result.err().map(|e| e.kind()), Some(io::ErrorKind::TimedOut));
+        assert!(begun.elapsed() < Duration::from_secs(10), "the child ran to its own end");
     }
 }
