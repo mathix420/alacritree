@@ -172,6 +172,23 @@ Options that fit no other table.
 The other tools alacritree can notice and cooperate with. `alacritree.toml` only.
 
 
+### `[integrations.checkout_hooks]`
+
+Programs to run when a worktree is created, first opened, or removed.
+
+- `command` (table): Programs to run when a worktree is created, first opened, or removed, keyed by a name of your choice. A table rather than a list, so a hook defined in alacritty.toml can be changed or disabled by name from alacritree.toml.
+
+### `[integrations.checkout_hooks.command.<name>]`
+
+One hook: the program to run, and its arguments for each worktree event.
+
+- `enabled` (boolean, default `true`): Run this hook.
+- `on_created` (array of string, default `[]`): Arguments when alacritree creates a worktree. `{checkout}` is the new worktree and `{main}` the project's main checkout. Empty skips it.
+- `on_opened` (array of string, default `[]`): Arguments the first time this process opens a shell in a worktree, including ones created outside alacritree. Runs again after a restart, so the command must be safe to repeat. Empty skips it.
+- `on_removed` (array of string, default `[]`): Arguments after a worktree is removed. Runs in the main checkout, since the worktree is gone. Empty skips it.
+- `path` (string): The program to run on Windows or natively. A bare name is looked up on PATH.
+- `wsl_path` (string, default `""`): The program to run inside a WSL distro for a worktree there, as written. Empty looks up the file name of `path`, without directory or extension, through the distro's login shell, and a distro where that finds nothing skips the hook. A Windows `path` is never run there.
+
 ### `[integrations.delta]`
 
 The pager the delta diff viewer runs.

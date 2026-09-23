@@ -63,6 +63,7 @@
     "size": 11.25
   },
   "integrations": {
+    "checkout_hooks": [],
     "delta": {
       "path": "delta",
       "wsl_path": null

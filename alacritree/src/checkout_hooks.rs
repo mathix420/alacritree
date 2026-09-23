@@ -1,7 +1,7 @@
 //! The checkout hooks this build knows, dispatched by `match` rather than a
 //! vtable, and the one place that decides which of them a config turns on.
 
-use alacritree_checkout_hooks::{CheckoutHook, Outcome, ambassador_impl_CheckoutHook};
+use alacritree_checkout_hooks::{CheckoutHook, CommandHook, Outcome, ambassador_impl_CheckoutHook};
 use alacritree_doppler::DopplerHook;
 use ambassador::Delegate;
 
@@ -11,15 +11,17 @@ use crate::config::IntegrationsConfig;
 #[delegate(CheckoutHook)]
 pub(crate) enum Hook {
     Doppler(DopplerHook),
+    Command(CommandHook),
 }
 
-/// Built-in hooks first, in a fixed order, so the progress steps read the
-/// same on every create.
+/// Built-in hooks first, in a fixed order, then the user's in name order, so
+/// the progress steps read the same on every create.
 pub(crate) fn from_config(integrations: &IntegrationsConfig) -> Vec<Hook> {
     let mut hooks = Vec::new();
     if integrations.doppler.enabled {
         hooks.push(Hook::Doppler(DopplerHook));
     }
+    hooks.extend(integrations.checkout_hooks.iter().cloned().map(Hook::Command));
     hooks
 }
 
@@ -58,5 +60,22 @@ mod tests {
         let mut lines = Vec::new();
         report(outcomes, |l| lines.push(l.to_string()));
         assert_eq!(lines, ["Linked 2 Doppler scope(s)", "Hook failed: could not run mise"]);
+    }
+
+    #[test]
+    fn command_hooks_follow_the_built_in_ones() {
+        let mut integrations = crate::config::IntegrationsConfig::default();
+        integrations.checkout_hooks = vec![alacritree_checkout_hooks::CommandHook {
+            name: "mise".into(),
+            program: alacritree_common::side::Program {
+                native: "mise".into(),
+                wsl: None,
+                name: "mise".into(),
+            },
+            on_created: vec!["trust".into()],
+            on_opened: Vec::new(),
+            on_removed: Vec::new(),
+        }];
+        assert!(matches!(from_config(&integrations)[..], [Hook::Doppler(_), Hook::Command(_)]));
     }
 }

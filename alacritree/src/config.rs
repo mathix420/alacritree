@@ -602,6 +602,7 @@ pub struct IntegrationsConfig {
     pub git: ToolConfig,
     pub gh: GhConfig,
     pub doppler: alacritree_doppler::DopplerConfig,
+    pub checkout_hooks: Vec<alacritree_checkout_hooks::CommandHook>,
     pub herdr: HerdrConfig,
     pub zellij: ZellijConfig,
     pub delta: ToolConfig,
@@ -3129,6 +3130,8 @@ struct RawIntegrations {
     gh: RawGh,
     /// The Doppler CLI behind scope mirroring for new worktrees.
     doppler: alacritree_doppler::RawDoppler,
+    /// Programs to run when a worktree is created, first opened, or removed.
+    checkout_hooks: alacritree_checkout_hooks::RawCheckoutHooks,
     /// Agents running under a herdr server.
     herdr: RawHerdr,
     /// Panes of running zellij sessions.
@@ -3343,6 +3346,7 @@ impl RawIntegrations {
             git: tool_config(self.git.path, self.git.wsl_path, Tool::Git),
             gh: self.gh.resolve(&moved),
             doppler: self.doppler.resolve(),
+            checkout_hooks: self.checkout_hooks.resolve(),
             herdr: self.herdr.resolve(moved.herdr_icon),
             zellij: self.zellij.resolve(),
             delta: delta_config(self.delta.path, self.delta.wsl_path, moved.delta_path),
@@ -5269,6 +5273,21 @@ wsl_path =              '/usr/bin/task'
     #[test]
     fn font_fallback_defaults_empty() {
         assert!(parse("").font.fallback.is_empty());
+    }
+
+    /// alacritty.toml is shared with alacritty and loaded first; a hook it
+    /// defines must be switchable off from alacritree.toml.
+    #[test]
+    fn a_command_hook_can_be_disabled_by_the_later_file() {
+        let base: toml::Value = toml::from_str(
+            "[integrations.checkout_hooks.command.mise]\npath = \"mise\"\non_created = [\"trust\"]",
+        )
+        .unwrap();
+        let over: toml::Value =
+            toml::from_str("[integrations.checkout_hooks.command.mise]\nenabled = false").unwrap();
+        let merged = merge(base, over);
+        let raw: RawConfig = merged.try_into().unwrap();
+        assert!(raw.into_config().integrations.checkout_hooks.is_empty());
     }
 
     #[test]

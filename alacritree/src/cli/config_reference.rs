@@ -51,6 +51,11 @@ impl<'a> Reference<'a> {
                 nested.push((path, child, false));
             } else if child.get("type") == Some(&"array".into()) && self.is_table(&child["items"]) {
                 nested.push((path, child, true));
+            } else if let Some(entry) = self.map_entry(child) {
+                // A table of named tables: document the key, then one
+                // `<name>` table for the shape every entry takes.
+                self.key(key, &path, child);
+                nested.push((format!("{path}.<name>"), entry, false));
             } else {
                 self.key(key, &path, child);
             }
@@ -95,6 +100,13 @@ impl<'a> Reference<'a> {
         let form =
             self.defs[name]["anyOf"].as_array()?.iter().find(|b| b.get("properties").is_some())?;
         Some((name, form))
+    }
+
+    /// The entry schema of a map whose values are tables, such as named
+    /// command hooks.
+    fn map_entry(&self, prop: &'a Value) -> Option<&'a Value> {
+        let entry = self.resolve(prop).get("additionalProperties")?;
+        self.is_table(entry).then_some(entry)
     }
 
     fn is_table(&self, prop: &'a Value) -> bool {
@@ -142,4 +154,16 @@ fn def_name(prop: &Value) -> Option<&str> {
         _ => &prop["$ref"],
     };
     reference.as_str()?.strip_prefix("#/$defs/")
+}
+
+#[cfg(test)]
+mod tests {
+    /// Named tables are a map in the schema; their fields must still reach
+    /// the reference, or command hooks are undocumented.
+    #[test]
+    fn a_map_of_tables_documents_its_entry_fields() {
+        let doc = super::document();
+        assert!(doc.contains("`[integrations.checkout_hooks.command.<name>]`"), "{doc}");
+        assert!(doc.contains("- `on_created` (array of string"), "{doc}");
+    }
 }

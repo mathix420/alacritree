@@ -15,3 +15,9 @@ alacritree_common.workspace = true
 ambassador.workspace = true
 thiserror.workspace = true
 log = "0.4"
+schemars = "1.2"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
+toml = { workspace = true }

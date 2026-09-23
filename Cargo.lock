@@ -120,7 +120,11 @@ dependencies = [
  "alacritree_common",
  "ambassador",
  "log",
+ "schemars",
+ "serde",
+ "tempfile",
  "thiserror 2.0.17",
+ "toml",
 ]
 
 [[package]]

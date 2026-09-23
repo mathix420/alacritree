@@ -232,6 +232,19 @@
       },
       "type": "object"
     },
+    "RawCheckoutHooks": {
+      "description": "`[integrations.checkout_hooks]`.",
+      "properties": {
+        "command": {
+          "additionalProperties": {
+            "$ref": "#/$defs/RawCommandHook"
+          },
+          "description": "Programs to run when a worktree is created, first opened, or removed,\nkeyed by a name of your choice. A table rather than a list, so a hook\ndefined in alacritty.toml can be changed or disabled by name from\nalacritree.toml.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
     "RawColors": {
       "properties": {
         "bright": {
@@ -276,6 +289,53 @@
           "description": "Colors a selection is drawn with."
         }
       },
+      "type": "object"
+    },
+    "RawCommandHook": {
+      "description": "One hook: the program to run, and its arguments for each worktree event.",
+      "properties": {
+        "enabled": {
+          "default": true,
+          "description": "Run this hook.",
+          "type": "boolean"
+        },
+        "on_created": {
+          "default": [],
+          "description": "Arguments when alacritree creates a worktree. `{checkout}` is the new\nworktree and `{main}` the project's main checkout. Empty skips it.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "on_opened": {
+          "default": [],
+          "description": "Arguments the first time this process opens a shell in a worktree,\nincluding ones created outside alacritree. Runs again after a restart,\nso the command must be safe to repeat. Empty skips it.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "on_removed": {
+          "default": [],
+          "description": "Arguments after a worktree is removed. Runs in the main checkout,\nsince the worktree is gone. Empty skips it.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "path": {
+          "description": "The program to run on Windows or natively. A bare name is looked up\non PATH.",
+          "type": "string"
+        },
+        "wsl_path": {
+          "default": "",
+          "description": "The program to run inside a WSL distro for a worktree there, as\nwritten. Empty looks up the file name of `path`, without directory or\nextension, through the distro's login shell, and a distro where that\nfinds nothing skips the hook.  A Windows `path` is never run there.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
       "type": "object"
     },
     "RawCursor": {
@@ -1021,6 +1081,10 @@
     },
     "RawIntegrations": {
       "properties": {
+        "checkout_hooks": {
+          "$ref": "#/$defs/RawCheckoutHooks",
+          "description": "Programs to run when a worktree is created, first opened, or removed."
+        },
         "delta": {
           "$ref": "#/$defs/RawDelta",
           "description": "The pager the delta diff viewer runs."

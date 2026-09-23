@@ -13,8 +13,11 @@ use std::process::ExitStatus;
 
 use alacritree_common::jobs::Blocking;
 
+pub mod command;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
+
+pub use command::{CommandHook, RawCheckoutHooks, RawCommandHook};
 
 /// A worktree event: `checkout` is the linked worktree, `main` the project's
 /// main checkout it belongs to.
