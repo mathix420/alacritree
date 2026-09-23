@@ -219,6 +219,7 @@ mod tests {
     use super::*;
     use crate::jobs;
     use std::path::PathBuf;
+    #[cfg(unix)]
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
