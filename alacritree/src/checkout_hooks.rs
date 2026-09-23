@@ -67,6 +67,43 @@ mod tests {
         ]);
     }
 
+    fn exiting_with(name: &str, code: u8) -> Hook {
+        let (program, args) = if cfg!(windows) {
+            ("cmd", vec!["/C".to_string(), format!("exit {code}")])
+        } else {
+            ("sh", vec!["-c".to_string(), format!("exit {code}")])
+        };
+        Hook::Command(alacritree_checkout_hooks::CommandHook {
+            name: name.into(),
+            program: alacritree_common::side::Program {
+                native: program.into(),
+                wsl: None,
+                name: program.into(),
+            },
+            on_created: args,
+            on_opened: Vec::new(),
+            on_removed: Vec::new(),
+        })
+    }
+
+    /// The app's enum reaches each backend through ambassador's cross-crate
+    /// delegation, in list order, and a failing hook does not stop the next.
+    #[test]
+    fn hooks_run_in_order_past_a_failure() {
+        use alacritree_checkout_hooks::{Checkout, CheckoutHooks, HookError};
+
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = [exiting_with("broken", 3), exiting_with("after", 0)];
+        let event = Checkout { main: dir.path(), checkout: dir.path() };
+        let outcomes = crate::jobs::on_this_thread(|b| hooks[..].created(&event, b));
+        assert!(
+            matches!(&outcomes[0], Err(HookError::Failed { hook, .. }) if hook == "broken"),
+            "{:?}",
+            outcomes[0]
+        );
+        assert_eq!(outcomes[1].as_ref().unwrap(), &Some("Ran after".to_string()));
+    }
+
     #[test]
     fn command_hooks_follow_the_built_in_ones() {
         let integrations = crate::config::IntegrationsConfig {
