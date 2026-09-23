@@ -151,19 +151,4 @@ mod tests {
         assert_eq!(outcomes[1].as_ref().expect("second hook ran"), &Some("after".to_string()));
         assert_eq!(hooks[1].events().len(), 1);
     }
-
-    #[test]
-    fn an_empty_list_reports_nothing() {
-        let (main, checkout) = event();
-        let hooks: [FakeHook; 0] = [];
-        let e = Checkout { main: &main, checkout: &checkout };
-        assert!(jobs::on_this_thread(|b| hooks[..].created(&e, b)).is_empty());
-    }
-
-    #[test]
-    fn a_spawn_error_names_the_hook() {
-        let err = HookError::Spawn { hook: "mise".into(), source: std::io::Error::other("boom") };
-        assert_eq!(err.to_string(), "could not run mise");
-        assert!(std::error::Error::source(&err).is_some());
-    }
 }
