@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use alacritree_checkout_hooks::{Checkout, CheckoutHooks};
+use alacritree_checkout_hooks::{Checkout, CheckoutHook, CheckoutHooks};
 use eframe::CreationContext;
 use egui::{Color32, Context, Frame, Margin, RichText, ScrollArea, SidePanel, Stroke};
 
@@ -1139,6 +1139,14 @@ impl AlacritreeApp {
     /// alacritree makes; this covers ones created outside it, which would
     /// otherwise lack, for example, their Doppler scopes.
     fn sync_checkout_hooks(&mut self, worktree: PathBuf) {
+        self.open_checkout_hooks(worktree, crate::checkout_hooks::from_config);
+    }
+
+    fn open_checkout_hooks<H: CheckoutHook + Send + 'static>(
+        &mut self,
+        worktree: PathBuf,
+        hooks: impl FnOnce(&crate::config::IntegrationsConfig) -> Vec<H>,
+    ) {
         if !self.hooks_opened.insert(worktree.clone()) {
             return;
         }
@@ -1152,7 +1160,7 @@ impl AlacritreeApp {
         let Some(main_checkout) = main_checkout else {
             return;
         };
-        let hooks = crate::checkout_hooks::from_config(&self.config.integrations);
+        let hooks = hooks(&self.config.integrations);
         self.detached_jobs.push(jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
             let event = Checkout { main: &main_checkout, checkout: &worktree };
             crate::checkout_hooks::report(hooks.opened(&event, blocking), |level, line| {
@@ -4184,13 +4192,34 @@ mod tests {
 
     #[test]
     fn checkout_hooks_open_once_per_worktree_per_process() {
+        use alacritree_checkout_hooks::fake::{Event, FakeHook};
+
         let mut app = test_app();
-        let wt = PathBuf::from("/not/a/project/worktree");
-        app.sync_checkout_hooks(wt.clone());
-        app.sync_checkout_hooks(wt.clone());
-        assert!(app.hooks_opened.contains(&wt));
-        assert_eq!(app.hooks_opened.len(), 1);
-        assert!(app.detached_jobs.is_empty(), "no project owns it, so nothing runs");
+        app.projects.push(project_with("/repo", &["/repo/wt"]));
+        let hook = FakeHook::silent();
+        let wt = PathBuf::from("/repo/wt");
+        let jobs_before = app.detached_jobs.len();
+        app.open_checkout_hooks(wt.clone(), |_| vec![hook.clone()]);
+        app.open_checkout_hooks(wt.clone(), |_| vec![hook.clone()]);
+        assert_eq!(app.detached_jobs.len(), jobs_before + 1, "the second open ran the hooks again");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while hook.events().is_empty() {
+            assert!(Instant::now() < deadline, "the hook job never ran");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(hook.events(), [Event::Opened { main: "/repo".into(), checkout: wt }]);
+    }
+
+    #[test]
+    fn checkout_hooks_skip_a_directory_no_project_owns() {
+        use alacritree_checkout_hooks::fake::FakeHook;
+
+        let mut app = test_app();
+        let hook = FakeHook::silent();
+        app.open_checkout_hooks(PathBuf::from("/not/a/project/worktree"), |_| vec![hook.clone()]);
+        assert!(app.detached_jobs.is_empty());
+        assert!(hook.events().is_empty());
     }
 
     /// An app with one plain shell session, for tests that need nothing
