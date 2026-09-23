@@ -268,12 +268,11 @@ fn wsl_checks(distros: &[wsl::WslDistro]) -> Vec<Check> {
     let probes = probe_distros(distros);
     let mut checks = vec![check("wsl", "distros", Status::Ok, names.join(", "))];
     checks.extend(probes.iter().map(|(name, probe)| wsl_distro_check(name, probe)));
-    checks.extend(wsl_doppler_check(&probes));
     checks
 }
 
-/// Probes every registry tool. doppler is among them even though nothing runs
-/// it inside a distro, because [`wsl_doppler_check`] is the only place that says so.
+/// Probes every registry tool, since each is one alacritree runs for a project
+/// inside the distro.
 fn probe_distros(distros: &[wsl::WslDistro]) -> Vec<(String, Probe)> {
     let (tx, rx) = std::sync::mpsc::channel();
     let names = tools::Tool::table(tools::Tool::name);
@@ -337,29 +336,6 @@ fn wsl_distro_check(name: &str, probe: &Probe) -> Check {
     let status =
         if tool_path(found, tools::Tool::Git).is_some() { Status::Ok } else { Status::Warn };
     check("wsl", name, status, detail)
-}
-
-/// Scope mirroring runs the Windows `doppler` against Windows paths, so a
-/// distro's own doppler is never consulted and a WSL project's worktrees come
-/// out unscoped however well doppler is set up inside the distro.  Someone
-/// who installed it there did so expecting otherwise.
-fn wsl_doppler_check(probes: &[(String, Probe)]) -> Option<Check> {
-    let distros: Vec<&str> = probes
-        .iter()
-        .filter(|(_, probe)| {
-            probe.as_ref().is_ok_and(|found| tool_path(found, tools::Tool::Doppler).is_some())
-        })
-        .map(|(name, _)| name.as_str())
-        .collect();
-    if distros.is_empty() {
-        return None;
-    }
-    let detail = format!(
-        "installed in {} — scope mirroring only runs the Windows doppler, so worktrees of a \
-         project inside a distro are not scoped",
-        distros.join(", ")
-    );
-    Some(check("wsl", "doppler", Status::Warn, detail))
 }
 
 /// Where a probe put `tool`, by tool rather than by index, so
@@ -888,29 +864,6 @@ mod tests {
         let check = wsl_distro_check("Ubuntu", &probe);
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("no answer in 15s"), "{:?}", check.detail);
-    }
-
-    /// Doppler inside a distro is set up by someone who expects worktrees
-    /// there to inherit its scopes.  They do not, and the app never says so.
-    #[test]
-    fn doppler_inside_a_distro_is_reported_as_unused() {
-        let probes = vec![
-            (
-                "Ubuntu".to_string(),
-                probe(&[None, None, None, Some("/usr/bin/doppler"), None, None]),
-            ),
-            ("kali-linux".to_string(), probe(&[None; tools::Tool::COUNT])),
-        ];
-        let check = wsl_doppler_check(&probes).expect("a warning about the unused doppler");
-        assert_eq!(check.status, Status::Warn);
-        assert!(check.detail.contains("Ubuntu"), "{:?}", check.detail);
-        assert!(!check.detail.contains("kali-linux"), "{:?}", check.detail);
-    }
-
-    #[test]
-    fn no_distro_has_doppler_and_nothing_is_said() {
-        let probes = vec![("Ubuntu".to_string(), probe(&[None; tools::Tool::COUNT]))];
-        assert!(wsl_doppler_check(&probes).is_none());
     }
 
     /// A missing optional tool has to say what it costs, or the reader has no

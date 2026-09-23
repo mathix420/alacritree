@@ -10,13 +10,18 @@
 //! out of the box.  We go through the doppler CLI instead of editing its
 //! config file so we never fight its on-disk format.  Everything is
 //! best-effort: no doppler binary, or nothing to copy, is a silent no-op.
+//!
+//! A worktree inside WSL is scoped by the distro's own doppler, under its
+//! Linux path: the Windows doppler keeps a separate config file that the
+//! distro's `doppler run` never reads.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
+use alacritree_common::jobs;
+use alacritree_common::side::{self, Program, Ran, Side};
 use alacritree_common::tools::{self, Tool};
-use alacritree_common::{command_ext, jobs};
+use alacritree_common::wsl::{self, Location};
 
 /// `enclave.*` is doppler's on-disk spelling of the `project`/`config`
 /// options (a leftover from when the product was called Enclave).
@@ -36,14 +41,22 @@ pub(crate) fn mirror_scopes(
     worktree: &Path,
     blocking: &jobs::Blocking,
 ) -> usize {
-    let Some(scopes) = all_scopes(blocking) else {
+    let main_at = locate(main_checkout);
+    let wt_at = locate(worktree);
+    let side = side_for(&wt_at);
+    // A main checkout and a worktree on different sides share no doppler
+    // config, so there is nothing to copy between them.
+    if side_for(&main_at) != side {
         return 0;
-    };
-    let main = canonical(main_checkout);
-    let worktree = canonical(worktree);
+    }
+    let main = scope_path(&main_at);
+    let worktree = scope_path(&wt_at);
     if main == worktree {
         return 0;
     }
+    let Some(scopes) = all_scopes(&side, blocking) else {
+        return 0;
+    };
 
     let mut written = 0;
     for (scope, options) in &scopes {
@@ -67,7 +80,7 @@ pub(crate) fn mirror_scopes(
         if let Some(pair) = &config_pair {
             args.push(pair);
         }
-        match run(&args, Some(&target), blocking) {
+        match run(&side, &args, Some(&target), blocking) {
             Some(_) => written += 1,
             None => log::warn!("doppler: failed to set scope for {}", target.display()),
         }
@@ -82,10 +95,12 @@ pub(crate) fn mirror_scopes(
 /// `&jobs::Blocking` because it shells out — call it from a pool job, never
 /// from the UI thread.
 pub(crate) fn forget_scopes(worktree: &Path, blocking: &jobs::Blocking) -> usize {
-    let Some(scopes) = all_scopes(blocking) else {
+    let wt_at = locate(worktree);
+    let side = side_for(&wt_at);
+    let worktree = scope_path(&wt_at);
+    let Some(scopes) = all_scopes(&side, blocking) else {
         return 0;
     };
-    let worktree = canonical(worktree);
 
     let mut cleaned = 0;
     for (scope, options) in &scopes {
@@ -95,7 +110,8 @@ pub(crate) fn forget_scopes(worktree: &Path, blocking: &jobs::Blocking) -> usize
         if !options.contains_key(PROJECT_KEY) && !options.contains_key(CONFIG_KEY) {
             continue;
         }
-        match run(&["configure", "unset", "project", "config"], Some(Path::new(scope)), blocking) {
+        let unset = ["configure", "unset", "project", "config"];
+        match run(&side, &unset, Some(Path::new(scope)), blocking) {
             Some(_) => cleaned += 1,
             None => log::warn!("doppler: failed to unset scope {scope}"),
         }
@@ -110,36 +126,64 @@ fn rebase_scope(scope: &str, main: &Path, worktree: &Path) -> Option<PathBuf> {
     if rel.as_os_str().is_empty() { Some(worktree.to_path_buf()) } else { Some(worktree.join(rel)) }
 }
 
-/// Every scope in doppler's config file, keyed by absolute directory path.
-fn all_scopes(blocking: &jobs::Blocking) -> Option<Scopes> {
-    let stdout = run(&["configure", "--all", "--json"], None, blocking)?;
+/// Where doppler runs for a checkout at `location`.
+fn side_for(location: &Location) -> Side {
+    Side::from_location(location)
+}
+
+/// The path doppler keys a scope by on the checkout's own side.
+fn scope_path(location: &Location) -> PathBuf {
+    PathBuf::from(side::spelling(location))
+}
+
+/// A checkout's location, canonicalized first so a symlinked or relative
+/// path names the same scope as the one `doppler setup` wrote.
+fn locate(path: &Path) -> Location {
+    wsl::classify(&std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+}
+
+/// Doppler as configured, plus where the resident helper already found it
+/// inside the checkout's distro.
+fn doppler_on(side: &Side, blocking: &jobs::Blocking) -> Program {
+    let wsl = match side {
+        Side::Native => None,
+        Side::Wsl { distro } => tools::wsl_located(Tool::Doppler, distro, blocking),
+    };
+    Program { native: tools::program(Tool::Doppler), wsl, name: Tool::Doppler.name().into() }
+}
+
+/// Every scope in doppler's config file on `side`, keyed by absolute
+/// directory path.
+fn all_scopes(side: &Side, blocking: &jobs::Blocking) -> Option<Scopes> {
+    let stdout = run(side, &["configure", "--all", "--json"], None, blocking)?;
     serde_json::from_slice(&stdout).ok()
 }
 
-/// Run doppler with `args`, returning stdout on success and `None` on any
-/// failure — including the binary not being installed, which is the common
-/// case and must stay quiet.
-#[allow(clippy::disallowed_methods)] // Running the doppler CLI is this function's job.
-fn run(args: &[&str], scope: Option<&Path>, _blocking: &jobs::Blocking) -> Option<Vec<u8>> {
-    let mut cmd = command_ext::hidden(tools::program(Tool::Doppler));
-    cmd.args(args)
-        .arg("--no-check-version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+/// Run doppler on `side` with `args`, returning stdout on success and `None`
+/// on any failure — including the binary not being installed there, which is
+/// the common case and must stay quiet.
+fn run(
+    side: &Side,
+    args: &[&str],
+    scope: Option<&Path>,
+    blocking: &jobs::Blocking,
+) -> Option<Vec<u8>> {
+    let mut argv: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    argv.push("--no-check-version".into());
     if let Some(scope) = scope {
-        cmd.arg("--scope").arg(scope);
+        argv.push("--scope".into());
+        argv.push(scope.to_string_lossy().into_owned());
     }
-    let output = cmd.output().ok()?;
-    output.status.success().then_some(output.stdout)
-}
-
-fn canonical(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    match side::run(side, &doppler_on(side, blocking), None, &argv, blocking) {
+        Ok(Ran::Finished(output)) if output.status.success() => Some(output.stdout),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use alacritree_common::wsl::Location;
+
     use super::*;
 
     #[test]
@@ -159,5 +203,34 @@ mod tests {
         assert_eq!(rebase_scope("/elsewhere", Path::new("/repo"), Path::new("/wt")), None);
         // Sibling with a shared string prefix must not match.
         assert_eq!(rebase_scope("/repo-other", Path::new("/repo"), Path::new("/wt")), None);
+    }
+
+    fn in_distro(linux: &str) -> Location {
+        Location::Wsl { distro: "Ubuntu".into(), linux_path: linux.into() }
+    }
+
+    #[test]
+    fn a_wsl_checkout_is_scoped_by_its_linux_path() {
+        assert_eq!(scope_path(&in_distro("/home/u/wt")), PathBuf::from("/home/u/wt"));
+        assert_eq!(
+            scope_path(&Location::Windows(PathBuf::from("/srv/wt"))),
+            PathBuf::from("/srv/wt")
+        );
+    }
+
+    #[test]
+    fn a_wsl_checkout_runs_the_distros_doppler() {
+        assert_eq!(side_for(&in_distro("/home/u/wt")), Side::Wsl { distro: "Ubuntu".into() });
+        assert_eq!(side_for(&Location::Windows(PathBuf::from("C:/wt"))), Side::Native);
+    }
+
+    #[test]
+    fn scopes_rebase_between_linux_paths() {
+        let target = rebase_scope(
+            "/home/u/repo/apps/web",
+            &scope_path(&in_distro("/home/u/repo")),
+            &scope_path(&in_distro("/home/u/wt")),
+        );
+        assert_eq!(target, Some(PathBuf::from("/home/u/wt/apps/web")));
     }
 }
