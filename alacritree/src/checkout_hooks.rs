@@ -17,10 +17,7 @@ pub(crate) enum Hook {
 /// Built-in hooks first, in a fixed order, then the user's in name order, so
 /// the progress steps read the same on every create.
 pub(crate) fn from_config(integrations: &IntegrationsConfig) -> Vec<Hook> {
-    let mut hooks = Vec::new();
-    if integrations.doppler.enabled {
-        hooks.push(Hook::Doppler(DopplerHook));
-    }
+    let mut hooks: Vec<Hook> = integrations.doppler.hook().map(Hook::Doppler).into_iter().collect();
     hooks.extend(integrations.checkout_hooks.iter().cloned().map(Hook::Command));
     hooks
 }
@@ -44,25 +41,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn doppler_joins_the_list_only_when_enabled() {
-        let mut integrations = crate::config::IntegrationsConfig::default();
-        assert!(matches!(from_config(&integrations)[..], [Hook::Doppler(_)]));
-        integrations.doppler.enabled = false;
-        assert!(from_config(&integrations).is_empty());
-    }
-
-    #[test]
     fn report_forwards_lines_and_names_failures() {
         use alacritree_checkout_hooks::HookError;
         let outcomes = vec![
-            Ok(Some("Linked 2 Doppler scope(s)".to_string())),
+            Ok(Some("Ran direnv".to_string())),
             Ok(None),
             Err(HookError::Spawn { hook: "mise".into(), source: std::io::Error::other("x") }),
         ];
         let mut lines = Vec::new();
         report(outcomes, |level, l| lines.push((level, l.to_string())));
         assert_eq!(lines, [
-            (log::Level::Info, "Linked 2 Doppler scope(s)".to_string()),
+            (log::Level::Info, "Ran direnv".to_string()),
             (log::Level::Warn, "Hook failed: could not run mise".to_string()),
         ]);
     }

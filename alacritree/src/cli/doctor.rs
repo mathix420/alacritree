@@ -144,7 +144,7 @@ fn tools() -> Vec<Tool> {
         Tool {
             program: "doppler",
             consequence: "new worktrees do not inherit the main checkout's scopes",
-            need: doppler_need(doppler_configured()),
+            need: doppler_need(alacritree_doppler::is_set_up()),
         },
     ];
     if cfg!(target_os = "linux") {
@@ -206,19 +206,13 @@ fn tool_check(tool: &Tool, found: Option<Found>) -> Check {
     }
 }
 
-/// Doppler scope mirroring only matters to someone who uses Doppler, and the
-/// only evidence of that is its config file — the CLI writes one on first
-/// `doppler setup`, and `alacritree_doppler` reads scopes straight out of it.
+/// Doppler scope mirroring only matters to someone who has set Doppler up.
 fn doppler_need(configured: bool) -> Need {
     if configured { Need::Optional } else { Need::Unused }
 }
 
-fn doppler_configured() -> bool {
-    home::home_dir().is_some_and(|home| home.join(".doppler").join(".doppler.yaml").is_file())
-}
-
-/// `gh` present but logged out fails exactly the way a missing `gh` does —
-/// silently — so it needs saying separately.
+/// `gh` present but logged out fails exactly the way a missing `gh` does,
+/// silently, so it needs saying separately.
 // The report's job is to run the tools it reports on, from a CLI with no
 // window to stall.
 #[allow(clippy::disallowed_methods)]
@@ -795,9 +789,8 @@ mod tests {
         assert_eq!(tool_check(&DOPPLER, None).status, Status::Ok);
     }
 
-    /// The evidence is Doppler's own config file: it is written on `doppler
-    /// setup`, and it is where `alacritree_doppler` reads scopes from. Someone who has
-    /// set Doppler up and then lost the binary does want to hear about it.
+    /// Someone who has set Doppler up and then lost the binary does want to
+    /// hear about it.
     #[test]
     fn doppler_is_only_worth_warning_about_once_it_has_been_set_up() {
         assert_eq!(doppler_need(true), Need::Optional);

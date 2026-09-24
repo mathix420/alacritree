@@ -8,7 +8,7 @@ mod settings;
 use alacritree_checkout_hooks::{Checkout, CheckoutHook, Outcome};
 use alacritree_common::jobs::Blocking;
 
-pub use settings::{DopplerConfig, RawDoppler};
+pub use settings::{DopplerConfig, RawDoppler, is_set_up};
 
 /// Best-effort throughout: no doppler binary, or nothing to copy, reports
 /// nothing rather than an error, as the create flow always has.

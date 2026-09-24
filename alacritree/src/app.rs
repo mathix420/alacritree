@@ -1010,7 +1010,7 @@ impl AlacritreeApp {
     }
 
     /// The one path every shell reaches, which is why the checkout guard and
-    /// the Doppler sync live here rather than in `spawn_session`: a named
+    /// the checkout hooks live here rather than in `spawn_session`: a named
     /// profile arrives with its shell already chosen and would otherwise open
     /// in a checkout Ctrl+T refuses.
     fn spawn_session_with_shell(
@@ -1031,13 +1031,9 @@ impl AlacritreeApp {
                     format!("worktree is no longer checked out: {}", dir.display()),
                 ));
             }
-            // Called synchronously, so the once-per-worktree guard is set
-            // before a second rapid spawn for the same worktree can see it
-            // unset. The hooks themselves run off-thread, so a shell in a
-            // worktree git already knows about can still start before they
-            // land, racing a hooked tool such as `doppler run` against the write.
-            // That costs one retryable "You must specify a project" failure,
-            // not lost work.
+            // Synchronous, so a second rapid spawn sees the once-per-worktree
+            // guard set. The hooks run off-thread, so the first shell may
+            // start before they land.
             self.sync_checkout_hooks(dir.clone());
         }
         let (size, cell_size) = self.next_spawn_geometry();
@@ -1136,8 +1132,7 @@ impl AlacritreeApp {
 
     /// Run every checkout hook's `on_opened` the first time this process
     /// opens a shell in a linked worktree. The create path covers worktrees
-    /// alacritree makes; this covers ones created outside it, which would
-    /// otherwise lack, for example, their Doppler scopes.
+    /// alacritree makes, and this covers ones created outside it.
     fn sync_checkout_hooks(&mut self, worktree: PathBuf) {
         self.open_checkout_hooks(worktree, crate::checkout_hooks::from_config);
     }

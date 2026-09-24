@@ -36,6 +36,18 @@ impl RawDoppler {
     }
 }
 
+impl DopplerConfig {
+    pub fn hook(&self) -> Option<crate::DopplerHook> {
+        self.enabled.then_some(crate::DopplerHook)
+    }
+}
+
+/// Whether this user has run `doppler setup`. The CLI writes its config file
+/// then, and that file holds the scopes the hook mirrors.
+pub fn is_set_up() -> bool {
+    home::home_dir().is_some_and(|home| home.join(".doppler").join(".doppler.yaml").is_file())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,6 +64,6 @@ mod tests {
     #[test]
     fn a_table_can_turn_doppler_off() {
         let raw: RawDoppler = toml::from_str("enabled = false").unwrap();
-        assert!(!raw.resolve().enabled);
+        assert!(raw.resolve().hook().is_none());
     }
 }

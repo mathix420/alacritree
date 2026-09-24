@@ -1033,8 +1033,9 @@ mod tests {
         );
     }
 
-    /// Doppler keys scopes by canonical path, and a removed directory can no
-    /// longer be canonicalized, so the hook must get the path resolved first.
+    /// A hook may key its state by canonical path, and a removed directory
+    /// can no longer be canonicalized, so the hook must get the path resolved
+    /// first.
     #[cfg(unix)]
     #[test]
     fn removal_hands_hooks_the_path_resolved_before_git_deleted_it() {

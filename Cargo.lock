@@ -146,6 +146,7 @@ version = "0.0.0"
 dependencies = [
  "alacritree_checkout_hooks",
  "alacritree_common",
+ "home",
  "log",
  "schemars",
  "serde",
