@@ -6,8 +6,8 @@
 use std::ffi::OsStr;
 use std::process::Command;
 
-/// The flag that suppresses the console window.  Public because creation flags
-/// are one field: a caller that names another flag has to pass this one too
+/// The flag that suppresses the console window. Public because creation flags
+/// are one field, so a caller that names another flag has to pass this one too
 /// rather than calling [`CommandExt::hide_console`].
 #[cfg(windows)]
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;

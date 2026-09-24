@@ -1,7 +1,7 @@
 //! WSL awareness: distro enumeration, Windows ↔ Linux path translation, and
-//! `wsl.exe` command construction.  The only module that knows WSL exists —
-//! everything else dispatches on `Location` or hands this module argv to
-//! wrap.  On non-Windows builds (and Windows without WSL) `distros()` is
+//! `wsl.exe` command construction. This is the only module that knows WSL
+//! exists. Everything else dispatches on `Location` or hands this module argv
+//! to wrap. On non-Windows builds, and on Windows without WSL, `distros()` is
 //! empty and `classify` never returns `Wsl`, so all WSL code paths are
 //! dormant without cfg-gating at call sites.
 
@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// Per-project shell override, persisted in state.toml as `"windows"`,
-/// `"wsl:<distro>"`, or `"profile:<name>"`.  Absent means auto-by-location.
+/// `"wsl:<distro>"`, or `"profile:<name>"`. Absent means auto-by-location.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellChoice {
     Windows,
@@ -41,7 +41,7 @@ impl ShellChoice {
     }
 }
 
-/// Where a path physically lives.  `linux_path` is the path as seen from
+/// Where a path physically lives. `linux_path` is the path as seen from
 /// inside the distro, always with forward slashes and a leading `/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Location {
@@ -49,7 +49,7 @@ pub enum Location {
     Wsl { distro: String, linux_path: String },
 }
 
-/// The distro-side directory Windows drives are mounted under.  Set once at
+/// The distro-side directory Windows drives are mounted under. Set once at
 /// startup from `[wsl] automount_root`; `/mnt` is WSL's default.
 static AUTOMOUNT_ROOT: OnceLock<String> = OnceLock::new();
 
@@ -99,7 +99,7 @@ pub fn linux_to_windows(linux: &str, distro: &str) -> PathBuf {
 fn linux_to_windows_with(linux: &str, distro: &str, automount_root: &str) -> PathBuf {
     let root = automount_root.trim_end_matches('/');
     if let Some(rest) = linux.strip_prefix(root) {
-        // The root must end at a segment boundary — "/mnta/…" is not under "/mnt".
+        // The root must end at a segment boundary. "/mnta/…" is not under "/mnt".
         if rest.starts_with('/') {
             let mut segments = rest.split('/').filter(|s| !s.is_empty());
             if let Some(first) = segments.next() {
@@ -133,9 +133,10 @@ pub fn normalize_root(path: PathBuf) -> PathBuf {
 }
 
 /// How a workspace path should read to the user: WSL workspaces in the
-/// distro's own spelling, native paths untouched.  Not `windows_to_linux`,
-/// which also rewrites `C:\…` into `/mnt/c/…` — correct for handing a path to
-/// git inside a distro, wrong for showing a Windows user their own path.
+/// distro's own spelling, native paths untouched. Not `windows_to_linux`,
+/// which also rewrites `C:\…` into `/mnt/c/…`. That is correct for handing a
+/// path to git inside a distro and wrong for showing a Windows user their own
+/// path.
 pub fn display_path(path: &Path) -> String {
     match classify(path) {
         Location::Wsl { linux_path, .. } => linux_path,
@@ -185,7 +186,7 @@ fn is_utility_distro(name: &str) -> bool {
     name.starts_with("docker-desktop") || name.starts_with("rancher-desktop")
 }
 
-/// The answer every caller shares.  A distro registered or unregistered
+/// The answer every caller shares. A distro registered or unregistered
 /// afterwards is picked up only on restart; that's an acceptable trade since
 /// mid-session registration churn is rare, and a stale entry just falls
 /// through the existing spawn-failure/degrade paths.
@@ -198,7 +199,7 @@ impl DistroCache {
         Self(OnceLock::new())
     }
 
-    /// An empty registry read is not cached: before the `wsl.exe` fallback
+    /// An empty registry read is not cached. Before the `wsl.exe` fallback
     /// has answered, it cannot tell a machine with no distros from one whose
     /// registry key is unreadable.
     fn get(&self, registry: impl FnOnce() -> Option<Vec<WslDistro>>) -> Vec<WslDistro> {
@@ -228,10 +229,10 @@ impl DistroCache {
 #[cfg(windows)]
 static DISTROS: DistroCache = DistroCache::new();
 
-/// Registered distros, default first-classed.  Reading the `Lxss` registry key
+/// Registered distros, default first-classed. Reading the `Lxss` registry key
 /// costs microseconds and knows which distro is the default, so it is the only
-/// source this reaches for: the `wsl -l -q` fallback spawns a process, and the
-/// sidebar asks for this list every frame.  Until
+/// source this reaches for. The `wsl -l -q` fallback spawns a process, and the
+/// sidebar asks for this list every frame. Until
 /// [`prime_distros_from_cli`] has filled that fallback in, a machine whose
 /// registry key is unreadable sees an empty list, the same answer it gets
 /// with no distros installed, which leaves WSL features dormant.
@@ -246,8 +247,9 @@ pub fn distros() -> Vec<WslDistro> {
 }
 
 /// Fill the shared list from `wsl.exe` when the registry has no answer.
-/// Submitted once at startup rather than reached from a draw path: `wsl.exe`
-/// costs hundreds of milliseconds warm and seconds while a distro VM boots.
+/// Submitted once at startup rather than reached from a draw path, because
+/// `wsl.exe` costs hundreds of milliseconds warm and seconds while a distro VM
+/// boots.
 #[cfg(windows)]
 pub fn prime_distros_from_cli(blocking: &jobs::Blocking) {
     DISTROS.settle(registry_distros, || cli_distros(blocking));
@@ -293,12 +295,12 @@ fn cli_distros(_blocking: &jobs::Blocking) -> Vec<WslDistro> {
 }
 
 /// The distros whose VM is up right now, or `None` when `wsl.exe` could not
-/// be asked.  Unlike [`distros`], which reads the registry and describes what
+/// be asked. Unlike [`distros`], which reads the registry and describes what
 /// is *installed*, this spawns `wsl.exe`, so it takes a [`jobs::Blocking`] and
-/// the answer is deliberately not cached: a distro starts and stops while
-/// alacritree runs.  A listing that failed and a listing that came back empty
-/// are different answers — one says nothing, the other says nothing is
-/// running — so callers that act on emptiness need them apart.
+/// the answer is deliberately not cached, since a distro starts and stops
+/// while alacritree runs. A listing that failed and a listing that came back
+/// empty are different answers. One says nothing, and the other says nothing
+/// is running, so callers that act on emptiness need them apart.
 #[cfg(windows)]
 #[allow(clippy::disallowed_methods)] // Running wsl.exe is this function's job.
 pub fn running_distros(_blocking: &jobs::Blocking) -> Option<Vec<String>> {
@@ -321,7 +323,7 @@ pub fn running_distros(_: &jobs::Blocking) -> Option<Vec<String>> {
 }
 
 /// Names from a `--running` listing, kept only where they name a registered
-/// distro.  With nothing running, wsl.exe prints a sentence in place of the
+/// distro. With nothing running, wsl.exe prints a sentence in place of the
 /// list, and every line of that output otherwise reads as a distro name.
 #[cfg(any(windows, test))]
 fn running_names(stdout: &[u8], registered: &[WslDistro]) -> Vec<String> {
@@ -332,7 +334,7 @@ fn running_names(stdout: &[u8], registered: &[WslDistro]) -> Vec<String> {
         .collect()
 }
 
-/// `wsl -l -q` lists the default distro first.  Output is UTF-8 when
+/// `wsl -l -q` lists the default distro first. Output is UTF-8 when
 /// WSL_UTF8=1 is honored (WSL 0.64.0+); older versions emit UTF-16LE,
 /// detected by the NUL bytes ASCII names acquire in that encoding.
 #[cfg(any(windows, test))]
@@ -353,11 +355,11 @@ fn parse_distro_list(stdout: &[u8]) -> Vec<WslDistro> {
 }
 
 /// `wsl.exe -d <distro> [--cd <dir>] --exec` with the console window
-/// suppressed and wsl.exe's own messages forced to UTF-8 (they are UTF-16LE
-/// otherwise; the relayed Linux byte stream is unaffected).  Callers append
-/// the argv to run — `--exec` passes it verbatim to the process, skipping
-/// the user's shell and rc files (per-invocation rc sourcing is a known
-/// latency trap).  `--cd` natively accepts Windows, UNC, and Linux paths.
+/// suppressed and wsl.exe's own messages forced to UTF-8. They are UTF-16LE
+/// otherwise, and the relayed Linux byte stream is unaffected. Callers append
+/// the argv to run. `--exec` passes it verbatim to the process and skips the
+/// user's shell and rc files, since per-invocation rc sourcing is a known
+/// latency trap. `--cd` natively accepts Windows, UNC, and Linux paths.
 pub fn command(distro: &str, cd: Option<&Path>) -> Command {
     let mut cmd = command_bare();
     cmd.arg("-d").arg(distro);
@@ -374,9 +376,9 @@ fn command_bare() -> Command {
     cmd
 }
 
-/// Program + args for a session whose shell runs inside `distro`.  No
-/// `--exec`: wsl.exe launches the distro's own default login shell, which
-/// is the contract — we never guess shells.
+/// Program + args for a session whose shell runs inside `distro`. No
+/// `--exec`, so wsl.exe launches the distro's own default login shell. That
+/// is the contract, and we never guess shells.
 pub fn shell_invocation(distro: &str, workdir: &Path) -> (String, Vec<String>) {
     ("wsl.exe".to_string(), vec![
         "-d".to_string(),
@@ -387,9 +389,9 @@ pub fn shell_invocation(distro: &str, workdir: &Path) -> (String, Vec<String>) {
 }
 
 /// Program + args for `-d <distro> --exec <argv...>`, tuple-shaped like
-/// `shell_invocation` rather than a `Command` like `command`: this feeds a
-/// PTY spawn, which has no creation-flags concept of its own, while `command`
-/// feeds a child process spawned through `std::process`, where
+/// `shell_invocation` rather than a `Command` like `command`, because this
+/// feeds a PTY spawn, which has no creation-flags concept of its own, while
+/// `command` feeds a child process spawned through `std::process`, where
 /// `CREATE_NO_WINDOW` and `WSL_UTF8` matter and would not survive a
 /// `(String, Vec<String>)` round trip.
 pub fn exec_invocation(distro: &str, argv: &[&str]) -> (String, Vec<String>) {
@@ -406,46 +408,47 @@ pub fn exec_invocation(distro: &str, argv: &[&str]) -> (String, Vec<String>) {
 pub const SECTION_SEP: &[u8] = b"\n@@ALACRITREE@@\n";
 
 /// The same budget the resident transport gives a request, for the same
-/// reason: a cold WSL VM can take seconds to answer, and nothing healthy
-/// takes longer.  Spent once, as a single deadline, across every wait
-/// `run_batch`'s fallback does — reading stdout, reading stderr, and
-/// reaping the child — rather than reset per wait, or a wedged wsl.exe
-/// could cost up to three times the budget before anything gives up.
+/// reason. A cold WSL VM can take seconds to answer, and nothing healthy
+/// takes longer. Spent once, as a single deadline, across every wait
+/// `run_batch`'s fallback does, which is reading stdout, reading stderr, and
+/// reaping the child. Resetting it per wait would let a wedged wsl.exe cost
+/// up to three times the budget before anything gives up.
 const ONE_SHOT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How often the fallback polls a killed child for its exit, once its
-/// deadline has already passed.  `Child::wait` has no timed variant, so
+/// deadline has already passed. `Child::wait` has no timed variant, so
 /// reaping under a deadline means polling `try_wait` instead.
 const ONE_SHOT_REAP_POLL: Duration = Duration::from_millis(20);
 
-/// Caps how much a drainer thread will buffer.  `child.kill()` only closes
+/// Caps how much a drainer thread will buffer. `child.kill()` only closes
 /// the handles wsl.exe itself owns; if something else inherited the other
 /// end of a pipe (a known wsl.exe failure mode), the drainer reading it
-/// never sees EOF and is abandoned on the timeout path.  The cap is what
+/// never sees EOF and is abandoned on the timeout path. The cap is what
 /// bounds that thread's memory rather than anything about a real batch
 /// script, whose output is orders of magnitude smaller.
 const MAX_ONE_SHOT_OUTPUT: u64 = 64 * 1024 * 1024;
 
-/// Kill and reap the child on every path that gives up on it — timeout, a
-/// failed read, a failed `try_wait` — so none of them leaves an unmanaged
-/// `wsl.exe` running.  Both errors are ignored: whichever way this returns,
-/// the caller is already reporting failure and has no next step for either.
+/// Kill and reap the child on every path that gives up on it, namely a
+/// timeout, a failed read, or a failed `try_wait`, so none of them leaves an
+/// unmanaged `wsl.exe` running. Both errors are ignored. Whichever way this
+/// returns, the caller is already reporting failure and has no next step for
+/// either.
 fn kill_and_reap(child: &mut Child) {
     let _ = child.kill();
-    // Unbounded, but safe here in a way the removed `output()` wait was not:
-    // that one waited on a child still running normally, with no bound on how
-    // long it could take.  This one waits on a child this process just killed
-    // and owns the only handle to, so it can only be slow if the kernel is
-    // slow to reap a process that no longer has anywhere else to go.
+    // Unbounded, but safe here in a way an `output()` wait would not be. That
+    // one waits on a child still running normally, with no bound on how long
+    // it could take. This one waits on a child this process just killed and
+    // owns the only handle to, so it can only be slow if the kernel is slow
+    // to reap a process that no longer has anywhere else to go.
     let _ = child.wait();
 }
 
-/// Reads `pipe` to EOF, capped at `cap` bytes.  A read that lands exactly on
-/// the cap is reported as an error rather than a success: `Read::take`
+/// Reads `pipe` to EOF, capped at `cap` bytes. A read that lands exactly on
+/// the cap is reported as an error rather than a success. `Read::take`
 /// cannot distinguish a batch that filled the cap from one that happened to
 /// stop there, and a batch script's output silently truncated at the cap
-/// reads to a caller (like `git_status`'s porcelain parser) as a complete,
-/// merely wrong, answer — worse than a loud failure.
+/// reads to a caller such as `git_status`'s porcelain parser as a complete
+/// but wrong answer, which is worse than a loud failure.
 fn drain_capped(pipe: impl Read, cap: u64) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     pipe.take(cap).read_to_end(&mut buf)?;
@@ -456,20 +459,20 @@ fn drain_capped(pipe: impl Read, cap: u64) -> std::io::Result<Vec<u8>> {
 }
 
 /// Run `script` through `sh -c` inside `distro`, with `args` bound to
-/// `$1..`.  Rides the resident helper's pipe when it is up; otherwise one
-/// wsl.exe round trip (~400 ms warm on a dev machine, seconds while the VM
-/// cold-boots) — callers batch every query for a repo into a single script
-/// and must never call this on the UI thread.
+/// `$1..`. Rides the resident helper's pipe when it is up, and otherwise
+/// makes one wsl.exe round trip of about 400 ms warm on a dev machine, or
+/// seconds while the VM cold-boots. Callers batch every query for a repo into
+/// a single script and must never call this on the UI thread.
 ///
 /// Deliberately not `Blocking::run_cancellable`, whose own doc says it
-/// leaves its pipes undrained until the child exits — fine for a bounded
-/// probe, wrong for a `git status` on a large repo, which can produce more
-/// output than a pipe buffer holds before this child would ever be asked to
-/// wait.  `_blocking` is unused because of that: the one-shot fallback below
-/// hand-rolls its own drain-and-wait instead, so it never registers in the
-/// cancel slot.  Consequence, not a regression — `.output()` had the same
-/// gap — a workspace switch that drops the `Job` handle leaves this `wsl.exe`
-/// running to its own deadline rather than being killed early.
+/// leaves its pipes undrained until the child exits. That is fine for a
+/// bounded probe and wrong for a `git status` on a large repo, which can
+/// produce more output than a pipe buffer holds before this child would ever
+/// be asked to wait. `_blocking` is unused for that reason. The one-shot
+/// fallback below hand-rolls its own drain-and-wait instead, so it never
+/// registers in the cancel slot. As with `.output()`, a workspace switch
+/// that drops the `Job` handle leaves this `wsl.exe` running to its own
+/// deadline rather than being killed early.
 #[allow(clippy::disallowed_methods)] // Running wsl.exe is this function's job.
 pub fn run_batch(
     distro: &str,
@@ -477,8 +480,8 @@ pub fn run_batch(
     args: &[&str],
     _blocking: &jobs::Blocking,
 ) -> Result<Vec<u8>, String> {
-    // A request the helper may have executed is never re-run as a one-shot
-    // (batch scripts have side effects); only a transport that failed
+    // A request the helper may have executed is never re-run as a one-shot,
+    // because batch scripts have side effects. Only a transport that failed
     // before the write falls through to the spawn below.
     if let Some(result) = crate::wsl_helper::try_run(distro, script, args) {
         return result;
@@ -497,9 +500,9 @@ pub fn run_batch(
     let deadline = Instant::now() + ONE_SHOT_TIMEOUT;
 
     // `output()` waits for exit with no deadline, so a wsl.exe that never
-    // exits pins this thread for the life of the process.  Draining on
+    // exits pins this thread for the life of the process. Draining on
     // workers and bounding the wait here mirrors how the ipc client bounds a
-    // named-pipe request from its own side.  One thread per pipe, because a
+    // named-pipe request from its own side. One thread per pipe, because a
     // child that fills whichever pipe is drained second blocks there while
     // the reader is still emptying the first.
     let (out_tx, out_rx) = std::sync::mpsc::channel();
@@ -529,7 +532,7 @@ pub fn run_batch(
         },
     };
     // The drainer has sent, so its only remaining work is dropping locals and
-    // returning — bounded, unlike joining a drainer that never sent.
+    // returning. That is bounded, unlike joining a drainer that never sent.
     let _ = out_handle.join();
     let stdout_bytes = match stdout_read {
         Ok(bytes) => bytes,
@@ -587,18 +590,18 @@ pub fn run_batch(
 }
 
 /// Resolve each of `programs` inside `distro` as the user's login shell sees
-/// them, in one wsl.exe round trip — call off the UI thread.  Results are
-/// positional: a program that is not on that PATH comes back `None`.
+/// them, in one wsl.exe round trip. Call it off the UI thread. Results are
+/// positional, and a program that is not on that PATH comes back `None`.
 ///
 /// `wsl.exe --exec sh` inherits only the default system PATH, which omits
 /// per-user install dirs like `~/.cargo/bin`; sourcing the login shell
 /// (`getent passwd` → the user's shell, run with `-lc`) picks up the profile
-/// that puts them there.  `|| echo` keeps a missing program's slot occupied,
+/// that puts them there. `|| echo` keeps a missing program's slot occupied,
 /// and is written the way the resident helper's hello line writes it because
 /// that form works in fish as well as in POSIX shells.
 ///
-/// Program names are interpolated into the script, so they must be literals —
-/// nothing a user typed belongs here.
+/// Program names are interpolated into the script, so they must be literals.
+/// Nothing a user typed belongs here.
 #[allow(clippy::disallowed_methods)] // Running wsl.exe is this function's job.
 pub fn probe_tools(
     distro: &str,
@@ -629,7 +632,7 @@ pub fn probe_tools(
 }
 
 /// One line per program asked for, in order; an empty line is a program the
-/// login shell could not find.  A short answer — the shell died partway —
+/// login shell could not find. A short answer, where the shell died partway,
 /// pads with `None` rather than sliding every later result onto the wrong
 /// name.
 fn parse_tool_paths(stdout: &[u8], count: usize) -> Vec<Option<String>> {
@@ -644,7 +647,7 @@ fn parse_tool_paths(stdout: &[u8], count: usize) -> Vec<Option<String>> {
 ///
 /// Positional sections are read by index at every call site, so inserting a
 /// command in the middle silently renames every section after it and still
-/// compiles.  Declaring the name beside the command it runs makes the wrong
+/// compiles. Declaring the name beside the command it runs makes the wrong
 /// name a lookup that fails loudly instead.
 pub struct Batch {
     preamble: String,
@@ -717,7 +720,7 @@ impl<'a> Reply<'a> {
     }
 }
 
-/// Split batched stdout on `SECTION_SEP`.  Always returns at least one
+/// Split batched stdout on `SECTION_SEP`. Always returns at least one
 /// section; a script with N separators yields N+1.
 pub fn split_sections(stdout: &[u8]) -> Vec<&[u8]> {
     let mut sections = Vec::new();
@@ -815,7 +818,7 @@ mod tests {
     }
 
     /// `classify` is documented to accept the verbatim forms, but only the plain
-    /// prefixes were ever exercised.  `display_path` makes that reachable from
+    /// prefixes were ever exercised. `display_path` makes that reachable from
     /// the UI, so pin it.
     #[cfg(windows)]
     #[test]
@@ -843,8 +846,8 @@ mod tests {
         assert_eq!(display_path(Path::new(r"\\wsl.localhost\kali-linux")), "/");
     }
 
-    /// Native paths are the user's own spelling and must survive untouched —
-    /// this is not `windows_to_linux`, which would rewrite `C:\` into `/mnt/c`.
+    /// Native paths are the user's own spelling and must survive untouched.
+    /// This is not `windows_to_linux`, which would rewrite `C:\` into `/mnt/c`.
     #[cfg(windows)]
     #[test]
     fn display_path_leaves_windows_paths_alone() {
@@ -1099,7 +1102,7 @@ mod tests {
     }
 
     /// A truncated answer must not slide the surviving paths onto the names
-    /// that follow them — reporting delta's path as doppler's is worse than
+    /// that follow them. Reporting delta's path as doppler's is worse than
     /// reporting neither.
     #[test]
     fn a_short_probe_answer_pads_rather_than_shifts() {
@@ -1110,7 +1113,7 @@ mod tests {
         ]);
     }
 
-    /// Live round trip against the default distro.  Requires WSL; run
+    /// Live round trip against the default distro. Requires WSL; run
     /// manually: `cargo test -p alacritree wsl:: -- --ignored`
     #[test]
     #[ignore]
@@ -1134,7 +1137,7 @@ mod tests {
         }
     }
 
-    /// A one-shot that never exits must not pin its caller.  Requires WSL;
+    /// A one-shot that never exits must not pin its caller. Requires WSL;
     /// run manually:
     /// `cargo nextest run -p alacritree wsl::tests::a_one_shot --run-ignored all`
     #[test]
@@ -1157,11 +1160,11 @@ mod tests {
 
     /// Draining stdout to EOF before touching stderr blocks the child on a
     /// full stderr pipe while the reader waits on stdout, and neither side
-    /// moves — the trap a single sequential drain would fall into.  Pipe
-    /// buffers are typically 64 KiB, so the script below writes well past
-    /// that to stderr before it can print the stdout marker this test
-    /// checks for; a regression to sequential draining deadlocks here
-    /// rather than merely running slow.  Requires WSL; run manually:
+    /// moves, which is the trap a single sequential drain would fall into.
+    /// Pipe buffers are typically 64 KiB, so the script below writes well
+    /// past that to stderr before it can print the stdout marker this test
+    /// checks for. Sequential draining deadlocks here rather than merely
+    /// running slow. Requires WSL; run manually:
     /// `cargo nextest run -p alacritree wsl::tests::a_batch_that_overflows --run-ignored all`
     #[test]
     #[ignore]

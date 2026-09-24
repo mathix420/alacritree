@@ -723,7 +723,7 @@
       "type": "object"
     },
     "RawGeneral": {
-      "description": "Subset of alacritty's `[general]` section that alacritree honors.  It\nlives in the shared `alacritty.toml`, so disabling alacritty's socket\ndisables ours too — the two sockets are separate files, but the intent\n(\"no IPC\") is the same.",
+      "description": "Subset of alacritty's `[general]` section that alacritree honors. It\nlives in the shared `alacritty.toml`, so disabling alacritty's socket\ndisables ours too. The two sockets are separate files, but the intent\n(\"no IPC\") is the same.",
       "properties": {
         "ipc_socket": {
           "default": true,
@@ -1835,7 +1835,7 @@
         },
         "sidebar_follow_active": {
           "default": false,
-          "description": "Whether the projects sidebar scrolls to the session on screen whenever\nit changes — a cycling key, a click, the palette, an IPC request.\nThe sidebar cursor is left where it was.",
+          "description": "Whether the projects sidebar scrolls to the session on screen whenever\nit changes, whether by a cycling key, a click, the palette, or an IPC\nrequest.\nThe sidebar cursor is left where it was.",
           "type": "boolean"
         },
         "sidebar_foreground": {
@@ -2094,7 +2094,7 @@
       "type": "object"
     },
     "RawWsl": {
-      "description": "Top-level `[wsl]`: platform-integration options.  Lives outside `[ui]`\nbecause nothing here is presentation — it governs how the app talks to\ndistros.",
+      "description": "Top-level `[wsl]`: platform-integration options. Lives outside `[ui]`\nbecause nothing here is presentation. It governs how the app talks to\ndistros.",
       "properties": {
         "automount_root": {
           "description": "Distro-side mount point for Windows drives, mirroring wsl.conf's\n`[automount] root`.  Only used for paths *we* translate (git output\nfrom inside a distro); `wsl.exe --cd` translates with the distro's\nreal mount table regardless of this value.  Unset means `/mnt`; the\nkey stays optional so the deprecated `[ui.wsl]` spelling can still win\nwhen this one is absent.",
@@ -2218,7 +2218,7 @@
     },
     "ui": {
       "$ref": "#/$defs/RawUi",
-      "description": "alacritree's own presentation: sidebar colors, icons, tooltips, shell\nprofiles, and everything else the terminal grid does not own.  Belongs\nin `alacritree.toml` — upstream alacritty warns about it."
+      "description": "alacritree's own presentation: sidebar colors, icons, tooltips, shell\nprofiles, and everything else the terminal grid does not own. Belongs\nin `alacritree.toml`, since upstream alacritty warns about it."
     },
     "window": {
       "$ref": "#/$defs/RawWindow",

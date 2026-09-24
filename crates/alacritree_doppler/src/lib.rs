@@ -1,6 +1,6 @@
-//! Doppler as a checkout hook: a new worktree gets the main checkout's
-//! scopes, a removed one gives them back. See `scopes` for why doppler needs
-//! this at all.
+//! Doppler as a checkout hook. A new worktree gets the main checkout's
+//! scopes, and a removed one gives them back. See `scopes` for why doppler
+//! needs this at all.
 
 mod scopes;
 mod settings;
@@ -10,7 +10,7 @@ use alacritree_common::jobs::Blocking;
 
 pub use settings::{DopplerConfig, RawDoppler, is_set_up};
 
-/// Best-effort throughout: no doppler binary, or nothing to copy, reports
+/// Best-effort throughout. No doppler binary, or nothing to copy, reports
 /// nothing rather than an error, as the create flow always has.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DopplerHook;

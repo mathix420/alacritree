@@ -1,7 +1,7 @@
 //! Resident WSL helper: one long-lived `sh` per distro, spoken to over its
 //! stdio pipe, serving the batch scripts (`RUN`), the foreground-process
 //! probe (`PROBE`), and tool paths (the hello line) without a per-call
-//! `wsl.exe` spawn.  The wire protocol is the seam a future compiled helper
+//! `wsl.exe` spawn. The wire protocol is the seam a future compiled helper
 //! would slot behind; nothing outside this module knows it exists.
 
 use base64::Engine;
@@ -86,9 +86,9 @@ pub struct Frame {
 }
 
 /// Incremental response parser fed arbitrary read chunks; complete frames
-/// come out as they close.  A malformed header is unrecoverable (the byte
-/// count is the only framing, so there is no resync point) and surfaces as
-/// an error for the caller to tear the client down on.
+/// come out as they close. A malformed header is unrecoverable, because the
+/// byte count is the only framing and there is no resync point. It surfaces
+/// as an error for the caller to tear the client down on.
 #[derive(Default)]
 pub struct FrameReader {
     buf: Vec<u8>,
@@ -142,27 +142,27 @@ fn parse_header(line: &[u8]) -> Option<(u64, i32, usize)> {
 use std::path::Path;
 
 /// The distro-side helper, passed verbatim as the single argument of
-/// `wsl.exe --exec sh -c`.  POSIX sh only — dash and busybox ash both run
-/// it.  Shape: capability hello, dead-pidfile GC, a background writer that
+/// `wsl.exe --exec sh -c`. POSIX sh only, so dash and busybox ash both run
+/// it. Shape: capability hello, dead-pidfile GC, a background writer that
 /// owns stdout, then the request dispatcher on stdin, whose `PING` answers
 /// with an unrouted frame so a caller can tell a stalled dispatcher from a
-/// slow one.  Responses all leave through the writer, whose FIFO completion
+/// slow one. Responses all leave through the writer, whose FIFO completion
 /// lines are far under PIPE_BUF, so concurrent jobs never interleave frames.
 /// Commentary lives here, not in the script, so every byte shipped into the
 /// distro earns its keep.
 ///
 /// Empty request fields arrive as `-` (see `encode_field`); decoded args
 /// lose trailing newlines to command substitution, which no current caller
-/// passes.  Stdin EOF ends the dispatcher; the EXIT trap removes the temp
+/// passes. Stdin EOF ends the dispatcher; the EXIT trap removes the temp
 /// dir and `kill 0` takes the writer and any in-flight jobs down with the
-/// process group, so a job can never deadlock on the deleted FIFO.  Relay
-/// death normally arrives as SIGHUP (every `--exec` session gets a
-/// controlling pty the shell owns, and losing it signals the foreground
-/// group), which the HUP trap below routes through the same EXIT trap —
-/// but a dispatcher that is already dead under a still-live relay, or one
-/// killed outright before the signal lands, reaches no trap at all.  A
-/// start sweeps those predecessors' directories the way the pidfile GC
-/// already sweeps stale session pids.
+/// process group, so a job can never deadlock on the deleted FIFO. Relay
+/// death normally arrives as SIGHUP, because every `--exec` session gets a
+/// controlling pty the shell owns and losing it signals the foreground
+/// group. The HUP trap below routes that through the same EXIT trap. A
+/// dispatcher that is already dead under a still-live relay, or one killed
+/// outright before the signal lands, reaches no trap at all. A start sweeps
+/// those predecessors' directories the way the pidfile GC already sweeps
+/// stale session pids.
 pub const HELPER_SCRIPT: &str = r##"
 set -u
 b64() { printf %s "$1" | base64 | tr -d '\n'; }
@@ -279,12 +279,12 @@ done
 "##;
 
 /// Login-shell shim for shimmed WSL sessions: publish the shell's PID under
-/// the probe key, then become the user's login shell.  `exec` makes the
+/// the probe key, then become the user's login shell. `exec` makes the
 /// pidfile PID *be* the shell, so the helper's tpgid walk starts from the
-/// right place.  wsl.exe's own no-`--exec` launch would start the login
+/// right place. wsl.exe's own no-`--exec` launch would start the login
 /// shell too but gives no way to learn its PID; re-resolving through
 /// `getent` is the documented divergence, with `/bin/sh` only as a last
-/// resort.  Single line: it travels through ConPTY command-line quoting.
+/// resort. Single line: it travels through ConPTY command-line quoting.
 pub const SHIM_SCRIPT: &str = r##"d=${XDG_RUNTIME_DIR:-/tmp}/alacritree; mkdir -p "$d" 2>/dev/null && printf %s $$ > "$d/session-$1.pid"; s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=/bin/sh; exec "$s" -l"##;
 
 /// argv for a session alacritree constructs itself (`ShellChoice::Wsl`,
@@ -306,11 +306,11 @@ pub fn shim_invocation(distro: &str, workdir: &Path, probe_key: &str) -> (String
 
 /// Probe-key shim for a `[[ui.profiles]]` entry that launches wsl.exe.
 /// Only argv this parser fully understands is wrapped: any mix of
-/// `-d`/`--distribution <distro>` and `--cd <dir>`, nothing else.  An
-/// unknown flag or a positional command may not be a plain login shell —
-/// it runs unmodified and simply probes as unknown.  Returns the rewritten
-/// argv plus the explicit distro (`None` = the default distro; the caller
-/// resolves it, since only `wsl::distros` knows which that is).
+/// `-d`/`--distribution <distro>` and `--cd <dir>`, nothing else. An
+/// unknown flag or a positional command may not be a plain login shell, so
+/// it runs unmodified and simply probes as unknown. Returns the rewritten
+/// argv plus the explicit distro. `None` means the default distro, which the
+/// caller resolves, since only `wsl::distros` knows which that is.
 pub fn wrap_profile_argv(
     program: &str,
     args: &[String],
@@ -335,17 +335,17 @@ pub fn wrap_profile_argv(
 }
 
 /// Command shim for an argv that already names what to run: publish the PID
-/// under the probe key, then become that command.  `SHIM_SCRIPT` cannot
+/// under the probe key, then become that command. `SHIM_SCRIPT` cannot
 /// stand in, since its `exec` is hard-wired to the login shell and would
-/// drop the command.  The `exec` here keeps the pidfile PID on the process
-/// that owns the tty, where the helper's `PROBE` starts its walk.  One
+/// drop the command. The `exec` here keeps the pidfile PID on the process
+/// that owns the tty, where the helper's `PROBE` starts its walk. One
 /// line, for `SHIM_SCRIPT`'s reason.
 pub const EXEC_SHIM_SCRIPT: &str = r##"d=${XDG_RUNTIME_DIR:-/tmp}/alacritree; mkdir -p "$d" 2>/dev/null && printf %s $$ > "$d/session-$1.pid"; shift; exec "$@""##;
 
 /// Probe-key shim for a wsl.exe argv whose `--exec` carries a command, the
-/// shape a multiplexer attach takes.  The command runs under
+/// shape a multiplexer attach takes. The command runs under
 /// [`EXEC_SHIM_SCRIPT`] rather than the login-shell shim, so the session
-/// that was asked for is still the session that runs.  An argv this parser
+/// that was asked for is still the session that runs. An argv this parser
 /// does not fully understand gets `None` and runs unmodified, probing as
 /// unknown.
 pub fn wrap_exec_argv(program: &str, args: &[String], probe_key: &str) -> Option<Vec<String>> {
@@ -381,9 +381,9 @@ pub fn is_wsl_program(program: &str) -> bool {
 }
 
 /// The leading `-d`/`--distribution <distro>` and `--cd <dir>` flags, the
-/// distro they name, and whatever follows them.  A flag missing its value
-/// gets `None`: the rest of the argv then means something this parser
-/// cannot see.
+/// distro they name, and whatever follows them. A flag missing its value
+/// gets `None`, because the rest of the argv then means something this
+/// parser cannot see.
 pub fn split_leading_flags(args: &[String]) -> Option<(Vec<String>, Option<String>, &[String])> {
     let mut distro = None;
     let mut flags = Vec::new();
@@ -425,14 +425,14 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// A broken distro must not cause a spawn storm.
 const RESPAWN_COOLDOWN: Duration = Duration::from_secs(30);
 
-/// The two periods the liveness decision reads.  A struct rather than
+/// The two periods the liveness decision reads. A struct rather than
 /// constants so a test can drive the wait loop in milliseconds; production
 /// only ever uses `DEFAULT`.
 struct Timing {
-    /// How often a waiter pings and re-examines the transport.  Matches the
+    /// How often a waiter pings and re-examines the transport. Matches the
     /// period zed's remote client uses for the same job.
     slice: Duration,
-    /// Six slices.  VS Code's equivalent tolerates four and AMQP two, both
+    /// Six slices. VS Code's equivalent tolerates four and AMQP two, both
     /// against peers that are not sharing vCPUs with the judge.
     silence_limit: Duration,
 }
@@ -451,7 +451,7 @@ fn starved(asked: Duration, slept: Duration) -> bool {
 /// Whether an expired slice is evidence the transport is dead.
 ///
 /// `silence` is how long the caller has *observed* no bytes, which is not
-/// the same as how old the last byte is: after a resume the last byte is
+/// the same as how old the last byte is. After a resume the last byte is
 /// legitimately hours old with nobody watching.
 fn wedged(timing: &Timing, asked: Duration, slept: Duration, silence: Duration) -> bool {
     !starved(asked, slept) && silence > timing.silence_limit
@@ -467,11 +467,11 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
 }
 
-/// Why a request produced no result — the distinction the fallback rule
-/// keys on.  `NotWritten` never reached the helper and is safe to re-run
-/// as a one-shot; `NoReply` was written and may have executed (batch
-/// scripts have side effects), so it must surface as an error, never a
-/// silent retry.
+/// Why a request produced no result, which is the distinction the fallback
+/// rule keys on. `NotWritten` never reached the helper and is safe to re-run
+/// as a one-shot. `NoReply` was written and may have executed, and batch
+/// scripts have side effects, so it must surface as an error, never a silent
+/// retry.
 #[derive(Debug)]
 pub enum TransportError {
     NotWritten(String),
@@ -488,15 +488,15 @@ pub struct HelperClient {
     capabilities: OnceLock<Capabilities>,
     down: AtomicBool,
     /// Kept so a teardown can end a `wsl.exe` that stopped draining its
-    /// pipes.  Dropping stdin only reaches a helper still listening for the
+    /// pipes. Dropping stdin only reaches a helper still listening for the
     /// EOF.
     child: Mutex<Option<std::process::Child>>,
     /// Monotonic base for `last_bytes_at`, which is stored as elapsed
     /// milliseconds so the read path stays lock-free.
     started: Instant,
     /// Milliseconds since `started` at the last successful read off the
-    /// helper's stdout.  Bytes, not frames: a partially delivered frame is
-    /// still proof the far end is producing output.
+    /// helper's stdout. Bytes, not frames, because a partially delivered
+    /// frame is still proof the far end is producing output.
     last_bytes_at: AtomicU64,
     timing: Timing,
 }
@@ -506,9 +506,9 @@ fn lock<'a, T>(mutex: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
 }
 
 impl HelperClient {
-    /// Spawn the helper for `distro`.  Returns once the process launch is
+    /// Spawn the helper for `distro`. Returns once the process launch is
     /// attempted; readiness (the hello line) arrives asynchronously on the
-    /// reader thread.  Failures leave the client marked down so the
+    /// reader thread. Failures leave the client marked down so the
     /// registry's cooldown sees them like any other death.
     // Launching the resident helper is this function's job; the child is
     // long-lived and never waited on here.
@@ -551,7 +551,7 @@ impl HelperClient {
             std::thread::Builder::new().name(format!("wsl-helper-{distro}")).spawn(move || {
                 reader.read_loop(stdout);
                 // Reap so a dead helper never lingers as a zombie in the
-                // process table.  Taking it also releases the handle a
+                // process table. Taking it also releases the handle a
                 // teardown would otherwise still be able to kill.
                 let finished = lock(&reader.child).take();
                 if let Some(mut child) = finished {
@@ -602,17 +602,17 @@ impl HelperClient {
         if !self.down.swap(true, Ordering::AcqRel) {
             log::warn!("wsl helper for {}: {why}; falling back to one-shot spawns", self.distro);
         }
-        // Closing stdin cannot be the teardown: a writer parked inside
+        // Closing stdin cannot be the teardown. A writer parked inside
         // `write_all` holds the stdin lock until its write fails, and a relay
-        // whose Linux side is already gone forwards no EOF at all.  Killing
-        // first bounds both.  The close below lands microseconds later, so no
+        // whose Linux side is already gone forwards no EOF at all. Killing
+        // first bounds both. The close below lands microseconds later, so no
         // ordering here gives the helper's EXIT trap a real chance to run.
         if let Some(child) = lock(&self.child).as_mut() {
             let _ = child.kill();
         }
         *lock(&self.stdin) = None;
         // Waiters whose request was already written see the hangup as a
-        // dropped sender — NoReply, never a retry.
+        // dropped sender, which is NoReply, never a retry.
         lock(&self.pending).clear();
     }
 
@@ -628,7 +628,7 @@ impl HelperClient {
         self.last_bytes_at.store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
 
-    /// How long the helper has produced nothing at all.  `Relaxed` is
+    /// How long the helper has produced nothing at all. `Relaxed` is
     /// enough because no other memory is published under the stamp, and a
     /// waiter that observes a stale value only defers judgment by one slice.
     fn silent_for(&self) -> Duration {
@@ -636,10 +636,10 @@ impl HelperClient {
         Duration::from_millis(now.saturating_sub(self.last_bytes_at.load(Ordering::Relaxed)))
     }
 
-    /// Ask the dispatcher to prove it is still reading.  The reply is a
+    /// Ask the dispatcher to prove it is still reading. The reply is a
     /// frame nothing routes; its only effect is refreshing `last_bytes_at`.
     fn ping(&self) {
-        // A held stdin lock is a reason to skip, never to wait: blocking
+        // A held stdin lock is a reason to skip, never to wait. Blocking
         // here would park the waiter inside the failure it came to detect,
         // and the thread holding the lock is itself proof of a live write.
         let Ok(mut guard) = self.stdin.try_lock() else { return };
@@ -648,7 +648,7 @@ impl HelperClient {
         }
     }
 
-    /// A client over arbitrary pipes, so a test can be the helper.  Starts
+    /// A client over arbitrary pipes, so a test can be the helper. Starts
     /// the reader thread the same way `spawn` does; there is no child to
     /// reap, so teardown finds `None` and skips the kill.
     #[cfg(test)]
@@ -698,16 +698,16 @@ impl HelperClient {
         if let Err(e) = write {
             lock(&self.pending).remove(&id);
             // A partial line has no terminating newline, so the dispatcher
-            // can never have run it — NotWritten is safe.
+            // can never have run it, and NotWritten is safe.
             self.mark_down(&format!("write failed: {e}"));
             return Err(TransportError::NotWritten(e));
         }
         // Liveness is asked as "has anything arrived recently", not "was
-        // this reply on time": a loaded host delivers late, a wedged helper
+        // this reply on time". A loaded host delivers late, a wedged helper
         // never delivers, and only the second is worth a teardown.
         let sent_at = Instant::now();
         let deadline = sent_at + timeout;
-        // Silence only counts while somebody was awake to observe it.  A
+        // Silence only counts while somebody was awake to observe it. A
         // slice that overran means the host was starved, and the quiet
         // underneath it says nothing about the far end, so the window
         // restarts rather than carrying that stretch forward.
@@ -741,7 +741,7 @@ impl HelperClient {
                 watching_since = Instant::now();
             }
             if wedged(&self.timing, asked, slept, silence) {
-                // The count is taken into a local first: passing
+                // The count is taken into a local first, because passing
                 // `lock(...).len()` as an argument keeps the guard alive
                 // across the call, and `mark_down` takes the same mutex.
                 let outstanding = {
@@ -788,12 +788,12 @@ fn registry() -> &'static Mutex<HashMap<String, Slot>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The ready client for `distro`, spawning one when none exists.  `None`
-/// while disabled, still starting, or cooling down after a death — callers
-/// fall back to one-shot spawns, which pay the same cold-boot cost the
-/// helper would.  Spawning happens under the registry lock but is only a
-/// process launch; the slow part (the hello) lands on the reader thread.
-/// Never call on the UI thread — same rule as `wsl::run_batch`.
+/// The ready client for `distro`, spawning one when none exists. `None`
+/// while disabled, still starting, or cooling down after a death, and
+/// callers then fall back to one-shot spawns, which pay the same cold-boot
+/// cost the helper would. Spawning happens under the registry lock but is
+/// only a process launch, and the slow part, the hello, lands on the reader
+/// thread. Never call on the UI thread, the same rule as `wsl::run_batch`.
 pub fn client(distro: &str) -> Option<Arc<HelperClient>> {
     if !enabled() || !cfg!(windows) {
         return None;
@@ -813,7 +813,7 @@ pub fn client(distro: &str) -> Option<Arc<HelperClient>> {
     None
 }
 
-/// Resident-first transport for `wsl::run_batch`.  `None` = helper
+/// Resident-first transport for `wsl::run_batch`. `None` = helper
 /// unavailable before anything was sent (fall back to a one-shot spawn);
 /// `Some(Err)` = sent but unanswered, which must not be retried;
 /// `Some(Ok)` = script stdout, one-shot-compatible.
@@ -859,7 +859,7 @@ fn probe_cache() -> &'static Mutex<HashMap<(String, String), Option<String>>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// A probe key unique across alacritree instances: the pidfile dir inside
+/// A probe key unique across alacritree instances. The pidfile dir inside
 /// each distro is shared, so the Windows pid namespaces the per-instance
 /// counter.
 pub fn new_probe_key() -> String {
@@ -876,10 +876,10 @@ pub fn unregister_probe(distro: &str, key: &str) {
     lock(probe_cache()).remove(&(distro.to_string(), key.to_string()));
 }
 
-/// Cached foreground `comm` for a shimmed WSL session — never blocks and
-/// never touches the pipe, so it is safe on the UI thread.  `None` means
-/// unknown (helper down, key unregistered, or an idle shell at the last
-/// poll); callers must treat unknown as "no TUI".
+/// Cached foreground `comm` for a shimmed WSL session. It never blocks and
+/// never touches the pipe, so it is safe on the UI thread. `None` means
+/// unknown: helper down, key unregistered, or an idle shell at the last
+/// poll. Callers must treat unknown as "no TUI".
 pub fn foreground_comm(distro: &str, key: &str) -> Option<String> {
     lock(probe_cache()).get(&(distro.to_string(), key.to_string()))?.clone()
 }
@@ -890,10 +890,10 @@ fn set_cached_comm(distro: &str, key: &str, comm: Option<String>) {
 }
 
 /// One process-wide poller refreshes every registered key at the agent
-/// cadence.  Requests leave this thread, so a slow helper delays freshness,
-/// never the UI.  Polling a distro also (re)spawns its helper through
+/// cadence. Requests leave this thread, so a slow helper delays freshness,
+/// never the UI. Polling a distro also (re)spawns its helper through
 /// `client()`, so an open WSL session keeps nudging a cooled-down helper
-/// back up.  The key list is snapshotted before any pipe I/O so the cache
+/// back up. The key list is snapshotted before any pipe I/O so the cache
 /// lock is never held across a request.
 fn ensure_poller() {
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -904,11 +904,11 @@ fn ensure_poller() {
                     std::thread::sleep(PROBE_POLL_INTERVAL);
                     let keys: Vec<(String, String)> = lock(probe_cache()).keys().cloned().collect();
                     for entry in keys {
-                        // Only a definitive reply overwrites the cache.  A missing
+                        // Only a definitive reply overwrites the cache. A missing
                         // client (helper down or in respawn cooldown) or a transport
-                        // error means "unknown", not "no TUI" — clobbering to None
+                        // error means "unknown", not "no TUI". Clobbering to None
                         // there would disable passthrough for a still-running TUI
-                        // until the next successful probe.  Still call client() every
+                        // until the next successful probe. Still call client() every
                         // tick so a cooled-down helper keeps getting nudged back up.
                         let Some(client) = client(&entry.0) else { continue };
                         let comm = match client.probe(&entry.1) {
@@ -1105,7 +1105,7 @@ mod tests {
     fn the_hup_trap_runs_the_exit_trap_on_a_dead_relay() {
         // Measured under load (30 relay kills per configuration): closing
         // stdin before killing left 19/30 temp dirs behind, killing first
-        // brought that to 16/30, and this trap is what took it to 0/30 — the
+        // brought that to 16/30, and this trap is what took it to 0/30. The
         // startup sweep is only the backstop for what this line prevents.
         assert!(HELPER_SCRIPT.contains("trap 'exit' HUP"));
     }
@@ -1121,8 +1121,8 @@ mod tests {
 
     #[test]
     fn payload_bytes_are_binary_safe() {
-        // NUL-delimited git porcelain, tabs, and newlines all pass through:
-        // the header's byte count is the only framing.
+        // NUL-delimited git porcelain, tabs, and newlines all pass through,
+        // because the header's byte count is the only framing.
         let payload = b"a\0b\tc\nd";
         let mut stream = format!("1\t0\t{}\n", payload.len()).into_bytes();
         stream.extend_from_slice(payload);
@@ -1194,7 +1194,8 @@ mod tests {
     fn refuses_unparseable_profiles() {
         let to_vec = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         // A positional command, an unknown flag, or a dangling value-flag may
-        // not be a plain login shell — leave it alone (probes as unknown).
+        // not be a plain login shell, so it is left alone and probes as
+        // unknown.
         assert!(wrap_profile_argv("wsl.exe", &to_vec(&["bash"]), "k").is_none());
         assert!(wrap_profile_argv("wsl.exe", &to_vec(&["-d", "kali", "htop"]), "k").is_none());
         assert!(wrap_profile_argv("wsl.exe", &to_vec(&["--exec", "sh"]), "k").is_none());
@@ -1242,7 +1243,8 @@ mod tests {
         // An inert distro name: even if the poller ticks mid-test, `client()`
         // cools down on the failed spawn instead of touching a real distro.
         const D: &str = "no-such-distro";
-        // Unknown key: unknown comm — the caller treats that as "no TUI".
+        // An unknown key has an unknown comm, which the caller treats as "no
+        // TUI".
         assert_eq!(foreground_comm(D, "test-77-1"), None);
         register_probe(D, "test-77-1");
         // Registered but not yet polled: still unknown, not a panic or a block.
@@ -1339,11 +1341,11 @@ mod tests {
 
     #[test]
     fn a_client_that_has_never_read_reports_its_whole_life_as_silence() {
-        // The helper end is bound rather than dropped: dropping it closes the
+        // The helper end is bound rather than dropped. Dropping it closes the
         // pipe, which the reader would correctly read as EOF and tear down.
         let (client, _helper) = FakeHelper::silent();
         std::thread::sleep(Duration::from_millis(20));
-        // Never stamped past the hello, so the silence covers the sleep.  The
+        // Never stamped past the hello, so the silence covers the sleep. The
         // clock only moves forward, so this bound cannot invert under load.
         assert!(client.silent_for() >= Duration::from_millis(20));
 
@@ -1365,7 +1367,7 @@ mod tests {
     #[test]
     fn a_ping_with_nowhere_to_write_is_silently_skipped() {
         let (client, _helper) = FakeHelper::silent();
-        // A torn-down client has no stdin.  A ping that cannot be sent is one
+        // A torn-down client has no stdin. A ping that cannot be sent is one
         // more slice of silence, which the wait loop already handles; it must
         // not panic and must not report anything new.
         client.mark_down("test");
@@ -1375,7 +1377,7 @@ mod tests {
 
     #[test]
     fn a_helper_that_stops_answering_is_torn_down_rather_than_waited_out() {
-        // Scaled down by two orders of magnitude: the decision is the same one
+        // Scaled down by two orders of magnitude. The decision is the same one
         // production makes, taken in a third of a second.
         let timing =
             Timing { slice: Duration::from_millis(50), silence_limit: Duration::from_millis(300) };
@@ -1396,8 +1398,7 @@ mod tests {
             started.elapsed()
         );
 
-        // The waiter asked the dispatcher to prove it was reading, which is the
-        // signal the old code had no way to send.
+        // The waiter asked the dispatcher to prove it was reading.
         let mut pings = 0;
         while let Ok(sent) = helper.from_client.try_recv() {
             if sent == b"0\tPING\n" {
@@ -1409,7 +1410,7 @@ mod tests {
 
     #[test]
     fn a_slow_job_over_a_healthy_pipe_is_never_torn_down() {
-        // A silence limit far longer than the test's own runtime: a false
+        // A silence limit far longer than the test's own runtime, so a false
         // teardown here would need the reader thread starved for five seconds
         // inside a test that finishes in a fraction of one.
         let timing =
@@ -1427,8 +1428,8 @@ mod tests {
                 if slices < 4 {
                     continue;
                 }
-                // The job finishes after four answered pings: slow, but the
-                // pipe was never quiet.
+                // The job finishes after four answered pings. That is slow,
+                // but the pipe was never quiet.
                 let _ = helper.to_client.send(b"1\t0\t2\nhi".to_vec());
                 return helper;
             }
@@ -1445,7 +1446,7 @@ mod tests {
 
     #[test]
     fn silence_older_than_the_wait_is_not_the_waiter_s_to_judge() {
-        // Wide margin on purpose: this runs alongside other `wsl_helper`
+        // Wide margin on purpose, since this runs alongside other `wsl_helper`
         // tests under nextest's parallel execution, and a scheduling delay
         // here must never read the same as a genuine clamp regression.
         let timing =
@@ -1469,7 +1470,7 @@ mod tests {
     }
 
     /// A wedged helper is torn down rather than making every later caller pay
-    /// the full run budget.  Requires WSL, and it deliberately kills the shared
+    /// the full run budget. Requires WSL, and it deliberately kills the shared
     /// helper for the default distro, so run it on its own:
     /// `cargo nextest run -p alacritree wsl_helper::tests::a_wedged_helper --run-ignored all`
     #[test]
@@ -1487,11 +1488,11 @@ mod tests {
         };
 
         // A job's stdout is `$t/<id>.out`, so its own fd 1 names the directory
-        // holding the completion fifo.  `$$` rather than `self`, because inside
+        // holding the completion fifo. `$$` rather than `self`, because inside
         // a command substitution `/proc/self` is the substitution's own pipe.
         // Removing the fifo leaves the writer blocked on a deleted inode while
         // later completions land in a regular file nobody reads, which is the
-        // wedge this test needs.  The removal is delayed so this request still
+        // wedge this test needs. The removal is delayed so this request still
         // gets its own answer back.
         let (exit, _) = client
             .run(
@@ -1510,7 +1511,7 @@ mod tests {
         }
     }
 
-    /// Live round trip against the default distro.  Requires WSL; run
+    /// Live round trip against the default distro. Requires WSL; run
     /// manually: `cargo test -p alacritree wsl_helper:: -- --ignored`
     #[test]
     #[ignore]
@@ -1586,7 +1587,7 @@ mod tests {
         // ...and probing the idle shell resolves to "no foreground comm".
         // WSL2 allocates a controlling pty for every `--exec` session
         // regardless of the Windows-side stdio redirection, so the shell owns
-        // the tty itself — the probe must read that as idle, not as a running
+        // the tty itself. The probe must read that as idle, not as a running
         // job, or every idle WSL session trips the close confirmation.
         let comm = client.probe(&key).expect("probe shimmed session");
         assert_eq!(comm, None, "idle shell should probe as no foreground job");
@@ -1596,7 +1597,7 @@ mod tests {
     }
 
     /// Killing the child is what frees a writer parked inside `write_all` on a
-    /// pipe nobody is draining.  Requires WSL and kills the shared helper for
+    /// pipe nobody is draining. Requires WSL and kills the shared helper for
     /// the default distro, so run it on its own:
     /// `cargo nextest run -p alacritree wsl_helper::tests::killing_a_helper --run-ignored all`
     #[test]
@@ -1615,7 +1616,7 @@ mod tests {
 
         // A job's parent is the backgrounded subshell and *its* parent is the
         // dispatcher, which is the process that has to stop reading stdin for a
-        // write to block.  Field 4 of /proc/<pid>/stat is the ppid.  The pid is
+        // write to block. Field 4 of /proc/<pid>/stat is the ppid. The pid is
         // handed back so a panic anywhere below can still resume it.
         let (exit, pid_out) = client
             .run(r#"p=$(awk '{print $4}' /proc/$PPID/stat); kill -STOP "$p"; printf '%s' "$p""#, &[
@@ -1630,7 +1631,7 @@ mod tests {
 
         // The client is deliberately unusable by the time teardown or a panic
         // runs, so resuming goes through a fresh one-shot command straight to
-        // the distro instead.  Drop covers every exit, panics included, so the
+        // the distro instead. Drop covers every exit, panics included, so the
         // dispatcher is never left frozen for the next test to trip over.
         struct ResumeStoppedDispatcher {
             distro: String,
@@ -1650,16 +1651,16 @@ mod tests {
         let _resume_dispatcher =
             ResumeStoppedDispatcher { distro: distro.name.clone(), pid: dispatcher_pid };
 
-        // Measured empirically: a few hundred KiB fits inside the combined
+        // Measured empirically, a few hundred KiB fits inside the combined
         // buffering of the Windows pipe, wsl.exe's relay, the hvsocket, and
         // the Linux pipe without ever pushing back, so `write_all` returns
-        // long before the stopped dispatcher would matter.  1 MiB is the
+        // long before the stopped dispatcher would matter. 1 MiB is the
         // smallest size found to exceed all of that and genuinely park the
         // writer; anything smaller passes without exercising the kill at all.
         let writer = client.clone();
         let blocked = std::thread::spawn(move || {
             let big = "x".repeat(1024 * 1024);
-            // A `NoReply` here means the write never blocked at all — it
+            // A `NoReply` here means the write never blocked at all. It
             // reached the helper and `mark_down` cleared the pending map out
             // from under it, which proves nothing about killing the child.
             let err =

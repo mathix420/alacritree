@@ -3,8 +3,8 @@
 Alacritree is a native desktop terminal built on top of `alacritty_terminal`
 (the headless PTY + VT parser + grid that powers Alacritty) and rendered with
 egui/eframe. On top of that base it adds a worktree-aware sidebar, multi-session
-workspaces, and a git-status panel — turning a single Alacritty-grade window
-into the command centre for parallel Git work.
+workspaces, and a git-status panel. Together they turn a single Alacritty-grade
+window into the command centre for parallel Git work.
 
 This document describes what Alacritree ships today. For the upstream terminal
 features inherited from Alacritty (vi mode, search, hints), see
@@ -23,8 +23,8 @@ per workspace is remembered as you switch between them.
 - `Ctrl+Tab` / `Ctrl+Shift+Tab` cycle sessions within the current workspace;
   on macOS `Cmd+1` … `Cmd+9` / `Cmd+Shift+]` / `Cmd+Shift+[` mirror Terminal.app.
 - `Alt+Right` / `Alt+Left` jump between workspaces.
-- Sessions are **not** killed when you switch workspaces — only when you close
-  them (or quit the app). Scrollback, running commands, and PTY state survive
+- Sessions are **not** killed when you switch workspaces, only when you close
+  them or quit the app. Scrollback, running commands, and PTY state survive
   arbitrary switches between worktrees.
 
 ### Workspace scratchpads
@@ -117,7 +117,7 @@ Each terminal session has its own background read/write thread, a unique
 events through an `EventProxy` that requests an egui repaint on every PTY
 message.
 
-## Left sidebar — projects and worktrees
+## Projects and worktrees in the left sidebar
 
 The left sidebar (`Ctrl+B`) lists projects you have registered and, under each
 project, its Git worktrees.
@@ -131,20 +131,20 @@ project, its Git worktrees.
   the create dialog branches from and what the right sidebar diffs against.
 - **Persisted state.** The list of project roots, their expand/collapse state,
   and the sidebar visibility flags are written to
-  `$XDG_CONFIG_HOME/alacritree/state.toml`. Failures are logged and ignored —
-  a missing or corrupt state file never crashes the app.
+  `$XDG_CONFIG_HOME/alacritree/state.toml`. Failures are logged and ignored,
+  so a missing or corrupt state file never crashes the app.
 
 ### herdr agents
 
-herdr is a terminal workspace manager for coding agents. When a herdr server is running, the agents it manages appear in the sidebar under the worktree each agent's working directory matches, dimmed and carrying the `◫` mark that says the pane belongs to herdr rather than to alacritree. A row names the agent's pane title where herdr reports one, with the agent kind in front of it as context, so two agents of one kind in one checkout can be told apart; an agent with no title is named by its kind alone. An agent whose directory matches no worktree — including one whose checkout has been removed — is listed under Home.
+herdr is a terminal workspace manager for coding agents. When a herdr server is running, the agents it manages appear in the sidebar under the worktree each agent's working directory matches, dimmed and carrying the `◫` mark that says the pane belongs to herdr rather than to alacritree. A row names the agent's pane title where herdr reports one, with the agent kind in front of it as context, so two agents of one kind in one checkout can be told apart; an agent with no title is named by its kind alone. An agent whose directory matches no worktree is listed under Home, including one whose checkout has been removed.
 
 - **Panes with no agent.** `[integrations.herdr] show_panes` widens the listing from the panes herdr detected an agent in to every pane it owns, so a herdr pane running a plain shell gets a row too. Such a row is named by the pane's own title and carries no status word, since `unknown` is what herdr calls an agent it cannot classify rather than a way of saying there is none. Opening one shares herdr's view of the tab that holds it: every `herdr agent` subcommand resolves its target through the agent registry, which holds nothing for such a pane, so a direct attach is never offered for it whatever `attach` says. The unit herdr can be pointed at is the tab, so in a tab holding several panes the attach lands on the whole split: the pane is drawn, but keyboard focus sits wherever herdr last left it, and herdr's own pane chord moves it.
-- **Attaching.** Enter or a click opens a session attached to that agent, and the row is replaced by the session's own row, which keeps the herdr mark so an attached agent still says where it lives. Hovering either row spells out the same sentence — the state, the harness, and what herdr calls the pane, with the way out after them. Detaching is herdr's own chord, not one of alacritree's, read from herdr's `config.toml` so a rebound `keys.prefix` or `keys.detach` is what you are told. The row's `×` ends the attach and leaves the pane running under herdr, so it offers to detach rather than to close, and the agent's own row comes back. Whether it asks first is `[ui] confirm_session_detach`, a switch of its own: a detach destroys nothing, so the busy question `confirm_session_close` asks has no answer here, and turning one off says nothing about the other. The same attach is reachable from outside the window too, as `alacritree multiplexer attach <side> <terminal-id>` and as the `attach_multiplexer_pane` MCP tool, both naming the pane by the side and terminal id `multiplexer list` reports and both waiting to reply until the session can be read. A pane can also be created from outside the window, as `alacritree multiplexer create` and as the `create_multiplexer_pane` MCP tool: the side defaults to the one the focused session's own pane belongs to and the workspace to the focused one, and the new pane appears in the sidebar under the workspace its directory matches, like any other. A workspace a WSL side has no path for, such as one on a network share, is refused before herdr is asked, so no pane opens somewhere else under its name. The new pane runs a shell, so its session shares herdr's view of the tab holding it, as for any pane with no agent. The same create is bindable as `NewMultiplexerPane` and reachable from the command palette (`Ctrl+K`). The whole set moves at once too: `AttachAllMultiplexerPanes` opens a session on every listed pane nothing holds yet and leaves the user in the workspace they asked from, and `DetachAllMultiplexerPanes` ends every session attached to a pane, asking `confirm_session_detach` once for the batch rather than once per session. Neither carries a default key binding.
+- **Attaching.** Enter or a click opens a session attached to that agent, and the row is replaced by the session's own row, which keeps the herdr mark so an attached agent still says where it lives. Hovering either row spells out the same sentence. It gives the state, the harness, and what herdr calls the pane, with the way out after them. Detaching is herdr's own chord, not one of alacritree's, read from herdr's `config.toml` so a rebound `keys.prefix` or `keys.detach` is what you are told. The row's `×` ends the attach and leaves the pane running under herdr, so it offers to detach rather than to close, and the agent's own row comes back. Whether it asks first is `[ui] confirm_session_detach`, a switch of its own: a detach destroys nothing, so the busy question `confirm_session_close` asks has no answer here, and turning one off says nothing about the other. The same attach is reachable from outside the window too, as `alacritree multiplexer attach <side> <terminal-id>` and as the `attach_multiplexer_pane` MCP tool, both naming the pane by the side and terminal id `multiplexer list` reports and both waiting to reply until the session can be read. A pane can also be created from outside the window, as `alacritree multiplexer create` and as the `create_multiplexer_pane` MCP tool: the side defaults to the one the focused session's own pane belongs to and the workspace to the focused one, and the new pane appears in the sidebar under the workspace its directory matches, like any other. A workspace a WSL side has no path for, such as one on a network share, is refused before herdr is asked, so no pane opens somewhere else under its name. The new pane runs a shell, so its session shares herdr's view of the tab holding it, as for any pane with no agent. The same create is bindable as `NewMultiplexerPane` and reachable from the command palette (`Ctrl+K`). The whole set moves at once too: `AttachAllMultiplexerPanes` opens a session on every listed pane nothing holds yet and leaves the user in the workspace they asked from, and `DetachAllMultiplexerPanes` ends every session attached to a pane, asking `confirm_session_detach` once for the batch rather than once per session. Neither carries a default key binding.
 - **Finding an agent by name.** The command palette (`Ctrl+K`) lists agents alongside sessions: an attached one sits under *Open sessions*, named the way its sidebar row is, and one nothing is attached to sits under *Herdr agents*, where Enter attaches it in the workspace its working directory matched. Typing `herdr` brings up both kinds. The sidebar's own search (`/`) reaches agents and session titles too when `[ui] search_depth` is `"sessions"`, so a query naming one agent shows that agent rather than its whole workspace; at `"workspaces"` a query only ever matches project and worktree names, and a query naming the workspace still shows everything under it. A session the sidebar does not list has no row to match. Unless `session_display.sidebar_always` is on, a workspace's only shell is folded into its workspace row.
-- **Order.** A workspace draws its own shell sessions first, then every herdr pane it holds — the sessions attached to one and the agents nothing is attached to alike — in herdr's own order. Attaching therefore changes how a pane is drawn and never where it sits, and neither does detaching or a restart. Reordering is for alacritree's own sessions: a herdr pane's place belongs to herdr, so drag and `MoveSessionUp` / `MoveSessionDown` pass over one. Sort the panes in herdr and the sidebar follows within a poll.
+- **Order.** A workspace draws its own shell sessions first, then every herdr pane it holds, in herdr's own order. The sessions attached to a pane and the agents nothing is attached to share that order. Attaching therefore changes how a pane is drawn and never where it sits, and neither does detaching or a restart. Reordering is for alacritree's own sessions: a herdr pane's place belongs to herdr, so drag and `MoveSessionUp` / `MoveSessionDown` pass over one. Sort the panes in herdr and the sidebar follows within a poll.
 - **Status.** A herdr row draws the same status marks as a native session, from alacritree's own `[ui] status_indicators` set, so a pane and a native session in the same state look the same. herdr reports blocked, working, done and idle, and the row keeps all four apart. A status alacritree does not recognise shows as unknown rather than idle. An attached agent's session row takes herdr's word too, so a dialog the pane title never mentions still reaches the sidebar.
-- **Native Windows.** herdr cannot attach a single agent there, so attaching focuses the pane in your own herdr window and shares the whole herdr session — the view resizes with the alacritree pane, and the tooltip says `shared view`. Each row still gets its own session, so every attached agent keeps its `×` and its place in the tab cycle. Every one of herdr's clients draws the same focused pane, though, so alacritree points herdr at the pane of whichever shared view you are looking at: switching to a session moves herdr's focus, in your own herdr window too. Moving that focus inside herdr rather than from the sidebar leaves the session showing a pane its row does not name, until you pick a row again. Both the focus and the session-name lookup are herdr processes, so they always run off the UI thread and the window keeps painting while herdr answers. `[integrations.herdr] attach = "session"` asks for that same shared view on every side, which is worth having where a direct attach costs you something: herdr repaints an attached pane row by row, so the terminal sees each soft wrap as a line break and a selection copies a wrapped command broken across lines, while herdr's own client knows where the wraps are.
-- **Discovery.** Alacritree asks the native `herdr` on your `PATH` and each running WSL distro. Nothing is installed or started. A side with no herdr on it is asked once and then left alone, so a machine without herdr pays a single failed spawn; a side whose herdr answered — even to say its server is down — is retried on a slow clock, so starting herdr after alacritree brings its agents in without a restart. See `[integrations.herdr]` under [Configuration](#configuration) for the poll interval and the opt-out.
+- **Native Windows.** herdr cannot attach a single agent there, so attaching focuses the pane in your own herdr window and shares the whole herdr session. The view resizes with the alacritree pane, and the tooltip says `shared view`. Each row still gets its own session, so every attached agent keeps its `×` and its place in the tab cycle. Every one of herdr's clients draws the same focused pane, though, so alacritree points herdr at the pane of whichever shared view you are looking at: switching to a session moves herdr's focus, in your own herdr window too. Moving that focus inside herdr rather than from the sidebar leaves the session showing a pane its row does not name, until you pick a row again. Both the focus and the session-name lookup are herdr processes, so they always run off the UI thread and the window keeps painting while herdr answers. `[integrations.herdr] attach = "session"` asks for that same shared view on every side, which is worth having where a direct attach costs you something: herdr repaints an attached pane row by row, so the terminal sees each soft wrap as a line break and a selection copies a wrapped command broken across lines, while herdr's own client knows where the wraps are.
+- **Discovery.** Alacritree asks the native `herdr` on your `PATH` and each running WSL distro. Nothing is installed or started. A side with no herdr on it is asked once and then left alone, so a machine without herdr pays a single failed spawn; a side whose herdr answered, even to say its server is down, is retried on a slow clock, so starting herdr after alacritree brings its agents in without a restart. See `[integrations.herdr]` under [Configuration](#configuration) for the poll interval and the opt-out.
 
 ### Creating a worktree
 
@@ -157,7 +157,7 @@ background thread and streams progress steps back to the UI:
 2. Verify the base branch exists locally or on `origin`.
 3. `git fetch origin <base>`.
 4. `git worktree add <target> -b <branch> origin/<base>` (or local fallback).
-5. Copy AI-assistant configs from the project root into the new worktree —
+5. Copy AI-assistant configs from the project root into the new worktree:
    `CLAUDE.md`, `CLAUDE.local.md`, `.claude/`, `.clauderc`, `AGENTS.md`,
    `.cursorrules`, `.cursor/`, `.aider.conf.yml`, `.aiderignore`,
    `.copilot-instructions.md`, `.github/copilot-instructions.md`,
@@ -165,7 +165,7 @@ background thread and streams progress steps back to the UI:
    destination files are left alone.
 6. Set `preferredNotifChannel: terminal_bell` in
    `.claude/settings.local.json` so Claude Code's completion bell fires through
-   the terminal — every other key in the file is preserved.
+   the terminal. Every other key in the file is preserved.
 7. Run the [checkout hooks](#checkout-hooks).
 
 Worktrees are created under
@@ -173,7 +173,7 @@ Worktrees are created under
 `~/.alacritree/worktrees` so they never clutter the repo's parent directory
 and stay grouped per app. The base is configurable per `[workspace]` in
 `alacritree.toml` (see Configuration below); changing it never moves existing
-worktrees — discovery goes through `git worktree list`. The `<hash>`
+worktrees, because discovery goes through `git worktree list`. The `<hash>`
 disambiguates same-named repos in different locations. `/` in branch names is
 rewritten to `-`, and a numeric suffix is appended if the target already
 exists.
@@ -183,7 +183,7 @@ exists.
 The delete modal pre-computes a cheap dirty-status summary (staged / modified
 / untracked counts) so the user can see what would be lost before confirming.
 Confirmation runs `git worktree remove` (with `--force` if requested) and then
-`git branch -D <branch>` — the branch deletion is best-effort so a detached
+`git branch -D <branch>`. The branch deletion is best-effort, so a detached
 HEAD doesn't block worktree cleanup. The [checkout hooks](#checkout-hooks)
 run after that, from the main checkout.
 
@@ -191,8 +191,8 @@ run after that, from the main checkout.
 
 Checkout hooks run when alacritree creates a worktree, the first time this
 process opens a shell in one, and after it removes one. Opening covers
-worktrees made outside alacritree, such as a plain `git worktree add`. It runs
-again after a restart, so an opening hook must be safe to repeat.
+worktrees made outside alacritree, such as a plain `git worktree add`. An
+opening hook runs again after a restart, so it must be safe to repeat.
 
 Two kinds of hook exist, and the built-in one runs first:
 
@@ -223,12 +223,12 @@ Two kinds of hook exist, and the built-in one runs first:
   runs it in the main checkout, since the worktree is gone.
 
   For a worktree inside a WSL distro, the command runs in that distro, with
-  Linux paths. Set `wsl_path` to the program there; left empty, alacritree
+  Linux paths. Set `wsl_path` to the program there. Without it, alacritree
   looks up the file name of `path` through the distro's login shell and skips
   the hook in a distro that doesn't have it. A Windows `path` is never run
   inside the distro.
 
-  The hooks are tables keyed by name rather than a list so `alacritree.toml`
+  The hooks are tables keyed by name rather than a list, so `alacritree.toml`
   can change or switch off one defined in `alacritty.toml`:
 
   ```toml
@@ -238,23 +238,23 @@ Two kinds of hook exist, and the built-in one runs first:
 
 A hook that fails does not stop the ones after it. Its error shows up as a
 "Hook failed" step while a worktree is being created, and in the log at `warn`
-for opening and removal. A hook still running after five minutes is killed
-and reported as timed out. Hooks read the config alacritree started with, so
+for opening and removal. A hook that runs past alacritree's time limit is
+killed and reported as timed out, with the limit in the error. Hooks read the config alacritree started with, so
 a new hook needs a restart.
 
-## Right sidebar — git status
+## Git status in the right sidebar
 
 The right sidebar (`Ctrl+G`) shows live status for the active workspace's
 worktree:
 
 - Current branch (or short OID on detached HEAD).
 - Staged and unstaged file lists with one-character glyphs (`A`/`M`/`D`/`R`/`?`/`!`).
-- A file-level diff summary against the **merge base** with the default branch
-  — so local-only commits still show up when the default branch hasn't moved.
+- A file-level diff summary against the **merge base** with the default branch,
+  so local-only commits still show up when the default branch hasn't moved.
 
 Status is cached per-worktree with a 1.5 s refresh interval (`StatusCache`),
 so the panel stays responsive even on large repos. A faster cheap path
-(`dirty_counts`) is used by the delete modal — it skips the branch-diff work
+(`dirty_counts`) is used by the delete modal. It skips the branch-diff work
 and just counts what `git worktree remove` would reject.
 
 Clicking a file opens its diff in a pane, and clicking it again closes the
@@ -303,15 +303,15 @@ frame and handles:
 
 Unicode box-drawing and powerline glyphs are rendered from a vector spec
 (`builtin_font.rs`) rather than fetched from the font file. This guarantees
-seamless cells regardless of the user's monospace font choice — borders,
+seamless cells regardless of the user's monospace font choice, so borders,
 braille blocks, and powerline separators always tile perfectly. The behaviour
 can be toggled with `font.builtin_box_drawing = false`.
 
 ### Over-wide icons
 
 An icon outside the built-in ranges comes from whichever fallback face has it,
-sized to *that* face's em rather than to the cell. On a narrow cell — a
-CJK-derived face's half-width advance, say — a Nerd Font icon is wider than
+sized to *that* face's em rather than to the cell. On a narrow cell, such as a
+CJK-derived face's half-width advance, a Nerd Font icon is wider than
 the column the terminal gave it and spills into the next one, where the next
 run's background paints over the part that escaped.
 
@@ -320,21 +320,21 @@ on the span it ends up with, up to four extra cells. This is kitty's
 behaviour; alacritty and Windows Terminal both let the overflow happen.
 
 Only the private use areas grow. A letter that happens to arrive from an
-over-wide fallback face keeps its cell however far it overruns, which is why
-this needs no switch — ordinary text can never move. `U+E0A0`–`U+E0A3` and
+over-wide fallback face keeps its cell however far it overruns. Ordinary text
+can never move, which is why this needs no switch. `U+E0A0`–`U+E0A3` and
 `U+E0C0`–`U+E0C7` are held back as well, matching kitty's `narrow_symbols`
 default: those marks read as part of the segment beside them, so a wider one
 looks wrong where a clipped one only looks cramped.
 
-Blanks are the only cells an icon may take — anything else is a character it
-would paint over — and one wanting more room than it gets stays where it is
+Blanks are the only cells an icon may take, since anything else is a character
+it would paint over. An icon wanting more room than it gets stays where it is
 rather than being pulled left. A blank draws nothing but its background, so it
 counts even when its foreground differs from the icon's, which is what lets an
 icon and the differently-highlighted space beside it share a run. Icons are
 commonly authored with exactly that trailing space (`" "`).
 
 Two things it leaves alone. A double-width character already owns two columns
-and is sized to them, so it never grows — it also never shares a run, since
+and is sized to them, so it never grows. It also never shares a run, since
 the flags marking its second column end one. And a block cursor parked on a
 grown icon redraws it at its own cell while the cursor is there, so the icon
 shifts back for as long as the cursor sits on it.
@@ -343,7 +343,7 @@ shifts back for as long as the cursor sits on it.
 
 URL detection mirrors Alacritty's default URL hint behaviour:
 
-- **OSC 8 hyperlinks** take priority over regex matches — they carry an
+- **OSC 8 hyperlinks** take priority over regex matches, because they carry an
   explicit URI that may differ from the visible text.
 - **Regex matches** use exactly Alacritty's URL pattern (`ipfs:`, `ipns:`,
   `magnet:`, `mailto:`, `gemini://`, `gopher://`, `https://`, `http://`,
@@ -352,16 +352,16 @@ URL detection mirrors Alacritty's default URL hint behaviour:
   URL embedded in prose (`see (https://example.com).`) opens at the right
   bound.
 
-Clicking a recognised link hands it to the OS handler — `xdg-open` on
+Clicking a recognised link hands it to the OS handler: `xdg-open` on
 Linux/BSDs, `open` on macOS, `cmd /c start` on Windows.
 
 ### Clipboard
 
 Two clipboards are distinguished:
 
-- **System clipboard** — `Ctrl+Shift+C` / `Ctrl+Shift+V` (also `Cmd+C` /
+- **System clipboard.** `Ctrl+Shift+C` / `Ctrl+Shift+V` (also `Cmd+C` /
   `Cmd+V` on macOS).
-- **PRIMARY selection** on Linux — `Shift+Insert` paste, with arboard's
+- **PRIMARY selection** on Linux. `Shift+Insert` pastes it, with arboard's
   `SetExtLinux` / `GetExtLinux` backed by `wayland-data-control` so X11 and
   Wayland both work. Platforms without a separate PRIMARY fall back to the
   system clipboard.
@@ -372,22 +372,22 @@ OSC 52 in the terminal flows through the same wrapper.
 
 Dropping files on the window does something different per region:
 
-- **Terminal grid** — the paths are *pasted*, quoted for the shell, joined by
+- **Terminal grid.** The paths are *pasted*, quoted for the shell, joined by
   spaces, with a trailing space. It is a paste, not typing: bracketed paste is
   honoured, and any path carrying a control character is left out of the payload
   (see below), so what arrives is a command line waiting on your Enter.
   Dropping an image on a session running Claude Code gives you `[Image #N]`,
   because Claude Code resolves a pasted image path.
-- **Projects sidebar** — a folder is added as a project; a file adds the folder
+- **Projects sidebar.** A folder is added as a project; a file adds the folder
   containing it. Several files from one folder add it once.
-- **Scratchpad tab** — the plain path is inserted at the cursor, one per line
+- **Scratchpad tab.** The plain path is inserted at the cursor, one per line
   and unquoted, since a document is not a command line. Dropping mid-line puts
   the block on lines of its own rather than welding it to the text either side.
 
 Paths dropped into a WSL session are rewritten to their distro-side spelling
 (`C:\pics\a.png` becomes `/mnt/c/pics/a.png`) and quoted POSIX-style, because a
 `C:` path resolves to nothing inside a distro. That POSIX quoting applies even
-when `quote` names another mode — `windows` quoting fed to `bash` is broken by
+when `quote` names another mode, because `windows` quoting fed to `bash` is broken by
 construction. A `\\wsl.localhost\<distro>\…` path is only rewritten when it
 belongs to the distro the session is running in; one from a *different* distro
 is pasted as-is, because the same Linux path means a different file there.
@@ -409,15 +409,15 @@ active.
 
 Input handling is layered:
 
-1. **Key bindings** — parsed from `[[keyboard.bindings]]` in the TOML config.
+1. **Key bindings**, parsed from `[[keyboard.bindings]]` in the TOML config.
    Alacritty's default set is preloaded, and so are alacritree's own (sidebar
    toggles, workspace switches, session spawn / cycle, palette); your entries
    are checked first so any default can be overridden, forwarded to the
    terminal (`action = "ReceiveChar"`), or consumed without an action (`action
    = "None"`).
-2. **Modal Enter/Escape** — consumed by whichever dialog is open. These are
+2. **Modal Enter/Escape**, consumed by whichever dialog is open. These are
    not bindings and cannot be rebound.
-3. **Egui text events** — preferred for printable input because they handle
+3. **Egui text events**, preferred for printable input because they handle
    dead keys and IME correctly. Control bytes (`Ctrl-<letter>`), CSI sequences
    for arrows / function keys, and `ESC + key` for `Alt+<key>` are derived
    directly from `egui::Event::Key`.
@@ -445,7 +445,7 @@ Alacritree bundles a small font carrying only the glyphs
 it paints itself (`⌂`, `⌫`, `⇅`, `✓` and about 25 others), registered as the
 **last** entry in each chrome font family.
 
-Because it is last, a font that already has a glyph keeps rendering it — your
+Because it is last, a font that already has a glyph keeps rendering it. Your
 font choice is unaffected, and the bundled face is reached only where the
 alternative was an empty box.
 
@@ -466,7 +466,7 @@ Run `alacritree --licenses` for the bundled font's licence.
 ## Configuration
 
 Two TOML files are loaded and **deep-merged using Alacritty's own merge
-semantics** — arrays concatenate (so `[[keyboard.bindings]]` in
+semantics**: arrays concatenate (so `[[keyboard.bindings]]` in
 `alacritree.toml` *adds to* upstream bindings rather than replacing them),
 tables merge recursively, primitives replace.
 
@@ -479,8 +479,8 @@ Search path (matches Alacritty exactly):
 
 Then the same locations for `alacritree.toml`. The two-file split keeps
 shared options (palette, cursor, scrolling, shell, key bindings) in
-`alacritty.toml` — usable by both the upstream alacritty terminal and
-Alacritree — while Alacritree-specific options live in `alacritree.toml`
+`alacritty.toml`, which both the upstream alacritty terminal and Alacritree
+can read. Alacritree-specific options live in `alacritree.toml`
 under `[ui]` and `[workspace]`:
 
 ```toml
@@ -505,12 +505,12 @@ A default Unix image directory is private to its owner (`0700`), and generated
 files are `0600`. A directory named with `image_dir` keeps its existing sharing
 permissions and is never swept, while the generated image files remain `0600`.
 A pasted path is quoted and, inside a WSL session, translated exactly as a
-dropped one — both follow `[ui.drop]`'s `quote` and `wsl_translate`, so those
+dropped one. Both follow `[ui.drop]`'s `quote` and `wsl_translate`, so those
 keys still apply even with `[ui.drop] enabled = false`. `quote = "posix"` is
 the only mode that makes an arbitrary filename inert.
 
 The sidebar cursor used to drop to the first row whenever its own row stopped
-being rendered — by a filter, or by deleting a session or worktree. It now
+being rendered, whether by a filter or by deleting a session or worktree. It now
 climbs or slides instead, under `sidebar_focus = "preserve"`. There is no
 setting that restores the old drop-to-first-row behavior.
 
@@ -518,20 +518,20 @@ Closing a session is the one removal the cursor cannot speak for: `Ctrl+Shift+W`
 from the terminal and a shell exiting on its own both originate outside the
 sidebar, so there is no cursor to slide. Under `"preserve"` the workspace falls
 back to its first session, whichever one closed. `"follow"` lands on the closed
-session's neighbour instead — the next one, or the previous when the last
-session closed, the same ordinal rule the cursor slides by.
+session's neighbour instead. That is the next one, or the previous one when the
+last session closed, which is the same ordinal rule the cursor slides by.
 
 Alacritty's palette, cursor, scrolling, window padding, shell, env, and binding
 tables are read by the same `Raw*` structs, so those parts of an existing
 `alacritty.toml` carry over. The structs cover the fields alacritree acts on
-rather than Alacritty's full schema — the JSON Schema below lists exactly what
+rather than Alacritty's full schema. The JSON Schema below lists exactly what
 a given table accepts.
 
-### Editor support — completion and validation
+### Editor completion and validation
 
 Alacritree publishes a JSON Schema for everything it reads out of the two
-files. Editors that speak the TOML language server — [taplo][taplo] and the
-[Even Better TOML][ebt] VS Code extension built on it — use it for key
+files. Editors that speak the TOML language server, such as [taplo][taplo] and the
+[Even Better TOML][ebt] VS Code extension built on it, use it for key
 completion, hover documentation and validation.
 
 Point a config at it by running:
@@ -548,7 +548,7 @@ which prepends a header naming the published schema:
 ```
 
 `latest/download` always resolves to the newest released schema. To validate
-against the version you actually run, name your tag instead —
+against the version you actually run, name your tag instead, as in
 `releases/download/v0.9.0/alacritree-config.json`. A file that already carries
 a `#:schema` header is left alone, so the command is safe to re-run.
 
@@ -559,7 +559,7 @@ yourself or point at a local copy; it is also committed at
 Two things worth knowing about what the schema does and does not do:
 
 - **Unknown keys are not errors.** The two files are layers, and
-  `alacritty.toml` legitimately carries keys only the real alacritty acts on —
+  `alacritty.toml` legitimately carries keys only the real alacritty acts on:
   `[hints]`, `[bell]`, `[mouse]`, `[general] import`. Those get no completion,
   but they are not flagged.
 - **Closed-value keys are completed.** `confirm_session_close`, `scrollbar`, `sidebar_focus`, `sidebar_scroll_align`, `search_scope`, `sidebar_tooltips`, `last_session_close`, `hold_exited_sessions`, `path_style.*` and `drop.quote` offer their accepted spellings. A binding's `action` completes from every action alacritree implements but rejects nothing, so an alacritty-only action still validates. Cursor `shape` and `blinking`, where Alacritty accepts more than one spelling for the same value, are deliberately left unconstrained, so a working config is never marked wrong.
@@ -577,18 +577,18 @@ glyph string, as shown above, or a table that styles it further:
 upstream_gone = { glyph = "⌫", color = "#ff5555", bold = true, italic = false, size = 8 }
 ```
 
-`glyph` is optional in table form — a table with no `glyph` key keeps that
+`glyph` is optional in table form. A table with no `glyph` key keeps that
 icon's default glyph and only applies the styling. `size` is in logical
 pixels, measured before `ui_scale`, and is clamped to the space the sidebar
 row reserves for that icon, so it cannot grow past its slot. Status markers
-and badges — `upstream_gone` above, and 11 other `[ui.icons]` keys covering
-worktree/session/home icons, PR badges, and the other upstream states — paint
-in a 10 px slot with a 10 px default, so `size` on those can only shrink.
+and badges paint in a 10 px slot with a 10 px default, so `size` on those can
+only shrink. They are `upstream_gone` above and 11 other `[ui.icons]` keys
+covering worktree/session/home icons, PR badges, and the other upstream states.
 The project expand/collapse arrow and the eight action-button icons
 (`add_project`, `new_worktree`, `new_session`, `remove_project`,
 `delete_worktree`, `close_session`, `refresh`, `reorder`) paint in a 16 px
 slot with a 12 px default, and the sidebar search icon has a slot of its own
-tied to the UI font size — all three groups can grow past their defaults.
+tied to the UI font size. All three groups can grow past their defaults.
 
 ### Shell launch profiles
 
@@ -623,12 +623,12 @@ WSL auto-selection by project location → `default_profile` →
 
 Persistent files written by Alacritree:
 
-- `$XDG_CONFIG_HOME/alacritree/state.toml` — projects, expanded state,
+- `$XDG_CONFIG_HOME/alacritree/state.toml` holds projects, expanded state and
   sidebar visibility.
-- `$XDG_CONFIG_HOME/alacritree/scratchpads/*.md` — one persistent Markdown
+- `$XDG_CONFIG_HOME/alacritree/scratchpads/*.md` holds one persistent Markdown
   scratchpad per workspace. Worktree deletion does not remove these notes.
-- `<worktree>/.claude/settings.local.json` — touched only during worktree
-  creation, only to set `preferredNotifChannel = "terminal_bell"`.
+- `<worktree>/.claude/settings.local.json` is touched only during worktree
+  creation, and only to set `preferredNotifChannel = "terminal_bell"`.
 
 No telemetry, no analytics, no background network traffic.
 
@@ -638,7 +638,7 @@ No telemetry, no analytics, no background network traffic.
 goes through the same modal so a stray Cmd-W doesn't kill live sessions.
 Modal Enter/Escape are intercepted before the terminal sees them.
 
-## MCP server — drive Alacritree from an LLM
+## MCP server to drive Alacritree from an LLM
 
 Alacritree exposes its features to LLM agents through the
 [Model Context Protocol](https://modelcontextprotocol.io). `alacritree mcp`
@@ -689,12 +689,12 @@ socket entirely.
 
 ### Shell integration: following the cwd
 
-alacritree never guesses a session's directory — a session tells it, via
+alacritree never guesses a session's directory. A session tells it, via
 `ALACRITREE_SESSION_ID` (exported into every session) and
 `alacritree session move`. Two opt-in hooks cover the common flows; add the
 one(s) you want to your shell config.
 
-**Sidebar follows the shell** — report the cwd at every prompt:
+**Sidebar follows the shell.** Report the cwd at every prompt:
 
 ```sh
 # bash (~/.bashrc)
@@ -709,7 +709,7 @@ precmd_functions+=(_alacritree_report_cwd)
 ```
 
 ```powershell
-# PowerShell ($PROFILE) — wrap your existing prompt function
+# PowerShell ($PROFILE). Wrap your existing prompt function.
 function prompt {
   if ($env:ALACRITREE_SESSION_ID) {
     alacritree session move $env:ALACRITREE_SESSION_ID "$PWD" *> $null
@@ -721,7 +721,7 @@ function prompt {
 Paths outside any known worktree are rejected by alacritree and ignored by
 the hook, so `cd /tmp` moves nothing.
 
-**Shell follows the sidebar** — when an agent moved the session (e.g. via the
+**Shell follows the sidebar.** When an agent moved the session (e.g. via the
 `move_session` MCP tool), land the shell there at the next prompt. Only the
 shell can change its own cwd, which is why this is a hook and not an app
 feature (requires `jq`):
@@ -742,8 +742,8 @@ PROMPT_COMMAND="_alacritree_follow${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 precmd_functions=(_alacritree_follow "${precmd_functions[@]}")
 ```
 
-Both hooks cost one local-socket round trip per prompt; running both at once
-is fine — `_alacritree_follow` only `cd`s when the session's workspace points
+Both hooks cost one local-socket round trip per prompt. Running both at once
+is fine, because `_alacritree_follow` only `cd`s when the session's workspace points
 outside the current worktree, so it doesn't fight `_alacritree_report_cwd`
 over ordinary subdirectory moves within the same worktree. If you install
 both, `_alacritree_follow` must run before `_alacritree_report_cwd` in the
@@ -758,21 +758,21 @@ report-cwd stamps the session with the (otherwise stale) `$PWD`.
 Every other tool that touches Git worktrees today falls into one of three
 buckets, and each bucket gives up something Alacritree refuses to. Pure
 worktree CLIs (branchlet, gtr, gwq, par, jackiotyu's VS Code extension) hand
-you a worktree and walk away — you still need a terminal, you still re-launch
-sessions every time you switch, you still lose scrollback. The growing pile of
+you a worktree and walk away. You still need a terminal, you still re-launch
+sessions every time you switch, and you still lose scrollback. The growing pile of
 AI-agent orchestrators (hive, ouijit, amux, agent-of-empires, uzi, genie,
 mozzie, superset, emdash, capy) bury the terminal inside a Kanban app, ship a
 100 MB Electron / Tauri / Chromium runtime, and lock you into a specific
 agent stack you didn't choose. The one product in the closest neighbourhood,
 aizen.win, is macOS-only, Apple-Silicon-only, and paid. Alacritree is a fast,
-native, open-source app — `alacritty_terminal`'s nine-year-battle-tested VT
-engine rendered in egui — that boots in milliseconds, reads your existing
+native, open-source app that boots in milliseconds, reads your existing
 `alacritty.toml` unchanged, persists per-worktree sessions across switches,
-and stays neutral about what you actually run inside them. The worktree
+and stays neutral about what you actually run inside them. It renders
+`alacritty_terminal`'s nine-year-battle-tested VT engine in egui. The worktree
 sidebar is opinionated where it should be (per-project layout, AI-config copy,
 branch validation, dirty-state warning before delete) and invisible where it
 shouldn't be (no agent assumptions, no telemetry, no Chromium). That
-combination — Alacritty-grade terminal first, worktree UX second, no AI
-baggage — is genuinely unoccupied territory in the current landscape, and
+combination of an Alacritty-grade terminal first, worktree UX second and no AI
+baggage is genuinely unoccupied territory in the current landscape, and
 it's what makes Alacritree both lighter than every "agent IDE" *and* more
 useful than every plain worktree CLI.

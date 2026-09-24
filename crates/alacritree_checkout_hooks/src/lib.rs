@@ -19,8 +19,8 @@ pub mod fake;
 
 pub use command::{CommandHook, RawCheckoutHooks, RawCommandHook};
 
-/// A worktree event: `checkout` is the linked worktree, `main` the project's
-/// main checkout it belongs to.
+/// A worktree event. `checkout` is the linked worktree, and `main` is the
+/// project's main checkout it belongs to.
 #[derive(Debug, Clone, Copy)]
 pub struct Checkout<'a> {
     pub main: &'a Path,
@@ -30,8 +30,9 @@ pub struct Checkout<'a> {
 /// A line for the progress UI, or nothing when the hook had nothing to do.
 pub type Outcome = Result<Option<String>, HookError>;
 
-/// `hook` is the hook's name as configured, not the program it runs: a
-/// command hook's table key is what the user can find in their config.
+/// `hook` is the hook's name as configured rather than the program it runs,
+/// since a command hook's table key is what the user can find in their
+/// config.
 #[derive(Debug, thiserror::Error)]
 pub enum HookError {
     #[error("{hook} failed ({status}){}", if stderr.is_empty() { String::new() } else { format!(": {stderr}") })]
@@ -72,9 +73,9 @@ pub trait CheckoutHook {
     ) -> ::alacritree_checkout_hooks::Outcome;
 }
 
-/// Every event run on each hook in order. One hook failing does not stop
-/// the next: each carries an unrelated tool, and a broken `mise` must not keep
-/// doppler from scoping the worktree.
+/// Runs each event on every hook in order. One hook failing does not stop
+/// the next. Each carries an unrelated tool, and a broken `mise` must not
+/// keep doppler from scoping the worktree.
 pub trait CheckoutHooks {
     fn created(&self, event: &Checkout<'_>, blocking: &Blocking) -> Vec<Outcome>;
     fn opened(&self, event: &Checkout<'_>, blocking: &Blocking) -> Vec<Outcome>;

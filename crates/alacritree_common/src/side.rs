@@ -1,7 +1,7 @@
 //! Where a program runs for a checkout, and running it there.
 //!
 //! A checkout under `\\wsl.localhost\<distro>\…` belongs to that distro, so
-//! a tool acting on it is the distro's Linux build: the Windows one reads the
+//! a tool acting on it is the distro's Linux build. The Windows one reads the
 //! Windows side's config and knows none of the distro's paths. A program not
 //! installed on the checkout's side is not an error, because someone with
 //! projects on both sides rarely installs every tool on both.
@@ -159,7 +159,7 @@ fn invocation(side: &Side, program: &Program, args: &[String]) -> Invocation {
 }
 
 /// Run `program` on `side`, killing it if the job is cancelled or it runs
-/// past [`LIMIT`]. Blocks, so it takes the pool's token: call it from a job,
+/// past [`LIMIT`]. Blocks, so it takes the pool's token. Call it from a job,
 /// never the UI thread.
 pub fn run(
     side: &Side,
@@ -239,7 +239,7 @@ mod tests {
         );
     }
 
-    /// A side has two spellings and they are not interchangeable: `label` is
+    /// A side has two spellings, and they are not interchangeable. `label` is
     /// a row's word for it and stays silent on the native side, while a
     /// client that cannot see the row needs the side named every time.
     #[test]
@@ -361,7 +361,7 @@ mod tests {
     }
 
     /// A hook that never exits must not keep a pool worker once the caller
-    /// is gone: the worktree dialog closing cancels the job.
+    /// is gone. Closing the worktree dialog cancels the job.
     #[cfg(unix)]
     #[test]
     fn cancelling_the_job_kills_a_hanging_program() {

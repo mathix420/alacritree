@@ -38,6 +38,6 @@ toml_edit = "0.24.0"
 [patch.crates-io]
 x11-clipboard = { git = "https://github.com/quininer/x11-clipboard.git", rev = "19ab2163cf0bd0db607e827a5214571990307866" }
 # Vendored egui-winit with a one-liner so Ctrl+V falls through to a Key event
-# when the clipboard isn't text (e.g. holds an image) — matches alacritty's
-# raw 0x16 forwarding and lets TUIs like Claude Code do their own wl-paste.
+# when the clipboard isn't text (e.g. holds an image), matching alacritty's
+# raw 0x16 forwarding and letting TUIs like Claude Code do their own wl-paste.
 egui-winit = { path = "egui-winit" }

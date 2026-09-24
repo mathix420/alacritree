@@ -7,10 +7,10 @@ the prompt, so the prompt waits on a subprocess or a repository walk.
     python3 alacritree/tools/ui-thread-audit.py .        # from the repo root
     python3 alacritree/tools/ui-thread-audit.py . NAME   # status of named fns
 
-Requires `ast-grep` on PATH.  Each finding prints the primitive, its line, and
-the call chain from `update` that reaches it.  The exit status is 1 while any
+Requires `ast-grep` on PATH. Each finding prints the primitive, its line, and
+the call chain from `update` that reaches it. The exit status is 1 while any
 finding stands, so CI can gate on it, and 2 when the scan itself came back
-empty — a guard that inspects nothing must not read as a guard that found
+empty. A guard that inspects nothing must not read as a guard that found
 nothing.
 
 ## How it decides

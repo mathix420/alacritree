@@ -1,18 +1,18 @@
 //! Mirror Doppler CLI scopes from a project's main checkout into its git
 //! worktrees.
 //!
-//! Doppler binds project/config to absolute directory paths (`doppler setup`
-//! writes them under `scoped:` in `~/.doppler/.doppler.yaml`), so a fresh
+//! Doppler binds project/config to absolute directory paths. `doppler setup`
+//! writes them under `scoped:` in `~/.doppler/.doppler.yaml`, so a fresh
 //! worktree starts unscoped and `doppler run` fails with "You must specify a
-//! project" even though the main checkout is fully set up.  Copying the main
-//! checkout's scopes — including per-subdirectory scopes in monorepos — to
-//! the equivalent paths inside the worktree makes `doppler run` work there
-//! out of the box.  We go through the doppler CLI instead of editing its
-//! config file so we never fight its on-disk format.  Everything is
-//! best-effort: no doppler binary, or nothing to copy, is a silent no-op.
+//! project" even though the main checkout is fully set up. Copying the main
+//! checkout's scopes, including per-subdirectory scopes in monorepos, to the
+//! equivalent paths inside the worktree makes `doppler run` work there out of
+//! the box. We go through the doppler CLI instead of editing its config file
+//! so we never fight its on-disk format. Everything is best-effort, so a
+//! missing doppler binary or nothing to copy is a silent no-op.
 //!
 //! A worktree inside WSL is scoped by the distro's own doppler, under its
-//! Linux path: the Windows doppler keeps a separate config file that the
+//! Linux path. The Windows doppler keeps a separate config file that the
 //! distro's `doppler run` never reads.
 
 use std::collections::HashMap;
@@ -24,17 +24,17 @@ use alacritree_common::tools::{self, Tool};
 use alacritree_common::wsl::{self, Location};
 
 /// `enclave.*` is doppler's on-disk spelling of the `project`/`config`
-/// options (a leftover from when the product was called Enclave).
+/// options, a leftover from when the product was called Enclave.
 const PROJECT_KEY: &str = "enclave.project";
 const CONFIG_KEY: &str = "enclave.config";
 
 type Scopes = HashMap<String, HashMap<String, serde_json::Value>>;
 
 /// Copy every scope at or under `main_checkout` to the equivalent path under
-/// `worktree`.  Scopes the worktree already defines are left untouched so a
-/// deliberate per-worktree `doppler setup` (e.g. pointing at a different
-/// config) survives.  Returns how many scopes were written.  Takes
-/// `&jobs::Blocking` because it shells out — call it from a pool job, never
+/// `worktree`. Scopes the worktree already defines are left untouched, so a
+/// deliberate per-worktree `doppler setup`, such as one pointing at a
+/// different config, survives. Returns how many scopes were written. Takes
+/// `&jobs::Blocking` because it shells out, so call it from a pool job, never
 /// from the UI thread.
 pub(crate) fn mirror_scopes(
     main_checkout: &Path,
@@ -89,10 +89,10 @@ pub(crate) fn mirror_scopes(
 }
 
 /// Drop the project/config options from every scope at or under `worktree`,
-/// so deleting a worktree doesn't grow doppler's config file forever.  Other
-/// options (tokens, hosts) are preserved; doppler prunes scope entries that
-/// end up empty.  Returns how many scopes were cleaned.  Takes
-/// `&jobs::Blocking` because it shells out — call it from a pool job, never
+/// so deleting a worktree doesn't grow doppler's config file forever. Other
+/// options, such as tokens and hosts, are preserved, and doppler prunes scope
+/// entries that end up empty. Returns how many scopes were cleaned. Takes
+/// `&jobs::Blocking` because it shells out, so call it from a pool job, never
 /// from the UI thread.
 pub(crate) fn forget_scopes(worktree: &Path, blocking: &jobs::Blocking) -> usize {
     let wt_at = locate(worktree);

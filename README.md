@@ -145,7 +145,7 @@ An agent running *inside* an Alacritree session automatically targets its host
 instance (advertised via the `ALACRITREE_SOCKET` env var); other clients can
 pass `alacritree mcp --socket <path>`. The transport mirrors Alacritty's IPC
 design — disable it with `ipc_socket = false` under `[general]`. See
-[`docs/alacritree.md`](docs/alacritree.md#mcp-server--drive-alacritree-from-an-llm)
+[`docs/alacritree.md`](docs/alacritree.md#mcp-server-to-drive-alacritree-from-an-llm)
 for the full tool list.
 
 ## Command line

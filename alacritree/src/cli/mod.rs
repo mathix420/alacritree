@@ -1,12 +1,12 @@
-//! `alacritree <command>` — the terminal-side skin over the IPC surface.
+//! `alacritree <command>` is the terminal-side skin over the IPC surface.
 //!
 //! Every command is built from [`IpcRequest`]s, the enum the MCP bridge speaks, so
 //! an agent that shells out reaches exactly the surface an agent with an MCP
-//! client does.  Running with no subcommand opens the window as before.
+//! client does. Running with no subcommand opens the window as before.
 //!
 //! Dispatch is hybrid: a request goes to a running alacritree if one is
 //! listening, and otherwise to [`offline`], which serves what it can from
-//! `state.toml` and git directly.  Commands that are meaningless without a
+//! `state.toml` and git directly. Commands that are meaningless without a
 //! window (anything about sessions) fail there rather than pretending.
 
 mod config_reference;
@@ -30,7 +30,7 @@ pub use config_reference::document as config_reference_document;
 pub use schema::document as schema_document;
 
 /// Redistributing the embedded subset obliges us to carry its notice, and
-/// installation copies only the executable — so the text ships inside it.
+/// installation copies only the executable, so the text ships inside it.
 const FONT_LICENSE: &str = include_str!("../../assets/FONT-LICENSE.txt");
 
 /// One `-o` fragment, which is a whole TOML document rather than a bare
@@ -211,8 +211,8 @@ enum ProjectCommand {
         #[arg(long)]
         all: bool,
     },
-    /// Set a project's display label.  Display only — the directory on disk
-    /// is untouched.
+    /// Set a project's display label. The label is display only and the
+    /// directory on disk is untouched.
     Rename {
         root: PathBuf,
         /// The new sidebar name.
@@ -243,8 +243,8 @@ enum SessionCommand {
         /// Append a carriage return, submitting the line.
         ///
         /// A shell passes argv through verbatim, so a trailing `\r` in the text
-        /// arrives as a backslash and an `r` — the command would be typed and
-        /// never run.  (An MCP client has no such problem: JSON decodes the
+        /// arrives as a backslash and an `r`. The command would be typed and
+        /// never run. (An MCP client has no such problem: JSON decodes the
         /// escape for it.)
         #[arg(long)]
         enter: bool,
@@ -381,7 +381,7 @@ pub fn run(cli: Cli) -> Option<i32> {
             return Some(0);
         },
         // Reads files rather than asking an instance, so it answers when
-        // nothing is running — which is exactly when a crash is being chased.
+        // nothing is running, which is exactly when a crash is being chased.
         Command::Crashes { all } => return Some(crashes::run(cli.json, all)),
         Command::Install { dest } => return Some(install::run(dest, cli.json)),
         // Generated from the config types in this binary, so it answers with
@@ -634,8 +634,8 @@ fn to_request(command: Command) -> IpcRequest {
 /// Make a path absolute without resolving symlinks or touching the disk.
 ///
 /// A shell hands us `.` or `../repo`, but the sidebar stores what the folder
-/// picker gave it, which is always absolute — so a relative path would match
-/// nothing.  `canonicalize` would also work, except on Windows it returns a
+/// picker gave it, which is always absolute, so a relative path would match
+/// nothing. `canonicalize` would also work, except on Windows it returns a
 /// `\\?\` path that matches neither the stored root nor anything a user would
 /// recognise in output.
 fn absolute(path: PathBuf) -> PathBuf {
@@ -820,8 +820,8 @@ mod tests {
     }
 
     /// The shell hands us argv verbatim, so a user who writes `'ls\r'` sends a
-    /// backslash and an `r` — the command is typed into the terminal and never
-    /// runs.  `--enter` is the only way to submit a line from a shell.
+    /// backslash and an `r`. The command is typed into the terminal and never
+    /// runs. `--enter` is the only way to submit a line from a shell.
     #[test]
     fn enter_submits_the_line_and_is_off_by_default() {
         assert!(matches!(
@@ -844,7 +844,7 @@ mod tests {
         ));
     }
 
-    /// Omitting the path means the home workspace — a distinct target, not a
+    /// Omitting the path means the home workspace, a distinct target, not a
     /// missing argument.
     #[test]
     fn workspace_select_without_a_path_means_home() {
@@ -890,14 +890,14 @@ mod tests {
         assert_eq!(run(cli), Some(0));
     }
 
-    /// With an app listening, the request must reach it — and the offline path
-    /// must stay out of it.  Falling back while a window is open would edit
+    /// With an app listening, the request must reach it, and the offline path
+    /// must stay out of it. Falling back while a window is open would edit
     /// `state.toml` behind the app's back, where the change would not show in
     /// the sidebar until the next restart.
     ///
-    /// The request is deliberately a read-only one.  `offline::handle` resolves
-    /// the *real* `state.toml` — the user's — so a test that fell through to it
-    /// with a mutating request would edit the config of whoever ran the suite.
+    /// The request is deliberately a read-only one. `offline::handle` resolves
+    /// the user's *real* `state.toml`, so a test that fell through to it with
+    /// a mutating request would edit the config of whoever ran the suite.
     #[test]
     fn a_running_app_answers_instead_of_the_offline_path() {
         let (transport, requests) =

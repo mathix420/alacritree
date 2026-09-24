@@ -1,13 +1,13 @@
 //! Serving a request with no alacritree running.
 //!
 //! The sidebar is a view of `state.toml` plus what git says about each root, and
-//! both outlive the window — so a request that only needs those two can be
-//! answered without an app.  Anything about sessions cannot: a session is a live
+//! both outlive the window, so a request that only needs those two can be
+//! answered without an app. Anything about sessions cannot: a session is a live
 //! PTY owned by a process that isn't there.
 //!
 //! The replies are byte-for-byte the ones a running app would send, so nothing
-//! downstream — rendering, `--json`, an agent parsing either — can tell which
-//! path answered it.
+//! downstream can tell which path answered it. That holds for rendering, for
+//! `--json`, and for an agent parsing either.
 
 use std::path::{Path, PathBuf};
 
@@ -29,7 +29,7 @@ pub(super) fn handle(request: &IpcRequest, config: &CreateConfig) -> IpcResult {
 fn handle_at(state_path: &Path, request: &IpcRequest, config: &CreateConfig) -> IpcResult {
     match request {
         IpcRequest::ListProjects => Ok(json!({
-            // No window means no focused workspace — the same value the app
+            // No window means no focused workspace, the same value the app
             // reports for its home tab.
             "current_workspace": Value::Null,
             "projects": discover_all(state_path).iter().map(project_json).collect::<Vec<_>>(),
@@ -47,8 +47,8 @@ fn handle_at(state_path: &Path, request: &IpcRequest, config: &CreateConfig) -> 
                 .ok_or_else(|| not_a_project(root))?;
             Ok(project_json(&renamed))
         },
-        // Nothing is cached without an app, so a refresh is just a fresh look —
-        // but it still has to fail on a root the sidebar does not have, or it
+        // Nothing is cached without an app, so a refresh is just a fresh look.
+        // It still has to fail on a root the sidebar does not have, or it
         // would report on projects the user never added.
         IpcRequest::RefreshProject { root } => {
             let known = discover_all(state_path)
@@ -235,8 +235,8 @@ mod tests {
         })
     }
 
-    /// The label is display state in `state.toml`, so it must stick — and
-    /// persist — without a window.
+    /// The label is display state in `state.toml`, so it must stick, and
+    /// persist, without a window.
     #[test]
     fn renaming_a_project_changes_its_listed_name() {
         let dir = TempDir::new().unwrap();
@@ -251,7 +251,7 @@ mod tests {
         assert_eq!(list_projects(&state)["projects"][0]["name"], "Work");
     }
 
-    /// No label means back to the directory name — the same request clears,
+    /// No label means back to the directory name. The same request clears,
     /// so no second verb is needed anywhere on the surface.
     #[test]
     fn renaming_without_a_label_restores_the_directory_name() {
@@ -306,7 +306,7 @@ mod tests {
     }
 
     /// The CLI is one writer among several, so it must never republish a
-    /// project list it read earlier — the same rule the windows follow.
+    /// project list it read earlier. The windows follow the same rule.
     #[test]
     fn adding_a_project_keeps_the_ones_already_on_disk() {
         let dir = TempDir::new().unwrap();

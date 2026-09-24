@@ -28,12 +28,12 @@ use crate::repaint::Repaint;
 use crate::worktree::{self as wt, CreateConfig, CreateRequest, Progress};
 use crate::{git_status, jobs};
 
-/// Absolute path to the running binary.  A shell can exec the CLI through it
-/// without a PATH lookup — which is the only reliable way in a distro, where
+/// Absolute path to the running binary. A shell can exec the CLI through it
+/// without a PATH lookup, which is the only reliable way in a distro, where
 /// the Windows binary is reachable through interop but is not on `$PATH`.
 const EXE_ENV: &str = "ALACRITREE_EXE";
 
-/// How long a connection waits for the UI thread before giving up — long
+/// How long a connection waits for the UI thread before giving up. It is long
 /// enough for a busy frame, short enough that a wedged app doesn't hang
 /// clients forever.
 const APP_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -90,8 +90,8 @@ pub(crate) fn spawn_listener(
         Err(e) => log::warn!("cannot advertise {EXE_ENV}: {e}"),
     }
 
-    // Only WSLENV-listed variables cross the wsl.exe boundary — in either
-    // direction.  Listing the socket lets programs in a distro find this
+    // Only WSLENV-listed variables cross the wsl.exe boundary, in either
+    // direction. Listing the socket lets programs in a distro find this
     // instance, whether they read the variable themselves or exec the
     // Windows CLI through interop (which inherits the distro's view); the
     // session id lets them name their own session in requests; the binary
@@ -108,13 +108,13 @@ pub(crate) fn spawn_listener(
     Ok(listener)
 }
 
-/// `WSLENV` extended with the variables alacritree exports — [`SOCKET_ENV`],
-/// [`crate::session::SESSION_ID_ENV`] and [`EXE_ENV`] — preserving whatever
-/// the user already shares across the boundary.
+/// `WSLENV` extended with [`SOCKET_ENV`], [`crate::session::SESSION_ID_ENV`]
+/// and [`EXE_ENV`], the variables alacritree exports. Whatever the user
+/// already shares across the boundary is preserved.
 ///
 /// Only the binary path carries a conversion flag: `/p` has WSL rewrite it
 /// into the distro's view of the drive, honouring whatever automount root
-/// that distro uses.  A pipe name and an id are not paths.
+/// that distro uses. A pipe name and an id are not paths.
 #[cfg(any(test, windows))]
 fn wslenv_with_alacritree_vars(current: Option<&str>) -> String {
     let mut wslenv = current.unwrap_or("").to_string();
@@ -201,8 +201,8 @@ fn dispatch(
     config: &CreateConfig,
 ) -> IpcResult {
     match Route::from(request) {
-        // `compute` walks the working tree — the same work StatusCache
-        // pushes to a background thread — so keep it off the UI thread.
+        // `compute` walks the working tree, the same work StatusCache
+        // pushes to a background thread, so keep it off the UI thread.
         // This is already the connection thread, not the UI thread; the
         // token just proves that plainly rather than adding a real wait.
         Route::Connection(ConnectionRequest::GitStatus { path }) => {
@@ -332,7 +332,7 @@ mod tests {
         assert_eq!(wslenv_with_alacritree_vars(None), ours);
         assert_eq!(wslenv_with_alacritree_vars(Some("")), ours);
         assert_eq!(wslenv_with_alacritree_vars(Some("LESS:FOO/p")), format!("LESS:FOO/p:{ours}"));
-        // Already listed — with or without conversion flags — is not repeated.
+        // Already listed, with or without conversion flags, is not repeated.
         assert_eq!(wslenv_with_alacritree_vars(Some(&ours)), ours);
         let flagged = format!("{SOCKET_ENV}/u:LESS");
         assert_eq!(
@@ -370,8 +370,8 @@ mod tests {
     }
 
     /// The client/server round trip over whatever transport the platform uses:
-    /// framing, dispatch to the app thread, and the reply.  Discovery by
-    /// scanning the socket directory is deliberately not tested — the scan
+    /// framing, dispatch to the app thread, and the reply. Discovery by
+    /// scanning the socket directory is deliberately not tested. The scan
     /// would happily find a real alacritree running on the same machine.
     #[test]
     fn round_trip_over_the_socket() {

@@ -309,7 +309,7 @@ impl AlacritreeApp {
             .or_insert_with(|| StatusCache::new(path.clone()));
 
         // Use whatever branch the cache already knows to query the PR
-        // cache without waiting for a fresh compute — first frame may
+        // cache without waiting for a fresh compute. The first frame may
         // be `None`, which `pr_cache.poll` handles by returning early.
         let cached_branch = cache.current_branch().map(str::to_string);
         let pr_info = self.pr_cache.poll(&path, cached_branch.as_deref(), ctx);
@@ -1029,8 +1029,8 @@ pub(super) fn branch_diff_row(
     resp
 }
 
-/// The git panel's header path.  It stays selectable although the panel turns
-/// label selection off, and — being a header rather than a row — keeps
+/// The git panel's header path. It stays selectable although the panel turns
+/// label selection off. Being a header rather than a row, it keeps
 /// `egui::Label`'s own elided-text tooltip instead of answering to
 /// `[ui] sidebar_tooltips`.
 pub(super) fn path_header_label(

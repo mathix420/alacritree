@@ -117,10 +117,11 @@ raw-window-handle = "0.6"
 # Linux reads /proc directly, so the dependency is Windows-only.
 sysinfo = { version = "0.36", default-features = false, features = ["system"] }
 # Distro enumeration reads HKCU\...\Lxss directly (Windows Terminal's
-# approach) — no process spawn at startup, and it identifies the default.
+# approach). That needs no process spawn at startup, and it identifies the
+# default.
 winreg = "0.55"
 # notify-rust's own WinRT backend, used directly because notify-rust doesn't
-# expose toast activation — needed to focus the pinging session on click.
+# expose toast activation, which focusing the pinging session on click needs.
 tauri-winrt-notification = "0.7"
 
 # The coverage scan is the only parallel work in this crate and it is
@@ -141,8 +142,8 @@ rayon = "1"
 fontconfig = { version = "0.8", features = ["dlopen"] }
 # UserNotifications framework, used instead of notify-rust because its
 # NSUserNotification backend is defunct on modern macOS: delivery silently
-# fails for unbundled processes and clicks are never surfaced.  Requires
-# running from an app bundle (see extra/osx) — same objc2 stack egui links.
+# fails for unbundled processes and clicks are never surfaced. Requires
+# running from an app bundle (see extra/osx) and shares egui's objc2 stack.
 objc2 = "0.6"
 block2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = [

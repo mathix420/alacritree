@@ -338,7 +338,7 @@ The program each session runs.
 
 ## `[ui]`
 
-alacritree's own presentation: sidebar colors, icons, tooltips, shell profiles, and everything else the terminal grid does not own. Belongs in `alacritree.toml` — upstream alacritty warns about it.
+alacritree's own presentation: sidebar colors, icons, tooltips, shell profiles, and everything else the terminal grid does not own. Belongs in `alacritree.toml`, since upstream alacritty warns about it.
 
 - `async_session_spawn` (boolean, default `false`): Open a session's PTY on a worker rather than in the frame that asked for it, so spawning does not stutter.
 - `attention_grace_ms` (integer, default `0`): Grace window in milliseconds before an attention trigger pings; a session that resumes work inside it swallows the ping.
@@ -366,7 +366,7 @@ alacritree's own presentation: sidebar colors, icons, tooltips, shell profiles, 
 - `sidebar_border` (string): Color of the line between a sidebar and the terminal.
 - `sidebar_click_focus` (boolean, default `false`): Clicking a sidebar moves keyboard focus to it.
 - `sidebar_focus` ("preserve" | "follow", default `"preserve"`): How far the projects sidebar goes when the cursor's row stops being rendered: "preserve" | "follow".
-- `sidebar_follow_active` (boolean, default `false`): Whether the projects sidebar scrolls to the session on screen whenever it changes — a cycling key, a click, the palette, an IPC request. The sidebar cursor is left where it was.
+- `sidebar_follow_active` (boolean, default `false`): Whether the projects sidebar scrolls to the session on screen whenever it changes, whether by a cycling key, a click, the palette, or an IPC request. The sidebar cursor is left where it was.
 - `sidebar_foreground` (string): Sidebar text color. Unset derives it from the terminal palette.
 - `sidebar_scroll_align` ("minimal" | "center", default `"minimal"`): Where a row the sidebar scrolled to is parked: "minimal" | "center". Under "center" every cursor step re-centres the list, and clicking a row near the panel edge scrolls it out from under the pointer.
 - `sidebar_tooltips` ("off" | "elided" | "always", default `"elided"`): When a sidebar row spells its full name out on hover: "elided" | "always" | "off".

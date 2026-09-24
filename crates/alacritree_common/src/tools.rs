@@ -46,8 +46,8 @@ impl Tool {
         self.into()
     }
 
-    /// One value per tool, indexed by discriminant: the shape the paths
-    /// table and `configure` take.
+    /// One value per tool, indexed by discriminant, which is the shape the
+    /// paths table and `configure` take.
     pub fn table<T>(mut f: impl FnMut(Tool) -> T) -> [T; Tool::COUNT] {
         std::array::from_fn(|i| f(Tool::VARIANTS[i]))
     }
@@ -197,7 +197,7 @@ pub fn locate(program: &str) -> Option<PathBuf> {
     locate_in(program, &dirs, &executable_extensions())
 }
 
-/// The empty extension comes last on Windows too: `PATHEXT` covers `git.exe`,
+/// The empty extension comes last on Windows too. `PATHEXT` covers `git.exe`,
 /// but a bare extensionless file is still executable if it is there.
 #[cfg(windows)]
 fn executable_extensions() -> Vec<String> {
@@ -221,7 +221,7 @@ fn lookups() -> &'static Mutex<Lookups> {
 }
 
 /// The helper's hello resolved every tool when the helper started. A miss
-/// there is not a kept miss: the live probe still sees a later install.
+/// there is not kept, because the live probe still sees a later install.
 fn probe_distro(distro: &str, tool: Tool, blocking: &jobs::Blocking) -> Option<String> {
     wsl_helper::capability(distro, tool.name()).or_else(|| {
         wsl::probe_tools(distro, &[tool.name()], blocking).ok()?.into_iter().next().flatten()

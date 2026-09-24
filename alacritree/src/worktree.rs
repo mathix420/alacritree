@@ -98,10 +98,10 @@ pub(crate) fn validate_branch_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Run [`create`] on the pool, waking the UI for each step.  A worktree
-/// create is user-initiated, so it runs at interactive priority.  The
+/// Run [`create`] on the pool, waking the UI for each step. A worktree
+/// create is user-initiated, so it runs at interactive priority. The
 /// streamed progress travels over the channel; the returned `Job` carries no
-/// result of its own and exists only to be held — dropping it would cancel
+/// result of its own and exists only to be held. Dropping it would cancel
 /// the create before it starts.
 pub(crate) fn spawn_create<H: CheckoutHook + Send + 'static>(
     req: CreateRequest,
@@ -311,7 +311,7 @@ pub(crate) fn list_branches(cwd: &Path, _blocking: &jobs::Blocking) -> Result<Ve
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(str::trim)
-        // `origin/HEAD` shortens to plain `origin` — an alias, not a branch.
+        // `origin/HEAD` shortens to plain `origin`, an alias, not a branch.
         .filter(|l| !l.is_empty() && *l != "origin")
         .map(str::to_string)
         .collect())
@@ -604,7 +604,7 @@ pub(crate) fn delete_worktree<H: CheckoutHooks + ?Sized>(
     args.push(&path_arg);
     run_git(project_root, &args)?;
     if let Some(branch) = branch {
-        // Branch may already be gone (e.g. detached HEAD) — ignore errors here.
+        // Branch may already be gone (e.g. detached HEAD), so ignore errors.
         let _ = run_git(project_root, &["branch", "-D", branch]);
     }
     let event = Checkout { main: project_root, checkout: &scope_root };
@@ -625,7 +625,7 @@ pub(crate) enum DeleteJob {
 /// Run a [`DeleteJob`] on the pool, waking the window when it finishes. The
 /// git shellouts and checkout hooks are slow enough to stutter paint, so the
 /// caller confirms the dialog, hands the work here, and adopts the result (an
-/// error to surface, or nothing) from the returned handle — the sidebar row
+/// error to surface, or nothing) from the returned handle. The sidebar row
 /// shows a spinner until it lands, so this runs at interactive priority.
 pub(crate) fn spawn_delete<H: CheckoutHook + Send + 'static>(
     project_root: PathBuf,
@@ -670,13 +670,13 @@ fn prune_worktree(
     let wt = repo
         .find_worktree(worktree_name)
         .map_err(|e| format!("failed to find worktree `{worktree_name}`: {}", e.message()))?;
-    // Default prune options refuse valid or locked worktrees — exactly the
-    // safety we want if the directory reappeared since discovery; the error
-    // surfaces to the caller.
+    // Default prune options refuse valid or locked worktrees. That is exactly
+    // the safety we want if the directory reappeared since discovery; the
+    // error surfaces to the caller.
     wt.prune(None).map_err(|e| format!("failed to prune: {}", e.message()))?;
     if delete_branch {
         if let Some(branch) = branch {
-            // Branch may already be gone — ignore errors, as delete_worktree does.
+            // Ignore errors as delete_worktree does. The branch may be gone.
             let _ = run_git(project_root, &["branch", "-D", branch]);
         }
     }
@@ -909,7 +909,7 @@ mod tests {
             if let Ok((mut stream, _)) = listener.accept() {
                 let _ = conn_tx.send(());
                 // Drain whatever the client sends without ever replying,
-                // until it closes the connection (killed or otherwise) — a
+                // until it closes the connection (killed or otherwise). A
                 // single short read returns as soon as *any* bytes arrive
                 // and would drop the connection right after the client's
                 // request, well before the read it actually blocks on.

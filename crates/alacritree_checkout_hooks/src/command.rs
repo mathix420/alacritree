@@ -1,5 +1,5 @@
-//! Hooks the user defines: a program and one argv template per event, in
-//! the same shape as the custom diff viewer.
+//! Hooks the user defines. Each is a program and one argv template per
+//! event, in the same shape as the custom diff viewer.
 
 use std::collections::BTreeMap;
 
@@ -57,7 +57,7 @@ fn enabled_by_default() -> bool {
     true
 }
 
-/// The name a distro's login shell finds `path` by: a native path, possibly
+/// The name a distro's login shell finds `path` by. A native path, possibly
 /// a Windows one, means nothing inside the distro.
 fn lookup_name(path: &str) -> String {
     std::path::Path::new(path)
@@ -202,8 +202,8 @@ mod tests {
         jobs::on_this_thread(|b| hook.on_created(&e, b))
     }
 
-    /// A path with spaces or quotes must stay one argument: the program is
-    /// run directly, never through a shell that would split it.
+    /// A path with spaces or quotes must stay one argument. The program runs
+    /// directly, never through a shell that would split it.
     #[test]
     fn placeholders_expand_to_exactly_one_argument_each() {
         let e = Checkout { main: Path::new("/src/my repo"), checkout: Path::new("/wt/it's ü") };

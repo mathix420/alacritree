@@ -7,10 +7,10 @@ use super::*;
 /// closed; `update` paints whichever are open.
 #[derive(Default)]
 pub(super) struct Modals {
-    /// A modal popup carrying a failure message the user must dismiss.  Every
-    /// failure that has no inline home lands here — a background action (e.g. a
+    /// A modal popup carrying a failure message the user must dismiss. Every
+    /// failure that has no inline home lands here: a background action (e.g. a
     /// worktree delete) that failed after its dialog closed, or a shell that
-    /// would not spawn.  Dismissing it leaves the app usable, which an error
+    /// would not spawn. Dismissing it leaves the app usable, which an error
     /// painted over the terminal would not.
     pub(super) error_dialog: Option<String>,
     pub(super) quit_dialog_open: bool,
@@ -80,8 +80,8 @@ impl AlacritreeApp {
                 Some(counts) => {
                     // A known-dirty count preloads `force` so confirming goes
                     // straight to a forced removal, with the discard warning
-                    // already on screen — the same outcome a warm cache gets
-                    // at request time, just landing a frame later.
+                    // already on screen. That is the same outcome a warm cache
+                    // gets at request time, just landing a frame later.
                     req.force = counts.is_dirty();
                     req.dirty = Some(counts);
                     req.dirty_job = None;
@@ -200,7 +200,7 @@ impl AlacritreeApp {
             return;
         };
         let Some(session) = self.sessions.iter().find(|s| s.id == id) else {
-            // Exited between the click and this frame — nothing left to close.
+            // Exited between the click and this frame. Nothing is left to close.
             self.modals.pending_session_close = None;
             return;
         };
@@ -406,7 +406,7 @@ impl AlacritreeApp {
             return;
         };
 
-        // Enter and Esc both just dismiss — there's nothing to confirm.
+        // Enter and Esc both just dismiss, since there's nothing to confirm.
         let (cancel_via_key, confirm_via_key) =
             consume_modal_keys(ctx, &self.modals.gate, ModalKind::Error);
         let frame = modal_frame(&theme);
@@ -505,7 +505,7 @@ impl AlacritreeApp {
     /// Adopt finished background deletes: pop up any failure and refresh the
     /// affected project so the removed worktree (or its spinner) drops out of
     /// the sidebar. A refusal that names a dirty or untracked tree reopens the
-    /// confirm as a forced retry instead of surfacing a plain error — git is
+    /// confirm as a forced retry instead of surfacing a plain error. Git is
     /// the authority on whether the removal would lose work, not a count read
     /// while the user was staring at the first dialog.
     pub(super) fn poll_pending_deletes(&mut self, ctx: &Context) {
@@ -556,7 +556,7 @@ impl AlacritreeApp {
             match f.result {
                 Ok(()) => {},
                 // Only opens the retry when no confirm is currently on
-                // screen — reopening unconditionally would swap the dialog
+                // screen. Reopening unconditionally would swap the dialog
                 // contents under a user looking at an unrelated confirm
                 // (same modal id, so an in-flight Enter would force-delete
                 // the wrong worktree), and a second refusal landing in this
@@ -604,7 +604,7 @@ impl AlacritreeApp {
                         done = Some(result);
                         break;
                     },
-                    // Nothing more this frame either way — a worker that
+                    // Nothing more this frame either way. A worker that
                     // unwound instead of reporting comes back through the
                     // failure latch below, so its placeholder row is
                     // replaced rather than left standing forever.
@@ -655,7 +655,7 @@ impl AlacritreeApp {
                 ui.spacing_mut().item_spacing.y = 6.0 * s;
                 ui.label(RichText::new(format!("Rename `{dir_name}`")).color(theme.text).strong());
                 ui.label(
-                    RichText::new("Sidebar name only — the directory is untouched.")
+                    RichText::new("Sidebar name only. The directory is untouched.")
                         .color(theme.text_muted)
                         .small(),
                 );
@@ -821,7 +821,7 @@ impl AlacritreeApp {
             picker.cursor = (picker.cursor + 1).min(filtered.len());
         }
         // While the listing is pending or failed, `filtered` is empty, so
-        // cursor 0 would resolve to Auto — applying it on Enter would clear
+        // cursor 0 would resolve to Auto, and applying it on Enter would clear
         // an existing override on a reflexive keypress rather than the no-op
         // that state should produce. Clicking Auto still works either way
         // (see `auto.clicked()` above); only the keyboard shortcut is gated.
@@ -973,7 +973,7 @@ impl AlacritreeApp {
             return None;
         }
         if confirm_via_key || create_clicked {
-            // Whitespace runs become single hyphens — `some text like this` →
+            // Whitespace runs become single hyphens: `some text like this` →
             // `some-text-like-this`.
             let canonical: String = branch.split_whitespace().collect::<Vec<_>>().join("-");
             if let Err(msg) = wt::validate_branch_name(&canonical) {
@@ -1169,8 +1169,8 @@ impl AlacritreeApp {
 /// it got to.
 const CREATE_WORKER_PANICKED: &str = "the background worker panicked";
 
-/// A modal action button.  Framed and filled so it reads as clickable —
-/// frameless text buttons looked like captions and users reached for the
+/// A modal action button. Framed and filled so it reads as clickable.
+/// Frameless text buttons looked like captions and users reached for the
 /// keyboard hint instead of the mouse.
 fn modal_button(
     ui: &mut egui::Ui,
@@ -1302,14 +1302,14 @@ pub(super) struct BaseBranchPicker {
 /// `worktree remove`) said before the message was reworded.
 ///
 /// `worktree.rs`'s failure string is `git <args>: fatal: '<path>' <reason>`,
-/// and `<path>` (attacker- or at least user-controlled) is echoed twice —
-/// once in the command args, once quoted right after `fatal:`. Matching
+/// and `<path>` (attacker- or at least user-controlled) is echoed twice,
+/// once in the command args and once quoted right after `fatal:`. Matching
 /// against the raw message would let a worktree path that happens to spell
 /// out one of these fragments turn an unrelated failure (locked tree, main
-/// worktree, filesystem error) into a false "needs --force" prompt. Since
-/// git's own wording always lands after the closing quote of the path — never
-/// inside it — cutting the tail at the last `'` drops both copies of the path
-/// and leaves only text git itself authored.
+/// worktree, filesystem error) into a false "needs --force" prompt. Git's own
+/// wording always lands after the closing quote of the path, never inside it,
+/// so cutting the tail at the last `'` drops both copies of the path and
+/// leaves only text git itself authored.
 pub(super) fn refused_for_unsaved_work(message: &str) -> bool {
     let tail = message.rsplit_once("fatal:").map_or(message, |(_, tail)| tail);
     let reason = tail.rsplit_once('\'').map_or(tail, |(_, after)| after).to_ascii_lowercase();
@@ -1362,13 +1362,13 @@ pub(super) fn dirty_parts(counts: &DirtyCounts) -> String {
 ///
 /// `counts` is `None` until a count lands (`checking`) or after a probe
 /// failed and left nothing to show (`!checking`). `force` is whether this
-/// confirm would pass `--force` — a first attempt whose resolved count is
+/// confirm would pass `--force`: a first attempt whose resolved count is
 /// already known dirty, or the retry after git refused an unforced removal.
 ///
 /// `force` is checked first: a forced retry followed git's own refusal, so
 /// it is never safe to render "nothing to warn about" for it, regardless of
-/// what `counts` holds — a stale-clean read, or none at all (the request was
-/// confirmed before its probe landed, which cancelled the probe).
+/// what `counts` holds, whether a stale-clean read or none at all (the
+/// request was confirmed before its probe landed, which cancelled the probe).
 pub(super) fn dirty_warning(
     counts: Option<&DirtyCounts>,
     force: bool,
@@ -1378,7 +1378,7 @@ pub(super) fn dirty_warning(
         return Some(match counts.filter(|c| c.is_dirty()) {
             Some(counts) => {
                 format!(
-                    "Working tree has {} file(s) — they will be discarded with --force.",
+                    "Working tree has {} file(s). They will be discarded with --force.",
                     dirty_parts(counts)
                 )
             },
