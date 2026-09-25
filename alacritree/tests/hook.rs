@@ -17,6 +17,21 @@ fn succeeds(program: &str, args: &[&str]) -> bool {
     hidden(program).args(args).output().is_ok_and(|o| o.status.success())
 }
 
+/// Runs a setup step that must succeed, and fails with what it printed when
+/// it does not. wsl.exe prints its own errors on stdout, in UTF-16 unless
+/// `WSL_UTF8` is set.
+#[allow(clippy::disallowed_methods)]
+fn run(program: &str, args: &[&str]) {
+    let out = hidden(program).env("WSL_UTF8", "1").args(args).output().expect("setup runs");
+    assert!(
+        out.status.success(),
+        "{program} {args:?} failed ({}): {}{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// A repository, a private taskrc and a private config dir, so nothing the
 /// developer owns is read or written. Taskwarrior 3 has no Windows build, so
 /// a host without a native one keeps the repository and taskrc inside the
@@ -34,7 +49,7 @@ fn with_task() -> Option<Sandbox> {
         let work = tempfile::tempdir().unwrap();
         let repo = work.path().join("myrepo");
         std::fs::create_dir(&repo).unwrap();
-        assert!(succeeds("git", &["-C", repo.to_str()?, "init", "-q", "-b", "main"]));
+        run("git", &["-C", repo.to_str()?, "init", "-q", "-b", "main"]);
         std::fs::write(work.path().join("taskrc"), "").unwrap();
         let root = work.path().to_str()?.to_string();
         let env = vec![("TASKRC", format!("{root}/taskrc")), ("TASKDATA", format!("{root}/data"))];
@@ -51,7 +66,7 @@ fn with_task() -> Option<Sandbox> {
     std::fs::create_dir(&repo).unwrap();
     let linux_repo = format!("{root}/myrepo");
     let init = ["-d", &distro, "-e", "git", "-C", &linux_repo, "init", "-q", "-b", "main"];
-    assert!(succeeds("wsl.exe", &init));
+    run("wsl.exe", &init);
     std::fs::write(work.path().join("taskrc"), "").unwrap();
     let env = vec![
         ("TASKRC", format!("{root}/taskrc")),
