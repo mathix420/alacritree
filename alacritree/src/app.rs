@@ -48,7 +48,6 @@ use crate::shell_decision::{ShellDecision, shell_decision};
 use crate::sidebar_model::{SidebarInputs, SidebarModel, Step};
 use crate::sidebar_nav::{self, SidebarRow, StepTarget};
 use crate::state::{self, PersistedProject};
-use crate::upstream::UpstreamState;
 use crate::workspace::WorkspaceKey;
 use crate::worktree::{self as wt, CreateRequest, Progress};
 use crate::wsl::{self, ShellChoice};
@@ -57,6 +56,7 @@ use crate::{
     clipboard_image, file_drop, ipc, jobs, mouse_hide, notify, paste, path_style, scratchpad,
     sidebar_focus, terminal_view, worktree_liveness,
 };
+use alacritree_vcs::UpstreamState;
 
 mod actions;
 mod focus;

@@ -241,7 +241,9 @@ The GitHub CLI behind PR badges and diff base branches.
 
 The git CLI, for the commands alacritree spawns. Repository reads go through libgit2, and scripts inside WSL find git on that distro's PATH.
 
+- `enabled` (boolean, default `true`): Recognize git repositories. Off, every git project is a plain folder: no worktree rows, no git panel and no pull request badges.
 - `path` (string, default `"git"`): The program to run on Windows or natively. Its own name is looked up on PATH; any other value runs as written.
+- `show_icon` (boolean, default `false`): Draw git's icon on the project rows of git repositories.
 - `wsl_path` (string, default `""`): The program to run inside every WSL distro, as written. Empty finds it by name through the distro's login shell.
 
 ### `[integrations.herdr]`

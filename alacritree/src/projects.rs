@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use git2::Repository;
 use serde_json::{Value, json};
 
-use crate::default_branch::{self, Evidence, WellKnown};
 use crate::{jobs, wsl};
+use alacritree_git::{self as default_branch, Evidence, WellKnown};
 
 #[derive(Debug, Clone)]
 pub struct Project {
@@ -40,7 +40,7 @@ pub struct Worktree {
     pub prunable: bool,
     /// Upstream state for `branch`, when the feature is enabled and the
     /// backend could answer.
-    pub upstream: Option<crate::upstream::UpstreamState>,
+    pub upstream: Option<alacritree_vcs::UpstreamState>,
 }
 
 /// A discovery result and whether it can be trusted to replace an existing
@@ -942,7 +942,7 @@ sep
 
         assert_eq!(
             with_flag.worktrees[0].upstream,
-            Some(crate::upstream::UpstreamState::Level { upstream: "upstream-branch".to_string() }),
+            Some(alacritree_vcs::UpstreamState::Level { upstream: "upstream-branch".to_string() }),
             "a real upstream must be found when the flag is on"
         );
         assert_eq!(

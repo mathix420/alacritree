@@ -1,0 +1,24 @@
+[package]
+name = "alacritree_git"
+version = "0.0.0"
+license = "Apache-2.0"
+description = "Git behind alacritree's version control trait, through libgit2 natively and git in WSL"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+# Repository fixtures for other crates' tests.
+test-support = []
+
+[dependencies]
+alacritree_common.workspace = true
+alacritree_vcs.workspace = true
+git2 = { version = "0.20", default-features = false }
+schemars = "1.2"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+alacritree_common = { workspace = true, features = ["test-support"] }
+alacritree_vcs = { workspace = true, features = ["test-support"] }
+tempfile = "3"

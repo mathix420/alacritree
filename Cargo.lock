@@ -68,10 +68,12 @@ dependencies = [
  "alacritree_doppler",
  "alacritree_forge",
  "alacritree_gh",
+ "alacritree_git",
  "alacritree_herdr",
  "alacritree_multiplexer",
  "alacritree_tasks",
  "alacritree_taskwarrior",
+ "alacritree_vcs",
  "alacritree_zellij",
  "alacritty_terminal",
  "ambassador",
@@ -200,6 +202,18 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "alacritree_git"
+version = "0.0.0"
+dependencies = [
+ "alacritree_common",
+ "alacritree_vcs",
+ "git2",
+ "schemars",
+ "serde",
  "tempfile",
 ]
 

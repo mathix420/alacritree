@@ -22,7 +22,6 @@ pub mod config;
 pub mod crash_log;
 pub(crate) mod cursor;
 pub(crate) mod decoration_sprites;
-pub mod default_branch;
 pub(crate) mod digest;
 pub mod dll_search;
 pub(crate) mod file_drop;
@@ -76,6 +75,7 @@ pub(crate) mod terminal_view;
 mod test_util;
 pub use alacritree_common::tools;
 pub(crate) mod upstream;
+pub mod vcs;
 #[cfg(windows)]
 pub mod win_session;
 pub(crate) mod workspace;

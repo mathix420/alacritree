@@ -32,6 +32,7 @@ alacritree_diff_viewer = { path = "crates/alacritree_diff_viewer" }
 alacritree_doppler = { path = "crates/alacritree_doppler" }
 alacritree_forge = { path = "crates/alacritree_forge" }
 alacritree_gh = { path = "crates/alacritree_gh" }
+alacritree_git = { path = "crates/alacritree_git" }
 alacritree_herdr = { path = "crates/alacritree_herdr" }
 alacritree_multiplexer = { path = "crates/alacritree_multiplexer" }
 alacritree_tasks = { path = "crates/alacritree_tasks" }

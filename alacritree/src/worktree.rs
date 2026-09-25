@@ -14,10 +14,10 @@ use alacritree_checkout_hooks::{CheckoutEvent, CheckoutHook, CheckoutHooks};
 
 use crate::checkout_hooks::Hook;
 use crate::config::{Config, WorkspaceConfig};
-use crate::default_branch::{self, Evidence, WellKnown};
 use crate::repaint::Repaint;
 use crate::tools::{self, Tool};
 use crate::{command_ext, jobs, wsl};
+use alacritree_git::{self as default_branch, Evidence, WellKnown};
 
 #[derive(Debug)]
 pub(crate) enum Progress {

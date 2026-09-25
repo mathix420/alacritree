@@ -2,24 +2,8 @@
 
 use std::collections::HashMap;
 
+use alacritree_vcs::UpstreamState;
 use git2::{BranchType, ErrorCode, Repository};
-
-/// What a branch's configured upstream is doing.  Nothing here contacts a
-/// remote, so every state describes local refs only.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UpstreamState {
-    /// Tracks `upstream` and matches it.
-    Level { upstream: String },
-    /// Tracks `upstream` and differs from it.
-    Diverged { upstream: String, ahead: usize, behind: usize },
-    /// `branch.<name>.remote` and `.merge` name `upstream`, but no such
-    /// reference exists locally.  A merged-and-deleted remote branch looks
-    /// like this only once something has pruned.
-    Gone { upstream: String },
-    /// No upstream is configured.  Not the same as "never pushed": `git push
-    /// origin <branch>` without `-u` pushes without configuring one.
-    Untracked,
-}
 
 /// Parse the tab-delimited output of
 /// `git for-each-ref

@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 
 use git2::{Delta, DiffOptions, Repository, Status, StatusOptions};
 
-use crate::default_branch::{self, Evidence, WellKnown};
 use crate::repaint::Repaint;
 use crate::{jobs, wsl};
+use alacritree_git::{self as default_branch, Evidence, WellKnown};
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 

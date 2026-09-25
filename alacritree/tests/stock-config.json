@@ -94,7 +94,9 @@
       "wsl_path": null
     },
     "git": {
+      "enabled": true,
       "path": "git",
+      "show_icon": false,
       "wsl_path": null
     },
     "herdr": {

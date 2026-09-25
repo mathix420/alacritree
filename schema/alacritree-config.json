@@ -769,10 +769,20 @@
     },
     "RawGit": {
       "properties": {
+        "enabled": {
+          "default": true,
+          "description": "Recognize git repositories. Off, every git project is a plain folder:\nno worktree rows, no git panel and no pull request badges.",
+          "type": "boolean"
+        },
         "path": {
           "default": "git",
           "description": "The program to run on Windows or natively. Its own name is\nlooked up on PATH; any other value runs as written.",
           "type": "string"
+        },
+        "show_icon": {
+          "default": false,
+          "description": "Draw git's icon on the project rows of git repositories.",
+          "type": "boolean"
         },
         "wsl_path": {
           "default": "",

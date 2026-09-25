@@ -26,7 +26,7 @@ use strum::{EnumCount, EnumIter, IntoStaticStr};
 
 use crate::bindings::{self, KeyBinding};
 use crate::path_style::PathStyle;
-use crate::tools::{Tool, ToolConfig, ToolPaths, tool_config};
+use crate::tools::{Tool, ToolConfig, ToolPaths};
 
 /// `[env]` carries whatever the user's environment carries, and a config dump
 /// ends up attached to bug reports.  Key names survive: that `FOO` was set is
@@ -600,7 +600,7 @@ impl PasteConfig {
 /// buttons. General sidebar and terminal appearance stays under `[ui]`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct IntegrationsConfig {
-    pub git: ToolConfig,
+    pub git: alacritree_git::GitConfig,
     pub gh: alacritree_gh::GhConfig,
     pub doppler: alacritree_doppler::DopplerConfig,
     pub checkout_hooks: Vec<alacritree_checkout_hooks::CommandHook>,
@@ -2831,7 +2831,7 @@ impl Default for RawUiPaste {
 struct RawIntegrations {
     /// The git CLI, for the commands alacritree spawns. Repository reads go
     /// through libgit2, and scripts inside WSL find git on that distro's PATH.
-    git: RawGit,
+    git: alacritree_git::RawGit,
     /// The GitHub CLI behind PR badges and diff base branches.
     gh: alacritree_gh::RawGh,
     /// The Doppler CLI behind scope mirroring for new worktrees.
@@ -2854,35 +2854,10 @@ struct RawIntegrations {
     diff_viewer: alacritree_diff_viewer::RawDiffViewer,
 }
 
-/// Declares an `[integrations.<tool>]` table whose only keys name it on each
-/// side of a Windows and WSL installation.
-macro_rules! raw_tool_table {
-    ($raw:ident, $program:literal) => {
-        #[derive(Debug, Deserialize, JsonSchema)]
-        #[serde(default)]
-        struct $raw {
-            /// The program to run on Windows or natively. Its own name is
-            /// looked up on PATH; any other value runs as written.
-            path: String,
-            /// The program to run inside every WSL distro, as written. Empty
-            /// finds it by name through the distro's login shell.
-            wsl_path: String,
-        }
-
-        impl Default for $raw {
-            fn default() -> Self {
-                Self { path: $program.to_string(), wsl_path: String::new() }
-            }
-        }
-    };
-}
-
-raw_tool_table!(RawGit, "git");
-
 impl RawIntegrations {
     fn resolve(self, moved: MovedUiKeys) -> IntegrationsConfig {
         IntegrationsConfig {
-            git: tool_config(self.git.path, self.git.wsl_path, Tool::Git),
+            git: self.git.resolve(),
             gh: self.gh.resolve(moved.gh),
             doppler: self.doppler.resolve(),
             checkout_hooks: self.checkout_hooks.resolve(),
