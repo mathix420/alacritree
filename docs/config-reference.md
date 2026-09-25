@@ -511,6 +511,8 @@ Sidebar glyph overrides.
   - The table form takes the same keys as `integrations.herdr.icon`.
 - `upstream_untracked` (string or table, default `"↑"`): A branch that tracks nothing.
   - The table form takes the same keys as `integrations.herdr.icon`.
+- `vcs_git` (string or table, default `"⎇"`): Before a git repository's name, when `[integrations.git] show_icon` is set.
+  - The table form takes the same keys as `integrations.herdr.icon`.
 - `worktree` (string or table, default `"○"`): A linked worktree.
   - The table form takes the same keys as `integrations.herdr.icon`.
 - `worktree_main` (string or table, default `"●"`): A project's main checkout.

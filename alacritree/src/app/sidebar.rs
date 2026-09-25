@@ -482,8 +482,13 @@ impl AlacritreeApp {
                     rows,
                 });
             }
+            let integrations = &self.config.integrations;
             views.push(ProjectView {
                 label: self.row_labels.project_label(project),
+                backend_icon: project
+                    .vcs
+                    .as_ref()
+                    .is_some_and(|v| shows_backend_icon(v, integrations)),
                 attention: self.project_needs_attention(project),
                 worktrees,
             });
@@ -750,6 +755,8 @@ impl FilterMembership {
 
 struct ProjectView {
     label: String,
+    /// Draw the project's version control icon before its name.
+    backend_icon: bool,
     attention: bool,
     worktrees: Vec<WorktreeView>,
 }
@@ -1075,6 +1082,9 @@ fn project_row_title(
         theme.icon_tooltips,
     )
     .clicked();
+    if paint.view.projects.get(idx).is_some_and(|p| p.backend_icon) {
+        paint_backend_icon(ui, theme, &icons.vcs_git);
+    }
     let name = paint.view.projects.get(idx).map_or(project.display_name(), |p| p.label.as_str());
     let (resp, galley) = truncating_label(
         ui,
@@ -1083,6 +1093,27 @@ fn project_row_title(
         egui::Sense::click(),
     );
     (expand_clicked, name_tooltip(resp, name, galley.elided, theme.sidebar_tooltips))
+}
+
+/// Whether a project row draws its backend's icon. Only git has one, and
+/// only when its section asks for it.
+fn shows_backend_icon(
+    vcs: &crate::vcs::Vcs,
+    integrations: &crate::config::IntegrationsConfig,
+) -> bool {
+    match vcs {
+        crate::vcs::Vcs::Git(_) => integrations.git.show_icon,
+        #[cfg(test)]
+        crate::vcs::Vcs::Fake(_) => false,
+    }
+}
+
+/// Centered into the row's icon slot, as the worktree rows' icons are.
+fn paint_backend_icon(ui: &mut egui::Ui, theme: &Theme, style: &IconStyle<Color32>) {
+    let (rect, _) = ui.allocate_exact_size(row_status_icon_size(theme), egui::Sense::hover());
+    let (glyph, font, color) =
+        resolve_icon(style, crate::config::DEFAULT_VCS_GIT_ICON, theme.text_dim, 10.0, 10.0, theme);
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, glyph, font, color);
 }
 
 /// The project row's trailing buttons: remove, refresh, new worktree, and the
@@ -2477,6 +2508,21 @@ fn drag_handle(ui: &mut egui::Ui, theme: &Theme) -> egui::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_rows_draw_no_backend_icon_by_default() {
+        let integrations = crate::config::IntegrationsConfig::default();
+        let vcs = crate::vcs::backends(&integrations).remove(0);
+        assert!(!shows_backend_icon(&vcs, &integrations));
+    }
+
+    #[test]
+    fn show_icon_draws_the_git_icon() {
+        let mut integrations = crate::config::IntegrationsConfig::default();
+        integrations.git.show_icon = true;
+        let vcs = crate::vcs::backends(&integrations).remove(0);
+        assert!(shows_backend_icon(&vcs, &integrations));
+    }
 
     #[test]
     fn a_session_row_takes_no_drop_of_its_own_session() {

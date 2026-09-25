@@ -47,7 +47,8 @@ impl LabelTemplates {
     /// `$branch` (absent when detached, so `${branch:...}` falls back),
     /// `$path` (full worktree path), `$pr` (the branch's PR number as
     /// `#123`, absent when none is known — `${pr:}` shows it only when one
-    /// exists).
+    /// exists), `$distance` (commits from the branch to the head as `+3`,
+    /// absent when the branch is the head, which it always is in git).
     pub(crate) fn worktree_label(&mut self, wt: &Checkout, pr: Option<&PrInfo>) -> String {
         let Some(template) = self.worktree.clone() else {
             return wt.name.clone();
@@ -60,6 +61,9 @@ impl LabelTemplates {
         vars.insert("path".to_string(), crate::wsl::display_path(&wt.path));
         if let Some(pr) = pr {
             vars.insert("pr".to_string(), format!("#{}", pr.number));
+        }
+        if let Some(distance) = wt.head.distance {
+            vars.insert("distance".to_string(), format!("+{distance}"));
         }
         self.render_or_fallback("worktree_name", &template, &vars, &wt.name)
     }
@@ -120,6 +124,15 @@ mod tests {
             gone: false,
             upstream: None,
         }
+    }
+
+    #[test]
+    fn distance_renders_as_plus_n_and_is_absent_on_its_name() {
+        let mut labels = LabelTemplates::new(Some("${branch} ${distance:}".into()), None);
+        let mut row = wt("alpha", Some("feature"));
+        assert_eq!(labels.worktree_label(&row, None), "feature");
+        row.head.distance = Some(3);
+        assert_eq!(labels.worktree_label(&row, None), "feature +3");
     }
 
     fn project(name: &str, label: Option<&str>) -> Project {

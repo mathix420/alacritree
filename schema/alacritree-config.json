@@ -1056,6 +1056,11 @@
           "default": "↑",
           "description": "A branch that tracks nothing."
         },
+        "vcs_git": {
+          "$ref": "#/$defs/RawIconStyle",
+          "default": "⎇",
+          "description": "Before a git repository's name, when `[integrations.git] show_icon`\nis set."
+        },
         "worktree": {
           "$ref": "#/$defs/RawIconStyle",
           "default": "○",
@@ -1819,6 +1824,7 @@
             "upstream_gone": "⌫",
             "upstream_level": "✓",
             "upstream_untracked": "↑",
+            "vcs_git": "⎇",
             "worktree": "○",
             "worktree_main": "●"
           },

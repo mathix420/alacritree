@@ -499,6 +499,13 @@
         "italic": false,
         "size": null
       },
+      "vcs_git": {
+        "bold": false,
+        "color": null,
+        "glyph": "⎇",
+        "italic": false,
+        "size": null
+      },
       "worktree": {
         "bold": false,
         "color": null,
