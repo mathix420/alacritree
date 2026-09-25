@@ -426,7 +426,7 @@ pub struct AlacritreeApp {
     /// In-flight background re-discoveries, keyed by project root.  Neither
     /// backend may block paint: wsl.exe takes seconds while the distro VM
     /// boots, and native discovery takes tens of milliseconds on a project
-    /// with many worktrees.  Results are adopted in `poll_project_refreshes`.
+    /// with many worktrees. Results are adopted in `poll_project_refreshes`.
     ///
     /// IPC callers are answered only once the result is live, since a client
     /// that refreshes a project to act on the new worktree list would
@@ -1561,9 +1561,9 @@ impl AlacritreeApp {
         if linked { self.is_gone(path) } else { !path.is_dir() }
     }
 
-    /// Whether the owning backend calls this checkout gone.  The row, the
+    /// Whether the owning backend calls this checkout gone. The row, the
     /// activate guard and the spawn guard all ask this, so a greyed row and a
-    /// refused shell never disagree about the same directory.  A probe that
+    /// refused shell never disagree about the same directory. A probe that
     /// could not tell answers `false`: an unreachable filesystem must not
     /// turn into a refusal.
     fn is_gone(&self, path: &Path) -> bool {

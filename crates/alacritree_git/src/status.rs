@@ -27,7 +27,7 @@ pub(crate) fn status(
 /// Cheap dirty check used by the delete modal when the git panel has never
 /// polled this worktree: avoids the branch-diff work that a status does,
 /// since we only need to know whether `git worktree remove` will refuse the
-/// path. Takes `&jobs::Blocking` because it shells out — call it from a pool
+/// path. Takes `&jobs::Blocking` because it shells out. Call it from a pool
 /// job, never from the UI thread.
 pub(crate) fn dirty(path: &Path, blocking: &jobs::Blocking) -> Result<Dirty, VcsError> {
     match wsl::classify(path) {
@@ -187,15 +187,9 @@ fn diff_against_branch(
         .interhunk_lines(0);
     let diff = repo.diff_tree_to_tree(Some(&base_tree), Some(&head_tree), Some(&mut opts))?;
 
-    // Single foreach pass: `file_cb` seeds a `DiffStat` per changed file and
-    // `line_cb` bumps additions/deletions on the most-recently-seeded entry.
-    // libgit2 calls `file_cb` once per file and then streams that file's
-    // lines before moving on, so tracking "current index" is sufficient.
-    //
-    // This replaces a `Patch::from_diff(diff, i)` loop that, for every file,
-    // re-fetched both blobs and re-ran the diff algorithm just so a
-    // throw-away `line_stats()` could count +/- — easily the dominant cost
-    // on branches with hundreds of changes.
+    // libgit2 streams each file's lines right after its `file_cb`, so
+    // `line_cb` counts into the entry seeded last. A `Patch` per file would
+    // fetch both blobs and rerun the diff just to count lines.
     struct Accum {
         stats: Vec<DiffStat>,
         current: Option<usize>,
@@ -237,7 +231,7 @@ fn diff_against_branch(
     Ok((accum.into_inner().stats, resolved))
 }
 
-/// Everything one refresh tick asks a WSL distro.  `$1` is the repository and
+/// Everything one refresh tick asks a WSL distro. `$1` is the repository and
 /// `$2` a recorded base branch, empty when there is none.
 ///
 /// The default branch is picked inside the round trip rather than back in
@@ -267,7 +261,7 @@ printf '%s' "$base""#,
         )
 }
 
-/// One wsl.exe round trip per refresh tick.  Runs on `spawn_compute`'s
+/// One wsl.exe round trip per refresh tick. Runs on `spawn_compute`'s
 /// worker thread, so the ~400 ms round trip never blocks paint.
 fn compute_wsl(
     distro: &str,
@@ -326,9 +320,9 @@ fn resolve_base_commit<'a>(
     Err(git2::Error::from_str(&format!("default branch '{branch}' not found")))
 }
 
-/// Map porcelain-v2 `XY` state chars to the sidebar's kinds.  X is the
+/// Map porcelain-v2 `XY` state chars to the sidebar's kinds. X is the
 /// index-vs-HEAD (staged) side, Y the worktree-vs-index (unstaged) side;
-/// `.` means unchanged on that side.  Mirrors `staged_kind`/`unstaged_kind`.
+/// `.` means unchanged on that side. Mirrors `staged_kind`/`unstaged_kind`.
 fn staged_kind_v2(x: char) -> Option<ChangeKind> {
     match x {
         'A' => Some(ChangeKind::Added),
@@ -349,8 +343,8 @@ fn unstaged_kind_v2(y: char) -> Option<ChangeKind> {
 }
 
 /// Parse `git status --porcelain=v2 -z` into the same (staged, unstaged)
-/// split the git2 arm produces.  Records are NUL-terminated; rename records
-/// (`2 …`) are followed by an extra NUL-separated token holding the rename
+/// split the git2 arm produces. Records are NUL-terminated; rename records
+/// (`2 ...`) are followed by an extra NUL-separated token holding the rename
 /// source, which the sidebar doesn't show.
 fn parse_status_v2_z(bytes: &[u8]) -> (Vec<FileChange>, Vec<FileChange>) {
     let mut staged = Vec::new();
@@ -363,7 +357,7 @@ fn parse_status_v2_z(bytes: &[u8]) -> (Vec<FileChange>, Vec<FileChange>) {
         let line = String::from_utf8_lossy(token);
         let Some((kind, rest)) = line.split_once(' ') else { continue };
         match kind {
-            // `1 XY sub mH mI mW hH hI path` — path is the 8th field and may
+            // `1 XY sub mH mI mW hH hI path`. The path is the 8th field and may
             // contain spaces, so bound the split.
             "1" => {
                 let mut fields = rest.splitn(8, ' ');
@@ -382,7 +376,7 @@ fn parse_status_v2_z(bytes: &[u8]) -> (Vec<FileChange>, Vec<FileChange>) {
                     push_xy(xy, path, &mut staged, &mut unstaged);
                 }
             },
-            // `u XY sub m1 m2 m3 mW h1 h2 h3 path` — conflicts land in the
+            // `u XY sub m1 m2 m3 mW h1 h2 h3 path`. Conflicts land in the
             // staged list, matching the git2 arm.
             "u" => {
                 if let Some(path) = rest.splitn(10, ' ').nth(9) {
@@ -492,7 +486,9 @@ mod tests {
     fn a_blank_branch_section_means_the_repository_could_not_be_opened() {
         let err = status_from_batch("/home/lev/proj", None, recorded(&["", "", "", "", "", ""]))
             .unwrap_err();
-        assert!(matches!(err, VcsError::NotARepository(path) if path == Path::new("/home/lev/proj")));
+        assert!(
+            matches!(err, VcsError::NotARepository(path) if path == Path::new("/home/lev/proj"))
+        );
     }
 
     #[test]
@@ -529,8 +525,7 @@ mod tests {
 
     #[test]
     fn a_detached_checkout_whose_batch_stopped_early_still_reports_a_status() {
-        let status =
-            status_from_batch("/home/lev/proj", None, recorded(&["", "abc1234"])).unwrap();
+        let status = status_from_batch("/home/lev/proj", None, recorded(&["", "abc1234"])).unwrap();
         assert_eq!(status.head.label(), Some("abc1234"));
     }
 

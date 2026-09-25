@@ -6,10 +6,10 @@ use std::path::Path;
 use alacritree_vcs::{Liveness, Probe};
 
 /// Whether `path` is still a worktree checkout, which is `.git`'s presence
-/// rather than the directory's.  `git worktree remove` deletes the contents
+/// rather than the directory's. `git worktree remove` deletes the contents
 /// first and only then the directory itself, so a remove that loses the last
-/// step — the usual outcome on Windows, where a shell sitting in the directory
-/// pins it — leaves an empty husk behind.  Git calls that worktree gone and
+/// step leaves an empty husk behind. That is the usual outcome on Windows,
+/// where a shell sitting in the directory pins it. Git calls that worktree gone and
 /// refuses to remove it twice ("validation failed: '<path>/.git' does not
 /// exist"); stat'ing the directory would call it alive.
 ///
@@ -77,7 +77,7 @@ mod tests {
     }
 
     /// `git worktree remove` deletes the contents and only then the directory,
-    /// so on Windows a shell sitting in it leaves this behind.  Git treats the
+    /// so on Windows a shell sitting in it leaves this behind. Git treats the
     /// worktree as gone; stat'ing the directory would not.
     #[test]
     fn the_husk_left_by_a_half_finished_remove_is_missing() {

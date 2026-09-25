@@ -15,16 +15,16 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 /// frozen panel is recorded while the process that froze it is still alive.
 const STALL_WARNING: Duration = Duration::from_secs(120);
 
-/// What the panel shows for a compute whose worker unwound.  The panic itself
+/// What the panel shows for a compute whose worker unwound. The panic itself
 /// is logged from the pool; the row only needs to stop claiming knowledge it
 /// does not have.
 const WORKER_DIED: &str = "the background worker did not finish";
 
-/// Background-refreshed cache.  A status walks the working tree and runs a
-/// tree-to-tree diff against the default branch — on a large repo that can
+/// Background-refreshed cache. A status walks the working tree and runs a
+/// tree-to-tree diff against the default branch. On a large repo that can
 /// take long enough to be felt as a stutter when done on the UI thread, so we
 /// spawn the work on a helper thread and let `poll` adopt the result on a
-/// later frame.  Callers always see the last known status immediately.
+/// later frame. Callers always see the last known status immediately.
 pub(crate) struct StatusCache {
     path: PathBuf,
     vcs: Vcs,
@@ -83,7 +83,7 @@ impl StatusCache {
     }
 
     /// How long the in-flight compute has been running, or `None` when
-    /// nothing is in flight.  A compute that never returns pins `pending`,
+    /// nothing is in flight. A compute that never returns pins `pending`,
     /// and `poll` will not spawn another while it does, so the panel keeps
     /// rendering whatever it last held.
     pub(crate) fn stalled_for(&self) -> Option<Duration> {
@@ -96,23 +96,23 @@ impl StatusCache {
     /// `Status::default()` (all-zero counts) until then, which callers
     /// must not read as "known clean". A compute that landed but failed
     /// (`error()` is `Some`, e.g. the repository could not be opened) is the
-    /// same "don't know" case — as is a compute whose worker unwound, which
-    /// is banked the same way — it still sets `last_refreshed` so `poll`
-    /// doesn't retry every frame, but it answers `false` here too.
+    /// same "don't know" case, as is a compute whose worker unwound, which
+    /// is banked the same way. Both still set `last_refreshed` so `poll`
+    /// doesn't retry every frame, but both answer `false` here too.
     pub(crate) fn has_status(&self) -> bool {
         self.last_refreshed.is_some() && self.last_error.is_none()
     }
 
     /// Returns the most recent known status, kicking off a background refresh
     /// when stale or when the default-branch hint changed since the last
-    /// completed compute.  Never blocks the caller.
+    /// completed compute. Never blocks the caller.
     pub(crate) fn poll(
         &mut self,
         default_branch_hint: Option<&str>,
         repaint: &impl Repaint,
     ) -> &Status {
         // Drain any completed background result before deciding whether to
-        // spawn another — a fresh answer shouldn't be ignored just because
+        // spawn another. A fresh answer shouldn't be ignored just because
         // the staleness timer also tripped.
         if let Some(pending) = &self.pending {
             if let Some(result) = pending.job.poll() {
@@ -128,7 +128,7 @@ impl StatusCache {
                 // it leaves the cache looking never-refreshed: the next poll
                 // starts another, and the pool wakes a frame at every job end,
                 // so a compute that fails every time would respawn at frame
-                // rate.  Bank it as the failure it is, on the clock a landed
+                // rate. Bank it as the failure it is, on the clock a landed
                 // error already uses, and the retry lands one interval later
                 // like any other.
                 self.last = Status::default();
@@ -140,7 +140,7 @@ impl StatusCache {
         }
 
         // Nothing healthy takes this long: the resident transport caps a
-        // request and the fallback is a single wsl.exe round trip.  Past it
+        // request and the fallback is a single wsl.exe round trip. Past it
         // the panel is frozen on a stale answer rather than waiting on a
         // slow one, and that difference is invisible from outside.
         if let Some(stalled) = self.stalled_for() {
@@ -316,9 +316,9 @@ mod tests {
 
     /// The regression this guards: a failure that leaves the cache looking
     /// never-refreshed is spawned again by the very next poll, and the pool
-    /// wakes a frame at every job end — so a compute that panics every time
+    /// wakes a frame at every job end, so a compute that panics every time
     /// would respawn at frame rate, burning a worker for as long as the panel
-    /// is open.  A compute that fails must not be retried more often than one
+    /// is open. A compute that fails must not be retried more often than one
     /// that succeeds.
     #[test]
     fn a_failed_compute_backs_off_as_far_as_a_successful_one() {

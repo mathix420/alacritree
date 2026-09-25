@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use alacritree_vcs::Liveness;
 
 /// How long a batch of results stands before the visible rows are checked
-/// again.  Matches `status_cache::StatusCache`, which answers the same "did this
+/// again. Matches `status_cache::StatusCache`, which answers the same "did this
 /// worktree change under us" question at the same human timescale.
 const FRESH_FOR: Duration = Duration::from_millis(1500);
 
@@ -73,7 +73,7 @@ impl LivenessCache {
 
     /// Whether `head`, the label just read from `path`, differs from `known`,
     /// the one discovery recorded, under a head no refresh has been asked for
-    /// yet.  Allocates only when it answers `true`.
+    /// yet. Allocates only when it answers `true`.
     pub(crate) fn branch_moved(&mut self, path: &Path, head: &str, known: Option<&str>) -> bool {
         if Some(head) == known || self.refreshed_heads.get(path).is_some_and(|h| h == head) {
             return false;
@@ -85,7 +85,7 @@ impl LivenessCache {
     /// An `Unknown` result replaces the last answer rather than preserving
     /// it.  Keeping it would leave the row claiming a checkout is gone while
     /// the backend's probe, which has no memory and refuses to call an
-    /// unreadable path missing, lets that same path spawn a shell.  Forgetting instead makes
+    /// unreadable path missing, lets that same path spawn a shell. Forgetting instead makes
     /// both say "cannot tell" and hands the row back to discovery's word.
     ///
     /// A round that probed nothing still restarts the interval, so a frame

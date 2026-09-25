@@ -185,7 +185,7 @@ pub(crate) fn validate_branch_name(name: &str) -> Result<(), BranchNameError> {
 }
 
 /// `git` primed to run against `cwd`'s repo: `git -C <cwd>` for Windows
-/// paths, the same command inside the owning distro for WSL paths.  Path
+/// paths, the same command inside the owning distro for WSL paths. Path
 /// *arguments* for WSL repos must already be Linux paths (`git_path_arg`).
 fn git_command(cwd: &Path) -> Command {
     match wsl::classify(cwd) {
@@ -226,7 +226,7 @@ fn run_git(cwd: &Path, args: &[&str]) -> Result<(), VcsError> {
     git_succeeded(args, output).map(drop)
 }
 
-/// `run_git`, for a call a cancel is allowed to end.  Progress goes to a
+/// `run_git`, for a call a cancel is allowed to end. Progress goes to a
 /// pipe, where git suppresses it, so the output stays small enough that the
 /// undrained pipes cannot fill.
 fn run_git_cancellable(
@@ -265,7 +265,7 @@ fn has_remote(cwd: &Path, name: &str) -> bool {
 }
 
 /// Branch names for the base-branch picker: locals first, then `origin/*`,
-/// short names, in git's ref order.  Shells out through [`git_command`]
+/// short names, in git's ref order. Shells out through [`git_command`]
 /// rather than using git2 so WSL worktrees resolve the same way everything
 /// else in this module does.
 #[allow(clippy::disallowed_methods)] // Running git is this function's job.
@@ -294,12 +294,12 @@ pub(crate) fn list_branches(
 ///
 /// `git ls-remote --symref HEAD` is the one source reflecting the upstream's
 /// current default, so it answers ahead of the caller's cached
-/// `refs/remotes/origin/HEAD`, which lags a rename.  Everything after that is
-/// [`default_branch::resolve`].  On total failure, returns the names tried.
+/// `refs/remotes/origin/HEAD`, which lags a rename. Everything after that is
+/// [`default_branch::resolve`]. On total failure, returns the names tried.
 ///
 /// That `ls-remote` is the only network round trip here, and a cancel landing
 /// during it must not leave the caller waiting on an unreachable remote, so it
-/// goes through [`jobs::Blocking::run_cancellable`].  A cancelled query folds
+/// goes through [`jobs::Blocking::run_cancellable`]. A cancelled query folds
 /// into the same `None` an unreachable one produces: the local `rev-parse`
 /// probes that follow are cheap, and the caller re-checks cancellation before
 /// trusting the outcome.
@@ -374,10 +374,10 @@ fn rev_parse_verify(cwd: &Path, name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Ask origin which branch HEAD points to.  Output looks like:
+/// Ask origin which branch HEAD points to. Output looks like:
 ///   ref: refs/heads/main\tHEAD
 ///   <sha>\tHEAD
-/// We pull the `refs/heads/<name>` from the symref line.  Runs as a
+/// We pull the `refs/heads/<name>` from the symref line. Runs as a
 /// cancellable child: `.ok()?` folds a cancel into the same `None` a
 /// network failure already produces, since `resolve_base_branch` re-checks
 /// cancellation before trusting whatever it decides in response.
@@ -512,7 +512,7 @@ mod tests {
     }
 
     /// The `ls-remote` inside `resolve_base_branch` is a second network round
-    /// trip ahead of the fetch.  A cancel landing while it is still waiting on
+    /// trip ahead of the fetch. A cancel landing while it is still waiting on
     /// an unresponsive remote must not be left to hang the way the fetch used
     /// to before it was routed through `run_git_cancellable`.
     #[test]

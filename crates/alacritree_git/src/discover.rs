@@ -16,7 +16,7 @@ use crate::{liveness, upstream};
 enum WslAnswer {
     Repo,
     NotARepo,
-    /// The distro could not be reached, or answered malformed — the tree is
+    /// The distro could not be reached, or answered malformed. The tree is
     /// unknown rather than empty.
     Unreachable,
 }
@@ -179,7 +179,7 @@ pub(crate) fn current_head(repo: &GitRepo) -> Head {
 
 /// A prunable worktree's checkout is gone, so its HEAD can't be read via
 /// `Repository::open`. Git still records it in the main repo's admin area
-/// (`.git/worktrees/<name>/HEAD`) — parse the symref line from there.
+/// (`.git/worktrees/<name>/HEAD`), whose symref line names the branch.
 fn branch_from_admin_head(repo: &GitRepo, worktree_name: &str) -> Option<String> {
     let head = repo.path().join("worktrees").join(worktree_name).join("HEAD");
     let contents = std::fs::read_to_string(head).ok()?;
@@ -214,14 +214,7 @@ pub(crate) fn detect_default_branch(repo: &GitRepo) -> Option<String> {
     })
 }
 
-/// Sections: 0 repo-or-not, 1 `worktree list --porcelain -z`,
-/// 2 origin/HEAD symref, 3 which common default-branch names exist,
-/// 4 `init.defaultBranch` only if it names an existing branch,
-/// 5 the distro's `$HOME`, 6 upstream tracking state per local branch —
-/// this last command only runs when `$2` is `"1"`, since `for-each-ref` with
-/// `%(upstream:track)` computes divergence for every branch even when the
-/// caller only wants the parse skipped.
-/// The `for-each-ref` format the upstream section emits.  A macro rather than
+/// The `for-each-ref` format the upstream section emits. A macro rather than
 /// a const so the script can `concat!` it and tests can hand the identical
 /// string to git, instead of asserting against a second copy that can drift.
 ///
@@ -234,8 +227,10 @@ macro_rules! upstream_format {
     };
 }
 
-/// Everything discovery asks a WSL distro, in one round trip.  `$1` is the
-/// repository path and `$2` is `"1"` when upstream tracking is wanted.
+/// Everything discovery asks a WSL distro, in one round trip. `$1` is the
+/// repository path and `$2` is `"1"` when upstream tracking is wanted. The
+/// `upstreams` section is gated on it rather than parsed and dropped, since
+/// `%(upstream:track)` computes divergence for every branch.
 fn discover_batch() -> wsl::Batch {
     wsl::Batch::new(r#"p="$1""#)
         .section("is_repo", r#"git -C "$p" rev-parse --is-inside-work-tree >/dev/null 2>&1 && printf yes || printf no"#)
@@ -266,7 +261,7 @@ fi"#
         )
 }
 
-/// One record from `git worktree list --porcelain -z`.  The main worktree is
+/// One record from `git worktree list --porcelain -z`. The main worktree is
 /// always the first record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WorktreeRecord {
@@ -277,7 +272,7 @@ struct WorktreeRecord {
 
 /// Parse `git worktree list --porcelain -z`: attributes are NUL-terminated
 /// `label value` lines; an empty line (two consecutive NULs) ends a record.
-/// `detached`/`bare`/`locked`/`prunable` labels need no handling — a
+/// `detached`/`bare`/`locked`/`prunable` labels need no handling. A
 /// detached record simply carries no `branch`.
 fn parse_worktree_list_z(bytes: &[u8]) -> Vec<WorktreeRecord> {
     let mut records = Vec::new();
@@ -311,7 +306,7 @@ fn parse_worktree_list_z(bytes: &[u8]) -> Vec<WorktreeRecord> {
     records
 }
 
-/// The same ranking from batched output.  The script has already dropped an
+/// The same ranking from batched output. The script has already dropped an
 /// `init.defaultBranch` naming no branch, so `config_default` arrives verified.
 fn default_branch_from_batch(
     origin_head: &str,
@@ -337,7 +332,7 @@ mod tests {
     use crate::GitBackend;
 
     /// `%(refname:short)` shortens to the *unambiguous* name, so a branch that
-    /// shares its name with a tag comes back as `heads/<name>`.  Worktree
+    /// shares its name with a tag comes back as `heads/<name>`. Worktree
     /// records carry the plain branch name, so any shortening that consults
     /// other ref namespaces breaks the join and the row loses its badge.
     #[test]
@@ -379,7 +374,7 @@ mod tests {
 
         // The round trip failed: the tree is unknown, not empty.
         assert_eq!(classify_wsl_answer(unreachable, not_repo, 0), WslAnswer::Unreachable);
-        // The distro answered "this is not a repository" — that is the truth.
+        // The distro answered "this is not a repository", which is the truth.
         assert_eq!(classify_wsl_answer(reached, not_repo, 0), WslAnswer::NotARepo);
         // A repository always has at least its main checkout, so parsing none of
         // them means the round trip came back malformed.
@@ -560,9 +555,9 @@ sep
     }
 
     /// A detached head's label is its short OID, and a real branch can be
-    /// named the same thing.  Build a worktree where that collision actually
-    /// occurs and check the lookup, not just that the record has no branch —
-    /// the latter holds whether or not the lookup guards against the collision.
+    /// named the same thing. Build a worktree where that collision actually
+    /// occurs and check the lookup, not just that the record has no branch.
+    /// The latter holds whether or not the lookup guards against the collision.
     #[test]
     fn a_detached_worktree_gets_no_badge_even_when_its_oid_looks_like_a_branch() {
         let dir = tempfile::tempdir().unwrap();
