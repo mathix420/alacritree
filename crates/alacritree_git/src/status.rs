@@ -294,8 +294,7 @@ fn status_from_batch(
     let name = Some(reply.text("branch")).filter(|s| !s.is_empty());
     let revision = Some(reply.text("revision")).filter(|s| !s.is_empty());
     if name.is_none() && revision.is_none() {
-        let context = format!("could not open repository at {linux_path}");
-        return Err(VcsError::Backend { source: context.clone().into(), context });
+        return Err(VcsError::NotARepository(linux_path.into()));
     }
     let (staged, working) = parse_status_v2_z(reply.bytes("status"));
     let trunk = Some(reply.text("default_branch")).filter(|s| !s.is_empty());
@@ -493,7 +492,7 @@ mod tests {
     fn a_blank_branch_section_means_the_repository_could_not_be_opened() {
         let err = status_from_batch("/home/lev/proj", None, recorded(&["", "", "", "", "", ""]))
             .unwrap_err();
-        assert_eq!(err.to_string(), "could not open repository at /home/lev/proj");
+        assert!(matches!(err, VcsError::NotARepository(path) if path == Path::new("/home/lev/proj")));
     }
 
     #[test]
