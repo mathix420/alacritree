@@ -453,7 +453,6 @@ mod tests {
     /// A real ConPTY session torn down, and what outlived it.
     struct Teardown {
         /// False when the session never printed its [`Session::ready`] text.
-
         ready: bool,
         /// False when `ClosePseudoConsole` had not returned by the deadline.
         /// It blocks until the conout pipe drains, so a session whose shell
