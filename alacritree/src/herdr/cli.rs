@@ -72,9 +72,44 @@ pub(super) fn attaches_directly(side: &Side, mode: AttachMode, has_agent: bool) 
 /// the window with it.
 const GESTURE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How every gesture that ran out [`GESTURE_TIMEOUT`] begins its refusal, so
-/// a herdr that went silent can be told from one that said no.
-pub(super) const NO_ANSWER: &str = "herdr did not answer";
+/// How a gesture that ran out [`GESTURE_TIMEOUT`] begins its refusal.
+const NO_ANSWER: &str = "herdr did not answer";
+
+/// The gesture a herdr that went silent was asked for.
+#[derive(Debug, Clone, Copy, strum::Display)]
+pub enum Gesture {
+    #[strum(serialize = "focusing the pane")]
+    Focus,
+    #[strum(serialize = "listing its sessions")]
+    ListSessions,
+    #[strum(serialize = "creating the pane")]
+    Create,
+}
+
+/// Why a gesture on the user's herdr got nothing done.
+#[derive(Debug, thiserror::Error)]
+pub enum HerdrError {
+    /// herdr went silent, which on a loaded WSL side is the `wsl.exe` launch
+    /// rather than herdr saying no.
+    #[error("{NO_ANSWER} while {0}")]
+    NoAnswer(Gesture),
+    #[error("failed to focus herdr pane: {0}")]
+    FocusFailed(#[source] CallError),
+    #[error("failed to focus herdr pane: {0}")]
+    FocusExited(String),
+    #[error("herdr refused to focus the pane: {0}")]
+    FocusRefused(String),
+    #[error("failed to create a herdr pane: {0}")]
+    CreateFailed(#[source] CallError),
+    #[error("herdr refused to create the pane: {0}")]
+    CreateRefused(String),
+    #[error("herdr answered with no pane")]
+    NoPane(#[source] serde_json::Error),
+    #[error("no herdr server is answering; start one, or name a side")]
+    NoServer,
+    #[error("no herdr session is focused and {} are answering; name one", .0.join(" and "))]
+    AmbiguousSide(Vec<String>),
+}
 
 /// A call that takes longer than this is logged at info, so a stall shows in
 /// a persistent log without every listing writing a line.
@@ -113,6 +148,7 @@ fn focus_request(pane_id: &str) -> String {
 }
 
 /// herdr's answer to a one-shot request, or the message it refused with.
+/// The message is herdr's own text, which the user reads as it stands.
 fn decode_answer(line: &str) -> Result<(), String> {
     #[derive(Deserialize)]
     struct Answer {
@@ -139,11 +175,17 @@ struct Reply {
     stderr: String,
 }
 
-#[derive(Debug)]
-enum CallError {
+#[derive(Debug, thiserror::Error)]
+pub enum CallError {
     /// Nothing came back inside the call's limit.
+    #[error("{NO_ANSWER}")]
     NoAnswer,
-    Failed(String),
+    #[error(transparent)]
+    Spawn(#[from] io::Error),
+    #[error("herdr started without its pipes")]
+    NoPipes,
+    #[error(transparent)]
+    Helper(TransportError),
 }
 
 /// How a call reached its side, named in the line that times it.
@@ -199,7 +241,7 @@ fn call(
         Ok(reply) if reply.ok => "answered",
         Ok(_) => "failed",
         Err(CallError::NoAnswer) => "got no answer",
-        Err(CallError::Failed(_)) => "could not run",
+        Err(_) => "could not run",
     };
     let level =
         if elapsed >= SLOW_CALL || result.is_err() { log::Level::Info } else { log::Level::Debug };
@@ -253,7 +295,7 @@ fn via_helper(
     Some(match answer {
         None => Err(CallError::NoAnswer),
         Some(Err(TransportError::NotWritten(_))) => return None,
-        Some(Err(TransportError::NoReply(e))) => Err(CallError::Failed(e)),
+        Some(Err(e @ TransportError::NoReply(_))) => Err(CallError::Helper(e)),
         Some(Ok((exit, payload))) => Ok(match request {
             Some(_) => Reply { ok: !payload.is_empty(), stdout: payload, stderr: String::new() },
             None if exit == 0 => Reply { ok: true, stdout: payload, stderr: String::new() },
@@ -288,14 +330,8 @@ fn run_child(
     request: Option<&str>,
     limit: Option<Duration>,
 ) -> Result<Reply, CallError> {
-    let failed = |e: io::Error| CallError::Failed(e.to_string());
     let stdin = if request.is_some() { Stdio::piped() } else { Stdio::null() };
-    let mut child = command
-        .stdin(stdin)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(failed)?;
+    let mut child = command.stdin(stdin).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     let mut stdin = child.stdin.take();
     if let (Some(stdin), Some(request)) = (&mut stdin, request) {
         let _ = stdin.write_all(request.as_bytes()).and_then(|()| stdin.flush());
@@ -303,7 +339,7 @@ fn run_child(
     let (Some(stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
         let _ = child.kill();
         let _ = child.wait();
-        return Err(CallError::Failed("herdr started without its pipes".into()));
+        return Err(CallError::NoPipes);
     };
     let one_line = request.is_some();
     let (tx, rx) = mpsc::channel();
@@ -327,7 +363,7 @@ fn run_child(
         let _ = errors_tx.send(text);
     });
     let answer = match (reader, limit) {
-        (Err(e), _) => Err(failed(e)),
+        (Err(e), _) => Err(CallError::Spawn(e)),
         (Ok(_), Some(limit)) => rx.recv_timeout(limit).map_err(|_| CallError::NoAnswer),
         (Ok(_), None) => rx.recv().map_err(|_| CallError::NoAnswer),
     };
@@ -353,18 +389,17 @@ pub(super) fn focus_pane(
     side: &Side,
     pane_id: &str,
     blocking: &jobs::Blocking,
-) -> Result<(), String> {
+) -> Result<(), HerdrError> {
     let request = focus_request(pane_id);
     let reply = call(side, &["remote-api-bridge"], Some(&request), Some(GESTURE_TIMEOUT), blocking)
         .map_err(|e| match e {
-            CallError::NoAnswer => format!("{NO_ANSWER} while focusing the pane"),
-            CallError::Failed(e) => format!("failed to focus herdr pane: {e}"),
+            CallError::NoAnswer => HerdrError::NoAnswer(Gesture::Focus),
+            e => HerdrError::FocusFailed(e),
         })?;
     if !reply.ok {
-        return Err(format!("failed to focus herdr pane: {}", reply.stderr.trim()));
+        return Err(HerdrError::FocusExited(reply.stderr.trim().to_string()));
     }
-    decode_answer(&String::from_utf8_lossy(&reply.stdout))
-        .map_err(|message| format!("herdr refused to focus the pane: {message}"))
+    decode_answer(&String::from_utf8_lossy(&reply.stdout)).map_err(HerdrError::FocusRefused)
 }
 
 /// The running session to attach to on this side.  `herdr session list
@@ -376,14 +411,12 @@ pub(super) fn focus_pane(
 pub(super) fn running_session_name(
     side: &Side,
     blocking: &jobs::Blocking,
-) -> Result<String, String> {
+) -> Result<String, HerdrError> {
     let fallback = || "default".to_string();
     let reply =
         match call(side, &["session", "list", "--json"], None, Some(GESTURE_TIMEOUT), blocking) {
-            Err(CallError::NoAnswer) => {
-                return Err(format!("{NO_ANSWER} while listing its sessions"));
-            },
-            Err(CallError::Failed(_)) => return Ok(fallback()),
+            Err(CallError::NoAnswer) => return Err(HerdrError::NoAnswer(Gesture::ListSessions)),
+            Err(_) => return Ok(fallback()),
             Ok(reply) if !reply.ok => return Ok(fallback()),
             Ok(reply) => reply,
         };
@@ -419,19 +452,19 @@ pub(super) fn create_pane(
     cwd: Option<String>,
     focus: bool,
     blocking: &jobs::Blocking,
-) -> Result<CreatedPane, String> {
+) -> Result<CreatedPane, HerdrError> {
     let create = create_args(cwd.as_deref(), focus);
     let borrowed: Vec<&str> = create.iter().map(String::as_str).collect();
     let reply =
         call(side, &borrowed, None, Some(GESTURE_TIMEOUT), blocking).map_err(|e| match e {
-            CallError::NoAnswer => format!("{NO_ANSWER} while creating the pane"),
-            CallError::Failed(e) => format!("failed to create a herdr pane: {e}"),
+            CallError::NoAnswer => HerdrError::NoAnswer(Gesture::Create),
+            e => HerdrError::CreateFailed(e),
         })?;
     if !reply.ok {
-        return Err(format!("herdr refused to create the pane: {}", reply.stderr));
+        return Err(HerdrError::CreateRefused(reply.stderr));
     }
-    let created = serde_json::from_slice::<CreatedTab>(&reply.stdout)
-        .map_err(|_| "herdr answered with no pane".to_string())?;
+    let created =
+        serde_json::from_slice::<CreatedTab>(&reply.stdout).map_err(HerdrError::NoPane)?;
     let root = created.result.root_pane;
     Ok(CreatedPane { terminal_id: root.terminal_id, pane_id: root.pane_id, tab_id: root.tab_id })
 }
@@ -462,7 +495,7 @@ pub(super) fn list_panes(
     Ok(ListingReply::parse(&String::from_utf8_lossy(&reply.stdout), listing, sampled_at, attached))
 }
 
-pub(super) type HerdrAttachResult = Result<(String, Vec<String>), String>;
+pub(super) type HerdrAttachResult = Result<(String, Vec<String>), HerdrError>;
 
 /// What a shared-view attach asks herdr before its client can start: focus
 /// the pane, since every app client draws whatever herdr has focused, then

@@ -95,7 +95,7 @@ fn request(subscriptions: Vec<Value>) -> String {
 
 /// The first line a subscription answers with: the ack, or the code of the
 /// error herdr refused it with.
-fn decode_reply(line: &str) -> Result<(), String> {
+fn decode_reply(line: &str) -> Result<(), PollError> {
     #[derive(Deserialize)]
     struct Reply {
         result: Option<Value>,
@@ -105,10 +105,10 @@ fn decode_reply(line: &str) -> Result<(), String> {
     struct ErrorBody {
         code: String,
     }
-    let unexpected = || "unexpected_reply".to_string();
+    let unexpected = || PollError::Server("unexpected_reply".to_string());
     let reply = serde_json::from_str::<Reply>(line).map_err(|_| unexpected())?;
     if let Some(error) = reply.error {
-        return Err(error.code);
+        return Err(PollError::Server(error.code));
     }
     match reply.result.as_ref().and_then(|result| result.get("type")).and_then(Value::as_str) {
         Some("subscription_started") => Ok(()),
@@ -287,8 +287,8 @@ fn relay(stdout: ChildStdout, mut stderr: ChildStderr, tx: &mpsc::Sender<Message
                     started = true;
                     Some(Message::Started)
                 },
-                Err(code) => {
-                    refusal = Some(code);
+                Err(error) => {
+                    refusal = Some(error);
                     None
                 },
             }
@@ -301,10 +301,7 @@ fn relay(stdout: ChildStdout, mut stderr: ChildStderr, tx: &mpsc::Sender<Message
     }
     let mut text = String::new();
     let _ = stderr.read_to_string(&mut text);
-    let reason = (!started).then(|| match refusal {
-        Some(code) => PollError::Server(code),
-        None => classify_exit(&text),
-    });
+    let reason = (!started).then(|| refusal.unwrap_or_else(|| classify_exit(&text)));
     send(Message::Ended { reason, stderr: text.trim().to_string() });
 }
 
@@ -325,8 +322,8 @@ mod tests {
     #[test]
     fn a_refusal_carries_herdr_code() {
         let line = r#"{"id":"alacritree:events","error":{"code":"pane_not_found","message":"no pane w1-9"}}"#;
-        assert_eq!(decode_reply(line), Err("pane_not_found".into()));
-        assert_eq!(decode_reply("not json"), Err("unexpected_reply".into()));
+        assert_eq!(decode_reply(line), Err(PollError::Server("pane_not_found".into())));
+        assert_eq!(decode_reply("not json"), Err(PollError::Server("unexpected_reply".into())));
     }
 
     #[test]

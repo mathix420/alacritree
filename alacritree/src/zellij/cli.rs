@@ -4,7 +4,7 @@
 //! over its socket, so a missing binary or no running session is a quiet
 //! empty listing.  This is the only file that spawns zellij.
 
-use std::io::Read;
+use std::io::{self, Read};
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -42,16 +42,51 @@ impl SideListing {
     }
 }
 
-/// Why a zellij call brought back nothing to read.
+/// Why a zellij call brought back nothing to read.  Every variant but
+/// [`NoAnswer`](CallError::NoAnswer) says no zellij ran on the side, or the
+/// one there would not list.
 #[derive(Debug, thiserror::Error)]
 pub enum CallError {
-    /// No zellij ran on the side, or the one there would not list.
-    #[error("{0}")]
-    Absent(String),
+    #[error("failed to run zellij: {0}")]
+    Spawn(#[source] io::Error),
+    #[error("zellij vanished: {0}")]
+    Vanished(#[source] io::Error),
+    #[error("no zellij on {side}: {said}")]
+    Absent { side: String, said: String },
     /// zellij did not answer in time, which says nothing about whether it
     /// is there.
     #[error("zellij did not answer")]
     NoAnswer,
+}
+
+/// Why zellij opened or focused no pane.
+#[derive(Debug, thiserror::Error)]
+pub enum ZellijError {
+    #[error(transparent)]
+    Call(#[from] CallError),
+    #[error("zellij refused to focus the pane: {0}")]
+    FocusRefused(String),
+    #[error("zellij refused to create the pane: {0}")]
+    CreateRefused(String),
+    #[error(
+        "a native Windows zellij pane cannot open in a chosen directory: zellij takes a directory \
+         only alongside a command, and the shell is named through sh"
+    )]
+    NativeCwd,
+    #[error("`{0}` names no zellij pane")]
+    NotAPane(String),
+    #[error("no zellij session is running on {0}; start one")]
+    NoSessionOn(String),
+    #[error(
+        "{} zellij sessions are running on {side} ({}); set [integrations.zellij] session",
+        sessions.len(),
+        sessions.join(", ")
+    )]
+    SeveralSessionsOn { side: String, sessions: Vec<String> },
+    #[error("no zellij session is running; start one, or name a side")]
+    NoSession,
+    #[error("no zellij session is focused and {} are running one; name a side", .0.join(" and "))]
+    AmbiguousSide(Vec<String>),
 }
 
 /// Runs `program <args>` on `side` and hands back what it printed.
@@ -73,7 +108,7 @@ fn run_child(mut command: Command, limit: Duration) -> Result<Output, CallError>
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| CallError::Absent(format!("failed to run zellij: {e}")))?;
+        .map_err(CallError::Spawn)?;
     let deadline = Instant::now() + limit;
     let remaining = || deadline.saturating_duration_since(Instant::now());
     // One thread per pipe, so a child filling the pipe read second cannot
@@ -87,7 +122,7 @@ fn run_child(mut command: Command, limit: Duration) -> Result<Output, CallError>
         let _ = child.wait();
         return Err(CallError::NoAnswer);
     };
-    let status = child.wait().map_err(|e| CallError::Absent(format!("zellij vanished: {e}")))?;
+    let status = child.wait().map_err(CallError::Vanished)?;
     Ok(Output { status, stdout, stderr })
 }
 
@@ -120,7 +155,7 @@ fn refusal(output: &Output) -> String {
 /// other failure is a shell that found no zellij.
 fn sessions(side: &Side, succeeded: bool, said: &str) -> Result<Vec<String>, CallError> {
     if !succeeded && !said.contains("No active zellij sessions") {
-        return Err(CallError::Absent(format!("no zellij on {}: {}", side.name(), said.trim())));
+        return Err(CallError::Absent { side: side.name(), said: said.trim().to_string() });
     }
     Ok(listing::live_sessions(said))
 }
@@ -230,16 +265,20 @@ fn read_listing(
 /// Brings `pane_id` to the front of `session`, switching to its tab.  zellij
 /// applies a CLI focus to the client that last typed, or to the session's
 /// own default view when no client is attached.
-pub fn focus_pane(program: &str, side: &Side, session: &str, pane_id: &str) -> Result<(), String> {
-    let output = run(program, side, &["--session", session, "action", "focus-pane-id", pane_id])
-        .map_err(|e| e.to_string())?;
+pub fn focus_pane(
+    program: &str,
+    side: &Side,
+    session: &str,
+    pane_id: &str,
+) -> Result<(), ZellijError> {
+    let output = run(program, side, &["--session", session, "action", "focus-pane-id", pane_id])?;
     let said = refusal(&output);
     // Focusing the pane that already has focus is refused with a non-zero
     // exit, and is exactly the state asked for.
     if output.status.success() || said.contains("already focused") {
         Ok(())
     } else {
-        Err(format!("zellij refused to focus the pane: {said}"))
+        Err(ZellijError::FocusRefused(said))
     }
 }
 
@@ -269,19 +308,16 @@ pub fn create_pane(
     session: &str,
     cwd: Option<&str>,
     focus: bool,
-) -> Result<CreatedPane, String> {
+) -> Result<CreatedPane, ZellijError> {
     if cwd.is_some() && *side == Side::Native && cfg!(windows) {
-        return Err("a native Windows zellij pane cannot open in a chosen directory: zellij \
-                    takes a directory only alongside a command, and the shell is named through \
-                    sh"
-        .to_string());
+        return Err(ZellijError::NativeCwd);
     }
     let args = new_pane_args(session, cwd, focus);
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-    let output = run(program, side, &borrowed).map_err(|e| e.to_string())?;
+    let output = run(program, side, &borrowed)?;
     let Some(id) = listing::created_pane_id(&stdout(&output)).filter(|_| output.status.success())
     else {
-        return Err(format!("zellij refused to create the pane: {}", refusal(&output)));
+        return Err(ZellijError::CreateRefused(refusal(&output)));
     };
     let listed = run(program, side, &["--session", session, "action", "list-panes", "--json"])
         .ok()
@@ -376,7 +412,7 @@ mod tests {
     fn a_distro_with_no_zellij_says_it_is_absent() {
         let printed = "127\nsh: 1: zellij: not found";
         let listing = read_listing(&wsl(), printed.as_bytes(), Instant::now());
-        assert!(matches!(listing, Err(CallError::Absent(_))), "{listing:?}");
+        assert!(matches!(listing, Err(CallError::Absent { .. })), "{listing:?}");
     }
 
     /// A listing zellij never finished, or one that printed nothing, says

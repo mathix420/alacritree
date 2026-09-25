@@ -218,7 +218,7 @@ pub(crate) struct AttachRequest {
 pub(crate) struct AttachAnswer {
     pub key: PaneKey,
     pub request: AttachRequest,
-    pub launch: Result<super::Launch, String>,
+    pub launch: Result<super::Launch, super::PaneError>,
 }
 
 /// The app's side of a pane create.  One waiter, not a list: nothing merges
@@ -235,7 +235,7 @@ pub(crate) struct CreateRequest {
 pub(crate) struct CreateAnswer {
     pub side: Side,
     pub request: CreateRequest,
-    pub pane: Result<super::CreatedPane, String>,
+    pub pane: Result<super::CreatedPane, super::PaneError>,
 }
 
 /// What the view sync needs to know about the app this frame.

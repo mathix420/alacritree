@@ -4060,7 +4060,9 @@ mod tests {
     };
     use super::widgets::agent_hint;
     use crate::herdr::{self, PendingAttach, PendingCreate};
-    use crate::multiplexer::{AttachRequest, MultiplexerKind, Pane, PaneStatus, Scripted};
+    use crate::multiplexer::{
+        AttachRequest, MultiplexerKind, Pane, PaneError, PaneStatus, Scripted,
+    };
     use crate::sidebar_model::build_snapshot;
     use crate::test_util::herdr_pane_key;
 
@@ -4851,7 +4853,7 @@ mod tests {
         let id = bind_pane_fixture(&mut app, &side, "term-focused");
         app.set_active_in_current_workspace(id);
 
-        assert_eq!(app.create_target(None, None), Ok((MultiplexerKind::Scripted, side)));
+        assert_eq!(app.create_target(None, None).unwrap(), (MultiplexerKind::Scripted, side));
     }
 
     /// A side whose rows are still drawn through one missed poll is still
@@ -4872,7 +4874,7 @@ mod tests {
         app.multiplexers.herdr_mut_for_test().caches_mut_for_test()[0]
             .fail_listing_for_test(herdr::PollError::Absent("spawn_failed"));
 
-        assert_eq!(app.create_target(None, None), Ok((MultiplexerKind::Herdr, Side::Native)));
+        assert_eq!(app.create_target(None, None).unwrap(), (MultiplexerKind::Herdr, Side::Native));
     }
 
     /// A worktree the sidebar does not have is refused before the multiplexer
@@ -4934,7 +4936,10 @@ mod tests {
     fn poll_pane_create_answers_the_waiter_when_the_multiplexer_refuses() {
         let mut app = test_app();
         let (reply_tx, reply_rx) = mpsc::channel();
-        app.multiplexers.scripted_mut().enable().answer_create(Err("boom".to_string()));
+        app.multiplexers
+            .scripted_mut()
+            .enable()
+            .answer_create(Err(PaneError::Scripted("boom".into())));
         app.create_multiplexer_pane(
             &Context::default(),
             (MultiplexerKind::Scripted, Side::Native),
@@ -5054,7 +5059,7 @@ mod tests {
             .scripted_mut()
             .enable()
             .answer_create(Ok(created_pane()))
-            .answer_attach(Err(refusal.clone()));
+            .answer_attach(Err(PaneError::Scripted(refusal.clone())));
         app.create_multiplexer_pane(
             &Context::default(),
             (MultiplexerKind::Scripted, Side::Native),
@@ -5147,7 +5152,10 @@ mod tests {
     fn a_refused_background_create_answers_only_its_client() {
         let mut app = test_app();
         let (reply_tx, reply_rx) = mpsc::channel();
-        app.multiplexers.scripted_mut().enable().answer_create(Err("boom".to_string()));
+        app.multiplexers
+            .scripted_mut()
+            .enable()
+            .answer_create(Err(PaneError::Scripted("boom".into())));
         app.create_multiplexer_pane(
             &Context::default(),
             (MultiplexerKind::Scripted, Side::Native),
@@ -5601,7 +5609,10 @@ mod tests {
         let mut app = test_app();
         let key = Scripted::key(&Side::Native, "t1");
         let (reply_tx, reply_rx) = mpsc::channel();
-        app.multiplexers.scripted_mut().enable().answer_attach(Err("boom".to_string()));
+        app.multiplexers
+            .scripted_mut()
+            .enable()
+            .answer_attach(Err(PaneError::Scripted("boom".into())));
         let unlisted = PaneTarget::unlisted(&key, "w1:p1");
         let switch = WorkspaceSwitch { to: None, from: None };
         app.attach_pane(

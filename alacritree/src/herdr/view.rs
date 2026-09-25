@@ -13,7 +13,7 @@ use crate::jobs;
 use crate::session::SessionId;
 
 use super::pane_key;
-use crate::multiplexer::{PaneKey, Side};
+use crate::multiplexer::{PaneError, PaneKey, Side};
 
 /// Where a side's focus was last established, and when.  The stamp is a
 /// watermark: a listing sampled at or before it cannot form an edge, so one
@@ -58,7 +58,7 @@ pub struct HerdrViewFocus {
     /// success with the pane herdr is actually on rather than whatever
     /// session happens to be active when the job completes.
     pub key: PaneKey,
-    pub job: jobs::Job<Result<(), String>>,
+    pub job: jobs::Job<Result<(), PaneError>>,
 }
 
 #[derive(Default)]

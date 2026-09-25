@@ -19,7 +19,7 @@ use super::model::{
     ViewStep,
 };
 use super::{
-    CreatedPane, Launch, MultiplexerKind, MultiplexerSession, Pane, PaneKey, PaneStatus,
+    CreatedPane, Launch, MultiplexerKind, MultiplexerSession, Pane, PaneError, PaneKey, PaneStatus,
     PaneTarget, Side,
 };
 use crate::config::{BakedGlyph, DEFAULT_SESSION_ICON, IconStyle};
@@ -62,9 +62,9 @@ pub(crate) struct Scripted {
     /// The side a create naming none lands on.  `None` refuses, naming why.
     default_side: Option<Side>,
     attach_queue: Vec<QueuedAttach>,
-    attach_answers: Vec<Result<Launch, String>>,
+    attach_answers: Vec<Result<Launch, PaneError>>,
     create_queue: Vec<QueuedCreate>,
-    create_answers: Vec<Result<CreatedPane, String>>,
+    create_answers: Vec<Result<CreatedPane, PaneError>>,
     /// A move the user made inside the multiplexer, handed back by the next
     /// `sync_view` and then forgotten.
     follow: Option<PaneKey>,
@@ -151,12 +151,12 @@ impl Scripted {
 
     /// What the next queued attach resolves to.  Answers are taken in the
     /// order they were pushed.
-    pub(crate) fn answer_attach(&mut self, launch: Result<Launch, String>) -> &mut Self {
+    pub(crate) fn answer_attach(&mut self, launch: Result<Launch, PaneError>) -> &mut Self {
         self.attach_answers.push(launch);
         self
     }
 
-    pub(crate) fn answer_create(&mut self, pane: Result<CreatedPane, String>) -> &mut Self {
+    pub(crate) fn answer_create(&mut self, pane: Result<CreatedPane, PaneError>) -> &mut Self {
         self.create_answers.push(pane);
         self
     }
@@ -260,16 +260,16 @@ impl MultiplexerSession for Scripted {
             .collect()
     }
 
-    fn default_side(&self) -> Result<Side, String> {
+    fn default_side(&self) -> Result<Side, PaneError> {
         self.default_side.clone().ok_or_else(|| {
             let sides: Vec<String> = self.sides.iter().map(|(side, _)| side.name()).collect();
-            match sides.as_slice() {
+            PaneError::Scripted(match sides.as_slice() {
                 [] => "no scripted server is running; start one, or name a side".to_string(),
                 several => format!(
                     "no scripted server is focused and {} are running one; name a side",
                     several.join(" and ")
                 ),
-            }
+            })
         })
     }
 

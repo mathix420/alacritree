@@ -36,6 +36,45 @@ use crate::session::SessionId;
 use crate::wsl;
 use crate::zellij::Zellij;
 
+/// Why a multiplexer request produced no pane. The message is what the user
+/// and an IPC client read.
+#[derive(Debug, thiserror::Error)]
+pub enum PaneError {
+    #[error("{}", all_disabled_reason())]
+    AllDisabled,
+    #[error("{}", .0.disabled_reason())]
+    Disabled(MultiplexerKind),
+    #[error("`{name}` is not a multiplexer, expected {}", known_names())]
+    Unknown { name: String },
+    #[error("{} has no path inside the {distro} distro", path.display())]
+    NoDistroPath { path: PathBuf, distro: String },
+    #[error("the {0} attach did not finish")]
+    AttachUnfinished(MultiplexerKind),
+    #[error("the {0} pane create did not finish")]
+    CreateUnfinished(MultiplexerKind),
+    #[error(transparent)]
+    Herdr(#[from] crate::herdr::HerdrError),
+    #[error(transparent)]
+    Zellij(#[from] crate::zellij::ZellijError),
+    #[cfg(test)]
+    #[error("{0}")]
+    Scripted(String),
+}
+
+fn all_disabled_reason() -> &'static str {
+    static REASON: OnceLock<String> = OnceLock::new();
+    REASON.get_or_init(|| {
+        let tables: Vec<String> =
+            MultiplexerKind::real().map(|kind| format!("[integrations.{kind}]")).collect();
+        format!("every multiplexer integration is disabled ({} enabled)", tables.join(" or "))
+    })
+}
+
+fn known_names() -> String {
+    let known: Vec<String> = MultiplexerKind::real().map(|k| format!("`{k}`")).collect();
+    known.join(" or ")
+}
+
 /// The directory a new pane opens in, spelled where the multiplexer resolves
 /// it: the distro's own path on a WSL side, the Windows path on the native
 /// one. `None` leaves the choice to the multiplexer. A workspace with no
@@ -44,13 +83,13 @@ use crate::zellij::Zellij;
 pub(crate) fn cwd_for(
     side: &Side,
     workspace: Option<&std::path::Path>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, PaneError> {
     let Some(path) = workspace else { return Ok(None) };
     match side {
         Side::Native => Ok(Some(path.display().to_string())),
-        Side::Wsl(distro) => wsl::windows_to_linux(path)
-            .map(Some)
-            .ok_or_else(|| format!("{} has no path inside the {distro} distro", path.display())),
+        Side::Wsl(distro) => wsl::windows_to_linux(path).map(Some).ok_or_else(|| {
+            PaneError::NoDistroPath { path: path.to_path_buf(), distro: distro.clone() }
+        }),
     }
 }
 
@@ -136,7 +175,7 @@ pub(crate) trait MultiplexerSession {
 
     /// The side a create that named none happens on, when only one server is
     /// answering.  `Err` names every side it could have meant.
-    fn default_side(&self) -> Result<Side, String>;
+    fn default_side(&self) -> Result<Side, PaneError>;
 
     /// When the listing last showed `terminal_id` gone from a side that
     /// reported it after `bound_at`.
@@ -308,34 +347,24 @@ impl Multiplexers {
     /// The reason a request naming no multiplexer is refused while every one
     /// is off.
     pub(crate) fn disabled_reason(&self) -> &'static str {
-        static REASON: OnceLock<String> = OnceLock::new();
-        REASON.get_or_init(|| {
-            let tables: Vec<String> =
-                MultiplexerKind::real().map(|kind| format!("[integrations.{kind}]")).collect();
-            format!("every multiplexer integration is disabled ({} enabled)", tables.join(" or "))
-        })
+        all_disabled_reason()
     }
 
     /// The multiplexer a request named, or `None` when it named none and any
     /// may answer.  A name that is no multiplexer, one that is switched off,
     /// and every one being off are all refusals.
-    pub(crate) fn requested(&self, name: Option<&str>) -> Result<Option<MultiplexerKind>, String> {
+    pub(crate) fn requested(
+        &self,
+        name: Option<&str>,
+    ) -> Result<Option<MultiplexerKind>, PaneError> {
         let Some(name) = name else {
-            return if self.any_enabled() {
-                Ok(None)
-            } else {
-                Err(self.disabled_reason().to_string())
-            };
+            return if self.any_enabled() { Ok(None) } else { Err(PaneError::AllDisabled) };
         };
         let kind = MultiplexerKind::from_str(name)
             .ok()
             .filter(|kind| MultiplexerKind::real().any(|real| real == *kind))
-            .ok_or_else(|| {
-                let known: Vec<String> =
-                    MultiplexerKind::real().map(|k| format!("`{k}`")).collect();
-                format!("`{name}` is not a multiplexer, expected {}", known.join(" or "))
-            })?;
-        if self.get(kind).enabled() { Ok(Some(kind)) } else { Err(kind.disabled_reason()) }
+            .ok_or_else(|| PaneError::Unknown { name: name.to_string() })?;
+        if self.get(kind).enabled() { Ok(Some(kind)) } else { Err(PaneError::Disabled(kind)) }
     }
 
     /// The multiplexer a request naming none goes to: the first one enabled.
@@ -480,12 +509,12 @@ mod tests {
     fn a_new_pane_opens_in_the_workspace_spelled_for_its_own_side() {
         let workspace = PathBuf::from(r"\\wsl.localhost\ubuntu\home\dev\repo");
         assert_eq!(
-            cwd_for(&Side::Wsl("ubuntu".into()), Some(&workspace)),
-            Ok(Some("/home/dev/repo".to_string()))
+            cwd_for(&Side::Wsl("ubuntu".into()), Some(&workspace)).unwrap(),
+            Some("/home/dev/repo".to_string())
         );
         assert_eq!(
-            cwd_for(&Side::Native, Some(&workspace)),
-            Ok(Some(workspace.display().to_string()))
+            cwd_for(&Side::Native, Some(&workspace)).unwrap(),
+            Some(workspace.display().to_string())
         );
     }
 
@@ -493,8 +522,8 @@ mod tests {
     /// default rather than being handed an empty path.
     #[test]
     fn a_new_pane_in_the_home_workspace_names_no_directory() {
-        assert_eq!(cwd_for(&Side::Native, None), Ok(None));
-        assert_eq!(cwd_for(&Side::Wsl("ubuntu".into()), None), Ok(None));
+        assert_eq!(cwd_for(&Side::Native, None).unwrap(), None);
+        assert_eq!(cwd_for(&Side::Wsl("ubuntu".into()), None).unwrap(), None);
     }
 
     /// Each multiplexer that fronts a server is built once, so every kind a
@@ -517,8 +546,8 @@ mod tests {
         assert!(!MultiplexerKind::real().any(|kind| kind == MultiplexerKind::Scripted));
         assert_eq!(all.len(), MultiplexerKind::real().count());
         assert_eq!(
-            all.requested(Some("scripted")),
-            Err("`scripted` is not a multiplexer, expected `herdr` or `zellij`".to_string())
+            all.requested(Some("scripted")).unwrap_err().to_string(),
+            "`scripted` is not a multiplexer, expected `herdr` or `zellij`"
         );
         assert!(!all.disabled_reason().contains("scripted"));
 

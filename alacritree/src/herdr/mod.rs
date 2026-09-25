@@ -21,6 +21,7 @@ pub(crate) use host::Herdr;
 pub(crate) use host::{PendingAttach, PendingCreate};
 pub(in crate::herdr) use poll::ListingReply;
 
+pub use cli::{CallError, Gesture, HerdrError};
 use cli::{attaches_directly, focus_pane, program, running_session_name};
 pub(crate) use model::pane_key;
 use model::unattached;

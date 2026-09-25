@@ -6,7 +6,7 @@
 use super::*;
 use crate::multiplexer::{
     AttachFocus, AttachRequest, CreateRequest, Launch, ListedPane, Managed, MultiplexerKind, Pane,
-    PaneKey, ViewState,
+    PaneError, PaneKey, ViewState,
 };
 
 impl AlacritreeApp {
@@ -161,7 +161,7 @@ impl AlacritreeApp {
         let cwd = match crate::multiplexer::cwd_for(&side, workspace.as_deref()) {
             Ok(cwd) => cwd,
             Err(e) => {
-                self.refuse_multiplexer_request(waiter, e, focus);
+                self.refuse_multiplexer_request(waiter, e.to_string(), focus);
                 return;
             },
         };
@@ -196,7 +196,9 @@ impl AlacritreeApp {
                         self.current_workspace = switch.from;
                     }
                 },
-                Err(e) => self.refuse_multiplexer_request(request.waiter, e, request.focus),
+                Err(e) => {
+                    self.refuse_multiplexer_request(request.waiter, e.to_string(), request.focus)
+                },
             }
         }
     }
@@ -263,7 +265,7 @@ impl AlacritreeApp {
                 },
                 Err(e) => {
                     self.restore_after_failed_attach(&request.workspace, request.previous);
-                    self.refuse_multiplexer_request(request.waiters, e, request.focus);
+                    self.refuse_multiplexer_request(request.waiters, e.to_string(), request.focus);
                 },
             }
         }
@@ -603,7 +605,7 @@ impl AlacritreeApp {
         let only = match self.multiplexers.requested(multiplexer) {
             Ok(only) => only,
             Err(e) => {
-                let _ = reply_tx.send(Err(e));
+                let _ = reply_tx.send(Err(e.to_string()));
                 return;
             },
         };
@@ -644,7 +646,7 @@ impl AlacritreeApp {
         let only = match self.multiplexers.requested(multiplexer) {
             Ok(only) => only,
             Err(e) => {
-                let _ = reply_tx.send(Err(e));
+                let _ = reply_tx.send(Err(e.to_string()));
                 return;
             },
         };
@@ -661,7 +663,7 @@ impl AlacritreeApp {
         let target = match self.create_target(only, named) {
             Ok(target) => target,
             Err(e) => {
-                let _ = reply_tx.send(Err(e));
+                let _ = reply_tx.send(Err(e.to_string()));
                 return;
             },
         };
@@ -689,7 +691,7 @@ impl AlacritreeApp {
         &self,
         only: Option<MultiplexerKind>,
         named: Option<Side>,
-    ) -> Result<(MultiplexerKind, Side), String> {
+    ) -> Result<(MultiplexerKind, Side), PaneError> {
         let focused = self
             .active_session_index()
             .and_then(|idx| self.sessions[idx].pane_key.as_ref())
@@ -703,7 +705,7 @@ impl AlacritreeApp {
             None => self.multiplexers.default_enabled(),
         };
         let Some(multiplexer) = default else {
-            return Err(self.multiplexers.disabled_reason().to_string());
+            return Err(PaneError::AllDisabled);
         };
         let side = match named {
             Some(side) => side,
@@ -724,7 +726,7 @@ impl Action for action::NewMultiplexerPane {
                 let workspace = app.current_workspace.clone();
                 app.create_multiplexer_pane(ctx, target, workspace, None, AttachFocus::Take);
             },
-            Err(e) => app.modals.error_dialog = Some(e),
+            Err(e) => app.modals.error_dialog = Some(e.to_string()),
         }
     }
 }

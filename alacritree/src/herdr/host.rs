@@ -8,15 +8,15 @@ use serde_json::{Value, json};
 
 use super::view::{HerdrViewAction, HerdrViewFocus, HerdrViewSync, ViewInputs};
 use super::{
-    EndpointCache, Endpoints, Listing, Settings, attaches_directly, cli, focus_pane, pane_key,
-    program, unattached,
+    EndpointCache, Endpoints, HerdrError, Listing, Settings, attaches_directly, cli, focus_pane,
+    pane_key, program, unattached,
 };
 use crate::config::{BakedGlyph, DEFAULT_HERDR_ICON, HerdrConfig, IconStyle};
 use crate::jobs;
 use crate::multiplexer::{
     AttachAnswer, AttachRequest, CreateAnswer, CreateRequest, CreatedPane, Launch, ListedPane,
-    Managed, MultiplexerKind, MultiplexerSession, Pane, PaneKey, PaneTarget, Side, ViewState,
-    ViewStep,
+    Managed, MultiplexerKind, MultiplexerSession, Pane, PaneError, PaneKey, PaneTarget, Side,
+    ViewState, ViewStep,
 };
 use crate::session::SessionId;
 
@@ -24,7 +24,7 @@ use crate::session::SessionId;
 /// its client runs, so everything the session needs is in hand by the time it
 /// opens.
 pub(crate) struct PendingAttach {
-    pub(crate) job: Option<jobs::Job<Result<Launch, String>>>,
+    pub(crate) job: Option<jobs::Job<Result<Launch, PaneError>>>,
     /// The pane to focus once the gesture runs.  A pane the listing has since
     /// dropped is focused as this said, since nothing newer says otherwise.
     pub(crate) target: PaneTarget,
@@ -33,7 +33,7 @@ pub(crate) struct PendingAttach {
 }
 
 pub(crate) struct PendingCreate {
-    pub(crate) job: jobs::Job<Result<CreatedPane, String>>,
+    pub(crate) job: jobs::Job<Result<CreatedPane, PaneError>>,
     pub(crate) side: Side,
     pub(crate) request: CreateRequest,
 }
@@ -77,10 +77,10 @@ impl Herdr {
     /// reach herdr, which on a loaded WSL side is the `wsl.exe` launch rather
     /// than herdr, so a live stream is left alone and only a side already
     /// down skips the rest of its backoff.
-    fn note_gesture<T>(&mut self, side: &Side, result: &Result<T, String>) {
+    fn note_gesture<T>(&mut self, side: &Side, result: &Result<T, PaneError>) {
         let Err(error) = result else { return };
         log::warn!("herdr ({side:?}): {error}");
-        if error.starts_with(cli::NO_ANSWER) {
+        if matches!(error, PaneError::Herdr(HerdrError::NoAnswer(_))) {
             self.reconnect_now(side);
         }
     }
@@ -248,7 +248,7 @@ impl MultiplexerSession for Herdr {
         listed
     }
 
-    fn default_side(&self) -> Result<Side, String> {
+    fn default_side(&self) -> Result<Side, PaneError> {
         // A cache holds a sample time only while it still holds a listing, so
         // a side whose rows are gone is not offered as the one a create meant.
         let answering: Vec<&Side> = self
@@ -260,11 +260,11 @@ impl MultiplexerSession for Herdr {
             .collect();
         match answering.as_slice() {
             [side] => Ok((*side).clone()),
-            [] => Err("no herdr server is answering; start one, or name a side".to_string()),
-            sides => Err(format!(
-                "no herdr session is focused and {} are answering; name one",
-                sides.iter().map(|side| side.name()).collect::<Vec<_>>().join(" and ")
-            )),
+            [] => Err(HerdrError::NoServer.into()),
+            sides => {
+                Err(HerdrError::AmbiguousSide(sides.iter().map(|side| side.name()).collect())
+                    .into())
+            },
         }
     }
 
@@ -355,7 +355,9 @@ impl MultiplexerSession for Herdr {
         let answer = match &pending.job {
             Some(job) => match job.poll() {
                 Some(launch) => Some(launch),
-                None if job.failed() => Some(Err("the herdr attach did not finish".to_string())),
+                None if job.failed() => {
+                    Some(Err(PaneError::AttachUnfinished(MultiplexerKind::Herdr)))
+                },
                 None => None,
             },
             None => {
@@ -370,6 +372,7 @@ impl MultiplexerSession for Herdr {
                         let focus = focus.then_some(target.pane_id.as_str());
                         cli::herdr_attach_gesture(&target.side, focus, name, blocking)
                             .map(|(program, argv)| Launch { program, argv })
+                            .map_err(PaneError::from)
                     }));
                 None
             },
@@ -396,7 +399,7 @@ impl MultiplexerSession for Herdr {
         let asked = side.clone();
         let focus = request.focus.takes();
         let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
-            cli::create_pane(&asked, cwd, focus, blocking)
+            cli::create_pane(&asked, cwd, focus, blocking).map_err(PaneError::from)
         });
         self.pending_create.push(PendingCreate { job, side, request });
     }
@@ -408,7 +411,9 @@ impl MultiplexerSession for Herdr {
         let pending = self.pending_create.remove(0);
         let pane = match pending.job.poll() {
             Some(pane) => pane,
-            None if pending.job.failed() => Err("the herdr pane create did not finish".to_string()),
+            None if pending.job.failed() => {
+                Err(PaneError::CreateUnfinished(MultiplexerKind::Herdr))
+            },
             None => {
                 self.pending_create.insert(0, pending);
                 return None;
@@ -462,7 +467,7 @@ impl MultiplexerSession for Herdr {
                 let Some(target) = self.focus_target(key) else { return ViewStep::default() };
                 let side = key.side.clone();
                 let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
-                    focus_pane(&side, &target.pane_id, blocking)
+                    focus_pane(&side, &target.pane_id, blocking).map_err(PaneError::from)
                 });
                 self.view_focus = Some(HerdrViewFocus { session: id, key: key.clone(), job });
                 ViewStep::default()
@@ -629,8 +634,8 @@ mod tests {
         assert!(cache.stream_up_for_test());
         herdr.caches_mut_for_test().push(cache);
 
-        let timed_out: Result<(), String> =
-            Err(format!("{} while focusing the pane", cli::NO_ANSWER));
+        let timed_out: Result<(), PaneError> =
+            Err(HerdrError::NoAnswer(crate::herdr::Gesture::Focus).into());
         herdr.note_gesture(&side, &timed_out);
 
         assert!(herdr.cache(&side).unwrap().stream_up_for_test(), "a live stream was restarted");

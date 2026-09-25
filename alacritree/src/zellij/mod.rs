@@ -14,15 +14,15 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-pub use cli::{CallError, SideListing, attach, create_pane, focus_pane, list_side};
+pub use cli::{CallError, SideListing, ZellijError, attach, create_pane, focus_pane, list_side};
 pub use listing::{split_terminal_id, terminal_id};
 use serde_json::{Value, json};
 
 use crate::config::{BakedGlyph, DEFAULT_ZELLIJ_ICON, IconStyle, ZellijConfig};
 use crate::multiplexer::{
     AttachAnswer, AttachRequest, CreateAnswer, CreateRequest, CreatedPane, Launch, ListedPane,
-    Managed, MultiplexerKind, MultiplexerSession, Pane, PaneKey, PaneTarget, Side, ViewState,
-    ViewStep,
+    Managed, MultiplexerKind, MultiplexerSession, Pane, PaneError, PaneKey, PaneTarget, Side,
+    ViewState, ViewStep,
 };
 use crate::session::SessionId;
 use crate::{jobs, wsl};
@@ -30,7 +30,7 @@ use crate::{jobs, wsl};
 /// A shared-view attach waiting on its focus call.  `job` is `None` until the
 /// attach at the head of the queue starts it.
 struct PendingAttach {
-    job: Option<jobs::Job<Result<Launch, String>>>,
+    job: Option<jobs::Job<Result<Launch, PaneError>>>,
     key: PaneKey,
     request: AttachRequest,
 }
@@ -45,7 +45,7 @@ const ABSENT_RECHECK: Duration = Duration::from_secs(60);
 type Polled = Vec<(Side, Result<SideListing, CallError>)>;
 
 struct PendingCreate {
-    job: jobs::Job<Result<CreatedPane, String>>,
+    job: jobs::Job<Result<CreatedPane, PaneError>>,
     side: Side,
     request: CreateRequest,
 }
@@ -103,7 +103,7 @@ impl Zellij {
 
     /// The session a new pane on `side` opens in: the configured one, or the
     /// only one running there.
-    fn create_session(&self, side: &Side) -> Result<String, String> {
+    fn create_session(&self, side: &Side) -> Result<String, ZellijError> {
         if let Some(session) = &self.config.session {
             return Ok(session.clone());
         }
@@ -111,13 +111,11 @@ impl Zellij {
             self.side(side).map(|listing| listing.sessions.as_slice()).unwrap_or_default();
         match running {
             [session] => Ok(session.clone()),
-            [] => Err(format!("no zellij session is running on {}; start one", side.name())),
-            several => Err(format!(
-                "{} zellij sessions are running on {} ({}); set [integrations.zellij] session",
-                several.len(),
-                side.name(),
-                several.join(", ")
-            )),
+            [] => Err(ZellijError::NoSessionOn(side.name())),
+            several => Err(ZellijError::SeveralSessionsOn {
+                side: side.name(),
+                sessions: several.to_vec(),
+            }),
         }
     }
 
@@ -131,12 +129,12 @@ impl Zellij {
                     self.absent.retain(|(absent, _)| *absent != side);
                     self.sides.push(listing);
                 },
-                Err(CallError::Absent(why)) => {
+                Err(CallError::NoAnswer) => {},
+                Err(why) => {
                     log::debug!("zellij: {why}; asking {} again in a minute", side.name());
                     self.absent.retain(|(absent, _)| *absent != side);
                     self.absent.push((side, at));
                 },
-                Err(CallError::NoAnswer) => {},
             }
         }
     }
@@ -255,7 +253,7 @@ impl MultiplexerSession for Zellij {
             .collect()
     }
 
-    fn default_side(&self) -> Result<Side, String> {
+    fn default_side(&self) -> Result<Side, PaneError> {
         let running: Vec<&Side> = self
             .sides
             .iter()
@@ -264,11 +262,11 @@ impl MultiplexerSession for Zellij {
             .collect();
         match running.as_slice() {
             [side] => Ok((*side).clone()),
-            [] => Err("no zellij session is running; start one, or name a side".to_string()),
-            sides => Err(format!(
-                "no zellij session is focused and {} are running one; name a side",
-                sides.iter().map(|side| side.name()).collect::<Vec<_>>().join(" and ")
-            )),
+            [] => Err(ZellijError::NoSession.into()),
+            sides => {
+                Err(ZellijError::AmbiguousSide(sides.iter().map(|side| side.name()).collect())
+                    .into())
+            },
         }
     }
 
@@ -337,21 +335,24 @@ impl MultiplexerSession for Zellij {
             let key = head.key.clone();
             let focus = head.request.focus.takes();
             let program = self.program(&key.side);
-            let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
-                let (session, pane_id) = split_terminal_id(&key.terminal_id)
-                    .ok_or_else(|| format!("`{}` names no zellij pane", key.terminal_id))?;
-                if focus {
-                    focus_pane(&program, &key.side, session, pane_id)?;
-                }
-                let (program, argv) = attach(&program, &key.side, session);
-                Ok(Launch { program, argv })
-            });
+            let job = jobs::pool().spawn(
+                jobs::Priority::Interactive,
+                move |_blocking| -> Result<Launch, PaneError> {
+                    let (session, pane_id) = split_terminal_id(&key.terminal_id)
+                        .ok_or_else(|| ZellijError::NotAPane(key.terminal_id.clone()))?;
+                    if focus {
+                        focus_pane(&program, &key.side, session, pane_id)?;
+                    }
+                    let (program, argv) = attach(&program, &key.side, session);
+                    Ok(Launch { program, argv })
+                },
+            );
             self.pending_attach[0].job = Some(job);
             return (None, false);
         };
         let launch = match job.poll() {
             Some(launch) => launch,
-            None if job.failed() => Err("the zellij attach did not finish".to_string()),
+            None if job.failed() => Err(PaneError::AttachUnfinished(MultiplexerKind::Zellij)),
             None => return (None, false),
         };
         let pending = self.pending_attach.remove(0);
@@ -364,9 +365,12 @@ impl MultiplexerSession for Zellij {
         let program = self.program(&side);
         let asked = side.clone();
         let focus = request.focus.takes();
-        let job = jobs::pool().spawn(jobs::Priority::Interactive, move |_blocking| {
-            create_pane(&program, &asked, &session?, cwd.as_deref(), focus)
-        });
+        let job = jobs::pool().spawn(
+            jobs::Priority::Interactive,
+            move |_blocking| -> Result<CreatedPane, PaneError> {
+                Ok(create_pane(&program, &asked, &session?, cwd.as_deref(), focus)?)
+            },
+        );
         self.pending_create.push(PendingCreate { job, side, request });
     }
 
@@ -375,7 +379,7 @@ impl MultiplexerSession for Zellij {
         let pane = match pending.job.poll() {
             Some(pane) => pane,
             None if pending.job.failed() => {
-                Err("the zellij pane create did not finish".to_string())
+                Err(PaneError::CreateUnfinished(MultiplexerKind::Zellij))
             },
             None => return None,
         };
@@ -442,6 +446,10 @@ mod tests {
         zellij
     }
 
+    fn absent(side: &Side) -> CallError {
+        CallError::Absent { side: side.name(), said: "no zellij".into() }
+    }
+
     /// A side with no zellij is asked again once a minute rather than every
     /// poll, since each ask on WSL can launch a `wsl.exe`.
     #[test]
@@ -449,7 +457,7 @@ mod tests {
         let wsl = Side::Wsl("d".into());
         let mut zellij = zellij(Vec::new());
         let at = Instant::now();
-        zellij.adopt(vec![(wsl.clone(), Err(CallError::Absent("no zellij".into())))], at);
+        zellij.adopt(vec![(wsl.clone(), Err(absent(&wsl)))], at);
 
         assert!(!zellij.due(&wsl, at + Duration::from_secs(2)));
         assert!(zellij.due(&wsl, at + Duration::from_secs(61)));
@@ -463,7 +471,7 @@ mod tests {
         let wsl = Side::Wsl("d".into());
         let mut zellij = zellij(Vec::new());
         let at = Instant::now();
-        zellij.adopt(vec![(wsl.clone(), Err(CallError::Absent("no zellij".into())))], at);
+        zellij.adopt(vec![(wsl.clone(), Err(absent(&wsl)))], at);
         let later = at + Duration::from_secs(61);
         zellij.adopt(vec![(wsl.clone(), Err(CallError::NoAnswer))], later);
 
@@ -521,7 +529,7 @@ mod tests {
     #[test]
     fn a_new_pane_goes_to_the_one_running_session() {
         let zellij = zellij(vec![side(Side::Native, &["only"], Vec::new(), Instant::now())]);
-        assert_eq!(zellij.create_session(&Side::Native), Ok("only".to_string()));
+        assert_eq!(zellij.create_session(&Side::Native).unwrap(), "only");
     }
 
     /// Several running sessions leave no way to tell which one a create
@@ -530,14 +538,15 @@ mod tests {
     fn a_new_pane_among_several_sessions_is_refused() {
         let zellij = zellij(vec![side(Side::Native, &["a", "b"], Vec::new(), Instant::now())]);
         let refusal = zellij.create_session(&Side::Native).unwrap_err();
-        assert!(refusal.contains("[integrations.zellij] session"), "{refusal}");
+        assert!(matches!(refusal, ZellijError::SeveralSessionsOn { .. }), "{refusal}");
+        assert!(refusal.to_string().contains("[integrations.zellij] session"), "{refusal}");
     }
 
     #[test]
     fn a_configured_session_is_where_new_panes_go() {
         let mut zellij = zellij(vec![side(Side::Native, &["a", "b"], Vec::new(), Instant::now())]);
         zellij.config.session = Some("b".into());
-        assert_eq!(zellij.create_session(&Side::Native), Ok("b".to_string()));
+        assert_eq!(zellij.create_session(&Side::Native).unwrap(), "b");
     }
 
     #[test]
