@@ -227,10 +227,10 @@ mod tests {
     /// seconds, while what these tests check is only how the cache takes a
     /// failure.
     fn panicking_compute() -> jobs::Job<Result<Status, String>> {
-        jobs::pool().spawn(
-            jobs::Priority::Interactive,
-            |_: &jobs::Blocking| -> Result<Status, String> { panic!("boom") },
-        )
+        jobs::pool()
+            .spawn(jobs::Priority::Interactive, |_: &jobs::Blocking| -> Result<Status, String> {
+                panic!("boom")
+            })
     }
 
     #[test]
