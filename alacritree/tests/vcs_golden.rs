@@ -197,7 +197,9 @@ fn project_list_and_state_file() {
     assert_golden("project-list.txt", &stdout(&cli(home, &["project", "list"]), home));
     let state = std::fs::read_to_string(home.join("alacritree").join("state.toml"))
         .expect("state.toml lands inside the isolated home");
-    assert_golden("state.toml", &normalize(&state, home));
+    // toml writes a path holding backslashes as a literal string, so Windows
+    // quotes the roots with `'` where Linux uses `"`.
+    assert_golden("state.toml", &normalize(&state, home).replace('\'', "\""));
 }
 
 #[test]
