@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use alacritree_common::jobs::Blocking;
-use alacritree_common::side::{self, Program, Ran, Side};
+use alacritree_common::side::{self, Program, Ran, Side, lookup_name};
 use alacritree_common::wsl;
 use serde::Deserialize;
 
@@ -55,14 +55,6 @@ pub struct RawCommandHook {
 
 fn enabled_by_default() -> bool {
     true
-}
-
-/// The name a distro's login shell finds `path` by. A native path, possibly
-/// a Windows one, means nothing inside the distro.
-fn lookup_name(path: &str) -> String {
-    std::path::Path::new(path)
-        .file_stem()
-        .map_or_else(|| path.to_string(), |stem| stem.to_string_lossy().into_owned())
 }
 
 impl RawCheckoutHooks {

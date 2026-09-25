@@ -3,7 +3,7 @@
 //! checkout hooks.
 
 use alacritree_common::jobs::Blocking;
-use alacritree_common::side::{self, Program, Ran, Side};
+use alacritree_common::side::{self, Program, Ran, Side, lookup_name};
 use serde::Deserialize;
 
 use crate::{Edit, Filter, Task, TaskBackend, TaskError};
@@ -133,14 +133,6 @@ impl RawTasks {
         };
         TasksConfig { command }
     }
-}
-
-/// The name a distro's login shell finds `path` by. A native path, possibly
-/// a Windows one, means nothing inside the distro.
-fn lookup_name(path: &str) -> String {
-    std::path::Path::new(path)
-        .file_stem()
-        .map_or_else(|| path.to_string(), |stem| stem.to_string_lossy().into_owned())
 }
 
 /// One argument list per operation. An empty one means the store cannot do

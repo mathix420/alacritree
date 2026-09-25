@@ -118,6 +118,14 @@ pub struct Program {
     pub name: String,
 }
 
+/// The name a distro's login shell finds `path` by, for [`Program::name`]. A
+/// native path, possibly a Windows one, means nothing inside the distro.
+pub fn lookup_name(path: &str) -> String {
+    Path::new(path)
+        .file_stem()
+        .map_or_else(|| path.to_string(), |stem| stem.to_string_lossy().into_owned())
+}
+
 /// A command line on the program's own side, and whether it passes through
 /// a login shell, whose exit status 127 means the program was not found.
 /// Inside a distro this is what follows `wsl.exe -d <distro> --exec`.
