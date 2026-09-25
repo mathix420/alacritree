@@ -4,6 +4,7 @@
 
 pub mod command_ext;
 pub mod jobs;
+pub mod settings;
 pub mod side;
 pub mod tools;
 pub mod wsl;

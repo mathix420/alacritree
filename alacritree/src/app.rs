@@ -5,6 +5,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use alacritree_checkout_hooks::{Checkout, CheckoutHook, CheckoutHooks};
+use alacritree_forge::{PrInfo, PrState};
 use eframe::CreationContext;
 use egui::{Color32, Context, Frame, Margin, RichText, ScrollArea, SidePanel, Stroke};
 
@@ -27,6 +28,7 @@ use crate::config::{
     profile_command,
 };
 use crate::crash_log::{self, ExitReason};
+use crate::forge::Forge;
 use crate::git_nav::{self, GitSection, SectionCount};
 use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
 use crate::in_flight::{Finished, InFlight};
@@ -36,7 +38,7 @@ use crate::multiplexer::{
 };
 use crate::panel_filter::{self, PanelFilter};
 use crate::path_style::PathStyle;
-use crate::pr_status::{self, PrCache, PrInfo, PrState};
+use crate::pr_status::{self, PrCache};
 use crate::projects::{Discovered, NotAProject, Project, Worktree, project_json};
 use crate::session::{
     self, Attachment, AttentionVerdict, LiveState, PendingAttention, Session, SessionActivity,
@@ -371,7 +373,7 @@ pub struct AlacritreeApp {
     sessions: SessionList,
     current_workspace: WorkspaceKey,
     projects: Vec<Project>,
-    pr_cache: PrCache,
+    pr_cache: PrCache<Forge>,
     /// Renders `[ui] worktree_name` / `project_name` templates at paint time.
     row_labels: crate::row_label::LabelTemplates,
     config: Config,
@@ -499,7 +501,7 @@ impl AlacritreeApp {
             sessions: SessionList::default(),
             current_workspace: None,
             projects,
-            pr_cache: PrCache::new(),
+            pr_cache: PrCache::new(Forge::default()),
             row_labels,
             icons: PaintedIcons::new(&config, &multiplexers),
             shortcuts: crate::shortcut::Shortcuts::new(&config.bindings),

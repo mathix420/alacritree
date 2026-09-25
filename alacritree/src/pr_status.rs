@@ -1,138 +1,94 @@
-//! Detect whether the current branch has an open PR on GitHub, and cache
-//! its base branch so the sidebar diff can target the PR's base instead of
-//! the repo's default branch.
-//!
-//! Why shell out to `gh` rather than hit the API directly: it inherits the
-//! user's existing auth and host config (enterprise, multiple accounts), and
-//! we already require `git` on PATH — adding `gh` is a familiar dependency
-//! for anyone who lives in this workflow.  The lookup is best-effort: if
-//! `gh` is missing, unauthenticated, or no PR exists, we silently fall back
-//! to the repo's default branch.
+//! Detect whether the current branch has a PR on the repository's forge, and
+//! cache its base branch so the sidebar diff can target the PR's base instead
+//! of the repo's default branch. The lookup is best-effort: a forge that
+//! fails or finds nothing leaves the default branch in place.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use alacritree_forge::{Head, PrInfo, PrState, PullRequests, RemoteForge};
+
+use crate::jobs;
 use crate::projects::Worktree;
 use crate::repaint::Repaint;
-use crate::tools::{self, Tool};
-use crate::{command_ext, jobs, pr_query, wsl};
 
-/// Re-query at most this often.  PR base branches rarely change, and a stale
-/// answer just falls back to the previous diff target — not worth hammering
-/// `gh` on every status refresh.
+/// Re-query at most this often. PR base branches rarely change, and a stale
+/// answer just falls back to the previous diff target, which is not worth
+/// hammering the forge on every status refresh.
 const TTL: Duration = Duration::from_secs(300);
-
-/// GitHub's PR lifecycle, folded to what the sidebar paints.  `gh` reports
-/// draftness as a separate boolean, so OPEN splits into Open/Draft here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PrState {
-    Open,
-    Draft,
-    Merged,
-    Closed,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PrInfo {
-    pub number: u64,
-    pub base_branch: String,
-    pub url: String,
-    pub state: PrState,
-}
 
 /// How many bursts may run at once: what the config asks for, never above one
 /// below the pool's background ceiling.
 ///
-/// A ceiling rather than a limit that binds today.  One frame's whole due list
+/// A ceiling rather than a limit that binds today. One frame's whole due list
 /// becomes a single job, and every entry it covers stays `pending` until that
 /// job settles, so nothing new falls due meanwhile: one request is in flight in
-/// steady state and two across a handover, under any cap this returns.  It
-/// stays because the shape it guards against is cheap to reintroduce — a spawn
-/// per group would put a project's repositories on the pool at once — and
+/// steady state and two across a handover, under any cap this returns. It
+/// stays because the shape it guards against is cheap to reintroduce, since a
+/// spawn per group would put a project's repositories on the pool at once, and
 /// because reserving a slot below the ceiling is what leaves a worker for the
 /// local work sharing the pool, at any pool size.
 fn effective_cap(configured: Option<usize>, ceiling: usize) -> usize {
     configured.unwrap_or(usize::MAX).min(ceiling.saturating_sub(1)).max(1)
 }
 
-pub(crate) struct PrCache {
+pub(crate) struct PrCache<F> {
+    forge: F,
     entries: HashMap<PathBuf, Entry>,
-    /// Requests in flight.  `in_flight` counts these rather than branches:
-    /// what a burst costs follows the repositories it spans — a resolve and a
-    /// query each, or one `gh pr list` per member of a group that could not be
-    /// batched — not the number of branches waiting on it.
+    /// Requests in flight. `in_flight` counts these rather than branches:
+    /// what a burst costs follows the repositories it spans, not the number
+    /// of branches waiting on it.
     batches: Vec<Batch>,
-    /// Entries that asked for a lookup this frame, grouped and spawned by the
-    /// next `drain_completed`.  Batching needs a whole frame's worth of due
+    /// Entries that asked for a lookup this frame, handed to the forge by the
+    /// next `drain_completed`. Batching needs a whole frame's worth of due
     /// entries before it can group them, which one `poll` call cannot see.
-    due: Vec<Member>,
+    due: Vec<Head>,
     in_flight: usize,
     concurrency: usize,
     generation: u64,
-    /// Elapsed since this cache was built.  A `Duration` rather than an
+    /// Elapsed since this cache was built. A `Duration` rather than an
     /// `Instant` because an `Instant` cannot be constructed or advanced, so
     /// nothing could set one to test a boundary against.
     clock: Box<dyn Fn() -> Duration + Send>,
 }
 
-impl Default for PrCache {
-    fn default() -> Self {
-        let origin = Instant::now();
-        Self::with_clock(move || origin.elapsed())
-    }
-}
-
 #[derive(Default)]
 struct Entry {
-    /// Branch the cached result was queried for.  Switching branches in the
+    /// Branch the cached result was queried for. Switching branches in the
     /// same worktree invalidates the entry.
     branch: Option<String>,
     info: Option<PrInfo>,
     queried_at: Option<Duration>,
     /// Set from the moment this entry joins the due list until its answer is
-    /// banked.  `should_spawn` reads it to avoid asking twice for one badge,
+    /// banked. `should_spawn` reads it to avoid asking twice for one badge,
     /// so it has to cover the queued frame as well as the running one.
     pending: bool,
-    /// A refresh landed while `pending` was already occupied.  The drain
+    /// A refresh landed while `pending` was already occupied. The drain
     /// leaves `queried_at` cleared instead of stamping the fresh lookup's
     /// result as current, so the next poll re-queries.
     refresh_requested: bool,
 }
 
-/// A worktree and the branch its badge is keyed to.  Carried through
-/// grouping and back out through the drain, so a batched answer can find
-/// every entry that asked for it.
-#[derive(Debug, Clone, PartialEq)]
-struct Member {
-    path: PathBuf,
-    branch: String,
-}
-
-/// One request in flight, and every entry waiting on it.  A job that never
+/// One request in flight, and every entry waiting on it. A job that never
 /// reports would otherwise hold its concurrency slot forever: a panicked one
 /// reports through `Job::failed` immediately, a merely slow one is backed off
 /// once it has been in flight past the TTL.
 struct Batch {
-    job: jobs::Job<BatchResult>,
+    job: jobs::Job<PullRequests>,
     started: Duration,
-    members: Vec<Member>,
+    members: Vec<Head>,
 }
 
-/// What one request reports back: an answer per worktree it covered.  Keyed by
-/// path rather than by branch, because two repositories in one burst can hold
-/// the same branch name.  `None` means the request covered that path and found
-/// no PR, which is a real answer.
-type BatchResult = HashMap<PathBuf, Option<PrInfo>>;
-
-impl PrCache {
-    pub(crate) fn new() -> Self {
-        Self::default()
+impl<F: RemoteForge + Clone + Send + 'static> PrCache<F> {
+    pub(crate) fn new(forge: F) -> Self {
+        let origin = Instant::now();
+        Self::with_clock(forge, move || origin.elapsed())
     }
 
-    pub(crate) fn with_clock(clock: impl Fn() -> Duration + Send + 'static) -> Self {
+    pub(crate) fn with_clock(forge: F, clock: impl Fn() -> Duration + Send + 'static) -> Self {
         Self {
+            forge,
             entries: HashMap::new(),
             batches: Vec::new(),
             due: Vec::new(),
@@ -161,8 +117,8 @@ impl PrCache {
 
     /// Returns the PR info known for `(path, branch)` right now, kicking off
     /// a background refresh if the cache is stale or branch-mismatched.
-    /// Never blocks — the caller will see the previous value (or `None`)
-    /// until the worker finishes and the next frame picks up the result.
+    /// Never blocks. The caller sees the previous value (or `None`) until the
+    /// worker finishes and the next frame picks up the result.
     pub(crate) fn poll(
         &mut self,
         path: &Path,
@@ -175,7 +131,7 @@ impl PrCache {
         // A `None` poll (the git-status compute hasn't produced a branch
         // yet, or never will) carries no information about the current
         // branch, so it must not evict or refresh a lookup keyed to a real
-        // one from another caller — just read whatever is cached.
+        // one from another caller. It just reads whatever is cached.
         let Some(branch) = branch else {
             return entry.info.clone();
         };
@@ -196,15 +152,15 @@ impl PrCache {
             }
             entry.branch = Some(branch.to_string());
             entry.pending = true;
-            self.due.push(Member { path: path.to_path_buf(), branch: branch.to_string() });
-            // The frame that queues a lookup is not the frame that starts one
-            // — the next drain is — and egui paints on demand.  Without asking
+            self.due.push(Head { path: path.to_path_buf(), branch: branch.to_string() });
+            // The frame that queues a lookup is not the frame that starts one,
+            // the next drain is, and egui paints on demand. Without asking
             // for that frame the request waits on the user's next input
             // instead of on the TTL.
             //
             // Only while a slot is free, though: over the cap the drain
             // refuses the member and leaves it due, so an unconditional ask
-            // would repaint at frame rate for as long as the batch runs.  The
+            // would repaint at frame rate for as long as the batch runs. The
             // guard inside the spawn closure delivers that wake when a slot
             // frees, on the panicking path too.
             if may_spawn(self.concurrency, self.in_flight) {
@@ -215,7 +171,7 @@ impl PrCache {
         self.entries.get(path).and_then(|entry| entry.info.clone())
     }
 
-    /// Advances whenever what `state` would answer may have moved.  The sidebar
+    /// Advances whenever what `state` would answer may have moved. The sidebar
     /// reconciler compares it to know a filtered row set needs rebuilding; a
     /// banked result that happens to match the previous one costs one extra
     /// rebuild, which is cheaper than diffing states to avoid it.
@@ -224,15 +180,15 @@ impl PrCache {
     }
 
     /// The cap on lookups in flight at once: `configured` if given, else the
-    /// pool decides.  Either way it never exceeds the pool's own background
-    /// ceiling, so a cold cache can't fork one `gh` process per eligible
+    /// pool decides. Either way it never exceeds the pool's own background
+    /// ceiling, so a cold cache can't fork one forge process per eligible
     /// worktree and starve the local work sharing the pool.
     pub(crate) fn set_concurrency(&mut self, configured: Option<usize>) {
         self.concurrency = effective_cap(configured, jobs::pool().background_ceiling());
     }
 
     /// Bank every finished request and free its slot, then turn the frame's
-    /// due list into new requests.  Runs once a frame ahead of every poll
+    /// due list into new requests. Runs once a frame ahead of every poll
     /// site rather than inside `poll`: an entry whose project collapsed
     /// mid-lookup is never polled again, and a slot it still held would never
     /// come back.
@@ -243,13 +199,13 @@ impl PrCache {
         for batch in std::mem::take(&mut self.batches) {
             if let Some(found) = batch.job.poll() {
                 for m in &batch.members {
-                    self.settle(m, found.get(&m.path).cloned().flatten(), now);
+                    self.settle(m, answer(&found, m), now);
                 }
                 banked = true;
             } else if batch.job.failed() || now.saturating_sub(batch.started) > TTL {
                 // A request that never reports has no answer to bank, but its
                 // members must still be stamped: leaving them due re-spawns a
-                // `gh` process every frame for as long as the failure lasts.
+                // lookup every frame for as long as the failure lasts.
                 for m in &batch.members {
                     self.back_off(m, now);
                 }
@@ -266,9 +222,9 @@ impl PrCache {
         self.spawn_due(repaint);
     }
 
-    /// Record one member's answer.  `None` means the request covered this
+    /// Record one member's answer. `None` means the request covered this
     /// branch and found no PR, which is a real answer and gets stamped.
-    fn settle(&mut self, m: &Member, info: Option<PrInfo>, now: Duration) {
+    fn settle(&mut self, m: &Head, info: Option<PrInfo>, now: Duration) {
         let entry = self.entries.entry(m.path.clone()).or_default();
         entry.branch = Some(m.branch.clone());
         entry.info = info;
@@ -281,22 +237,22 @@ impl PrCache {
 
     /// Stamp a member whose request produced nothing, keeping its previous
     /// answer on screen and holding it off for a TTL.
-    fn back_off(&mut self, m: &Member, now: Duration) {
+    fn back_off(&mut self, m: &Head, now: Duration) {
         let entry = self.entries.entry(m.path.clone()).or_default();
         entry.queried_at = Some(now);
         entry.refresh_requested = false;
         entry.pending = false;
     }
 
-    /// Hand the frame's due list to one worker.  Grouping needs `git2` to read
-    /// each path's `origin`, which is why nothing here inspects the list: the
-    /// frame only decides whether there is room to ask.
+    /// Hand the frame's due list to one worker. The frame only decides whether
+    /// there is room to ask; how the list is grouped into requests is the
+    /// forge's business, and may need blocking reads to decide.
     ///
     /// Over the cap the list is dropped, and every member is returned to the
-    /// state it was polled in — not just `pending` cleared.  `poll` has
-    /// already written the new branch, so on a branch switch the stamp is the
-    /// only thing left saying the entry is stale; keeping it would read as a
-    /// fresh answer for a branch nothing ever looked up.
+    /// state it was polled in, not just `pending` cleared. `poll` has already
+    /// written the new branch, so on a branch switch the stamp is the only
+    /// thing left saying the entry is stale; keeping it would read as a fresh
+    /// answer for a branch nothing ever looked up.
     fn spawn_due(&mut self, repaint: &impl Repaint) {
         let due = std::mem::take(&mut self.due);
         if due.is_empty() {
@@ -313,17 +269,18 @@ impl PrCache {
         }
         let members = due.clone();
         let repaint = repaint.clone();
+        let forge = self.forge.clone();
         let job = jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
             // Fires on a panicking unwind too, since it's a local: the drain
             // that frees this slot only runs on a frame, so an exit without a
             // repaint can stall polling for good.
             let _wake = WakeOnDrop(repaint);
-            run_due(due, blocking)
+            forge.pull_requests(due, blocking)
         });
         self.bank_batch(members, job);
     }
 
-    /// Mark every entry stale.  Entries with a lookup already running also get
+    /// Mark every entry stale. Entries with a lookup already running also get
     /// `refresh_requested`, because clearing `queried_at` alone cannot reach
     /// them: `poll` will not spawn while `pending` is occupied, and the drain
     /// would stamp a fresh timestamp over the request.
@@ -337,12 +294,12 @@ impl PrCache {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    /// Record a started request against every entry it covers.  Each entry is
+    /// Record a started request against every entry it covers. Each entry is
     /// keyed to the branch being asked about rather than to the last banked
     /// answer: a worker that dies without sending leaves nothing for the drain
     /// to key it with, and a mismatched branch makes the entry due again on the
     /// next frame however recently it was queried.
-    fn bank_batch(&mut self, members: Vec<Member>, job: jobs::Job<BatchResult>) {
+    fn bank_batch(&mut self, members: Vec<Head>, job: jobs::Job<PullRequests>) {
         let started = self.now();
         for m in &members {
             let entry = self.entries.entry(m.path.clone()).or_default();
@@ -367,6 +324,18 @@ impl PrCache {
     }
 }
 
+/// A lookup that failed reads as no PR, the way it always has when `gh` is
+/// missing or unauthenticated, so the diff falls back to the default branch.
+fn answer(found: &PullRequests, m: &Head) -> Option<PrInfo> {
+    match found.get(&m.path)? {
+        Ok(info) => info.clone(),
+        Err(e) => {
+            log::debug!("PR lookup for {} in {} failed: {e}", m.branch, m.path.display());
+            None
+        },
+    }
+}
+
 /// Whether another lookup may start.
 fn may_spawn(concurrency: usize, in_flight: usize) -> bool {
     in_flight < concurrency
@@ -388,9 +357,9 @@ fn should_spawn(
     invalidate || !fresh
 }
 
-/// A `None` incoming branch never invalidates — the caller has nothing to
-/// compare against. A `Some` branch that disagrees with the cached one means
-/// a real branch switch and must invalidate.
+/// A `None` incoming branch never invalidates, since the caller has nothing
+/// to compare against. A `Some` branch that disagrees with the cached one
+/// means a real branch switch and must invalidate.
 fn should_invalidate(cached_branch: Option<&str>, incoming_branch: Option<&str>) -> bool {
     match incoming_branch {
         None => false,
@@ -399,8 +368,8 @@ fn should_invalidate(cached_branch: Option<&str>, incoming_branch: Option<&str>)
 }
 
 /// Whether a worktree in `state` survives the projects panel's PR dimension.
-/// The active states union; with none active every worktree passes.  An unknown
-/// state — no lookup yet, no PR, or no `gh` — satisfies no active toggle.
+/// The active states union; with none active every worktree passes. An unknown
+/// state, whether no lookup yet, no PR, or no `gh`, satisfies no active toggle.
 pub(crate) fn pr_pass(
     state: Option<PrState>,
     open: bool,
@@ -420,16 +389,16 @@ pub(crate) fn pr_pass(
     }
 }
 
-/// The branch a worktree's PR lookup is keyed to.  The active worktree prefers
+/// The branch a worktree's PR lookup is keyed to. The active worktree prefers
 /// its live status branch; every other worktree, and an active one whose
 /// `StatusCache` has not produced a branch yet, uses the stored snapshot.
 ///
-/// The split is what keeps two pollers of one path from fighting.  [`PrCache`]
-/// is keyed by path alone, so the right sidebar — which polls the active
-/// workspace with its live `StatusCache` branch, recomputed every ~1.5 s — and
+/// The split is what keeps two pollers of one path from fighting. [`PrCache`]
+/// is keyed by path alone, so the right sidebar, which polls the active
+/// workspace with its live `StatusCache` branch recomputed every ~1.5 s, and
 /// the projects sidebar must agree on a branch, or each drain flips
 /// `entry.branch` and they invalidate each other's lookups forever after an
-/// in-terminal checkout.  Every other worktree has a single poller, and an
+/// in-terminal checkout. Every other worktree has a single poller, and an
 /// inactive workspace's `StatusCache` is created once and then never re-polled
 /// or pruned: reading it would freeze the branch at whatever it was on the last
 /// visit and shadow later `refresh_project` updates to `wt.branch`.
@@ -445,177 +414,6 @@ pub(crate) fn effective_branch<'a>(
     }
 }
 
-/// Group a whole burst and ask for each group in turn, reporting one answer
-/// per worktree.  Runs on a worker: both the `git2` reads that grouping needs
-/// and the requests themselves block.
-fn run_due(due: Vec<Member>, blocking: &jobs::Blocking) -> BatchResult {
-    let mut out = HashMap::new();
-    for group in groups(due, blocking) {
-        // A cancel landing between groups has no child to kill — neither the
-        // request nor the sweep registers one — so each group asks before
-        // starting rather than forking `gh` for a caller that is gone.
-        if blocking.cancelled() {
-            break;
-        }
-        let found = query_group(
-            &group,
-            |cwd, query| run_graphql(cwd, query, blocking),
-            |m, head_owner| query_gh(&m.path, &m.branch, head_owner, blocking),
-        );
-        for m in &group.members {
-            out.insert(m.path.clone(), found.get(&m.branch).cloned());
-        }
-    }
-    out
-}
-
-/// What one request covers: the branches asked about, and one worktree inside
-/// the repository to run `gh` from.  An absent `slug` means this group has no
-/// batched form and runs the per-branch path instead.
-struct Group {
-    /// Any worktree of this repository; `gh` resolves the repo from its cwd.
-    cwd: PathBuf,
-    slug: Option<(String, String)>,
-    members: Vec<Member>,
-    /// The owner each branch pushes to, where one could be read.
-    head_owners: HashMap<String, String>,
-}
-
-/// One request per repository, chunked, plus one per path that cannot be
-/// grouped.  Reading `origin` costs a git2 open per due path, and resolving
-/// costs a `gh` process per repository, which is why this runs on a worker
-/// rather than on the frame.
-fn groups(due: Vec<Member>, blocking: &jobs::Blocking) -> Vec<Group> {
-    groups_with(due, |cwd| resolve_repo(cwd, blocking))
-}
-
-/// `resolve` names the repository a group asks about, given any worktree of
-/// it.  Separate from [`groups`] so a test can pin which repository a group
-/// ends up asking without a `gh` process deciding it.
-fn groups_with(
-    due: Vec<Member>,
-    resolve: impl Fn(&Path) -> Option<(String, String)>,
-) -> Vec<Group> {
-    let mut by_repo: HashMap<(String, String), Group> = HashMap::new();
-    let mut ungrouped = Vec::new();
-    for m in due {
-        let (slug, head_owner) = match wsl::classify(&m.path) {
-            wsl::Location::Windows(p) => read_remotes(&p, &m.branch),
-            // Nothing here can read a repository inside a distro, and its
-            // `gh` runs as a script rather than a `Command`.
-            wsl::Location::Wsl { .. } => (None, None),
-        };
-        let group = match slug {
-            Some((owner, name)) => {
-                by_repo.entry((owner.clone(), name.clone())).or_insert_with(|| Group {
-                    cwd: m.path.clone(),
-                    slug: Some((owner, name)),
-                    members: Vec::new(),
-                    head_owners: HashMap::new(),
-                })
-            },
-            None => {
-                ungrouped.push(Group {
-                    cwd: m.path.clone(),
-                    slug: None,
-                    members: Vec::new(),
-                    head_owners: HashMap::new(),
-                });
-                ungrouped.last_mut().expect("just pushed")
-            },
-        };
-        if let Some(owner) = head_owner {
-            group.head_owners.insert(m.branch.clone(), owner);
-        }
-        group.members.push(m);
-    }
-    by_repo
-        .into_values()
-        .flat_map(|mut g| {
-            // `origin` says only which worktrees share a repository.  Which
-            // repository to ask is `gh`'s answer, and the two differ on a fork
-            // checkout: `origin` names the fork, while a pull request is listed
-            // under the repository it targets.  One resolve per repository, so
-            // a project's worktrees still cost one process between them.
-            g.slug = resolve(&g.cwd);
-            g.members
-                .chunks(pr_query::CHUNK)
-                .map(|c| Group {
-                    cwd: g.cwd.clone(),
-                    slug: g.slug.clone(),
-                    members: c.to_vec(),
-                    head_owners: g.head_owners.clone(),
-                })
-                .collect::<Vec<_>>()
-        })
-        .chain(ungrouped)
-        .collect()
-}
-
-/// Ask GitHub about a whole group in one request, falling back to the
-/// per-branch path when there is no batched form or the request produced no
-/// usable answer.  GraphQL can need scopes `gh pr list` does not, so an
-/// install that works today can fail here, and a project's badges must not
-/// vanish when it does.
-///
-/// An answer naming no PR at all is still an answer and returns as one: a
-/// repository whose branches have no open PRs is the common case, and
-/// sweeping it per branch would find the same nothing at one process each.
-///
-/// `request` and `per_branch` are injected so a test can pin which of the two
-/// paths a given response takes without spawning `gh`.
-fn query_group(
-    group: &Group,
-    request: impl Fn(&Path, &str) -> Option<Vec<u8>>,
-    per_branch: impl Fn(&Member, Option<&str>) -> Option<PrInfo>,
-) -> HashMap<String, PrInfo> {
-    let branches: Vec<String> = group.members.iter().map(|m| m.branch.clone()).collect();
-    let head_owner = |branch: &str| group.head_owners.get(branch).map(String::as_str);
-    if let Some((owner, name)) = &group.slug {
-        let query = pr_query::build(owner, name, &branches);
-        if let Some(stdout) = request(&group.cwd, &query) {
-            if let Some(parsed) = pr_query::parse(&stdout, &branches, head_owner) {
-                return parsed;
-            }
-        }
-    }
-    group
-        .members
-        .iter()
-        .filter_map(|m| per_branch(m, head_owner(&m.branch)).map(|i| (m.branch.clone(), i)))
-        .collect()
-}
-
-/// Run one GraphQL document through `gh`, returning its stdout.
-///
-/// The query goes in on stdin because `-f query=` puts it in argv, and a
-/// Windows command line caps at 32,767 characters, which a full chunk of
-/// aliases can exceed.  `--input -` reads a JSON body, so a bare query piped
-/// in comes back as HTTP 502 rather than as an argument error.
-///
-/// Only ever called for a group with a slug, which means a native path: a WSL
-/// group has no slug and never reaches here.
-#[allow(clippy::disallowed_methods)] // Running `gh` is this function's job.
-fn run_graphql(cwd: &Path, query: &str, _blocking: &jobs::Blocking) -> Option<Vec<u8>> {
-    let mut child = command_ext::hidden(tools::program(Tool::Gh))
-        .current_dir(cwd)
-        .args(["api", "graphql", "--input", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    {
-        use std::io::Write;
-        // The scope ends before the wait below, which closes the pipe and lets
-        // `gh` see EOF; held open, the child waits for input that never ends.
-        let mut stdin = child.stdin.take()?;
-        stdin.write_all(pr_query::body(query).as_bytes()).ok()?;
-    }
-    let output = child.wait_with_output().ok()?;
-    output.status.success().then_some(output.stdout)
-}
-
 struct WakeOnDrop<R: Repaint>(R);
 
 impl<R: Repaint> Drop for WakeOnDrop<R> {
@@ -624,331 +422,66 @@ impl<R: Repaint> Drop for WakeOnDrop<R> {
     }
 }
 
-fn pr_state(state: &str, is_draft: bool) -> PrState {
-    match state {
-        "MERGED" => PrState::Merged,
-        "CLOSED" => PrState::Closed,
-        "OPEN" if is_draft => PrState::Draft,
-        // Unknown states paint as open rather than vanishing; gh's enum is
-        // stable, so this is a forward-compatibility hedge, not a real case.
-        _ => PrState::Open,
-    }
-}
-
-/// Ask `gh` for the PR associated with `branch` in `path`.  Returns `None`
-/// on any failure mode (no `gh`, not authenticated, no PR, non-GitHub
-/// remote, ...).  The branch is named explicitly so the answer is tied to
-/// that specific branch rather than whatever ref happens to be checked out
-/// in the worktree.
-///
-/// `--head` rather than `gh pr view <branch>`: `pr view` matches a PR's head
-/// *label*, which is the bare branch only while the head lives in the base
-/// repo and becomes `owner:branch` once it lives on a fork.  A checkout whose
-/// `origin` is a personal fork therefore finds nothing.  `--head` filters on
-/// the head ref name alone, which both layouts share, and `--state all` keeps
-/// the merged and closed badges that `pr list` would otherwise drop.
-#[allow(clippy::disallowed_methods)] // Running `gh` is this function's job.
-fn query_gh(
-    path: &Path,
-    branch: &str,
-    head_owner: Option<&str>,
-    blocking: &jobs::Blocking,
-) -> Option<PrInfo> {
-    const PR_JSON_FIELDS: &str = "number,baseRefName,url,state,isDraft,headRepositoryOwner";
-    // `--head` matches the ref name in every head repository and `--state all`
-    // keeps the closed and merged ones, so a generic branch name in a busy base
-    // repo overflows `gh`'s default page of 30 and the owner preference below
-    // never sees this checkout's own PR.
-    const PR_LIMIT: &str = "100";
-    match wsl::classify(path) {
-        wsl::Location::Windows(p) => {
-            let output = command_ext::hidden(tools::program(Tool::Gh))
-                .current_dir(p)
-                .args([
-                    "pr",
-                    "list",
-                    "--head",
-                    branch,
-                    "--state",
-                    "all",
-                    "--limit",
-                    PR_LIMIT,
-                    "--json",
-                    PR_JSON_FIELDS,
-                ])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .stdin(Stdio::null())
-                .output()
-                .ok()?;
-            if !output.status.success() {
-                return None;
-            }
-            parse_gh_output(&output.stdout, head_owner)
-        },
-        // WSL gh needs distro-local auth; the registry keeps helper-resolved
-        // per-user installs that the default `--exec` PATH cannot find.
-        wsl::Location::Wsl { distro, linux_path } => {
-            let gh = tools::wsl_in_job(Tool::Gh, &distro, blocking);
-            // The push remote's URL rides along on the first line: git2 cannot
-            // read a repository that lives inside the distro, and a second
-            // round trip would double the cost of a badge that already forks
-            // `gh`.  The remote is chosen in git's own push order, as
-            // `read_remotes` does natively.  The substitution collapses a
-            // missing remote to a blank line, so the JSON always starts after
-            // exactly one newline.
-            let script = r#"cd "$1" || exit 1
-r=$(git config --get "branch.$3.pushRemote" || git config --get remote.pushDefault || git config --get "branch.$3.remote")
-case "$r" in ''|.) r=origin ;; esac
-printf '%s\n' "$(git config --get "remote.$r.url" 2>/dev/null)"
-exec "$2" pr list --head "$3" --state all --limit "$4" --json "$5""#;
-            let stdout = wsl::run_batch(
-                &distro,
-                script,
-                &[&linux_path, &gh, branch, PR_LIMIT, PR_JSON_FIELDS],
-                blocking,
-            )
-            .ok()?;
-            let (push_url, json) = split_remote_url_line(&stdout);
-            let owner = push_url.and_then(github_slug_from_url).map(|(owner, _)| owner);
-            parse_gh_output(json, owner.as_deref())
-        },
-    }
-}
-
-/// Split the WSL batch's leading push remote URL off the JSON that follows
-/// it.  An empty first line means the branch has no readable push remote.
-fn split_remote_url_line(stdout: &[u8]) -> (Option<&str>, &[u8]) {
-    let Some(end) = stdout.iter().position(|b| *b == b'\n') else {
-        // Nothing ran far enough to emit the line; hand the payload to the
-        // JSON parser, which rejects it the way it rejects any non-JSON.
-        return (None, stdout);
-    };
-    let url = std::str::from_utf8(&stdout[..end]).ok().map(str::trim).filter(|u| !u.is_empty());
-    (url, &stdout[end + 1..])
-}
-
-/// The repository `gh` itself would act on from this worktree, which is the
-/// one holding the pull requests: `origin` on a fork checkout names the fork,
-/// while a pull request opened from it is listed under the repository it
-/// targets.  Asking `gh` rather than reimplementing its resolution also
-/// honours `gh repo set-default` and the `upstream` remote convention.
-///
-/// `None` for anything that does not answer with a GitHub `owner/name`, which
-/// leaves the group on the per-branch path.
-#[allow(clippy::disallowed_methods)] // Running `gh` is this function's job.
-fn resolve_repo(cwd: &Path, _blocking: &jobs::Blocking) -> Option<(String, String)> {
-    let output = command_ext::hidden(tools::program(Tool::Gh))
-        .current_dir(cwd)
-        .args(["repo", "view", "--json", "nameWithOwner"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_name_with_owner(&output.stdout)
-}
-
-/// Split `gh repo view --json nameWithOwner` into its two halves.
-fn parse_name_with_owner(stdout: &[u8]) -> Option<(String, String)> {
-    let value: serde_json::Value = serde_json::from_slice(stdout).ok()?;
-    let (owner, name) = value.get("nameWithOwner")?.as_str()?.split_once('/')?;
-    (!owner.is_empty() && !name.is_empty()).then(|| (owner.to_string(), name.to_string()))
-}
-
-/// Two answers from one `git2` open.  First, the GitHub `(owner, repository)`
-/// of `origin`, the grouping key for which worktrees share a repository.
-/// `resolve_repo` decides what the request asks about.  Second, the owner
-/// `branch` pushes to, which is whose PR the branch can have.  Either is
-/// `None` for a missing, unreadable or non-GitHub remote.
-fn read_remotes(path: &Path, branch: &str) -> (Option<(String, String)>, Option<String>) {
-    let Ok(repo) = git2::Repository::open(path) else { return (None, None) };
-    let slug_of = |name: &str| {
-        let remote = repo.find_remote(name).ok()?;
-        github_slug_from_url(remote.url()?)
-    };
-    let head_owner = slug_of(&push_remote(&repo, branch)).map(|(owner, _)| owner);
-    (slug_of("origin"), head_owner)
-}
-
-/// The remote `git push` sends `branch` to, in git's own order.  `.` names the
-/// local repository, which pushes nowhere, so it reads as unset.
-fn push_remote(repo: &git2::Repository, branch: &str) -> String {
-    let Ok(config) = repo.config() else { return "origin".to_string() };
-    [
-        format!("branch.{branch}.pushRemote"),
-        "remote.pushDefault".into(),
-        format!("branch.{branch}.remote"),
-    ]
-    .iter()
-    .filter_map(|key| config.get_string(key).ok())
-    .find(|name| !name.is_empty() && name != ".")
-    .unwrap_or_else(|| "origin".to_string())
-}
-
-/// Owner and repository of a GitHub remote URL, for the shapes git accepts:
-/// `https://github.com/owner/repo.git`, `git@github.com:owner/repo.git`, and
-/// the scp-style host alias `gh:owner/repo.git`.  The `.git` suffix comes off
-/// so that two spellings of one remote group together.  `None` for anything
-/// else — the owner only breaks ties, and an ungroupable worktree just takes
-/// the per-branch path.
-fn github_slug_from_url(url: &str) -> Option<(String, String)> {
-    let (host, path) = split_remote_url(url.trim())?;
-    if !is_github_host(host) {
-        return None;
-    }
-    let (owner, repo) = path.trim_start_matches('/').split_once('/')?;
-    let repo = repo.strip_suffix(".git").unwrap_or(repo);
-    (!owner.is_empty() && !repo.is_empty()).then(|| (owner.to_string(), repo.to_string()))
-}
-
-/// Host and path of a remote URL, covering both the scheme form and the
-/// scp-style `[user@]host:path` one that git reads whenever the colon comes
-/// before any slash.
-fn split_remote_url(url: &str) -> Option<(&str, &str)> {
-    if let Some((_, rest)) = url.split_once("://") {
-        let (authority, path) = rest.split_once('/')?;
-        return Some((remote_host(authority), path));
-    }
-    let (authority, path) = url.split_once(':')?;
-    // A leading slash means an absolute local path (`C:/repos/x`), which git
-    // does not read as scp-style however much it looks like one.
-    if authority.contains('/') || path.starts_with('/') {
-        return None;
-    }
-    Some((remote_host(authority), path))
-}
-
-fn remote_host(authority: &str) -> &str {
-    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
-    host.split(':').next().unwrap_or(host)
-}
-
-/// `github.com`, or any host with no dot in it.  A dotless host is an
-/// `~/.ssh/config` alias whose real target we cannot see, and aliases are how
-/// fork checkouts pick an SSH identity — refusing them would blind the owner
-/// preference to the layout it exists for.  Guessing wrong on one just yields
-/// an owner no PR matches.
-fn is_github_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("github.com") || !host.contains('.')
-}
-
-/// Pick the PR a head branch's badge should show.  Two rules, in order:
-///
-/// `--head` matches the ref name across *every* head repository, so a generic
-/// branch name ("dev", "patch-1") also collects PRs strangers opened from their
-/// own forks, and upstream-sync PRs whose head is the upstream's `main`.  With
-/// `head_owner`, the account the branch pushes to, only that account's PRs
-/// and ones reporting no owner stay in the running, and a branch with none of
-/// its own gets no badge.  Without a readable owner, every PR stays in.
-///
-/// Among what survives, `gh pr list` answers newest first and a branch
-/// accumulates PRs over its life; an open one is the live PR, so it outranks a
-/// newer abandoned attempt.  Drafts report `OPEN` too, so this covers them.
-/// Mirrors how `gh pr view` orders its own candidates.
-fn select_pr<'a>(
-    prs: &'a [serde_json::Value],
-    head_owner: Option<&str>,
-) -> Option<&'a serde_json::Value> {
-    open_or_newest(prs.iter().filter(|pr| {
-        head_owner.is_none_or(|owner| {
-            pr_head_owner(pr).is_none_or(|login| login.eq_ignore_ascii_case(owner))
-        })
-    }))
-}
-
-fn open_or_newest<'a>(
-    prs: impl Iterator<Item = &'a serde_json::Value>,
-) -> Option<&'a serde_json::Value> {
-    let mut newest = None;
-    for pr in prs {
-        if pr.get("state").and_then(|s| s.as_str()) == Some("OPEN") {
-            return Some(pr);
-        }
-        newest = newest.or(Some(pr));
-    }
-    newest
-}
-
-/// `None` from a `gh` too old to report it, or a head repository since
-/// deleted.  Neither is evidence the PR belongs to someone else.
-fn pr_head_owner(pr: &serde_json::Value) -> Option<&str> {
-    pr.get("headRepositoryOwner")?.get("login")?.as_str()
-}
-
-fn parse_gh_output(stdout: &[u8], head_owner: Option<&str>) -> Option<PrInfo> {
-    let list: serde_json::Value = serde_json::from_slice(stdout).ok()?;
-    select_and_build(list.as_array()?, head_owner)
-}
-
-/// Select the winning PR from a candidate list and build the `PrInfo` for it.
-/// Shared by the single-branch `gh pr list` path and the batched GraphQL one,
-/// so a change to selection or field reads applies to both by construction.
-pub(crate) fn select_and_build(
-    prs: &[serde_json::Value],
-    head_owner: Option<&str>,
-) -> Option<PrInfo> {
-    let value = select_pr(prs, head_owner)?;
-    let number = value.get("number")?.as_u64()?;
-    let base = value.get("baseRefName")?.as_str()?.to_string();
-    let url = value.get("url")?.as_str()?.to_string();
-    let state = value.get("state").and_then(|v| v.as_str()).unwrap_or("OPEN");
-    let is_draft = value.get("isDraft").and_then(|v| v.as_bool()).unwrap_or(false);
-    Some(PrInfo { number, base_branch: base, url, state: pr_state(state, is_draft) })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
 
+    use alacritree_forge::fake::FakeForge;
+
     use crate::repaint::Recorder;
-    use crate::test_util::{add_worktree, init_repo};
+
+    fn cache() -> PrCache<FakeForge> {
+        PrCache::new(FakeForge::default())
+    }
+
+    fn cache_with_clock(now: &Arc<Mutex<Duration>>) -> PrCache<FakeForge> {
+        let reader = Arc::clone(now);
+        PrCache::with_clock(FakeForge::default(), move || *reader.lock().expect("clock poisoned"))
+    }
 
     /// Spawn a job that blocks until `release` fires, so a test can hold a
-    /// lookup pending for as long as it needs.  Dropping `release` unblocks
+    /// lookup pending for as long as it needs. Dropping `release` unblocks
     /// it too, which is what reclaims the slot once a test is done with it.
     ///
     /// Runs on a throwaway pool rather than the process-wide `jobs::pool()`:
     /// this deliberately wedges a background slot, and the shared pool is a
     /// handful of workers other test binaries in this crate poll against
-    /// with their own deadlines — a pool built just for this call can never
+    /// with their own deadlines. A pool built just for this call can never
     /// starve them, or be starved by them.
-    fn spawn_stuck_job() -> (mpsc::Sender<()>, jobs::Job<BatchResult>) {
+    fn spawn_stuck_job() -> (mpsc::Sender<()>, jobs::Job<PullRequests>) {
         let (release, gate) = mpsc::channel::<()>();
         let job = jobs::Pool::new(2).spawn(jobs::Priority::Background, move |_| {
             let _ = gate.recv();
-            BatchResult::new()
+            PullRequests::new()
         });
         (release, job)
     }
 
     /// Bank `job` as the request covering `(path, branch)`, the shape `poll`
     /// and the drain produce for a single due worktree.
-    fn bank_one(cache: &mut PrCache, path: &str, branch: &str, job: jobs::Job<BatchResult>) {
-        cache.bank_batch(
-            vec![Member { path: PathBuf::from(path), branch: branch.to_string() }],
-            job,
-        );
+    fn bank_one<F: RemoteForge + Clone + Send + 'static>(
+        cache: &mut PrCache<F>,
+        path: &str,
+        branch: &str,
+        job: jobs::Job<PullRequests>,
+    ) {
+        cache.bank_batch(vec![Head { path: PathBuf::from(path), branch: branch.to_string() }], job);
     }
 
     /// Wire a stuck request into `cache` as if it had been in flight since
     /// `started`, for tests that need to force `drain_completed`'s TTL branch
-    /// without waiting out the real TTL.  `bank_batch` stamps `started` from
+    /// without waiting out the real TTL. `bank_batch` stamps `started` from
     /// the cache's own clock, so the batch is assembled by hand instead.
     fn insert_stuck_entry(
-        cache: &mut PrCache,
+        cache: &mut PrCache<FakeForge>,
         path: &Path,
         branch: &str,
         started: Duration,
     ) -> mpsc::Sender<()> {
         let (release, job) = spawn_stuck_job();
-        let member = Member { path: path.to_path_buf(), branch: branch.to_string() };
+        let member = Head { path: path.to_path_buf(), branch: branch.to_string() };
         cache.entries.insert(path.to_path_buf(), Entry {
             branch: Some(branch.to_string()),
             pending: true,
@@ -961,7 +494,7 @@ mod tests {
 
     /// Drive `drain_completed` until the entry at `path` has no request
     /// outstanding, mirroring how the UI's frame loop drives it.
-    fn drain_until(cache: &mut PrCache, path: &Path, timeout: Duration) {
+    fn drain_until(cache: &mut PrCache<FakeForge>, path: &Path, timeout: Duration) {
         let repaint = Recorder::default();
         let deadline = Instant::now() + timeout;
         loop {
@@ -974,243 +507,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parses_gh_json() {
-        let stdout =
-            br#"[{"baseRefName":"main","number":42,"url":"https://github.com/o/r/pull/42"}]"#;
-        let info = parse_gh_output(stdout, None).unwrap();
-        assert_eq!(info.number, 42);
-        assert_eq!(info.base_branch, "main");
-        assert_eq!(info.url, "https://github.com/o/r/pull/42");
-    }
-
-    #[test]
-    fn rejects_empty_output() {
-        assert!(parse_gh_output(b"", None).is_none());
-    }
-
-    #[test]
-    fn rejects_an_empty_pr_list() {
-        assert!(parse_gh_output(b"[]", None).is_none());
-    }
-
-    /// `gh` answers errors as a bare object, so valid JSON that is not a list
-    /// must degrade the same way malformed output does.
-    #[test]
-    fn rejects_json_that_is_not_a_list() {
-        assert!(parse_gh_output(b"{}", None).is_none());
-    }
-
-    /// A head branch accumulates PRs over its life. `gh pr list` answers newest
-    /// first, but the open one is the live PR — a newer abandoned attempt must
-    /// not shadow it.
-    #[test]
-    fn an_open_pr_wins_over_a_newer_closed_one() {
-        let stdout = br#"[
-            {"baseRefName":"main","number":9,"url":"u9","state":"CLOSED","isDraft":false},
-            {"baseRefName":"main","number":4,"url":"u4","state":"OPEN","isDraft":false}
-        ]"#;
-        let info = parse_gh_output(stdout, None).unwrap();
-        assert_eq!(info.number, 4);
-        assert_eq!(info.state, PrState::Open);
-    }
-
-    #[test]
-    fn a_draft_counts_as_open_when_selecting() {
-        let stdout = br#"[
-            {"baseRefName":"main","number":9,"url":"u9","state":"MERGED","isDraft":false},
-            {"baseRefName":"main","number":4,"url":"u4","state":"OPEN","isDraft":true}
-        ]"#;
-        let info = parse_gh_output(stdout, None).unwrap();
-        assert_eq!(info.number, 4);
-        assert_eq!(info.state, PrState::Draft);
-    }
-
-    /// With nothing open, the newest attempt is the one worth painting.
-    #[test]
-    fn the_newest_pr_wins_when_none_are_open() {
-        let stdout = br#"[
-            {"baseRefName":"main","number":9,"url":"u9","state":"MERGED","isDraft":false},
-            {"baseRefName":"main","number":4,"url":"u4","state":"CLOSED","isDraft":false}
-        ]"#;
-        let info = parse_gh_output(stdout, None).unwrap();
-        assert_eq!(info.number, 9);
-        assert_eq!(info.state, PrState::Merged);
-    }
-
-    #[test]
-    fn parses_pr_states() {
-        for (json_state, is_draft, expected) in [
-            ("OPEN", false, PrState::Open),
-            ("OPEN", true, PrState::Draft),
-            ("MERGED", false, PrState::Merged),
-            ("CLOSED", false, PrState::Closed),
-            ("SOMETHING_NEW", false, PrState::Open),
-        ] {
-            let stdout = format!(
-                r#"[{{"baseRefName":"main","number":1,"url":"https://github.com/o/r/pull/1","state":"{json_state}","isDraft":{is_draft}}}]"#
-            );
-            let info = parse_gh_output(stdout.as_bytes(), None).unwrap();
-            assert_eq!(info.state, expected, "state={json_state} draft={is_draft}");
-        }
-    }
-
-    #[test]
-    fn missing_state_fields_default_to_open() {
-        // Old gh versions may omit fields we didn't ask for; degrade, don't drop.
-        let stdout =
-            br#"[{"baseRefName":"main","number":42,"url":"https://github.com/o/r/pull/42"}]"#;
-        assert_eq!(parse_gh_output(stdout, None).unwrap().state, PrState::Open);
-    }
-
-    fn pr(number: u64, state: &str, head_owner: &str) -> serde_json::Value {
-        serde_json::json!({
-            "number": number,
-            "baseRefName": "main",
-            "url": format!("u{number}"),
-            "state": state,
-            "isDraft": false,
-            "headRepositoryOwner": { "login": head_owner },
-        })
-    }
-
-    fn number_of(pr: Option<&serde_json::Value>) -> Option<u64> {
-        pr?.get("number")?.as_u64()
-    }
-
-    #[test]
-    fn select_pr_prefers_an_open_pr_over_a_newer_non_open_one() {
-        let prs = [pr(9, "MERGED", "someone"), pr(4, "OPEN", "someone")];
-        assert_eq!(number_of(select_pr(&prs, None)), Some(4));
-    }
-
-    #[test]
-    fn select_pr_takes_the_newest_when_none_are_open() {
-        let prs = [pr(9, "MERGED", "someone"), pr(4, "CLOSED", "someone")];
-        assert_eq!(number_of(select_pr(&prs, None)), Some(9));
-    }
-
-    /// `--head` matches the ref name in *every* head repository, so a generic
-    /// branch name ("dev", "patch-1") collects strangers' PRs.  Theirs must not
-    /// decide this worktree's badge or diff base, however live they are.
-    #[test]
-    fn select_pr_prefers_the_head_owners_pr_over_a_strangers_open_one() {
-        let prs = [pr(9, "OPEN", "stranger"), pr(4, "MERGED", "me")];
-        assert_eq!(number_of(select_pr(&prs, Some("me"))), Some(4));
-    }
-
-    #[test]
-    fn select_pr_prefers_an_open_pr_among_the_head_owners_own() {
-        let prs = [pr(9, "MERGED", "me"), pr(7, "OPEN", "stranger"), pr(4, "OPEN", "me")];
-        assert_eq!(number_of(select_pr(&prs, Some("me"))), Some(4));
-    }
-
-    /// GitHub logins are case-insensitive, so a remote URL that disagrees with
-    /// the API's casing still names the same account.
-    #[test]
-    fn select_pr_matches_the_owner_case_insensitively() {
-        let prs = [pr(9, "OPEN", "stranger"), pr(4, "MERGED", "Me")];
-        assert_eq!(number_of(select_pr(&prs, Some("me"))), Some(4));
-    }
-
-    #[test]
-    fn select_pr_takes_nothing_when_every_pr_is_another_owners() {
-        let prs = [pr(9, "MERGED", "stranger"), pr(4, "OPEN", "other")];
-        assert!(select_pr(&prs, Some("me")).is_none());
-    }
-
-    #[test]
-    fn select_pr_keeps_every_pr_without_a_readable_owner() {
-        let prs = [pr(9, "MERGED", "stranger"), pr(4, "OPEN", "other")];
-        assert_eq!(number_of(select_pr(&prs, None)), Some(4));
-    }
-
-    /// A `gh` too old to report the head owner must not filter every candidate
-    /// away — an unknown owner is no evidence the PR belongs to someone else.
-    #[test]
-    fn select_pr_tolerates_a_missing_head_owner() {
-        let prs = [serde_json::json!({"number": 4, "state": "OPEN"})];
-        assert_eq!(number_of(select_pr(&prs, Some("me"))), Some(4));
-    }
-
-    #[test]
-    fn select_pr_reports_nothing_for_an_empty_list() {
-        assert!(select_pr(&[], Some("me")).is_none());
-    }
-
-    /// The regression this preference exists for: a stale PR opened by a
-    /// stranger on the same branch name, still carrying the base branch the
-    /// repository has since renamed away from.
-    #[test]
-    fn the_head_owners_pr_decides_the_diff_base() {
-        let stdout = br#"[
-            {"baseRefName":"master","number":9,"url":"u9","state":"OPEN","isDraft":false,"headRepositoryOwner":{"login":"stranger"}},
-            {"baseRefName":"main","number":4,"url":"u4","state":"MERGED","isDraft":false,"headRepositoryOwner":{"login":"me"}}
-        ]"#;
-        let info = parse_gh_output(stdout, Some("me")).unwrap();
-        assert_eq!(info.number, 4);
-        assert_eq!(info.base_branch, "main");
-    }
-
-    #[test]
-    fn derives_the_slug_from_an_https_remote() {
-        let slug = github_slug_from_url("https://github.com/owner/repo.git");
-        assert_eq!(slug, Some(("owner".to_string(), "repo".to_string())));
-    }
-
-    #[test]
-    fn derives_the_slug_from_an_scp_style_ssh_remote() {
-        let slug = github_slug_from_url("git@github.com:owner/repo.git");
-        assert_eq!(slug, Some(("owner".to_string(), "repo".to_string())));
-    }
-
-    /// The slug is the grouping key, so two spellings of one remote have to
-    /// produce the same one or a repository splits into two requests.
-    #[test]
-    fn two_spellings_of_one_remote_share_a_grouping_key() {
-        let with_suffix = github_slug_from_url("https://github.com/owner/repo.git");
-        let without = github_slug_from_url("git@github.com:owner/repo");
-        assert_eq!(with_suffix, Some(("owner".to_string(), "repo".to_string())));
-        assert_eq!(with_suffix, without);
-    }
-
-    /// An `~/.ssh/config` alias is how a fork checkout picks an identity, and it
-    /// hides the host it resolves to — reading it as foreign would blind the
-    /// preference to exactly the layout it exists for.
-    #[test]
-    fn derives_the_owner_from_an_ssh_host_alias() {
-        let slug = github_slug_from_url("gh:owner/repo.git");
-        assert_eq!(slug.map(|(owner, _)| owner).as_deref(), Some("owner"));
-    }
-
-    #[test]
-    fn rejects_a_non_github_remote() {
-        assert!(github_slug_from_url("https://gitlab.com/owner/repo.git").is_none());
-        assert!(github_slug_from_url("git@gitlab.com:owner/repo.git").is_none());
-    }
-
-    #[test]
-    fn rejects_a_malformed_remote() {
-        assert!(github_slug_from_url("").is_none());
-        assert!(github_slug_from_url("not a url").is_none());
-        assert!(github_slug_from_url("https://github.com/owner").is_none());
-        assert!(github_slug_from_url("C:/repos/checkout").is_none());
-    }
-
-    #[test]
-    fn the_wsl_batch_line_carries_the_origin_url() {
-        let (url, json) = split_remote_url_line(b"gh:me/repo.git\n[]");
-        assert_eq!(url, Some("gh:me/repo.git"));
-        assert_eq!(json, b"[]".as_slice());
-    }
-
-    #[test]
-    fn a_worktree_without_a_remote_leaves_the_wsl_line_blank() {
-        let (url, json) = split_remote_url_line(b"\n[]");
-        assert_eq!(url, None);
-        assert_eq!(json, b"[]".as_slice());
-    }
-
     fn sample_info() -> PrInfo {
         PrInfo {
             number: 7,
@@ -1218,6 +514,44 @@ mod tests {
             url: "https://github.com/o/r/pull/7".to_string(),
             state: PrState::Open,
         }
+    }
+
+    /// A poll that falls due reaches the forge on the next drain, and the
+    /// forge's answer is what the following poll reads.
+    #[test]
+    fn a_due_poll_asks_the_forge_and_banks_its_answer() {
+        let forge = FakeForge::default().with_pr("topic", sample_info());
+        let mut cache = PrCache::new(forge.clone());
+        let path = Path::new("/repo/wt");
+        let repaint = Recorder::default();
+
+        assert_eq!(cache.poll(path, Some("topic"), &repaint), None);
+        drain_until(&mut cache, path, Duration::from_secs(5));
+
+        assert_eq!(forge.calls(), [vec![Head { path: path.into(), branch: "topic".into() }]]);
+        assert_eq!(cache.poll(path, Some("topic"), &repaint), Some(sample_info()));
+        assert_eq!(forge.calls().len(), 1, "a banked answer is fresh for a TTL");
+    }
+
+    /// A lookup the forge reports as failed clears the badge and holds off a
+    /// TTL, as a missing or unauthenticated `gh` always has.
+    #[test]
+    fn a_failed_lookup_reads_as_no_pr_until_the_ttl() {
+        let forge = FakeForge::default().failing_on("topic");
+        let mut cache = PrCache::new(forge);
+        let path = Path::new("/repo/wt");
+        let repaint = Recorder::default();
+        cache.entries.insert(path.to_path_buf(), Entry {
+            branch: Some("topic".into()),
+            info: Some(sample_info()),
+            ..Entry::default()
+        });
+
+        cache.poll(path, Some("topic"), &repaint);
+        drain_until(&mut cache, path, Duration::from_secs(5));
+
+        assert_eq!(cache.state(path, Some("topic")), None);
+        assert!(!cache.is_due(path, "topic"), "a failure is stamped, not retried every frame");
     }
 
     #[test]
@@ -1237,7 +571,7 @@ mod tests {
 
     #[test]
     fn polling_with_none_retains_info_from_a_completed_some_branch_lookup() {
-        let mut cache = PrCache::new();
+        let mut cache = cache();
         let path = PathBuf::from("/repo");
         cache.entries.insert(path.clone(), Entry {
             branch: Some("b".to_string()),
@@ -1330,7 +664,7 @@ mod tests {
 
     #[test]
     fn state_is_none_for_a_branch_the_entry_was_not_queried_for() {
-        let mut cache = PrCache::new();
+        let mut cache = cache();
         cache.entries.insert(PathBuf::from("/repo/wt"), Entry {
             branch: Some("main".into()),
             info: Some(PrInfo {
@@ -1354,9 +688,9 @@ mod tests {
     /// in `poll` would strand the slot forever.
     #[test]
     fn drain_completed_frees_a_slot_for_an_entry_nobody_polls() {
-        let mut cache = PrCache::new();
+        let mut cache = cache();
         cache.set_concurrency(Some(1));
-        let job = jobs::pool().spawn(jobs::Priority::Background, |_| BatchResult::new());
+        let job = jobs::pool().spawn(jobs::Priority::Background, |_| PullRequests::new());
         bank_one(&mut cache, "/repo/wt", "main", job);
         assert_eq!(cache.in_flight(), 1);
 
@@ -1366,14 +700,15 @@ mod tests {
     }
 
     /// A panicking job must free its slot the moment `drain_completed`
-    /// observes `Job::failed`, not after waiting out the TTL — distinct from
-    /// the TTL tests below, which backdate `started` instead of panicking.
+    /// observes `Job::failed`, not after waiting out the TTL. This differs
+    /// from the TTL tests below, which backdate `started` instead of
+    /// panicking.
     #[test]
     fn drain_completed_frees_a_slot_immediately_when_the_job_panics() {
-        let mut cache = PrCache::new();
+        let mut cache = cache();
         cache.set_concurrency(Some(1));
         let job = jobs::Pool::new(2)
-            .spawn(jobs::Priority::Background, |_| -> BatchResult { panic!("boom") });
+            .spawn(jobs::Priority::Background, |_| -> PullRequests { panic!("boom") });
         bank_one(&mut cache, "/repo/wt", "main", job);
         assert_eq!(cache.in_flight(), 1);
 
@@ -1382,14 +717,13 @@ mod tests {
         assert_eq!(cache.in_flight(), 0);
     }
 
-    /// A job that never reports — a panic, or a `gh` call that hangs — must
-    /// not hold its slot forever. Without the TTL backoff a capped cache
+    /// A job that never reports, whether it panicked or its forge call hangs,
+    /// must not hold its slot forever. Without the TTL backoff a capped cache
     /// would stop polling permanently.
     #[test]
     fn drain_completed_frees_a_slot_for_a_job_stuck_past_the_ttl() {
         let now = Arc::new(Mutex::new(Duration::ZERO));
-        let reader = Arc::clone(&now);
-        let mut cache = PrCache::with_clock(move || *reader.lock().expect("clock poisoned"));
+        let mut cache = cache_with_clock(&now);
         cache.set_concurrency(Some(1));
         let _release =
             insert_stuck_entry(&mut cache, Path::new("/repo/wt"), "main", Duration::ZERO);
@@ -1402,13 +736,12 @@ mod tests {
     }
 
     /// A job just backed off by the TTL banks no answer, so nothing but a
-    /// fresh `queried_at` can hold the entry back — and the guard's repaint
+    /// fresh `queried_at` can hold the entry back, and the guard's repaint
     /// delivers the frame that would re-spawn it.
     #[test]
     fn a_job_stuck_past_the_ttl_leaves_the_entry_ineligible_to_respawn() {
         let now = Arc::new(Mutex::new(Duration::ZERO));
-        let reader = Arc::clone(&now);
-        let mut cache = PrCache::with_clock(move || *reader.lock().expect("clock poisoned"));
+        let mut cache = cache_with_clock(&now);
         let _release =
             insert_stuck_entry(&mut cache, Path::new("/repo/wt"), "main", Duration::ZERO);
 
@@ -1434,8 +767,7 @@ mod tests {
     #[test]
     fn the_ttl_boundary_is_exact() {
         let now = Arc::new(Mutex::new(Duration::ZERO));
-        let reader = Arc::clone(&now);
-        let mut cache = PrCache::with_clock(move || *reader.lock().expect("clock poisoned"));
+        let mut cache = cache_with_clock(&now);
 
         cache.entries.insert(PathBuf::from("/repo"), Entry {
             branch: Some("main".into()),
@@ -1458,7 +790,7 @@ mod tests {
 
     #[test]
     fn generation_advances_on_a_banked_result_and_holds_still_otherwise() {
-        let mut cache = PrCache::new();
+        let mut cache = cache();
         let _release =
             insert_stuck_entry(&mut cache, Path::new("/repo/pending"), "main", Duration::ZERO);
 
@@ -1466,7 +798,7 @@ mod tests {
         cache.drain_completed(&Recorder::default());
         assert_eq!(cache.generation(), before, "a frame that banks nothing must not invalidate");
 
-        let job = jobs::pool().spawn(jobs::Priority::Background, |_| BatchResult::new());
+        let job = jobs::pool().spawn(jobs::Priority::Background, |_| PullRequests::new());
         bank_one(&mut cache, "/repo/banked", "main", job);
         drain_until(&mut cache, Path::new("/repo/banked"), Duration::from_secs(5));
         assert!(cache.generation() > before);
@@ -1477,7 +809,7 @@ mod tests {
     /// a fresh `queried_at` and swallow the request.
     #[test]
     fn a_refresh_during_a_lookup_survives_the_drain() {
-        let mut cache = PrCache::new();
+        let mut cache = cache();
         let (release, job) = spawn_stuck_job();
         bank_one(&mut cache, "/repo/wt", "main", job);
 
@@ -1508,7 +840,7 @@ mod tests {
     /// flag then refuses to stamp `queried_at`, so a second lookup starts.
     #[test]
     fn a_refresh_on_an_idle_entry_does_not_set_the_flag() {
-        let mut cache = PrCache::new();
+        let mut cache = cache();
         cache.entries.insert(PathBuf::from("/repo/wt"), Entry {
             branch: Some("main".into()),
             info: None,
@@ -1538,23 +870,24 @@ mod tests {
     /// and spawn nothing.
     #[test]
     fn a_cache_that_was_never_configured_still_admits_a_lookup() {
-        let cache = PrCache::new();
+        let cache = cache();
         assert!(may_spawn(cache.concurrency, cache.in_flight));
     }
 
     #[test]
     fn set_concurrency_clamps_zero_to_one() {
-        let mut cache = PrCache::new();
+        let mut cache = cache();
         cache.set_concurrency(Some(0));
         assert!(may_spawn(cache.concurrency, 0));
         assert!(!may_spawn(cache.concurrency, 1));
     }
 
-    /// `gh` is the slowest thing the pool runs and the least urgent.  Letting it
-    /// take the last background slot puts the git status panel, which is what a
-    /// user reads to decide what to do next, behind a network call.
+    /// A forge lookup is the slowest thing the pool runs and the least urgent.
+    /// Letting it take the last background slot puts the git status panel,
+    /// which is what a user reads to decide what to do next, behind a network
+    /// call.
     #[test]
-    fn gh_never_takes_the_last_background_slot() {
+    fn a_lookup_never_takes_the_last_background_slot() {
         // A four-worker pool admits three background tasks; an eight-worker one,
         // seven.
         assert_eq!(effective_cap(None, 3), 2);
@@ -1578,11 +911,11 @@ mod tests {
     }
 
     /// The cap has to hold where a due list becomes requests, not just in the
-    /// helper: a cold cache polls every eligible worktree in one frame.  A
+    /// helper: a cold cache polls every eligible worktree in one frame. A
     /// refused member falls due again rather than being lost.
     #[test]
     fn the_drain_respects_the_concurrency_cap() {
-        let mut cache = PrCache::new();
+        let mut cache = cache();
         cache.set_concurrency(Some(1));
         let (_release, job) = spawn_stuck_job();
         bank_one(&mut cache, "/repo/busy", "main", job);
@@ -1613,7 +946,7 @@ mod tests {
     #[test]
     fn a_queued_poll_asks_for_the_frame_that_spawns_it() {
         let repaint = Recorder::default();
-        let mut cache = PrCache::new();
+        let mut cache = cache();
 
         cache.poll(Path::new("/repo/wt"), Some("main"), &repaint);
 
@@ -1621,15 +954,15 @@ mod tests {
     }
 
     /// A member the cap refuses has its `pending` cleared, so it falls due
-    /// again on the very next frame.  Asking for that frame while nothing can
+    /// again on the very next frame. Asking for that frame while nothing can
     /// spawn spins the UI at frame rate for as long as the batch runs, and a
-    /// batch runs several serial `gh` processes.  Nothing is lost by staying
+    /// batch can run several serial forge processes. Nothing is lost by staying
     /// quiet: the guard inside the spawn closure delivers the wake the moment
     /// a slot frees, on the panicking path too.
     #[test]
     fn a_poll_the_cap_will_refuse_does_not_ask_for_another_frame() {
         let repaint = Recorder::default();
-        let mut cache = PrCache::new();
+        let mut cache = cache();
         cache.set_concurrency(Some(1));
         let (_release, job) = spawn_stuck_job();
         bank_one(&mut cache, "/repo/busy", "main", job);
@@ -1650,17 +983,17 @@ mod tests {
         assert_eq!(repaint.wakes(), 1);
     }
 
-    /// The spawn has no sender of its own — the pool's channel is internal —
-    /// so this drives a real job through the pool instead of hand-rolling a
-    /// thread, and checks the failure the same way production code does:
-    /// `poll` until `failed` latches.
+    /// The spawn has no sender of its own, since the pool's channel is
+    /// internal, so this drives a real job through the pool instead of
+    /// hand-rolling a thread, and checks the failure the same way production
+    /// code does: `poll` until `failed` latches.
     #[test]
     fn a_panicking_worker_still_wakes_the_app_and_reports_failed() {
         let repaint = Recorder::default();
 
         let job = {
             let repaint = repaint.clone();
-            jobs::Pool::new(2).spawn(jobs::Priority::Background, move |_| -> BatchResult {
+            jobs::Pool::new(2).spawn(jobs::Priority::Background, move |_| -> PullRequests {
                 let _wake = WakeOnDrop(repaint);
                 panic!("worker died");
             })
@@ -1676,135 +1009,29 @@ mod tests {
         assert_eq!(repaint.wakes(), 1, "a panicking unwind still wakes the app");
     }
 
-    fn group_of(branches: &[&str]) -> Group {
-        Group {
-            cwd: PathBuf::from("/repo"),
-            slug: Some(("owner".to_string(), "repo".to_string())),
-            members: branches
-                .iter()
-                .map(|b| Member { path: PathBuf::from("/repo"), branch: (*b).to_string() })
-                .collect(),
-            head_owners: HashMap::new(),
-        }
-    }
-
-    /// A repository where nothing has a PR is the common case.  Reading its
-    /// answer as a failure would spend one `gh pr list` per branch finding the
-    /// same nothing, every TTL, which is the cost this batching exists to
-    /// remove.
-    #[test]
-    fn a_good_response_with_no_prs_does_not_fall_back() {
-        let group = group_of(&["topic-a", "topic-b"]);
-        let sweeps = AtomicUsize::new(0);
-
-        let found = query_group(
-            &group,
-            |_, _| {
-                Some(br#"{"data":{"repository":{"b0":{"nodes":[]},"b1":{"nodes":[]}}}}"#.to_vec())
-            },
-            |_, _| {
-                sweeps.fetch_add(1, Ordering::Relaxed);
-                Some(sample_info())
-            },
-        );
-
-        assert!(found.is_empty());
-        assert_eq!(sweeps.load(Ordering::Relaxed), 0, "an answer of `none` is still an answer");
-    }
-
-    /// GraphQL can need scopes `gh pr list` does not, and GitHub reports a
-    /// query it could not run as an HTTP 200 with a null `repository`.  Every
-    /// badge in the project depends on that reading as a failure.
-    #[test]
-    fn a_failed_request_sweeps_the_group_per_branch() {
-        let group = group_of(&["topic-a", "topic-b"]);
-        let sweeps = AtomicUsize::new(0);
-
-        let found = query_group(
-            &group,
-            |_, _| Some(br#"{"data":{"repository":null},"errors":[{"message":"nope"}]}"#.to_vec()),
-            |_, _| {
-                sweeps.fetch_add(1, Ordering::Relaxed);
-                Some(sample_info())
-            },
-        );
-
-        assert_eq!(sweeps.load(Ordering::Relaxed), 2, "one lookup per branch");
-        assert_eq!(found.len(), 2);
-    }
-
-    /// A group with no repository to name — a WSL worktree, or one whose
-    /// remote nothing could read — never reaches the batched form at all.
-    #[test]
-    fn a_group_without_a_repository_never_asks_for_a_batch() {
-        let mut group = group_of(&["topic"]);
-        group.slug = None;
-
-        let found = query_group(
-            &group,
-            |_, _| panic!("a group with no repository has nothing to ask about"),
-            |_, _| Some(sample_info()),
-        );
-
-        assert_eq!(found.len(), 1);
-    }
-
-    /// A cancel landing between groups has no child to kill — neither the
-    /// batched request nor the per-branch sweep registers one — so the loop
-    /// has to ask.  Otherwise a burst keeps forking `gh` to build an answer
-    /// the drain has already backed off and nobody will read.
-    #[test]
-    fn run_due_stops_between_groups_once_cancelled() {
-        let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().expect("temp dir")).collect();
-        let due: Vec<Member> = dirs
-            .iter()
-            .map(|d| Member { path: d.path().to_path_buf(), branch: "topic".into() })
-            .collect();
-        let (tx, rx) = mpsc::channel();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (gate_tx, gate_rx) = mpsc::channel::<()>();
-
-        let job = jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
-            // Both halves of this handshake are load-bearing, for the reasons
-            // spelled out in `worktree::tests::create_stops_between_steps_
-            // once_cancelled`: the started signal keeps the task off the
-            // pre-start skip, and the gate keeps it from racing past the first
-            // check before the flag lands.
-            let _ = started_tx.send(());
-            let _ = gate_rx.recv();
-            let _ = tx.send(run_due(due, blocking));
-        });
-        started_rx.recv_timeout(Duration::from_secs(5)).expect("the job never started");
-        drop(job);
-        let _ = gate_tx.send(());
-
-        let out = rx.recv_timeout(Duration::from_secs(30)).expect("run_due never returned");
-        assert!(out.is_empty(), "a cancelled burst kept asking: {out:?}");
-    }
-
     /// One result covers many entries, so the drain has to fan a single map out
     /// across every path that contributed to it.
     #[test]
     fn one_banked_result_reaches_every_member() {
         let repaint = Recorder::default();
-        let mut cache = PrCache::new();
+        let mut cache = cache();
         let members =
-            vec![Member { path: PathBuf::from("/repo/a"), branch: "topic-a".into() }, Member {
+            vec![Head { path: PathBuf::from("/repo/a"), branch: "topic-a".into() }, Head {
                 path: PathBuf::from("/repo/b"),
                 branch: "topic-b".into(),
             }];
         let job = jobs::Pool::new(2).spawn(jobs::Priority::Background, |_| {
-            HashMap::from([
+            PullRequests::from([
                 (
                     PathBuf::from("/repo/a"),
-                    Some(PrInfo {
+                    Ok(Some(PrInfo {
                         number: 7,
                         base_branch: "master".into(),
                         url: "u".into(),
                         state: PrState::Open,
-                    }),
+                    })),
                 ),
-                (PathBuf::from("/repo/b"), None),
+                (PathBuf::from("/repo/b"), Ok(None)),
             ])
         });
         cache.bank_batch(members, job);
@@ -1820,174 +1047,9 @@ mod tests {
         assert_eq!(cache.in_flight(), 0, "the request never reported");
 
         assert_eq!(cache.state(Path::new("/repo/a"), Some("topic-a")), Some(PrState::Open));
-        // Asked about and absent from the answer means no PR, not "never asked":
+        // Asked about and answered with no PR means no PR, not "never asked":
         // the entry must be stamped, or it re-queries on the very next frame.
         assert_eq!(cache.state(Path::new("/repo/b"), Some("topic-b")), None);
         assert!(!cache.is_due(Path::new("/repo/b"), "topic-b"), "banked as no-PR, not left due");
-    }
-
-    /// A WSL worktree has no `origin` git2 can read and no `Command` to pipe a
-    /// query into.  Grouping must leave it on the per-branch path rather than
-    /// dropping it, or its badge disappears.
-    #[test]
-    fn an_ungroupable_path_still_gets_its_own_group() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let due = vec![Member { path: dir.path().to_path_buf(), branch: "topic".into() }];
-        let resolves = AtomicUsize::new(0);
-
-        let out = groups_with(due, |_| {
-            resolves.fetch_add(1, Ordering::Relaxed);
-            Some(("resolved".to_string(), "repo".to_string()))
-        });
-
-        assert_eq!(out.len(), 1);
-        assert!(out[0].slug.is_none(), "a repo with no readable origin cannot be grouped");
-        assert_eq!(out[0].members.len(), 1);
-        assert_eq!(resolves.load(Ordering::Relaxed), 0, "and costs no `gh` process to find out");
-    }
-
-    /// `origin` on a fork checkout names the fork, and a pull request opened
-    /// from it belongs to the repository it targets.  Asking the fork finds
-    /// nothing, so the group must ask whatever `gh` resolves instead — once
-    /// for the repository, not once per worktree.
-    #[test]
-    fn a_group_asks_the_resolved_repository_not_its_origin() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let repo = init_repo(&dir.path().join("main"));
-        repo.remote("origin", "https://github.com/me/fork.git").expect("remote");
-        let linked = add_worktree(&repo, "topic-b");
-        let due =
-            vec![Member { path: dir.path().join("main"), branch: "topic-a".into() }, Member {
-                path: linked,
-                branch: "topic-b".into(),
-            }];
-        let resolves = AtomicUsize::new(0);
-
-        let out = groups_with(due, |_| {
-            resolves.fetch_add(1, Ordering::Relaxed);
-            Some(("upstream".to_string(), "repo".to_string()))
-        });
-
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].slug, Some(("upstream".to_string(), "repo".to_string())));
-        assert_eq!(resolves.load(Ordering::Relaxed), 1, "one resolve for the whole repository");
-    }
-
-    /// Nothing groups a worktree whose repository cannot be resolved, so it
-    /// keeps the per-branch path rather than losing its badge.
-    #[test]
-    fn a_repository_that_does_not_resolve_falls_back_to_per_branch() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let repo = init_repo(dir.path());
-        repo.remote("origin", "https://github.com/owner/repo.git").expect("remote");
-        let due = vec![Member { path: dir.path().to_path_buf(), branch: "topic".into() }];
-
-        let out = groups_with(due, |_| None);
-
-        assert_eq!(out.len(), 1);
-        assert!(out[0].slug.is_none());
-        assert_eq!(out[0].members.len(), 1);
-    }
-
-    /// A GraphQL answer carrying `nodes` as the only branch's PRs.
-    fn graphql_answer(nodes: &[serde_json::Value]) -> Vec<u8> {
-        let nodes: Vec<_> = nodes
-            .iter()
-            .map(|pr| {
-                let mut pr = pr.clone();
-                pr["url"] = "u".into();
-                pr["baseRefName"] = "main".into();
-                pr
-            })
-            .collect();
-        serde_json::json!({ "data": { "repository": { "b0": { "nodes": nodes } } } })
-            .to_string()
-            .into_bytes()
-    }
-
-    /// Group `branch` of a repository with `remotes`, and ask with `answer`
-    /// standing in for GitHub.
-    fn ask_as_github(
-        remotes: &[(&str, &str)],
-        config: &[(&str, &str)],
-        branch: &str,
-        answer: Vec<u8>,
-    ) -> HashMap<String, PrInfo> {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let repo = init_repo(dir.path());
-        for (name, url) in remotes {
-            repo.remote(name, url).expect("remote");
-        }
-        for (key, value) in config {
-            repo.config().unwrap().set_str(key, value).unwrap();
-        }
-        let due = vec![Member { path: dir.path().to_path_buf(), branch: branch.into() }];
-        let groups = groups_with(due, |_| Some(("upstream".to_string(), "repo".to_string())));
-        assert_eq!(groups.len(), 1);
-        query_group(&groups[0], |_, _| Some(answer.clone()), |_, _| panic!("the batch answered"))
-    }
-
-    /// An upstream-sync PR opened from the upstream's `main` matches a fork's
-    /// `main` by head ref name.  It is not the fork's PR, and a branch with no
-    /// PR of its own gets no badge.
-    #[test]
-    fn a_branch_with_only_another_owners_pr_gets_no_badge() {
-        let found = ask_as_github(
-            &[("origin", "gh:me/repo.git")],
-            &[],
-            "main",
-            graphql_answer(&[pr(12, "CLOSED", "upstream")]),
-        );
-
-        assert!(found.is_empty(), "matched another owner's PR: {found:?}");
-    }
-
-    /// A branch pushed to a fork while `origin` names the upstream has its PR
-    /// under the fork's owner, however live the upstream's own PR is.
-    #[test]
-    fn a_branch_pushed_to_a_fork_keeps_the_forks_pr() {
-        let found = ask_as_github(
-            &[
-                ("origin", "https://github.com/upstream/repo.git"),
-                ("fork", "https://github.com/me/repo.git"),
-            ],
-            &[("branch.topic.pushRemote", "fork")],
-            "topic",
-            graphql_answer(&[pr(9, "OPEN", "upstream"), pr(4, "OPEN", "me")]),
-        );
-
-        assert_eq!(found.get("topic").map(|i| i.number), Some(4));
-    }
-
-    #[test]
-    fn reads_the_repository_gh_resolved() {
-        let slug = parse_name_with_owner(br#"{"nameWithOwner":"mathix420/alacritree"}"#);
-        assert_eq!(slug, Some(("mathix420".to_string(), "alacritree".to_string())));
-    }
-
-    #[test]
-    fn rejects_output_that_names_no_repository() {
-        assert!(parse_name_with_owner(b"").is_none());
-        assert!(parse_name_with_owner(b"{}").is_none());
-        assert!(parse_name_with_owner(br#"{"nameWithOwner":"alacritree"}"#).is_none());
-        assert!(parse_name_with_owner(br#"{"nameWithOwner":"/alacritree"}"#).is_none());
-    }
-
-    /// Branches of one repository share a request; a chunk boundary splits them
-    /// into two rather than growing one request without limit.
-    #[test]
-    fn one_repository_chunks_at_the_limit() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let repo = init_repo(dir.path());
-        repo.remote("origin", "https://github.com/owner/repo.git").expect("remote");
-        let due: Vec<Member> = (0..pr_query::CHUNK + 1)
-            .map(|i| Member { path: dir.path().to_path_buf(), branch: format!("b{i}") })
-            .collect();
-
-        let out = groups_with(due, |_| Some(("owner".to_string(), "repo".to_string())));
-
-        assert_eq!(out.len(), 2, "one chunk over the limit is two requests");
-        assert!(out.iter().all(|g| g.slug == Some(("owner".into(), "repo".into()))));
-        assert_eq!(out.iter().map(|g| g.members.len()).sum::<usize>(), pr_query::CHUNK + 1);
     }
 }

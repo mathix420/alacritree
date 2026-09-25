@@ -2,17 +2,21 @@
 //!
 //! One `gh` process per worktree meant every worktree of a project asking the
 //! same repository the same question, and all of them becoming due together
-//! when the TTL expired.  Naming the exact head refs is what keeps the cost
+//! when the TTL expired. Naming the exact head refs is what keeps the cost
 //! proportional to branch count rather than to how many PRs the repository
 //! has, which is what makes one request viable at all.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::process::Stdio;
 
-use crate::pr_status::PrInfo;
+use alacritree_common::command_ext;
+use alacritree_common::tools::{self, Tool};
+use alacritree_forge::PrInfo;
 
-/// Aliases per request.  Measured: no error appeared at any size up to 398,
+/// Aliases per request. Measured: no error appeared at any size up to 398,
 /// rate limit stays at one point through 100, and per-branch time flattens
-/// around 50.  100 wins at the concurrency this pool actually leaves for
+/// around 50. 100 wins at the concurrency this pool actually leaves for
 /// lookups, and is also under the ceiling a Windows command line would impose
 /// if the query ever moved off stdin.
 pub(crate) const CHUNK: usize = 100;
@@ -23,8 +27,9 @@ const FIELDS: &str = "number baseRefName url state isDraft headRepositoryOwner {
 /// several PRs can share one, and the owner tiebreak needs them all to choose
 /// from.
 ///
-/// `worktree::validate_branch_name` gates branches alacritree creates, but not
-/// the ones a repository already had — those reach `build` unvalidated. One
+/// The app's `worktree::validate_branch_name` gates branches alacritree
+/// creates, but not the ones a repository already had, which reach `build`
+/// unvalidated. One
 /// query answers a whole project, so a single unescaped quote in any branch
 /// name would break out of the string literal and take every branch's badge
 /// down with it, not just its own. `graphql_string` is what closes that: a
@@ -47,7 +52,7 @@ pub(crate) fn build(owner: &str, name: &str, branches: &[String]) -> String {
     q
 }
 
-/// A GraphQL string literal for arbitrary UTF-8 input.  GraphQL's string
+/// A GraphQL string literal for arbitrary UTF-8 input. GraphQL's string
 /// grammar is JSON's, so `serde_json`'s own quoting and escaping already does
 /// the job.
 fn graphql_string(s: &str) -> String {
@@ -56,7 +61,7 @@ fn graphql_string(s: &str) -> String {
 
 /// `gh api graphql --input -` reads a JSON body, so the query is wrapped
 /// rather than piped raw.
-pub(crate) fn body(query: &str) -> String {
+fn body(query: &str) -> String {
     serde_json::json!({ "query": query }).to_string()
 }
 
@@ -64,11 +69,11 @@ pub(crate) fn body(query: &str) -> String {
 /// A partial response is normal here: one request covers a whole project, so
 /// losing all of it because one branch failed would be worse than losing one.
 ///
-/// `None` is the response that answered nothing — malformed, a null
-/// `repository`, or every alias failing beside a top-level `errors`, all of
-/// which GitHub can report under an HTTP 200 — and is what sends a group to
-/// the per-branch path.  An empty map is the opposite: a well-formed answer
-/// that no branch in this repository has a PR.  The two have to stay
+/// `None` is the response that answered nothing, and is what sends a group to
+/// the per-branch path: malformed, a null `repository`, or every alias failing
+/// beside a top-level `errors`, all of which GitHub can report under an HTTP
+/// 200. An empty map is the opposite: a well-formed answer
+/// that no branch in this repository has a PR. The two have to stay
 /// distinguishable, or the common "nobody here has a PR" answer costs a
 /// per-branch sweep that finds the same nothing.
 pub(crate) fn parse<'a>(
@@ -87,12 +92,12 @@ pub(crate) fn parse<'a>(
             continue;
         };
         let Some(list) = nodes.as_array() else { continue };
-        if let Some(info) = crate::pr_status::select_and_build(list, head_owner(branch)) {
+        if let Some(info) = crate::select_and_build(list, head_owner(branch)) {
             found.insert(branch.clone(), info);
         }
     }
     // Nothing came back and the response is carrying errors: a whole selection
-    // failed, which a timeout on a full chunk produces.  A repository where no
+    // failed, which a timeout on a full chunk produces. A repository where no
     // branch has a PR answers the same shape without the `errors`, so reading
     // both as "no PR" would blank every badge in the project for a TTL.
     if found.is_empty() && has_errors(&v) {
@@ -103,6 +108,36 @@ pub(crate) fn parse<'a>(
 
 fn has_errors(response: &serde_json::Value) -> bool {
     response.get("errors").and_then(|e| e.as_array()).is_some_and(|list| !list.is_empty())
+}
+
+/// Run one GraphQL document through `gh`, returning its stdout.
+///
+/// The query goes in on stdin because `-f query=` puts it in argv, and a
+/// Windows command line caps at 32,767 characters, which a full chunk of
+/// aliases can exceed. `--input -` reads a JSON body, so a bare query piped
+/// in comes back as HTTP 502 rather than as an argument error.
+///
+/// Only ever called for a group with a slug, which means a native path: a WSL
+/// group has no slug and never reaches here.
+#[allow(clippy::disallowed_methods)] // Running `gh` is this function's job.
+pub(crate) fn run(cwd: &Path, query: &str) -> Option<Vec<u8>> {
+    let mut child = command_ext::hidden(tools::program(Tool::Gh))
+        .current_dir(cwd)
+        .args(["api", "graphql", "--input", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    {
+        use std::io::Write;
+        // The scope ends before the wait below, which closes the pipe and lets
+        // `gh` see EOF; held open, the child waits for input that never ends.
+        let mut stdin = child.stdin.take()?;
+        stdin.write_all(body(query).as_bytes()).ok()?;
+    }
+    let output = child.wait_with_output().ok()?;
+    output.status.success().then_some(output.stdout)
 }
 
 #[cfg(test)]
@@ -120,7 +155,7 @@ mod tests {
     /// A quote in any interpolated name must stay inside its own literal
     /// rather than closing it early: one request answers a whole project, so a
     /// name that broke out would corrupt every branch's alias, not just its
-    /// own.  The expected forms are spelled out rather than built with
+    /// own. The expected forms are spelled out rather than built with
     /// `graphql_string`, so a bug inside that function cannot satisfy both
     /// sides of the assertion.
     #[test]
@@ -131,7 +166,7 @@ mod tests {
         assert!(q.contains("b1: pullRequests(headRefName: \"main\""), "{q}");
     }
 
-    /// `gh api graphql --input -` reads a JSON body.  A bare query piped in comes
+    /// `gh api graphql --input -` reads a JSON body. A bare query piped in comes
     /// back as HTTP 502, which reads like a transient GitHub failure and is not.
     #[test]
     fn the_body_is_json_wrapped() {
@@ -167,7 +202,7 @@ mod tests {
     }
 
     /// GitHub answers a query it could not run with HTTP 200, a null
-    /// `repository` and an `errors` list.  Read as "no PRs" that would blank
+    /// `repository` and an `errors` list. Read as "no PRs" that would blank
     /// every badge in the project until the TTL expired.
     #[test]
     fn a_null_repository_is_not_an_answer() {
@@ -176,8 +211,8 @@ mod tests {
         assert!(parse(stdout, &["main".into()], |_| Some("me")).is_none());
     }
 
-    /// A whole-selection failure — a timeout on a full chunk, say — comes back
-    /// as HTTP 200 with every alias null beside a top-level `errors`.  Read as
+    /// A whole-selection failure, such as a timeout on a full chunk, comes back
+    /// as HTTP 200 with every alias null beside a top-level `errors`. Read as
     /// "no branch here has a PR" it would blank every badge in the project
     /// until the TTL expired.
     #[test]

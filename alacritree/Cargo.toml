@@ -18,6 +18,8 @@ dist = true
 alacritree_checkout_hooks.workspace = true
 alacritree_common.workspace = true
 alacritree_doppler.workspace = true
+alacritree_forge.workspace = true
+alacritree_gh.workspace = true
 ambassador.workspace = true
 alacritty_terminal = { path = "../alacritty_terminal" }
 base64 = "0.22"
@@ -78,6 +80,7 @@ thiserror.workspace = true
 [dev-dependencies]
 alacritree_checkout_hooks = { workspace = true, features = ["test-support"] }
 alacritree_common = { workspace = true, features = ["test-support"] }
+alacritree_forge = { workspace = true, features = ["test-support"] }
 # Throwaway repos and state files for worktree, prune, and persistence tests.
 tempfile = "3"
 # Integration tests parse the `--json` output of the real binary.

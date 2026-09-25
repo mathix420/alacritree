@@ -13,7 +13,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::pr_status::PrInfo;
+use alacritree_forge::PrInfo;
+
 use crate::projects::{Project, Worktree};
 
 /// Substitute `vars` into `template`.  `None` on any subst error or when the
@@ -221,7 +222,7 @@ mod tests {
             number,
             base_branch: "master".into(),
             url: String::new(),
-            state: crate::pr_status::PrState::Open,
+            state: alacritree_forge::PrState::Open,
         }
     }
 

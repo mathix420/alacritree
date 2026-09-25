@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use alacritree_common::settings::moved_key;
 use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Rgb};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -600,7 +601,7 @@ impl PasteConfig {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct IntegrationsConfig {
     pub git: ToolConfig,
-    pub gh: GhConfig,
+    pub gh: alacritree_gh::GhConfig,
     pub doppler: alacritree_doppler::DopplerConfig,
     pub checkout_hooks: Vec<alacritree_checkout_hooks::CommandHook>,
     pub herdr: HerdrConfig,
@@ -655,26 +656,6 @@ impl IntegrationsConfig {
     pub fn tool_paths(&self) -> [ToolPaths; Tool::COUNT] {
         Tool::table(|tool| self.paths(tool))
     }
-}
-
-/// `[integrations.gh]`: where the GitHub CLI lives and whether the sidebar
-/// asks it about pull requests.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct GhConfig {
-    /// The tool's own name, or a native path that runs as written.
-    pub path: String,
-    /// A path that runs as written inside every WSL distro, or `None` to
-    /// find the tool by name there.
-    pub wsl_path: Option<String>,
-    /// Paint PR-status badges on worktree rows and poll `gh` for expanded
-    /// projects' worktrees. Best-effort like the diff-base lookup: no `gh`,
-    /// no auth, or no PR paints nothing.
-    pub pr_status: bool,
-    /// Max `gh` lookups in flight at once. Unset lets the pool decide, which
-    /// is one below its own background ceiling so a lookup can never take the
-    /// last slot local work needs. A value lowers that; nothing raises it,
-    /// because the pool's ceiling binds underneath either way.
-    pub pr_status_concurrency: Option<usize>,
 }
 
 /// What opening a herdr agent row attaches to.
@@ -3127,7 +3108,7 @@ struct RawIntegrations {
     /// through libgit2, and scripts inside WSL find git on that distro's PATH.
     git: RawGit,
     /// The GitHub CLI behind PR badges and diff base branches.
-    gh: RawGh,
+    gh: alacritree_gh::RawGh,
     /// The Doppler CLI behind scope mirroring for new worktrees.
     doppler: alacritree_doppler::RawDoppler,
     /// Programs to run when a worktree is created, first opened, or removed.
@@ -3170,63 +3151,6 @@ macro_rules! raw_tool_table {
 }
 
 raw_tool_table!(RawGit, "git");
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(default)]
-struct RawGh {
-    /// The program to run on Windows or natively. Its own name is looked up
-    /// on PATH; any other value runs as written.
-    path: String,
-    /// The program to run inside every WSL distro, as written. Empty finds it
-    /// by name through the distro's login shell.
-    wsl_path: String,
-    /// Poll `gh` for each branch's open pull request, which drives the PR row
-    /// icons, the PR-state filters, and `$pr` in row templates.
-    #[schemars(default = "default_pr_status")]
-    pr_status: Option<bool>,
-    /// Max `gh` lookups in flight at once. Unset lets the pool decide, which
-    /// is one below its own background ceiling so a lookup can never take
-    /// the last slot local work needs. A value lowers that; nothing raises
-    /// it, because the pool's ceiling binds underneath either way.
-    pr_status_concurrency: Option<usize>,
-}
-
-impl Default for RawGh {
-    fn default() -> Self {
-        Self {
-            path: "gh".to_string(),
-            wsl_path: String::new(),
-            pr_status: None,
-            pr_status_concurrency: None,
-        }
-    }
-}
-
-fn default_pr_status() -> bool {
-    false
-}
-
-impl RawGh {
-    fn resolve(self, moved: &MovedUiKeys) -> GhConfig {
-        let tool = tool_config(self.path, self.wsl_path, Tool::Gh);
-        GhConfig {
-            path: tool.path,
-            wsl_path: tool.wsl_path,
-            pr_status: moved_key(
-                self.pr_status,
-                moved.pr_status,
-                "[ui] pr_status",
-                "[integrations.gh] pr_status",
-            )
-            .unwrap_or_else(default_pr_status),
-            pr_status_concurrency: moved_key(
-                self.pr_status_concurrency,
-                moved.pr_status_concurrency,
-                "[ui] pr_status_concurrency",
-                "[integrations.gh] pr_status_concurrency",
-            ),
-        }
-    }
-}
 raw_tool_table!(RawDelta, "delta");
 raw_tool_table!(RawTuicr, "tuicr");
 
@@ -3344,7 +3268,7 @@ impl RawIntegrations {
     fn resolve(self, moved: MovedUiKeys) -> IntegrationsConfig {
         IntegrationsConfig {
             git: tool_config(self.git.path, self.git.wsl_path, Tool::Git),
-            gh: self.gh.resolve(&moved),
+            gh: self.gh.resolve(moved.gh),
             doppler: self.doppler.resolve(),
             checkout_hooks: self.checkout_hooks.resolve(),
             herdr: self.herdr.resolve(moved.herdr_icon),
@@ -3362,19 +3286,8 @@ impl RawIntegrations {
 #[derive(Default)]
 struct MovedUiKeys {
     delta_path: Option<String>,
-    pr_status: Option<bool>,
-    pr_status_concurrency: Option<usize>,
+    gh: alacritree_gh::MovedGhKeys,
     herdr_icon: Option<RawIconStyle>,
-}
-
-/// A deprecated key applies only where the file omits its replacement, so a
-/// replacement written at its default still wins. Raw config structs accept
-/// unknown keys, so dropping the old field would lose the override silently.
-fn moved_key<T>(new: Option<T>, old: Option<T>, from: &str, to: &str) -> Option<T> {
-    if old.is_some() {
-        log::warn!("{from} is deprecated; set {to}");
-    }
-    new.or(old)
 }
 
 /// `[ui] delta_path` was one path used on both sides. It still fills each
@@ -3938,8 +3851,10 @@ impl RawConfig {
     fn into_config(mut self) -> Config {
         let moved = MovedUiKeys {
             delta_path: self.ui.delta_path.take(),
-            pr_status: self.ui.pr_status,
-            pr_status_concurrency: self.ui.pr_status_concurrency,
+            gh: alacritree_gh::MovedGhKeys {
+                pr_status: self.ui.pr_status,
+                pr_status_concurrency: self.ui.pr_status_concurrency,
+            },
             herdr_icon: self.ui.icons.herdr.take(),
         };
         let config = Config::default();

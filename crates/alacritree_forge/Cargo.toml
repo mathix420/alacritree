@@ -1,0 +1,16 @@
+[package]
+name = "alacritree_forge"
+version = "0.0.0"
+license = "Apache-2.0"
+description = "What alacritree asks the host of a repository's pull requests"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+test-support = []
+
+[dependencies]
+alacritree_common.workspace = true
+ambassador.workspace = true
+thiserror.workspace = true
