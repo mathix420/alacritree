@@ -12,7 +12,7 @@ use interprocess::local_socket::{GenericFilePath, Stream, ToFsName};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::git_status::{self, ChangeKind, GitStatus};
+use alacritree_vcs::{ChangeKind, FileChange, Status};
 
 pub(crate) const SOCKET_ENV: &str = "ALACRITREE_SOCKET";
 
@@ -129,20 +129,21 @@ pub(crate) enum IpcRequest {
 /// that text only when it answers.
 pub(crate) type IpcResult = Result<Value, String>;
 
-pub(crate) fn git_status_json(status: &GitStatus) -> Value {
-    if let Some(err) = &status.error {
+/// The `git_status` reply: the error alone when the status could not be read.
+pub(crate) fn status_json(status: &Status, error: Option<&str>) -> Value {
+    if let Some(err) = error {
         return json!({ "error": err });
     }
-    let changes = |list: &[git_status::FileChange]| -> Vec<Value> {
+    let changes = |list: &[FileChange]| -> Vec<Value> {
         list.iter().map(|f| json!({ "path": f.path, "kind": kind_name(f.kind) })).collect()
     };
     json!({
-        "branch": status.branch,
-        "default_branch": status.default_branch,
-        "staged": changes(&status.staged),
-        "unstaged": changes(&status.unstaged),
+        "branch": status.head.label(),
+        "default_branch": status.trunk,
+        "staged": changes(status.staged.as_deref().unwrap_or_default()),
+        "unstaged": changes(&status.working),
         "diff_vs_default_branch": status
-            .branch_diff
+            .base_diff
             .iter()
             .map(|d| json!({ "path": d.path, "additions": d.additions, "deletions": d.deletions }))
             .collect::<Vec<_>>(),
@@ -336,6 +337,12 @@ pub(crate) fn socket_dir() -> PathBuf {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_status_error_replies_with_the_error_alone() {
+        let reply = status_json(&Status::default(), Some("boom"));
+        assert_eq!(reply, serde_json::json!({ "error": "boom" }));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

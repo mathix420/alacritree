@@ -4,7 +4,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::{VcsKind, VersionControl};
+use alacritree_common::jobs::Blocking;
+
+use crate::{Status, VcsError, VcsKind, VersionControl};
 
 /// Clones share the recorded requests, so a test keeps one clone and hands
 /// the other to the code under test.
@@ -13,15 +15,21 @@ pub struct FakeVcs {
     root: PathBuf,
     kind: VcsKind,
     calls: Arc<Mutex<Vec<String>>>,
+    status: Option<Status>,
 }
 
 impl FakeVcs {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), kind: VcsKind::Git, calls: Arc::default() }
+        Self { root: root.into(), kind: VcsKind::Git, calls: Arc::default(), status: None }
     }
 
     pub fn with_kind(mut self, kind: VcsKind) -> Self {
         self.kind = kind;
+        self
+    }
+
+    pub fn with_status(mut self, status: Status) -> Self {
+        self.status = Some(status);
         self
     }
 
@@ -30,8 +38,6 @@ impl FakeVcs {
         self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    // No trait method takes a path to record yet.
-    #[allow(dead_code)]
     fn record(&self, method: &str, path: &Path) {
         self.calls
             .lock()
@@ -47,6 +53,11 @@ impl VersionControl for FakeVcs {
 
     fn kind(&self) -> VcsKind {
         self.kind
+    }
+
+    fn status(&self, checkout: &Path, _: Option<&str>, _: &Blocking) -> Result<Status, VcsError> {
+        self.record("status", checkout);
+        self.status.clone().ok_or_else(|| VcsError::NotARepository(checkout.to_path_buf()))
     }
 }
 

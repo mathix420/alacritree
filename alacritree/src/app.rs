@@ -30,7 +30,7 @@ use crate::config::{
 use crate::crash_log::{self, ExitReason};
 use crate::forge::Forge;
 use crate::git_nav::{self, GitSection, SectionCount};
-use crate::git_status::{self, ChangeKind, DirtyCounts, FileChange, GitStatus, StatusCache};
+use crate::git_status::{self, DirtyCounts};
 use crate::in_flight::{Finished, InFlight};
 use crate::modal_gate::{ModalGate, ModalKind};
 use crate::multiplexer::{
@@ -48,6 +48,7 @@ use crate::shell_decision::{ShellDecision, shell_decision};
 use crate::sidebar_model::{SidebarInputs, SidebarModel, Step};
 use crate::sidebar_nav::{self, SidebarRow, StepTarget};
 use crate::state::{self, PersistedProject};
+use crate::status_cache::StatusCache;
 use crate::workspace::WorkspaceKey;
 use crate::worktree::{self as wt, CreateRequest, Progress};
 use crate::wsl::{self, ShellChoice};
@@ -374,6 +375,8 @@ pub struct AlacritreeApp {
     current_workspace: WorkspaceKey,
     projects: Vec<Project>,
     pr_cache: PrCache<Forge>,
+    /// The enabled version control backends, in the order they claim a root.
+    vcs_backends: Vec<crate::vcs::Vcs>,
     /// Renders `[ui] worktree_name` / `project_name` templates at paint time.
     row_labels: crate::row_label::LabelTemplates,
     config: Config,
@@ -502,6 +505,7 @@ impl AlacritreeApp {
             current_workspace: None,
             projects,
             pr_cache: PrCache::new(Forge::default()),
+            vcs_backends: crate::vcs::backends(&config.integrations),
             row_labels,
             icons: PaintedIcons::new(&config, &multiplexers),
             shortcuts: crate::shortcut::Shortcuts::new(&config.bindings),
@@ -1435,7 +1439,7 @@ impl AlacritreeApp {
         // worktree the git panel has already completed a compute for answers
         // from that cache instead of walking the tree again. A cache entry
         // with no compute yet (the panel's first frame for this workspace)
-        // is `GitStatus::default()`, indistinguishable from "known clean",
+        // is `Status::default()`, indistinguishable from "known clean",
         // so it is not read as an answer. A cold one waits on a job so the
         // dialog opens at once and fills in.
         //
@@ -8146,11 +8150,11 @@ mod tests {
             let theme = Theme::from_config(&config);
 
             for (kind, glyph, hint) in [
-                (ChangeKind::Modified, "M", "modified"),
-                (ChangeKind::Untracked, "?", "untracked"),
-                (ChangeKind::Conflicted, "!", "conflicted"),
+                (alacritree_vcs::ChangeKind::Modified, "M", "modified"),
+                (alacritree_vcs::ChangeKind::Untracked, "?", "untracked"),
+                (alacritree_vcs::ChangeKind::Conflicted, "!", "conflicted"),
             ] {
-                let change = FileChange { path: "README.md".to_owned(), kind };
+                let change = alacritree_vcs::FileChange { path: "README.md".to_owned(), kind };
                 let mut row = |ui: &mut egui::Ui| {
                     let _ = file_row(ui, &change, &theme, false);
                 };
@@ -8452,12 +8456,12 @@ mod tests {
             let mut config = Config::default();
             config.ui.sidebar_tooltips = mode;
             let theme = Theme::from_config(&config);
-            let change = crate::git_status::FileChange {
+            let change = alacritree_vcs::FileChange {
                 path: path.to_owned(),
-                kind: crate::git_status::ChangeKind::Modified,
+                kind: alacritree_vcs::ChangeKind::Modified,
             };
             let stat =
-                crate::git_status::DiffStat { path: path.to_owned(), additions: 3, deletions: 1 };
+                alacritree_vcs::DiffStat { path: path.to_owned(), additions: 3, deletions: 1 };
 
             for (kind, is_diff) in [("file", false), ("diff", true)] {
                 let texts = texts_while_hovering(140.0, |ui| {

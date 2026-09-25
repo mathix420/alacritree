@@ -4,20 +4,26 @@
 
 mod default_branch;
 mod settings;
+mod status;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 use std::path::Path;
 
-use alacritree_vcs::{VcsKind, VersionControl};
+use alacritree_common::jobs::Blocking;
+use alacritree_vcs::{Status, VcsError, VcsKind, VersionControl};
 
 #[doc(hidden)]
 pub use default_branch::{Evidence, WellKnown, resolve, shell_ranking};
 pub use settings::{GitConfig, RawGit};
+#[doc(hidden)]
+pub use status::parse_status_v2_z;
 
 /// The resolved config travels with the value, so a project's `Vcs` is
 /// cheap to clone and answers without a config lookup.
 #[derive(Debug, Clone)]
 pub struct GitBackend {
-    // Commands read the program path once status moves behind the trait.
+    // Read once a command runs the configured program rather than `git`.
     #[allow(dead_code)]
     config: GitConfig,
 }
@@ -40,5 +46,14 @@ impl VersionControl for GitBackend {
 
     fn kind(&self) -> VcsKind {
         VcsKind::Git
+    }
+
+    fn status(
+        &self,
+        checkout: &Path,
+        base_hint: Option<&str>,
+        blocking: &Blocking,
+    ) -> Result<Status, VcsError> {
+        status::status(checkout, base_hint, blocking)
     }
 }

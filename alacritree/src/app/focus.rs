@@ -35,7 +35,8 @@ impl AlacritreeApp {
         let active_workspace = self.current_workspace.as_deref();
         let active_branch = active_workspace
             .and_then(|p| self.git_panel.status.get(p))
-            .and_then(|c| c.current_branch());
+            .and_then(|c| c.live_head())
+            .and_then(alacritree_vcs::Head::label);
         SidebarInputs {
             projects: &self.projects,
             sessions: self.sessions.iter().map(move |s| sidebar_focus::SessionInput {

@@ -14,19 +14,18 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
+use alacritree_vcs::{Status, VersionControl};
 use interprocess::local_socket::traits::Listener as _;
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, ToFsName};
 use serde_json::json;
 
 #[cfg(unix)]
 use super::protocol::connect;
-use super::protocol::{
-    IpcRequest, IpcResult, SOCKET_ENV, git_status_json, socket_dir, unlink_socket,
-};
+use super::protocol::{IpcRequest, IpcResult, SOCKET_ENV, socket_dir, status_json, unlink_socket};
 use super::route::{AppRequest, ConnectionRequest, DeferredRequest, Route};
+use crate::jobs;
 use crate::repaint::Repaint;
 use crate::worktree::{self as wt, CreateConfig, CreateRequest, Progress};
-use crate::{git_status, jobs};
 
 /// Absolute path to the running binary. A shell can exec the CLI through it
 /// without a PATH lookup, which is the only reliable way in a distro, where
@@ -201,14 +200,21 @@ fn dispatch(
     config: &CreateConfig,
 ) -> IpcResult {
     match Route::from(request) {
-        // `compute` walks the working tree, the same work StatusCache
+        // A status walks the working tree, the same work StatusCache
         // pushes to a background thread, so keep it off the UI thread.
         // This is already the connection thread, not the UI thread; the
         // token just proves that plainly rather than adding a real wait.
         Route::Connection(ConnectionRequest::GitStatus { path }) => {
-            Ok(git_status_json(&jobs::on_this_thread(|blocking| {
-                git_status::compute(&path, None, blocking)
-            })))
+            match crate::vcs::for_path(&config.vcs, &path) {
+                Some(vcs) => {
+                    let result = jobs::on_this_thread(|blocking| vcs.status(&path, None, blocking));
+                    Ok(match result {
+                        Ok(status) => status_json(&status, None),
+                        Err(e) => status_json(&Status::default(), Some(&e.to_string())),
+                    })
+                },
+                None => Ok(status_json(&Status::default(), Some("version control is disabled"))),
+            }
         },
         Route::Connection(ConnectionRequest::CreateWorktree { project_root, branch }) => {
             create_worktree(project_root, branch, app_tx, repaint, config)

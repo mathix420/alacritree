@@ -87,11 +87,13 @@ pub(crate) enum BranchNameError {
 }
 
 /// What a create from IPC or the offline CLI reads from config: where the
-/// worktree goes, and the hooks that run once it exists.
+/// worktree goes, the hooks that run once it exists, and the enabled version
+/// control backends.
 #[derive(Clone, Default)]
 pub(crate) struct CreateConfig {
     pub(crate) workspace: WorkspaceConfig,
     pub(crate) hooks: Vec<Hook>,
+    pub(crate) vcs: Vec<crate::vcs::Vcs>,
 }
 
 impl CreateConfig {
@@ -99,6 +101,7 @@ impl CreateConfig {
         Self {
             workspace: config.workspace.clone(),
             hooks: crate::checkout_hooks::from_config(&config.integrations),
+            vcs: crate::vcs::backends(&config.integrations),
         }
     }
 }

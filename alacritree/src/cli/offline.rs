@@ -11,13 +11,14 @@
 
 use std::path::{Path, PathBuf};
 
+use alacritree_vcs::{Status, VersionControl};
 use serde_json::{Value, json};
 
-use crate::ipc::protocol::{self, IpcRequest, IpcResult};
+use crate::ipc::protocol::{IpcRequest, IpcResult, status_json};
 use crate::projects::{self, NotAProject, Project, project_json};
 use crate::state::{self, PersistedProject, PersistedState};
 use crate::worktree::{self as wt, CreateConfig, CreateRequest};
-use crate::{git_status, jobs, scratchpad};
+use crate::{jobs, scratchpad};
 
 pub(super) fn handle(request: &IpcRequest, config: &CreateConfig) -> IpcResult {
     let Some(path) = state::config_path() else {
@@ -57,10 +58,15 @@ fn handle_at(state_path: &Path, request: &IpcRequest, config: &CreateConfig) -> 
                 .ok_or_else(|| NotAProject(root.clone()).to_string())?;
             Ok(project_json(&known))
         },
-        IpcRequest::GitStatus { path } => {
-            Ok(protocol::git_status_json(&jobs::on_this_thread(|blocking| {
-                git_status::compute(path, None, blocking)
-            })))
+        IpcRequest::GitStatus { path } => match crate::vcs::for_path(&config.vcs, path) {
+            Some(vcs) => {
+                let result = jobs::on_this_thread(|blocking| vcs.status(path, None, blocking));
+                Ok(match result {
+                    Ok(status) => status_json(&status, None),
+                    Err(e) => status_json(&Status::default(), Some(&e.to_string())),
+                })
+            },
+            None => Ok(status_json(&Status::default(), Some("version control is disabled"))),
         },
         IpcRequest::CreateWorktree { project_root, branch } => {
             create_worktree(project_root.clone(), branch.clone(), config)

@@ -5,6 +5,7 @@
 use alacritree_diff_viewer::{
     self as diff_viewer, DiffRequest, DiffSource, Section, Target, diff_key,
 };
+use alacritree_vcs::{ChangeKind, FileChange, Status};
 
 use super::*;
 
@@ -53,7 +54,9 @@ struct GitSidebarView {
     theme: Theme,
     path: PathBuf,
     workspace_home: Option<String>,
-    status: GitStatus,
+    status: Status,
+    /// Why the status could not be read, shown in place of the panel.
+    error: Option<String>,
     pr_info: Option<PrInfo>,
     branch_base: Option<String>,
     active_diff_key: Option<String>,
@@ -185,7 +188,7 @@ impl AlacritreeApp {
     /// With no kind toggle active every kind passes; otherwise the active
     /// toggles union (`m`: Modified/Renamed, `d`: Deleted, `u`: Untracked/Added).
     /// Conflicted rows and the branch-diff section are handled by `visible_rows`.
-    fn filtered_git_rows(&mut self, status: &GitStatus) -> git_nav::GitRows {
+    fn filtered_git_rows(&mut self, status: &Status) -> git_nav::GitRows {
         let apply = self.git_panel.filter.toggles_apply(self.sidebar_focus_state.search_scope);
         let m = apply && self.git_panel.filter.is_toggled('m');
         let d = apply && self.git_panel.filter.is_toggled('d');
@@ -194,9 +197,9 @@ impl AlacritreeApp {
         let filter = &mut self.git_panel.filter;
         let mut query_pass = |path: &str| filter.matches(path);
         git_nav::visible_rows(
-            &status.staged,
-            &status.unstaged,
-            &status.branch_diff,
+            status.staged.as_deref().unwrap_or_default(),
+            &status.working,
+            &status.base_diff,
             &kind_pass,
             &mut query_pass,
         )
@@ -302,16 +305,21 @@ impl AlacritreeApp {
         let workspace_home = self.workspace_home(&path);
 
         let project_default = self.project_default_branch_for(&path);
-        let cache = self
-            .git_panel
-            .status
-            .entry(path.clone())
-            .or_insert_with(|| StatusCache::new(path.clone()));
+        if !self.git_panel.status.contains_key(&path) {
+            let Some(vcs) = self.vcs_backends.first().cloned() else {
+                // No backend is enabled, so there is no status to show.
+                self.git_panel.rows.clear();
+                self.git_panel.branch_base = None;
+                return None;
+            };
+            self.git_panel.status.insert(path.clone(), StatusCache::new(path.clone(), vcs));
+        }
+        let cache = self.git_panel.status.get_mut(&path).expect("inserted above");
 
         // Use whatever branch the cache already knows to query the PR
         // cache without waiting for a fresh compute. The first frame may
         // be `None`, which `pr_cache.poll` handles by returning early.
-        let cached_branch = cache.current_branch().map(str::to_string);
+        let cached_branch = cache.live_head().and_then(|head| head.name.clone());
         let pr_info = self.pr_cache.poll(&path, cached_branch.as_deref(), ctx);
         let effective_default = effective_base_branch(
             self.git_panel.base_branch_overrides.get(&path).map(String::as_str),
@@ -320,11 +328,11 @@ impl AlacritreeApp {
         );
         // Clone the non-blocking poll result before cursor repair mutates `self`.
         let status = cache.poll(effective_default.as_deref(), ctx).clone();
+        let error = cache.error().map(str::to_string);
 
         // Prefer the resolved ref (e.g. `refs/remotes/origin/main`) so
         // the cursor's Enter-to-diff matches the branch section's rows.
-        let git_branch_base =
-            status.default_branch_resolved.clone().or_else(|| status.default_branch.clone());
+        let git_branch_base = status.base.clone().or_else(|| status.trunk.clone());
         let diff_viewer = &self.config.integrations.diff_viewer;
         let review = |section: Section| {
             let target = Target::Section(section);
@@ -381,6 +389,7 @@ impl AlacritreeApp {
             path,
             workspace_home,
             status,
+            error,
             pr_info,
             branch_base: git_branch_base,
             active_diff_key,
@@ -540,9 +549,8 @@ fn paint_git_sidebar_status(
     requests: &mut GitSidebarRequests,
 ) {
     let theme = &view.theme;
-    let status = &view.status;
     ScrollArea::vertical().show(ui, |ui| {
-        if let Some(err) = &status.error {
+        if let Some(err) = &view.error {
             ui.label(RichText::new(err).color(view.theme.error).small());
             return;
         }
@@ -569,10 +577,9 @@ fn paint_git_branch_header(
     requests: &mut GitSidebarRequests,
 ) {
     let theme = &view.theme;
-    let Some(branch) = &view.status.branch else { return };
+    let Some(branch) = view.status.head.label() else { return };
     // Pin the base label so a long branch cannot widen the sidebar.
-    let default =
-        view.status.default_branch.as_deref().filter(|default| *default != branch.as_str());
+    let default = view.status.trunk.as_deref().filter(|default| *default != branch);
     row_with_trailing(
         ui,
         |ui| {
@@ -620,7 +627,7 @@ fn paint_staged_section(
         section_gap,
         review,
         |ui| {
-            for file in &view.status.staged {
+            for file in view.status.staged.iter().flatten() {
                 if !view.staged_visible.contains(&file.path) {
                     continue;
                 }
@@ -663,7 +670,7 @@ fn paint_unstaged_section(
         section_gap,
         review,
         |ui| {
-            for file in &view.status.unstaged {
+            for file in &view.status.working {
                 if !view.unstaged_visible.contains(&file.path) {
                     continue;
                 }
@@ -697,10 +704,10 @@ fn paint_branch_section(
     requests: &mut GitSidebarRequests,
     section_gap: &mut f32,
 ) {
-    if view.status.branch_diff.is_empty() {
+    if view.status.base_diff.is_empty() {
         return;
     }
-    let base_label = match &view.status.default_branch {
+    let base_label = match &view.status.trunk {
         Some(branch) => format!("Changes vs {branch}"),
         None => "Changes vs default".to_string(),
     };
@@ -726,7 +733,7 @@ fn paint_branch_section(
         requests.diff = view.branch_review.clone();
     }
     ui.add_space(2.0);
-    for stat in &view.status.branch_diff {
+    for stat in &view.status.base_diff {
         if !view.branch_visible.contains(&stat.path) {
             continue;
         }
@@ -862,11 +869,14 @@ pub(super) fn file_row(
                 // a clickable row so the click falls through.
                 let badge = ui.add(
                     egui::Label::new(
-                        RichText::new(change.kind.glyph()).color(color).monospace().small(),
+                        RichText::new(git_nav::change_glyph(change.kind))
+                            .color(color)
+                            .monospace()
+                            .small(),
                     )
                     .selectable(false),
                 );
-                hints.add(badge.rect, change.kind.label());
+                hints.add(badge.rect, git_nav::change_label(change.kind));
                 let (_, galley) = git_path_label(ui, &change.path, path_color, theme);
                 path_galley = Some(galley);
                 fill_row(ui);
@@ -883,7 +893,7 @@ pub(super) fn file_row(
 
 pub(super) fn branch_diff_row(
     ui: &mut egui::Ui,
-    stat: &crate::git_status::DiffStat,
+    stat: &alacritree_vcs::DiffStat,
     theme: &Theme,
     is_active: bool,
 ) -> egui::Response {
@@ -1034,7 +1044,7 @@ impl AlacritreeApp {
     fn cached_branch_base(&self) -> Option<String> {
         let path = self.active_session_path()?;
         let status = self.git_panel.status.get(&path)?.last();
-        status.default_branch_resolved.clone().or_else(|| status.default_branch.clone())
+        status.base.clone().or_else(|| status.trunk.clone())
     }
 
     fn toggle_git_filter(&mut self, action: NamedAction) {

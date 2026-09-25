@@ -66,4 +66,13 @@ pub trait VersionControl {
     fn claims(&self, root: &::std::path::Path) -> bool;
 
     fn kind(&self) -> ::alacritree_vcs::VcsKind;
+
+    /// Must not record history. A backend whose every command writes (jj
+    /// snapshots the working copy) reads without writing here.
+    fn status(
+        &self,
+        checkout: &::std::path::Path,
+        base_hint: ::std::option::Option<&str>,
+        blocking: &::alacritree_common::jobs::Blocking,
+    ) -> ::std::result::Result<::alacritree_vcs::Status, ::alacritree_vcs::VcsError>;
 }

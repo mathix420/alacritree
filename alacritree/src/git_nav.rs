@@ -6,7 +6,30 @@
 //! changing identity. An index would silently retarget the cursor onto
 //! whatever file happens to land at that position next.
 
-use crate::git_status::{ChangeKind, DiffStat, FileChange};
+use alacritree_vcs::{ChangeKind, DiffStat, FileChange};
+
+pub(crate) fn change_glyph(kind: ChangeKind) -> &'static str {
+    match kind {
+        ChangeKind::Added => "A",
+        ChangeKind::Modified => "M",
+        ChangeKind::Deleted => "D",
+        ChangeKind::Renamed => "R",
+        ChangeKind::Untracked => "?",
+        ChangeKind::Conflicted => "!",
+    }
+}
+
+/// What the glyph stands for, for readers who do not know porcelain.
+pub(crate) fn change_label(kind: ChangeKind) -> &'static str {
+    match kind {
+        ChangeKind::Added => "added",
+        ChangeKind::Modified => "modified",
+        ChangeKind::Deleted => "deleted",
+        ChangeKind::Renamed => "renamed",
+        ChangeKind::Untracked => "untracked",
+        ChangeKind::Conflicted => "conflicted",
+    }
+}
 
 /// Which list of the git panel a row belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

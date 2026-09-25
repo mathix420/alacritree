@@ -101,11 +101,11 @@ impl AlacritreeApp {
                 .map(|wt| (wt.path.clone(), filter.matches(&wt.name)))
                 .collect()
         };
-        let live_branch = self
+        let live_head = self
             .current_workspace
             .as_deref()
             .and_then(|p| self.git_panel.status.get(p))
-            .and_then(|c| c.current_branch());
+            .and_then(|c| c.live_head());
         let current_workspace = self.current_workspace.as_deref();
         // Skipped outright while the PR dimension is inert: `worktree_pr_passes`
         // would not read the map, and building it costs a path clone per
@@ -115,7 +115,7 @@ impl AlacritreeApp {
                 .iter()
                 .flat_map(|p| p.worktrees.iter())
                 .map(|wt| {
-                    let branch = pr_status::effective_branch(wt, current_workspace, live_branch);
+                    let branch = pr_status::effective_branch(wt, current_workspace, live_head);
                     let state = self.pr_cache.state(&wt.path, branch);
                     (
                         wt.path.clone(),
@@ -439,9 +439,9 @@ impl AlacritreeApp {
         let any_pr_toggle =
             any_pr_toggle_active(&self.sidebar.filter, self.sidebar_focus_state.search_scope);
         let current_workspace = self.current_workspace.as_deref();
-        let live_branch = current_workspace
+        let live_head = current_workspace
             .and_then(|p| self.git_panel.status.get(p))
-            .and_then(|cache| cache.current_branch());
+            .and_then(|cache| cache.live_head());
         // The same path can be a worktree of two projects, and `PrCache` is
         // keyed by path alone, so a second poller would only invalidate the
         // first's lookup and burn a `gh` process every frame.
@@ -460,8 +460,7 @@ impl AlacritreeApp {
                     &wt.path,
                     should_poll_pr(pr_enabled, project.expanded, any_pr_toggle),
                     || {
-                        let branch =
-                            pr_status::effective_branch(wt, current_workspace, live_branch);
+                        let branch = pr_status::effective_branch(wt, current_workspace, live_head);
                         self.pr_cache.poll(&wt.path, branch, ctx)
                     },
                 );

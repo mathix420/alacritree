@@ -389,9 +389,10 @@ pub(crate) fn pr_pass(
     }
 }
 
-/// The branch a worktree's PR lookup is keyed to. The active worktree prefers
-/// its live status branch; every other worktree, and an active one whose
-/// `StatusCache` has not produced a branch yet, uses the stored snapshot.
+/// The branch a worktree's PR lookup is keyed to. The active worktree uses its
+/// live head's branch, which a detached head does not have; every other
+/// worktree, and an active one whose `StatusCache` has not read a head yet,
+/// uses the stored snapshot.
 ///
 /// The split is what keeps two pollers of one path from fighting. [`PrCache`]
 /// is keyed by path alone, so the right sidebar, which polls the active
@@ -405,10 +406,13 @@ pub(crate) fn pr_pass(
 pub(crate) fn effective_branch<'a>(
     wt: &'a Worktree,
     current_workspace: Option<&Path>,
-    live_branch: Option<&'a str>,
+    live: Option<&'a alacritree_vcs::Head>,
 ) -> Option<&'a str> {
     if current_workspace == Some(wt.path.as_path()) {
-        live_branch.or(wt.branch.as_deref())
+        match live {
+            Some(head) => head.name.as_deref(),
+            None => wt.branch.as_deref(),
+        }
     } else {
         wt.branch.as_deref()
     }
@@ -642,7 +646,22 @@ mod tests {
     fn effective_branch_prefers_the_live_branch_for_the_active_worktree() {
         let wt = worktree("/repo/wt", Some("stored"));
         let active = Some(Path::new("/repo/wt"));
-        assert_eq!(effective_branch(&wt, active, Some("live")), Some("live"));
+        assert_eq!(effective_branch(&wt, active, Some(&live_head(Some("live")))), Some("live"));
+    }
+
+    #[test]
+    fn a_detached_active_workspace_queries_no_pull_request() {
+        let wt = worktree("/repo/wt", Some("stored"));
+        let active = Some(Path::new("/repo/wt"));
+        assert_eq!(effective_branch(&wt, active, Some(&live_head(None))), None);
+    }
+
+    fn live_head(name: Option<&str>) -> alacritree_vcs::Head {
+        alacritree_vcs::Head {
+            name: name.map(str::to_string),
+            revision: Some("abc1234".into()),
+            distance: None,
+        }
     }
 
     /// A workspace that just became active has a fresh `StatusCache` with no
@@ -659,7 +678,7 @@ mod tests {
     fn effective_branch_ignores_a_live_branch_from_another_workspace() {
         let wt = worktree("/repo/wt", Some("stored"));
         let active = Some(Path::new("/repo/other"));
-        assert_eq!(effective_branch(&wt, active, Some("live")), Some("stored"));
+        assert_eq!(effective_branch(&wt, active, Some(&live_head(Some("live")))), Some("stored"));
     }
 
     #[test]

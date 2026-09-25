@@ -19,8 +19,6 @@ pub enum Vcs {
 
 /// The enabled backends, in the order they claim a root. Git comes first so a
 /// colocated jj repository opens as git until its user picks otherwise.
-// The app reaches backends through `for_path` once status moves behind the trait.
-#[allow(dead_code)]
 pub(crate) fn backends(integrations: &IntegrationsConfig) -> Vec<Vcs> {
     let mut out = Vec::new();
     if integrations.git.enabled {
@@ -31,10 +29,15 @@ pub(crate) fn backends(integrations: &IntegrationsConfig) -> Vec<Vcs> {
 
 /// The first backend that claims `root`. A claim may open the repository,
 /// so callers run this off the UI thread.
-// The app reaches backends through `for_path` once status moves behind the trait.
-#[allow(dead_code)]
 pub(crate) fn detect(backends: &[Vcs], root: &Path) -> Option<Vcs> {
     backends.iter().find(|vcs| vcs.claims(root)).cloned()
+}
+
+/// The backend that answers for `path` off the UI thread: the first that
+/// claims it, else the first enabled one, so a folder that is no repository
+/// gets that backend's own error text, as it always has.
+pub(crate) fn for_path(backends: &[Vcs], path: &Path) -> Option<Vcs> {
+    detect(backends, path).or_else(|| backends.first().cloned())
 }
 
 #[cfg(test)]
