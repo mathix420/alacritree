@@ -817,6 +817,16 @@ mod tests {
     }
     use crate::repaint::Recorder;
 
+    /// A compute that panics. Interactive, since a background job runs below
+    /// normal priority and a saturated machine can leave it unscheduled for
+    /// seconds, while what these tests check is only how the cache takes a
+    /// failure.
+    fn panicking_compute() -> jobs::Job<GitStatus> {
+        jobs::pool().spawn(jobs::Priority::Interactive, |_: &jobs::Blocking| -> GitStatus {
+            panic!("boom")
+        })
+    }
+
     #[test]
     fn a_status_poll_reports_without_blocking_its_caller() {
         let dir = tempfile::tempdir().expect("a temp dir");
@@ -848,10 +858,7 @@ mod tests {
     #[test]
     fn a_failed_compute_clears_pending_so_a_future_poll_is_not_blocked() {
         let mut cache = StatusCache::new(PathBuf::from("/doesnt/matter"));
-        let job = jobs::pool()
-            .spawn(jobs::Priority::Background, |_: &jobs::Blocking| -> GitStatus {
-                panic!("boom")
-            });
+        let job = panicking_compute();
         cache.pending = Some(Pending { hint: None, job, started: Instant::now(), warned: false });
 
         let repaint = Recorder::default();
@@ -910,10 +917,7 @@ mod tests {
     /// that succeeds.
     #[test]
     fn a_failed_compute_backs_off_as_far_as_a_successful_one() {
-        let job = jobs::pool()
-            .spawn(jobs::Priority::Background, |_: &jobs::Blocking| -> GitStatus {
-                panic!("boom")
-            });
+        let job = panicking_compute();
         // Latch the failure before the cache sees it, so the poll below reads
         // a settled job rather than racing the worker.
         let deadline = Instant::now() + Duration::from_secs(5);

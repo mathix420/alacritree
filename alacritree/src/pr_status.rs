@@ -993,7 +993,9 @@ mod tests {
 
         let job = {
             let repaint = repaint.clone();
-            jobs::Pool::new(2).spawn(jobs::Priority::Background, move |_| -> PullRequests {
+            // Interactive, since a background job runs below normal priority and
+            // a saturated machine can leave it unscheduled for seconds.
+            jobs::Pool::new(2).spawn(jobs::Priority::Interactive, move |_| -> PullRequests {
                 let _wake = WakeOnDrop(repaint);
                 panic!("worker died");
             })
