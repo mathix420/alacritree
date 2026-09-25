@@ -5,7 +5,7 @@ use std::process::{Command, Output, Stdio};
 
 use alacritree_common::tools::{self, Tool};
 use alacritree_common::{command_ext, jobs, wsl};
-use alacritree_vcs::{Base, CreateCheckout, Created, VcsError};
+use alacritree_vcs::{Base, CreateCheckout, Created, RemoveCheckout, VcsError};
 
 use crate::default_branch::{self, Evidence, WellKnown};
 
@@ -59,6 +59,71 @@ pub(crate) fn create(req: &CreateCheckout) -> Result<Created, VcsError> {
     let target = git_path_arg(&req.main, &req.target)?;
     run_git(&req.main, &["worktree", "add", &target, "-b", &req.name, &req.base.revision])?;
     Ok(Created::default())
+}
+
+/// A live checkout goes through `git worktree remove`, and a gone one is
+/// pruned. Either way its branch goes too when asked.
+pub(crate) fn remove(req: &RemoveCheckout) -> Result<(), VcsError> {
+    let checkout = &req.checkout;
+    if checkout.gone {
+        prune_worktree(&req.main, &checkout.name)?;
+    } else {
+        let path_arg = git_path_arg(&req.main, &checkout.path)?;
+        let mut args: Vec<&str> = vec!["worktree", "remove"];
+        if req.force {
+            args.push("--force");
+        }
+        args.push(&path_arg);
+        run_git(&req.main, &args).map_err(|e| match e {
+            VcsError::Failed { command, stderr } if refused_for_unsaved_work(&stderr) => {
+                VcsError::Unsaved { message: format!("{command}: {stderr}") }
+            },
+            e => e,
+        })?;
+    }
+    if req.delete_name
+        && let Some(branch) = &checkout.head.name
+    {
+        // Branch may already be gone (e.g. detached HEAD), so ignore errors.
+        let _ = run_git(&req.main, &["branch", "-D", branch]);
+    }
+    Ok(())
+}
+
+/// Remove the git metadata of a worktree whose checkout directory is gone
+/// (git calls these *prunable*). Uses git2's per-worktree prune rather than
+/// shelling out to `git worktree prune`, which would sweep every stale
+/// worktree in the repo instead of just the one the user asked about.
+fn prune_worktree(main: &Path, worktree_name: &str) -> Result<(), VcsError> {
+    let repo = git2::Repository::open(main)
+        .map_err(|e| git2_error(format!("failed to open repository: {}", e.message()), e))?;
+    let wt = repo.find_worktree(worktree_name).map_err(|e| {
+        git2_error(format!("failed to find worktree `{worktree_name}`: {}", e.message()), e)
+    })?;
+    // Default prune options refuse valid or locked worktrees. That is exactly
+    // the safety we want if the directory reappeared since discovery; the
+    // error surfaces to the caller.
+    wt.prune(None).map_err(|e| git2_error(format!("failed to prune: {}", e.message()), e))
+}
+
+fn git2_error(context: String, source: git2::Error) -> VcsError {
+    VcsError::Backend { context, source: Box::new(source) }
+}
+
+/// `git worktree remove` refuses a tree with work in it, and that refusal is
+/// the authority on whether removing would lose anything. `contains modified
+/// or untracked files` is git's current wording, `is dirty` what git 2.17
+/// said before the rewording.
+///
+/// git prints `fatal: '<path>' <reason>`, and a user-chosen path that spells
+/// out a fragment must not turn an unrelated failure into a false "needs
+/// --force" prompt. git's reason always follows the path's closing quote, so
+/// only the text after the last `'` is read.
+fn refused_for_unsaved_work(output: &str) -> bool {
+    let tail = output.rsplit_once("fatal:").map_or(output, |(_, tail)| tail);
+    let reason = tail.rsplit_once('\'').map_or(tail, |(_, after)| after).to_ascii_lowercase();
+    reason.contains("contains modified or untracked files, use --force")
+        || reason.contains("is dirty, use --force")
 }
 
 fn spawn_error(source: std::io::Error) -> VcsError {
@@ -353,7 +418,9 @@ mod tests {
     use std::time::Duration;
 
     use alacritree_common::{command_ext, jobs};
-    use alacritree_vcs::{CreateCheckout, VcsError, VersionControl};
+    use alacritree_vcs::{
+        Checkout, CreateCheckout, Head, RemoveCheckout, VcsError, VersionControl,
+    };
 
     use super::*;
     use crate::{GitBackend, GitConfig};
@@ -536,5 +603,129 @@ mod tests {
         jobs::on_this_thread(|b| backend().create_checkout(&req, b)).unwrap();
         assert!(req.target.join(".git").exists());
         assert!(Path::new(&main).join(".git").join("refs").join("heads").join("new").exists());
+    }
+
+    /// A checkout discovery found gone, as the delete dialog hands it over.
+    fn checkout(path: &Path, name: &str, gone: bool) -> Checkout {
+        Checkout {
+            name: name.into(),
+            path: path.to_path_buf(),
+            head: Head { name: Some(name.into()), ..Head::default() },
+            is_main: false,
+            gone,
+            upstream: None,
+        }
+    }
+
+    fn remove(main: &Path, checkout: Checkout, delete_name: bool) -> Result<(), VcsError> {
+        let req = RemoveCheckout { main: main.to_path_buf(), checkout, force: false, delete_name };
+        jobs::on_this_thread(|b| backend().remove_checkout(&req, b))
+    }
+
+    #[test]
+    fn prune_removes_stale_metadata_and_keeps_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = crate::test_support::init_repo(&tmp.path().join("repo"));
+        let wt_path = crate::test_support::add_worktree(&repo_dir, "stale");
+        std::fs::remove_dir_all(&wt_path).unwrap();
+
+        remove(&repo_dir, checkout(&wt_path, "stale", true), false).unwrap();
+
+        let repo = git2::Repository::open(&repo_dir).unwrap();
+        assert!(repo.find_worktree("stale").is_err());
+        assert!(repo.find_branch("stale", git2::BranchType::Local).is_ok());
+    }
+
+    #[test]
+    fn prune_deletes_branch_when_asked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = crate::test_support::init_repo(&tmp.path().join("repo"));
+        let wt_path = crate::test_support::add_worktree(&repo_dir, "stale");
+        std::fs::remove_dir_all(&wt_path).unwrap();
+
+        remove(&repo_dir, checkout(&wt_path, "stale", true), true).unwrap();
+
+        let repo = git2::Repository::open(&repo_dir).unwrap();
+        assert!(repo.find_worktree("stale").is_err());
+        assert!(repo.find_branch("stale", git2::BranchType::Local).is_err());
+    }
+
+    /// Discovery can be stale: a directory that came back since is refused
+    /// rather than swept.
+    #[test]
+    fn prune_refuses_a_live_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = crate::test_support::init_repo(&tmp.path().join("repo"));
+        let wt_path = crate::test_support::add_worktree(&repo_dir, "live");
+
+        assert!(remove(&repo_dir, checkout(&wt_path, "live", true), false).is_err());
+
+        let repo = git2::Repository::open(&repo_dir).unwrap();
+        assert!(repo.find_worktree("live").is_ok());
+        assert!(repo.find_branch("live", git2::BranchType::Local).is_ok());
+    }
+
+    #[test]
+    fn removing_a_worktree_with_untracked_files_is_refused_as_unsaved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = crate::test_support::init_repo(&tmp.path().join("repo"));
+        let wt_path = crate::test_support::add_worktree(&repo_dir, "dirty");
+        std::fs::write(wt_path.join("new.txt"), "x").unwrap();
+
+        let result = remove(&repo_dir, checkout(&wt_path, "dirty", false), false);
+
+        assert!(matches!(result, Err(VcsError::Unsaved { .. })), "{result:?}");
+        assert!(wt_path.exists());
+    }
+
+    #[test]
+    fn refused_for_unsaved_work_matches_a_real_git_refusal() {
+        assert!(refused_for_unsaved_work(
+            "fatal: '../wt1' contains modified or untracked files, use --force to delete it"
+        ));
+    }
+
+    #[test]
+    fn refused_for_unsaved_work_ignores_unrelated_failures() {
+        assert!(!refused_for_unsaved_work("fatal: '../wt1' is a main working tree"));
+    }
+
+    /// A worktree path that happens to contain the matched phrase must not
+    /// turn an unrelated failure into a false "needs --force" prompt --
+    /// `refused_for_unsaved_work` only reads the text after the closing
+    /// quote of the path, never the quoted path itself.
+    #[test]
+    fn refused_for_unsaved_work_is_not_fooled_by_a_path_spelling_out_the_phrase() {
+        let path = "../is dirty, use --force to delete it";
+        assert!(!refused_for_unsaved_work(&format!(
+            "fatal: '{path}' cannot be locked: filesystem error"
+        )));
+    }
+}
+
+#[cfg(test)]
+#[cfg(windows)]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn git_path_arg_windows_repo_passes_path_through() {
+        let repo = Path::new(r"C:\x");
+        let path = Path::new(r"C:\x\y");
+        assert_eq!(git_path_arg(repo, path).unwrap(), r"C:\x\y");
+    }
+
+    #[test]
+    fn git_path_arg_wsl_repo_translates_worktree_path() {
+        let repo = Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj");
+        let path = Path::new(r"\\wsl.localhost\kali-linux\home\lev\wt");
+        assert_eq!(git_path_arg(repo, path).unwrap(), "/home/lev/wt");
+    }
+
+    #[test]
+    fn git_path_arg_wsl_repo_errors_outside_distro_mapping() {
+        let repo = Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj");
+        let path = Path::new("wt");
+        assert!(matches!(git_path_arg(repo, path), Err(VcsError::BadPath(_))));
     }
 }

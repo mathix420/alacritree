@@ -7,17 +7,16 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver};
 
 use alacritree_checkout_hooks::{CheckoutEvent, CheckoutHook, CheckoutHooks};
-use alacritree_vcs::{CreateCheckout, VcsError, VersionControl};
+use alacritree_vcs::{CreateCheckout, RemoveCheckout, VcsError, VersionControl};
 
 use crate::checkout_hooks::Hook;
 use crate::config::{Config, WorkspaceConfig};
 use crate::repaint::Repaint;
-use crate::tools::{self, Tool};
-use crate::{command_ext, jobs, wsl};
+use crate::vcs::Vcs;
+use crate::{jobs, wsl};
 
 #[derive(Debug)]
 pub(crate) enum Progress {
@@ -34,16 +33,6 @@ pub(crate) enum WorktreeError {
     /// panic happened, so a create's step list stops wherever it got to.
     #[error("the background worker panicked")]
     WorkerPanicked,
-    #[error("failed to run git: {0}")]
-    Spawn(#[source] io::Error),
-    /// git ran and refused. `output` is what git printed, kept apart from
-    /// `args` so a caller can read git's reason without the command line.
-    #[error("git {args}: {output}")]
-    Git { args: String, output: String },
-    #[error("invalid worktree path")]
-    NonUtf8Path,
-    #[error("worktree path is outside the distro")]
-    OutsideDistro,
     #[error("failed to create {}: {source}", path.display())]
     CreateDir { path: PathBuf, source: io::Error },
     #[error("could not locate home directory")]
@@ -52,12 +41,6 @@ pub(crate) enum WorktreeError {
     WslHome(#[source] wsl::BatchError),
     #[error("could not determine the distro home directory")]
     EmptyWslHome,
-    #[error("failed to open repository: {}", .0.message())]
-    OpenRepo(#[source] git2::Error),
-    #[error("failed to find worktree `{name}`: {}", source.message())]
-    FindWorktree { name: String, source: git2::Error },
-    #[error("failed to prune: {}", .0.message())]
-    Prune(#[source] git2::Error),
     #[error(transparent)]
     Vcs(#[from] VcsError),
 }
@@ -100,7 +83,7 @@ pub(crate) struct CreateRequest {
     /// Base directory to create the worktree under; `None` uses the built-in
     /// `~/.alacritree/worktrees` default.
     base_dir: Option<PathBuf>,
-    vcs: crate::vcs::Vcs,
+    vcs: Vcs,
 }
 
 impl CreateRequest {
@@ -112,7 +95,7 @@ impl CreateRequest {
         default_branch: Option<String>,
         branch: String,
         workspace: &WorkspaceConfig,
-        vcs: crate::vcs::Vcs,
+        vcs: Vcs,
     ) -> Self {
         let base_dir = workspace.base_dir_for(&project_root);
         Self { project_root, default_branch, branch, base_dir, vcs }
@@ -233,60 +216,6 @@ fn enable_claude_terminal_bell(worktree_root: &Path) -> std::io::Result<()> {
     std::fs::write(path, pretty)
 }
 
-/// `git` primed to run against `cwd`'s repo: `git -C <cwd>` for Windows
-/// paths, the same command inside the owning distro for WSL paths.  Path
-/// *arguments* for WSL repos must already be Linux paths (`git_path_arg`).
-fn git_command(cwd: &Path) -> Command {
-    match wsl::classify(cwd) {
-        wsl::Location::Windows(path) => {
-            let mut cmd = command_ext::hidden(tools::program(Tool::Git));
-            cmd.arg("-C").arg(path);
-            cmd
-        },
-        wsl::Location::Wsl { distro, linux_path } => {
-            let mut cmd = wsl::command(&distro, None);
-            cmd.arg(tools::wsl_program(Tool::Git)).arg("-C").arg(linux_path);
-            cmd
-        },
-    }
-}
-
-/// The form of `path` git receives as an argument: Linux for WSL repos
-/// (in-distro git can't resolve UNC paths), the Windows string otherwise.
-fn git_path_arg(repo: &Path, path: &Path) -> Result<String, WorktreeError> {
-    match wsl::classify(repo) {
-        wsl::Location::Windows(_) => {
-            Ok(path.to_str().ok_or(WorktreeError::NonUtf8Path)?.to_string())
-        },
-        wsl::Location::Wsl { .. } => {
-            wsl::windows_to_linux(path).ok_or(WorktreeError::OutsideDistro)
-        },
-    }
-}
-
-#[allow(clippy::disallowed_methods)] // Running git is this function's job.
-fn run_git(cwd: &Path, args: &[&str]) -> Result<(), WorktreeError> {
-    let output = git_command(cwd)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(WorktreeError::Spawn)?;
-    git_succeeded(args, output).map(drop)
-}
-
-/// `output` when git exited cleanly. Otherwise what git said on stderr, or on
-/// stdout when stderr was empty.
-fn git_succeeded(args: &[&str], output: Output) -> Result<Output, WorktreeError> {
-    if output.status.success() {
-        return Ok(output);
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let said = if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() };
-    Err(WorktreeError::Git { args: args.join(" "), output: said.to_string() })
-}
-
 /// Worktrees live under `<base>/<project>-<hash>/<branch>`.  `base` defaults
 /// to `~/.alacritree/worktrees` so worktrees don't clutter the repo's parent
 /// directory and stay grouped per app; a configured `workspace.worktree_dir`
@@ -394,33 +323,6 @@ fn copy_llm_configs(src_root: &Path, dst_root: &Path) -> usize {
     copied
 }
 
-#[cfg(test)]
-#[cfg(windows)]
-mod windows_tests {
-    use super::*;
-
-    #[test]
-    fn git_path_arg_windows_repo_passes_path_through() {
-        let repo = Path::new(r"C:\x");
-        let path = Path::new(r"C:\x\y");
-        assert_eq!(git_path_arg(repo, path).unwrap(), r"C:\x\y");
-    }
-
-    #[test]
-    fn git_path_arg_wsl_repo_translates_worktree_path() {
-        let repo = Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj");
-        let path = Path::new(r"\\wsl.localhost\kali-linux\home\lev\wt");
-        assert_eq!(git_path_arg(repo, path).unwrap(), "/home/lev/wt");
-    }
-
-    #[test]
-    fn git_path_arg_wsl_repo_errors_outside_distro_mapping() {
-        let repo = Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj");
-        let path = Path::new("wt");
-        assert!(matches!(git_path_arg(repo, path), Err(WorktreeError::OutsideDistro)));
-    }
-}
-
 fn copy_path(src: &Path, dst: &Path) -> std::io::Result<()> {
     if src.is_dir() {
         std::fs::create_dir_all(dst)?;
@@ -440,103 +342,46 @@ fn copy_path(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Remove `req.checkout` and tell the hooks, or forget it when it is gone,
+/// which runs no hook.
 pub(crate) fn delete_worktree<H: CheckoutHooks + ?Sized>(
-    project_root: &Path,
-    worktree_path: &Path,
-    branch: Option<&str>,
-    force: bool,
+    vcs: &Vcs,
+    req: &RemoveCheckout,
     hooks: &H,
     blocking: &jobs::Blocking,
 ) -> Result<(), WorktreeError> {
-    let path_arg = git_path_arg(project_root, worktree_path)?;
     // Resolve before removal: canonicalize needs the directory to still
     // exist, and the checkout hooks below run after git has deleted it.
-    let scope_root =
-        std::fs::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.to_path_buf());
-    let mut args: Vec<&str> = vec!["worktree", "remove"];
-    if force {
-        args.push("--force");
+    let path = &req.checkout.path;
+    let scope_root = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+    vcs.remove_checkout(req, blocking)?;
+    if req.checkout.gone {
+        return Ok(());
     }
-    args.push(&path_arg);
-    run_git(project_root, &args)?;
-    if let Some(branch) = branch {
-        // Branch may already be gone (e.g. detached HEAD), so ignore errors.
-        let _ = run_git(project_root, &["branch", "-D", branch]);
-    }
-    let event = CheckoutEvent { main: project_root, checkout: &scope_root };
+    let event = CheckoutEvent { main: &req.main, checkout: &scope_root };
     crate::checkout_hooks::report(hooks.removed(&event, blocking), |level, line| {
         log::log!(level, "{line} (removed {})", scope_root.display())
     });
     Ok(())
 }
 
-/// A worktree removal to run on a background thread: either delete a live
-/// checkout ([`delete_worktree`]) or prune the leftover metadata of one whose
-/// directory is already gone ([`prune_worktree`]).
-pub(crate) enum DeleteJob {
-    Remove { worktree_path: PathBuf, branch: Option<String>, force: bool },
-    Prune { worktree_name: String, branch: Option<String>, delete_branch: bool },
-}
-
-/// Run a [`DeleteJob`] on the pool, waking the window when it finishes. The
-/// git shellouts and checkout hooks are slow enough to stutter paint, so the
-/// caller confirms the dialog, hands the work here, and adopts the result (an
-/// error to surface, or nothing) from the returned handle. The sidebar row
-/// shows a spinner until it lands, so this runs at interactive priority.
+/// Run [`delete_worktree`] on the pool, waking the window when it finishes.
+/// The backend's commands and the checkout hooks are slow enough to stutter
+/// paint, so the caller confirms the dialog, hands the work here, and adopts
+/// the result (an error to surface, or nothing) from the returned handle. The
+/// sidebar row shows a spinner until it lands, so this runs at interactive
+/// priority.
 pub(crate) fn spawn_delete<H: CheckoutHook + Send + 'static>(
-    project_root: PathBuf,
-    job: DeleteJob,
+    vcs: Vcs,
+    req: RemoveCheckout,
     hooks: Vec<H>,
     repaint: impl Repaint,
 ) -> jobs::Job<Result<(), WorktreeError>> {
     jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
-        let result = match job {
-            DeleteJob::Remove { worktree_path, branch, force } => {
-                let hooks = hooks.as_slice();
-                delete_worktree(
-                    &project_root,
-                    &worktree_path,
-                    branch.as_deref(),
-                    force,
-                    hooks,
-                    blocking,
-                )
-            },
-            DeleteJob::Prune { worktree_name, branch, delete_branch } => {
-                prune_worktree(&project_root, &worktree_name, branch.as_deref(), delete_branch)
-            },
-        };
+        let result = delete_worktree(&vcs, &req, hooks.as_slice(), blocking);
         repaint.wake();
         result
     })
-}
-
-/// Remove the git metadata of a worktree whose checkout directory is gone
-/// (git calls these *prunable*). Uses git2's per-worktree prune rather than
-/// shelling out to `git worktree prune`, which would sweep every stale
-/// worktree in the repo instead of just the one the user asked about.
-fn prune_worktree(
-    project_root: &Path,
-    worktree_name: &str,
-    branch: Option<&str>,
-    delete_branch: bool,
-) -> Result<(), WorktreeError> {
-    let repo = git2::Repository::open(project_root).map_err(WorktreeError::OpenRepo)?;
-    let wt = repo.find_worktree(worktree_name).map_err(|source| WorktreeError::FindWorktree {
-        name: worktree_name.to_string(),
-        source,
-    })?;
-    // Default prune options refuse valid or locked worktrees. That is exactly
-    // the safety we want if the directory reappeared since discovery; the
-    // error surfaces to the caller.
-    wt.prune(None).map_err(WorktreeError::Prune)?;
-    if delete_branch {
-        if let Some(branch) = branch {
-            // Ignore errors as delete_worktree does. The branch may be gone.
-            let _ = run_git(project_root, &["branch", "-D", branch]);
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -555,6 +400,39 @@ mod tests {
 
     fn git() -> crate::vcs::Vcs {
         crate::vcs::Vcs::Git(alacritree_git::GitBackend::new(&alacritree_git::GitConfig::default()))
+    }
+
+    fn live_checkout(path: &Path, branch: &str) -> alacritree_vcs::Checkout {
+        alacritree_vcs::Checkout {
+            name: branch.into(),
+            path: path.to_path_buf(),
+            head: alacritree_vcs::Head { name: Some(branch.into()), ..Default::default() },
+            is_main: false,
+            gone: false,
+            upstream: None,
+        }
+    }
+
+    /// A gone checkout is forgotten, never removed, so no removal hook runs
+    /// for it.
+    #[test]
+    fn forgetting_a_gone_checkout_runs_no_hook() {
+        let fake = FakeVcs::new("/r");
+        let hook = FakeHook::silent();
+        let mut checkout = live_checkout(Path::new("/r-wt"), "gone");
+        checkout.gone = true;
+        let req = RemoveCheckout {
+            main: PathBuf::from("/r"),
+            checkout,
+            force: false,
+            delete_name: false,
+        };
+        jobs::on_this_thread(|b| {
+            delete_worktree(&crate::vcs::Vcs::Fake(fake.clone()), &req, &[hook.clone()][..], b)
+        })
+        .expect("forget succeeds");
+        assert_eq!(fake.calls(), ["remove /r-wt"]);
+        assert_eq!(hook.events(), []);
     }
 
     fn abs(tail: &str) -> PathBuf {
@@ -591,13 +469,14 @@ mod tests {
         let wt_path = add_worktree(&repo, "feature");
         assert!(wt_path.is_dir());
 
-        let job = DeleteJob::Remove {
-            worktree_path: wt_path.clone(),
-            branch: Some("feature".to_string()),
+        let req = RemoveCheckout {
+            main: repo_dir,
+            checkout: live_checkout(&wt_path, "feature"),
             force: false,
+            delete_name: true,
         };
         let repaint = Recorder::default();
-        let handle = spawn_delete(repo_dir, job, Vec::<FakeHook>::new(), repaint.clone());
+        let handle = spawn_delete(git(), req, Vec::<FakeHook>::new(), repaint.clone());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let result = loop {
             if let Some(result) = handle.poll() {
@@ -612,46 +491,6 @@ mod tests {
         assert!(!wt_path.exists(), "worktree directory should be gone");
         assert!(repo.find_worktree("feature").is_err());
         assert!(repo.find_branch("feature", git2::BranchType::Local).is_err());
-    }
-
-    #[test]
-    fn prune_removes_stale_metadata_and_keeps_branch() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_dir = tmp.path().join("repo");
-        let repo = init_repo(&repo_dir);
-        let wt_path = add_worktree(&repo, "stale");
-        std::fs::remove_dir_all(&wt_path).unwrap();
-
-        prune_worktree(&repo_dir, "stale", Some("stale"), false).unwrap();
-
-        assert!(repo.find_worktree("stale").is_err());
-        assert!(repo.find_branch("stale", git2::BranchType::Local).is_ok());
-    }
-
-    #[test]
-    fn prune_deletes_branch_when_asked() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_dir = tmp.path().join("repo");
-        let repo = init_repo(&repo_dir);
-        let wt_path = add_worktree(&repo, "stale");
-        std::fs::remove_dir_all(&wt_path).unwrap();
-
-        prune_worktree(&repo_dir, "stale", Some("stale"), true).unwrap();
-
-        assert!(repo.find_worktree("stale").is_err());
-        assert!(repo.find_branch("stale", git2::BranchType::Local).is_err());
-    }
-
-    #[test]
-    fn prune_refuses_a_live_worktree() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo_dir = tmp.path().join("repo");
-        let repo = init_repo(&repo_dir);
-        add_worktree(&repo, "live");
-
-        assert!(prune_worktree(&repo_dir, "live", Some("live"), false).is_err());
-        assert!(repo.find_worktree("live").is_ok());
-        assert!(repo.find_branch("live", git2::BranchType::Local).is_ok());
     }
 
     /// `create` must stop between steps when its handle is gone.  Killing a
@@ -827,10 +666,14 @@ mod tests {
         let link = tmp.path().join("via-link");
         std::os::unix::fs::symlink(&wt_path, &link).unwrap();
         let hook = FakeHook::silent();
-        jobs::on_this_thread(|b| {
-            delete_worktree(&repo_dir, &link, Some("linked"), true, &[hook.clone()][..], b)
-        })
-        .expect("delete succeeds");
+        let req = RemoveCheckout {
+            main: repo_dir.clone(),
+            checkout: live_checkout(&link, "linked"),
+            force: true,
+            delete_name: true,
+        };
+        jobs::on_this_thread(|b| delete_worktree(&git(), &req, &[hook.clone()][..], b))
+            .expect("delete succeeds");
         assert_eq!(hook.events(), [Event::Removed { main: repo_dir, checkout: canonical }]);
     }
 }

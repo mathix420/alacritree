@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use alacritree_common::jobs::Blocking;
 
 use crate::{
-    Base, CreateCheckout, Created, Dirty, Liveness, Probe, Repository, Status, VcsError, VcsKind,
-    VersionControl,
+    Base, CreateCheckout, Created, Dirty, Liveness, Probe, RemoveCheckout, Repository, Status,
+    VcsError, VcsKind, VersionControl,
 };
 
 /// Clones share the recorded requests, so a test keeps one clone and hands
@@ -24,6 +24,7 @@ pub struct FakeVcs {
     probe: Option<Probe>,
     names: Vec<String>,
     refuse_prepare: bool,
+    refuse_removal: bool,
 }
 
 impl FakeVcs {
@@ -38,6 +39,7 @@ impl FakeVcs {
             probe: None,
             names: Vec::new(),
             refuse_prepare: false,
+            refuse_removal: false,
         }
     }
 
@@ -74,6 +76,12 @@ impl FakeVcs {
     /// `prepare_checkout` answers that no `origin` remote exists.
     pub fn refusing_prepare(mut self) -> Self {
         self.refuse_prepare = true;
+        self
+    }
+
+    /// `remove_checkout` answers that the checkout holds unsaved work.
+    pub fn refusing_removal(mut self) -> Self {
+        self.refuse_removal = true;
         self
     }
 
@@ -157,6 +165,14 @@ impl VersionControl for FakeVcs {
             source: Box::new(e),
         })?;
         Ok(Created::default())
+    }
+
+    fn remove_checkout(&self, req: &RemoveCheckout, _: &Blocking) -> Result<(), VcsError> {
+        self.record("remove", &req.checkout.path);
+        if self.refuse_removal {
+            return Err(VcsError::Unsaved { message: "the checkout holds unsaved work".into() });
+        }
+        Ok(())
     }
 }
 

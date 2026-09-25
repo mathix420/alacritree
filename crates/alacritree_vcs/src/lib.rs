@@ -124,4 +124,11 @@ pub trait VersionControl {
         req: &::alacritree_vcs::CreateCheckout,
         blocking: &::alacritree_common::jobs::Blocking,
     ) -> ::std::result::Result<::alacritree_vcs::Created, ::alacritree_vcs::VcsError>;
+
+    /// A live checkout is removed and a gone one is forgotten.
+    fn remove_checkout(
+        &self,
+        req: &::alacritree_vcs::RemoveCheckout,
+        blocking: &::alacritree_common::jobs::Blocking,
+    ) -> ::std::result::Result<(), ::alacritree_vcs::VcsError>;
 }

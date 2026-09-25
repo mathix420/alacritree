@@ -6467,10 +6467,12 @@ mod tests {
                 dirty: None,
                 delete_branch: true,
                 prunable: false,
-                job: jobs::Job::ready(Err(wt::WorktreeError::Git {
-                    args: format!("worktree remove {path}"),
-                    output: reason.to_string(),
-                })),
+                job: jobs::Job::ready(Err(wt::WorktreeError::Vcs(
+                    alacritree_vcs::VcsError::Failed {
+                        command: format!("git worktree remove {path}"),
+                        stderr: reason.to_string(),
+                    },
+                ))),
             });
         }
 

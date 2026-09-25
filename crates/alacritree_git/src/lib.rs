@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 
 use alacritree_common::jobs::Blocking;
 use alacritree_vcs::{
-    Base, CreateCheckout, Created, Dirty, Probe, Repository, Status, VcsError, VcsKind,
-    VersionControl,
+    Base, CreateCheckout, Created, Dirty, Probe, RemoveCheckout, Repository, Status, VcsError,
+    VcsKind, VersionControl,
 };
 
 pub use settings::{GitConfig, RawGit};
@@ -98,5 +98,9 @@ impl VersionControl for GitBackend {
 
     fn create_checkout(&self, req: &CreateCheckout, _: &Blocking) -> Result<Created, VcsError> {
         checkouts::create(req)
+    }
+
+    fn remove_checkout(&self, req: &RemoveCheckout, _: &Blocking) -> Result<(), VcsError> {
+        checkouts::remove(req)
     }
 }
