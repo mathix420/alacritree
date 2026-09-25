@@ -695,10 +695,7 @@ mod tests {
         let side = Side::Wsl("d".into());
         let mut herdr = herdr(AttachMode::Agent);
         let mut cache = EndpointCache::new(side.clone());
-        cache.set_settings_for_test(Settings {
-            detach: Some("Ctrl+B q".into()),
-            ..Settings::default()
-        });
+        cache.set_settings_for_test(Settings { detach: Some("Ctrl+B q".into()) });
         herdr.caches_mut_for_test().push(cache);
         let managed = herdr.managed(&side, None);
         assert_eq!(managed.detach.as_deref(), Some("Ctrl+B q"));
