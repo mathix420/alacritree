@@ -5,13 +5,13 @@
 
 use std::path::{Path, PathBuf};
 
+use alacritree_common::{jobs, wsl};
+use alacritree_tasks::scope::{GLOBAL, Harness, Place, SessionRef, node, sanitize};
+use alacritree_tasks::{Filter, NodeMatch, Status, Task, TaskBackend, tree};
 use serde::Deserialize;
 
 use crate::digest::stable_digest;
-use crate::tasks::scope::{GLOBAL, Harness, Place, SessionRef, node, sanitize};
-use crate::tasks::taskwarrior::{Status, Task, Taskwarrior};
-use crate::tasks::{facts, tree};
-use crate::{jobs, wsl};
+use crate::tasks::facts;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum Event {
@@ -62,18 +62,15 @@ fn visible_nodes(place: &Place, session: Option<&SessionRef>) -> Vec<String> {
     nodes
 }
 
-pub(crate) fn context(place: &Place, session: Option<&SessionRef>, tasks: &[Task]) -> String {
-    let target = node(place, session);
-    let mut text = format!(
-        "Task list, kept in taskwarrior. Write your own tasks to project `{target}`.\n- add: \
-         `task add project:{target} order:<n> subof:<parent uuid> -- <text>` (subof is \
-         optional)\n- finish: `task <uuid> done`; begin: `task <uuid> start`\n`alacritree task \
-         scope` prints the project. If `subof:` or `order:` end up inside a description, run \
-         `alacritree task setup` once.\n"
-    );
+pub(crate) fn context(
+    backend: &impl TaskBackend,
+    place: &Place,
+    session: Option<&SessionRef>,
+    tasks: &[Task],
+) -> String {
+    let mut text = backend.agent_guide(&node(place, session));
     for scope in visible_nodes(place, session).iter().rev() {
-        let in_scope: Vec<&Task> =
-            tasks.iter().filter(|t| t.project.as_deref() == Some(scope.as_str())).collect();
+        let in_scope: Vec<&Task> = tasks.iter().filter(|t| t.node() == scope).collect();
         if in_scope.is_empty() {
             continue;
         }
@@ -81,7 +78,7 @@ pub(crate) fn context(place: &Place, session: Option<&SessionRef>, tasks: &[Task
         for row in tree::rows(&in_scope) {
             let mark = if row.status == Status::Completed { "x" } else { " " };
             let started = if row.started { " (in progress)" } else { "" };
-            let short = row.uuid.get(..8).unwrap_or(&row.uuid);
+            let short = row.id.get(..8).unwrap_or(&row.id);
             let indent = "  ".repeat(row.depth);
             text.push_str(&format!("{indent}- [{mark}] {}{started} ({short})\n", row.text));
         }
@@ -112,6 +109,7 @@ fn on_this_host(cwd: PathBuf, here: Option<PathBuf>) -> Option<PathBuf> {
 
 /// `None` means print nothing, which is where every failure lands.
 pub(crate) fn run(
+    backend: &impl TaskBackend,
     event: Event,
     harness: Harness,
     stdin: &str,
@@ -127,17 +125,12 @@ pub(crate) fn run(
         payload.session_id.filter(|id| !id.trim().is_empty()).map(|id| SessionRef { harness, id });
     let (place, tasks) = jobs::on_this_thread(|b| {
         let (side, place) = facts::place_for(&cwd, b);
-        let scopes = visible_nodes(&place, session.as_ref())
-            .iter()
-            .map(|n| format!("project.is:{n}"))
-            .collect::<Vec<_>>()
-            .join(" or ");
-        let filter = [format!("({scopes})"), "(status:pending or status:completed)".to_string()];
-        let tasks = Taskwarrior::for_project(side, b).export(&filter, b);
+        let nodes = visible_nodes(&place, session.as_ref()).into_iter().map(NodeMatch::Exact);
+        let tasks = backend.list(&side, &Filter { nodes: nodes.collect() }, b);
         tasks.map(|tasks| (place, tasks))
     })
     .ok()?;
-    let text = context(&place, session.as_ref(), &tasks);
+    let text = context(backend, &place, session.as_ref(), &tasks);
     // Session start records what it showed too, so the first prompt after it
     // does not repeat an unchanged list.
     if let (Some(dir), Some(session)) = (state_dir, session.as_ref()) {
@@ -158,18 +151,14 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alacritree_tasks::fake::FakeBackend;
 
-    fn task(uuid: &str, project: &str, text: &str, status: Status) -> Task {
+    fn task(id: &str, project: &str, text: &str, status: Status) -> Task {
         Task {
-            uuid: uuid.into(),
             description: text.into(),
             status,
-            start: None,
-            subof: None,
             order: Some(1024),
-            project: Some(project.into()),
-            entry: None,
-            modified: None,
+            ..alacritree_tasks::fake::task(id, project)
         }
     }
 
@@ -183,19 +172,18 @@ mod tests {
             task("33333333-cccc", "r.main.codex-s1", "my step", Status::Pending),
             task("44444444-dddd", "r.main.claude-other", "not mine", Status::Pending),
         ];
-        let text = context(&place, Some(&me), &tasks);
+        let text = context(&FakeBackend::default(), &place, Some(&me), &tasks);
         assert!(text.contains("`r.main.codex-s1`"));
         assert!(text.contains("- [ ] my step (33333333)"));
         assert!(text.contains("- [x] ship it (22222222)"));
         assert!(text.contains("global chore"));
         assert!(!text.contains("not mine"), "other agents' lists stay out");
-        assert!(text.contains("subof:"));
     }
 
     #[test]
     fn without_a_session_the_workspace_is_the_write_target() {
         let place = Place::Workspace { repo: "r".into(), branch: "main".into() };
-        assert!(context(&place, None, &[]).contains("`r.main`"));
+        assert!(context(&FakeBackend::default(), &place, None, &[]).contains("`r.main`"));
     }
 
     #[test]

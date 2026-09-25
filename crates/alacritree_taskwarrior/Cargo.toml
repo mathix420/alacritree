@@ -1,0 +1,19 @@
+[package]
+name = "alacritree_taskwarrior"
+version = "0.0.0"
+license = "Apache-2.0"
+description = "Keeps alacritree's task lists in taskwarrior"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+alacritree_common.workspace = true
+alacritree_tasks.workspace = true
+schemars = "1.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+alacritree_common = { workspace = true, features = ["test-support"] }
+tempfile = "3"

@@ -1,8 +1,8 @@
-//! The tasks tab: taskwarrior's lists for one workspace, drawn as checklist
-//! rows. Each change is one `task` call on the pool, typed text shows at
-//! once, and a reload replaces it with what taskwarrior holds. Agents write
-//! the same store, so the tab re-exports while visible instead of trusting
-//! its own copy.
+//! The tasks tab: the backend's lists for one workspace, drawn as checklist
+//! rows. Each change is a batch of edits on the pool, typed text shows at
+//! once, and a reload replaces it with what the store holds. Agents write
+//! the same store, so the tab re-lists while visible instead of trusting its
+//! own copy.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -10,14 +10,16 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, Key, Modifiers, Response, RichText, ScrollArea, Sense, TextEdit, Ui};
 
-use crate::jobs::{self, Blocking, Job, Priority};
-use crate::multiplexer::Side;
+use alacritree_common::jobs::{self, Job, Priority};
+use alacritree_common::side::Side;
+use alacritree_common::wsl;
+use alacritree_tasks::scope::{GLOBAL, Place, node};
+use alacritree_tasks::tree::{self, Row, Section};
+use alacritree_tasks::{Edit, Filter, NodeMatch, Status, Task, TaskBackend, TaskError};
+
 use crate::projects::{Project, Worktree};
+use crate::tasks::backend::{self, Backend};
 use crate::tasks::facts;
-use crate::tasks::scope::{GLOBAL, Place, node};
-use crate::tasks::taskwarrior::{Status, Task, TaskError, Taskwarrior};
-use crate::tasks::tree::{self, Edit, Row, Section};
-use crate::wsl;
 
 const RELOAD_EVERY: Duration = Duration::from_secs(1);
 const INDENT: f32 = 16.0;
@@ -55,61 +57,26 @@ impl Scope {
         }
     }
 
-    /// `project:` is a left match, so `project:r` alone would also return a
-    /// repository named `r-web`; the trailing dot keeps to `r`'s subtree.
-    pub(crate) fn filter(&self) -> Vec<String> {
-        let scopes = match &self.repo {
-            Some(repo) => format!("(project.is:{repo} or project:{repo}. or project.is:{GLOBAL})"),
-            None => format!("(project.is:{GLOBAL})"),
-        };
-        vec![scopes, "(status:pending or status:completed)".to_string()]
+    /// The global list and the repository's whole subtree, since the tab
+    /// shows the agent sessions below the workspace too.
+    pub(crate) fn filter(&self) -> Filter {
+        let repo = self.repo.iter().map(|repo| NodeMatch::Subtree(repo.clone()));
+        Filter { nodes: repo.chain([NodeMatch::Exact(GLOBAL.to_string())]).collect() }
     }
 }
 
-/// One `task` call the tab asks for. A frame queues it and the next one
-/// spawns it, so what a frame decided can be read before the pool runs it.
-#[derive(Clone, Debug, PartialEq)]
-enum Op {
-    Done(String),
-    Undone(String),
-    Start(String),
-    Stop(String),
-    Delete(String),
-    Describe(String, String),
-    Edits(Vec<Edit>),
-}
-
-impl Op {
-    fn run(self, tw: &Taskwarrior, b: &Blocking) -> Result<(), TaskError> {
-        match self {
-            Op::Done(uuid) => tw.done(&uuid, b),
-            Op::Undone(uuid) => tw.undone(&uuid, b),
-            Op::Start(uuid) => tw.start(&uuid, b),
-            Op::Stop(uuid) => tw.stop(&uuid, b),
-            Op::Delete(uuid) => tw.delete(&uuid, b),
-            Op::Describe(uuid, text) => tw.describe(&uuid, &text, b),
-            Op::Edits(edits) => {
-                for edit in edits {
-                    match edit {
-                        Edit::Add { project, description, subof, order } => {
-                            tw.add(&project, &description, subof.as_deref(), order, b)?;
-                        },
-                        Edit::Modify { uuid, mods } => tw.modify(&uuid, &mods, b)?,
-                    }
-                }
-                Ok(())
-            },
-        }
-    }
-}
+/// Edits the tab asks for, with the row a failure is shown on. A frame
+/// queues them and the next one spawns them, so what a frame decided can be
+/// read before the pool runs it.
+type QueuedWrite = (Option<String>, Vec<Edit>);
 
 /// A write in flight, with the row its failure is shown on.
 type PendingWrite = (Option<String>, Job<Result<(), TaskError>>);
 
-/// An export in flight, with the count of writes finished when it started.
+/// A listing in flight, with the count of writes finished when it started.
 type PendingReload = (u64, Job<Result<Vec<Task>, TaskError>>);
 
-/// A row being typed that taskwarrior has not got yet.
+/// A row being typed that the store has not got yet.
 struct NewRow {
     node: String,
     after: Option<String>,
@@ -119,6 +86,7 @@ struct NewRow {
 }
 
 pub(crate) struct TasksView {
+    backend: Backend,
     scope: Scope,
     /// The worktree's names as `task scope` reads them from git.
     resolving: Option<Job<Place>>,
@@ -132,12 +100,12 @@ pub(crate) struct TasksView {
     /// while an older one is still running.
     stale: bool,
     writes_finished: u64,
-    outbox: Vec<(Option<String>, Op)>,
+    outbox: Vec<QueuedWrite>,
     writes: Vec<PendingWrite>,
     row_errors: HashMap<String, String>,
-    /// Typed text a reload has not confirmed yet, by uuid.
+    /// Typed text a reload has not confirmed yet, by id.
     drafts: HashMap<String, String>,
-    /// What the rows show until an export started after every write has
+    /// What the rows show until a listing started after every write has
     /// landed: toggled statuses, deleted rows, and added rows.
     statuses: HashMap<String, Status>,
     deleted: HashSet<String>,
@@ -149,11 +117,12 @@ pub(crate) struct TasksView {
 impl TasksView {
     /// Shows `scope` at once, and switches to the names git gives `worktree`
     /// once they are read.
-    pub(crate) fn new(scope: Scope, worktree: Option<PathBuf>) -> Self {
+    pub(crate) fn new(backend: Backend, scope: Scope, worktree: Option<PathBuf>) -> Self {
         let resolving = worktree.map(|dir| {
             jobs::pool().spawn(Priority::Interactive, move |b| facts::place_for(&dir, b).1)
         });
         Self {
+            backend,
             scope,
             resolving,
             tasks: Vec::new(),
@@ -175,8 +144,8 @@ impl TasksView {
         }
     }
 
-    /// Taskwarrior's sections with the unconfirmed changes laid over them.
-    /// An added row has no uuid yet.
+    /// The store's sections with the unconfirmed changes laid over them.
+    /// An added row has no id yet.
     fn sections(&self) -> Vec<Section> {
         let mut sections = tree::sections(
             &self.tasks,
@@ -184,22 +153,22 @@ impl TasksView {
             self.scope.workspace.as_deref(),
         );
         for section in &mut sections {
-            section.rows.retain(|r| !self.deleted.contains(&r.uuid));
+            section.rows.retain(|r| !self.deleted.contains(&r.id));
             for row in &mut section.rows {
-                if let Some(status) = self.statuses.get(&row.uuid) {
+                if let Some(status) = self.statuses.get(&row.id) {
                     row.status = *status;
                 }
             }
             for add in self.added.iter().filter(|a| a.node == section.node) {
                 let rows = &section.rows;
                 let anchor =
-                    add.after.as_ref().and_then(|u| rows.iter().position(|r| &r.uuid == u));
+                    add.after.as_ref().and_then(|id| rows.iter().position(|r| &r.id == id));
                 let at = anchor.map_or(rows.len(), |i| {
                     let below = rows[i + 1..].iter().take_while(|r| r.depth > rows[i].depth);
                     i + 1 + below.count()
                 });
                 section.rows.insert(at, Row {
-                    uuid: String::new(),
+                    id: String::new(),
                     depth: add.depth,
                     text: add.text.clone(),
                     status: Status::Pending,
@@ -223,25 +192,22 @@ impl TasksView {
     }
 
     fn section_tasks(&self, node: &str) -> Vec<Task> {
-        self.tasks
-            .iter()
-            .filter(|t| t.project.as_deref().unwrap_or(GLOBAL) == node)
-            .cloned()
-            .collect()
+        self.tasks.iter().filter(|t| t.node() == node).cloned().collect()
     }
 
-    fn write(&mut self, row: Option<String>, op: Op) {
+    fn write(&mut self, row: Option<String>, edits: Vec<Edit>) {
+        if edits.is_empty() {
+            return;
+        }
         match &row {
-            Some(uuid) => self.row_errors.remove(uuid),
+            Some(id) => self.row_errors.remove(id),
             None => self.write_error.take(),
         };
-        self.outbox.push((row, op));
+        self.outbox.push((row, edits));
     }
 
-    fn apply(&mut self, row: Option<String>, edits: Vec<Edit>) {
-        if !edits.is_empty() {
-            self.write(row, Op::Edits(edits));
-        }
+    fn write_one(&mut self, row: &str, edit: Edit) {
+        self.write(Some(row.to_string()), vec![edit]);
     }
 
     fn finish_write(&mut self, row: Option<String>, result: Result<(), TaskError>) {
@@ -249,15 +215,15 @@ impl TasksView {
         self.stale = true;
         let Err(e) = result else { return };
         match row {
-            Some(uuid) => {
-                self.drafts.remove(&uuid);
-                self.row_errors.insert(uuid, e.to_string());
+            Some(id) => {
+                self.drafts.remove(&id);
+                self.row_errors.insert(id, e.to_string());
             },
             None => self.write_error = Some(e.to_string()),
         }
     }
 
-    /// What an export started now is tagged with.
+    /// What a listing started now is tagged with.
     fn reload_epoch(&self) -> u64 {
         self.writes_finished
     }
@@ -268,9 +234,8 @@ impl TasksView {
                 self.load_error = None;
                 // A draft stays until the store holds its text or the task
                 // is gone.
-                self.drafts.retain(|uuid, text| {
-                    tasks.iter().any(|t| &t.uuid == uuid && &t.description != text)
-                });
+                self.drafts
+                    .retain(|id, text| tasks.iter().any(|t| &t.id == id && &t.description != text));
                 let settled = epoch == self.writes_finished
                     && self.writes.is_empty()
                     && self.outbox.is_empty();
@@ -293,10 +258,10 @@ impl TasksView {
             self.scope.adopt(&place);
             self.stale = true;
         }
-        for (row, op) in std::mem::take(&mut self.outbox) {
-            let side = self.scope.side.clone();
+        for (row, edits) in std::mem::take(&mut self.outbox) {
+            let (store, side) = (self.backend.clone(), self.scope.side.clone());
             let job = jobs::pool().spawn(Priority::Interactive, move |b| {
-                op.run(&Taskwarrior::for_project(side, b), b)
+                backend::apply_all(&store, &side, &edits, b)
             });
             self.writes.push((row, job));
         }
@@ -320,10 +285,9 @@ impl TasksView {
         let due = self.last_reload.is_none_or(|t| t.elapsed() >= RELOAD_EVERY);
         if self.reload.is_none() && (self.stale || due) {
             self.stale = false;
-            let scope = self.scope.clone();
-            let job = jobs::pool().spawn(Priority::Background, move |b| {
-                Taskwarrior::for_project(scope.side.clone(), b).export(&scope.filter(), b)
-            });
+            let (store, scope) = (self.backend.clone(), self.scope.clone());
+            let job = jobs::pool()
+                .spawn(Priority::Background, move |b| store.list(&scope.side, &scope.filter(), b));
             self.reload = Some((self.reload_epoch(), job));
             self.last_reload = Some(Instant::now());
         }
@@ -394,7 +358,7 @@ fn show_section(
     let tasks = view.section_tasks(&section.node);
     for row in &section.rows {
         show_row(ui, view, section, &tasks, row, allow_focus, c);
-        let follows = |n: &NewRow| n.node == section.node && n.after.as_deref() == Some(&row.uuid);
+        let follows = |n: &NewRow| n.node == section.node && n.after.as_deref() == Some(&row.id);
         if view.new_row.as_ref().is_some_and(follows) {
             show_new_row(ui, view, &tasks);
         }
@@ -404,7 +368,7 @@ fn show_section(
         show_new_row(ui, view, &tasks);
     } else if ui.small_button(RichText::new("+ add a task").color(c.dim)).clicked() {
         // Drawn below the last root row from the next frame on.
-        let last_root = section.rows.iter().rev().find(|r| r.depth == 0).map(|r| r.uuid.clone());
+        let last_root = section.rows.iter().rev().find(|r| r.depth == 0).map(|r| r.id.clone());
         view.new_row = Some(NewRow {
             node: section.node.clone(),
             after: last_root,
@@ -424,7 +388,7 @@ fn show_row(
     allow_focus: bool,
     c: Colors,
 ) {
-    if row.uuid.is_empty() {
+    if row.id.is_empty() {
         ui.horizontal(|ui| {
             ui.add_space(row.depth as f32 * INDENT);
             ui.add_enabled(false, egui::Checkbox::without_text(&mut false));
@@ -437,15 +401,15 @@ fn show_row(
         ui.add_space(row.depth as f32 * INDENT);
         let mut checked = row.status == Status::Completed;
         if ui.checkbox(&mut checked, "").changed() {
-            let uuid = row.uuid.clone();
+            let id = row.id.clone();
             let status = if checked { Status::Completed } else { Status::Pending };
-            view.statuses.insert(uuid.clone(), status);
-            view.write(Some(uuid.clone()), if checked { Op::Done(uuid) } else { Op::Undone(uuid) });
+            view.statuses.insert(id.clone(), status);
+            view.write_one(&row.id, if checked { Edit::Done(id) } else { Edit::Undone(id) });
         }
         if row.started {
             ui.label(RichText::new(">").color(c.text));
         }
-        let mut buffer = view.drafts.get(&row.uuid).cloned().unwrap_or_else(|| row.text.clone());
+        let mut buffer = view.drafts.get(&row.id).cloned().unwrap_or_else(|| row.text.clone());
         // Backspace on a row that is already empty deletes it. TextEdit reads
         // key events without consuming them, so the press that empties the
         // row is still in the queue after it.
@@ -461,14 +425,13 @@ fn show_row(
                 .desired_width(f32::INFINITY),
         );
         if edit.changed() {
-            view.drafts.insert(row.uuid.clone(), buffer.clone());
+            view.drafts.insert(row.id.clone(), buffer.clone());
         }
         edit.context_menu(|ui| {
             for (label, start) in [("Start", true), ("Stop", false)] {
                 if ui.button(label).clicked() {
-                    let uuid = row.uuid.clone();
-                    let op = if start { Op::Start(uuid.clone()) } else { Op::Stop(uuid.clone()) };
-                    view.write(Some(uuid), op);
+                    let id = row.id.clone();
+                    view.write_one(&row.id, if start { Edit::Start(id) } else { Edit::Stop(id) });
                     ui.close_menu();
                 }
             }
@@ -482,28 +445,28 @@ fn show_row(
                 )
             });
             if tab {
-                view.apply(Some(row.uuid.clone()), tree::indent(&refs, &row.uuid));
+                view.write(Some(row.id.clone()), tree::indent(&refs, &row.id));
             }
             if shift_tab {
-                view.apply(Some(row.uuid.clone()), tree::dedent(&refs, &row.uuid));
+                view.write(Some(row.id.clone()), tree::dedent(&refs, &row.id));
             }
             if erase {
-                view.drafts.remove(&row.uuid);
-                view.deleted.insert(row.uuid.clone());
-                view.write(Some(row.uuid.clone()), Op::Delete(row.uuid.clone()));
+                view.drafts.remove(&row.id);
+                view.deleted.insert(row.id.clone());
+                view.write_one(&row.id, Edit::Delete(row.id.clone()));
             }
         }
         if edit.lost_focus() {
             let text = buffer.trim().to_string();
             if text != row.text && !text.is_empty() {
-                view.write(Some(row.uuid.clone()), Op::Describe(row.uuid.clone(), text));
+                view.write_one(&row.id, Edit::Describe { id: row.id.clone(), description: text });
             } else {
-                view.drafts.remove(&row.uuid);
+                view.drafts.remove(&row.id);
             }
             if ui.input(|i| i.key_pressed(Key::Enter)) {
                 view.new_row = Some(NewRow {
                     node: section.node.clone(),
-                    after: Some(row.uuid.clone()),
+                    after: Some(row.id.clone()),
                     depth: row.depth,
                     text: String::new(),
                     focus: true,
@@ -512,7 +475,7 @@ fn show_row(
         }
     });
     // Below the row, since the text beside it takes the full width.
-    if let Some(e) = view.row_errors.get(&row.uuid) {
+    if let Some(e) = view.row_errors.get(&row.id) {
         ui.horizontal(|ui| {
             ui.add_space((row.depth + 1) as f32 * INDENT);
             ui.add(egui::Label::new(RichText::new(e).color(c.error)).wrap());
@@ -520,7 +483,7 @@ fn show_row(
     }
 }
 
-/// Taskwarrior rejects an empty description, so a new row exists only here
+/// A store may reject an empty description, so a new row exists only here
 /// until it has text; leaving it empty drops it.
 fn show_new_row(ui: &mut Ui, view: &mut TasksView, tasks: &[Task]) {
     let Some(new) = view.new_row.as_mut() else { return };
@@ -547,7 +510,7 @@ fn show_new_row(ui: &mut Ui, view: &mut TasksView, tasks: &[Task]) {
         let new = view.new_row.take().expect("present above");
         let refs: Vec<&Task> = tasks.iter().collect();
         let edits = tree::insert_after(&refs, &new.node, new.after.as_deref(), &text);
-        view.apply(None, edits);
+        view.write(None, edits);
         view.added.push(NewRow { text, ..new });
     }
 }
@@ -636,43 +599,37 @@ mod tests {
     }
 
     #[test]
-    fn the_filter_keeps_other_repos_out() {
+    fn a_repo_lists_its_subtree_and_the_global_list() {
         let s = Scope { side: Side::Native, repo: Some("r".into()), workspace: None };
-        assert_eq!(s.filter(), [
-            "(project.is:r or project:r. or project.is:global)".to_string(),
-            "(status:pending or status:completed)".to_string(),
+        assert_eq!(s.filter().nodes, [
+            NodeMatch::Subtree("r".into()),
+            NodeMatch::Exact(GLOBAL.into())
         ]);
     }
 
     #[test]
     fn home_filters_to_global() {
         let s = Scope::for_workspace(None, None);
-        assert_eq!(s.filter()[0], "(project.is:global)");
+        assert_eq!(s.filter().nodes, [NodeMatch::Exact(GLOBAL.into())]);
     }
 
     use egui::epaint::ClippedShape;
     use egui::{CentralPanel, Event, PointerButton, Pos2, RawInput, Rect, Shape, Vec2};
 
-    fn pending(uuid: &str, text: &str) -> Task {
+    fn pending(id: &str, text: &str) -> Task {
         Task {
-            uuid: uuid.into(),
             description: text.into(),
-            status: Status::Pending,
-            start: None,
-            subof: None,
             order: Some(1024),
-            project: Some(GLOBAL.into()),
-            entry: None,
-            modified: None,
+            ..alacritree_tasks::fake::task(id, GLOBAL)
         }
     }
 
-    /// The tab drawn frame by frame with real egui input and no `task`
-    /// process: writes collect in `ops` instead of reaching the pool.
+    /// The tab drawn frame by frame with real egui input and no backend:
+    /// writes collect in `ops` instead of reaching the pool.
     struct Harness {
         ctx: egui::Context,
         view: TasksView,
-        ops: Vec<(Option<String>, Op)>,
+        ops: Vec<QueuedWrite>,
         /// Painted text and where it shows, clipped to what is on screen.
         texts: Vec<(String, Rect)>,
         background_clicked: bool,
@@ -694,7 +651,8 @@ mod tests {
     impl Harness {
         fn new(tasks: Vec<Task>) -> Self {
             let ctx = egui::Context::default();
-            let mut view = TasksView::new(Scope::for_workspace(None, None), None);
+            let scope = Scope::for_workspace(None, None);
+            let mut view = TasksView::new(Backend::default(), scope, None);
             view.tasks = tasks;
             let mut h =
                 Self { ctx, view, ops: Vec::new(), texts: Vec::new(), background_clicked: false };
@@ -769,7 +727,7 @@ mod tests {
         }
 
         fn deleted(&self) -> bool {
-            self.ops.iter().any(|(_, op)| matches!(op, Op::Delete(_)))
+            self.ops.iter().flat_map(|(_, edits)| edits).any(|e| matches!(e, Edit::Delete(_)))
         }
     }
 
@@ -777,7 +735,7 @@ mod tests {
     fn clicking_a_checkbox_marks_the_task_done_at_once() {
         let mut h = Harness::new(vec![pending("a", "one")]);
         h.click(h.checkbox("one"));
-        assert_eq!(h.ops, [(Some("a".to_string()), Op::Done("a".into()))]);
+        assert_eq!(h.ops, [(Some("a".to_string()), vec![Edit::Done("a".into())])]);
         assert_eq!(h.view.plain_lines(), ["## global", "- [x] one"]);
     }
 
@@ -829,7 +787,7 @@ mod tests {
         h.key(Key::Backspace);
         h.key(Key::Backspace);
         assert!(h.deleted());
-        assert_eq!(h.view.plain_lines(), ["## global"], "gone before taskwarrior answers");
+        assert_eq!(h.view.plain_lines(), ["## global"], "gone before the store answers");
     }
 
     #[test]
@@ -854,7 +812,8 @@ mod tests {
     #[test]
     fn a_failed_add_outlives_the_reload_after_it() {
         let mut h = Harness::new(Vec::new());
-        h.view.finish_write(None, Err(TaskError::Failed { stderr: "no".into() }));
+        let refused = TaskError::Failed { program: "task".into(), stderr: "no".into() };
+        h.view.finish_write(None, Err(refused));
         let epoch = h.view.reload_epoch();
         h.view.finish_reload(epoch, Ok(Vec::new()));
         h.frame(Vec::new());
@@ -868,7 +827,8 @@ mod tests {
         h.click(rect.center());
         h.frame(vec![Event::Text("milk".into())]);
         h.key(Key::Enter);
-        assert!(matches!(h.ops.as_slice(), [(None, Op::Edits(_))]), "{:?}", h.ops);
+        assert!(matches!(h.ops.as_slice(), [(None, edits)] if edits.len() == 1), "{:?}", h.ops);
+
         assert_eq!(h.view.plain_lines(), ["## global", "- [ ] milk"]);
     }
 }

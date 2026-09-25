@@ -370,11 +370,13 @@ pub fn run(cli: Cli) -> Option<i32> {
         Command::Hook { event, harness } => {
             let mut stdin = String::new();
             let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin);
-            let harness = crate::tasks::scope::Harness::parse(&harness)
+            let harness = alacritree_tasks::scope::Harness::parse(&harness)
                 .expect("clap restricts --harness to known names");
             task::configure_tools(cli.config_dir.as_deref(), &cli.options);
             let state_dir = cli.config_dir.clone().or_else(crate::state::config_dir);
-            if let Some(out) = crate::tasks::hook::run(event, harness, &stdin, state_dir.as_deref())
+            let backend = crate::tasks::backend::Backend::default();
+            let state_dir = state_dir.as_deref();
+            if let Some(out) = crate::tasks::hook::run(&backend, event, harness, &stdin, state_dir)
             {
                 println!("{out}");
             }

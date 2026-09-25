@@ -26,10 +26,11 @@ use crate::crash_log::{Verdict, classify};
 use crate::ipc::protocol::{self, IpcRequest, SendError};
 use crate::multiplexer::Side;
 use crate::shell_decision::{ShellDecision, shell_decision};
-use crate::tasks::taskwarrior::{TaskError, Taskwarrior};
 use crate::tools::locate;
 use crate::wsl::{self, ShellChoice};
 use crate::{command_ext, jobs, state, tools};
+use alacritree_tasks::TaskError;
+use alacritree_taskwarrior::Taskwarrior;
 
 /// An instance that is wedged should not wedge the report too.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -633,28 +634,17 @@ fn taskwarrior_checks(distros: &[wsl::WslDistro]) -> Vec<Check> {
     sides
         .map(|side| {
             let name = side.name();
-            let declared = jobs::on_this_thread(|b| {
-                let tw = Taskwarrior::for_side(side, b);
-                Ok::<_, TaskError>((
-                    tw.rc_value("uda.subof.type", b)?,
-                    tw.rc_value("uda.order.type", b)?,
-                ))
-            });
-            let declared = match &declared {
-                Ok((subof, order)) => Ok((subof.as_deref(), order.as_deref())),
-                Err(e) => Err(e),
-            };
-            uda_check(&name, declared)
+            let declared =
+                jobs::on_this_thread(|b| Taskwarrior::default().fields_declared(side, b));
+            uda_check(&name, declared.as_ref().copied())
         })
         .collect()
 }
 
-fn uda_check(side: &str, declared: Result<(Option<&str>, Option<&str>), &TaskError>) -> Check {
+fn uda_check(side: &str, declared: Result<bool, &TaskError>) -> Check {
     match declared {
-        Ok((Some("uuid"), Some("numeric"))) => {
-            check("taskwarrior", side, Status::Ok, "subof and order declared")
-        },
-        Ok(_) => check(
+        Ok(true) => check("taskwarrior", side, Status::Ok, "subof and order declared"),
+        Ok(false) => check(
             "taskwarrior",
             side,
             Status::Warn,
@@ -847,10 +837,10 @@ mod tests {
     }
 
     #[test]
-    fn uda_check_warns_until_both_are_declared() {
-        assert_eq!(uda_check("native", Ok((Some("uuid"), Some("numeric")))).status, Status::Ok);
-        assert_eq!(uda_check("native", Ok((Some("uuid"), None))).status, Status::Warn);
-        assert_eq!(uda_check("wsl:Ubuntu", Ok((None, None))).status, Status::Warn);
+    fn uda_check_warns_until_the_fields_are_declared() {
+        assert_eq!(uda_check("native", Ok(true)).status, Status::Ok);
+        assert_eq!(uda_check("wsl:Ubuntu", Ok(false)).status, Status::Warn);
+
         let missing = uda_check("native", Err(&TaskError::Missing { program: "task".into() }));
         assert_eq!(missing.status, Status::Warn);
         assert!(missing.detail.contains("not found"), "{:?}", missing.detail);

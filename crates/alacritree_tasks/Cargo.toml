@@ -1,0 +1,21 @@
+[package]
+name = "alacritree_tasks"
+version = "0.0.0"
+license = "Apache-2.0"
+description = "What alacritree asks the store that keeps its task lists"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+# The in-memory store, for other crates' tests of code that drives a backend.
+test-support = []
+
+[dependencies]
+alacritree_common.workspace = true
+ambassador.workspace = true
+schemars = "1.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+strum = { version = "0.26", features = ["derive"] }
+thiserror.workspace = true

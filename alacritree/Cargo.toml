@@ -23,6 +23,8 @@ alacritree_forge.workspace = true
 alacritree_gh.workspace = true
 alacritree_herdr.workspace = true
 alacritree_multiplexer.workspace = true
+alacritree_tasks.workspace = true
+alacritree_taskwarrior.workspace = true
 alacritree_zellij.workspace = true
 ambassador.workspace = true
 alacritty_terminal = { path = "../alacritty_terminal" }
@@ -88,6 +90,7 @@ alacritree_common = { workspace = true, features = ["test-support"] }
 alacritree_forge = { workspace = true, features = ["test-support"] }
 alacritree_herdr = { workspace = true, features = ["test-support"] }
 alacritree_multiplexer = { workspace = true, features = ["test-support"] }
+alacritree_tasks = { workspace = true, features = ["test-support"] }
 alacritree_zellij = { workspace = true, features = ["test-support"] }
 # Throwaway repos and state files for worktree, prune, and persistence tests.
 tempfile = "3"

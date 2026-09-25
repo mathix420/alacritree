@@ -1,17 +1,17 @@
-//! Where a task lives, as a taskwarrior project node. The CLI, the hook and
-//! the tab each gather facts their own way and meet here, so all three name
-//! a place the same way.
+//! Where a task lives, as a project node. The CLI, the hook and the tab each
+//! gather facts their own way and meet here, so all three name a place the
+//! same way.
 
-pub(crate) const GLOBAL: &str = "global";
+pub const GLOBAL: &str = "global";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Harness {
+pub enum Harness {
     Claude,
     Codex,
 }
 
 impl Harness {
-    pub(crate) fn parse(name: &str) -> Option<Self> {
+    pub fn parse(name: &str) -> Option<Self> {
         match name {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
@@ -19,7 +19,7 @@ impl Harness {
         }
     }
 
-    pub(crate) fn prefix(self) -> &'static str {
+    pub fn prefix(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
@@ -30,27 +30,26 @@ impl Harness {
 /// An agent conversation, keyed by the harness's own id so a resumed
 /// conversation finds its tasks again.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SessionRef {
+pub struct SessionRef {
     pub harness: Harness,
     pub id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Place {
+pub enum Place {
     Global,
     Project { repo: String },
     Workspace { repo: String, branch: String },
 }
 
-/// Taskwarrior splits project names on `.`, so a dot inside one segment would
-/// invent a level.
-pub(crate) fn sanitize(segment: &str) -> String {
+/// Nodes nest on `.`, so a dot inside one segment would invent a level.
+pub fn sanitize(segment: &str) -> String {
     segment.chars().map(|c| if matches!(c, '.' | '/' | '\\') { '-' } else { c }).collect()
 }
 
 /// A session only means something inside a workspace; above one there is no
 /// conversation to key.
-pub(crate) fn node(place: &Place, session: Option<&SessionRef>) -> String {
+pub fn node(place: &Place, session: Option<&SessionRef>) -> String {
     match place {
         Place::Global => GLOBAL.to_string(),
         Place::Project { repo } => sanitize(repo),
@@ -67,7 +66,7 @@ pub(crate) fn node(place: &Place, session: Option<&SessionRef>) -> String {
 /// Codex's hook payload carries the root session id, which is also what it
 /// exports as `CODEX_SESSION_ID`, so keying on it keeps a subagent's shell
 /// and the hook on one node.
-pub(crate) fn session_from_env(get: impl Fn(&str) -> Option<String>) -> Option<SessionRef> {
+pub fn session_from_env(get: impl Fn(&str) -> Option<String>) -> Option<SessionRef> {
     [("CODEX_SESSION_ID", Harness::Codex), ("CLAUDE_CODE_SESSION_ID", Harness::Claude)]
         .into_iter()
         .find_map(|(key, harness)| {

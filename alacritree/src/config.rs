@@ -608,7 +608,7 @@ pub struct IntegrationsConfig {
     pub zellij: alacritree_zellij::ZellijConfig,
     pub delta: ToolConfig,
     pub tuicr: ToolConfig,
-    pub taskwarrior: TaskwarriorConfig,
+    pub taskwarrior: alacritree_taskwarrior::TaskwarriorConfig,
     pub diff_viewer: alacritree_diff_viewer::DiffViewerConfig,
 }
 
@@ -637,15 +637,6 @@ impl IntegrationsConfig {
     pub fn tool_paths(&self) -> [ToolPaths; Tool::COUNT] {
         Tool::table(|tool| self.paths(tool))
     }
-}
-
-/// `[integrations.taskwarrior]`: where `task` lives on each side, and
-/// whether the tasks tab is on.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct TaskwarriorConfig {
-    pub path: String,
-    pub wsl_path: Option<String>,
-    pub enabled: bool,
 }
 
 /// Disposable by nature.  Unix keeps captures in the user's cache rather than
@@ -2850,7 +2841,7 @@ struct RawIntegrations {
     /// The review TUI the tuicr diff viewer runs.
     tuicr: alacritree_diff_viewer::RawTuicr,
     /// Task lists kept in taskwarrior.
-    taskwarrior: RawTaskwarrior,
+    taskwarrior: alacritree_taskwarrior::RawTaskwarrior,
     /// What the git panel's diff pane runs.
     diff_viewer: alacritree_diff_viewer::RawDiffViewer,
 }
@@ -2904,35 +2895,6 @@ struct MovedUiKeys {
     delta_path: Option<String>,
     gh: alacritree_gh::MovedGhKeys,
     herdr_icon: Option<RawIconStyle>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(default)]
-struct RawTaskwarrior {
-    /// The program to run on Windows or natively. Its own name is looked up
-    /// on PATH; any other value runs as written.
-    path: String,
-    /// The program to run inside every WSL distro, as written. Empty finds it
-    /// by name through the distro's login shell.
-    wsl_path: String,
-    /// Show task lists kept in taskwarrior in a tab (`OpenTasks`, Ctrl+~).
-    /// Agents write the same lists with `task` and read them through
-    /// `alacritree hook`. Off leaves the binding inert and the palette entry
-    /// out.
-    enabled: bool,
-}
-
-impl Default for RawTaskwarrior {
-    fn default() -> Self {
-        Self { path: "task".to_string(), wsl_path: String::new(), enabled: false }
-    }
-}
-
-impl RawTaskwarrior {
-    fn resolve(self) -> TaskwarriorConfig {
-        let tool = tool_config(self.path, self.wsl_path, Tool::Task);
-        TaskwarriorConfig { path: tool.path, wsl_path: tool.wsl_path, enabled: self.enabled }
-    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

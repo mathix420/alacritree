@@ -1,17 +1,17 @@
-//! The tab's model: tasks split into scope sections, nested by `subof`,
+//! The tab's model: tasks split into scope sections, nested by `parent`,
 //! ordered by `order`, and the edits that inserting or indenting turns into.
 //! Free of egui so it can be tested without a frame.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::tasks::scope::GLOBAL;
-use crate::tasks::taskwarrior::{Status, Task};
+use crate::scope::GLOBAL;
+use crate::{Edit, Status, Task};
 
-pub(crate) const STRIDE: i64 = 1024;
+pub const STRIDE: i64 = 1024;
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Row {
-    pub uuid: String,
+pub struct Row {
+    pub id: String,
     pub depth: usize,
     pub text: String,
     pub status: Status,
@@ -19,7 +19,7 @@ pub(crate) struct Row {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SectionKind {
+pub enum SectionKind {
     Global,
     Project,
     Workspace,
@@ -27,20 +27,10 @@ pub(crate) enum SectionKind {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Section {
+pub struct Section {
     pub node: String,
     pub kind: SectionKind,
     pub rows: Vec<Row>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Edit {
-    Add { project: String, description: String, subof: Option<String>, order: i64 },
-    Modify { uuid: String, mods: Vec<String> },
-}
-
-fn project(t: &Task) -> &str {
-    t.project.as_deref().unwrap_or(GLOBAL)
 }
 
 /// Agents may add tasks with no `order`; those sort after ordered ones,
@@ -49,23 +39,19 @@ fn sort_key(t: &Task) -> (bool, i64, String) {
     (t.order.is_none(), t.order.unwrap_or(0), t.entry.clone().unwrap_or_default())
 }
 
-/// A `subof` naming a task outside `tasks` is treated as none, so a task
-/// whose parent was deleted or lives in another scope still shows.
+/// A parent outside `tasks` is treated as none, so a task whose parent was
+/// deleted or lives in another scope still shows.
 fn parent_of<'a>(t: &'a Task, present: &HashSet<&str>) -> Option<&'a str> {
-    t.subof.as_deref().filter(|p| present.contains(p) && *p != t.uuid)
+    t.parent.as_deref().filter(|p| present.contains(p) && *p != t.id)
 }
 
 fn present<'a>(tasks: &[&'a Task]) -> HashSet<&'a str> {
-    tasks.iter().map(|t| t.uuid.as_str()).collect()
+    tasks.iter().map(|t| t.id.as_str()).collect()
 }
 
-pub(crate) fn sections(
-    tasks: &[Task],
-    repo: Option<&str>,
-    workspace: Option<&str>,
-) -> Vec<Section> {
+pub fn sections(tasks: &[Task], repo: Option<&str>, workspace: Option<&str>) -> Vec<Section> {
     let in_node =
-        |node: &str| -> Vec<&Task> { tasks.iter().filter(|t| project(t) == node).collect() };
+        |node: &str| -> Vec<&Task> { tasks.iter().filter(|t| t.node() == node).collect() };
     let section =
         |node: &str, kind| Section { node: node.to_string(), kind, rows: rows(&in_node(node)) };
     let mut out = vec![section(GLOBAL, SectionKind::Global)];
@@ -75,7 +61,7 @@ pub(crate) fn sections(
         let prefix = format!("{workspace}.");
         let mut sessions: Vec<&str> = tasks
             .iter()
-            .map(project)
+            .map(Task::node)
             .filter(|p| p.starts_with(&prefix))
             .collect::<HashSet<_>>()
             .into_iter()
@@ -89,7 +75,7 @@ pub(crate) fn sections(
     out
 }
 
-pub(crate) fn rows(tasks: &[&Task]) -> Vec<Row> {
+pub fn rows(tasks: &[&Task]) -> Vec<Row> {
     let present = present(tasks);
     let mut children: HashMap<Option<&str>, Vec<&Task>> = HashMap::new();
     for t in tasks {
@@ -101,14 +87,14 @@ pub(crate) fn rows(tasks: &[&Task]) -> Vec<Row> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     walk(&children, None, 0, &mut seen, &mut out);
-    // Tasks in a `subof` cycle have no root to be reached from.
+    // Tasks in a parent cycle have no root to be reached from.
     let mut stranded: Vec<&Task> =
-        tasks.iter().copied().filter(|t| !seen.contains(t.uuid.as_str())).collect();
+        tasks.iter().copied().filter(|t| !seen.contains(t.id.as_str())).collect();
     stranded.sort_by_key(|t| sort_key(t));
     for t in stranded {
-        if seen.insert(t.uuid.clone()) {
+        if seen.insert(t.id.clone()) {
             out.push(row(t, 0));
-            walk(&children, Some(&t.uuid), 1, &mut seen, &mut out);
+            walk(&children, Some(&t.id), 1, &mut seen, &mut out);
         }
     }
     out
@@ -122,20 +108,20 @@ fn walk(
     out: &mut Vec<Row>,
 ) {
     for t in children.get(&parent).into_iter().flatten() {
-        if seen.insert(t.uuid.clone()) {
+        if seen.insert(t.id.clone()) {
             out.push(row(t, depth));
-            walk(children, Some(&t.uuid), depth + 1, seen, out);
+            walk(children, Some(&t.id), depth + 1, seen, out);
         }
     }
 }
 
 fn row(t: &Task, depth: usize) -> Row {
     Row {
-        uuid: t.uuid.clone(),
+        id: t.id.clone(),
         depth,
         text: t.description.clone(),
         status: t.status,
-        started: t.start.is_some(),
+        started: t.started,
     }
 }
 
@@ -145,10 +131,6 @@ fn siblings<'a>(tasks: &[&'a Task], parent: Option<&str>) -> Vec<&'a Task> {
         tasks.iter().copied().filter(|t| parent_of(t, &present) == parent).collect();
     list.sort_by_key(|t| sort_key(t));
     list
-}
-
-fn order_mod(order: i64) -> String {
-    format!("order:{order}")
 }
 
 /// The `order` for a new sibling placed after `list[index]`, or first when
@@ -171,10 +153,7 @@ fn slot(list: &[&Task], index: Option<usize>) -> (Vec<Edit>, i64) {
             let renumber = list
                 .iter()
                 .enumerate()
-                .map(|(i, t)| Edit::Modify {
-                    uuid: t.uuid.clone(),
-                    mods: vec![order_mod((i as i64 + 1) * STRIDE)],
-                })
+                .map(|(i, t)| Edit::Reorder { id: t.id.clone(), order: (i as i64 + 1) * STRIDE })
                 .collect();
             let low = index.map_or(0, |i| (i as i64 + 1) * STRIDE);
             (renumber, low + STRIDE / 2)
@@ -182,58 +161,52 @@ fn slot(list: &[&Task], index: Option<usize>) -> (Vec<Edit>, i64) {
     }
 }
 
-pub(crate) fn insert_after(
+pub fn insert_after(
     tasks: &[&Task],
     project: &str,
     after: Option<&str>,
     description: &str,
 ) -> Vec<Edit> {
     let present = present(tasks);
-    let anchor = after.and_then(|u| tasks.iter().copied().find(|t| t.uuid == u));
+    let anchor = after.and_then(|u| tasks.iter().copied().find(|t| t.id == u));
     let parent = anchor.and_then(|t| parent_of(t, &present));
     let list = siblings(tasks, parent);
-    let index = anchor.and_then(|a| list.iter().position(|t| t.uuid == a.uuid));
+    let index = anchor.and_then(|a| list.iter().position(|t| t.id == a.id));
     let (mut edits, order) = slot(&list, index);
     edits.push(Edit::Add {
         project: project.to_string(),
         description: description.to_string(),
-        subof: parent.map(str::to_string),
+        parent: parent.map(str::to_string),
         order,
     });
     edits
 }
 
-pub(crate) fn indent(tasks: &[&Task], uuid: &str) -> Vec<Edit> {
+pub fn indent(tasks: &[&Task], id: &str) -> Vec<Edit> {
     let present = present(tasks);
-    let Some(me) = tasks.iter().copied().find(|t| t.uuid == uuid) else { return Vec::new() };
+    let Some(me) = tasks.iter().copied().find(|t| t.id == id) else { return Vec::new() };
     let list = siblings(tasks, parent_of(me, &present));
-    let Some(pos) = list.iter().position(|t| t.uuid == uuid) else { return Vec::new() };
+    let Some(pos) = list.iter().position(|t| t.id == id) else { return Vec::new() };
     let Some(new_parent) = pos.checked_sub(1).map(|i| list[i]) else { return Vec::new() };
-    let children = siblings(tasks, Some(&new_parent.uuid));
+    let children = siblings(tasks, Some(&new_parent.id));
     let (mut edits, order) = slot(&children, children.len().checked_sub(1));
-    edits.push(Edit::Modify {
-        uuid: uuid.to_string(),
-        mods: vec![format!("subof:{}", new_parent.uuid), order_mod(order)],
-    });
+    edits.push(Edit::Move { id: id.to_string(), parent: Some(new_parent.id.clone()), order });
     edits
 }
 
-pub(crate) fn dedent(tasks: &[&Task], uuid: &str) -> Vec<Edit> {
+pub fn dedent(tasks: &[&Task], id: &str) -> Vec<Edit> {
     let present = present(tasks);
-    let Some(me) = tasks.iter().copied().find(|t| t.uuid == uuid) else { return Vec::new() };
+    let Some(me) = tasks.iter().copied().find(|t| t.id == id) else { return Vec::new() };
     let Some(parent) =
-        parent_of(me, &present).and_then(|p| tasks.iter().copied().find(|t| t.uuid == p))
+        parent_of(me, &present).and_then(|p| tasks.iter().copied().find(|t| t.id == p))
     else {
         return Vec::new();
     };
     let grandparent = parent_of(parent, &present);
     let list = siblings(tasks, grandparent);
-    let index = list.iter().position(|t| t.uuid == parent.uuid);
+    let index = list.iter().position(|t| t.id == parent.id);
     let (mut edits, order) = slot(&list, index);
-    edits.push(Edit::Modify {
-        uuid: uuid.to_string(),
-        mods: vec![format!("subof:{}", grandparent.unwrap_or("")), order_mod(order)],
-    });
+    edits.push(Edit::Move { id: id.to_string(), parent: grandparent.map(str::to_string), order });
     edits
 }
 
@@ -241,50 +214,26 @@ pub(crate) fn dedent(tasks: &[&Task], uuid: &str) -> Vec<Edit> {
 mod tests {
     use super::*;
 
-    fn task(uuid: &str, project: &str, subof: Option<&str>, order: Option<i64>) -> Task {
+    fn task(id: &str, project: &str, parent: Option<&str>, order: Option<i64>) -> Task {
         Task {
-            uuid: uuid.into(),
-            description: uuid.into(),
-            status: Status::Pending,
-            start: None,
-            subof: subof.map(Into::into),
+            parent: parent.map(Into::into),
             order,
-            project: Some(project.into()),
-            entry: Some(format!("20260921T00000{}Z", uuid.len())),
-            modified: None,
+            entry: Some(format!("20260921T00000{}Z", id.len())),
+            ..crate::fake::task(id, project)
         }
     }
 
     fn shape(rows: &[Row]) -> Vec<(&str, usize)> {
-        rows.iter().map(|r| (r.uuid.as_str(), r.depth)).collect()
+        rows.iter().map(|r| (r.id.as_str(), r.depth)).collect()
     }
 
     fn refs(tasks: &[Task]) -> Vec<&Task> {
         tasks.iter().collect()
     }
 
-    /// `tasks` after taskwarrior applies `edits`, a new task taking its
-    /// description as its uuid.
     fn applied(tasks: &[Task], edits: &[Edit]) -> Vec<Task> {
         let mut out = tasks.to_vec();
-        for edit in edits {
-            match edit {
-                Edit::Add { project, description, subof, order } => {
-                    out.push(task(description, project, subof.as_deref(), Some(*order)));
-                },
-                Edit::Modify { uuid, mods } => {
-                    let t = out.iter_mut().find(|t| &t.uuid == uuid).unwrap();
-                    for m in mods {
-                        match m.split_once(':').unwrap() {
-                            ("order", n) => t.order = Some(n.parse().unwrap()),
-                            ("subof", "") => t.subof = None,
-                            ("subof", p) => t.subof = Some(p.into()),
-                            other => panic!("{other:?}"),
-                        }
-                    }
-                },
-            }
-        }
+        edits.iter().for_each(|edit| crate::fake::apply(&mut out, edit));
         out
     }
 
@@ -300,13 +249,13 @@ mod tests {
     }
 
     #[test]
-    fn orphan_subof_renders_as_root() {
+    fn an_orphaned_parent_renders_as_root() {
         let t = [task("x", "r", Some("gone"), Some(1024))];
         assert_eq!(shape(&rows(&refs(&t))), [("x", 0)]);
     }
 
     #[test]
-    fn subof_cycle_terminates() {
+    fn a_parent_cycle_terminates() {
         let t = [task("a", "r", Some("b"), Some(1)), task("b", "r", Some("a"), Some(2))];
         let got = rows(&refs(&t));
         assert_eq!(got.len(), 2);
@@ -360,7 +309,7 @@ mod tests {
         assert_eq!(insert_after(&refs(&t), "r", Some("a"), "new"), [Edit::Add {
             project: "r".into(),
             description: "new".into(),
-            subof: None,
+            parent: None,
             order: 1536
         }]);
     }
@@ -387,10 +336,10 @@ mod tests {
     fn a_closed_gap_renumbers_the_siblings_first() {
         let t = [task("a", "r", None, Some(10)), task("b", "r", None, Some(11))];
         let edits = insert_after(&refs(&t), "r", Some("a"), "x");
-        assert_eq!(edits[..2], [
-            Edit::Modify { uuid: "a".into(), mods: vec!["order:1024".into()] },
-            Edit::Modify { uuid: "b".into(), mods: vec!["order:2048".into()] },
-        ]);
+        assert_eq!(edits[..2], [Edit::Reorder { id: "a".into(), order: 1024 }, Edit::Reorder {
+            id: "b".into(),
+            order: 2048
+        },]);
         let Edit::Add { order, .. } = &edits[2] else { panic!() };
         assert_eq!(*order, 1536);
     }
@@ -418,11 +367,11 @@ mod tests {
     #[test]
     fn insert_below_a_child_stays_a_sibling_of_that_child() {
         let t = [task("a", "r", None, Some(1024)), task("a1", "r", Some("a"), Some(1024))];
-        let Some(Edit::Add { subof, .. }) = insert_after(&refs(&t), "r", Some("a1"), "x").pop()
+        let Some(Edit::Add { parent, .. }) = insert_after(&refs(&t), "r", Some("a1"), "x").pop()
         else {
             panic!()
         };
-        assert_eq!(subof.as_deref(), Some("a"));
+        assert_eq!(parent.as_deref(), Some("a"));
     }
 
     #[test]
@@ -432,9 +381,10 @@ mod tests {
             task("a1", "r", Some("a"), Some(1024)),
             task("b", "r", None, Some(2048)),
         ];
-        assert_eq!(indent(&refs(&t), "b"), [Edit::Modify {
-            uuid: "b".into(),
-            mods: vec!["subof:a".into(), "order:2048".into()]
+        assert_eq!(indent(&refs(&t), "b"), [Edit::Move {
+            id: "b".into(),
+            parent: Some("a".into()),
+            order: 2048
         }]);
     }
 
@@ -451,9 +401,10 @@ mod tests {
             task("a1", "r", Some("a"), Some(1024)),
             task("b", "r", None, Some(2048)),
         ];
-        assert_eq!(dedent(&refs(&t), "a1"), [Edit::Modify {
-            uuid: "a1".into(),
-            mods: vec!["subof:".into(), "order:1536".into()]
+        assert_eq!(dedent(&refs(&t), "a1"), [Edit::Move {
+            id: "a1".into(),
+            parent: None,
+            order: 1536
         }]);
     }
 

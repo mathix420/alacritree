@@ -1077,7 +1077,7 @@ impl AlacritreeApp {
         if let Some(index) = self.tasks_session_index(&workspace) {
             let id = self.sessions[index].id;
             if self.sessions.active(&workspace) == Some(id) {
-                // Taskwarrior holds every task, so there is nothing to lose.
+                // The backend holds every task, so there is nothing to lose.
                 self.close_session(ctx, id);
                 return;
             }
@@ -1091,7 +1091,11 @@ impl AlacritreeApp {
                 workspace.clone(),
                 TermSize::new(80, 24),
                 (8.0, 16.0),
-                crate::tasks::view::TasksView::new(scope, worktree.map(|w| w.path.clone())),
+                crate::tasks::view::TasksView::new(
+                    crate::tasks::backend::Backend::default(),
+                    scope,
+                    worktree.map(|w| w.path.clone()),
+                ),
             );
             let id = session.id;
             self.sessions.push(session);

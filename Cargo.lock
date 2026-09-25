@@ -70,6 +70,8 @@ dependencies = [
  "alacritree_gh",
  "alacritree_herdr",
  "alacritree_multiplexer",
+ "alacritree_tasks",
+ "alacritree_taskwarrior",
  "alacritree_zellij",
  "alacritty_terminal",
  "ambassador",
@@ -226,6 +228,31 @@ dependencies = [
  "serde_json",
  "strum",
  "thiserror 2.0.17",
+]
+
+[[package]]
+name = "alacritree_tasks"
+version = "0.0.0"
+dependencies = [
+ "alacritree_common",
+ "ambassador",
+ "schemars",
+ "serde",
+ "serde_json",
+ "strum",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "alacritree_taskwarrior"
+version = "0.0.0"
+dependencies = [
+ "alacritree_common",
+ "alacritree_tasks",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

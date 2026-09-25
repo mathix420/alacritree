@@ -6,12 +6,12 @@
 use std::path::Path;
 use std::process::Stdio;
 
-use crate::command_ext::hidden;
-use crate::jobs::Blocking;
-use crate::multiplexer::Side;
-use crate::tasks::scope::Place;
-use crate::tools::{self, Tool};
-use crate::wsl;
+use alacritree_common::command_ext::hidden;
+use alacritree_common::jobs::Blocking;
+use alacritree_common::side::Side;
+use alacritree_common::tools::{self, Tool};
+use alacritree_common::wsl;
+use alacritree_tasks::scope::Place;
 
 pub(crate) fn side_of(cwd: &Path) -> (Side, String) {
     match wsl::classify(cwd) {
