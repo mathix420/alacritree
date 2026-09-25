@@ -1,0 +1,6 @@
+project (main)  <home>/code/project
+  main  main  <home>/code/project/
+  wt-detached  8e86e75  <home>/code/wt-detached
+  wt-feature  feature  <home>/code/wt-feature
+plain (unknown)  <home>/code/plain
+  plain  detached  <home>/code/plain

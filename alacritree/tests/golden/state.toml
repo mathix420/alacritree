@@ -1,0 +1,10 @@
+show_left_sidebar = true
+show_right_sidebar = true
+
+[[projects]]
+root = '<home>/code/project'
+expanded = true
+
+[[projects]]
+root = '<home>/code/plain'
+expanded = true

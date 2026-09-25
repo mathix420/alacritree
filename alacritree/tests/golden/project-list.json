@@ -1,0 +1,45 @@
+{
+  "current_workspace": null,
+  "projects": [
+    {
+      "default_branch": "main",
+      "label": null,
+      "name": "project",
+      "root": "<home>/code/project",
+      "worktrees": [
+        {
+          "branch": "main",
+          "is_main": true,
+          "name": "main",
+          "path": "<home>/code/project/"
+        },
+        {
+          "branch": "8e86e75",
+          "is_main": false,
+          "name": "wt-detached",
+          "path": "<home>/code/wt-detached"
+        },
+        {
+          "branch": "feature",
+          "is_main": false,
+          "name": "wt-feature",
+          "path": "<home>/code/wt-feature"
+        }
+      ]
+    },
+    {
+      "default_branch": null,
+      "label": null,
+      "name": "plain",
+      "root": "<home>/code/plain",
+      "worktrees": [
+        {
+          "branch": null,
+          "is_main": true,
+          "name": "plain",
+          "path": "<home>/code/plain"
+        }
+      ]
+    }
+  ]
+}

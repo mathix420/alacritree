@@ -1,0 +1,27 @@
+{
+  "branch": "feature",
+  "default_branch": "main",
+  "diff_vs_default_branch": [
+    {
+      "additions": 2,
+      "deletions": 0,
+      "path": "c.txt"
+    }
+  ],
+  "staged": [
+    {
+      "kind": "added",
+      "path": "staged.txt"
+    }
+  ],
+  "unstaged": [
+    {
+      "kind": "modified",
+      "path": "a.txt"
+    },
+    {
+      "kind": "untracked",
+      "path": "untracked.txt"
+    }
+  ]
+}

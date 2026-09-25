@@ -1,0 +1,8 @@
+on feature
+staged:
+  added  staged.txt
+unstaged:
+  modified  a.txt
+  untracked  untracked.txt
+vs main:
+  +2 -0  c.txt
