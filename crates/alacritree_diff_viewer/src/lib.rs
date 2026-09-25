@@ -9,6 +9,7 @@ mod launch;
 mod settings;
 
 use alacritree_common::tools::Tool;
+use alacritree_vcs::{DiffScope, DiffTarget, VersionControl};
 
 pub use settings::{
     DiffViewerConfig, DiffViewerPreset, RawCustomDiffViewer, RawDelta, RawDiffViewer, RawTuicr,
@@ -44,23 +45,6 @@ pub fn diff_key(req: &DiffRequest) -> String {
         DiffSource::Branch { .. } => "branch",
     };
     format!("{tag}:{}", req.file)
-}
-
-/// git arguments after `git` for the requested diff.
-fn diff_args(req: &DiffRequest) -> Vec<String> {
-    let mut args = vec!["diff".to_string()];
-    match &req.source {
-        DiffSource::Staged => args.push("--cached".to_string()),
-        DiffSource::Worktree => {},
-        DiffSource::Untracked => args.push("--no-index".to_string()),
-        DiffSource::Branch { base } => args.push(format!("{base}...")),
-    }
-    args.push("--".to_string());
-    if matches!(req.source, DiffSource::Untracked) {
-        args.push("/dev/null".to_string());
-    }
-    args.push(req.file.clone());
-    args
 }
 
 /// A whole git panel section.
@@ -149,10 +133,10 @@ impl Templates {
             staged: uncommitted_row.clone(),
             unstaged: uncommitted_row.clone(),
             untracked: uncommitted_row,
-            branch: words(&["-r", "{base}...HEAD", "-p", "{file}"]),
+            branch: words(&["-r", "{range}", "-p", "{file}"]),
             staged_scope: words(&["-w"]),
             unstaged_scope: words(&["-w"]),
-            branch_scope: words(&["-r", "{base}...HEAD"]),
+            branch_scope: words(&["-r", "{range}"]),
         }
     }
 
@@ -214,14 +198,16 @@ pub fn opens(viewer: &Viewer, target: &Target) -> bool {
             !template.is_empty()
                 && template.iter().all(|arg| {
                     (!arg.contains("{file}") || target.file().is_some())
-                        && (!arg.contains("{base}") || target.base().is_some())
+                        && (!(arg.contains("{base}") || arg.contains("{range}"))
+                            || target.base().is_some())
                 })
         },
     }
 }
 
 /// How a viewer opens a target, or `None` when the target is unavailable.
-pub fn plan(viewer: &Viewer, target: &Target) -> Option<Launch> {
+/// `vcs` owns the checkout, and says what a diff and a review range are.
+pub fn plan(viewer: &Viewer, target: &Target, vcs: &impl VersionControl) -> Option<Launch> {
     if !opens(viewer, target) {
         return None;
     }
@@ -229,25 +215,36 @@ pub fn plan(viewer: &Viewer, target: &Target) -> Option<Launch> {
         Viewer::Pager { pager, args } => Launch::Pager {
             pager: pager.clone(),
             pager_args: args.clone(),
-            git_args: target_git_args(target),
+            git_args: vcs.diff_args(&diff_target(target)),
         },
         Viewer::Direct { program, templates } => Launch::Direct {
             program: program.clone(),
-            args: templates.for_target(target).iter().map(|arg| substitute(arg, target)).collect(),
+            args: templates
+                .for_target(target)
+                .iter()
+                .map(|arg| substitute(arg, target, vcs))
+                .collect(),
         },
     })
 }
 
-fn target_git_args(target: &Target) -> Vec<String> {
-    match target {
-        Target::Row(req) => diff_args(req),
-        Target::Section(Section::Staged) => vec!["diff".to_string(), "--cached".to_string()],
-        Target::Section(Section::Unstaged) => vec!["diff".to_string()],
-        Target::Section(Section::Branch { base }) => vec!["diff".to_string(), format!("{base}...")],
-    }
+/// What the backend is asked to diff for `target`.
+fn diff_target(target: &Target) -> DiffTarget {
+    let (scope, untracked) = match target {
+        Target::Row(req) => match &req.source {
+            DiffSource::Staged => (DiffScope::Staged, false),
+            DiffSource::Worktree => (DiffScope::Working, false),
+            DiffSource::Untracked => (DiffScope::Working, true),
+            DiffSource::Branch { base } => (DiffScope::Base { base: base.clone() }, false),
+        },
+        Target::Section(Section::Staged) => (DiffScope::Staged, false),
+        Target::Section(Section::Unstaged) => (DiffScope::Working, false),
+        Target::Section(Section::Branch { base }) => (DiffScope::Base { base: base.clone() }, false),
+    };
+    DiffTarget { scope, file: target.file().map(str::to_string), untracked }
 }
 
-fn substitute(arg: &str, target: &Target) -> String {
+fn substitute(arg: &str, target: &Target, vcs: &impl VersionControl) -> String {
     let mut output = String::with_capacity(arg.len());
     let mut remaining = arg;
     while let Some(open) = remaining.find('{') {
@@ -258,6 +255,9 @@ fn substitute(arg: &str, target: &Target) -> String {
             remaining = after;
         } else if let Some(after) = tail.strip_prefix("{base}") {
             output.push_str(target.base().unwrap_or_default());
+            remaining = after;
+        } else if let Some(after) = tail.strip_prefix("{range}") {
+            output.push_str(&target.base().map(|base| vcs.review_range(base)).unwrap_or_default());
             remaining = after;
         } else {
             output.push('{');
@@ -270,6 +270,9 @@ fn substitute(arg: &str, target: &Target) -> String {
 
 #[cfg(test)]
 mod tests {
+    use alacritree_vcs::fake::FakeVcs;
+    use alacritree_vcs::{DiffScope, DiffTarget};
+
     use super::*;
 
     fn row(file: &str, source: DiffSource) -> Target {
@@ -280,34 +283,62 @@ mod tests {
         DiffSource::Branch { base: "refs/remotes/origin/main".to_string() }
     }
 
-    fn direct_args(viewer: &Viewer, target: &Target) -> Option<Vec<String>> {
-        match plan(viewer, target)? {
+    fn branch_target(base: &str) -> Target {
+        Target::Section(Section::Branch { base: base.to_string() })
+    }
+
+    fn custom_viewer(branch_scope: &[&str]) -> Viewer {
+        Viewer::Direct {
+            program: Program::Custom { path: "difft".to_string(), wsl_path: None },
+            templates: Templates {
+                branch_scope: branch_scope.iter().map(|arg| (*arg).to_string()).collect(),
+                ..Templates::default()
+            },
+        }
+    }
+
+    fn direct_args_with(viewer: &Viewer, target: &Target, vcs: &FakeVcs) -> Option<Vec<String>> {
+        match plan(viewer, target, vcs)? {
             Launch::Direct { args, .. } => Some(args),
             Launch::Pager { .. } => panic!("a direct viewer planned a pager launch"),
         }
     }
 
-    fn git_args(target: &Target) -> Vec<String> {
-        match plan(&Viewer::delta(), target).expect("delta opens everything") {
-            Launch::Pager { git_args, .. } => git_args,
-            Launch::Direct { .. } => panic!("delta planned a direct launch"),
-        }
+    fn direct_args(viewer: &Viewer, target: &Target) -> Option<Vec<String>> {
+        direct_args_with(viewer, target, &FakeVcs::new("/r").with_range("RANGE"))
     }
 
     #[test]
-    fn diff_args_per_source() {
-        let req = |source| DiffRequest { file: "a.rs".to_string(), source };
-        assert_eq!(diff_args(&req(DiffSource::Staged)), ["diff", "--cached", "--", "a.rs"]);
-        assert_eq!(diff_args(&req(DiffSource::Worktree)), ["diff", "--", "a.rs"]);
-        assert_eq!(diff_args(&req(DiffSource::Untracked)), [
-            "diff",
-            "--no-index",
-            "--",
-            "/dev/null",
-            "a.rs"
-        ]);
-        let base = DiffSource::Branch { base: "main".to_string() };
-        assert_eq!(diff_args(&req(base)), ["diff", "main...", "--", "a.rs"]);
+    fn rows_and_sections_map_to_the_backend_target() {
+        let target = |scope, file: Option<&str>, untracked| DiffTarget {
+            scope,
+            file: file.map(str::to_string),
+            untracked,
+        };
+        let base = || DiffScope::Base { base: "main".to_string() };
+        let main = DiffSource::Branch { base: "main".to_string() };
+        assert_eq!(
+            diff_target(&row("a.rs", DiffSource::Staged)),
+            target(DiffScope::Staged, Some("a.rs"), false)
+        );
+        assert_eq!(
+            diff_target(&row("a.rs", DiffSource::Worktree)),
+            target(DiffScope::Working, Some("a.rs"), false)
+        );
+        assert_eq!(
+            diff_target(&row("a.rs", DiffSource::Untracked)),
+            target(DiffScope::Working, Some("a.rs"), true)
+        );
+        assert_eq!(diff_target(&row("a.rs", main)), target(base(), Some("a.rs"), false));
+        assert_eq!(
+            diff_target(&Target::Section(Section::Staged)),
+            target(DiffScope::Staged, None, false)
+        );
+        assert_eq!(
+            diff_target(&Target::Section(Section::Unstaged)),
+            target(DiffScope::Working, None, false)
+        );
+        assert_eq!(diff_target(&branch_target("main")), target(base(), None, false));
     }
 
     #[test]
@@ -323,18 +354,14 @@ mod tests {
     }
 
     #[test]
-    fn delta_pipes_each_target_through_the_pager() {
-        let launch = plan(&Viewer::delta(), &row("a.rs", DiffSource::Staged)).unwrap();
+    fn delta_pipes_the_backend_diff_through_the_pager() {
+        let vcs = FakeVcs::new("/r");
+        let launch = plan(&Viewer::delta(), &row("a.rs", DiffSource::Staged), &vcs).unwrap();
         assert_eq!(launch, Launch::Pager {
             pager: Program::Tool(Tool::Delta),
             pager_args: vec!["--paging=always".to_string()],
-            git_args: vec!["diff".into(), "--cached".into(), "--".into(), "a.rs".into()],
+            git_args: vec!["diff".into()],
         });
-        assert_eq!(git_args(&Target::Section(Section::Staged)), ["diff", "--cached"]);
-        assert_eq!(git_args(&Target::Section(Section::Unstaged)), ["diff"]);
-        assert_eq!(git_args(&Target::Section(Section::Branch { base: "main".into() })), [
-            "diff", "main..."
-        ]);
     }
 
     #[test]
@@ -344,22 +371,34 @@ mod tests {
             assert_eq!(direct_args(&tuicr, &row("a.rs", source)).unwrap(), ["-w", "-p", "a.rs"]);
         }
         assert_eq!(direct_args(&tuicr, &row("a.rs", branch())).unwrap(), [
-            "-r",
-            "refs/remotes/origin/main...HEAD",
-            "-p",
-            "a.rs"
+            "-r", "RANGE", "-p", "a.rs"
         ]);
         assert_eq!(direct_args(&tuicr, &Target::Section(Section::Staged)).unwrap(), ["-w"]);
         assert_eq!(direct_args(&tuicr, &Target::Section(Section::Unstaged)).unwrap(), ["-w"]);
-        let changes = Target::Section(Section::Branch { base: "main".into() });
-        assert_eq!(direct_args(&tuicr, &changes).unwrap(), ["-r", "main...HEAD"]);
+        assert_eq!(direct_args(&tuicr, &branch_target("main")).unwrap(), ["-r", "RANGE"]);
         assert_eq!(tuicr.program(), &Program::Tool(Tool::Tuicr));
     }
 
     #[test]
+    fn the_built_in_tuicr_templates_render_the_range_the_backend_gives() {
+        let vcs = FakeVcs::new("/r").with_range("origin/main...HEAD");
+        let args = direct_args_with(&Viewer::tuicr(), &branch_target("origin/main"), &vcs);
+        assert_eq!(args.unwrap(), ["-r", "origin/main...HEAD"]);
+    }
+
+    #[test]
+    fn a_custom_template_still_accepts_base() {
+        let vcs = FakeVcs::new("/r").with_range("ignored");
+        let viewer = custom_viewer(&["--base", "{base}"]);
+        let args = direct_args_with(&viewer, &branch_target("origin/main"), &vcs);
+        assert_eq!(args.unwrap(), ["--base", "origin/main"]);
+    }
+
+    #[test]
     fn a_file_name_stays_one_argument() {
-        let args = direct_args(&Viewer::tuicr(), &row("dir/my {base} 'x'.rs", DiffSource::Staged));
-        assert_eq!(args.unwrap(), ["-w", "-p", "dir/my {base} 'x'.rs"]);
+        let file = "dir/my {base} {range} 'x'.rs";
+        let args = direct_args(&Viewer::tuicr(), &row(file, DiffSource::Staged));
+        assert_eq!(args.unwrap(), ["-w", "-p", file]);
     }
 
     #[test]
@@ -368,15 +407,19 @@ mod tests {
             program: Program::Custom { path: "difft".to_string(), wsl_path: None },
             templates: Templates {
                 staged: vec!["--base".to_string(), "{base}".to_string()],
+                untracked: vec!["{range}".to_string()],
                 ..Templates::default()
             },
         };
+        let vcs = FakeVcs::new("/r");
         let staged_row = row("a.rs", DiffSource::Staged);
         assert!(!opens(&viewer, &staged_row));
-        assert!(plan(&viewer, &staged_row).is_none(), "a staged row has no base");
+        assert!(plan(&viewer, &staged_row, &vcs).is_none(), "a staged row has no base");
+        let untracked_row = row("a.rs", DiffSource::Untracked);
+        assert!(!opens(&viewer, &untracked_row), "an untracked row has no range");
         let unstaged_row = row("a.rs", DiffSource::Worktree);
         assert!(!opens(&viewer, &unstaged_row));
-        assert!(plan(&viewer, &unstaged_row).is_none(), "the unstaged template is empty");
+        assert!(plan(&viewer, &unstaged_row, &vcs).is_none(), "the unstaged template is empty");
         assert!(opens(&Viewer::delta(), &Target::Section(Section::Unstaged)));
     }
 }

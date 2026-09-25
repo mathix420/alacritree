@@ -131,4 +131,13 @@ pub trait VersionControl {
         req: &::alacritree_vcs::RemoveCheckout,
         blocking: &::alacritree_common::jobs::Blocking,
     ) -> ::std::result::Result<(), ::alacritree_vcs::VcsError>;
+
+    /// Arguments after the program that print `target` as a unified diff.
+    fn diff_args(
+        &self,
+        target: &::alacritree_vcs::DiffTarget,
+    ) -> ::std::vec::Vec<::std::string::String>;
+
+    /// What a Direct viewer template's `{range}` becomes for a base review.
+    fn review_range(&self, base: &str) -> ::std::string::String;
 }

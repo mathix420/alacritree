@@ -208,8 +208,8 @@ What the git panel's diff pane runs.
 
 The viewer `preset = "custom"` runs.
 
-- `branch` (array of string, default `[]`): Arguments for a `Changes vs` row. `{file}` is the row's path and `{base}` the branch it diffs against.
-- `branch_scope` (array of string, default `[]`): Arguments for the `Changes vs` section header. `{base}` is the branch it diffs against.
+- `branch` (array of string, default `[]`): Arguments for a `Changes vs` row. `{file}` is the row's path, `{base}` the branch it diffs against and `{range}` the range from that branch to the checkout's head, as the repository spells it.
+- `branch_scope` (array of string, default `[]`): Arguments for the `Changes vs` section header. `{base}` is the branch it diffs against and `{range}` the range from that branch to the checkout's head, as the repository spells it.
 - `pager` (string, default `""`): Pager mode: a command git runs as `core.pager` for the panel's own `git diff`. Set this or `path`, never both.
 - `path` (string, default `""`): Direct mode: a program that renders the diff itself, run with the argument list below that matches what was chosen. An empty list makes that row kind or section open nothing.
 - `staged` (array of string, default `[]`): Arguments for a staged row. `{file}` is the row's path.

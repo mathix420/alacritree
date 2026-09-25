@@ -159,6 +159,7 @@ name = "alacritree_diff_viewer"
 version = "0.0.0"
 dependencies = [
  "alacritree_common",
+ "alacritree_vcs",
  "log",
  "schemars",
  "serde",

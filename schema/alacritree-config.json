@@ -397,7 +397,7 @@
       "properties": {
         "branch": {
           "default": [],
-          "description": "Arguments for a `Changes vs` row. `{file}` is the row's path and\n`{base}` the branch it diffs against.",
+          "description": "Arguments for a `Changes vs` row. `{file}` is the row's path,\n`{base}` the branch it diffs against and `{range}` the range from that\nbranch to the checkout's head, as the repository spells it.",
           "items": {
             "type": "string"
           },
@@ -405,7 +405,7 @@
         },
         "branch_scope": {
           "default": [],
-          "description": "Arguments for the `Changes vs` section header. `{base}` is the branch\nit diffs against.",
+          "description": "Arguments for the `Changes vs` section header. `{base}` is the branch\nit diffs against and `{range}` the range from that branch to the\ncheckout's head, as the repository spells it.",
           "items": {
             "type": "string"
           },

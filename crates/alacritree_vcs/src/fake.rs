@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use alacritree_common::jobs::Blocking;
 
 use crate::{
-    Base, CreateCheckout, Created, Dirty, Liveness, Probe, RemoveCheckout, Repository, Status,
-    VcsError, VcsKind, VersionControl,
+    Base, CreateCheckout, Created, DiffTarget, Dirty, Liveness, Probe, RemoveCheckout, Repository,
+    Status, VcsError, VcsKind, VersionControl,
 };
 
 /// Clones share the recorded requests, so a test keeps one clone and hands
@@ -25,6 +25,7 @@ pub struct FakeVcs {
     names: Vec<String>,
     refuse_prepare: bool,
     refuse_removal: bool,
+    range: String,
 }
 
 impl FakeVcs {
@@ -40,6 +41,7 @@ impl FakeVcs {
             names: Vec::new(),
             refuse_prepare: false,
             refuse_removal: false,
+            range: String::new(),
         }
     }
 
@@ -76,6 +78,12 @@ impl FakeVcs {
     /// `prepare_checkout` answers that no `origin` remote exists.
     pub fn refusing_prepare(mut self) -> Self {
         self.refuse_prepare = true;
+        self
+    }
+
+    /// What `review_range` answers for every base.
+    pub fn with_range(mut self, range: &str) -> Self {
+        self.range = range.to_string();
         self
     }
 
@@ -173,6 +181,14 @@ impl VersionControl for FakeVcs {
             return Err(VcsError::Unsaved { message: "the checkout holds unsaved work".into() });
         }
         Ok(())
+    }
+
+    fn diff_args(&self, _: &DiffTarget) -> Vec<String> {
+        vec!["diff".into()]
+    }
+
+    fn review_range(&self, _: &str) -> String {
+        self.range.clone()
     }
 }
 

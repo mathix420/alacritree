@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 alacritree_common.workspace = true
+alacritree_vcs.workspace = true
 log = "0.4"
 schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
@@ -16,5 +17,6 @@ strum = { version = "0.26", features = ["derive"] }
 
 [dev-dependencies]
 alacritree_common = { workspace = true, features = ["test-support"] }
+alacritree_vcs = { workspace = true, features = ["test-support"] }
 tempfile = "3"
 toml.workspace = true

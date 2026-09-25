@@ -4,6 +4,7 @@
 
 mod checkouts;
 mod default_branch;
+mod diff;
 mod discover;
 mod liveness;
 mod settings;
@@ -16,8 +17,8 @@ use std::path::{Path, PathBuf};
 
 use alacritree_common::jobs::Blocking;
 use alacritree_vcs::{
-    Base, CreateCheckout, Created, Dirty, Probe, RemoveCheckout, Repository, Status, VcsError,
-    VcsKind, VersionControl,
+    Base, CreateCheckout, Created, DiffTarget, Dirty, Probe, RemoveCheckout, Repository, Status,
+    VcsError, VcsKind, VersionControl,
 };
 
 pub use settings::{GitConfig, RawGit};
@@ -102,5 +103,13 @@ impl VersionControl for GitBackend {
 
     fn remove_checkout(&self, req: &RemoveCheckout, _: &Blocking) -> Result<(), VcsError> {
         checkouts::remove(req)
+    }
+
+    fn diff_args(&self, target: &DiffTarget) -> Vec<String> {
+        diff::diff_args(target)
+    }
+
+    fn review_range(&self, base: &str) -> String {
+        diff::review_range(base)
     }
 }

@@ -496,7 +496,11 @@ impl AlacritreeApp {
             self.close_session(ctx, id);
             return;
         }
-        let Some(launch) = diff_viewer::plan(&self.config.integrations.diff_viewer.viewer, &target)
+        let Some(vcs) = self.vcs_for(&workspace) else {
+            return;
+        };
+        let Some(launch) =
+            diff_viewer::plan(&self.config.integrations.diff_viewer.viewer, &target, &vcs)
         else {
             return;
         };

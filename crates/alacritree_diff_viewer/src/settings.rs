@@ -140,15 +140,17 @@ pub struct RawCustomDiffViewer {
     unstaged: Vec<String>,
     /// Arguments for an untracked row. `{file}` is the row's path.
     untracked: Vec<String>,
-    /// Arguments for a `Changes vs` row. `{file}` is the row's path and
-    /// `{base}` the branch it diffs against.
+    /// Arguments for a `Changes vs` row. `{file}` is the row's path,
+    /// `{base}` the branch it diffs against and `{range}` the range from that
+    /// branch to the checkout's head, as the repository spells it.
     branch: Vec<String>,
     /// Arguments for the Staged section header.
     staged_scope: Vec<String>,
     /// Arguments for the Unstaged section header.
     unstaged_scope: Vec<String>,
     /// Arguments for the `Changes vs` section header. `{base}` is the branch
-    /// it diffs against.
+    /// it diffs against and `{range}` the range from that branch to the
+    /// checkout's head, as the repository spells it.
     branch_scope: Vec<String>,
 }
 
