@@ -1449,6 +1449,12 @@ mod tests {
     }
 
     #[test]
+    fn the_dirty_count_names_only_what_is_there() {
+        let counts = Dirty { staged: 0, modified: 2, untracked: 1 };
+        assert_eq!(dirty_parts(&counts), "2 modified, 1 untracked");
+    }
+
+    #[test]
     fn picker_filter_is_a_case_insensitive_contains() {
         let branches =
             vec!["main".to_string(), "develop".to_string(), "origin/develop".to_string()];

@@ -362,8 +362,8 @@ impl AlacritreeApp {
         for row in &self.git_panel.rows {
             match row.section {
                 GitSection::Staged => &mut staged_visible,
-                GitSection::Unstaged => &mut unstaged_visible,
-                GitSection::Branch => &mut branch_visible,
+                GitSection::Working => &mut unstaged_visible,
+                GitSection::Base => &mut branch_visible,
             }
             .insert(row.path.clone());
         }
@@ -627,6 +627,9 @@ fn paint_staged_section(
     requests: &mut GitSidebarRequests,
     section_gap: &mut f32,
 ) {
+    if view.status.staged.is_none() {
+        return;
+    }
     let review = ReviewButton::for_target(view, view.staged_review.as_ref());
     let clicked = section(
         ui,
@@ -664,6 +667,12 @@ fn paint_staged_section(
     }
 }
 
+/// A backend without a staging area has one list of changes, so it is not
+/// called unstaged.
+fn working_section_title(status: &Status) -> &'static str {
+    if status.staged.is_some() { "Unstaged" } else { "Changes" }
+}
+
 fn paint_unstaged_section(
     ui: &mut egui::Ui,
     view: &GitSidebarView,
@@ -674,7 +683,7 @@ fn paint_unstaged_section(
     let clicked = section(
         ui,
         &view.theme,
-        "Unstaged",
+        working_section_title(&view.status),
         &view.unstaged_count,
         view.filtering,
         section_gap,
@@ -695,7 +704,7 @@ fn paint_unstaged_section(
                     ui,
                     &response,
                     &view.cursor_row,
-                    GitSection::Unstaged,
+                    GitSection::Working,
                     &file.path,
                     view.cursor_moved,
                     &view.theme,
@@ -753,7 +762,7 @@ fn paint_branch_section(
                 ui,
                 &response,
                 &view.cursor_row,
-                GitSection::Branch,
+                GitSection::Base,
                 &stat.path,
                 view.cursor_moved,
                 &view.theme,
@@ -770,7 +779,7 @@ fn paint_branch_section(
             ui,
             &response,
             &view.cursor_row,
-            GitSection::Branch,
+            GitSection::Base,
             &stat.path,
             view.cursor_moved,
             &view.theme,
@@ -1044,7 +1053,13 @@ fn paint_git_row_cursor(
 
 impl AlacritreeApp {
     fn open_review(&mut self, ctx: &Context, action: NamedAction) {
-        if let Some(section) = review_section(action, self.cached_branch_base().as_deref()) {
+        let status = self
+            .active_session_path()
+            .and_then(|path| self.git_panel.status.get(&path))
+            .filter(|cache| cache.has_status())
+            .map(|cache| cache.last());
+        let base = self.cached_branch_base();
+        if let Some(section) = review_section_for(action, status, base.as_deref()) {
             self.open_diff(ctx, Target::Section(section));
         }
     }
@@ -1166,6 +1181,21 @@ pub(super) fn git_filter_identity(action: NamedAction) -> Option<char> {
     }
 }
 
+/// [`review_section`] for a checkout whose latest status is `status`, `None`
+/// before one lands. A backend without a staging area has no staged section
+/// to review.
+pub(super) fn review_section_for(
+    action: NamedAction,
+    status: Option<&Status>,
+    base: Option<&str>,
+) -> Option<Section> {
+    if matches!(action, NamedAction::ReviewStaged(_)) && status.is_some_and(|s| s.staged.is_none())
+    {
+        return None;
+    }
+    review_section(action, base)
+}
+
 /// The section a Review action opens. The branch section needs a known base.
 pub(super) fn review_section(action: NamedAction, base: Option<&str>) -> Option<Section> {
     match action {
@@ -1195,8 +1225,8 @@ pub(super) fn git_row_diff_request(
 ) -> Option<DiffRequest> {
     let source = match row.section {
         GitSection::Staged => DiffSource::Staged,
-        GitSection::Unstaged => unstaged_diff_source(row.kind),
-        GitSection::Branch => branch_diff_source(base)?,
+        GitSection::Working => unstaged_diff_source(row.kind),
+        GitSection::Base => branch_diff_source(base)?,
     };
     Some(DiffRequest { file: row.path.clone(), source })
 }
@@ -1287,6 +1317,48 @@ mod tests {
     use alacritree_diff_viewer::{Program, Templates, Viewer};
 
     use super::*;
+
+    fn modified(path: &str) -> alacritree_vcs::FileChange {
+        alacritree_vcs::FileChange { path: path.into(), kind: ChangeKind::Modified }
+    }
+
+    #[test]
+    fn a_backend_without_staging_shows_changes_and_no_staged_section() {
+        let status = Status { staged: None, working: vec![modified("a.rs")], ..Default::default() };
+        let rows = git_nav::visible_rows(
+            status.staged.as_deref().unwrap_or_default(),
+            &status.working,
+            &status.base_diff,
+            &|_| true,
+            &mut |_| true,
+        );
+        assert!(rows.rows.iter().all(|r| r.section != GitSection::Staged));
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(working_section_title(&status), "Changes");
+    }
+
+    #[test]
+    fn git_still_titles_its_sections_staged_and_unstaged() {
+        let status = Status { staged: Some(vec![]), ..Default::default() };
+        assert_eq!(working_section_title(&status), "Unstaged");
+    }
+
+    #[test]
+    fn review_staged_is_unavailable_without_staging() {
+        let status = Status { staged: None, ..Default::default() };
+        let staged = NamedAction::ReviewStaged(action::ReviewStaged);
+        assert_eq!(review_section_for(staged, Some(&status), None), None);
+        let unstaged = NamedAction::ReviewUnstaged(action::ReviewUnstaged);
+        assert_eq!(review_section_for(unstaged, Some(&status), None), Some(Section::Unstaged));
+    }
+
+    /// Before the first status lands nothing says the backend lacks staging,
+    /// so the action keeps working as it always has.
+    #[test]
+    fn review_staged_stays_available_before_the_first_status() {
+        let staged = NamedAction::ReviewStaged(action::ReviewStaged);
+        assert_eq!(review_section_for(staged, None, None), Some(Section::Staged));
+    }
 
     #[test]
     fn a_review_action_names_its_section_and_the_branch_needs_a_base() {
@@ -1401,7 +1473,7 @@ mod tests {
 
     #[test]
     fn a_branch_row_without_a_base_opens_no_diff() {
-        let row = git_nav::GitRow { section: GitSection::Branch, path: "a.rs".into(), kind: None };
+        let row = git_nav::GitRow { section: GitSection::Base, path: "a.rs".into(), kind: None };
         assert!(git_row_diff_request(&row, None).is_none());
         let request = git_row_diff_request(&row, Some("main")).expect("a base makes it clickable");
         assert!(matches!(request.source, DiffSource::Branch { base } if base == "main"));
