@@ -393,9 +393,10 @@ mod tests {
 
     use super::*;
     use crate::repaint::Recorder;
-    use crate::test_util::{add_worktree, init_repo};
     use alacritree_checkout_hooks::fake::{Event, FakeHook};
-    use alacritree_git::test_support::clone_with_origin;
+    use alacritree_git::test_support::{
+        add_worktree, branch_exists, clone_with_origin, init_repo, worktree_exists,
+    };
     use alacritree_vcs::fake::FakeVcs;
 
     fn git() -> crate::vcs::Vcs {
@@ -489,8 +490,8 @@ mod tests {
         assert!(result.is_ok(), "delete failed: {result:?}");
         assert_eq!(repaint.wakes(), 1, "the finished delete should wake the UI");
         assert!(!wt_path.exists(), "worktree directory should be gone");
-        assert!(repo.find_worktree("feature").is_err());
-        assert!(repo.find_branch("feature", git2::BranchType::Local).is_err());
+        assert!(!worktree_exists(&repo, "feature"));
+        assert!(!branch_exists(&repo, "feature"));
     }
 
     /// `create` must stop between steps when its handle is gone.  Killing a
@@ -660,8 +661,8 @@ mod tests {
     fn removal_hands_hooks_the_path_resolved_before_git_deleted_it() {
         let tmp = tempfile::tempdir().unwrap();
         let repo_dir = tmp.path().join("repo");
-        let repo = crate::test_util::init_repo(&repo_dir);
-        let wt_path = crate::test_util::add_worktree(&repo, "linked");
+        let repo = init_repo(&repo_dir);
+        let wt_path = add_worktree(&repo, "linked");
         let canonical = wt_path.canonicalize().unwrap();
         let link = tmp.path().join("via-link");
         std::os::unix::fs::symlink(&wt_path, &link).unwrap();

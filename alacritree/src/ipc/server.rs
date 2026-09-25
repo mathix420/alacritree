@@ -422,7 +422,7 @@ mod tests {
     #[test]
     fn an_ipc_create_lands_under_the_configured_worktree_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let project = crate::test_util::clone_with_origin(dir.path());
+        let project = alacritree_git::test_support::clone_with_origin(dir.path());
         let base = dir.path().join("worktrees");
         let path = socket_dir().join(format!("alacritree-create-test-{}.sock", std::process::id()));
         // With no app thread on the other end, the refresh after the create

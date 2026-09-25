@@ -425,8 +425,8 @@ pub struct AlacritreeApp {
     last_pane_geometry: Option<(TermSize, (f32, f32))>,
     /// In-flight background re-discoveries, keyed by project root.  Neither
     /// backend may block paint: wsl.exe takes seconds while the distro VM
-    /// boots, and git2 takes tens of milliseconds on a project with many
-    /// worktrees.  Results are adopted in `poll_project_refreshes`.
+    /// boots, and native discovery takes tens of milliseconds on a project
+    /// with many worktrees.  Results are adopted in `poll_project_refreshes`.
     ///
     /// IPC callers are answered only once the result is live, since a client
     /// that refreshes a project to act on the new worktree list would
@@ -760,8 +760,8 @@ impl AlacritreeApp {
     }
 
     /// Re-discovery always runs on a worker thread: wsl.exe takes ~400 ms warm
-    /// and seconds while the distro VM boots, and git2 discovery costs tens of
-    /// milliseconds on a project with many worktrees.
+    /// and seconds while the distro VM boots, and native discovery costs tens
+    /// of milliseconds on a project with many worktrees.
     fn refresh_project(&mut self, ctx: &Context, idx: usize) {
         let root = self.projects[idx].root.clone();
         let ctx = ctx.clone();
@@ -4483,9 +4483,8 @@ mod tests {
     #[test]
     fn a_branch_switched_outside_the_app_reaches_the_sidebar() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = crate::test_util::init_repo(&dir.path().join("main"));
-        let linked = crate::test_util::add_worktree(&repo, "topic");
-        let root = repo.workdir().unwrap().to_path_buf();
+        let root = alacritree_git::test_support::init_repo(&dir.path().join("main"));
+        let linked = alacritree_git::test_support::add_worktree(&root, "topic");
         let mut app = test_app();
         app.projects.push(
             jobs::on_this_thread(|b| {
@@ -4499,13 +4498,8 @@ mod tests {
             .project,
         );
 
-        let head = repo.head().unwrap().peel_to_commit().unwrap();
         for (checkout, branch) in [(&root, "switched-main"), (&linked, "switched-linked")] {
-            repo.branch(branch, &head, false).unwrap();
-            git2::Repository::open(checkout)
-                .unwrap()
-                .set_head(&format!("refs/heads/{branch}"))
-                .unwrap();
+            alacritree_git::test_support::switch_head(checkout, branch);
         }
 
         let branches = |app: &AlacritreeApp| {

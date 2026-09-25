@@ -89,7 +89,6 @@ dependencies = [
  "env_logger",
  "fontconfig",
  "fontdb",
- "git2",
  "home",
  "interprocess",
  "libc",

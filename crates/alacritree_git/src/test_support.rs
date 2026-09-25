@@ -57,6 +57,14 @@ pub fn set_config(repo: &Path, key: &str, value: &str) {
     Repository::open(repo).unwrap().config().unwrap().set_str(key, value).unwrap();
 }
 
+pub fn branch_exists(repo: &Path, name: &str) -> bool {
+    Repository::open(repo).unwrap().find_branch(name, git2::BranchType::Local).is_ok()
+}
+
+pub fn worktree_exists(repo: &Path, name: &str) -> bool {
+    Repository::open(repo).unwrap().find_worktree(name).is_ok()
+}
+
 /// Points HEAD at its commit directly, as `git checkout --detach` does.
 pub fn detach(repo: &Path) {
     let repo = Repository::open(repo).unwrap();

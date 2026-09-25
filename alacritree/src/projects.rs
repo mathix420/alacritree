@@ -193,7 +193,7 @@ fn display_name(root: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{add_worktree, init_repo};
+    use alacritree_git::test_support::{add_worktree, init_repo};
 
     #[test]
     fn refresh_keeps_worktrees_when_discovery_is_not_authoritative() {

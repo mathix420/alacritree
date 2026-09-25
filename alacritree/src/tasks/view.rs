@@ -577,12 +577,8 @@ mod tests {
     #[test]
     fn a_detached_checkout_names_the_node_task_scope_names() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("review");
-        let repo = git2::Repository::init(&root).unwrap();
-        let sig = git2::Signature::now("t", "t@t").unwrap();
-        let tree = repo.find_tree(repo.treebuilder(None).unwrap().write().unwrap()).unwrap();
-        let oid = repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
-        repo.set_head_detached(oid).unwrap();
+        let root = alacritree_git::test_support::init_repo(&dir.path().join("review"));
+        alacritree_git::test_support::detach(&root);
 
         let project = jobs::on_this_thread(|b| {
             Project::discover(root.clone(), &crate::vcs::backends(&Default::default()), false, b)

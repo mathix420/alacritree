@@ -175,7 +175,9 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::test_util::{clone_with_origin, workspace_under};
+    use alacritree_git::test_support::clone_with_origin;
+
+    use crate::test_util::workspace_under;
 
     fn serve(state_path: &Path, request: &IpcRequest) -> IpcResult {
         handle_at(state_path, request, &CreateConfig::default())
