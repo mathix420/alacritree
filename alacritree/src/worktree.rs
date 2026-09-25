@@ -400,7 +400,7 @@ mod tests {
     use alacritree_vcs::fake::FakeVcs;
 
     fn git() -> crate::vcs::Vcs {
-        crate::vcs::Vcs::Git(alacritree_git::GitBackend::new(&alacritree_git::GitConfig::default()))
+        crate::vcs::Vcs::Git(alacritree_git::GitBackend)
     }
 
     fn live_checkout(path: &Path, branch: &str) -> alacritree_vcs::Checkout {

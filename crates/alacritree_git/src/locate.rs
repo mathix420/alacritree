@@ -106,7 +106,7 @@ mod tests {
     use alacritree_vcs::{Head, Located, VersionControl};
 
     use super::*;
-    use crate::{GitBackend, GitConfig};
+    use crate::GitBackend;
 
     const LINKED: &str = "worktree /src/alacritree\nHEAD aaaaaaaaaa\nbranch \
                           refs/heads/master\n\nworktree /src/alacritree-worktrees/feat/x\nHEAD \
@@ -217,8 +217,7 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
 
         let found =
-            jobs::on_this_thread(|b| GitBackend::new(&GitConfig::default()).locate(&sub, b))
-                .expect("the worktree is found");
+            jobs::on_this_thread(|b| GitBackend.locate(&sub, b)).expect("the worktree is found");
 
         let same = |a: &std::path::Path, b: &std::path::Path| {
             a.canonicalize().unwrap() == b.canonicalize().unwrap()
@@ -231,8 +230,7 @@ mod tests {
     #[test]
     fn a_folder_outside_any_repository_is_not_located() {
         let dir = tempfile::tempdir().unwrap();
-        let found =
-            jobs::on_this_thread(|b| GitBackend::new(&GitConfig::default()).locate(dir.path(), b));
+        let found = jobs::on_this_thread(|b| GitBackend.locate(dir.path(), b));
         assert_eq!(found, None);
     }
 }

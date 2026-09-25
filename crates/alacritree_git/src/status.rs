@@ -489,7 +489,7 @@ mod tests {
     use alacritree_vcs::VersionControl;
 
     use super::*;
-    use crate::{GitBackend, GitConfig};
+    use crate::GitBackend;
 
     /// What a distro sends back for a batch, section by section, so a WSL
     /// refresh can be tested without one.
@@ -626,7 +626,7 @@ u UU N... 100644 100644 100644 100644 e1 e2 e3 conflicted.rs\0\
         let dir = tempfile::tempdir().unwrap();
         let repo = crate::test_support::init_repo(dir.path());
         crate::test_support::detach(&repo);
-        let backend = GitBackend::new(&GitConfig::default());
+        let backend = GitBackend;
         let status =
             alacritree_common::jobs::on_this_thread(|b| backend.status(&repo, None, b)).unwrap();
         assert_eq!(status.head.name, None);
@@ -638,7 +638,7 @@ u UU N... 100644 100644 100644 100644 e1 e2 e3 conflicted.rs\0\
     fn a_clean_checkout_is_not_dirty() {
         let dir = tempfile::tempdir().unwrap();
         let repo = crate::test_support::init_repo(dir.path());
-        let backend = GitBackend::new(&GitConfig::default());
+        let backend = GitBackend;
         let dirty = alacritree_common::jobs::on_this_thread(|b| backend.dirty(&repo, b)).unwrap();
         assert!(!dirty.is_dirty());
     }
@@ -646,7 +646,7 @@ u UU N... 100644 100644 100644 100644 e1 e2 e3 conflicted.rs\0\
     #[test]
     fn a_folder_that_is_no_repository_keeps_git2s_full_error_text() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = GitBackend::new(&GitConfig::default());
+        let backend = GitBackend;
         let err = alacritree_common::jobs::on_this_thread(|b| backend.status(dir.path(), None, b))
             .unwrap_err();
         assert!(err.to_string().contains("; class="), "{err}");

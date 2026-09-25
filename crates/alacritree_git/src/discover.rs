@@ -334,7 +334,7 @@ mod tests {
     use alacritree_vcs::VersionControl;
 
     use super::*;
-    use crate::{GitBackend, GitConfig};
+    use crate::GitBackend;
 
     /// `%(refname:short)` shortens to the *unambiguous* name, so a branch that
     /// shares its name with a tag comes back as `heads/<name>`.  Worktree
@@ -512,7 +512,7 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
         let seed = crate::test_support::init_repo(&dir.path().join("seed"));
         let bare = crate::test_support::bare_clone(&seed, &dir.path().join("repo.git"));
         let wt = crate::test_support::add_worktree(&bare, "feature");
-        let backend = GitBackend::new(&GitConfig::default());
+        let backend = GitBackend;
         assert!(backend.claims(&bare));
         let repo = jobs::on_this_thread(|b| backend.discover(&bare, &[], false, b)).unwrap();
         assert!(repo.checkouts.iter().any(|c| c.path == wt), "{:?}", repo.checkouts);
@@ -521,7 +521,7 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
     #[test]
     fn a_folder_that_is_no_repository_says_so() {
         let dir = tempfile::tempdir().unwrap();
-        let backend = GitBackend::new(&GitConfig::default());
+        let backend = GitBackend;
         assert!(!backend.claims(dir.path()));
         let found = jobs::on_this_thread(|b| backend.discover(dir.path(), &[], false, b));
         assert!(matches!(found, Err(VcsError::NotARepository(_))));

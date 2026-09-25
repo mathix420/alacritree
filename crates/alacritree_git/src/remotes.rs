@@ -34,11 +34,11 @@ mod tests {
 
     use alacritree_vcs::{Remotes, VersionControl};
 
+    use crate::GitBackend;
     use crate::test_support::{add_remote, init_repo, set_config};
-    use crate::{GitBackend, GitConfig};
 
     fn remotes(repo: &Path, branch: &str) -> Remotes {
-        GitBackend::new(&GitConfig::default()).remotes(repo, branch)
+        GitBackend.remotes(repo, branch)
     }
 
     #[test]

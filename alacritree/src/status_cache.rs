@@ -219,7 +219,7 @@ mod tests {
     use crate::repaint::Recorder;
 
     fn git() -> Vcs {
-        Vcs::Git(alacritree_git::GitBackend::new(&alacritree_git::GitConfig::default()))
+        Vcs::Git(alacritree_git::GitBackend)
     }
 
     /// A compute that panics. Interactive, since a background job runs below

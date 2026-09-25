@@ -30,11 +30,11 @@ pub(crate) fn review_range(base: &str) -> String {
 mod tests {
     use alacritree_vcs::{DiffScope, DiffTarget, VersionControl};
 
-    use crate::{GitBackend, GitConfig};
+    use crate::GitBackend;
 
     fn args(scope: DiffScope, file: Option<&str>, untracked: bool) -> Vec<String> {
         let target = DiffTarget { scope, file: file.map(str::to_string), untracked };
-        GitBackend::new(&GitConfig::default()).diff_args(&target)
+        GitBackend.diff_args(&target)
     }
 
     fn base(name: &str) -> DiffScope {
@@ -66,9 +66,6 @@ mod tests {
 
     #[test]
     fn a_base_review_range_is_the_triple_dot_range_to_head() {
-        assert_eq!(
-            GitBackend::new(&GitConfig::default()).review_range("origin/main"),
-            "origin/main...HEAD"
-        );
+        assert_eq!(GitBackend.review_range("origin/main"), "origin/main...HEAD");
     }
 }

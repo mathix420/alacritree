@@ -22,7 +22,7 @@ pub enum Vcs {
 pub(crate) fn backends(integrations: &IntegrationsConfig) -> Vec<Vcs> {
     let mut out = Vec::new();
     if integrations.git.enabled {
-        out.push(Vcs::Git(GitBackend::new(&integrations.git)));
+        out.push(Vcs::Git(GitBackend));
     }
     out
 }
@@ -56,7 +56,7 @@ mod tests {
 
     #[test]
     fn the_git_variant_delegates_to_the_git_crate() {
-        let vcs = Vcs::Git(alacritree_git::GitBackend::new(&alacritree_git::GitConfig::default()));
+        let vcs = Vcs::Git(alacritree_git::GitBackend);
         let plain = tempfile::tempdir().unwrap();
         assert_eq!(vcs.kind(), VcsKind::Git);
         assert!(!vcs.claims(plain.path()));

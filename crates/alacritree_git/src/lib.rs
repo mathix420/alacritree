@@ -25,20 +25,10 @@ use alacritree_vcs::{
 
 pub use settings::{GitConfig, RawGit};
 
-/// The resolved config travels with the value, so a project's `Vcs` is
-/// cheap to clone and answers without a config lookup.
-#[derive(Debug, Clone)]
-pub struct GitBackend {
-    // Read once a command runs the configured program rather than `git`.
-    #[allow(dead_code)]
-    config: GitConfig,
-}
-
-impl GitBackend {
-    pub fn new(config: &GitConfig) -> Self {
-        Self { config: config.clone() }
-    }
-}
+/// Holds no state. Every git command finds its program through
+/// `alacritree_common::tools`, which `[integrations.git]` configures.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GitBackend;
 
 impl VersionControl for GitBackend {
     fn claims(&self, root: &Path) -> bool {

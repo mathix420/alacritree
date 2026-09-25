@@ -423,10 +423,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::{GitBackend, GitConfig};
+    use crate::GitBackend;
 
     fn backend() -> GitBackend {
-        GitBackend::new(&GitConfig::default())
+        GitBackend
     }
 
     #[test]
