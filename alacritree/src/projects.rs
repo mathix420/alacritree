@@ -296,6 +296,17 @@ mod tests {
         assert!(project.checkouts.is_empty());
     }
 
+    /// A distro that is stopped answers no discovery. The project keeps the
+    /// rows it had rather than turning into a plain folder.
+    #[test]
+    fn an_unreachable_repository_is_not_authoritative() {
+        let fake = alacritree_vcs::fake::FakeVcs::new("/r").unreachable("the distro is stopped");
+        let found = jobs::on_this_thread(|b| {
+            Project::discover(PathBuf::from("/r"), &[crate::vcs::Vcs::Fake(fake)], false, b)
+        });
+        assert!(!found.authoritative);
+    }
+
     fn git_backends() -> Vec<crate::vcs::Vcs> {
         crate::vcs::backends(&crate::config::IntegrationsConfig::default())
     }

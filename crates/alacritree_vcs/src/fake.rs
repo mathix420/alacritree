@@ -28,6 +28,7 @@ pub struct FakeVcs {
     range: String,
     remotes: Remotes,
     located: Option<Located>,
+    unreachable: Option<String>,
 }
 
 impl FakeVcs {
@@ -46,6 +47,7 @@ impl FakeVcs {
             range: String::new(),
             remotes: Remotes::default(),
             located: None,
+            unreachable: None,
         }
     }
 
@@ -101,6 +103,13 @@ impl FakeVcs {
         self
     }
 
+    /// `discover` answers that the repository cannot be reached, for this
+    /// `reason`, as a stopped WSL distro does.
+    pub fn unreachable(mut self, reason: &str) -> Self {
+        self.unreachable = Some(reason.to_string());
+        self
+    }
+
     /// `remove_checkout` answers that the checkout holds unsaved work.
     pub fn refusing_removal(mut self) -> Self {
         self.refuse_removal = true;
@@ -147,6 +156,9 @@ impl VersionControl for FakeVcs {
         _: &Blocking,
     ) -> Result<Repository, VcsError> {
         self.record("discover", root);
+        if let Some(reason) = &self.unreachable {
+            return Err(VcsError::Unreachable(reason.clone()));
+        }
         self.repository.clone().ok_or_else(|| VcsError::NotARepository(root.to_path_buf()))
     }
 
