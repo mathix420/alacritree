@@ -623,6 +623,7 @@ impl AlacritreeApp {
 
     fn load_projects(config: &Config) -> (state::PersistedState, Vec<Project>) {
         let persisted = state::load();
+        let backends = crate::vcs::backends(&config.integrations);
         let projects: Vec<Project> = persisted
             .projects
             .iter()
@@ -635,7 +636,6 @@ impl AlacritreeApp {
                 let root = wsl::normalize_root(p.root.clone());
                 let mut project = match wsl::classify(&root) {
                     wsl::Location::Windows(_) => jobs::on_this_thread(|blocking| {
-                        let backends = crate::vcs::backends(&config.integrations);
                         Project::discover(root, &backends, config.ui.upstream_status, blocking)
                             .project
                     }),
