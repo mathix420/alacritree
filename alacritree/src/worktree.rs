@@ -420,9 +420,12 @@ fn resolve_base_branch(
 
     // `hint` is a cached detection, not a choice, so it stands in for
     // `origin/HEAD` only when the live query cannot answer.
-    let origin_head = query_origin_head(cwd, blocking)
-        .or_else(|| hint.map(str::to_string))
-        .filter(|name| have(name, &mut tried));
+    let queried = query_origin_head(cwd, blocking);
+    if blocking.cancelled() {
+        return Err(tried);
+    }
+    let origin_head =
+        queried.or_else(|| hint.map(str::to_string)).filter(|name| have(name, &mut tried));
     let present: Vec<&str> =
         WellKnown::ALL.iter().map(|c| c.as_str()).filter(|name| have(name, &mut tried)).collect();
     let init_default =
@@ -960,6 +963,28 @@ mod tests {
             Ok(Ok(path)) => panic!("create finished a worktree nobody was waiting for: {path:?}"),
             Err(e) => panic!("create never returned: {e}"),
         }
+    }
+
+    /// A cancel that kills `ls-remote` must end the resolve there. Probing each
+    /// candidate name afterwards is a dozen more git spawns, which a loaded
+    /// machine turns into seconds the gone caller is still made to wait.
+    #[test]
+    fn a_cancelled_resolve_probes_no_branch_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = crate::test_util::clone_with_origin(tmp.path());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (out_tx, out_rx) = mpsc::channel();
+        let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
+            let _ = started_tx.send(());
+            let _ = go_rx.recv();
+            let _ = out_tx.send(resolve_base_branch(&project, Some("main"), blocking));
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).expect("the worker started");
+        drop(job);
+        go_tx.send(()).unwrap();
+        let resolved = out_rx.recv_timeout(Duration::from_secs(10)).expect("resolve returned");
+        assert!(resolved.is_err(), "a cancelled resolve went on to pick {resolved:?}");
     }
 
     /// The `ls-remote` inside `resolve_base_branch` is a second network round
