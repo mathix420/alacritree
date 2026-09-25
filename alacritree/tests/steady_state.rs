@@ -7,10 +7,11 @@ use std::time::Instant;
 use alacritree::alloc_count::{CountingAllocator, measure};
 use alacritree::in_flight::InFlight;
 use alacritree::multiplexer::Side;
-use alacritree::projects::{Project, Worktree};
+use alacritree::projects::Project;
 use alacritree::sidebar_focus::{ObservedInputs, SessionInput, UiInputs};
 use alacritree::sidebar_model::{SidebarInputs, SidebarModel};
 use alacritree_herdr::{self as herdr, FollowFocus};
+use alacritree_vcs::{Checkout, Head};
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -22,16 +23,17 @@ fn tree(projects: usize, worktrees: usize) -> Vec<Project> {
             root: PathBuf::from(format!("/home/user/code/p{p}")),
             name: format!("/home/user/code/p{p}"),
             label: None,
-            default_branch: None,
-            worktrees: (0..worktrees)
+            vcs: None,
+            trunk: None,
+            checkouts: (0..worktrees)
                 .map(|w| {
                     let path = format!("/home/user/code/p{p}/worktree-{w}");
-                    Worktree {
+                    Checkout {
                         name: path.clone(),
                         path: PathBuf::from(path),
-                        branch: None,
+                        head: Head::default(),
                         is_main: false,
-                        prunable: false,
+                        gone: false,
                         upstream: None,
                     }
                 })

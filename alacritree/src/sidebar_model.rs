@@ -313,7 +313,7 @@ pub(crate) fn build_snapshot(
     for p in projects {
         let project_id =
             push(&mut b, &mut next_row, SidebarRow::Project(p.root.clone()), Parent::Root);
-        for wt in &p.worktrees {
+        for wt in &p.checkouts {
             if skip_worktree == Some(wt.path.as_path()) {
                 skip_projected_rows(rows, &mut next_row, listed, &wt.path);
                 continue;

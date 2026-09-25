@@ -8,9 +8,10 @@
 //! return from, while a row gone from the model was deleted and the cursor
 //! slides to a sibling.
 
+use alacritree_vcs::Checkout;
 use std::path::{Path, PathBuf};
 
-use crate::projects::{Project, Worktree};
+use crate::projects::Project;
 use crate::session::SessionId;
 use crate::sidebar_nav::SidebarRow;
 use crate::workspace::WorkspaceKey;
@@ -390,9 +391,9 @@ impl WorktreeInput {
     }
 }
 
-impl<'a> From<&'a Worktree> for WorktreeView<'a> {
-    fn from(wt: &'a Worktree) -> Self {
-        Self { path: &wt.path, name: &wt.name, prunable: wt.prunable, branch: wt.branch.as_deref() }
+impl<'a> From<&'a Checkout> for WorktreeView<'a> {
+    fn from(wt: &'a Checkout) -> Self {
+        Self { path: &wt.path, name: &wt.name, prunable: wt.gone, branch: wt.head.label() }
     }
 }
 
@@ -427,13 +428,13 @@ impl ObservedInputs {
                     name: p.display_name().to_string(),
                     expanded: p.expanded,
                     worktrees: p
-                        .worktrees
+                        .checkouts
                         .iter()
                         .map(|wt| WorktreeInput {
                             path: wt.path.clone(),
                             name: wt.name.clone(),
-                            prunable: wt.prunable,
-                            branch: wt.branch.clone(),
+                            prunable: wt.gone,
+                            branch: wt.head.label().map(str::to_string),
                         })
                         .collect(),
                 })
@@ -487,11 +488,11 @@ impl ObservedInputs {
             if was.root != now.root
                 || was.name != now.display_name()
                 || was.expanded != now.expanded
-                || was.worktrees.len() != now.worktrees.len()
+                || was.worktrees.len() != now.checkouts.len()
             {
                 return false;
             }
-            for (wt_was, wt_now) in was.worktrees.iter().zip(&now.worktrees) {
+            for (wt_was, wt_now) in was.worktrees.iter().zip(&now.checkouts) {
                 visit();
                 if wt_was.view() != WorktreeView::from(wt_now) {
                     return false;
@@ -604,11 +605,11 @@ mod tests {
         use crate::sidebar_nav::tests::project;
 
         let mut a = project("/a", true, &["/a/wt1"]);
-        a.worktrees[0].branch = Some("main".to_string());
+        a.checkouts[0].head.name = Some("main".to_string());
         let base = ObservedInputs::capture(&[a.clone()], std::iter::empty(), ui("", 0));
 
         let mut changed = a.clone();
-        changed.worktrees[0].branch = Some("feature".to_string());
+        changed.checkouts[0].head.name = Some("feature".to_string());
 
         assert!(!base.matches(&[changed], std::iter::empty(), ui("", 0)));
     }

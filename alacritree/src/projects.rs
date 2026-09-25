@@ -6,8 +6,11 @@ use std::path::PathBuf;
 use git2::Repository;
 use serde_json::{Value, json};
 
-use crate::{jobs, wsl};
 use alacritree_git::{self as default_branch, Evidence, WellKnown};
+use alacritree_vcs::{Checkout, Head, VcsKind, VersionControl};
+
+use crate::vcs::Vcs;
+use crate::{jobs, wsl};
 
 #[derive(Debug, Clone)]
 pub struct Project {
@@ -18,29 +21,16 @@ pub struct Project {
     /// `expanded` and `shell_override`, this is user state: discovery never
     /// sets it, and refreshes must not lose it.
     pub label: Option<String>,
-    pub default_branch: Option<String>,
-    pub worktrees: Vec<Worktree>,
+    /// The backend that owns the repository, or `None` for a plain folder.
+    pub vcs: Option<Vcs>,
+    pub trunk: Option<String>,
+    pub checkouts: Vec<Checkout>,
     pub expanded: bool,
     pub shell_override: Option<crate::wsl::ShellChoice>,
     /// The distro's own `$HOME` for a WSL project, so a path can collapse to
     /// `~` without guessing the prefix from the path itself.  `None` for a
     /// native project, whose home comes from `home::home_dir()`.
     pub home: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Worktree {
-    pub name: String,
-    pub path: PathBuf,
-    pub branch: Option<String>,
-    pub is_main: bool,
-    /// The checkout directory is gone but git's worktree metadata remains
-    /// (`git worktree list` still shows it as prunable). Such a row cannot
-    /// host a shell and only offers cleanup.
-    pub prunable: bool,
-    /// Upstream state for `branch`, when the feature is enabled and the
-    /// backend could answer.
-    pub upstream: Option<alacritree_vcs::UpstreamState>,
 }
 
 /// A discovery result and whether it can be trusted to replace an existing
@@ -91,16 +81,24 @@ fn classify_wsl_answer(reached: bool, is_repo: bool, worktrees_parsed: usize) ->
 impl Project {
     /// Classify the root and discover through the owning backend: in-distro
     /// git for WSL paths, git2 for Windows paths, and a pseudo-worktree
-    /// placeholder when the root is not a repository.
-    pub fn discover(root: PathBuf, upstream: bool, blocking: &jobs::Blocking) -> Discovered {
+    /// placeholder when the root is not a repository or git is disabled.
+    pub fn discover(
+        root: PathBuf,
+        backends: &[Vcs],
+        upstream: bool,
+        blocking: &jobs::Blocking,
+    ) -> Discovered {
+        let Some(git) = backends.iter().find(|vcs| vcs.kind() == VcsKind::Git).cloned() else {
+            return Discovered::found(Self::placeholder(root));
+        };
         let name = display_name(&root);
         match wsl::classify(&root) {
             wsl::Location::Wsl { distro, linux_path } => {
-                Self::discover_wsl(root, name, &distro, &linux_path, upstream, blocking)
+                Self::discover_wsl(root, name, &distro, &linux_path, git, upstream, blocking)
             },
             // A directory that is not a repository is a fact, not a failure.
             wsl::Location::Windows(_) => match Repository::open(&root) {
-                Ok(repo) => Discovered::found(Self::from_repo(root, name, &repo, upstream)),
+                Ok(repo) => Discovered::found(Self::from_repo(root, name, &repo, git, upstream)),
                 Err(_) => Discovered::found(Self::placeholder(root)),
             },
         }
@@ -111,18 +109,19 @@ impl Project {
     pub fn placeholder(root: PathBuf) -> Self {
         let name = display_name(&root);
         Project {
-            worktrees: vec![Worktree {
+            checkouts: vec![Checkout {
                 name: name.clone(),
                 path: root.clone(),
-                branch: None,
+                head: Head::default(),
                 is_main: true,
-                prunable: false,
+                gone: false,
                 upstream: None,
             }],
             root,
             name,
             label: None,
-            default_branch: None,
+            vcs: None,
+            trunk: None,
             expanded: true,
             shell_override: None,
             home: None,
@@ -138,11 +137,12 @@ impl Project {
         name: String,
         distro: &str,
         linux_path: &str,
+        git: Vcs,
         upstream: bool,
         blocking: &jobs::Blocking,
     ) -> Discovered {
         let run = |script: &str, args: &[&str]| wsl::run_batch(distro, script, args, blocking);
-        Self::discover_from_batch(root, name, distro, linux_path, upstream, run)
+        Self::discover_from_batch(root, name, distro, linux_path, git, upstream, run)
     }
 
     /// Discovery once the round trip is somebody else's problem, so a test
@@ -152,6 +152,7 @@ impl Project {
         name: String,
         distro: &str,
         linux_path: &str,
+        git: Vcs,
         upstream: bool,
         run: impl Fn(&str, &[&str]) -> Result<Vec<u8>, wsl::BatchError>,
     ) -> Discovered {
@@ -167,34 +168,36 @@ impl Project {
 
         let records = parse_worktree_list_z(reply.bytes("worktrees"));
         let upstreams = crate::upstream::parse_for_each_ref(reply.bytes("upstreams"));
-        let worktrees: Vec<Worktree> = records
+        let checkouts: Vec<Checkout> = records
             .iter()
             .enumerate()
             .map(|(i, rec)| {
                 let path = wsl::linux_to_windows(&rec.path, distro);
-                // Same rendering as the git2 arm: branch name, or the short
-                // OID when detached.
-                let branch = rec
-                    .branch
-                    .clone()
-                    .or_else(|| rec.head.as_ref().map(|h| h.chars().take(7).collect()));
+                // Same shape as the git2 arm: the branch when there is one,
+                // and the short OID either way.
+                let head = Head {
+                    name: rec.branch.clone(),
+                    revision: rec.head.as_ref().map(|h| h.chars().take(7).collect()),
+                    distance: None,
+                };
                 let wt_name = if i == 0 { "main".to_string() } else { display_name(&path) };
-                let prunable = i != 0 && crate::worktree_liveness::is_gone(&path);
+                let gone = i != 0 && crate::worktree_liveness::is_gone(&path);
                 let upstream = rec.branch.as_deref().and_then(|b| upstreams.get(b).cloned());
-                Worktree { name: wt_name, path, branch, is_main: i == 0, prunable, upstream }
+                Checkout { name: wt_name, path, head, is_main: i == 0, gone, upstream }
             })
             .collect();
 
-        match classify_wsl_answer(stdout.is_ok(), reply.text("is_repo") == "yes", worktrees.len()) {
+        match classify_wsl_answer(stdout.is_ok(), reply.text("is_repo") == "yes", checkouts.len()) {
             WslAnswer::Unreachable => Discovered::unavailable(Self::placeholder(root)),
             WslAnswer::NotARepo => Discovered::found(Self::placeholder(root)),
             WslAnswer::Repo => Discovered::found(Project {
-                default_branch: default_branch_from_batch(
+                vcs: Some(git),
+                trunk: default_branch_from_batch(
                     &reply.text("origin_head"),
                     &reply.text("well_known_heads"),
                     &reply.text("init_default"),
                 ),
-                worktrees,
+                checkouts,
                 root,
                 name,
                 label: None,
@@ -205,24 +208,24 @@ impl Project {
         }
     }
 
-    fn from_repo(root: PathBuf, name: String, repo: &Repository, upstream: bool) -> Self {
+    fn from_repo(root: PathBuf, name: String, repo: &Repository, git: Vcs, upstream: bool) -> Self {
         let main_path = repo.workdir().map(|p| p.to_path_buf()).unwrap_or_else(|| root.clone());
 
         let upstreams =
             if upstream { crate::upstream::map_from_repo(repo) } else { HashMap::new() };
-        let lookup = |branch: &Option<String>, detached: bool| {
-            if detached { None } else { branch.as_deref().and_then(|b| upstreams.get(b).cloned()) }
-        };
+        // A detached head names no branch, so it never adopts the state of a
+        // branch that happens to share its short OID.
+        let lookup = |head: &Head| head.name.as_deref().and_then(|b| upstreams.get(b).cloned());
 
-        let mut worktrees = Vec::new();
-        let (branch, detached) = current_branch(repo);
-        let upstream = lookup(&branch, detached);
-        worktrees.push(Worktree {
+        let mut checkouts = Vec::new();
+        let head = current_head(repo);
+        let upstream = lookup(&head);
+        checkouts.push(Checkout {
             name: "main".to_string(),
             path: main_path.clone(),
-            branch,
+            head,
             is_main: true,
-            prunable: false,
+            gone: false,
             upstream,
         });
 
@@ -230,24 +233,25 @@ impl Project {
             for name in names.iter().flatten() {
                 if let Ok(wt) = repo.find_worktree(name) {
                     let path = wt.path().to_path_buf();
-                    let (branch, detached) = match Repository::open(&path)
+                    let head = Repository::open(&path)
                         .ok()
-                        .map(|wt_repo| current_branch(&wt_repo))
-                    {
-                        Some((Some(branch), detached)) => (Some(branch), detached),
-                        _ => (branch_from_admin_head(repo, name), false),
-                    };
-                    let upstream = lookup(&branch, detached);
-                    worktrees.push(Worktree {
+                        .map(|wt_repo| current_head(&wt_repo))
+                        .filter(|head| head.label().is_some())
+                        .unwrap_or_else(|| Head {
+                            name: branch_from_admin_head(repo, name),
+                            ..Head::default()
+                        });
+                    let upstream = lookup(&head);
+                    checkouts.push(Checkout {
                         name: name.to_string(),
                         // The checkout's own `.git`, not git2's `is_prunable`: a
                         // *locked* worktree with a missing checkout is not
                         // git-prunable but still cannot host a shell, and a
                         // half-finished remove leaves the directory behind
                         // without it.
-                        prunable: crate::worktree_liveness::is_gone(&path),
+                        gone: crate::worktree_liveness::is_gone(&path),
                         path,
-                        branch,
+                        head,
                         is_main: false,
                         upstream,
                     });
@@ -256,8 +260,9 @@ impl Project {
         }
 
         Project {
-            default_branch: detect_default_branch(repo),
-            worktrees,
+            vcs: Some(git),
+            trunk: detect_default_branch(repo),
+            checkouts,
             root,
             name,
             label: None,
@@ -286,18 +291,19 @@ impl Project {
         if !found.authoritative {
             return;
         }
-        let mut worktrees = found.project.worktrees;
-        let stranded: Vec<Worktree> = self
-            .worktrees
+        let mut checkouts = found.project.checkouts;
+        let stranded: Vec<Checkout> = self
+            .checkouts
             .drain(..)
             .filter(|wt| {
-                occupied.contains(&wt.path) && !worktrees.iter().any(|fresh| fresh.path == wt.path)
+                occupied.contains(&wt.path) && !checkouts.iter().any(|fresh| fresh.path == wt.path)
             })
-            .map(|wt| Worktree { prunable: true, upstream: None, ..wt })
+            .map(|wt| Checkout { gone: true, upstream: None, ..wt })
             .collect();
-        worktrees.extend(stranded);
-        self.worktrees = worktrees;
-        self.default_branch = found.project.default_branch;
+        checkouts.extend(stranded);
+        self.checkouts = checkouts;
+        self.vcs = found.project.vcs;
+        self.trunk = found.project.trunk;
         self.home = found.project.home;
     }
 }
@@ -309,31 +315,30 @@ pub fn project_json(project: &Project) -> Value {
         "name": project.display_name(),
         "label": project.label,
         "root": project.root,
-        "default_branch": project.default_branch,
+        "default_branch": project.trunk,
         "worktrees": project
-            .worktrees
+            .checkouts
             .iter()
             .map(|wt| json!({
                 "name": wt.name,
                 "path": wt.path,
-                "branch": wt.branch,
+                "branch": wt.head.label(),
                 "is_main": wt.is_main,
             }))
             .collect::<Vec<_>>(),
     })
 }
 
-/// Branch name, or the short OID when detached.  The flag is what callers
-/// key on: the OID string is indistinguishable from a branch name.
-fn current_branch(repo: &Repository) -> (Option<String>, bool) {
+/// The branch HEAD names, when it names one, and the short OID either way.
+/// Keeping them apart is what tells a detached head from a branch that
+/// happens to be named like an OID.
+fn current_head(repo: &Repository) -> Head {
     let Ok(head) = repo.head() else {
-        return (None, false);
+        return Head::default();
     };
-    if head.is_branch() {
-        (head.shorthand().map(|s| s.to_string()), false)
-    } else {
-        (head.target().map(|oid| oid.to_string().chars().take(7).collect()), true)
-    }
+    let revision = head.target().map(|oid| oid.to_string().chars().take(7).collect());
+    let name = if head.is_branch() { head.shorthand().map(str::to_string) } else { None };
+    Head { name, revision, distance: None }
 }
 
 /// A prunable worktree's checkout is gone, so its HEAD can't be read via
@@ -549,27 +554,27 @@ mod tests {
     #[test]
     fn refresh_keeps_worktrees_when_discovery_is_not_authoritative() {
         let mut project = Project::placeholder(PathBuf::from("/nonexistent-root"));
-        project.default_branch = Some("develop".to_string());
-        project.worktrees = vec![
-            Worktree {
+        project.trunk = Some("develop".to_string());
+        project.checkouts = vec![
+            Checkout {
                 name: "main".to_string(),
                 path: PathBuf::from("/nonexistent-root"),
-                branch: None,
+                head: Head { name: None, ..Head::default() },
                 is_main: true,
-                prunable: false,
+                gone: false,
                 upstream: None,
             },
-            Worktree {
+            Checkout {
                 name: "feature".to_string(),
                 path: PathBuf::from("/nonexistent-root-feature"),
-                branch: Some("feature".to_string()),
+                head: Head { name: Some("feature".to_string()), ..Head::default() },
                 is_main: false,
-                prunable: false,
+                gone: false,
                 upstream: None,
             },
         ];
 
-        let before = project.worktrees.clone();
+        let before = project.checkouts.clone();
         project.apply(
             Discovered {
                 project: Project::placeholder(project.root.clone()),
@@ -578,10 +583,10 @@ mod tests {
             &HashSet::new(),
         );
 
-        assert_eq!(project.worktrees.len(), before.len());
-        assert_eq!(project.worktrees[1].name, "feature");
+        assert_eq!(project.checkouts.len(), before.len());
+        assert_eq!(project.checkouts[1].name, "feature");
         assert_eq!(
-            project.default_branch.as_deref(),
+            project.trunk.as_deref(),
             Some("develop"),
             "an unreachable backend must not erase the known default branch either"
         );
@@ -591,13 +596,13 @@ mod tests {
     fn apply_adopts_an_authoritative_result() {
         let mut project = Project::placeholder(PathBuf::from("/root"));
         let mut fresh = Project::placeholder(PathBuf::from("/root"));
-        fresh.worktrees.clear();
-        fresh.default_branch = Some("main".to_string());
+        fresh.checkouts.clear();
+        fresh.trunk = Some("main".to_string());
 
         project.apply(Discovered { project: fresh, authoritative: true }, &HashSet::new());
 
-        assert!(project.worktrees.is_empty());
-        assert_eq!(project.default_branch.as_deref(), Some("main"));
+        assert!(project.checkouts.is_empty());
+        assert_eq!(project.trunk.as_deref(), Some("main"));
     }
 
     /// `git worktree prune` drops the worktree from discovery while its shells
@@ -606,45 +611,45 @@ mod tests {
     #[test]
     fn apply_keeps_a_dropped_worktree_that_still_holds_sessions() {
         let mut project = Project::placeholder(PathBuf::from("/repo"));
-        project.worktrees = vec![Worktree {
+        project.checkouts = vec![Checkout {
             name: "gone".to_string(),
             path: PathBuf::from("/repo-worktrees/gone"),
-            branch: Some("feature".to_string()),
+            head: Head { name: Some("feature".to_string()), ..Head::default() },
             is_main: false,
-            prunable: false,
+            gone: false,
             upstream: None,
         }];
 
         let mut fresh = Project::placeholder(PathBuf::from("/repo"));
-        fresh.worktrees.clear();
+        fresh.checkouts.clear();
         let occupied = HashSet::from([PathBuf::from("/repo-worktrees/gone")]);
 
         project.apply(Discovered::found(fresh), &occupied);
 
-        let kept = project.worktrees.first().expect("the row survives its checkout");
+        let kept = project.checkouts.first().expect("the row survives its checkout");
         assert_eq!(kept.path, PathBuf::from("/repo-worktrees/gone"));
-        assert_eq!(kept.branch.as_deref(), Some("feature"), "the branch still names the row");
-        assert!(kept.prunable, "but it can no longer host a new shell");
+        assert_eq!(kept.head.name.as_deref(), Some("feature"), "the branch still names the row");
+        assert!(kept.gone, "but it can no longer host a new shell");
     }
 
     #[test]
     fn apply_drops_a_worktree_once_its_last_session_is_gone() {
         let mut project = Project::placeholder(PathBuf::from("/repo"));
-        project.worktrees = vec![Worktree {
+        project.checkouts = vec![Checkout {
             name: "gone".to_string(),
             path: PathBuf::from("/repo-worktrees/gone"),
-            branch: None,
+            head: Head { name: None, ..Head::default() },
             is_main: false,
-            prunable: true,
+            gone: true,
             upstream: None,
         }];
 
         let mut fresh = Project::placeholder(PathBuf::from("/repo"));
-        fresh.worktrees.clear();
+        fresh.checkouts.clear();
 
         project.apply(Discovered::found(fresh), &HashSet::new());
 
-        assert!(project.worktrees.is_empty());
+        assert!(project.checkouts.is_empty());
     }
 
     #[test]
@@ -662,12 +667,44 @@ mod tests {
         assert_eq!(classify_wsl_answer(reached, repo, 2), WslAnswer::Repo);
     }
 
+    fn git_backends() -> Vec<crate::vcs::Vcs> {
+        crate::vcs::backends(&crate::config::IntegrationsConfig::default())
+    }
+
+    /// `topic` is no well-known name and has no `origin/HEAD` behind it, so no
+    /// trunk resolves, and the repository must still count as one.
+    #[test]
+    fn a_repository_without_a_detectable_trunk_is_still_a_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = alacritree_git::test_support::init_repo_on(dir.path(), "topic");
+        let found =
+            jobs::on_this_thread(|b| Project::discover(repo.clone(), &git_backends(), false, b));
+        assert!(found.project.trunk.is_none());
+        assert!(found.project.vcs.is_some());
+        assert_eq!(found.project.checkouts[0].head.name.as_deref(), Some("topic"));
+    }
+
+    #[test]
+    fn a_detached_worktree_keeps_its_revision_apart_from_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = alacritree_git::test_support::init_repo(&dir.path().join("repo"));
+        let wt = alacritree_git::test_support::add_worktree(&repo, "side");
+        alacritree_git::test_support::detach(&wt);
+        let found =
+            jobs::on_this_thread(|b| Project::discover(repo.clone(), &git_backends(), false, b));
+        let side = found.project.checkouts.iter().find(|c| c.path == wt).unwrap();
+        assert_eq!(side.head.name, None);
+        assert_eq!(side.head.label().map(str::len), Some(7));
+    }
+
     #[test]
     fn a_non_git_windows_root_is_authoritative() {
         let dir = tempfile::tempdir().unwrap();
-        let found = jobs::on_this_thread(|b| Project::discover(dir.path().to_path_buf(), false, b));
+        let found = jobs::on_this_thread(|b| {
+            Project::discover(dir.path().to_path_buf(), &git_backends(), false, b)
+        });
         assert!(found.authoritative, "a directory that is genuinely not a repo is the truth");
-        assert_eq!(found.project.worktrees.len(), 1);
+        assert_eq!(found.project.checkouts.len(), 1);
     }
 
     #[test]
@@ -677,10 +714,12 @@ mod tests {
         let repo = init_repo(&repo_dir);
         add_worktree(&repo, "feature");
 
-        let project = jobs::on_this_thread(|b| Project::discover(repo_dir, false, b)).project;
-        let wt = project.worktrees.iter().find(|w| w.name == "feature").unwrap();
-        assert!(!wt.prunable);
-        assert_eq!(wt.branch.as_deref(), Some("feature"));
+        let project =
+            jobs::on_this_thread(|b| Project::discover(repo_dir, &git_backends(), false, b))
+                .project;
+        let wt = project.checkouts.iter().find(|w| w.name == "feature").unwrap();
+        assert!(!wt.gone);
+        assert_eq!(wt.head.name.as_deref(), Some("feature"));
     }
 
     /// A distro root has no `file_name()`, so the name falls back to the whole
@@ -699,10 +738,12 @@ mod tests {
         let wt_path = add_worktree(&repo, "feature");
         std::fs::remove_dir_all(&wt_path).unwrap();
 
-        let project = jobs::on_this_thread(|b| Project::discover(repo_dir, false, b)).project;
-        let wt = project.worktrees.iter().find(|w| w.name == "feature").unwrap();
-        assert!(wt.prunable);
-        assert_eq!(wt.branch.as_deref(), Some("feature"));
+        let project =
+            jobs::on_this_thread(|b| Project::discover(repo_dir, &git_backends(), false, b))
+                .project;
+        let wt = project.checkouts.iter().find(|w| w.name == "feature").unwrap();
+        assert!(wt.gone);
+        assert_eq!(wt.head.name.as_deref(), Some("feature"));
     }
 
     #[test]
@@ -711,9 +752,11 @@ mod tests {
         let repo_dir = tmp.path().join("repo");
         init_repo(&repo_dir);
 
-        let project = jobs::on_this_thread(|b| Project::discover(repo_dir, false, b)).project;
-        assert!(project.worktrees[0].is_main);
-        assert!(!project.worktrees[0].prunable);
+        let project =
+            jobs::on_this_thread(|b| Project::discover(repo_dir, &git_backends(), false, b))
+                .project;
+        assert!(project.checkouts[0].is_main);
+        assert!(!project.checkouts[0].gone);
     }
 
     #[test]
@@ -722,7 +765,9 @@ mod tests {
         let repo_dir = tmp.path().join("repo");
         init_repo(&repo_dir);
 
-        let mut project = jobs::on_this_thread(|b| Project::discover(repo_dir, false, b)).project;
+        let mut project =
+            jobs::on_this_thread(|b| Project::discover(repo_dir, &git_backends(), false, b))
+                .project;
         assert_eq!(project.display_name(), "repo");
 
         project.label = Some("Work".to_string());
@@ -780,6 +825,7 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
             "proj".to_string(),
             "Ubuntu",
             "/home/lev/proj",
+            git_backends().remove(0),
             false,
             recorded(sections),
         )
@@ -797,10 +843,10 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
             b"",
         ]);
         let project = discovered.project;
-        assert_eq!(project.default_branch.as_deref(), Some("trunk"), "origin/HEAD wins");
+        assert_eq!(project.trunk.as_deref(), Some("trunk"), "origin/HEAD wins");
         assert_eq!(project.home.as_deref(), Some("/home/lev"));
-        assert_eq!(project.worktrees.len(), 1);
-        assert_eq!(project.worktrees[0].branch.as_deref(), Some("main"));
+        assert_eq!(project.checkouts.len(), 1);
+        assert_eq!(project.checkouts[0].head.name.as_deref(), Some("main"));
     }
 
     #[test]
@@ -815,7 +861,7 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
             b"",
         ]);
         assert_eq!(
-            names.project.default_branch.as_deref(),
+            names.project.trunk.as_deref(),
             Some("master"),
             "a present well-known name outranks init.defaultBranch"
         );
@@ -829,15 +875,15 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
             b"/home/lev",
             b"",
         ]);
-        assert_eq!(config.project.default_branch.as_deref(), Some("mainline"));
+        assert_eq!(config.project.trunk.as_deref(), Some("mainline"));
     }
 
     #[test]
     fn a_folder_that_is_not_a_repository_gets_the_placeholder_worktree() {
         let discovered = discover_recorded(&[b"no", b"", b"", b"", b"", b"/home/lev", b""]);
         let project = discovered.project;
-        assert!(project.default_branch.is_none());
-        assert_eq!(project.worktrees.len(), 1, "a non-git folder still gets a shell");
+        assert!(project.trunk.is_none());
+        assert_eq!(project.checkouts.len(), 1, "a non-git folder still gets a shell");
     }
 
     /// A truncated batch cannot be told from a repository with no worktrees,
@@ -855,6 +901,7 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
             "proj".to_string(),
             "Ubuntu",
             "/home/lev/proj",
+            git_backends().remove(0),
             false,
             |_: &str, _: &[&str]| Err(wsl::BatchError::Refused { stderr: "no distro".into() }),
         );
@@ -893,7 +940,7 @@ sep
         }
     }
 
-    /// A detached HEAD's `branch` holds a short OID, and a real branch can be
+    /// A detached head's label is its short OID, and a real branch can be
     /// named the same thing.  Build a worktree where that collision actually
     /// occurs and check the lookup, not just that the record has no branch —
     /// the latter holds whether or not the lookup guards against the collision.
@@ -910,9 +957,11 @@ sep
         repo.branch(&short, &repo.find_commit(oid).unwrap(), false).unwrap();
         repo.set_head_detached(oid).unwrap();
 
-        let project =
-            jobs::on_this_thread(|b| Project::discover(dir.path().to_path_buf(), true, b)).project;
-        let main = &project.worktrees[0];
+        let project = jobs::on_this_thread(|b| {
+            Project::discover(dir.path().to_path_buf(), &git_backends(), true, b)
+        })
+        .project;
+        let main = &project.checkouts[0];
         assert!(
             main.upstream.is_none(),
             "a detached row must not adopt the same-named branch's state"
@@ -937,16 +986,19 @@ sep
         head_branch.set_upstream(Some("upstream-branch")).unwrap();
 
         let with_flag =
-            jobs::on_this_thread(|b| Project::discover(repo_dir.clone(), true, b)).project;
-        let without_flag = jobs::on_this_thread(|b| Project::discover(repo_dir, false, b)).project;
+            jobs::on_this_thread(|b| Project::discover(repo_dir.clone(), &git_backends(), true, b))
+                .project;
+        let without_flag =
+            jobs::on_this_thread(|b| Project::discover(repo_dir, &git_backends(), false, b))
+                .project;
 
         assert_eq!(
-            with_flag.worktrees[0].upstream,
+            with_flag.checkouts[0].upstream,
             Some(alacritree_vcs::UpstreamState::Level { upstream: "upstream-branch".to_string() }),
             "a real upstream must be found when the flag is on"
         );
         assert_eq!(
-            without_flag.worktrees[0].upstream, None,
+            without_flag.checkouts[0].upstream, None,
             "the same upstream must not be found when the flag is off"
         );
     }
@@ -962,13 +1014,13 @@ sep
         existing.expanded = false;
 
         let mut fresh = Project::placeholder(PathBuf::from("/repo"));
-        fresh.default_branch = Some("main".to_string());
+        fresh.trunk = Some("main".to_string());
         fresh.home = Some("/home/lev".to_string());
 
         existing.apply(Discovered::found(fresh), &HashSet::new());
 
         assert_eq!(existing.home.as_deref(), Some("/home/lev"));
-        assert_eq!(existing.default_branch.as_deref(), Some("main"));
+        assert_eq!(existing.trunk.as_deref(), Some("main"));
         assert_eq!(existing.label.as_deref(), Some("Work"), "a rename is user state");
         assert!(!existing.expanded, "the expand toggle is user state");
     }

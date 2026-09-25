@@ -3,6 +3,7 @@
 //! of the repo's default branch. The lookup is best-effort: a forge that
 //! fails or finds nothing leaves the default branch in place.
 
+use alacritree_vcs::Checkout;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -10,7 +11,7 @@ use std::time::{Duration, Instant};
 use alacritree_forge::{Head, PrInfo, PrState, PullRequests, RemoteForge};
 
 use crate::jobs;
-use crate::projects::Worktree;
+
 use crate::repaint::Repaint;
 
 /// Re-query at most this often. PR base branches rarely change, and a stale
@@ -402,19 +403,19 @@ pub(crate) fn pr_pass(
 /// in-terminal checkout. Every other worktree has a single poller, and an
 /// inactive workspace's `StatusCache` is created once and then never re-polled
 /// or pruned: reading it would freeze the branch at whatever it was on the last
-/// visit and shadow later `refresh_project` updates to `wt.branch`.
+/// visit and shadow later `refresh_project` updates to `wt.head`.
 pub(crate) fn effective_branch<'a>(
-    wt: &'a Worktree,
+    wt: &'a Checkout,
     current_workspace: Option<&Path>,
     live: Option<&'a alacritree_vcs::Head>,
 ) -> Option<&'a str> {
     if current_workspace == Some(wt.path.as_path()) {
         match live {
             Some(head) => head.name.as_deref(),
-            None => wt.branch.as_deref(),
+            None => wt.head.name.as_deref(),
         }
     } else {
-        wt.branch.as_deref()
+        wt.head.name.as_deref()
     }
 }
 
@@ -595,13 +596,13 @@ mod tests {
         assert!(!entry.pending, "None poll must not queue a competing lookup");
     }
 
-    fn worktree(path: &str, branch: Option<&str>) -> Worktree {
-        Worktree {
+    fn worktree(path: &str, branch: Option<&str>) -> Checkout {
+        Checkout {
             name: String::new(),
             path: PathBuf::from(path),
-            branch: branch.map(String::from),
+            head: alacritree_vcs::Head { name: branch.map(String::from), ..Default::default() },
             is_main: false,
-            prunable: false,
+            gone: false,
             upstream: None,
         }
     }
@@ -647,6 +648,13 @@ mod tests {
         let wt = worktree("/repo/wt", Some("stored"));
         let active = Some(Path::new("/repo/wt"));
         assert_eq!(effective_branch(&wt, active, Some(&live_head(Some("live")))), Some("live"));
+    }
+
+    #[test]
+    fn a_detached_checkout_elsewhere_queries_no_pull_request() {
+        let mut wt = worktree("/repo/wt", None);
+        wt.head.revision = Some("abc1234".into());
+        assert_eq!(effective_branch(&wt, Some(Path::new("/repo/other")), None), None);
     }
 
     #[test]

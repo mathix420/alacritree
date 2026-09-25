@@ -766,7 +766,7 @@ pub(super) fn pane_workspaces(
 ) -> Vec<PathBuf> {
     projects
         .iter()
-        .flat_map(|p| p.worktrees.iter())
+        .flat_map(|p| p.checkouts.iter())
         .filter(|wt| !worktree_looks_gone(wt, missing(&wt.path)))
         .map(|wt| wt.path.clone())
         .collect()

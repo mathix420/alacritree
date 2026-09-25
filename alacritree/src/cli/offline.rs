@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use crate::ipc::protocol::{IpcRequest, IpcResult, status_json};
 use crate::projects::{self, NotAProject, Project, project_json};
 use crate::state::{self, PersistedProject, PersistedState};
+use crate::vcs::Vcs;
 use crate::worktree::{self as wt, CreateConfig, CreateRequest};
 use crate::{jobs, scratchpad};
 
@@ -33,16 +34,19 @@ fn handle_at(state_path: &Path, request: &IpcRequest, config: &CreateConfig) -> 
             // No window means no focused workspace, the same value the app
             // reports for its home tab.
             "current_workspace": Value::Null,
-            "projects": discover_all(state_path).iter().map(project_json).collect::<Vec<_>>(),
+            "projects": discover_all(state_path, &config.vcs)
+                .iter()
+                .map(project_json)
+                .collect::<Vec<_>>(),
         })),
-        IpcRequest::AddProject { path } => Ok(project_json(&add(state_path, path))),
+        IpcRequest::AddProject { path } => Ok(project_json(&add(state_path, path, &config.vcs))),
         IpcRequest::RemoveProject { root } => {
             remove(state_path, root).map_err(|e| e.to_string())?;
             Ok(json!({ "removed": root }))
         },
         IpcRequest::RenameProject { root, label } => {
             rename(state_path, root, label.clone()).map_err(|e| e.to_string())?;
-            let renamed = discover_all(state_path)
+            let renamed = discover_all(state_path, &config.vcs)
                 .into_iter()
                 .find(|p| p.root == *root)
                 .ok_or_else(|| NotAProject(root.clone()).to_string())?;
@@ -52,7 +56,7 @@ fn handle_at(state_path: &Path, request: &IpcRequest, config: &CreateConfig) -> 
         // It still has to fail on a root the sidebar does not have, or it
         // would report on projects the user never added.
         IpcRequest::RefreshProject { root } => {
-            let known = discover_all(state_path)
+            let known = discover_all(state_path, &config.vcs)
                 .into_iter()
                 .find(|p| p.root == *root)
                 .ok_or_else(|| NotAProject(root.clone()).to_string())?;
@@ -94,14 +98,17 @@ fn handle_at(state_path: &Path, request: &IpcRequest, config: &CreateConfig) -> 
     }
 }
 
-fn add(state_path: &Path, path: &Path) -> Project {
+fn add(state_path: &Path, path: &Path, backends: &[Vcs]) -> Project {
     let root = path.to_path_buf();
     state::mutate_at(state_path, |s| {
         if !s.projects.iter().any(|p| p.root == root) {
             s.projects.push(PersistedProject { root, expanded: true, shell: None, label: None });
         }
     });
-    jobs::on_this_thread(|blocking| Project::discover(path.to_path_buf(), false, blocking)).project
+    jobs::on_this_thread(|blocking| {
+        Project::discover(path.to_path_buf(), backends, false, blocking)
+    })
+    .project
 }
 
 fn remove(state_path: &Path, root: &Path) -> Result<(), NotAProject> {
@@ -131,13 +138,15 @@ fn rename(state_path: &Path, root: &Path, label: Option<String>) -> Result<(), N
     Ok(())
 }
 
-fn discover_all(state_path: &Path) -> Vec<Project> {
+fn discover_all(state_path: &Path, backends: &[Vcs]) -> Vec<Project> {
     let PersistedState { projects, .. } = state::load_from(state_path);
     projects
         .into_iter()
         .map(|p| {
-            let mut project =
-                jobs::on_this_thread(|blocking| Project::discover(p.root, false, blocking)).project;
+            let mut project = jobs::on_this_thread(|blocking| {
+                Project::discover(p.root, backends, false, blocking)
+            })
+            .project;
             project.expanded = p.expanded;
             project.label = p.label;
             project

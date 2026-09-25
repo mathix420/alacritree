@@ -38,7 +38,7 @@ use crate::multiplexer::{
 use crate::panel_filter::{self, PanelFilter};
 use crate::path_style::PathStyle;
 use crate::pr_status::{self, PrCache};
-use crate::projects::{Discovered, NotAProject, Project, Worktree, project_json};
+use crate::projects::{Discovered, NotAProject, Project, project_json};
 use crate::session::{
     self, Attachment, AttentionVerdict, LiveState, PendingAttention, Session, SessionActivity,
     SessionId, SessionKind, ShellCommand, ShownState, TermSize, poll_attention_debounce,
@@ -56,7 +56,7 @@ use crate::{
     clipboard_image, file_drop, ipc, jobs, mouse_hide, notify, paste, path_style, scratchpad,
     sidebar_focus, terminal_view, worktree_liveness,
 };
-use alacritree_vcs::{Dirty, UpstreamState, VersionControl};
+use alacritree_vcs::{Checkout, Dirty, UpstreamState, VersionControl};
 
 mod actions;
 mod focus;
@@ -439,7 +439,7 @@ pub struct AlacritreeApp {
     /// Every multiplexer alacritree hosts panes from, each with its own
     /// listing and calls in flight.
     multiplexers: Multiplexers,
-    /// Row styling only, never `Worktree::prunable`, which the delete flow
+    /// Row styling only, never `Checkout::gone`, which the delete flow
     /// reads to choose between removing a worktree and pruning it.
     liveness: worktree_liveness::LivenessCache,
     /// The probe job in flight, if any.  One at a time: a path slower than
@@ -619,7 +619,9 @@ impl AlacritreeApp {
                 let root = wsl::normalize_root(p.root.clone());
                 let mut project = match wsl::classify(&root) {
                     wsl::Location::Windows(_) => jobs::on_this_thread(|blocking| {
-                        Project::discover(root, config.ui.upstream_status, blocking).project
+                        let backends = crate::vcs::backends(&config.integrations);
+                        Project::discover(root, &backends, config.ui.upstream_status, blocking)
+                            .project
                     }),
                     wsl::Location::Wsl { .. } => Project::placeholder(root),
                 };
@@ -749,9 +751,10 @@ impl AlacritreeApp {
         let ctx = ctx.clone();
         let worker_root = root.clone();
         let upstream = self.config.ui.upstream_status;
+        let backends = self.vcs_backends.clone();
         self.project_refreshes.start(root, || {
             jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
-                let found = Project::discover(worker_root, upstream, blocking);
+                let found = Project::discover(worker_root, &backends, upstream, blocking);
                 ctx.request_repaint();
                 found
             })
@@ -857,9 +860,9 @@ impl AlacritreeApp {
             let known = self
                 .projects
                 .iter()
-                .flat_map(|p| &p.worktrees)
+                .flat_map(|p| &p.checkouts)
                 .find(|wt| wt.path == *path)
-                .map(|wt| wt.branch.as_deref());
+                .map(|wt| wt.head.label());
             if let Some(known) = known
                 && self.liveness.branch_moved(path, head, known)
             {
@@ -870,7 +873,7 @@ impl AlacritreeApp {
             return;
         }
         for idx in 0..self.projects.len() {
-            if self.projects[idx].worktrees.iter().any(|wt| moved.contains(&wt.path.as_path())) {
+            if self.projects[idx].checkouts.iter().any(|wt| moved.contains(&wt.path.as_path())) {
                 self.refresh_project(ctx, idx);
             }
         }
@@ -1107,17 +1110,28 @@ impl AlacritreeApp {
         self.focus_terminal();
     }
 
-    /// Home has neither. A folder that is not a repository has a project but
+    /// Home has neither. A folder with no version control has a project but
     /// no worktree, since its placeholder has no branch to key a workspace on.
-    fn project_and_worktree(&self, ws: &WorkspaceKey) -> (Option<&Project>, Option<&Worktree>) {
+    fn project_and_worktree(&self, ws: &WorkspaceKey) -> (Option<&Project>, Option<&Checkout>) {
         let Some(path) = ws else { return (None, None) };
         self.projects
             .iter()
             .find_map(|p| {
-                let wt = p.worktrees.iter().find(|wt| wt.path == *path)?;
-                Some((Some(p), p.default_branch.is_some().then_some(wt)))
+                let wt = p.checkouts.iter().find(|wt| wt.path == *path)?;
+                Some((Some(p), p.vcs.is_some().then_some(wt)))
             })
             .unwrap_or((None, None))
+    }
+
+    /// The backend that answers for a checkout: its project's, else the first
+    /// enabled one, so a folder that is no repository still gets that
+    /// backend's own error text.
+    fn vcs_for(&self, path: &Path) -> Option<crate::vcs::Vcs> {
+        self.projects
+            .iter()
+            .find(|p| p.checkouts.iter().any(|c| c.path == path))
+            .and_then(|p| p.vcs.clone())
+            .or_else(|| self.vcs_backends.first().cloned())
     }
 
     fn spawn_scratchpad(
@@ -1156,11 +1170,11 @@ impl AlacritreeApp {
             return;
         }
         let main_checkout = self.projects.iter().find_map(|p| {
-            let owns = p.worktrees.iter().any(|wt| !wt.is_main && wt.path == worktree);
+            let owns = p.checkouts.iter().any(|wt| !wt.is_main && wt.path == worktree);
             if !owns {
                 return None;
             }
-            p.worktrees.iter().find(|wt| wt.is_main).map(|wt| wt.path.clone())
+            p.checkouts.iter().find(|wt| wt.is_main).map(|wt| wt.path.clone())
         });
         let Some(main_checkout) = main_checkout else {
             return;
@@ -1217,7 +1231,7 @@ impl AlacritreeApp {
         let choice = path.and_then(|p| {
             self.projects
                 .iter()
-                .find(|proj| proj.worktrees.iter().any(|wt| wt.path.as_path() == p))
+                .find(|proj| proj.checkouts.iter().any(|wt| wt.path.as_path() == p))
                 .and_then(|proj| proj.shell_override.clone())
         });
         let location_distro = path.and_then(|p| match wsl::classify(p) {
@@ -1257,7 +1271,7 @@ impl AlacritreeApp {
             self.modals.error_dialog =
                 Some("worktree directory is missing. Prune it from the sidebar.".to_string());
             if let Some(idx) =
-                self.projects.iter().position(|p| p.worktrees.iter().any(|w| w.path == path))
+                self.projects.iter().position(|p| p.checkouts.iter().any(|w| w.path == path))
             {
                 self.refresh_project(ctx, idx);
             }
@@ -1422,7 +1436,7 @@ impl AlacritreeApp {
         }
         let Some((project_idx, wt)) =
             self.projects.iter().enumerate().find_map(|(idx, p)| {
-                p.worktrees.iter().find(|w| w.path == *path).map(|w| (idx, w))
+                p.checkouts.iter().find(|w| w.path == *path).map(|w| (idx, w))
             })
         else {
             return;
@@ -1433,7 +1447,7 @@ impl AlacritreeApp {
         // Discovery marking can be stale; a dir deleted since the last
         // refresh should still get the prune flow, not a doomed
         // `git worktree remove`.
-        let prunable = wt.prunable || worktree_liveness::is_gone(&wt.path);
+        let prunable = wt.gone || worktree_liveness::is_gone(&wt.path);
         // A missing dir has nothing to be dirty; skip the status probe. A
         // worktree the git panel has already completed a compute for answers
         // from that cache instead of walking the tree again. A cache entry
@@ -1459,7 +1473,7 @@ impl AlacritreeApp {
         } else {
             let path = wt.path.clone();
             let job = jobs::pool().spawn(jobs::Priority::Interactive, {
-                let vcs = self.vcs_backends.first().cloned();
+                let vcs = self.vcs_for(&path);
                 move |blocking| {
                     vcs.map_or_else(Dirty::default, |vcs| {
                         vcs.dirty(&path, blocking).unwrap_or_default()
@@ -1472,7 +1486,7 @@ impl AlacritreeApp {
             project_idx,
             worktree_path: wt.path.clone(),
             worktree_name: wt.name.clone(),
-            branch: wt.branch.clone(),
+            branch: wt.head.name.clone(),
             dirty,
             dirty_job,
             prunable,
@@ -1522,7 +1536,7 @@ impl AlacritreeApp {
         let linked = self
             .projects
             .iter()
-            .flat_map(|p| &p.worktrees)
+            .flat_map(|p| &p.checkouts)
             .filter(|wt| wt.path == path)
             .any(|wt| !wt.is_main);
         if linked { worktree_liveness::is_gone(path) } else { !path.is_dir() }
@@ -1538,7 +1552,7 @@ impl AlacritreeApp {
             return;
         };
         if let Some(idx) =
-            self.projects.iter().position(|p| p.worktrees.iter().any(|w| w.path == path))
+            self.projects.iter().position(|p| p.checkouts.iter().any(|w| w.path == path))
         {
             self.refresh_project(ctx, idx);
         }
@@ -1713,7 +1727,7 @@ impl AlacritreeApp {
         let root = self
             .projects
             .iter()
-            .find(|p| p.worktrees.iter().any(|w| w.path == path))
+            .find(|p| p.checkouts.iter().any(|w| w.path == path))
             .map(|p| p.root.clone());
         if let Some(root) = root {
             self.set_project_expanded(&root, true);
@@ -1809,7 +1823,7 @@ impl AlacritreeApp {
     fn workspace_order(&self) -> Vec<WorkspaceKey> {
         let mut order: Vec<WorkspaceKey> = vec![None];
         for project in &self.projects {
-            for wt in &project.worktrees {
+            for wt in &project.checkouts {
                 let has_sessions = self.workspace_has_sessions_only(&Some(wt.path.clone()));
                 if worktree_is_switchable(wt, self.liveness.missing(&wt.path), has_sessions) {
                     order.push(Some(wt.path.clone()));
@@ -2469,7 +2483,7 @@ impl AlacritreeApp {
             wsl::Location::Wsl { .. } => self
                 .projects
                 .iter()
-                .find(|p| p.worktrees.iter().any(|w| w.path == path))
+                .find(|p| p.checkouts.iter().any(|w| w.path == path))
                 .and_then(|p| p.home.clone()),
             wsl::Location::Windows(_) => home::home_dir().map(|h| h.display().to_string()),
         }
@@ -2812,7 +2826,7 @@ impl AlacritreeApp {
     }
 
     fn project_needs_attention(&self, project: &Project) -> bool {
-        project.worktrees.iter().any(|wt| self.workspace_needs_attention(&Some(wt.path.clone())))
+        project.checkouts.iter().any(|wt| self.workspace_needs_attention(&Some(wt.path.clone())))
     }
 
     /// What a collapsed workspace row draws.  A session that is blocked, done
@@ -2966,7 +2980,7 @@ impl AlacritreeApp {
     /// slashes via canonicalization.
     fn known_worktree_path(&self, path: &Path) -> Option<PathBuf> {
         let canonical = path.canonicalize().ok();
-        self.projects.iter().flat_map(|p| &p.worktrees).find_map(|wt| {
+        self.projects.iter().flat_map(|p| &p.checkouts).find_map(|wt| {
             (wt.path == path || canonical.as_deref() == Some(wt.path.as_path()))
                 .then(|| wt.path.clone())
         })
@@ -3484,7 +3498,7 @@ fn workspace_label_for(projects: &[Project], ws: &WorkspaceKey) -> String {
         return "Home".to_string();
     };
     for project in projects {
-        for wt in &project.worktrees {
+        for wt in &project.checkouts {
             if &wt.path == path {
                 return format!("{} / {}", project.display_name(), wt.name);
             }
@@ -3962,7 +3976,7 @@ fn plan_move(
 fn project_main_for(projects: &[Project], ws: &Path) -> Option<PathBuf> {
     let root = sidebar_nav::project_of(projects, &Some(ws.to_path_buf()))?;
     let project = projects.iter().find(|p| p.root == root)?;
-    let main = project.worktrees.iter().find(|w| w.is_main)?;
+    let main = project.checkouts.iter().find(|w| w.is_main)?;
     if main.path == ws { None } else { Some(main.path.clone()) }
 }
 
@@ -3986,7 +4000,7 @@ fn row_project_root(
     };
     projects
         .iter()
-        .find(|p| p.worktrees.iter().any(|w| w.path == workspace))
+        .find(|p| p.checkouts.iter().any(|w| w.path == workspace))
         .map(|p| p.root.clone())
 }
 
@@ -4029,11 +4043,11 @@ fn pane_backed_activity(own: SessionActivity, status: Option<PaneStatus>) -> Ses
 /// this shared so a row that has just gone grey cannot remain a dead stop in
 /// the workspace ring. Main checkouts are never prune candidates, even when
 /// their project is a non-git directory with no .git entry.
-fn worktree_looks_gone(wt: &Worktree, missing: Option<bool>) -> bool {
-    missing.map_or(wt.prunable, |gone| gone && !wt.is_main)
+fn worktree_looks_gone(wt: &Checkout, missing: Option<bool>) -> bool {
+    missing.map_or(wt.gone, |gone| gone && !wt.is_main)
 }
 
-fn worktree_is_switchable(wt: &Worktree, missing: Option<bool>, has_sessions: bool) -> bool {
+fn worktree_is_switchable(wt: &Checkout, missing: Option<bool>, has_sessions: bool) -> bool {
     !worktree_looks_gone(wt, missing) || has_sessions
 }
 
@@ -4088,7 +4102,7 @@ mod tests {
     use crate::test_util::herdr_pane_key;
 
     fn plain_worktree_row<'a>(
-        wt: &'a crate::projects::Worktree,
+        wt: &'a alacritree_vcs::Checkout,
         icons: &'a crate::config::Icons<Color32>,
         theme: &'a Theme,
     ) -> WorktreeRowView<'a> {
@@ -4183,6 +4197,32 @@ mod tests {
         );
         app.sessions.push(session);
         app
+    }
+
+    fn checkout_at(path: &std::path::Path) -> alacritree_vcs::Checkout {
+        alacritree_vcs::Checkout {
+            name: "main".into(),
+            path: path.to_path_buf(),
+            head: alacritree_vcs::Head::default(),
+            is_main: true,
+            gone: false,
+            upstream: None,
+        }
+    }
+
+    #[test]
+    fn a_project_with_a_backend_and_no_trunk_has_a_worktree_for_the_tasks_scope() {
+        let mut app = test_app();
+        let root = PathBuf::from("/r");
+        app.projects.push(Project {
+            vcs: Some(crate::vcs::Vcs::Fake(alacritree_vcs::fake::FakeVcs::new("/r"))),
+            trunk: None,
+            checkouts: vec![checkout_at(&root)],
+            ..Project::placeholder(root.clone())
+        });
+        let (project, worktree) = app.project_and_worktree(&Some(root));
+        assert!(project.is_some());
+        assert!(worktree.is_some());
     }
 
     /// `test_app` with its one session in a workspace nobody is looking at,
@@ -4419,8 +4459,17 @@ mod tests {
         let linked = crate::test_util::add_worktree(&repo, "topic");
         let root = repo.workdir().unwrap().to_path_buf();
         let mut app = test_app();
-        app.projects
-            .push(jobs::on_this_thread(|b| Project::discover(root.clone(), false, b)).project);
+        app.projects.push(
+            jobs::on_this_thread(|b| {
+                Project::discover(
+                    root.clone(),
+                    &crate::vcs::backends(&app.config.integrations),
+                    false,
+                    b,
+                )
+            })
+            .project,
+        );
 
         let head = repo.head().unwrap().peel_to_commit().unwrap();
         for (checkout, branch) in [(&root, "switched-main"), (&linked, "switched-linked")] {
@@ -4433,12 +4482,12 @@ mod tests {
 
         let branches = |app: &AlacritreeApp| {
             let mut branches: Vec<String> =
-                app.projects[0].worktrees.iter().filter_map(|wt| wt.branch.clone()).collect();
+                app.projects[0].checkouts.iter().filter_map(|wt| wt.head.name.clone()).collect();
             branches.sort();
             branches
         };
         let drawn: Vec<PathBuf> =
-            app.projects[0].worktrees.iter().map(|wt| wt.path.clone()).collect();
+            app.projects[0].checkouts.iter().map(|wt| wt.path.clone()).collect();
         let ctx = Context::default();
         app.poll_worktree_liveness(&ctx, true, &drawn);
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -7065,7 +7114,7 @@ mod tests {
         let mut app = lifecycle_app();
         let mut project = project_with("/repo", &["/repo/feature"]);
         project.label = Some("renamed".into());
-        project.worktrees[1].name = "feature".into();
+        project.checkouts[1].name = "feature".into();
         app.projects.push(project);
         app.multiplexers.scripted_mut().set_icon(glyph_icon("✦"));
         let side = Side::Native;
@@ -7255,24 +7304,25 @@ mod tests {
         ]);
     }
 
-    use crate::projects::{Project, Worktree};
+    use crate::projects::Project;
 
     /// A project whose main checkout is `root`, plus secondary worktrees.
     fn project_with(root: &str, extra: &[&str]) -> Project {
-        let wt = |path: &str, is_main: bool| Worktree {
+        let wt = |path: &str, is_main: bool| Checkout {
             name: path.to_string(),
             path: PathBuf::from(path),
-            branch: None,
+            head: alacritree_vcs::Head::default(),
             is_main,
-            prunable: false,
+            gone: false,
             upstream: None,
         };
         Project {
             root: PathBuf::from(root),
             name: "p".to_string(),
             label: None,
-            default_branch: None,
-            worktrees: std::iter::once(wt(root, true))
+            vcs: None,
+            trunk: None,
+            checkouts: std::iter::once(wt(root, true))
                 .chain(extra.iter().map(|p| wt(p, false)))
                 .collect(),
             expanded: true,
@@ -7788,12 +7838,12 @@ mod tests {
     fn hovering_an_elided_worktree_row_reveals_the_full_name() {
         let theme = Theme::from_config(&Config::default());
         let icons = crate::config::Icons::default().map_colors(rgb_to_color32);
-        let wt = crate::projects::Worktree {
+        let wt = alacritree_vcs::Checkout {
             name: "feature/a-branch-name-far-too-long-for-the-sidebar".to_owned(),
             path: PathBuf::from("/repo/wt"),
-            branch: None,
+            head: alacritree_vcs::Head::default(),
             is_main: false,
-            prunable: false,
+            gone: false,
             upstream: None,
         };
 
@@ -7875,12 +7925,12 @@ mod tests {
             italic: false,
             size: None,
         };
-        let wt = crate::projects::Worktree {
+        let wt = alacritree_vcs::Checkout {
             name: "feature/x".to_owned(),
             path: PathBuf::from("/repo/wt"),
-            branch: None,
+            head: alacritree_vcs::Head::default(),
             is_main: false,
-            prunable: false,
+            gone: false,
             upstream: Some(UpstreamState::Gone { upstream: "origin/x".into() }),
         };
         let input = egui::RawInput {
@@ -7996,12 +8046,12 @@ mod tests {
     /// report every text drawn while it lingers there.
     fn texts_while_hovering_badge(theme: &Theme, glyph: &str) -> Vec<Vec<(String, bool)>> {
         let icons = crate::config::Icons::default().map_colors(rgb_to_color32);
-        let wt = crate::projects::Worktree {
+        let wt = alacritree_vcs::Checkout {
             name: "wt".to_owned(),
             path: PathBuf::from("/repo/wt"),
-            branch: None,
+            head: alacritree_vcs::Head::default(),
             is_main: false,
-            prunable: false,
+            gone: false,
             upstream: Some(UpstreamState::Level { upstream: "origin/x".into() }),
         };
         let pr = PrInfo {
@@ -8254,12 +8304,12 @@ mod tests {
         let distinctive = Color32::from_rgb(200, 30, 220);
         icons.delete_worktree =
             IconStyle { color: Some(distinctive), bold: true, ..Default::default() };
-        let wt = crate::projects::Worktree {
+        let wt = alacritree_vcs::Checkout {
             name: "feature/x".to_owned(),
             path: PathBuf::from("/repo/wt"),
-            branch: None,
+            head: alacritree_vcs::Head::default(),
             is_main: false,
-            prunable: false,
+            gone: false,
             upstream: None,
         };
         let input = egui::RawInput {
@@ -8312,12 +8362,12 @@ mod tests {
             let mut config = Config::default();
             config.ui.sidebar_tooltips = mode;
             let theme = Theme::from_config(&config);
-            let wt = crate::projects::Worktree {
+            let wt = alacritree_vcs::Checkout {
                 name: name.to_owned(),
                 path: PathBuf::from("/repo/wt"),
-                branch: None,
+                head: alacritree_vcs::Head::default(),
                 is_main: false,
-                prunable: false,
+                gone: false,
                 upstream: None,
             };
 
@@ -8358,12 +8408,12 @@ mod tests {
     fn render_worktree_row_with_badges() -> Vec<egui::epaint::ClippedShape> {
         let theme = Theme::from_config(&Config::default());
         let icons = crate::config::Icons::default().map_colors(rgb_to_color32);
-        let wt = crate::projects::Worktree {
+        let wt = alacritree_vcs::Checkout {
             name: "feature/x".to_owned(),
             path: PathBuf::from("/repo/wt"),
-            branch: None,
+            head: alacritree_vcs::Head::default(),
             is_main: false,
-            prunable: false,
+            gone: false,
             upstream: Some(UpstreamState::Level { upstream: "origin/x".into() }),
         };
         let pr = PrInfo {
@@ -8906,12 +8956,12 @@ mod tests {
 
     #[test]
     fn a_grey_worktree_only_stays_in_the_workspace_ring_while_it_holds_sessions() {
-        let wt = Worktree {
+        let wt = Checkout {
             name: "gone".into(),
             path: PathBuf::from("/repo-worktrees/gone"),
-            branch: Some("feature".into()),
+            head: alacritree_vcs::Head { name: Some("feature".into()), ..Default::default() },
             is_main: false,
-            prunable: false,
+            gone: false,
             upstream: None,
         };
 
@@ -8921,12 +8971,12 @@ mod tests {
 
     #[test]
     fn a_main_checkout_never_looks_prunable_from_the_row_probe() {
-        let wt = Worktree {
+        let wt = Checkout {
             name: "main".into(),
             path: PathBuf::from("/plain-project"),
-            branch: None,
+            head: alacritree_vcs::Head::default(),
             is_main: true,
-            prunable: false,
+            gone: false,
             upstream: None,
         };
 

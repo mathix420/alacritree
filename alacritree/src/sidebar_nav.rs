@@ -4,12 +4,13 @@
 //! indices: the project list mutates underneath the cursor (git-status
 //! refresh, worktree add/remove), and an index would silently retarget.
 
+use alacritree_vcs::Checkout;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::ReorderScope;
 use crate::multiplexer::PaneKey;
-use crate::projects::{Project, Worktree};
+use crate::projects::Project;
 use crate::session::SessionId;
 use crate::workspace::WorkspaceKey;
 
@@ -75,7 +76,7 @@ pub(crate) fn visible_rows(projects: &[Project], listed: &ListedRows) -> Vec<Sid
     for p in projects {
         rows.push(SidebarRow::Project(p.root.clone()));
         if p.expanded {
-            for wt in &p.worktrees {
+            for wt in &p.checkouts {
                 rows.push(SidebarRow::Worktree(wt.path.clone()));
                 push_entry_rows(&mut rows, listed, &Some(wt.path.clone()));
             }
@@ -88,7 +89,7 @@ pub(crate) fn visible_rows(projects: &[Project], listed: &ListedRows) -> Vec<Sid
 /// list resolves to the first in sidebar order: a session records a directory,
 /// not a project, so there is nothing better to go on.
 fn owning_project<'a>(projects: &'a [Project], path: &Path) -> Option<&'a Project> {
-    projects.iter().find(|p| p.worktrees.iter().any(|w| w.path == path))
+    projects.iter().find(|p| p.checkouts.iter().any(|w| w.path == path))
 }
 
 /// The workspaces a session living in `origin` may move through, in sidebar
@@ -118,7 +119,7 @@ pub(crate) fn move_range(
                 Some(project) => order
                     .iter()
                     .filter(|ws| {
-                        ws.as_deref().is_some_and(|p| project.worktrees.iter().any(|w| w.path == p))
+                        ws.as_deref().is_some_and(|p| project.checkouts.iter().any(|w| w.path == p))
                     })
                     .cloned()
                     .collect(),
@@ -182,7 +183,7 @@ pub(crate) fn step_target(
 /// so nothing better is available.
 pub(crate) fn project_of<'a>(projects: &'a [Project], ws: &WorkspaceKey) -> Option<&'a Path> {
     let path = ws.as_deref()?;
-    projects.iter().find(|p| p.worktrees.iter().any(|w| w.path == path)).map(|p| p.root.as_path())
+    projects.iter().find(|p| p.checkouts.iter().any(|w| w.path == path)).map(|p| p.root.as_path())
 }
 
 /// The row the panel scrolls to when the session on screen changes: the
@@ -284,7 +285,7 @@ pub(crate) fn seed(
         let shown = match &ws {
             None => true,
             Some(path) => {
-                projects.iter().any(|p| p.expanded && p.worktrees.iter().any(|wt| wt.path == *path))
+                projects.iter().any(|p| p.expanded && p.checkouts.iter().any(|wt| wt.path == *path))
             },
         };
         let listed_here =
@@ -297,7 +298,7 @@ pub(crate) fn seed(
         return SidebarRow::Home;
     };
     for p in projects {
-        if p.worktrees.iter().any(|wt| wt.path == path) {
+        if p.checkouts.iter().any(|wt| wt.path == path) {
             return if p.expanded {
                 SidebarRow::Worktree(path.to_path_buf())
             } else {
@@ -318,7 +319,7 @@ pub(crate) struct RowPredicates<'a> {
     pub home_name: bool,
     pub project_self: &'a dyn Fn(&Project) -> bool,
     pub gate: &'a dyn Fn(&WorkspaceKey) -> bool,
-    pub name: &'a mut dyn FnMut(&Project, &Worktree) -> bool,
+    pub name: &'a mut dyn FnMut(&Project, &Checkout) -> bool,
     /// `None` while the query is empty, which is what keeps a bare toggle
     /// from surfacing every workspace that holds any child at all.
     pub child: Option<&'a mut dyn FnMut(&WorkspaceEntry) -> bool>,
@@ -372,7 +373,7 @@ pub(crate) fn filtered_rows(
     for p in projects {
         let self_matches = (preds.project_self)(p);
         let mut visible_worktrees: Vec<SidebarRow> = Vec::new();
-        for wt in &p.worktrees {
+        for wt in &p.checkouts {
             let ws = Some(wt.path.clone());
             if !(preds.gate)(&ws) {
                 continue;
@@ -408,7 +409,7 @@ pub(crate) fn ensure_cursor(
 pub(crate) mod tests {
     use super::*;
     use crate::multiplexer::Side;
-    use crate::projects::Worktree;
+
     use crate::test_util::herdr_pane_key;
 
     fn no_sessions() -> ListedRows {
@@ -442,15 +443,16 @@ pub(crate) mod tests {
             root: PathBuf::from(root),
             name: root.to_string(),
             label: None,
-            default_branch: None,
-            worktrees: worktrees
+            vcs: None,
+            trunk: None,
+            checkouts: worktrees
                 .iter()
-                .map(|p| Worktree {
+                .map(|p| Checkout {
                     name: p.to_string(),
                     path: PathBuf::from(p),
-                    branch: None,
+                    head: alacritree_vcs::Head::default(),
                     is_main: false,
-                    prunable: false,
+                    gone: false,
                     upstream: None,
                 })
                 .collect(),
@@ -646,7 +648,7 @@ pub(crate) mod tests {
     #[test]
     fn step_moves_and_clamps_at_both_ends() {
         let rows = visible_rows(&[project("/a", true, &["/a/wt1"])], &no_sessions());
-        // Home -> Project -> Worktree
+        // Home -> Project -> Checkout
         assert_eq!(step(&rows, &SidebarRow::Home, 1), SidebarRow::Project(PathBuf::from("/a")));
         assert_eq!(
             step(&rows, &SidebarRow::Project(PathBuf::from("/a")), 1),

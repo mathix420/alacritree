@@ -250,9 +250,9 @@ impl AlacritreeApp {
 
     fn project_default_branch_for(&self, path: &Path) -> Option<String> {
         for project in &self.projects {
-            for wt in &project.worktrees {
+            for wt in &project.checkouts {
                 if wt.path == path {
-                    return project.default_branch.clone();
+                    return project.trunk.clone();
                 }
             }
         }
@@ -306,7 +306,7 @@ impl AlacritreeApp {
 
         let project_default = self.project_default_branch_for(&path);
         if !self.git_panel.status.contains_key(&path) {
-            let Some(vcs) = self.vcs_backends.first().cloned() else {
+            let Some(vcs) = self.vcs_for(&path) else {
                 // No backend is enabled, so there is no status to show.
                 self.git_panel.rows.clear();
                 self.git_panel.branch_base = None;

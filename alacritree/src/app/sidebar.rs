@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::multiplexer::{MultiplexerKind, Pane};
+use alacritree_vcs::Checkout;
 
 pub(super) struct Sidebar {
     /// Reveals the project rows' drag grips.  A transient mode, not persisted:
@@ -97,7 +98,7 @@ impl AlacritreeApp {
             let filter = &mut self.sidebar.filter;
             self.projects
                 .iter()
-                .flat_map(|p| p.worktrees.iter())
+                .flat_map(|p| p.checkouts.iter())
                 .map(|wt| (wt.path.clone(), filter.matches(&wt.name)))
                 .collect()
         };
@@ -113,7 +114,7 @@ impl AlacritreeApp {
         let pr_matches: HashMap<PathBuf, bool> = if any_pr {
             self.projects
                 .iter()
-                .flat_map(|p| p.worktrees.iter())
+                .flat_map(|p| p.checkouts.iter())
                 .map(|wt| {
                     let branch = pr_status::effective_branch(wt, current_workspace, live_head);
                     let state = self.pr_cache.state(&wt.path, branch);
@@ -187,7 +188,7 @@ impl AlacritreeApp {
         let project_self =
             |p: &Project| !any_toggle && project_matches.get(&p.root).copied().unwrap_or(false);
         let mut name =
-            |_p: &Project, wt: &Worktree| worktree_matches.get(&wt.path).copied().unwrap_or(false);
+            |_p: &Project, wt: &Checkout| worktree_matches.get(&wt.path).copied().unwrap_or(false);
         let children_tested = !child_matches.is_empty();
         let mut child = |entry: &sidebar_nav::WorkspaceEntry| {
             child_matches.get(&entry.row()).copied().unwrap_or(false)
@@ -448,8 +449,8 @@ impl AlacritreeApp {
         let mut polled: HashMap<PathBuf, Option<PrInfo>> = HashMap::new();
         let mut views = Vec::with_capacity(self.projects.len());
         for project in &self.projects {
-            let mut worktrees = Vec::with_capacity(project.worktrees.len());
-            for wt in &project.worktrees {
+            let mut worktrees = Vec::with_capacity(project.checkouts.len());
+            for wt in &project.checkouts {
                 let ws = Some(wt.path.clone());
                 let rows = self.workspace_rows(&ws, listed);
                 // Aggregates apply only while the session list is hidden, as
@@ -1212,7 +1213,7 @@ fn paint_worktrees(
     requests: &mut SidebarRequests,
 ) {
     let states = paint.view.projects.get(idx).map_or(&[][..], |p| p.worktrees.as_slice());
-    for (wt, state) in project.worktrees.iter().zip(states) {
+    for (wt, state) in project.checkouts.iter().zip(states) {
         if paint.view.filtering && !paint.view.membership.worktrees.contains(&wt.path) {
             continue;
         }
@@ -1226,7 +1227,7 @@ fn paint_worktrees(
 fn paint_worktree(
     ui: &mut egui::Ui,
     paint: SidebarPaint<'_>,
-    wt: &Worktree,
+    wt: &Checkout,
     state: &WorktreeView,
     requests: &mut SidebarRequests,
 ) {
@@ -1481,9 +1482,9 @@ const WORKTREE_MENU_MAX_WIDTH: f32 = 220.0;
 
 /// What one worktree row paints from.
 pub(super) struct WorktreeRowView<'a> {
-    pub(super) wt: &'a Worktree,
+    pub(super) wt: &'a Checkout,
     // What the liveness probe has seen since discovery ran, if anything.
-    // `Some` overrides `wt.prunable` in both directions; `None` leaves it
+    // `Some` overrides `wt.gone` in both directions; `None` leaves it
     // standing.  Kept out of the flag itself because that also picks between
     // `git worktree remove` and a prune, and a probe must never decide that.
     pub(super) missing: Option<bool>,

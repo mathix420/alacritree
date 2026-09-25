@@ -11,11 +11,12 @@
 //! with one warning per config key, so a typo'd config degrades to today's
 //! sidebar rather than blank rows.
 
+use alacritree_vcs::Checkout;
 use std::collections::{HashMap, HashSet};
 
 use alacritree_forge::PrInfo;
 
-use crate::projects::{Project, Worktree};
+use crate::projects::Project;
 
 /// Substitute `vars` into `template`.  `None` on any subst error or when the
 /// trimmed result is empty — the caller falls back to the plain name either
@@ -47,14 +48,14 @@ impl LabelTemplates {
     /// `$path` (full worktree path), `$pr` (the branch's PR number as
     /// `#123`, absent when none is known — `${pr:}` shows it only when one
     /// exists).
-    pub(crate) fn worktree_label(&mut self, wt: &Worktree, pr: Option<&PrInfo>) -> String {
+    pub(crate) fn worktree_label(&mut self, wt: &Checkout, pr: Option<&PrInfo>) -> String {
         let Some(template) = self.worktree.clone() else {
             return wt.name.clone();
         };
         let mut vars = HashMap::new();
         vars.insert("name".to_string(), wt.name.clone());
-        if let Some(branch) = &wt.branch {
-            vars.insert("branch".to_string(), branch.clone());
+        if let Some(branch) = wt.head.label() {
+            vars.insert("branch".to_string(), branch.to_string());
         }
         vars.insert("path".to_string(), crate::wsl::display_path(&wt.path));
         if let Some(pr) = pr {
@@ -103,20 +104,20 @@ impl LabelTemplates {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::projects::Worktree;
+
     use std::path::PathBuf;
 
     fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     }
 
-    fn wt(name: &str, branch: Option<&str>) -> Worktree {
-        Worktree {
+    fn wt(name: &str, branch: Option<&str>) -> Checkout {
+        Checkout {
             name: name.to_string(),
             path: PathBuf::from("/tmp/wt").join(name),
-            branch: branch.map(str::to_string),
+            head: alacritree_vcs::Head { name: branch.map(str::to_string), ..Default::default() },
             is_main: false,
-            prunable: false,
+            gone: false,
             upstream: None,
         }
     }
@@ -126,8 +127,9 @@ mod tests {
             root: PathBuf::from("/tmp/projects").join(name),
             name: name.to_string(),
             label: label.map(str::to_string),
-            default_branch: None,
-            worktrees: Vec::new(),
+            vcs: None,
+            trunk: None,
+            checkouts: Vec::new(),
             expanded: false,
             shell_override: None,
             home: None,
@@ -246,12 +248,12 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn the_path_variable_uses_the_distros_spelling() {
-        let wt = Worktree {
+        let wt = Checkout {
             name: "monorepo".to_string(),
             path: PathBuf::from(r"\\wsl.localhost\kali-linux\home\lev\Git\monorepo"),
-            branch: Some("main".to_string()),
+            head: alacritree_vcs::Head { name: Some("main".to_string()), ..Default::default() },
             is_main: true,
-            prunable: false,
+            gone: false,
             upstream: None,
         };
         let mut templates = LabelTemplates::new(Some("$path".to_string()), None);

@@ -175,9 +175,13 @@ impl AlacritreeApp {
         );
 
         if recheck {
+            let vcs = self
+                .modals
+                .pending_delete
+                .as_ref()
+                .and_then(|req| self.vcs_for(&req.worktree_path));
             if let Some(req) = self.modals.pending_delete.as_mut() {
                 let path = req.worktree_path.clone();
-                let vcs = self.vcs_backends.first().cloned();
                 req.dirty_job =
                     Some(jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
                         vcs.map_or_else(Dirty::default, |vcs| {
@@ -912,7 +916,7 @@ impl AlacritreeApp {
         let theme = self.theme;
         let danger = self.theme.error;
         let project_name = self.projects[project_idx].display_name().to_string();
-        let default_branch = self.projects[project_idx].default_branch.clone();
+        let default_branch = self.projects[project_idx].trunk.clone();
         let project_root = self.projects[project_idx].root.clone();
 
         let (cancel_via_key, confirm_via_key) =
