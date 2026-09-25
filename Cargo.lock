@@ -189,6 +189,7 @@ name = "alacritree_forge"
 version = "0.0.0"
 dependencies = [
  "alacritree_common",
+ "alacritree_vcs",
  "ambassador",
  "thiserror 2.0.17",
 ]
@@ -199,7 +200,7 @@ version = "0.0.0"
 dependencies = [
  "alacritree_common",
  "alacritree_forge",
- "git2",
+ "alacritree_vcs",
  "schemars",
  "serde",
  "serde_json",

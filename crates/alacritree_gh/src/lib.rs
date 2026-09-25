@@ -27,8 +27,8 @@ const GH: &str = "gh";
 pub struct GhForge;
 
 impl RemoteForge for GhForge {
-    /// Group a whole burst and ask for each group in turn. Both the `git2`
-    /// reads that grouping needs and the requests themselves block.
+    /// Group a whole burst and ask for each group in turn. The requests
+    /// block.
     fn pull_requests(&self, heads: Vec<Head>, blocking: &Blocking) -> PullRequests {
         let mut out = HashMap::new();
         for group in groups(heads, blocking) {
@@ -60,9 +60,8 @@ struct Group {
 }
 
 /// One request per repository, chunked, plus one per path that cannot be
-/// grouped. Reading `origin` costs a git2 open per due path, and resolving
-/// costs a `gh` process per repository, which is why this runs on a worker
-/// rather than on the frame.
+/// grouped. Resolving costs a `gh` process per repository, which is why this
+/// runs on a worker rather than on the frame.
 fn groups(due: Vec<Head>, blocking: &Blocking) -> Vec<Group> {
     groups_with(due, |cwd| resolve_repo(cwd, blocking))
 }
@@ -74,11 +73,16 @@ fn groups_with(due: Vec<Head>, resolve: impl Fn(&Path) -> Option<(String, String
     let mut by_repo: HashMap<(String, String), Group> = HashMap::new();
     let mut ungrouped = Vec::new();
     for m in due {
-        let (slug, head_owner) = match wsl::classify(&m.path) {
-            wsl::Location::Windows(p) => read_remotes(&p, &m.branch),
-            // Nothing here can read a repository inside a distro, and its
-            // `gh` runs as a script rather than a `Command`.
-            wsl::Location::Wsl { .. } => (None, None),
+        // `origin` groups the checkouts that share a repository, and the
+        // push remote's owner is whose pull request the branch can have. A
+        // WSL checkout arrives without remotes, and its `gh` runs as a
+        // script rather than a `Command`.
+        let (slug, head_owner) = match &m.remotes {
+            Some(remotes) => (
+                remotes.origin_url.as_deref().and_then(github_slug_from_url),
+                remotes.push_url.as_deref().and_then(github_slug_from_url).map(|(owner, _)| owner),
+            ),
+            None => (None, None),
         };
         let group = match slug {
             Some((owner, name)) => {
@@ -225,13 +229,12 @@ fn query_gh(
         // per-user installs that the default `--exec` PATH cannot find.
         wsl::Location::Wsl { distro, linux_path } => {
             let gh = tools::wsl_in_job(Tool::Gh, &distro, blocking);
-            // The push remote's URL rides along on the first line: git2 cannot
-            // read a repository that lives inside the distro, and a second
-            // round trip would double the cost of a badge that already forks
-            // `gh`. The remote is chosen in git's own push order, as
-            // `read_remotes` does natively. The substitution collapses a
-            // missing remote to a blank line, so the JSON always starts after
-            // exactly one newline.
+            // The push remote's URL rides along on the first line: nothing on
+            // the Windows side reads a repository that lives inside the
+            // distro, and a second round trip would double the cost of a
+            // badge that already forks `gh`. The remote is chosen in git's own
+            // push order. The substitution collapses a missing remote to a
+            // blank line, so the JSON always starts after exactly one newline.
             let script = r#"cd "$1" || exit 1
 r=$(git config --get "branch.$3.pushRemote" || git config --get remote.pushDefault || git config --get "branch.$3.remote")
 case "$r" in ''|.) r=origin ;; esac
@@ -292,36 +295,6 @@ fn parse_name_with_owner(stdout: &[u8]) -> Option<(String, String)> {
     let value: serde_json::Value = serde_json::from_slice(stdout).ok()?;
     let (owner, name) = value.get("nameWithOwner")?.as_str()?.split_once('/')?;
     (!owner.is_empty() && !name.is_empty()).then(|| (owner.to_string(), name.to_string()))
-}
-
-/// Two answers from one `git2` open. First, the GitHub `(owner, repository)`
-/// of `origin`, the grouping key for which worktrees share a repository.
-/// `resolve_repo` decides what the request asks about. Second, the owner
-/// `branch` pushes to, which is whose PR the branch can have. Either is
-/// `None` for a missing, unreadable or non-GitHub remote.
-fn read_remotes(path: &Path, branch: &str) -> (Option<(String, String)>, Option<String>) {
-    let Ok(repo) = git2::Repository::open(path) else { return (None, None) };
-    let slug_of = |name: &str| {
-        let remote = repo.find_remote(name).ok()?;
-        github_slug_from_url(remote.url()?)
-    };
-    let head_owner = slug_of(&push_remote(&repo, branch)).map(|(owner, _)| owner);
-    (slug_of("origin"), head_owner)
-}
-
-/// The remote `git push` sends `branch` to, in git's own order. `.` names the
-/// local repository, which pushes nowhere, so it reads as unset.
-fn push_remote(repo: &git2::Repository, branch: &str) -> String {
-    let Ok(config) = repo.config() else { return "origin".to_string() };
-    [
-        format!("branch.{branch}.pushRemote"),
-        "remote.pushDefault".into(),
-        format!("branch.{branch}.remote"),
-    ]
-    .iter()
-    .filter_map(|key| config.get_string(key).ok())
-    .find(|name| !name.is_empty() && name != ".")
-    .unwrap_or_else(|| "origin".to_string())
 }
 
 /// Owner and repository of a GitHub remote URL, for the shapes git accepts:
@@ -444,25 +417,11 @@ mod tests {
     use std::time::Duration;
 
     use alacritree_common::jobs;
-    use git2::Repository;
+    use alacritree_vcs::Remotes;
 
-    /// A repository with one commit, so a worktree can branch off it.
-    fn init_repo(dir: &Path) -> Repository {
-        std::fs::create_dir_all(dir).unwrap();
-        let repo = Repository::init(dir).unwrap();
-        {
-            let sig = git2::Signature::now("test", "test@example.com").unwrap();
-            let tree_id = repo.index().unwrap().write_tree().unwrap();
-            let tree = repo.find_tree(tree_id).unwrap();
-            repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
-        }
-        repo
-    }
-
-    fn add_worktree(repo: &Repository, name: &str) -> PathBuf {
-        let path = repo.workdir().unwrap().parent().unwrap().join(format!("wt-{name}"));
-        repo.worktree(name, &path, None).unwrap();
-        path
+    /// Remotes as the git backend reads them for a native checkout.
+    fn remotes(origin: &str, push: &str) -> Option<Remotes> {
+        Some(Remotes { origin_url: Some(origin.into()), push_url: Some(push.into()) })
     }
 
     fn parsed(stdout: &[u8], head_owner: Option<&str>) -> PrInfo {
@@ -722,7 +681,11 @@ mod tests {
             slug: Some(("owner".to_string(), "repo".to_string())),
             members: branches
                 .iter()
-                .map(|b| Head { path: PathBuf::from(format!("/repo/{b}")), branch: (*b).into() })
+                .map(|b| Head {
+                    path: PathBuf::from(format!("/repo/{b}")),
+                    branch: (*b).into(),
+                    remotes: None,
+                })
                 .collect(),
             head_owners: HashMap::new(),
         }
@@ -823,7 +786,7 @@ mod tests {
         group.slug = None;
         group.members = ["/a", "/b"]
             .into_iter()
-            .map(|path| Head { path: PathBuf::from(path), branch: "main".into() })
+            .map(|path| Head { path: PathBuf::from(path), branch: "main".into(), remotes: None })
             .collect();
 
         let found = query_group(
@@ -860,7 +823,7 @@ mod tests {
         let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().expect("temp dir")).collect();
         let due: Vec<Head> = dirs
             .iter()
-            .map(|d| Head { path: d.path().to_path_buf(), branch: "topic".into() })
+            .map(|d| Head { path: d.path().to_path_buf(), branch: "topic".into(), remotes: None })
             .collect();
         let (tx, rx) = mpsc::channel();
         let (started_tx, started_rx) = mpsc::channel();
@@ -882,13 +845,13 @@ mod tests {
         assert!(out.is_empty(), "a cancelled burst kept asking: {out:?}");
     }
 
-    /// A WSL worktree has no `origin` git2 can read and no `Command` to pipe a
+    /// A WSL worktree arrives with no remotes and has no `Command` to pipe a
     /// query into. Grouping must leave it on the per-branch path rather than
     /// dropping it, or its badge disappears.
     #[test]
     fn an_ungroupable_path_still_gets_its_own_group() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let due = vec![Head { path: dir.path().to_path_buf(), branch: "topic".into() }];
+        let due = vec![Head { path: dir.path().to_path_buf(), branch: "topic".into(), remotes: None }];
         let resolves = AtomicUsize::new(0);
 
         let out = groups_with(due, |_| {
@@ -908,14 +871,11 @@ mod tests {
     /// the repository rather than once per worktree.
     #[test]
     fn a_group_asks_the_resolved_repository_not_its_origin() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let repo = init_repo(&dir.path().join("main"));
-        repo.remote("origin", "https://github.com/me/fork.git").expect("remote");
-        let linked = add_worktree(&repo, "topic-b");
-        let due = vec![Head { path: dir.path().join("main"), branch: "topic-a".into() }, Head {
-            path: linked,
-            branch: "topic-b".into(),
-        }];
+        let fork = || remotes("https://github.com/me/fork.git", "https://github.com/me/fork.git");
+        let due = vec![
+            Head { path: PathBuf::from("/r/main"), branch: "topic-a".into(), remotes: fork() },
+            Head { path: PathBuf::from("/r/wt-topic-b"), branch: "topic-b".into(), remotes: fork() },
+        ];
         let resolves = AtomicUsize::new(0);
 
         let out = groups_with(due, |_| {
@@ -928,14 +888,33 @@ mod tests {
         assert_eq!(resolves.load(Ordering::Relaxed), 1, "one resolve for the whole repository");
     }
 
+    /// The remotes arrive with the head, so grouping reads no repository: the
+    /// checkout here does not even exist.
+    #[test]
+    fn a_head_is_grouped_by_the_remotes_it_carries() {
+        let remotes = Some(Remotes {
+            origin_url: Some("https://github.com/up/repo.git".into()),
+            push_url: Some("git@github.com:me/repo.git".into()),
+        });
+        let due = vec![Head { path: PathBuf::from("/no/such/checkout"), branch: "topic".into(), remotes }];
+
+        let out = groups_with(due, |_| Some(("up".to_string(), "repo".to_string())));
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].slug, Some(("up".to_string(), "repo".to_string())));
+        assert_eq!(out[0].head_owners.get("topic").map(String::as_str), Some("me"));
+    }
+
     /// Nothing groups a worktree whose repository cannot be resolved, so it
     /// keeps the per-branch path rather than losing its badge.
     #[test]
     fn a_repository_that_does_not_resolve_falls_back_to_per_branch() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let repo = init_repo(dir.path());
-        repo.remote("origin", "https://github.com/owner/repo.git").expect("remote");
-        let due = vec![Head { path: dir.path().to_path_buf(), branch: "topic".into() }];
+        let origin = "https://github.com/owner/repo.git";
+        let due = vec![Head {
+            path: PathBuf::from("/r"),
+            branch: "topic".into(),
+            remotes: remotes(origin, origin),
+        }];
 
         let out = groups_with(due, |_| None);
 
@@ -960,24 +939,12 @@ mod tests {
             .into_bytes()
     }
 
-    /// Group `branch` of a repository with `remotes`, and ask with `answer`
-    /// standing in for GitHub. Returns the PR number the branch's badge
-    /// shows, if any.
-    fn ask_as_github(
-        remotes: &[(&str, &str)],
-        config: &[(&str, &str)],
-        branch: &str,
-        answer: Vec<u8>,
-    ) -> Option<u64> {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let repo = init_repo(dir.path());
-        for (name, url) in remotes {
-            repo.remote(name, url).expect("remote");
-        }
-        for (key, value) in config {
-            repo.config().unwrap().set_str(key, value).unwrap();
-        }
-        let due = vec![Head { path: dir.path().to_path_buf(), branch: branch.into() }];
+    /// Group `branch` of a repository whose `origin` and push remote have
+    /// these URLs, and ask with `answer` standing in for GitHub. Returns the
+    /// PR number the branch's badge shows, if any.
+    fn ask_as_github(origin: &str, push: &str, branch: &str, answer: Vec<u8>) -> Option<u64> {
+        let due =
+            vec![Head { path: PathBuf::from("/r"), branch: branch.into(), remotes: remotes(origin, push) }];
         let groups = groups_with(due, |_| Some(("upstream".to_string(), "repo".to_string())));
         assert_eq!(groups.len(), 1);
         let found = query_group(
@@ -994,8 +961,8 @@ mod tests {
     #[test]
     fn a_branch_with_only_another_owners_pr_gets_no_badge() {
         let found = ask_as_github(
-            &[("origin", "gh:me/repo.git")],
-            &[],
+            "gh:me/repo.git",
+            "gh:me/repo.git",
             "main",
             graphql_answer(&[pr(12, "CLOSED", "upstream")]),
         );
@@ -1008,11 +975,8 @@ mod tests {
     #[test]
     fn a_branch_pushed_to_a_fork_keeps_the_forks_pr() {
         let found = ask_as_github(
-            &[
-                ("origin", "https://github.com/upstream/repo.git"),
-                ("fork", "https://github.com/me/repo.git"),
-            ],
-            &[("branch.topic.pushRemote", "fork")],
+            "https://github.com/upstream/repo.git",
+            "https://github.com/me/repo.git",
             "topic",
             graphql_answer(&[pr(9, "OPEN", "upstream"), pr(4, "OPEN", "me")]),
         );
@@ -1038,11 +1002,13 @@ mod tests {
     /// into two rather than growing one request without limit.
     #[test]
     fn one_repository_chunks_at_the_limit() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let repo = init_repo(dir.path());
-        repo.remote("origin", "https://github.com/owner/repo.git").expect("remote");
+        let origin = "https://github.com/owner/repo.git";
         let due: Vec<Head> = (0..graphql::CHUNK + 1)
-            .map(|i| Head { path: dir.path().to_path_buf(), branch: format!("b{i}") })
+            .map(|i| Head {
+                path: PathBuf::from("/r"),
+                branch: format!("b{i}"),
+                remotes: remotes(origin, origin),
+            })
             .collect();
 
         let out = groups_with(due, |_| Some(("owner".to_string(), "repo".to_string())));

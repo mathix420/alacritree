@@ -7,6 +7,8 @@ mod default_branch;
 mod diff;
 mod discover;
 mod liveness;
+mod locate;
+mod remotes;
 mod settings;
 mod status;
 #[cfg(any(test, feature = "test-support"))]
@@ -17,8 +19,8 @@ use std::path::{Path, PathBuf};
 
 use alacritree_common::jobs::Blocking;
 use alacritree_vcs::{
-    Base, CreateCheckout, Created, DiffTarget, Dirty, Probe, RemoveCheckout, Repository, Status,
-    VcsError, VcsKind, VersionControl,
+    Base, CreateCheckout, Created, DiffTarget, Dirty, Located, Probe, Remotes, RemoveCheckout,
+    Repository, Status, VcsError, VcsKind, VersionControl,
 };
 
 pub use settings::{GitConfig, RawGit};
@@ -111,5 +113,13 @@ impl VersionControl for GitBackend {
 
     fn review_range(&self, base: &str) -> String {
         diff::review_range(base)
+    }
+
+    fn remotes(&self, checkout: &Path, name: &str) -> Remotes {
+        remotes::remotes(checkout, name)
+    }
+
+    fn locate(&self, dir: &Path, blocking: &Blocking) -> Option<Located> {
+        locate::locate(dir, blocking)
     }
 }

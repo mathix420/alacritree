@@ -114,6 +114,7 @@ pub(crate) fn run(
     harness: Harness,
     stdin: &str,
     state_dir: Option<&Path>,
+    backends: &[crate::vcs::Vcs],
 ) -> Option<String> {
     let payload: Payload = serde_json::from_str(stdin).unwrap_or_default();
     let here = std::env::current_dir().ok();
@@ -124,7 +125,7 @@ pub(crate) fn run(
     let session =
         payload.session_id.filter(|id| !id.trim().is_empty()).map(|id| SessionRef { harness, id });
     let (place, tasks) = jobs::on_this_thread(|b| {
-        let (side, place) = facts::place_for(&cwd, b);
+        let (side, place) = facts::place_for(&cwd, backends, b);
         let nodes = visible_nodes(&place, session.as_ref()).into_iter().map(NodeMatch::Exact);
         let tasks = backend.list(&side, &Filter { nodes: nodes.collect() }, b);
         tasks.map(|tasks| (place, tasks))

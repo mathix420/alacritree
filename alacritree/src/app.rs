@@ -457,6 +457,22 @@ pub struct AlacritreeApp {
     mouse_hide: mouse_hide::MouseHide,
 }
 
+/// The backend that answers for a checkout: its project's, else the first
+/// enabled one, so a folder that is no repository still gets that backend's
+/// own error text. Free of `self` so a caller can hold it while it borrows
+/// another field mutably.
+fn owning_vcs<'a>(
+    projects: &'a [Project],
+    backends: &'a [crate::vcs::Vcs],
+    path: &Path,
+) -> Option<&'a crate::vcs::Vcs> {
+    projects
+        .iter()
+        .find(|p| p.checkouts.iter().any(|c| c.path == path))
+        .and_then(|p| p.vcs.as_ref())
+        .or_else(|| backends.first())
+}
+
 impl AlacritreeApp {
     fn from_parts(
         config: Config,
@@ -1109,6 +1125,7 @@ impl AlacritreeApp {
                     crate::tasks::backend::Backend::from_config(&self.config.integrations),
                     scope,
                     worktree.map(|w| w.path.clone()),
+                    self.vcs_backends.clone(),
                 ),
             );
             let id = session.id;
@@ -1131,15 +1148,9 @@ impl AlacritreeApp {
             .unwrap_or((None, None))
     }
 
-    /// The backend that answers for a checkout: its project's, else the first
-    /// enabled one, so a folder that is no repository still gets that
-    /// backend's own error text.
+    /// [`owning_vcs`], cloned.
     fn vcs_for(&self, path: &Path) -> Option<crate::vcs::Vcs> {
-        self.projects
-            .iter()
-            .find(|p| p.checkouts.iter().any(|c| c.path == path))
-            .and_then(|p| p.vcs.clone())
-            .or_else(|| self.vcs_backends.first().cloned())
+        owning_vcs(&self.projects, &self.vcs_backends, path).cloned()
     }
 
     fn spawn_scratchpad(

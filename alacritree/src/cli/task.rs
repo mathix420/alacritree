@@ -27,9 +27,9 @@ pub(super) fn run(
     config_dir: Option<&Path>,
     overrides: &[toml::Value],
 ) -> i32 {
-    configure_tools(config_dir, overrides);
+    let integrations = configure_tools(config_dir, overrides);
     match command {
-        TaskCommand::Scope => scope(json),
+        TaskCommand::Scope => scope(json, &crate::vcs::backends(&integrations)),
         TaskCommand::Setup => setup(json),
     }
 }
@@ -46,12 +46,12 @@ pub(super) fn configure_tools(
     config.integrations
 }
 
-fn scope(json: bool) -> i32 {
+fn scope(json: bool, backends: &[crate::vcs::Vcs]) -> i32 {
     let Ok(cwd) = std::env::current_dir() else {
         eprintln!("alacritree: the current directory is unreadable");
         return 1;
     };
-    let (_, place) = jobs::on_this_thread(|b| facts::place_for(&cwd, b));
+    let (_, place) = jobs::on_this_thread(|b| facts::place_for(&cwd, backends, b));
     let project = node(&place, session_from_env(|key| std::env::var(key).ok()).as_ref());
     if json {
         println!("{}", serde_json::json!({ "project": project }));

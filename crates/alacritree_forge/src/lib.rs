@@ -39,6 +39,9 @@ pub struct PrInfo {
 pub struct Head {
     pub path: PathBuf,
     pub branch: String,
+    /// Read by the checkout's version control before the lookup. `None` when
+    /// it could not be read from here, such as inside a WSL distro.
+    pub remotes: Option<alacritree_vcs::Remotes>,
 }
 
 /// One answer per checkout asked about, keyed by path because two

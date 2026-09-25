@@ -376,7 +376,9 @@ pub fn run(cli: Cli) -> Option<i32> {
             let state_dir = cli.config_dir.clone().or_else(crate::state::config_dir);
             let backend = crate::tasks::backend::Backend::from_config(&integrations);
             let state_dir = state_dir.as_deref();
-            if let Some(out) = crate::tasks::hook::run(&backend, event, harness, &stdin, state_dir)
+            let backends = crate::vcs::backends(&integrations);
+            if let Some(out) =
+                crate::tasks::hook::run(&backend, event, harness, &stdin, state_dir, &backends)
             {
                 println!("{out}");
             }

@@ -462,7 +462,8 @@ impl AlacritreeApp {
                     should_poll_pr(pr_enabled, project.expanded, any_pr_toggle),
                     || {
                         let branch = pr_status::effective_branch(wt, current_workspace, live_head);
-                        self.pr_cache.poll(&wt.path, branch, ctx)
+                        let vcs = project.vcs.as_ref()?;
+                        self.pr_cache.poll(&wt.path, branch, vcs, ctx)
                     },
                 );
                 // Rendered up front: the panel closure borrows `projects` mutably, and

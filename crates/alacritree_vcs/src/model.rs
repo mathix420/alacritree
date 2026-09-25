@@ -158,7 +158,9 @@ pub struct Probe {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Located {
     pub main: PathBuf,
-    pub checkout: PathBuf,
+    /// `None` inside the repository but in no checkout, such as a bare
+    /// repository's own directory.
+    pub checkout: Option<PathBuf>,
     pub head: Head,
 }
 

@@ -49,6 +49,14 @@ pub fn add_worktree(repo: &Path, name: &str) -> PathBuf {
     path
 }
 
+pub fn add_remote(repo: &Path, name: &str, url: &str) {
+    Repository::open(repo).unwrap().remote(name, url).unwrap();
+}
+
+pub fn set_config(repo: &Path, key: &str, value: &str) {
+    Repository::open(repo).unwrap().config().unwrap().set_str(key, value).unwrap();
+}
+
 /// Points HEAD at its commit directly, as `git checkout --detach` does.
 pub fn detach(repo: &Path) {
     let repo = Repository::open(repo).unwrap();

@@ -12,5 +12,6 @@ test-support = []
 
 [dependencies]
 alacritree_common.workspace = true
+alacritree_vcs.workspace = true
 ambassador.workspace = true
 thiserror.workspace = true

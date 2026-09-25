@@ -325,7 +325,8 @@ impl AlacritreeApp {
         // cache without waiting for a fresh compute. The first frame may
         // be `None`, which `pr_cache.poll` handles by returning early.
         let cached_branch = cache.live_head().and_then(|head| head.name.clone());
-        let pr_info = self.pr_cache.poll(&path, cached_branch.as_deref(), ctx);
+        let pr_info = owning_vcs(&self.projects, &self.vcs_backends, &path)
+            .and_then(|vcs| self.pr_cache.poll(&path, cached_branch.as_deref(), vcs, ctx));
         let effective_default = effective_base_branch(
             self.git_panel.base_branch_overrides.get(&path).map(String::as_str),
             pr_info.as_ref().map(|p| p.base_branch.as_str()),

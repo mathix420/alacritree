@@ -118,9 +118,15 @@ pub(crate) struct TasksView {
 impl TasksView {
     /// Shows `scope` at once, and switches to the names git gives `worktree`
     /// once they are read.
-    pub(crate) fn new(backend: Backend, scope: Scope, worktree: Option<PathBuf>) -> Self {
+    pub(crate) fn new(
+        backend: Backend,
+        scope: Scope,
+        worktree: Option<PathBuf>,
+        backends: Vec<crate::vcs::Vcs>,
+    ) -> Self {
         let resolving = worktree.map(|dir| {
-            jobs::pool().spawn(Priority::Interactive, move |b| facts::place_for(&dir, b).1)
+            jobs::pool()
+                .spawn(Priority::Interactive, move |b| facts::place_for(&dir, &backends, b).1)
         });
         Self {
             backend,
@@ -583,8 +589,9 @@ mod tests {
         })
         .project;
         let worktree = &project.checkouts[0];
+        let backends = crate::vcs::backends(&Default::default());
         let (_, place) =
-            jobs::on_this_thread(|b| crate::tasks::facts::place_for(&worktree.path, b));
+            jobs::on_this_thread(|b| crate::tasks::facts::place_for(&worktree.path, &backends, b));
         let mut scope = Scope::for_workspace(Some(&project), Some(worktree));
         scope.adopt(&place);
         assert_eq!(scope.workspace.as_deref(), Some("review.review"));
@@ -657,7 +664,8 @@ mod tests {
         fn new(tasks: Vec<Task>) -> Self {
             let ctx = egui::Context::default();
             let scope = Scope::for_workspace(None, None);
-            let mut view = TasksView::new(Backend::from_config(&Default::default()), scope, None);
+            let mut view =
+                TasksView::new(Backend::from_config(&Default::default()), scope, None, Vec::new());
             view.tasks = tasks;
             let mut h =
                 Self { ctx, view, ops: Vec::new(), texts: Vec::new(), background_clicked: false };

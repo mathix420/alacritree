@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use alacritree_common::jobs::Blocking;
 
 use crate::{
-    Base, CreateCheckout, Created, DiffTarget, Dirty, Liveness, Probe, RemoveCheckout, Repository,
-    Status, VcsError, VcsKind, VersionControl,
+    Base, CreateCheckout, Created, DiffTarget, Dirty, Liveness, Located, Probe, Remotes,
+    RemoveCheckout, Repository, Status, VcsError, VcsKind, VersionControl,
 };
 
 /// Clones share the recorded requests, so a test keeps one clone and hands
@@ -26,6 +26,8 @@ pub struct FakeVcs {
     refuse_prepare: bool,
     refuse_removal: bool,
     range: String,
+    remotes: Remotes,
+    located: Option<Located>,
 }
 
 impl FakeVcs {
@@ -42,6 +44,8 @@ impl FakeVcs {
             refuse_prepare: false,
             refuse_removal: false,
             range: String::new(),
+            remotes: Remotes::default(),
+            located: None,
         }
     }
 
@@ -84,6 +88,16 @@ impl FakeVcs {
     /// What `review_range` answers for every base.
     pub fn with_range(mut self, range: &str) -> Self {
         self.range = range.to_string();
+        self
+    }
+
+    pub fn with_remotes(mut self, remotes: Remotes) -> Self {
+        self.remotes = remotes;
+        self
+    }
+
+    pub fn with_located(mut self, located: Located) -> Self {
+        self.located = Some(located);
         self
     }
 
@@ -189,6 +203,16 @@ impl VersionControl for FakeVcs {
 
     fn review_range(&self, _: &str) -> String {
         self.range.clone()
+    }
+
+    fn remotes(&self, checkout: &Path, _: &str) -> Remotes {
+        self.record("remotes", checkout);
+        self.remotes.clone()
+    }
+
+    fn locate(&self, dir: &Path, _: &Blocking) -> Option<Located> {
+        self.record("locate", dir);
+        self.located.clone()
     }
 }
 

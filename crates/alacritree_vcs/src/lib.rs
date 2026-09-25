@@ -140,4 +140,15 @@ pub trait VersionControl {
 
     /// What a Direct viewer template's `{range}` becomes for a base review.
     fn review_range(&self, base: &str) -> ::std::string::String;
+
+    /// The URLs a forge needs for `name`'s pull request. A local config read,
+    /// never a network call.
+    fn remotes(&self, checkout: &::std::path::Path, name: &str) -> ::alacritree_vcs::Remotes;
+
+    /// Which checkout, and which head, `dir` belongs to, walking up from it.
+    fn locate(
+        &self,
+        dir: &::std::path::Path,
+        blocking: &::alacritree_common::jobs::Blocking,
+    ) -> ::std::option::Option<::alacritree_vcs::Located>;
 }
