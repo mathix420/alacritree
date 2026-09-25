@@ -3,7 +3,6 @@
 //! Nothing here knows about the clipboard or about sessions: it takes pixels,
 //! and it returns a path.  That is what keeps it testable without a window.
 
-use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -18,25 +17,14 @@ use crate::jobs;
 /// on the UI thread during a keystroke.  64 MP is far past any screenshot.
 const MAX_PIXELS: usize = 64 * 1024 * 1024;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum EncodeError {
+    #[error("{pixels} pixels is past the {MAX_PIXELS} limit")]
     TooLarge { pixels: usize },
+    #[error("dimensions imply {expected} bytes, got {actual}")]
     Inconsistent { expected: usize, actual: usize },
-    Encoding(png::EncodingError),
-}
-
-impl fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TooLarge { pixels } => {
-                write!(f, "{pixels} pixels is past the {MAX_PIXELS} limit")
-            },
-            Self::Inconsistent { expected, actual } => {
-                write!(f, "dimensions imply {expected} bytes, got {actual}")
-            },
-            Self::Encoding(e) => write!(f, "{e}"),
-        }
-    }
+    #[error(transparent)]
+    Encoding(#[from] png::EncodingError),
 }
 
 /// `Compression::Fast` buys latency on a keypress at the cost of a larger file
@@ -56,9 +44,9 @@ pub(crate) fn encode_png(image: &ImageData<'_>) -> Result<Vec<u8>, EncodeError> 
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     encoder.set_compression(png::Compression::Fast);
-    let mut writer = encoder.write_header().map_err(EncodeError::Encoding)?;
-    writer.write_image_data(&image.bytes).map_err(EncodeError::Encoding)?;
-    writer.finish().map_err(EncodeError::Encoding)?;
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(&image.bytes)?;
+    writer.finish()?;
     Ok(out)
 }
 

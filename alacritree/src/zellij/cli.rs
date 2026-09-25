@@ -4,7 +4,6 @@
 //! over its socket, so a missing binary or no running session is a quiet
 //! empty listing.  This is the only file that spawns zellij.
 
-use std::fmt;
 use std::io::Read;
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
@@ -44,22 +43,15 @@ impl SideListing {
 }
 
 /// Why a zellij call brought back nothing to read.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum CallError {
     /// No zellij ran on the side, or the one there would not list.
+    #[error("{0}")]
     Absent(String),
     /// zellij did not answer in time, which says nothing about whether it
     /// is there.
+    #[error("zellij did not answer")]
     NoAnswer,
-}
-
-impl fmt::Display for CallError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Absent(why) => f.write_str(why),
-            Self::NoAnswer => f.write_str("zellij did not answer"),
-        }
-    }
 }
 
 /// Runs `program <args>` on `side` and hands back what it printed.

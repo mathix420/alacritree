@@ -73,6 +73,7 @@ enum_dispatch = "0.3"
 # Spells a multiplexer's name for the wire and reads it back, off the same
 # enum the dispatch uses, so the two cannot disagree.
 strum = { version = "0.26", features = ["derive"] }
+thiserror.workspace = true
 
 [dev-dependencies]
 alacritree_checkout_hooks = { workspace = true, features = ["test-support"] }

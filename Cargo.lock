@@ -105,6 +105,7 @@ dependencies = [
  "sysinfo",
  "tauri-winrt-notification",
  "tempfile",
+ "thiserror 2.0.17",
  "toml",
  "ttf-parser",
  "unicode-width 0.2.2",

@@ -55,21 +55,16 @@ fn integer_order<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i64>, 
     Ok(Option::<f64>::deserialize(d)?.map(|n| n.round() as i64))
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum TaskError {
+    #[error("taskwarrior not found: {program}")]
     Missing { program: String },
+    #[error("task failed: {}", stderr.trim())]
     Failed { stderr: String },
-    Io(String),
-}
-
-impl std::fmt::Display for TaskError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Missing { program } => write!(f, "taskwarrior not found: {program}"),
-            Self::Failed { stderr } => write!(f, "task failed: {}", stderr.trim()),
-            Self::Io(e) => write!(f, "task could not run: {e}"),
-        }
-    }
+    #[error("task could not run: {0}")]
+    Io(#[source] io::Error),
+    #[error("task export was not JSON: {0}")]
+    Export(#[source] serde_json::Error),
 }
 
 #[derive(Clone, Debug)]
@@ -127,7 +122,7 @@ impl Taskwarrior {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return Err(TaskError::Missing { program: self.program.clone() });
             },
-            Err(e) => return Err(TaskError::Io(e.to_string())),
+            Err(e) => return Err(TaskError::Io(e)),
         };
         // A WSL login shell reports a missing program as 127, not ENOENT.
         if output.status.code() == Some(127) {
@@ -160,7 +155,7 @@ impl Taskwarrior {
         let mut args = filter.to_vec();
         args.push("export".into());
         let output = self.run(&args, b)?;
-        serde_json::from_slice(&output.stdout).map_err(|e| TaskError::Io(e.to_string()))
+        serde_json::from_slice(&output.stdout).map_err(TaskError::Export)
     }
 
     /// `--` stops taskwarrior reading `+tag` or `due:` out of the text.

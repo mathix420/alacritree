@@ -466,9 +466,7 @@ fn ipc_checks(socket: Option<&Path>, enabled: bool) -> Vec<Check> {
         Err(SendError::NoInstance) => {
             check("ipc", "instance", Status::Ok, "none running, but offline commands still work")
         },
-        Err(SendError::Failed(e)) => {
-            check("ipc", "instance", Status::Warn, format!("running but not answering: {e}"))
-        },
+        Err(e) => check("ipc", "instance", Status::Warn, format!("running but not answering: {e}")),
     });
     checks
 }

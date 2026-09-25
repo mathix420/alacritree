@@ -313,7 +313,7 @@ impl<R: Repaint> super::protocol::Transport for InMemory<R> {
         _timeout: Duration,
     ) -> Result<serde_json::Value, super::protocol::SendError> {
         dispatch(request.clone(), &self.app_tx, &self.repaint, &CreateConfig::default())
-            .map_err(super::protocol::SendError::Failed)
+            .map_err(super::protocol::SendError::Refused)
     }
 }
 

@@ -545,7 +545,7 @@ fn dispatch(
             if let Some(dir) = resolved.state_dir {
                 crate::state::set_dir(dir);
             }
-            offline::handle(request, &create).map_err(SendError::Failed)
+            offline::handle(request, &create).map_err(SendError::Refused)
         },
         result => result,
     }
@@ -928,6 +928,6 @@ mod tests {
         let result =
             LocalSocket(Some(&dead)).send(&IpcRequest::ListProjects, Duration::from_secs(5));
 
-        assert_eq!(result, Err(SendError::NoInstance));
+        assert!(matches!(result, Err(SendError::NoInstance)), "{result:?}");
     }
 }

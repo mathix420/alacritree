@@ -163,19 +163,24 @@ fn kind_name(kind: ChangeKind) -> &'static str {
 /// because it is not really an error: it is how the CLI learns there is no app
 /// to talk to, and falls back to serving the request itself.  Distinguishing it
 /// by matching on an error message would break the day someone rewords one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum SendError {
+    #[error("no running alacritree instance found")]
     NoInstance,
-    Failed(String),
-}
-
-impl std::fmt::Display for SendError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SendError::NoInstance => f.write_str("no running alacritree instance found"),
-            SendError::Failed(e) => f.write_str(e),
-        }
-    }
+    #[error("alacritree did not reply in time")]
+    TimedOut,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("no reply from alacritree: {0}")]
+    NoReply(#[source] std::io::Error),
+    #[error("malformed IPC reply: {0}")]
+    MalformedReply(#[source] serde_json::Error),
+    #[error("malformed IPC reply")]
+    MissingOk,
+    /// What the answering side said went wrong. The wire carries it as plain
+    /// text, so it reaches here as the message the user reads.
+    #[error("{0}")]
+    Refused(String),
 }
 
 /// Send one request to a running alacritree and wait for its reply.
@@ -193,15 +198,11 @@ pub(crate) fn send_request(
     let socket = socket.map(Path::to_path_buf);
     let request = request.clone();
     let (tx, rx) = mpsc::channel();
-    std::thread::Builder::new()
-        .name("alacritree-ipc-client".into())
-        .spawn(move || {
-            let _ = tx.send(exchange(socket.as_deref(), &request));
-        })
-        .map_err(|e| SendError::Failed(e.to_string()))?;
+    std::thread::Builder::new().name("alacritree-ipc-client".into()).spawn(move || {
+        let _ = tx.send(exchange(socket.as_deref(), &request));
+    })?;
 
-    rx.recv_timeout(timeout)
-        .unwrap_or_else(|_| Err(SendError::Failed("alacritree did not reply in time".to_string())))
+    rx.recv_timeout(timeout).unwrap_or(Err(SendError::TimedOut))
 }
 
 /// Where a client's requests go. Production sends them over a running
@@ -222,26 +223,23 @@ impl Transport for LocalSocket<'_> {
 
 fn exchange(socket: Option<&Path>, request: &IpcRequest) -> Result<Value, SendError> {
     let stream = find_socket(socket).map_err(|_| SendError::NoInstance)?;
-    exchange_on(stream, request).map_err(SendError::Failed)
+    exchange_on(stream, request)
 }
 
-fn exchange_on(stream: Stream, request: &IpcRequest) -> Result<Value, String> {
+fn exchange_on(stream: Stream, request: &IpcRequest) -> Result<Value, SendError> {
     let mut writer = &stream;
-    let body = serde_json::to_string(request).map_err(|e| e.to_string())?;
-    writer.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
-    writer.write_all(b"\n").map_err(|e| e.to_string())?;
-    writer.flush().map_err(|e| e.to_string())?;
+    let body = serde_json::to_string(request).map_err(std::io::Error::from)?;
+    writer.write_all(body.as_bytes())?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
 
     let mut reply = String::new();
-    BufReader::new(&stream)
-        .read_line(&mut reply)
-        .map_err(|e| format!("no reply from alacritree: {e}"))?;
-    let value: Value =
-        serde_json::from_str(&reply).map_err(|e| format!("malformed IPC reply: {e}"))?;
+    BufReader::new(&stream).read_line(&mut reply).map_err(SendError::NoReply)?;
+    let value: Value = serde_json::from_str(&reply).map_err(SendError::MalformedReply)?;
     if let Some(err) = value.get("error").and_then(Value::as_str) {
-        return Err(err.to_string());
+        return Err(SendError::Refused(err.to_string()));
     }
-    value.get("ok").cloned().ok_or_else(|| "malformed IPC reply".to_string())
+    value.get("ok").cloned().ok_or(SendError::MissingOk)
 }
 
 /// Same resolution order as alacritty's `find_socket`: explicit path, then the
