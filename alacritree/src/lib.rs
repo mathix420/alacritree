@@ -30,7 +30,6 @@ pub(crate) mod fonts;
 pub(crate) mod forge;
 pub mod frame_log;
 pub(crate) mod git_nav;
-pub(crate) mod git_status;
 pub(crate) mod glyph_cache;
 pub(crate) mod gpu_timing;
 pub(crate) mod grid_gl;

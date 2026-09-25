@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// How long a batch of results stands before the visible rows are checked
-/// again.  Matches `git_status::StatusCache`, which answers the same "did this
+/// again.  Matches `status_cache::StatusCache`, which answers the same "did this
 /// worktree change under us" question at the same human timescale.
 const FRESH_FOR: Duration = Duration::from_millis(1500);
 

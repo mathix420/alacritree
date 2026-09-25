@@ -30,7 +30,6 @@ use crate::config::{
 use crate::crash_log::{self, ExitReason};
 use crate::forge::Forge;
 use crate::git_nav::{self, GitSection, SectionCount};
-use crate::git_status::{self, DirtyCounts};
 use crate::in_flight::{Finished, InFlight};
 use crate::modal_gate::{ModalGate, ModalKind};
 use crate::multiplexer::{
@@ -57,7 +56,7 @@ use crate::{
     clipboard_image, file_drop, ipc, jobs, mouse_hide, notify, paste, path_style, scratchpad,
     sidebar_focus, terminal_view, worktree_liveness,
 };
-use alacritree_vcs::UpstreamState;
+use alacritree_vcs::{Dirty, UpstreamState, VersionControl};
 
 mod actions;
 mod focus;
@@ -1447,20 +1446,25 @@ impl AlacritreeApp {
         // straight to a forced removal. The dialog does not confirm until a
         // count is known, so no removal runs against an unknown tree.
         let (dirty, dirty_job, force) = if prunable {
-            (Some(DirtyCounts::default()), None, false)
+            (Some(Dirty::default()), None, false)
         } else if let Some(counts) = self
             .git_panel
             .status
             .get(&wt.path)
             .filter(|cache| cache.has_status())
-            .map(|cache| DirtyCounts::from_status(cache.last()))
+            .map(|cache| crate::status_cache::dirty_of(cache.last()))
         {
             let force = counts.is_dirty();
             (Some(counts), None, force)
         } else {
             let path = wt.path.clone();
-            let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
-                git_status::dirty_counts(&path, blocking)
+            let job = jobs::pool().spawn(jobs::Priority::Interactive, {
+                let vcs = self.vcs_backends.first().cloned();
+                move |blocking| {
+                    vcs.map_or_else(Dirty::default, |vcs| {
+                        vcs.dirty(&path, blocking).unwrap_or_default()
+                    })
+                }
             });
             (None, Some(job), false)
         };
@@ -6316,7 +6320,7 @@ mod tests {
         Some(PathBuf::from(p))
     }
 
-    fn delete_request(project_idx: usize, path: &str, dirty: Option<DirtyCounts>) -> DeleteRequest {
+    fn delete_request(project_idx: usize, path: &str, dirty: Option<Dirty>) -> DeleteRequest {
         DeleteRequest {
             project_idx,
             worktree_path: PathBuf::from(path),
@@ -6349,8 +6353,7 @@ mod tests {
         let mut app = test_app();
         app.projects.push(project_with("/repo", &["/repo/wt"]));
         let idx = app.projects.len() - 1;
-        app.modals.pending_delete =
-            Some(delete_request(idx, "/repo/wt", Some(DirtyCounts::default())));
+        app.modals.pending_delete = Some(delete_request(idx, "/repo/wt", Some(Dirty::default())));
 
         dialog_frame(&mut app, &Context::default(), vec![key_ev(egui::Key::Enter, true)]);
 
@@ -6376,8 +6379,7 @@ mod tests {
         let mut app = test_app();
         app.projects.push(project_with("/repo", &["/repo/wt"]));
         let idx = app.projects.len() - 1;
-        app.modals.pending_delete =
-            Some(delete_request(idx, "/repo/wt", Some(DirtyCounts::default())));
+        app.modals.pending_delete = Some(delete_request(idx, "/repo/wt", Some(Dirty::default())));
 
         press_in_delete_dialog(&mut app, egui::Key::Enter);
 
@@ -6425,7 +6427,7 @@ mod tests {
         // A stale-clean read carried into the retry must not read as "safe"
         // either -- the retry only exists because git already refused this
         // exact tree as dirty.
-        let clean = DirtyCounts::default();
+        let clean = Dirty::default();
         let message =
             dirty_warning(Some(&clean), true, false).expect("a forced confirm always warns");
         assert!(message.contains("--force"));

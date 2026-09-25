@@ -177,9 +177,12 @@ impl AlacritreeApp {
         if recheck {
             if let Some(req) = self.modals.pending_delete.as_mut() {
                 let path = req.worktree_path.clone();
+                let vcs = self.vcs_backends.first().cloned();
                 req.dirty_job =
                     Some(jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
-                        git_status::dirty_counts(&path, blocking)
+                        vcs.map_or_else(Dirty::default, |vcs| {
+                            vcs.dirty(&path, blocking).unwrap_or_default()
+                        })
                     }));
             }
             return;
@@ -514,7 +517,7 @@ impl AlacritreeApp {
             worktree_path: PathBuf,
             worktree_name: String,
             branch: Option<String>,
-            dirty: Option<DirtyCounts>,
+            dirty: Option<Dirty>,
             delete_branch: bool,
             prunable: bool,
             result: Result<(), wt::WorktreeError>,
@@ -1195,9 +1198,9 @@ pub(super) struct DeleteRequest {
     pub(super) branch: Option<String>,
     /// `None` until a count lands. The cache answers for a worktree the git
     /// panel has shown; one never selected has to wait for the job.
-    pub(super) dirty: Option<DirtyCounts>,
+    pub(super) dirty: Option<Dirty>,
     /// Fills `dirty` when the cache was cold.
-    pub(super) dirty_job: Option<jobs::Job<DirtyCounts>>,
+    pub(super) dirty_job: Option<jobs::Job<Dirty>>,
     /// The checkout dir is already gone; confirm prunes metadata instead of
     /// removing a directory.
     pub(super) prunable: bool,
@@ -1218,7 +1221,7 @@ pub(super) struct DeleteTask {
     pub(super) worktree_path: PathBuf,
     pub(super) worktree_name: String,
     pub(super) branch: Option<String>,
-    pub(super) dirty: Option<DirtyCounts>,
+    pub(super) dirty: Option<Dirty>,
     pub(super) delete_branch: bool,
     /// Distinguishes the "prune" vs "delete" wording in a failure message.
     pub(super) prunable: bool,
@@ -1317,7 +1320,7 @@ pub(super) fn refused_for_unsaved_work(error: &wt::WorktreeError) -> bool {
 /// already cost the user their shells by the time the refusal arrives.  A
 /// resolved count presets `--force`, which git will not refuse for
 /// dirtiness; a forced retry has already been through that refusal.
-fn delete_confirm_ready(counts: Option<&DirtyCounts>, force: bool) -> bool {
+fn delete_confirm_ready(counts: Option<&Dirty>, force: bool) -> bool {
     force || counts.is_some()
 }
 
@@ -1336,7 +1339,7 @@ fn push_error(slot: &mut Option<String>, message: String) {
     }
 }
 
-pub(super) fn dirty_parts(counts: &DirtyCounts) -> String {
+pub(super) fn dirty_parts(counts: &Dirty) -> String {
     let mut parts = Vec::new();
     if counts.staged > 0 {
         parts.push(format!("{} staged", counts.staged));
@@ -1361,11 +1364,7 @@ pub(super) fn dirty_parts(counts: &DirtyCounts) -> String {
 /// it is never safe to render "nothing to warn about" for it, regardless of
 /// what `counts` holds, whether a stale-clean read or none at all (the
 /// request was confirmed before its probe landed, which cancelled the probe).
-pub(super) fn dirty_warning(
-    counts: Option<&DirtyCounts>,
-    force: bool,
-    checking: bool,
-) -> Option<String> {
+pub(super) fn dirty_warning(counts: Option<&Dirty>, force: bool, checking: bool) -> Option<String> {
     if force {
         return Some(match counts.filter(|c| c.is_dirty()) {
             Some(counts) => {
@@ -1418,7 +1417,7 @@ mod tests {
 
     #[test]
     fn dirty_warning_stays_quiet_for_a_known_clean_unforced_tree() {
-        let clean = DirtyCounts::default();
+        let clean = Dirty::default();
         assert_eq!(dirty_warning(Some(&clean), false, false), None);
     }
 

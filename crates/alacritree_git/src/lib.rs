@@ -11,13 +11,11 @@ pub mod test_support;
 use std::path::Path;
 
 use alacritree_common::jobs::Blocking;
-use alacritree_vcs::{Status, VcsError, VcsKind, VersionControl};
+use alacritree_vcs::{Dirty, Status, VcsError, VcsKind, VersionControl};
 
 #[doc(hidden)]
 pub use default_branch::{Evidence, WellKnown, resolve, shell_ranking};
 pub use settings::{GitConfig, RawGit};
-#[doc(hidden)]
-pub use status::parse_status_v2_z;
 
 /// The resolved config travels with the value, so a project's `Vcs` is
 /// cheap to clone and answers without a config lookup.
@@ -55,5 +53,9 @@ impl VersionControl for GitBackend {
         blocking: &Blocking,
     ) -> Result<Status, VcsError> {
         status::status(checkout, base_hint, blocking)
+    }
+
+    fn dirty(&self, checkout: &Path, blocking: &Blocking) -> Result<Dirty, VcsError> {
+        status::dirty(checkout, blocking)
     }
 }

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use alacritree_vcs::{Head, Status, VersionControl};
+use alacritree_vcs::{ChangeKind, Dirty, Head, Status, VersionControl};
 
 use crate::jobs;
 use crate::repaint::Repaint;
@@ -176,6 +176,14 @@ impl StatusCache {
     }
 }
 
+/// The delete dialog's counts from a status the git panel already polled, so
+/// opening the dialog costs no repository walk.
+pub(crate) fn dirty_of(status: &Status) -> Dirty {
+    let untracked = status.working.iter().filter(|c| c.kind == ChangeKind::Untracked).count();
+    let staged = status.staged.as_ref().map_or(0, Vec::len);
+    Dirty { staged, modified: status.working.len() - untracked, untracked }
+}
+
 fn spawn_compute(path: PathBuf, vcs: Vcs, hint: Option<String>, repaint: impl Repaint) -> Pending {
     let worker_hint = hint.clone();
     let job = jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
@@ -188,7 +196,26 @@ fn spawn_compute(path: PathBuf, vcs: Vcs, hint: Option<String>, repaint: impl Re
 
 #[cfg(test)]
 mod tests {
+    use alacritree_vcs::FileChange;
+
     use super::*;
+
+    #[test]
+    fn dirty_counts_come_from_a_status_the_panel_already_has() {
+        let status = Status {
+            head: Head { name: Some("main".into()), ..Head::default() },
+            staged: Some(vec![FileChange { path: "a".into(), kind: ChangeKind::Added }]),
+            working: vec![
+                FileChange { path: "b".into(), kind: ChangeKind::Modified },
+                FileChange { path: "c".into(), kind: ChangeKind::Untracked },
+                FileChange { path: "d".into(), kind: ChangeKind::Untracked },
+            ],
+            ..Status::default()
+        };
+        let dirty = dirty_of(&status);
+        assert_eq!(dirty, Dirty { staged: 1, modified: 1, untracked: 2 });
+        assert!(dirty.is_dirty());
+    }
     use crate::repaint::Recorder;
 
     fn git() -> Vcs {

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use alacritree_common::jobs::Blocking;
 
-use crate::{Status, VcsError, VcsKind, VersionControl};
+use crate::{Dirty, Status, VcsError, VcsKind, VersionControl};
 
 /// Clones share the recorded requests, so a test keeps one clone and hands
 /// the other to the code under test.
@@ -16,11 +16,18 @@ pub struct FakeVcs {
     kind: VcsKind,
     calls: Arc<Mutex<Vec<String>>>,
     status: Option<Status>,
+    dirty: Dirty,
 }
 
 impl FakeVcs {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), kind: VcsKind::Git, calls: Arc::default(), status: None }
+        Self {
+            root: root.into(),
+            kind: VcsKind::Git,
+            calls: Arc::default(),
+            status: None,
+            dirty: Dirty::default(),
+        }
     }
 
     pub fn with_kind(mut self, kind: VcsKind) -> Self {
@@ -30,6 +37,11 @@ impl FakeVcs {
 
     pub fn with_status(mut self, status: Status) -> Self {
         self.status = Some(status);
+        self
+    }
+
+    pub fn with_dirty(mut self, dirty: Dirty) -> Self {
+        self.dirty = dirty;
         self
     }
 
@@ -58,6 +70,11 @@ impl VersionControl for FakeVcs {
     fn status(&self, checkout: &Path, _: Option<&str>, _: &Blocking) -> Result<Status, VcsError> {
         self.record("status", checkout);
         self.status.clone().ok_or_else(|| VcsError::NotARepository(checkout.to_path_buf()))
+    }
+
+    fn dirty(&self, checkout: &Path, _: &Blocking) -> Result<Dirty, VcsError> {
+        self.record("dirty", checkout);
+        Ok(self.dirty)
     }
 }
 

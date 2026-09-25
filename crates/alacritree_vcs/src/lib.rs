@@ -75,4 +75,11 @@ pub trait VersionControl {
         base_hint: ::std::option::Option<&str>,
         blocking: &::alacritree_common::jobs::Blocking,
     ) -> ::std::result::Result<::alacritree_vcs::Status, ::alacritree_vcs::VcsError>;
+
+    /// Cheaper than `status`: no base diff.
+    fn dirty(
+        &self,
+        checkout: &::std::path::Path,
+        blocking: &::alacritree_common::jobs::Blocking,
+    ) -> ::std::result::Result<::alacritree_vcs::Dirty, ::alacritree_vcs::VcsError>;
 }
