@@ -418,7 +418,7 @@ impl AlacritreeApp {
         };
         self.activate_session_by_id(id);
         self.reveal_search_row(&SidebarRow::Session(id));
-        self.set_sidebar_cursor(SidebarRow::Session(id));
+        self.sidebar.model.set_cursor(SidebarRow::Session(id));
         self.focus_terminal();
         self.multiplexers.get_mut(key.multiplexer).view_attached(id, &key);
     }

@@ -6,8 +6,6 @@ pub(super) struct SidebarFocusState {
     /// `[ui] search_scope`: whether a live query stands down both panels'
     /// toggle filters.  Toggled at runtime, never persisted.
     pub(super) search_scope: SearchScope,
-    /// Last reconciled snapshot, the baseline for the next cursor repair.
-    pub(super) previous: Option<sidebar_focus::TreeSnapshot>,
     /// What the reconciler itself last wrote. A different value on the next
     /// pass means the user navigated through a click, session cycling, the
     /// palette, a notification, or IPC, so the anchor has been overtaken.
@@ -18,62 +16,69 @@ pub(super) struct SidebarFocusState {
 
 impl SidebarFocusState {
     pub(super) fn new(search_scope: SearchScope) -> Self {
-        Self { search_scope, previous: None, written: None, deferred_close: None }
+        Self { search_scope, written: None, deferred_close: None }
     }
 }
 
 impl AlacritreeApp {
     /// Everything outside the tree that decides what the sidebar projects.
     ///
-    /// `ObservedInputs::capture` and `ObservedInputs::matches` answer for the
-    /// same frame, so they have to be fed the same inputs.  Spelled out at
-    /// both call sites that was a matter of discipline: add an input to one
-    /// copy and not the other, and `matches` returns `true` forever, the
-    /// reconciler early-returns, and the cursor never repairs again.  No test
-    /// in `sidebar_focus.rs` can see that, because the defect is in the call.
-    ///
-    /// Borrows rather than clones, because the reconciler calls it on every
+    /// Borrows rather than clones, because the reconciler checks it on every
     /// frame and `tests/steady_state.rs` holds the unchanged path to no
-    /// allocation at all.
-    fn sidebar_ui_inputs(&self) -> sidebar_focus::UiInputs<'_> {
+    /// allocation at all.  Session titles are left out unless a query is
+    /// live, so a shell repainting its prompt does not invalidate rows no
+    /// title can change.
+    fn sidebar_inputs(
+        &self,
+    ) -> SidebarInputs<'_, impl Iterator<Item = sidebar_focus::SessionInput<'_>> + Clone> {
+        let titles = !self.sidebar.filter.query().is_empty();
         let active_workspace = self.current_workspace.as_deref();
         let active_branch = active_workspace
             .and_then(|p| self.git_panel.status.get(p))
             .and_then(|c| c.current_branch());
-        sidebar_focus::UiInputs {
-            session_rows_always: self.session_rows_always,
-            sessions_filter_counts_detached: self.sessions_filter_counts_detached,
-            query: self.sidebar.filter.query(),
-            toggles: self.sidebar.filter.toggle_bits(),
-            toggles_apply: self.sidebar.filter.toggles_apply(self.sidebar_focus_state.search_scope),
-            pr_generation: pr_generation_for(
-                self.pr_cache.generation(),
-                any_pr_toggle_active(&self.sidebar.filter, self.sidebar_focus_state.search_scope),
-            ),
-            active_workspace,
-            active_branch,
-            panes_generation: self.panes_generation(),
+        SidebarInputs {
+            projects: &self.projects,
+            sessions: self.sessions.iter().map(move |s| sidebar_focus::SessionInput {
+                workspace: &s.working_directory,
+                id: s.id,
+                attention: s.needs_attention,
+                title: if titles { &s.title } else { "" },
+            }),
+            ui: sidebar_focus::UiInputs {
+                session_rows_always: self.session_rows_always,
+                sessions_filter_counts_detached: self.sessions_filter_counts_detached,
+                query: self.sidebar.filter.query(),
+                toggles: self.sidebar.filter.toggle_bits(),
+                toggles_apply: self
+                    .sidebar
+                    .filter
+                    .toggles_apply(self.sidebar_focus_state.search_scope),
+                pr_generation: pr_generation_for(
+                    self.pr_cache.generation(),
+                    any_pr_toggle_active(
+                        &self.sidebar.filter,
+                        self.sidebar_focus_state.search_scope,
+                    ),
+                ),
+                active_workspace,
+                active_branch,
+                panes_generation: self.panes_generation(),
+            },
         }
     }
 
-    pub(super) fn sidebar_snapshot(
-        &mut self,
-        skip_worktree: Option<&Path>,
-    ) -> sidebar_focus::TreeSnapshot {
-        let inputs = sidebar_focus::ObservedInputs::capture(
-            &self.projects,
-            self.session_inputs(self.observes_session_titles()),
-            self.sidebar_ui_inputs(),
-        );
-        let rows = self.current_project_rows();
-        let live = self.session_pairs();
+    /// Rebuild the sidebar rows when their inputs moved.
+    pub(super) fn refresh_sidebar_rows(&mut self) {
+        let Some(stale) = self.sidebar.model.stale_rows(&self.sidebar_inputs()) else { return };
         let listed = self.listed_workspace_rows();
-        let snapshot =
-            build_sidebar_snapshot(&self.projects, &live, &listed, &rows, skip_worktree, inputs);
-        // Paint reuses these until the next rebuild, so an unchanged filtering
-        // frame runs no fuzzy matching at all.
-        self.sidebar.rows_cache = Some(rows);
-        snapshot
+        let rows = self.build_project_rows(&listed);
+        self.sidebar.model.fill_rows(stale, rows, listed);
+    }
+
+    /// The sidebar model, with rows current for this moment.
+    pub(super) fn fresh_sidebar_model(&mut self) -> &mut SidebarModel {
+        self.refresh_sidebar_rows();
+        &mut self.sidebar.model
     }
 
     /// Repair the sidebar cursor against what changed since the last pass.
@@ -85,47 +90,25 @@ impl AlacritreeApp {
     pub(super) fn reconcile_sidebar_focus(&mut self, ctx: &Context) {
         if sidebar_focus_overtaken(
             &self.sidebar_focus_state.written,
-            self.sidebar.cursor.as_ref(),
+            self.sidebar.model.cursor(),
             &self.current_workspace,
             self.sessions.active(&self.current_workspace),
         ) {
-            self.sidebar.anchor = None;
+            self.sidebar.model.drop_anchor();
         }
 
         let deferred = self.sidebar_focus_state.deferred_close.take();
-        let skip = deferred.as_ref().and_then(|d| d.removed_worktree.clone());
-
-        if deferred.is_none() {
-            if let Some(prev) = &self.sidebar_focus_state.previous {
-                let unchanged = prev.inputs.matches(
-                    &self.projects,
-                    self.session_inputs(self.observes_session_titles()),
-                    self.sidebar_ui_inputs(),
-                );
-                if unchanged {
-                    return;
-                }
-            }
+        self.refresh_sidebar_rows();
+        if deferred.is_none() && !self.sidebar.model.needs_reconcile() {
+            return;
         }
 
-        let next = self.sidebar_snapshot(skip.as_deref());
-        let prev = self.sidebar_focus_state.previous.take().unwrap_or_else(|| next.clone());
-        let outcome = sidebar_focus::repair(
-            &prev,
-            &next,
-            self.sidebar.cursor.as_ref(),
-            self.sidebar.anchor.as_ref(),
-        );
-
-        if outcome.cursor != self.sidebar.cursor {
-            self.sidebar.cursor = outcome.cursor;
-            self.sidebar.cursor_moved = true;
-        }
-        self.sidebar.anchor = outcome.anchor;
-        self.sidebar_focus_state.previous = Some(next);
+        let skip = deferred.as_ref().and_then(|d| d.removed_worktree.as_deref());
+        let live = self.session_pairs();
+        let follow = self.sidebar.model.reconcile(&self.projects, &live, skip);
 
         if self.config.ui.sidebar_focus.follows() {
-            match (outcome.follow, deferred) {
+            match (follow, deferred) {
                 (Some(target), _) => self.apply_follow_target(ctx, target),
                 // Nothing live to land on, so the verdict this pass took over
                 // from still decides where the terminal goes.
@@ -141,7 +124,7 @@ impl AlacritreeApp {
     /// pass does not mistake it for the user navigating.
     pub(super) fn mark_sidebar_focus_write(&mut self) {
         self.sidebar_focus_state.written = Some(SidebarFocusWrite {
-            cursor: self.sidebar.cursor.clone(),
+            cursor: self.sidebar.model.cursor().cloned(),
             workspace: self.current_workspace.clone(),
             active: self.sessions.active(&self.current_workspace),
         });
@@ -170,11 +153,10 @@ impl AlacritreeApp {
 
     pub(super) fn apply_sidebar_nav(&mut self, ctx: &Context, key: egui::Key) {
         use egui::Key;
-        let rows = self.current_project_rows();
-        let Some(cursor) = self.sidebar_cursor_within(&rows) else { return };
+        let Some(cursor) = self.fresh_sidebar_model().cursor_within() else { return };
         match key {
-            Key::ArrowUp => self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, -1)),
-            Key::ArrowDown => self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, 1)),
+            Key::ArrowUp => self.sidebar.model.move_cursor(Step::Line(-1)),
+            Key::ArrowDown => self.sidebar.model.move_cursor(Step::Line(1)),
             Key::ArrowRight => match &cursor {
                 SidebarRow::Project(root) => {
                     let root = root.clone();
@@ -190,9 +172,7 @@ impl AlacritreeApp {
             Key::ArrowLeft => match &cursor {
                 SidebarRow::Project(root) => self.set_project_expanded(root, false),
                 SidebarRow::Worktree(_) | SidebarRow::Session(_) | SidebarRow::Pane(_) => {
-                    if let Some(target) = sidebar_nav::left_target(&rows, &cursor) {
-                        self.set_sidebar_cursor(target);
-                    }
+                    self.sidebar.model.move_cursor(Step::Left);
                 },
                 SidebarRow::Home => {},
             },
@@ -211,7 +191,7 @@ impl AlacritreeApp {
             PaneFocus::ProjectsSidebar
                 if self.sidebar.filter.mode() == panel_filter::Mode::Search =>
             {
-                let acted = self.sidebar.cursor.clone();
+                let acted = self.sidebar.model.cursor().cloned();
                 if let Some(row) = acted.as_ref() {
                     self.reveal_search_row(row);
                 }
@@ -248,9 +228,7 @@ impl AlacritreeApp {
     /// can move the very same row far off-screen.
     fn finish_project_search_at(&mut self, requested: Option<SidebarRow>) {
         self.sidebar.filter.exit_search();
-        let rows = self.current_project_rows();
-        self.sidebar.cursor = sidebar_nav::ensure_cursor(&rows, requested.as_ref());
-        self.sidebar.cursor_moved = true;
+        self.fresh_sidebar_model().seat_cursor(requested);
     }
 
     /// Git-panel counterpart of `finish_project_search_at`.
@@ -339,135 +317,6 @@ pub(super) fn pr_generation_for(generation: u64, any_pr_toggle_active: bool) -> 
     if any_pr_toggle_active { generation } else { 0 }
 }
 
-/// Step the lockstep index over the rows a skipped worktree owns.
-///
-/// The projection is built before the deletion is known, so it still lists
-/// the worktree with everything under it.  Leaving the index parked on a row
-/// no node will match again would mark every later node unprojected, and the
-/// cursor repair reads an unprojected row as one that has gone away.
-pub(super) fn skip_projected_rows(
-    rows: &[SidebarRow],
-    next_row: &mut usize,
-    listed: &sidebar_nav::ListedRows,
-    path: &Path,
-) {
-    if rows.get(*next_row) != Some(&SidebarRow::Worktree(path.to_path_buf())) {
-        return;
-    }
-    *next_row += 1;
-    for entry in listed.get(&Some(path.to_path_buf())).map_or(&[][..], Vec::as_slice) {
-        if rows.get(*next_row) != Some(&entry.row()) {
-            break;
-        }
-        *next_row += 1;
-    }
-}
-
-/// Assemble the model arena and the projection.  `rows` is the projection —
-/// exactly what the cursor steps over — and `live` is the model: every running
-/// session, whatever the listing threshold or the filter says.  Building
-/// membership from `listed` instead would make the last session in a workspace
-/// read as deleted the moment its sibling closed.
-///
-/// `listed` is the listing the projection was built from.  A herdr row exists
-/// only while its agent is listed, so there is no wider model to take it from,
-/// and reading a second listing here could disagree with `rows`.
-///
-/// `skip_worktree` drops a worktree whose deletion is already committed but
-/// whose git operation has not finished, so nothing lands the cursor — or a
-/// new shell — inside a directory on its way out.
-///
-/// Nodes are pushed in exactly the order `sidebar_nav::visible_rows` emits,
-/// with unprojected nodes interleaved, so one forward index into `rows`
-/// classifies every node.  Asking `rows.contains` per node instead would be
-/// quadratic in path comparisons on a path that runs whenever the user types.
-pub(super) fn build_sidebar_snapshot(
-    projects: &[Project],
-    live: &[(WorkspaceKey, SessionId)],
-    listed: &sidebar_nav::ListedRows,
-    rows: &[SidebarRow],
-    skip_worktree: Option<&Path>,
-    inputs: sidebar_focus::ObservedInputs,
-) -> sidebar_focus::TreeSnapshot {
-    use sidebar_focus::Parent;
-    use sidebar_nav::WorkspaceEntry;
-
-    let mut b = sidebar_focus::SnapshotBuilder::default();
-    let mut next_row = 0usize;
-    let mut placed = vec![false; live.len()];
-
-    // Consume `rows` in lockstep: a node is projected exactly when it is the
-    // row the projection expects next.
-    let push = |b: &mut sidebar_focus::SnapshotBuilder,
-                next_row: &mut usize,
-                row: SidebarRow,
-                parent: Parent| {
-        let projected = rows.get(*next_row) == Some(&row);
-        if projected {
-            *next_row += 1;
-        }
-        b.push(row, parent, projected)
-    };
-    let push_workspace = |b: &mut sidebar_focus::SnapshotBuilder,
-                          next_row: &mut usize,
-                          placed: &mut [bool],
-                          ws: &WorkspaceKey,
-                          parent: Parent| {
-        let entries = listed.get(ws).map_or(&[][..], Vec::as_slice);
-        for entry in entries {
-            push(b, next_row, entry.row(), parent);
-        }
-        // A workspace lists every shell session it has or none of them, and a
-        // session attached to a herdr pane is always listed, so a session
-        // reaching the second arm here belongs to a workspace that listed
-        // nothing at all.  It is running, so the model keeps it; it is drawn
-        // nowhere, so the projection does not.
-        for (i, (w, id)) in live.iter().enumerate() {
-            if w != ws {
-                continue;
-            }
-            placed[i] = true;
-            if !entries.contains(&WorkspaceEntry::Session(*id)) {
-                b.push(SidebarRow::Session(*id), parent, false);
-            }
-        }
-    };
-
-    let home_id = push(&mut b, &mut next_row, SidebarRow::Home, Parent::Root);
-    push_workspace(&mut b, &mut next_row, &mut placed, &None, Parent::Node(home_id));
-
-    for p in projects {
-        let project_id =
-            push(&mut b, &mut next_row, SidebarRow::Project(p.root.clone()), Parent::Root);
-        for wt in &p.worktrees {
-            if skip_worktree == Some(wt.path.as_path()) {
-                skip_projected_rows(rows, &mut next_row, listed, &wt.path);
-                continue;
-            }
-            let wt_id = push(
-                &mut b,
-                &mut next_row,
-                SidebarRow::Worktree(wt.path.clone()),
-                Parent::Node(project_id),
-            );
-            let ws = Some(wt.path.clone());
-            push_workspace(&mut b, &mut next_row, &mut placed, &ws, Parent::Node(wt_id));
-        }
-    }
-
-    // Sessions whose workspace has no row left — a removed project, or a
-    // worktree already treated as gone.  They are running, so they belong in
-    // the model; they have no place in the tree, so they are nobody's sibling.
-    for (i, (_, id)) in live.iter().enumerate() {
-        if !placed[i] {
-            b.push(SidebarRow::Session(*id), Parent::Detached, false);
-        }
-    }
-
-    debug_assert_eq!(next_row, rows.len(), "every projected row must be in the arena");
-    b.finish(inputs)
-}
-
 /// The cursor, workspace, and active session the reconciler last wrote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SidebarFocusWrite {
@@ -528,6 +377,7 @@ pub(super) fn search_reveal_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sidebar_model::build_snapshot;
 
     #[test]
     fn the_sentinel_sees_a_same_workspace_session_switch() {
@@ -578,8 +428,7 @@ mod tests {
             (Some(PathBuf::from("/a/wt1")), vec![2, 3]),
         ]));
         let rows = sidebar_nav::visible_rows(&projects, &listed);
-        let snapshot =
-            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
+        let snapshot = build_snapshot(&projects, &live, &listed, &rows, None, Default::default());
 
         for row in &rows {
             let id = snapshot.find(row).expect("every projected row is in the model");
@@ -620,8 +469,7 @@ mod tests {
             l
         };
         let rows = sidebar_nav::visible_rows(&projects, &listed);
-        let snapshot =
-            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
+        let snapshot = build_snapshot(&projects, &live, &listed, &rows, None, Default::default());
 
         let id = snapshot
             .find(&SidebarRow::Session(7))
@@ -639,8 +487,7 @@ mod tests {
         let live = vec![(Some(PathBuf::from("/orphan/wt1")), 5)];
         let listed = sidebar_nav::ListedRows::new();
         let rows = sidebar_nav::visible_rows(&projects, &listed);
-        let snapshot =
-            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
+        let snapshot = build_snapshot(&projects, &live, &listed, &rows, None, Default::default());
 
         let id = snapshot.find(&SidebarRow::Session(5)).expect("the session is still running");
         assert_eq!(
@@ -658,7 +505,7 @@ mod tests {
         let listed = sidebar_nav::ListedRows::new();
         let rows = sidebar_nav::visible_rows(&projects, &listed);
         let doomed = PathBuf::from("/a/wt2");
-        let snapshot = build_sidebar_snapshot(
+        let snapshot = build_snapshot(
             &projects,
             &[],
             &listed,
@@ -692,7 +539,7 @@ mod tests {
         let listed = sidebar_nav::ListedRows::new();
         let rows = sidebar_nav::visible_rows(&projects, &listed);
         let doomed = PathBuf::from("/a/wt2");
-        let snapshot = build_sidebar_snapshot(
+        let snapshot = build_snapshot(
             &projects,
             &[],
             &listed,
@@ -729,8 +576,7 @@ mod tests {
             sidebar_nav::WorkspaceEntry::Session(9),
         ])]);
         let rows = sidebar_nav::visible_rows(&projects, &listed);
-        let snapshot =
-            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
+        let snapshot = build_snapshot(&projects, &live, &listed, &rows, None, Default::default());
 
         assert_eq!(rows, vec![
             SidebarRow::Home,

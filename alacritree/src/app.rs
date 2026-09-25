@@ -43,6 +43,7 @@ use crate::session::{
     SessionId, SessionKind, ShellCommand, ShownState, TermSize, poll_attention_debounce,
 };
 use crate::shell_decision::{ShellDecision, shell_decision};
+use crate::sidebar_model::{SidebarInputs, SidebarModel, Step};
 use crate::sidebar_nav::{self, SidebarRow, StepTarget};
 use crate::state::{self, PersistedProject};
 use crate::upstream::UpstreamState;
@@ -1665,7 +1666,7 @@ impl AlacritreeApp {
         let sidebar_focused = self.focus == PaneFocus::ProjectsSidebar;
         let Some(id) = reorder_subject(
             sidebar_focused,
-            self.sidebar.cursor.as_ref(),
+            self.sidebar.model.cursor(),
             || self.sessions.active(&None),
             |path| self.sessions.active(&Some(path.to_path_buf())),
             || self.active_session_index().map(|idx| self.sessions[idx].id),
@@ -1695,13 +1696,12 @@ impl AlacritreeApp {
     /// Keep the sidebar pointed at the session a key just moved.
     ///
     /// The cursor key is unchanged across a move inside one workspace, so
-    /// neither `set_sidebar_cursor` nor the focus reconciler would notice the
-    /// row moved and scroll after it, so this sets the one-shot itself. A
+    /// neither `SidebarModel::set_cursor` nor the focus reconciler would notice
+    /// the row moved and scroll after it, so this pins the cursor instead. A
     /// landing inside a collapsed project expands it, because a cursor with no
     /// painted row is the state the reconciler treats as a row that went away.
     fn follow_moved_session(&mut self, id: SessionId, landed_in: &WorkspaceKey) {
-        self.sidebar.cursor = Some(SidebarRow::Session(id));
-        self.sidebar.cursor_moved = true;
+        self.sidebar.model.pin_cursor(SidebarRow::Session(id));
         let Some(path) = landed_in.as_deref() else { return };
         let root = self
             .projects
@@ -1968,18 +1968,16 @@ impl AlacritreeApp {
             self.persist_sidebars();
         }
         self.focus = PaneFocus::ProjectsSidebar;
-        self.sidebar.cursor = Some(sidebar_nav::seed(
+        let seed = sidebar_nav::seed(
             &self.projects,
             self.current_workspace.as_deref(),
             &self.listed_workspace_rows(),
             self.sessions.active(&self.current_workspace),
-        ));
+        );
         // Seeding reads the unfiltered tree, so a lingering filter from a prior
         // focus round-trip can leave the seeded row outside the current rows;
         // repair it immediately rather than waiting for the first key press.
-        let rows = self.current_project_rows();
-        self.sidebar.cursor = sidebar_nav::ensure_cursor(&rows, self.sidebar.cursor.as_ref());
-        self.sidebar.cursor_moved = true;
+        self.fresh_sidebar_model().seat_cursor(Some(seed));
         // Seeding rewrites the cursor from terminal state, which the overtaken
         // check would otherwise read as the user navigating.  The anchor
         // outlives a trip through the terminal by design.
@@ -2138,56 +2136,8 @@ impl AlacritreeApp {
             // here would reset it before anything could observe that.
             Outcome::FilterChanged => {},
             Outcome::Consumed => {},
-            Outcome::MoveCursor(delta) => self.move_sidebar_cursor(delta),
+            Outcome::MoveCursor(delta) => self.fresh_sidebar_model().move_cursor(Step::Line(delta)),
             Outcome::LeavePanel => self.focus_terminal(),
-        }
-    }
-
-    /// The cursor, when `rows` still holds it.
-    ///
-    /// A worktree removed, a project collapsed by mouse, or a filter toggle
-    /// narrowing the rows out from under it all leave a cursor pointing at a
-    /// row that is gone.  That cursor lands on the first row and the caller
-    /// stops, so the next press acts from there; unfiltered rows always lead
-    /// with Home.
-    fn sidebar_cursor_within(&mut self, rows: &[SidebarRow]) -> Option<SidebarRow> {
-        if let Some(cursor) = self.sidebar.cursor.clone().filter(|c| rows.contains(c)) {
-            return Some(cursor);
-        }
-        if let Some(first) = rows.first() {
-            self.set_sidebar_cursor(first.clone());
-        }
-        None
-    }
-
-    fn move_sidebar_cursor(&mut self, delta: i32) {
-        let rows = self.current_project_rows();
-        let Some(cursor) = self.sidebar_cursor_within(&rows) else { return };
-        self.set_sidebar_cursor(sidebar_nav::step(&rows, &cursor, delta));
-    }
-
-    /// Home/End for the sidebar cursor: first or last of the rows the arrow
-    /// keys step over (the filtered set while a filter is active).
-    fn sidebar_cursor_to_edge(&mut self, top: bool) {
-        let rows = self.current_project_rows();
-        let target = if top { rows.first() } else { rows.last() };
-        if let Some(row) = target.cloned() {
-            self.set_sidebar_cursor(row);
-        }
-    }
-
-    /// PageUp/PageDown for the sidebar cursor: the nearest project header
-    /// above/below, clamped at the extremes.
-    fn sidebar_cursor_project_jump(&mut self, delta: i32) {
-        let rows = self.current_project_rows();
-        let Some(cursor) = self.sidebar_cursor_within(&rows) else { return };
-        let target = if delta > 0 {
-            sidebar_nav::next_project(&rows, &cursor)
-        } else {
-            sidebar_nav::previous_project(&rows, &cursor)
-        };
-        if let Some(row) = target {
-            self.set_sidebar_cursor(row);
         }
     }
 
@@ -2200,31 +2150,6 @@ impl AlacritreeApp {
     /// focus reconciler observes.
     fn session_pairs(&self) -> Vec<(WorkspaceKey, SessionId)> {
         self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect()
-    }
-
-    /// Whether the sidebar's observed inputs carry session titles.  The
-    /// capture and the per-frame compare must read this from one place: a
-    /// capture that banks titles the compare stands down on can never match
-    /// again, and the reconciler then rebuilds the tree on every frame with
-    /// nothing failing to say so.
-    fn observes_session_titles(&self) -> bool {
-        !self.sidebar.filter.query().is_empty()
-    }
-
-    /// Live sessions borrowed for the unchanged-inputs check, which runs on
-    /// every frame and must not allocate.  `titles` is off unless a query is
-    /// live, so a shell repainting its prompt does not invalidate a projection
-    /// no title can change.
-    fn session_inputs(
-        &self,
-        titles: bool,
-    ) -> impl Iterator<Item = sidebar_focus::SessionInput<'_>> {
-        self.sessions.iter().map(move |s| sidebar_focus::SessionInput {
-            workspace: &s.working_directory,
-            id: s.id,
-            attention: s.needs_attention,
-            title: if titles { &s.title } else { "" },
-        })
     }
 
     /// Enter on a cursor row: open Home/worktree sessions and return focus to
@@ -2282,13 +2207,6 @@ impl AlacritreeApp {
         };
         self.current_workspace = ws.clone();
         self.sessions.set_active(ws, id);
-    }
-
-    fn set_sidebar_cursor(&mut self, row: SidebarRow) {
-        if self.sidebar.cursor.as_ref() != Some(&row) {
-            self.sidebar.cursor = Some(row);
-            self.sidebar.cursor_moved = true;
-        }
     }
 
     fn set_project_expanded(&mut self, root: &Path, expanded: bool) {
@@ -4128,7 +4046,7 @@ mod tests {
     use crate::config::{AttachMode, SidebarFocus, UiTheme};
     use crate::multiplexer::{CreatedPane, Launch};
 
-    use super::focus::{build_sidebar_snapshot, search_reveal_root};
+    use super::focus::search_reveal_root;
     use super::git_panel::{
         GIT_FILTER_TOGGLES, base_branch_target, branch_diff_row, file_row, git_filter_identity,
         git_path_label, path_header_label,
@@ -4143,6 +4061,7 @@ mod tests {
     use super::widgets::agent_hint;
     use crate::herdr::{self, PendingAttach, PendingCreate};
     use crate::multiplexer::{AttachRequest, MultiplexerKind, Pane, PaneStatus, Scripted};
+    use crate::sidebar_model::build_snapshot;
     use crate::test_util::herdr_pane_key;
 
     fn plain_worktree_row<'a>(
@@ -8559,8 +8478,7 @@ mod tests {
             ]),
         ]);
         let rows = sidebar_nav::visible_rows(&projects, &listed);
-        let snapshot =
-            build_sidebar_snapshot(&projects, &live, &listed, &rows, None, Default::default());
+        let snapshot = build_snapshot(&projects, &live, &listed, &rows, None, Default::default());
 
         for row in &rows {
             let id = snapshot.find(row).expect("every projected row is in the model");
@@ -8600,7 +8518,7 @@ mod tests {
             sidebar_nav::WorkspaceEntry::Pane(Scripted::key(&Side::Native, "term_doomed")),
         ])]);
         let rows = sidebar_nav::visible_rows(&projects, &listed);
-        let snapshot = build_sidebar_snapshot(
+        let snapshot = build_snapshot(
             &projects,
             &[],
             &listed,

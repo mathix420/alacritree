@@ -1130,7 +1130,7 @@ impl Action for action::SetBaseBranch {
     fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
         let target = base_branch_target(
             app.focus == PaneFocus::ProjectsSidebar,
-            app.sidebar.cursor.as_ref(),
+            app.sidebar.model.cursor(),
             |id| app.sessions.iter().find(|s| s.id == id).map(|s| s.working_directory.clone()),
             &app.current_workspace,
         );

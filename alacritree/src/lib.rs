@@ -67,6 +67,7 @@ pub(crate) mod session;
 pub(crate) mod shell_decision;
 pub(crate) mod shortcut;
 pub mod sidebar_focus;
+pub mod sidebar_model;
 pub(crate) mod sidebar_nav;
 pub(crate) mod stale_exe;
 pub mod startup_log;

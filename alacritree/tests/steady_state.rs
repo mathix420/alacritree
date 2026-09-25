@@ -11,6 +11,7 @@ use alacritree::in_flight::InFlight;
 use alacritree::multiplexer::Side;
 use alacritree::projects::{Project, Worktree};
 use alacritree::sidebar_focus::{ObservedInputs, SessionInput, UiInputs};
+use alacritree::sidebar_model::{SidebarInputs, SidebarModel};
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -59,7 +60,9 @@ fn sessions(count: usize) -> Vec<(Option<PathBuf>, u64, String)> {
         .collect()
 }
 
-fn inputs<'a>(s: &'a [(Option<PathBuf>, u64, String)]) -> impl Iterator<Item = SessionInput<'a>> {
+fn inputs<'a>(
+    s: &'a [(Option<PathBuf>, u64, String)],
+) -> impl Iterator<Item = SessionInput<'a>> + Clone {
     s.iter().map(|(ws, id, title)| SessionInput { workspace: ws, id: *id, attention: false, title })
 }
 
@@ -110,6 +113,32 @@ fn an_unchanged_frame_with_toggle_filters_and_a_narrow_query_allocates_nothing()
 
     assert!(same);
     assert_eq!(counts.allocs, 0, "a filter must not put an allocation back in the frame path");
+}
+
+/// The reconciler asks the row cache whether it is stale on every frame, so a
+/// cache that answered by recapturing the inputs, or rebuilt the tree behind a
+/// cache-shaped call, would put the cost back in the frame path.
+#[test]
+fn a_fresh_row_cache_and_a_reconciled_tree_allocate_nothing() {
+    let projects = tree(10, 5);
+    let live = sessions(150);
+    let inputs =
+        SidebarInputs { projects: &projects, sessions: inputs(&live), ui: ui("worktree", 0) };
+    let mut model = SidebarModel::default();
+    let stale = model.stale_rows(&inputs).expect("an empty model has no rows to reuse");
+    model.fill_rows(stale, Vec::new(), Default::default());
+    model.reconcile(&projects, &[], None);
+
+    let ((stale, needs_reconcile), counts) =
+        measure(|| (model.stale_rows(&inputs).is_some(), model.needs_reconcile()));
+
+    assert!(!stale, "the fixture must actually be unchanged, or this measures the wrong path");
+    assert!(!needs_reconcile);
+    assert_eq!(
+        counts.allocs, 0,
+        "an unchanged frame allocated {} times ({} bytes) checking the row cache",
+        counts.allocs, counts.bytes
+    );
 }
 
 /// The poll runs every frame with no setting that disables it, so the

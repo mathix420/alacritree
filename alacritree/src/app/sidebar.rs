@@ -5,33 +5,21 @@ use super::*;
 use crate::multiplexer::{MultiplexerKind, Pane};
 
 pub(super) struct Sidebar {
-    pub(super) cursor: Option<SidebarRow>,
     /// Reveals the project rows' drag grips.  A transient mode, not persisted:
     /// reordering is a rare, deliberate act, and a grip on every row the rest
     /// of the time is noise.
     pub(super) reorder_mode: bool,
-    /// One-shot: scroll the cursor row into view on the next sidebar paint.
-    pub(super) cursor_moved: bool,
     /// Fuzzy-search query and `s`/`a` toggle state for the projects panel.
     /// Transient: never persisted, never touches the `expanded` flag.
     pub(super) filter: PanelFilter,
-    /// Rows behind the last-built focus snapshot. Paint reuses this until the
-    /// next rebuild instead of recomputing the projection every frame.
-    pub(super) rows_cache: Option<Vec<SidebarRow>>,
-    /// The deepest row a filter hid, restored when it becomes visible again.
-    pub(super) anchor: Option<SidebarRow>,
+    /// The rows and the cursor over them.  Read rows through
+    /// `fresh_sidebar_model`, which rebuilds them first when they are stale.
+    pub(super) model: SidebarModel,
 }
 
 impl Sidebar {
     pub(super) fn new(filter: PanelFilter) -> Self {
-        Self {
-            cursor: None,
-            reorder_mode: false,
-            cursor_moved: false,
-            filter,
-            rows_cache: None,
-            anchor: None,
-        }
+        Self { reorder_mode: false, filter, model: SidebarModel::default() }
     }
 }
 
@@ -73,12 +61,15 @@ impl AlacritreeApp {
             .rect_filled(rect, 0.0, accent.linear_multiply(0.15));
     }
 
-    /// Rows the sidebar cursor steps over this frame: the fuzzy/toggle-filtered
-    /// set while a filter is active, the full visible set otherwise.
-    pub(super) fn current_project_rows(&mut self) -> Vec<SidebarRow> {
-        let listed = self.listed_workspace_rows();
+    /// Rows the sidebar cursor steps over: the fuzzy/toggle-filtered set while
+    /// a filter is active, the full visible set otherwise.  Only
+    /// `refresh_sidebar_rows` calls this; everything else reads the cache.
+    pub(super) fn build_project_rows(
+        &mut self,
+        listed: &sidebar_nav::ListedRows,
+    ) -> Vec<SidebarRow> {
         if !self.sidebar.filter.is_filtering() {
-            return sidebar_nav::visible_rows(&self.projects, &listed);
+            return sidebar_nav::visible_rows(&self.projects, listed);
         }
 
         let apply = self.sidebar.filter.toggles_apply(self.sidebar_focus_state.search_scope);
@@ -185,7 +176,7 @@ impl AlacritreeApp {
                 toggle_sessions,
                 sessions_filter_passes(
                     &session_workspaces,
-                    &listed,
+                    listed,
                     key,
                     self.sessions_filter_counts_detached,
                 ),
@@ -203,7 +194,7 @@ impl AlacritreeApp {
         };
         let child: Option<&mut dyn FnMut(&sidebar_nav::WorkspaceEntry) -> bool> =
             if children_tested { Some(&mut child) } else { None };
-        sidebar_nav::filtered_rows(&self.projects, &listed, sidebar_nav::RowPredicates {
+        sidebar_nav::filtered_rows(&self.projects, listed, sidebar_nav::RowPredicates {
             home_gate: gate(&None),
             home_name: home_matches,
             project_self: &project_self,
@@ -321,11 +312,11 @@ impl AlacritreeApp {
                 Some((dragged.0, range))
             });
         let cursor_row = if self.focus == PaneFocus::ProjectsSidebar {
-            self.sidebar.cursor.clone()
+            self.sidebar.model.cursor().cloned()
         } else {
             None
         };
-        let cursor_moved = std::mem::take(&mut self.sidebar.cursor_moved);
+        let cursor_moved = self.sidebar.model.take_cursor_moved();
 
         let filtering = self.sidebar.filter.is_filtering();
         let active_now = self.sessions.active(&self.current_workspace);
@@ -339,20 +330,18 @@ impl AlacritreeApp {
             &self.current_workspace,
             active_now,
         );
-        let rows: Vec<SidebarRow> = if filtering || wants_follow {
-            match &self.sidebar.rows_cache {
-                Some(rows) => rows.clone(),
-                None => self.current_project_rows(),
-            }
+        let rows: &[SidebarRow] = if filtering || wants_follow {
+            self.refresh_sidebar_rows();
+            self.sidebar.model.rows()
         } else {
-            Vec::new()
+            &[]
         };
         let follow_row = wants_follow
             .then(|| {
                 let project_root = sidebar_nav::project_of(&self.projects, &self.current_workspace)
                     .map(Path::to_path_buf);
                 sidebar_nav::follow_scroll_row(
-                    &rows,
+                    rows,
                     &self.current_workspace,
                     active_now,
                     project_root.as_deref(),
@@ -735,7 +724,7 @@ struct FilterMembership {
 }
 
 impl FilterMembership {
-    fn of(filtering: bool, rows: Vec<SidebarRow>) -> Self {
+    fn of(filtering: bool, rows: &[SidebarRow]) -> Self {
         let mut membership = Self { home: true, ..Self::default() };
         if filtering {
             membership.home = false;
@@ -743,13 +732,13 @@ impl FilterMembership {
                 match row {
                     SidebarRow::Home => membership.home = true,
                     SidebarRow::Project(root) => {
-                        membership.projects.insert(root);
+                        membership.projects.insert(root.clone());
                     },
                     SidebarRow::Worktree(path) => {
-                        membership.worktrees.insert(path);
+                        membership.worktrees.insert(path.clone());
                     },
                     SidebarRow::Session(_) | SidebarRow::Pane(_) => {
-                        membership.children.insert(row);
+                        membership.children.insert(row.clone());
                     },
                 }
             }
@@ -2007,31 +1996,31 @@ impl AlacritreeApp {
 
 impl Action for action::SidebarTop {
     fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
-        app.sidebar_cursor_to_edge(true);
+        app.fresh_sidebar_model().move_cursor(Step::First);
     }
 }
 
 impl Action for action::SidebarBottom {
     fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
-        app.sidebar_cursor_to_edge(false);
+        app.fresh_sidebar_model().move_cursor(Step::Last);
     }
 }
 
 impl Action for action::SidebarNextProject {
     fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
-        app.sidebar_cursor_project_jump(1);
+        app.fresh_sidebar_model().move_cursor(Step::Project(1));
     }
 }
 
 impl Action for action::SidebarPreviousProject {
     fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
-        app.sidebar_cursor_project_jump(-1);
+        app.fresh_sidebar_model().move_cursor(Step::Project(-1));
     }
 }
 
 impl Action for action::DeleteSelected {
     fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
-        match app.sidebar.cursor.clone() {
+        match app.sidebar.model.cursor().cloned() {
             Some(SidebarRow::Session(id)) => app.request_close_session(ctx, id),
             Some(SidebarRow::Worktree(path)) => app.request_worktree_delete(&path),
             Some(SidebarRow::Project(root)) => {
@@ -2050,7 +2039,7 @@ impl Action for action::RenameSelected {
         // Only project rows carry an editable label; sessions and
         // worktrees take their names from the terminal title and the
         // `[ui] worktree_name` template.
-        if let Some(SidebarRow::Project(root)) = app.sidebar.cursor.clone() {
+        if let Some(SidebarRow::Project(root)) = app.sidebar.model.cursor().cloned() {
             if let Some(p) = app.projects.iter().find(|p| p.root == root) {
                 app.modals.pending_rename =
                     Some(RenameState { root, label: p.display_name().to_string() });
@@ -2061,7 +2050,7 @@ impl Action for action::RenameSelected {
 
 impl Action for action::ToggleProjectExpanded {
     fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
-        let Some(cursor) = app.sidebar.cursor.clone() else {
+        let Some(cursor) = app.sidebar.model.cursor().cloned() else {
             return;
         };
         let root = {
@@ -2076,7 +2065,7 @@ impl Action for action::ToggleProjectExpanded {
             // Collapsing hides the cursored child; move the cursor to
             // the header so it doesn't point at a now-invisible row.
             if expanded && !matches!(cursor, SidebarRow::Project(_)) {
-                app.set_sidebar_cursor(SidebarRow::Project(root));
+                app.sidebar.model.set_cursor(SidebarRow::Project(root));
             }
         }
     }
@@ -2116,7 +2105,7 @@ impl Action for action::ToggleSidebarFocus {
 impl Action for action::CloseSession {
     fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
         let cursored = if app.focus == PaneFocus::ProjectsSidebar {
-            match &app.sidebar.cursor {
+            match app.sidebar.model.cursor() {
                 Some(SidebarRow::Session(id)) => Some(*id),
                 _ => None,
             }
@@ -2253,7 +2242,7 @@ pub(super) fn worktree_pr_passes(
     !any_pr || pr_matches.get(path).copied().unwrap_or(false)
 }
 
-/// Whether `current_project_rows` resolves session and pane names for
+/// Whether `build_project_rows` resolves session and pane names for
 /// `child_matches` this frame.  `[ui] search_depth` at its "workspaces"
 /// default answers false unconditionally, so no child name is ever computed
 /// and a query costs what matching workspace names alone costs.
@@ -2549,7 +2538,7 @@ mod tests {
     }
 
     /// The "workspaces" depth never reaches a child, whatever the query:
-    /// `child_matches` is not built, so `current_project_rows` feeds
+    /// `child_matches` is not built, so `build_project_rows` feeds
     /// `sidebar_nav::filtered_rows` a `None` child predicate and a query
     /// naming a session matches only that session's workspace.
     #[test]

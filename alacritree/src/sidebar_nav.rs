@@ -33,7 +33,7 @@ pub enum SidebarRow {
 /// rather than two blocks because attaching turns the second into the first,
 /// and a pane that changed how it is drawn has not changed where it belongs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum WorkspaceEntry {
+pub enum WorkspaceEntry {
     Session(SessionId),
     Pane(PaneKey),
 }
