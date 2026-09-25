@@ -51,8 +51,9 @@ pub struct Checkout {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Head {
-    /// The branch or bookmark, when one applies. PR lookup and the tasks
-    /// scope use this and nothing else.
+    /// The branch or bookmark, when one applies. Code that acts on the branch
+    /// reads this, such as PR lookup and branch deletion. Display reads
+    /// `label()`.
     pub name: Option<String>,
     /// A short revision id, e.g. 7 hex digits of a git commit.
     pub revision: Option<String>,
@@ -165,6 +166,8 @@ pub struct Located {
     /// `None` inside the repository but in no checkout, such as a bare
     /// repository's own directory.
     pub checkout: Option<PathBuf>,
+    /// `name` is `None` when another checkout has the same branch out, since
+    /// the branch then names neither of them.
     pub head: Head,
 }
 
