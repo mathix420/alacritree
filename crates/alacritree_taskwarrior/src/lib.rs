@@ -344,14 +344,25 @@ mod tests {
     /// Taskwarrior 3 has no Windows build, so a Windows host without one uses
     /// the default distro's, with the paths carried in through `WSLENV`.
     fn private() -> Option<(tempfile::TempDir, Side, Taskwarrior)> {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        std::fs::write(dir.path().join("taskrc"), "").expect("an empty taskrc");
-        let native = Some((Side::Native, dir.path().to_str().unwrap().to_string()));
-        let wsl = wsl::distros()
-            .into_iter()
-            .find(|d| d.is_default)
-            .and_then(|d| Some((Side::Wsl(d.name), wsl::windows_to_linux(dir.path())?)));
-        let (side, tw) = [native, wsl].into_iter().flatten().find_map(|(side, root)| {
+        type Home = Option<(tempfile::TempDir, Side, String)>;
+        let native: fn() -> Home = || {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let root = dir.path().to_str().expect("a UTF-8 temp dir").to_string();
+            Some((dir, Side::Native, root))
+        };
+        // On the distro's own filesystem. Taskwarrior's SQLite store on a
+        // `/mnt/c` path takes seconds per write, and minutes per test once
+        // the machine is busy.
+        let distro: fn() -> Home = || {
+            let distro = wsl::distros().into_iter().find(|d| d.is_default)?.name;
+            let tmp = std::path::PathBuf::from(format!(r"\\wsl.localhost\{distro}\tmp"));
+            let dir = tempfile::Builder::new().prefix("alacritree-task").tempdir_in(tmp).ok()?;
+            let root = wsl::windows_to_linux(dir.path())?;
+            Some((dir, Side::Wsl(distro), root))
+        };
+        [native, distro].into_iter().find_map(|home| {
+            let (dir, side, root) = home()?;
+            std::fs::write(dir.path().join("taskrc"), "").expect("an empty taskrc");
             let mut env = vec![
                 ("TASKRC".to_string(), format!("{root}/taskrc")),
                 ("TASKDATA".to_string(), format!("{root}/data")),
@@ -365,10 +376,11 @@ mod tests {
             // skips; any other failure is the adapter's.
             match jobs::on_this_thread(|b| tw.on(side.clone(), b).run(&["export".into()])) {
                 Err(TaskError::Missing { .. }) => None,
-                result => Some(result.map(|_| (side, tw)).expect("a private taskwarrior exports")),
+                result => {
+                    Some(result.map(|_| (dir, side, tw)).expect("a private taskwarrior exports"))
+                },
             }
-        })?;
-        Some((dir, side, tw))
+        })
     }
 
     fn add(
