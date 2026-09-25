@@ -9,7 +9,7 @@
 //! `~/.cargo/bin`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use strum::{EnumCount, VariantArray};
@@ -192,10 +192,25 @@ fn locate_in(program: &str, dirs: &[PathBuf], exts: &[String]) -> Option<PathBuf
 }
 
 pub fn locate(program: &str) -> Option<PathBuf> {
-    let dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).collect())
-        .unwrap_or_default();
-    locate_in(program, &dirs, &executable_extensions())
+    locate_in(program, &search_path(), &executable_extensions())
+}
+
+/// Where `Command::new(program)` finds `program`, which is narrower than
+/// [`locate`] on Windows. A shell runs a `.cmd` shim or an extensionless
+/// script for a bare name, but `Command` never spawns either.
+pub fn locate_spawnable(program: &str) -> Option<PathBuf> {
+    locate_in(program, &search_path(), &spawnable_extensions(program))
+}
+
+fn search_path() -> Vec<PathBuf> {
+    std::env::var_os("PATH").map(|path| std::env::split_paths(&path).collect()).unwrap_or_default()
+}
+
+/// `Command` on Windows appends `.exe` to a name without an extension and
+/// tries nothing else.
+fn spawnable_extensions(program: &str) -> Vec<String> {
+    let bare = cfg!(windows) && Path::new(program).extension().is_none();
+    vec![if bare { ".exe" } else { "" }.to_string()]
 }
 
 /// The empty extension comes last on Windows too. `PATHEXT` covers `git.exe`,
@@ -426,5 +441,22 @@ mod tests {
 
         assert_eq!(found, Some(exe));
         assert_eq!(locate_in("/nowhere/shell", &[], &[String::new()]), None);
+    }
+
+    /// A shim that forwards `task` to WSL is on the search path for shells,
+    /// and must not pass for a `task` that alacritree can spawn natively.
+    #[cfg(windows)]
+    #[test]
+    fn a_shim_is_not_spawnable_and_an_exe_is() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let dirs = [dir.path().to_path_buf()];
+        std::fs::write(dir.path().join("task.cmd"), "").unwrap();
+        std::fs::write(dir.path().join("task"), "").unwrap();
+
+        assert_eq!(locate_in("task", &dirs, &spawnable_extensions("task")), None);
+
+        let exe = dir.path().join("task.exe");
+        std::fs::write(&exe, "").unwrap();
+        assert_eq!(locate_in("task", &dirs, &spawnable_extensions("task")), Some(exe));
     }
 }

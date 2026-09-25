@@ -105,11 +105,12 @@ impl Taskwarrior {
 
     /// The `task` holding the tasks of a project on `side`. Taskwarrior 3 has
     /// no Windows build, so a Windows project uses the default distro's when
-    /// no `task` is found on Windows.
+    /// Windows has no `task` to spawn. A shim that forwards to WSL does not
+    /// count, since only a shell can run it.
     fn for_project(&self, side: &Side, blocking: &Blocking) -> Cli<'_> {
         let side = match side {
             Side::Native if cfg!(windows) => native_or_default_distro(
-                tools::locate(&tools::program(Tool::Task)).is_some(),
+                tools::locate_spawnable(&tools::program(Tool::Task)).is_some(),
                 wsl::distros().into_iter().find(|d| d.is_default).map(|d| d.name),
             ),
             side => side.clone(),
