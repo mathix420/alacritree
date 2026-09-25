@@ -1,0 +1,20 @@
+[package]
+name = "alacritree_diff_viewer"
+version = "0.0.0"
+license = "Apache-2.0"
+description = "What the git panel's diff pane opens and the command that opens it"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+alacritree_common.workspace = true
+log = "0.4"
+schemars = "1.2"
+serde = { version = "1", features = ["derive"] }
+strum = { version = "0.26", features = ["derive"] }
+
+[dev-dependencies]
+alacritree_common = { workspace = true, features = ["test-support"] }
+tempfile = "3"
+toml.workspace = true

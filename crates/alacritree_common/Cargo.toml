@@ -15,6 +15,7 @@ test-support = []
 [dependencies]
 base64 = "0.22"
 log = "0.4"
+schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 strum = { version = "0.26", features = ["derive"] }
 thiserror.workspace = true

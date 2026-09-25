@@ -28,6 +28,7 @@ lto = "thin"
 [workspace.dependencies]
 alacritree_checkout_hooks = { path = "crates/alacritree_checkout_hooks" }
 alacritree_common = { path = "crates/alacritree_common" }
+alacritree_diff_viewer = { path = "crates/alacritree_diff_viewer" }
 alacritree_doppler = { path = "crates/alacritree_doppler" }
 alacritree_forge = { path = "crates/alacritree_forge" }
 alacritree_gh = { path = "crates/alacritree_gh" }

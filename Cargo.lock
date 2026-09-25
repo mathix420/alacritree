@@ -64,6 +64,7 @@ dependencies = [
  "ab_glyph",
  "alacritree_checkout_hooks",
  "alacritree_common",
+ "alacritree_diff_viewer",
  "alacritree_doppler",
  "alacritree_forge",
  "alacritree_gh",
@@ -136,12 +137,26 @@ version = "0.0.0"
 dependencies = [
  "base64",
  "log",
+ "schemars",
  "serde",
  "strum",
  "tempfile",
  "thiserror 2.0.17",
  "windows-sys 0.59.0",
  "winreg",
+]
+
+[[package]]
+name = "alacritree_diff_viewer"
+version = "0.0.0"
+dependencies = [
+ "alacritree_common",
+ "log",
+ "schemars",
+ "serde",
+ "strum",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]

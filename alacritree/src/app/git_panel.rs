@@ -2,11 +2,11 @@
 //! keyboard navigation and filter that drive its cursor, and the diff panes
 //! its rows open.
 
-use super::*;
-use crate::diff_viewer::{
-    self, DiffRequest, DiffSource, Launch, Program, Section, Target, diff_key,
+use alacritree_diff_viewer::{
+    self as diff_viewer, DiffRequest, DiffSource, Section, Target, diff_key,
 };
-use crate::tools::{self, Tool};
+
+use super::*;
 
 /// The toggle identities the git panel accepts: modified, deleted, untracked.
 pub(super) const GIT_FILTER_TOGGLES: &[char] = &['m', 'd', 'u'];
@@ -490,10 +490,8 @@ impl AlacritreeApp {
             self.sessions.remove(&[id], self.config.ui.sidebar_focus);
         }
 
-        let (program, args) = match wsl::classify(&workspace) {
-            wsl::Location::Wsl { distro, .. } => wsl_diff_command(ctx, &distro, &workspace, launch),
-            wsl::Location::Windows(_) => native_diff_command(launch),
-        };
+        let repaint = ctx.clone();
+        let (program, args) = launch.command_line(&workspace, move || repaint.request_repaint());
         let title = match &target {
             Target::Row(req) => format!(
                 "diff: {}",
@@ -533,85 +531,6 @@ impl AlacritreeApp {
             }
             if let SessionKind::Diff { key } = &s.kind { Some(key.clone()) } else { None }
         })
-    }
-}
-
-fn native_program(program: &Program) -> String {
-    match program {
-        Program::Tool(tool) => tools::program(*tool),
-        Program::Custom { path, .. } => path.clone(),
-    }
-}
-
-fn native_pager_value(program: &Program, args: &[String]) -> String {
-    match program {
-        Program::Tool(tool) => diff_viewer::executable_pager_command(&tools::program(*tool), args),
-        Program::Custom { path, .. } => diff_viewer::pager_command(path, args),
-    }
-}
-
-fn native_diff_command(launch: Launch) -> (String, Vec<String>) {
-    match launch {
-        Launch::Pager { pager, pager_args, git_args } => diff_viewer::native_pager_command(
-            &tools::program(Tool::Git),
-            &native_pager_value(&pager, &pager_args),
-            &git_args,
-        ),
-        Launch::Direct { program, args } => (native_program(&program), args),
-    }
-}
-
-fn wsl_program(ctx: &Context, distro: &str, program: &Program) -> Option<String> {
-    match program {
-        Program::Tool(tool) => {
-            let repaint = ctx.clone();
-            tools::wsl_resolved(*tool, distro, move || repaint.request_repaint())
-        },
-        Program::Custom { wsl_path, .. } => wsl_path.clone(),
-    }
-}
-
-fn program_name(program: &Program) -> &str {
-    match program {
-        Program::Tool(tool) => tool.name(),
-        Program::Custom { path, .. } => path,
-    }
-}
-
-fn wsl_pager_value(program: &Program, path: &str, args: &[String]) -> String {
-    match program {
-        Program::Tool(_) => diff_viewer::executable_pager_command(path, args),
-        Program::Custom { .. } => diff_viewer::pager_command(path, args),
-    }
-}
-
-fn wsl_diff_command(
-    ctx: &Context,
-    distro: &str,
-    workspace: &Path,
-    launch: Launch,
-) -> (String, Vec<String>) {
-    let git = tools::wsl_program(Tool::Git);
-    match launch {
-        Launch::Pager { pager, pager_args, git_args } => match wsl_program(ctx, distro, &pager) {
-            Some(path) => {
-                let pager = wsl_pager_value(&pager, &path, &pager_args);
-                diff_viewer::wsl_pager_command(distro, workspace, &git, &pager, &git_args)
-            },
-            None => {
-                let pager = diff_viewer::pager_command(program_name(&pager), &pager_args);
-                diff_viewer::wsl_pager_command_login(distro, workspace, &git, &pager, &git_args)
-            },
-        },
-        Launch::Direct { program, args } => match wsl_program(ctx, distro, &program) {
-            Some(path) => diff_viewer::wsl_direct_command(distro, workspace, &path, &args),
-            None => diff_viewer::wsl_direct_command_login(
-                distro,
-                workspace,
-                program_name(&program),
-                &args,
-            ),
-        },
     }
 }
 
@@ -1345,8 +1264,9 @@ fn paint_row_bg(
 
 #[cfg(test)]
 mod tests {
+    use alacritree_diff_viewer::{Program, Templates, Viewer};
+
     use super::*;
-    use crate::diff_viewer::{Section, Templates, Viewer};
 
     #[test]
     fn a_review_action_names_its_section_and_the_branch_needs_a_base() {
@@ -1434,43 +1354,6 @@ mod tests {
         };
         app.open_diff(&Context::default(), Target::Section(Section::Staged));
         assert!(has_diff_pane(&app));
-    }
-
-    #[test]
-    fn a_wsl_diff_uses_the_configured_wsl_git_not_the_native_git() {
-        let _lock = crate::tools::test_configuration_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        use strum::EnumCount;
-        struct RestoreToolConfiguration([crate::tools::ToolPaths; crate::tools::Tool::COUNT]);
-        impl Drop for RestoreToolConfiguration {
-            fn drop(&mut self) {
-                crate::tools::configure(self.0.clone());
-            }
-        }
-        let _restore = RestoreToolConfiguration(crate::tools::test_configuration());
-        let mut configured = crate::tools::Tool::table(crate::tools::ToolPaths::named);
-        configured[crate::tools::Tool::Git as usize] = crate::tools::ToolPaths {
-            native: "C:/native/git.exe".to_string(),
-            wsl: Some("/opt/wsl/bin/git".to_string()),
-        };
-        crate::tools::configure(configured);
-        let launch = Launch::Pager {
-            pager: Program::Custom {
-                path: "delta --side-by-side".to_string(),
-                wsl_path: Some("/opt/delta".to_string()),
-            },
-            pager_args: Vec::new(),
-            git_args: vec!["diff".to_string()],
-        };
-        let (_, args) = wsl_diff_command(
-            &Context::default(),
-            "kali-linux",
-            Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj"),
-            launch,
-        );
-        assert_eq!(args[9], "/opt/wsl/bin/git");
-        assert!(!args[9..].iter().any(|arg| arg == "C:/native/git.exe"));
     }
 
     #[test]

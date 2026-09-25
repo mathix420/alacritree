@@ -400,6 +400,24 @@ pub fn exec_invocation(distro: &str, argv: &[&str]) -> (String, Vec<String>) {
     ("wsl.exe".to_string(), args)
 }
 
+/// [`exec_invocation`] started in `cwd`, for a program that acts on the
+/// directory it runs in.
+pub fn exec_invocation_in(
+    distro: &str,
+    cwd: &Path,
+    argv: impl IntoIterator<Item = String>,
+) -> (String, Vec<String>) {
+    let mut args = vec![
+        "-d".to_string(),
+        distro.to_string(),
+        "--cd".to_string(),
+        cwd.to_string_lossy().into_owned(),
+        "--exec".to_string(),
+    ];
+    args.extend(argv);
+    ("wsl.exe".to_string(), args)
+}
+
 /// Separates the outputs of the individual commands a batch script runs.
 /// Scripts emit it between sections via `sep() { printf '\n@@ALACRITREE@@\n'; }`;
 /// NUL-delimited porcelain payloads pass through untouched because the
@@ -1009,6 +1027,15 @@ mod tests {
         let (program, args) = exec_invocation("kali-linux", &["sh", "-lc", "herdr agent list"]);
         assert_eq!(program, "wsl.exe");
         assert_eq!(args, vec!["-d", "kali-linux", "--exec", "sh", "-lc", "herdr agent list"]);
+    }
+
+    #[test]
+    fn exec_invocation_in_changes_directory_before_exec() {
+        let cwd = r"\\wsl.localhost\kali-linux\home\lev\proj";
+        let (program, args) =
+            exec_invocation_in("kali-linux", Path::new(cwd), ["tuicr".into(), "-w".into()]);
+        assert_eq!(program, "wsl.exe");
+        assert_eq!(args, ["-d", "kali-linux", "--cd", cwd, "--exec", "tuicr", "-w"]);
     }
 
     #[test]

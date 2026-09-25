@@ -17,12 +17,12 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use alacritree_diff_viewer::{Program, Viewer};
 use serde_json::{Value, json};
 use strum::VariantArray;
 
 use crate::config::{self, Config, ConfigDiagnosis, ConfigFile, Profile, ShellConfig};
 use crate::crash_log::{Verdict, classify};
-use crate::diff_viewer::{Program, Viewer};
 use crate::ipc::protocol::{self, IpcRequest, SendError};
 use crate::multiplexer::Side;
 use crate::shell_decision::{ShellDecision, shell_decision};
@@ -724,11 +724,11 @@ fn to_json(checks: &[Check]) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use alacritree_diff_viewer::Templates;
     use strum::EnumCount;
     use tempfile::TempDir;
 
     use super::*;
-    use crate::diff_viewer::{Program, Templates, Viewer};
     use crate::state::{PersistedProject, PersistedState};
 
     const GIT: Tool =

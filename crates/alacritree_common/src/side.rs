@@ -143,19 +143,39 @@ const NOT_FOUND: i32 = 127;
 
 /// Shell code that sets `$s` to the distro user's own login shell, since
 /// `wsl.exe --exec` sees only the system PATH.
-pub const LOGIN_SHELL: &str = r#"s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=${SHELL:-/bin/sh}"#;
+const LOGIN_SHELL: &str = r#"s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=${SHELL:-/bin/sh}"#;
+
+/// An `sh -c` script that runs `inner` under the distro user's login shell,
+/// passing its own positional parameters through. `inner` is spliced into
+/// single quotes, so it must not contain one.
+pub fn login_shell_script(inner: &str) -> String {
+    format!(r#"{LOGIN_SHELL}; exec "$s" -lc '{inner}' "$s" "$@""#)
+}
 
 fn invocation(side: &Side, program: &Program, args: &[String]) -> Invocation {
     let (program, mut argv, via_login_shell) = match (side, &program.wsl) {
         (Side::Native, _) => (program.native.clone(), Vec::new(), false),
         (Side::Wsl(_), Some(path)) => (path.clone(), Vec::new(), false),
         (Side::Wsl(_), None) => {
-            let script = format!(r#"{LOGIN_SHELL}; exec "$s" -lc 'exec "$@"' "$s" "$@""#);
+            let script = login_shell_script(r#"exec "$@""#);
             ("sh".to_string(), vec!["-c".into(), script, "sh".into(), program.name.clone()], true)
         },
     };
     argv.extend(args.iter().cloned());
     Invocation { program, args: argv, via_login_shell }
+}
+
+/// Program and argv that run `program <args>` in `distro` from `cwd`, found
+/// the way [`run`] finds it, for a caller that hands the command to a
+/// terminal instead of waiting on it.
+pub fn wsl_command_line(
+    distro: &str,
+    cwd: &Path,
+    program: &Program,
+    args: &[String],
+) -> (String, Vec<String>) {
+    let inv = invocation(&Side::Wsl(distro.to_string()), program, args);
+    wsl::exec_invocation_in(distro, cwd, std::iter::once(inv.program).chain(inv.args))
 }
 
 /// Run `program` on `side`, killing it if the job is cancelled or it runs
@@ -339,6 +359,38 @@ mod tests {
         let inv = invocation(&side, &program(r"C:\Tools\doppler.exe", None, "doppler"), &[]);
         assert_eq!(&inv.args[2..], ["sh", "doppler"]);
         assert!(!inv.args.iter().any(|a| a.contains(r"C:\Tools")), "{:?}", inv.args);
+    }
+
+    const WORKSPACE: &str = r"\\wsl.localhost\kali-linux\home\lev\proj";
+
+    #[test]
+    fn a_wsl_command_line_execs_a_configured_path_in_the_workspace() {
+        let tuicr = program("tuicr", Some("/home/lev/.cargo/bin/tuicr"), "tuicr");
+        let args = ["-w".to_string(), "-p".to_string(), "a b.rs".to_string()];
+        let (program, argv) = wsl_command_line("kali-linux", Path::new(WORKSPACE), &tuicr, &args);
+        assert_eq!(program, "wsl.exe");
+        assert_eq!(argv, [
+            "-d",
+            "kali-linux",
+            "--cd",
+            WORKSPACE,
+            "--exec",
+            "/home/lev/.cargo/bin/tuicr",
+            "-w",
+            "-p",
+            "a b.rs"
+        ]);
+    }
+
+    #[test]
+    fn a_wsl_command_line_passes_an_unconfigured_program_to_the_login_shell() {
+        let tuicr = program("tuicr", None, "tuicr");
+        let (_, argv) =
+            wsl_command_line("kali-linux", Path::new(WORKSPACE), &tuicr, &["-w".to_string()]);
+        assert_eq!(argv[..7], ["-d", "kali-linux", "--cd", WORKSPACE, "--exec", "sh", "-c"]);
+        assert!(argv[7].contains("getent passwd"));
+        assert!(argv[7].ends_with(r#"exec "$s" -lc 'exec "$@"' "$s" "$@""#), "{}", argv[7]);
+        assert_eq!(argv[8..], ["sh", "tuicr", "-w"]);
     }
 
     #[test]
