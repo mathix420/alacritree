@@ -6,7 +6,10 @@ use std::sync::{Arc, Mutex};
 
 use alacritree_common::jobs::Blocking;
 
-use crate::{Dirty, Liveness, Probe, Repository, Status, VcsError, VcsKind, VersionControl};
+use crate::{
+    Base, CreateCheckout, Created, Dirty, Liveness, Probe, Repository, Status, VcsError, VcsKind,
+    VersionControl,
+};
 
 /// Clones share the recorded requests, so a test keeps one clone and hands
 /// the other to the code under test.
@@ -19,6 +22,8 @@ pub struct FakeVcs {
     dirty: Dirty,
     repository: Option<Repository>,
     probe: Option<Probe>,
+    names: Vec<String>,
+    refuse_prepare: bool,
 }
 
 impl FakeVcs {
@@ -31,6 +36,8 @@ impl FakeVcs {
             dirty: Dirty::default(),
             repository: None,
             probe: None,
+            names: Vec::new(),
+            refuse_prepare: false,
         }
     }
 
@@ -56,6 +63,17 @@ impl FakeVcs {
 
     pub fn with_probe(mut self, probe: Probe) -> Self {
         self.probe = Some(probe);
+        self
+    }
+
+    pub fn with_names(mut self, names: Vec<String>) -> Self {
+        self.names = names;
+        self
+    }
+
+    /// `prepare_checkout` answers that no `origin` remote exists.
+    pub fn refusing_prepare(mut self) -> Self {
+        self.refuse_prepare = true;
         self
     }
 
@@ -105,6 +123,40 @@ impl VersionControl for FakeVcs {
     fn probe(&self, checkout: &Path) -> Probe {
         self.record("probe", checkout);
         self.probe.clone().unwrap_or(Probe { liveness: Liveness::Present, head: None })
+    }
+
+    fn names(&self, checkout: &Path, _: &Blocking) -> Result<Vec<String>, VcsError> {
+        self.record("names", checkout);
+        Ok(self.names.clone())
+    }
+
+    fn validate_name(&self, _: &str) -> Result<(), VcsError> {
+        Ok(())
+    }
+
+    fn prepare_checkout(
+        &self,
+        main: &Path,
+        _: Option<&str>,
+        on_step: &mut dyn FnMut(&str),
+        _: &Blocking,
+    ) -> Result<Base, VcsError> {
+        self.record("prepare", main);
+        if self.refuse_prepare {
+            return Err(VcsError::NoRemote { remote: "origin".into() });
+        }
+        on_step("Preparing");
+        Ok(Base { name: "main".into(), revision: "origin/main".into() })
+    }
+
+    /// Creates the directory, so the app's steps that copy into it can run.
+    fn create_checkout(&self, req: &CreateCheckout, _: &Blocking) -> Result<Created, VcsError> {
+        self.record("create", &req.target);
+        std::fs::create_dir_all(&req.target).map_err(|e| VcsError::Backend {
+            context: format!("could not create {}", req.target.display()),
+            source: Box::new(e),
+        })?;
+        Ok(Created::default())
     }
 }
 

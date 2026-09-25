@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use alacritree_vcs::{Status, VersionControl};
+use alacritree_vcs::{Status, VcsError, VersionControl};
 use interprocess::local_socket::traits::Listener as _;
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, ToFsName};
 use serde_json::json;
@@ -244,8 +244,10 @@ fn create_worktree(
     repaint: &impl Repaint,
     config: &CreateConfig,
 ) -> IpcResult {
-    wt::validate_branch_name(&branch).map_err(|e| e.to_string())?;
-    let req = CreateRequest::new(project_root.clone(), None, branch, &config.workspace);
+    let vcs = crate::vcs::for_path(&config.vcs, &project_root)
+        .ok_or_else(|| VcsError::NotARepository(project_root.clone()).to_string())?;
+    vcs.validate_name(&branch).map_err(|e| e.to_string())?;
+    let req = CreateRequest::new(project_root.clone(), None, branch, &config.workspace, vcs);
     let (rx, job) = wt::spawn_create(req, config.hooks.clone(), repaint.clone());
     let outcome = drain_create(&rx, IPC_CREATE_BUDGET);
     // Dropping on every path, including the deadline, is what ends the fetch

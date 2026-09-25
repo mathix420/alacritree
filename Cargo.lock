@@ -215,6 +215,7 @@ dependencies = [
  "schemars",
  "serde",
  "tempfile",
+ "thiserror 2.0.17",
 ]
 
 [[package]]

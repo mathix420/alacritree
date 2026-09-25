@@ -2,6 +2,7 @@
 //! and WSL paths through one batched `sh` script per question, so a status
 //! refresh costs one `wsl.exe` round trip rather than one per git command.
 
+mod checkouts;
 mod default_branch;
 mod discover;
 mod liveness;
@@ -14,10 +15,11 @@ mod upstream;
 use std::path::{Path, PathBuf};
 
 use alacritree_common::jobs::Blocking;
-use alacritree_vcs::{Dirty, Probe, Repository, Status, VcsError, VcsKind, VersionControl};
+use alacritree_vcs::{
+    Base, CreateCheckout, Created, Dirty, Probe, Repository, Status, VcsError, VcsKind,
+    VersionControl,
+};
 
-#[doc(hidden)]
-pub use default_branch::{Evidence, WellKnown, resolve, shell_ranking};
 pub use settings::{GitConfig, RawGit};
 
 /// The resolved config travels with the value, so a project's `Vcs` is
@@ -74,5 +76,27 @@ impl VersionControl for GitBackend {
 
     fn probe(&self, checkout: &Path) -> Probe {
         liveness::probe_checkout(checkout)
+    }
+
+    fn names(&self, checkout: &Path, blocking: &Blocking) -> Result<Vec<String>, VcsError> {
+        checkouts::list_branches(checkout, blocking)
+    }
+
+    fn validate_name(&self, name: &str) -> Result<(), VcsError> {
+        checkouts::validate_branch_name(name).map_err(|e| VcsError::InvalidName(e.to_string()))
+    }
+
+    fn prepare_checkout(
+        &self,
+        main: &Path,
+        trunk_hint: Option<&str>,
+        on_step: &mut dyn FnMut(&str),
+        blocking: &Blocking,
+    ) -> Result<Base, VcsError> {
+        checkouts::prepare(main, trunk_hint, on_step, blocking)
+    }
+
+    fn create_checkout(&self, req: &CreateCheckout, _: &Blocking) -> Result<Created, VcsError> {
+        checkouts::create(req)
     }
 }

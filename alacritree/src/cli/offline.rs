@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use alacritree_vcs::{Status, VersionControl};
+use alacritree_vcs::{Status, VcsError, VersionControl};
 use serde_json::{Value, json};
 
 use crate::ipc::protocol::{IpcRequest, IpcResult, status_json};
@@ -158,8 +158,10 @@ fn discover_all(state_path: &Path, backends: &[Vcs]) -> Vec<Project> {
 /// no sidebar to tell, and the next `project list` discovers the new worktree
 /// from git anyway.
 fn create_worktree(project_root: PathBuf, branch: String, config: &CreateConfig) -> IpcResult {
-    wt::validate_branch_name(&branch).map_err(|e| e.to_string())?;
-    let request = CreateRequest::new(project_root, None, branch, &config.workspace);
+    let vcs = crate::vcs::for_path(&config.vcs, &project_root)
+        .ok_or_else(|| VcsError::NotARepository(project_root.clone()).to_string())?;
+    vcs.validate_name(&branch).map_err(|e| e.to_string())?;
+    let request = CreateRequest::new(project_root, None, branch, &config.workspace, vcs);
     let mut steps = Vec::new();
     let path = jobs::on_this_thread(|blocking| {
         wt::create(&request, config.hooks.as_slice(), |step| steps.push(step.to_string()), blocking)

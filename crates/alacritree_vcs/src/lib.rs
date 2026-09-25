@@ -97,4 +97,31 @@ pub trait VersionControl {
     /// Runs on the probe worker for rows the sidebar draws. A filesystem
     /// read, never a process.
     fn probe(&self, checkout: &::std::path::Path) -> ::alacritree_vcs::Probe;
+
+    /// Names the base picker offers, locals first.
+    fn names(
+        &self,
+        checkout: &::std::path::Path,
+        blocking: &::alacritree_common::jobs::Blocking,
+    ) -> ::std::result::Result<::std::vec::Vec<::std::string::String>, ::alacritree_vcs::VcsError>;
+
+    fn validate_name(&self, name: &str) -> ::std::result::Result<(), ::alacritree_vcs::VcsError>;
+
+    /// Resolves the base and fetches it, reporting each step as it starts.
+    /// The last report names the step `create_checkout` runs under, since
+    /// the app picks the target path inside that step, between the calls.
+    fn prepare_checkout(
+        &self,
+        main: &::std::path::Path,
+        trunk_hint: ::std::option::Option<&str>,
+        on_step: &mut dyn FnMut(&str),
+        blocking: &::alacritree_common::jobs::Blocking,
+    ) -> ::std::result::Result<::alacritree_vcs::Base, ::alacritree_vcs::VcsError>;
+
+    /// Creates `req.target` on a new name, starting from `req.base`.
+    fn create_checkout(
+        &self,
+        req: &::alacritree_vcs::CreateCheckout,
+        blocking: &::alacritree_common::jobs::Blocking,
+    ) -> ::std::result::Result<::alacritree_vcs::Created, ::alacritree_vcs::VcsError>;
 }

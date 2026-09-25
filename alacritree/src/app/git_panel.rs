@@ -262,8 +262,13 @@ impl AlacritreeApp {
     pub(super) fn open_base_branch_picker(&mut self, worktree: PathBuf) {
         let detected = self.project_default_branch_for(&worktree);
         let job_worktree = worktree.clone();
+        let vcs = self.vcs_for(&worktree);
         let job = jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
-            crate::worktree::list_branches(&job_worktree, blocking)
+            match vcs {
+                Some(vcs) => vcs.names(&job_worktree, blocking),
+                None => Err(alacritree_vcs::VcsError::NotARepository(job_worktree)),
+            }
+            .map_err(wt::WorktreeError::Vcs)
         });
         self.modals.pending_base_branch = Some(BaseBranchPicker {
             worktree,

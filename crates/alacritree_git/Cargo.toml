@@ -17,6 +17,7 @@ alacritree_vcs.workspace = true
 git2 = { version = "0.20", default-features = false }
 schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
+thiserror.workspace = true
 
 [dev-dependencies]
 alacritree_common = { workspace = true, features = ["test-support"] }

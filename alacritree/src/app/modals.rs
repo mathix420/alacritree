@@ -911,7 +911,7 @@ impl AlacritreeApp {
         ctx: &Context,
         project_idx: usize,
         mut branch: String,
-        mut error: Option<wt::BranchNameError>,
+        mut error: Option<alacritree_vcs::VcsError>,
     ) -> Option<CreateState> {
         let theme = self.theme;
         let danger = self.theme.error;
@@ -983,7 +983,11 @@ impl AlacritreeApp {
             // Whitespace runs become single hyphens: `some text like this` →
             // `some-text-like-this`.
             let canonical: String = branch.split_whitespace().collect::<Vec<_>>().join("-");
-            if let Err(invalid) = wt::validate_branch_name(&canonical) {
+            let Some(vcs) = self.vcs_for(&project_root) else {
+                error = Some(alacritree_vcs::VcsError::NotARepository(project_root));
+                return Some(CreateState::Prompt { project_idx, branch, error });
+            };
+            if let Err(invalid) = vcs.validate_name(&canonical) {
                 error = Some(invalid);
                 return Some(CreateState::Prompt { project_idx, branch, error });
             }
@@ -992,6 +996,7 @@ impl AlacritreeApp {
                 default_branch,
                 canonical.clone(),
                 &self.config.workspace,
+                vcs,
             );
             let hooks = crate::checkout_hooks::from_config(&self.config.integrations);
             let (rx, job) = wt::spawn_create(req, hooks, ctx.clone());
@@ -1236,7 +1241,7 @@ pub(super) enum CreateState {
     Prompt {
         project_idx: usize,
         branch: String,
-        error: Option<wt::BranchNameError>,
+        error: Option<alacritree_vcs::VcsError>,
     },
     Running {
         project_idx: usize,
