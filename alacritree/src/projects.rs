@@ -332,7 +332,15 @@ mod tests {
         alacritree_git::test_support::detach(&wt);
         let found =
             jobs::on_this_thread(|b| Project::discover(repo.clone(), &git_backends(), false, b));
-        let side = found.project.checkouts.iter().find(|c| c.path == wt).unwrap();
+        // Git reports the long form of a temp dir Windows may hand out as an
+        // 8.3 short path, so the paths compare canonicalized.
+        let wt = wt.canonicalize().unwrap();
+        let side = found
+            .project
+            .checkouts
+            .iter()
+            .find(|c| c.path.canonicalize().ok().as_ref() == Some(&wt))
+            .unwrap();
         assert_eq!(side.head.name, None);
         assert_eq!(side.head.label().map(str::len), Some(7));
     }
