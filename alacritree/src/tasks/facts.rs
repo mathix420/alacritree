@@ -41,7 +41,10 @@ pub(crate) fn place_from(located: Option<&Located>) -> Place {
     let Some(located) = located else { return Place::Global };
     let name = basename(&located.main);
     // A bare repository's directory carries a `.git` suffix its name does not.
-    let repo = name.strip_suffix(".git").map_or_else(|| name.clone(), str::to_string);
+    let repo = match name.strip_suffix(".git") {
+        Some(stripped) if located.bare => stripped.to_string(),
+        _ => name,
+    };
     let Some(checkout) = &located.checkout else { return Place::Project { repo } };
     let branch = located.head.name.clone().unwrap_or_else(|| basename(checkout));
     Place::Workspace { repo, branch }
@@ -58,6 +61,7 @@ mod tests {
     fn located(main: &str, checkout: Option<&str>, branch: Option<&str>) -> Located {
         Located {
             main: PathBuf::from(main),
+            bare: false,
             checkout: checkout.map(PathBuf::from),
             head: Head { name: branch.map(str::to_string), ..Head::default() },
         }
@@ -86,12 +90,24 @@ mod tests {
 
     #[test]
     fn a_bare_repo_drops_its_git_suffix_and_has_no_workspace_at_its_root() {
-        assert_eq!(place_from(Some(&located("/src/proj.git", None, None))), Place::Project {
-            repo: "proj".into()
-        });
-        let linked = located("/src/proj.git", Some("/src/proj-main"), Some("main"));
+        let bare =
+            |checkout, branch| Located { bare: true, ..located("/src/proj.git", checkout, branch) };
+        assert_eq!(place_from(Some(&bare(None, None))), Place::Project { repo: "proj".into() });
+        let linked = bare(Some("/src/proj-main"), Some("main"));
         assert_eq!(place_from(Some(&linked)), Place::Workspace {
             repo: "proj".into(),
+            branch: "main".into()
+        });
+    }
+
+    /// Only a bare repository's suffix is dropped. A working copy that happens
+    /// to live in a directory called `x.git` is named `x.git`, and its tasks
+    /// stay on that node.
+    #[test]
+    fn a_working_copy_keeps_a_git_suffix_in_its_name() {
+        let here = located("/src/tooling.git", Some("/src/tooling.git"), Some("main"));
+        assert_eq!(place_from(Some(&here)), Place::Workspace {
+            repo: "tooling.git".into(),
             branch: "main".into()
         });
     }

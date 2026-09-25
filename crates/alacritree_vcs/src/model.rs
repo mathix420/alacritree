@@ -158,6 +158,10 @@ pub struct Probe {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Located {
     pub main: PathBuf,
+    /// The repository has no working copy of its own, as a bare git
+    /// repository has, so `main`'s directory name carries a suffix such as
+    /// `.git` that the repository's name does not.
+    pub bare: bool,
     /// `None` inside the repository but in no checkout, such as a bare
     /// repository's own directory.
     pub checkout: Option<PathBuf>,

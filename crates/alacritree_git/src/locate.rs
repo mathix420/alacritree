@@ -80,12 +80,13 @@ fn normalize(path: &str) -> String {
 /// has out does not tell the two apart, so it names neither.
 fn located_from(porcelain: &str, toplevel: Option<&str>) -> Option<Located> {
     let all = entries(porcelain);
-    let main = PathBuf::from(&all.first()?.path);
+    let first = all.first()?;
+    let (main, bare) = (PathBuf::from(&first.path), first.bare);
     let current = toplevel
         .map(normalize)
         .and_then(|top| all.iter().find(|e| !e.bare && normalize(&e.path) == top));
     let Some(current) = current else {
-        return Some(Located { main, checkout: None, head: Head::default() });
+        return Some(Located { main, bare, checkout: None, head: Head::default() });
     };
     let shared =
         |branch: &String| all.iter().filter(|e| e.branch.as_ref() == Some(branch)).count() > 1;
@@ -94,7 +95,7 @@ fn located_from(porcelain: &str, toplevel: Option<&str>) -> Option<Located> {
         revision: current.head.as_ref().map(|h| h.chars().take(7).collect()),
         distance: None,
     };
-    Some(Located { main, checkout: Some(PathBuf::from(&current.path)), head })
+    Some(Located { main, bare, checkout: Some(PathBuf::from(&current.path)), head })
 }
 
 #[cfg(test)]
@@ -114,6 +115,7 @@ mod tests {
     fn located(main: &str, checkout: Option<&str>, name: Option<&str>, rev: &str) -> Located {
         Located {
             main: PathBuf::from(main),
+            bare: false,
             checkout: checkout.map(PathBuf::from),
             head: Head {
                 name: name.map(str::to_string),
@@ -167,10 +169,14 @@ mod tests {
                          aaa\nbranch refs/heads/main\n\n";
         let root = located_from(porcelain, None).unwrap();
         assert_eq!(root.main, PathBuf::from("/src/proj.git"));
+        assert!(root.bare);
         assert_eq!(root.checkout, None);
         assert_eq!(
             located_from(porcelain, Some("/src/proj-main")),
-            Some(located("/src/proj.git", Some("/src/proj-main"), Some("main"), "aaa"))
+            Some(Located {
+                bare: true,
+                ..located("/src/proj.git", Some("/src/proj-main"), Some("main"), "aaa")
+            })
         );
     }
 
