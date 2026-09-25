@@ -253,7 +253,7 @@ impl Action for action::OpenScratchpad {
 
 impl Action for action::OpenTasks {
     fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
-        if app.config.integrations.taskwarrior.enabled {
+        if app.config.integrations.tasks_enabled() {
             app.toggle_tasks_tab(ctx);
         }
     }

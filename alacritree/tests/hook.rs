@@ -166,6 +166,45 @@ fn a_missing_task_binary_prints_nothing_and_exits_zero() {
     assert!(out.stdout.is_empty());
 }
 
+/// A configured command answers the hook in taskwarrior's place, guide and
+/// lists both.
+#[cfg(unix)]
+#[test]
+fn a_task_command_answers_the_hook() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = without_task();
+    let bin = sandbox.state.path().join("todo");
+    std::fs::write(&bin, "#!/bin/sh\ncat \"$(dirname \"$0\")/tasks.json\"\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tasks = r#"[{"id":"t1","description":"from the command","status":"pending","project":"myrepo.main"},
+        {"id":"t2","description":"another repo","status":"pending","project":"other"}]"#;
+    std::fs::write(sandbox.state.path().join("tasks.json"), tasks).unwrap();
+    let path = format!("integrations.tasks.command.path='{}'", bin.display());
+    let args = [
+        "-o",
+        "integrations.tasks.command.enabled=true",
+        "-o",
+        &path,
+        "-o",
+        "integrations.tasks.command.list=['list']",
+        "-o",
+        "integrations.tasks.command.agent_guide='Use todo for {project}.'",
+        "hook",
+        "session-start",
+        "--harness",
+        "claude",
+    ];
+    let out = hook(&sandbox, &args, &fixture("claude-session-start.json", &sandbox.repo));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!("stdout is JSON ({e}): {}", String::from_utf8_lossy(&out.stderr))
+    });
+    let ctx = json["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+    assert!(ctx.starts_with("Use todo for myrepo.main.claude-"), "{ctx}");
+    assert!(ctx.contains("from the command"), "{ctx}");
+    assert!(!ctx.contains("another repo"), "{ctx}");
+}
+
 #[test]
 fn garbage_stdin_exits_zero() {
     let sandbox = without_task();

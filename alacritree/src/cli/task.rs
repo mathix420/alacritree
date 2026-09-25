@@ -35,10 +35,15 @@ pub(super) fn run(
 }
 
 /// Points `task` and `git` at the configured programs, so
-/// `[integrations.taskwarrior] path` and `-o` reach every call.
-pub(super) fn configure_tools(config_dir: Option<&Path>, overrides: &[toml::Value]) {
+/// `[integrations.taskwarrior] path` and `-o` reach every call, and hands back
+/// the integrations for the caller to pick a task backend from.
+pub(super) fn configure_tools(
+    config_dir: Option<&Path>,
+    overrides: &[toml::Value],
+) -> config::IntegrationsConfig {
     let (config, _) = config::load(config_dir, overrides);
     tools::configure(config.integrations.tool_paths());
+    config.integrations
 }
 
 fn scope(json: bool) -> i32 {

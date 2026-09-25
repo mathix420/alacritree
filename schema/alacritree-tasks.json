@@ -1,0 +1,88 @@
+{
+  "$defs": {
+    "Status": {
+      "description": "Where a task stands. A store's other states, such as deleted or waiting,\nstay out of a listing.",
+      "enum": [
+        "pending",
+        "completed"
+      ],
+      "type": "string"
+    },
+    "Task": {
+      "description": "One task as a store lists it.",
+      "properties": {
+        "description": {
+          "description": "What the task says, on one line.",
+          "type": "string"
+        },
+        "entry": {
+          "default": null,
+          "description": "When the task was created. Compared as text, so it needs a format\nthat sorts by time, such as ISO 8601 in UTC.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "What every edit addresses the task by. Stable for the task's life.",
+          "type": "string"
+        },
+        "modified": {
+          "default": null,
+          "description": "When the task last changed, compared the same way as `entry`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "order": {
+          "default": null,
+          "description": "Position among the task's siblings, lowest first. Tasks without one\nfollow the ordered ones, oldest first.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "parent": {
+          "default": null,
+          "description": "The `id` of the task this one nests under. A parent the listing does\nnot hold leaves the task at the top level.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project": {
+          "default": null,
+          "description": "The project node the task belongs to, such as `repo.branch`. Absent\nis the global list.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "started": {
+          "default": false,
+          "description": "Work on the task has begun.",
+          "type": "boolean"
+        },
+        "status": {
+          "$ref": "#/$defs/Status"
+        }
+      },
+      "required": [
+        "id",
+        "description",
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://github.com/mathix420/alacritree/releases/latest/download/alacritree-tasks.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "What `[integrations.tasks.command] list` prints: the store's pending and completed tasks, as one JSON array.",
+  "items": {
+    "$ref": "#/$defs/Task"
+  },
+  "title": "alacritree task list",
+  "type": "array"
+}

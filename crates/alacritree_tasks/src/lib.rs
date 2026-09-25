@@ -8,6 +8,7 @@
 // this crate must answer to its own name for those paths to resolve here too.
 extern crate self as alacritree_tasks;
 
+pub mod command;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
 pub mod scope;
@@ -15,6 +16,7 @@ pub mod tree;
 
 use serde::Deserialize;
 
+pub use crate::command::{RawTasks, TaskCommand, TasksConfig};
 use crate::scope::GLOBAL;
 
 /// Where a task stands. A store's other states, such as deleted or waiting,
@@ -31,6 +33,7 @@ pub enum Status {
 pub struct Task {
     /// What every edit addresses the task by. Stable for the task's life.
     pub id: String,
+    /// What the task says, on one line.
     pub description: String,
     pub status: Status,
     /// Work on the task has begun.
@@ -144,6 +147,11 @@ pub enum TaskError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("{program} did not finish within {}s", alacritree_common::side::LIMIT.as_secs())]
+    TimedOut { program: String },
+    /// The command backend has no arguments for this operation.
+    #[error("[integrations.tasks.command] has no `{operation}` arguments")]
+    Unsupported { operation: &'static str },
 }
 
 #[ambassador::delegatable_trait]

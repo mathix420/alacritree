@@ -1109,6 +1109,10 @@
           "$ref": "#/$defs/RawHerdr",
           "description": "Agents running under a herdr server."
         },
+        "tasks": {
+          "$ref": "#/$defs/RawTasks",
+          "description": "Task lists kept by a program of your own."
+        },
         "taskwarrior": {
           "$ref": "#/$defs/RawTaskwarrior",
           "description": "Task lists kept in taskwarrior."
@@ -1513,6 +1517,120 @@
           "type": "object"
         }
       ]
+    },
+    "RawTaskCommand": {
+      "properties": {
+        "add": {
+          "default": [],
+          "description": "Arguments that add a task. `{project}` is its node, `{description}`\nits text, `{parent}` the id it nests under, empty at the top level,\nand `{order}` its place among its siblings.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "agent_guide": {
+          "default": "Task list. Write your own tasks to project {project}.\n",
+          "description": "What an agent is told ahead of its lists. `{project}` is the node it\nwrites its own tasks to.",
+          "type": "string"
+        },
+        "delete": {
+          "default": [],
+          "description": "Arguments that delete task `{id}`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "describe": {
+          "default": [],
+          "description": "Arguments that replace the text of task `{id}` with `{description}`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "done": {
+          "default": [],
+          "description": "Arguments that complete task `{id}`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "enabled": {
+          "default": false,
+          "description": "Keep task lists through this command instead of taskwarrior, and show\nthem in a tab (`OpenTasks`, Ctrl+~). Agents read them through\n`alacritree hook`. Needs `path`.",
+          "type": "boolean"
+        },
+        "list": {
+          "default": [],
+          "description": "Arguments that print the pending and completed tasks as a JSON array,\nin the shape `alacritree-tasks.json` describes. That schema is\nattached to each release. alacritree keeps the tasks under the project\nnodes it shows.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "move": {
+          "default": [],
+          "description": "Arguments that nest task `{id}` under `{parent}`, empty for the top\nlevel, at `{order}` among its new siblings.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "path": {
+          "default": "",
+          "description": "The program to run on Windows or natively. A bare name is looked up\non PATH.",
+          "type": "string"
+        },
+        "reorder": {
+          "default": [],
+          "description": "Arguments that give task `{id}` the place `{order}` among its\nsiblings.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "start": {
+          "default": [],
+          "description": "Arguments that mark work on task `{id}` begun.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "stop": {
+          "default": [],
+          "description": "Arguments that mark work on task `{id}` stopped.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "undone": {
+          "default": [],
+          "description": "Arguments that make completed task `{id}` pending again.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "wsl_path": {
+          "default": "",
+          "description": "The program to run inside a WSL distro for a project there, as\nwritten. Empty looks up the file name of `path`, without directory or\nextension, through the distro's login shell. A Windows `path` is never\nrun there.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "RawTasks": {
+      "properties": {
+        "command": {
+          "$ref": "#/$defs/RawTaskCommand",
+          "description": "A task store run through a program of your own, in place of\ntaskwarrior."
+        }
+      },
+      "type": "object"
     },
     "RawTaskwarrior": {
       "properties": {

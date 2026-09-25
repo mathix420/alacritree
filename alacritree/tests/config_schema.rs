@@ -1,15 +1,16 @@
 //! The committed `schema/alacritree-config.json` and `docs/config-reference.md`
-//! must match what the config types generate.  A stale schema is worse than
-//! none: editors would report valid config as invalid, and stay quiet about the
-//! keys it does not know about.
+//! must match what the config types generate, and `schema/alacritree-tasks.json`
+//! what the task model generates.  A stale schema is worse than none: editors
+//! would report valid config as invalid, and stay quiet about the keys it does
+//! not know about.
 //!
 //! `ALACRITREE_UPDATE_SCHEMA=1 cargo test -p alacritree --test config_schema`
-//! rewrites both files instead of failing, so the run that catches the drift is
+//! rewrites the files instead of failing, so the run that catches the drift is
 //! also the one that fixes it.
 
 use std::path::PathBuf;
 
-use alacritree::cli::{config_reference_document, schema_document};
+use alacritree::cli::{config_reference_document, schema_document, task_list_schema_document};
 
 /// A path relative to the repository root, which sits beside the manifest dir.
 fn repo_path(relative: &str) -> PathBuf {
@@ -28,6 +29,11 @@ fn the_committed_schema_matches_the_config_types() {
 #[test]
 fn the_committed_config_reference_matches_the_schema() {
     assert_current(repo_path("docs/config-reference.md"), &config_reference_document());
+}
+
+#[test]
+fn the_committed_task_list_schema_matches_the_task_model() {
+    assert_current(repo_path("schema/alacritree-tasks.json"), &task_list_schema_document());
 }
 
 fn assert_current(path: PathBuf, generated: &str) {

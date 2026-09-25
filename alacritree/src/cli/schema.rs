@@ -23,23 +23,45 @@ use std::path::{Path, PathBuf};
 pub(super) const ID: &str =
     "https://github.com/mathix420/alacritree/releases/latest/download/alacritree-config.json";
 
+/// Where the shape of a task command's `list` output is published, attached
+/// to every release beside the config schema for the same reasons.
+const TASKS_ID: &str =
+    "https://github.com/mathix420/alacritree/releases/latest/download/alacritree-tasks.json";
+
 /// The schema document, pretty-printed with a trailing newline.
 pub fn document() -> String {
     let mut schema =
         serde_json::to_value(crate::config::json_schema()).expect("a schema serializes");
-    let obj = schema.as_object_mut().expect("a struct schema is a JSON object");
-    obj.insert("$id".into(), ID.into());
-    obj.insert("title".into(), "alacritree configuration".into());
-    obj.insert(
-        "description".into(),
+    drop_nulls(&mut schema);
+    publish(
+        schema,
+        ID,
+        "alacritree configuration",
         "Everything alacritree reads out of alacritty.toml and alacritree.toml. Unknown keys are \
          allowed: the two files are layers, and alacritty.toml legitimately carries keys only the \
-         real alacritty acts on."
-            .into(),
-    );
+         real alacritty acts on.",
+    )
+}
 
-    drop_nulls(&mut schema);
+/// The schema a task command's `list` output follows, pretty-printed with a
+/// trailing newline. JSON has null, so an absent field may also be null and
+/// the schema keeps saying so.
+pub fn tasks_document() -> String {
+    let schema = schemars::schema_for!(Vec<alacritree_tasks::Task>);
+    publish(
+        serde_json::to_value(schema).expect("a schema serializes"),
+        TASKS_ID,
+        "alacritree task list",
+        "What `[integrations.tasks.command] list` prints: the store's pending and completed \
+         tasks, as one JSON array.",
+    )
+}
 
+fn publish(mut schema: serde_json::Value, id: &str, title: &str, description: &str) -> String {
+    let obj = schema.as_object_mut().expect("a schema is a JSON object");
+    obj.insert("$id".into(), id.into());
+    obj.insert("title".into(), title.into());
+    obj.insert("description".into(), description.into());
     format!("{}\n", serde_json::to_string_pretty(&schema).expect("a JSON value pretty-prints"))
 }
 

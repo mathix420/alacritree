@@ -27,7 +27,7 @@ use clap_complete::Shell;
 use crate::ipc::protocol::{IpcRequest, LocalSocket, SendError, Transport};
 
 pub use config_reference::document as config_reference_document;
-pub use schema::document as schema_document;
+pub use schema::{document as schema_document, tasks_document as task_list_schema_document};
 
 /// Redistributing the embedded subset obliges us to carry its notice, and
 /// installation copies only the executable, so the text ships inside it.
@@ -372,9 +372,9 @@ pub fn run(cli: Cli) -> Option<i32> {
             let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut stdin);
             let harness = alacritree_tasks::scope::Harness::parse(&harness)
                 .expect("clap restricts --harness to known names");
-            task::configure_tools(cli.config_dir.as_deref(), &cli.options);
+            let integrations = task::configure_tools(cli.config_dir.as_deref(), &cli.options);
             let state_dir = cli.config_dir.clone().or_else(crate::state::config_dir);
-            let backend = crate::tasks::backend::Backend::default();
+            let backend = crate::tasks::backend::Backend::from_config(&integrations);
             let state_dir = state_dir.as_deref();
             if let Some(out) = crate::tasks::hook::run(&backend, event, harness, &stdin, state_dir)
             {

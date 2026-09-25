@@ -1092,7 +1092,7 @@ impl AlacritreeApp {
                 TermSize::new(80, 24),
                 (8.0, 16.0),
                 crate::tasks::view::TasksView::new(
-                    crate::tasks::backend::Backend::default(),
+                    crate::tasks::backend::Backend::from_config(&self.config.integrations),
                     scope,
                     worktree.map(|w| w.path.clone()),
                 ),

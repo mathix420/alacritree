@@ -236,11 +236,14 @@ version = "0.0.0"
 dependencies = [
  "alacritree_common",
  "ambassador",
+ "log",
  "schemars",
  "serde",
  "serde_json",
  "strum",
+ "tempfile",
  "thiserror 2.0.17",
+ "toml",
 ]
 
 [[package]]

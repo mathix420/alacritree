@@ -113,6 +113,9 @@
       "show_unmatched": true,
       "wsl_path": null
     },
+    "tasks": {
+      "command": null
+    },
     "taskwarrior": {
       "enabled": false,
       "path": "task",

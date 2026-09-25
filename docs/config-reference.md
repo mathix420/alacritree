@@ -262,6 +262,30 @@ Agents running under a herdr server.
 - `show_unmatched` (boolean, default `true`): List panes whose working directory matches no worktree, under Home.
 - `wsl_path` (string, default `""`): The program to run inside every WSL distro, as written. Empty finds it by name through the distro's login shell.
 
+### `[integrations.tasks]`
+
+Task lists kept by a program of your own.
+
+
+### `[integrations.tasks.command]`
+
+A task store run through a program of your own, in place of taskwarrior.
+
+- `add` (array of string, default `[]`): Arguments that add a task. `{project}` is its node, `{description}` its text, `{parent}` the id it nests under, empty at the top level, and `{order}` its place among its siblings.
+- `agent_guide` (string, default `"Task list. Write your own tasks to project {project}.\n"`): What an agent is told ahead of its lists. `{project}` is the node it writes its own tasks to.
+- `delete` (array of string, default `[]`): Arguments that delete task `{id}`.
+- `describe` (array of string, default `[]`): Arguments that replace the text of task `{id}` with `{description}`.
+- `done` (array of string, default `[]`): Arguments that complete task `{id}`.
+- `enabled` (boolean, default `false`): Keep task lists through this command instead of taskwarrior, and show them in a tab (`OpenTasks`, Ctrl+~). Agents read them through `alacritree hook`. Needs `path`.
+- `list` (array of string, default `[]`): Arguments that print the pending and completed tasks as a JSON array, in the shape `alacritree-tasks.json` describes. That schema is attached to each release. alacritree keeps the tasks under the project nodes it shows.
+- `move` (array of string, default `[]`): Arguments that nest task `{id}` under `{parent}`, empty for the top level, at `{order}` among its new siblings.
+- `path` (string, default `""`): The program to run on Windows or natively. A bare name is looked up on PATH.
+- `reorder` (array of string, default `[]`): Arguments that give task `{id}` the place `{order}` among its siblings.
+- `start` (array of string, default `[]`): Arguments that mark work on task `{id}` begun.
+- `stop` (array of string, default `[]`): Arguments that mark work on task `{id}` stopped.
+- `undone` (array of string, default `[]`): Arguments that make completed task `{id}` pending again.
+- `wsl_path` (string, default `""`): The program to run inside a WSL distro for a project there, as written. Empty looks up the file name of `path`, without directory or extension, through the distro's login shell. A Windows `path` is never run there.
+
 ### `[integrations.taskwarrior]`
 
 Task lists kept in taskwarrior.

@@ -86,6 +86,31 @@ The tab shows the global section, the project, the workspace, and one section fo
 
 The tab reloads from taskwarrior every second while it is shown, so tasks an agent adds appear on their own. A project inside WSL reads and writes that distro's taskwarrior. Taskwarrior 3 has no Windows build, so a Windows project uses the default distro's taskwarrior when `task` is not on the Windows `PATH`. Linux and macOS always use the native install.
 
+#### A task store of your own
+
+A program you write can keep the lists instead of taskwarrior. `[integrations.tasks.command]` names it and gives one argument list per operation, the way a custom diff viewer does:
+
+```toml
+[integrations.tasks.command]
+enabled = true
+path = "todo-bridge"
+list = ["list", "--json"]
+add = ["add", "{project}", "{order}", "{parent}", "--", "{description}"]
+move = ["move", "{id}", "{parent}", "{order}"]
+reorder = ["move", "{id}", "--order", "{order}"]
+describe = ["edit", "{id}", "--", "{description}"]
+done = ["done", "{id}"]
+undone = ["reopen", "{id}"]
+start = ["start", "{id}"]
+stop = ["stop", "{id}"]
+delete = ["rm", "{id}"]
+agent_guide = "Tasks live in todo-bridge. Add yours with `todo-bridge add {project} ...`.\n"
+```
+
+`list` prints the pending and completed tasks as one JSON array, in the shape `alacritree-tasks.json` describes. That schema is attached to every release beside the config schema, and `schema/alacritree-tasks.json` in this repository holds the current one. alacritree keeps the tasks under the nodes the tab or the hook is showing, so the program may print all of them. The other operations answer through their exit status: 0 means done, and anything else puts the program's standard error on the row. `{parent}` is empty for a task at the top level. Each placeholder fills exactly one argument, since no shell splits the words. An operation left empty is one the store cannot do, and the tab says so when it is asked for.
+
+With the command enabled, the tab turns on without `[integrations.taskwarrior]`, and `alacritree hook` reads the lists through the command. `agent_guide` is what an agent reads above its lists, with `{project}` standing for the node it writes its own tasks to. For a project inside WSL, the command runs in that distro: `wsl_path` as written, or the file name of `path` through the distro's login shell.
+
 #### Agent hooks
 
 `alacritree hook <event> --harness <claude|codex>` gives an agent its lists when a session starts, and again before a prompt whenever they changed. It prints one JSON object for the harness to add to the model's context, or nothing, and always exits 0, so a missing `task` never blocks a turn. The agent sees its own session's list and every scope above it, never another agent's.

@@ -609,6 +609,7 @@ pub struct IntegrationsConfig {
     pub delta: ToolConfig,
     pub tuicr: ToolConfig,
     pub taskwarrior: alacritree_taskwarrior::TaskwarriorConfig,
+    pub tasks: alacritree_tasks::TasksConfig,
     pub diff_viewer: alacritree_diff_viewer::DiffViewerConfig,
 }
 
@@ -636,6 +637,11 @@ impl IntegrationsConfig {
     /// Indexed by [`Tool`] discriminant, the shape `tools::configure` takes.
     pub fn tool_paths(&self) -> [ToolPaths; Tool::COUNT] {
         Tool::table(|tool| self.paths(tool))
+    }
+
+    /// Whether some backend keeps task lists for the tasks tab.
+    pub fn tasks_enabled(&self) -> bool {
+        self.taskwarrior.enabled || self.tasks.command.is_some()
     }
 }
 
@@ -2842,6 +2848,8 @@ struct RawIntegrations {
     tuicr: alacritree_diff_viewer::RawTuicr,
     /// Task lists kept in taskwarrior.
     taskwarrior: alacritree_taskwarrior::RawTaskwarrior,
+    /// Task lists kept by a program of your own.
+    tasks: alacritree_tasks::RawTasks,
     /// What the git panel's diff pane runs.
     diff_viewer: alacritree_diff_viewer::RawDiffViewer,
 }
@@ -2883,6 +2891,7 @@ impl RawIntegrations {
             delta: self.delta.resolve(moved.delta_path),
             tuicr: self.tuicr.resolve(),
             taskwarrior: self.taskwarrior.resolve(),
+            tasks: self.tasks.resolve(),
             diff_viewer: self.diff_viewer.resolve(),
         }
     }
@@ -4028,6 +4037,20 @@ wsl_path =              '/usr/bin/task'
             config.integrations.paths(Tool::Task),
             paths("C:/bin/task.exe", Some("/usr/bin/task"))
         );
+    }
+
+    #[test]
+    fn a_task_command_turns_the_tab_on_without_taskwarrior() {
+        assert!(!config_from("").integrations.tasks_enabled());
+        let config = config_from(
+            "[integrations.tasks.command]
+enabled = true
+path = 'todo'
+list = ['ls']
+",
+        );
+        assert!(config.integrations.tasks_enabled());
+        assert!(!config.integrations.taskwarrior.enabled);
     }
 
     #[test]

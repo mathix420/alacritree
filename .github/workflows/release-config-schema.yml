@@ -3,9 +3,10 @@ name: Release config schema
 # Post-announce hook for the dist pipeline. `alacritree schema` names
 # `releases/latest/download/alacritree-config.json` as the schema's id, so a
 # config carrying the `#:schema` header only resolves once that asset exists on
-# every release.
+# every release. `alacritree-tasks.json`, the shape a task command's `list`
+# prints, rides along on the same terms.
 #
-# The file is uploaded from the checkout rather than regenerated here: the
+# The files are uploaded from the checkout rather than regenerated here: the
 # `config_schema` integration test fails the build when the committed copy and
 # the config types disagree, so at a release tag they are the same document and
 # building one would only cost a compile.
@@ -23,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Upload alacritree-config.json
+      - name: Upload the schemas
         env:
           GH_TOKEN: ${{ secrets.ALACRITREE_BOT_TOKEN }}
           PLAN: ${{ inputs.plan }}
@@ -35,5 +36,10 @@ jobs:
             exit 0
           fi
           tag=$(jq -r '.announcement_tag' <<< "$PLAN")
-          gh release upload "$tag" schema/alacritree-config.json \
+          files=(schema/alacritree-config.json)
+          # Tolerate tags cut before the task list schema existed.
+          if [[ -f schema/alacritree-tasks.json ]]; then
+            files+=(schema/alacritree-tasks.json)
+          fi
+          gh release upload "$tag" "${files[@]}" \
             --repo "$GITHUB_REPOSITORY" --clobber

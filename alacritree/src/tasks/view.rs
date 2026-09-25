@@ -652,7 +652,7 @@ mod tests {
         fn new(tasks: Vec<Task>) -> Self {
             let ctx = egui::Context::default();
             let scope = Scope::for_workspace(None, None);
-            let mut view = TasksView::new(Backend::default(), scope, None);
+            let mut view = TasksView::new(Backend::from_config(&Default::default()), scope, None);
             view.tasks = tasks;
             let mut h =
                 Self { ctx, view, ops: Vec::new(), texts: Vec::new(), background_clicked: false };

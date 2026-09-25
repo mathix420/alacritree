@@ -155,7 +155,7 @@ impl AlacritreeApp {
     pub(super) fn palette_items(&self) -> Vec<PaletteItem> {
         let mut items = command_palette::action_items(
             &self.shortcuts,
-            self.config.integrations.taskwarrior.enabled,
+            self.config.integrations.tasks_enabled(),
         );
         for (i, profile) in self.config.profiles.iter().enumerate() {
             let index = i + 1;
