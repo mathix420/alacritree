@@ -1,8 +1,8 @@
 //! A multiplexer whose answers a test writes down in advance.
 //!
-//! [`Multiplexer`](super::Multiplexer) is a closed enum, so without a variant
-//! here a fake satisfying [`MultiplexerSession`] could not become one, and app
-//! tests reached past the seam into herdr's wire format instead.
+//! The app's multiplexer enum is closed, so without a variant for this a fake
+//! satisfying [`MultiplexerSession`] could not become one, and app tests
+//! reached past the seam into herdr's wire format instead.
 //!
 //! Nothing here runs a subprocess or watches a clock.  The listing is whatever
 //! `set_panes` was handed, and each queued attach or create takes the next
@@ -12,38 +12,32 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use alacritree_common::settings::IconStyle;
 use serde_json::{Value, json};
 
-use super::model::{
+use crate::model::{
     AttachAnswer, AttachRequest, CreateAnswer, CreateRequest, ListedPane, Managed, ViewState,
     ViewStep,
 };
-use super::{
+use crate::{
     CreatedPane, Launch, MultiplexerKind, MultiplexerSession, Pane, PaneError, PaneKey, PaneStatus,
-    PaneTarget, Side,
+    PaneTarget, SessionId, Side,
 };
-use crate::config::{BakedGlyph, DEFAULT_SESSION_ICON, IconStyle};
-use crate::session::SessionId;
-
-/// Borrowed rather than drawn: every `BakedGlyph` is declared through
-/// `baked_glyphs!` so the baked font subset covers it, and a scripted row
-/// wants a neutral mark rather than one of its own.
-const SCRIPTED_ICON: BakedGlyph = DEFAULT_SESSION_ICON;
 
 /// An attach this adapter was asked for and has not answered yet.
-pub(crate) struct QueuedAttach {
+pub struct QueuedAttach {
     pub key: PaneKey,
     pub request: AttachRequest,
 }
 
 /// A create this adapter was asked for and has not answered yet.
-pub(crate) struct QueuedCreate {
+pub struct QueuedCreate {
     pub side: Side,
     pub request: CreateRequest,
 }
 
 #[derive(Default)]
-pub(crate) struct Scripted {
+pub struct Scripted {
     enabled: bool,
     /// Whether opening a row attaches to the one pane or shares the whole
     /// view.  Both multiplexers in production answer this differently, so the
@@ -75,7 +69,7 @@ pub(crate) struct Scripted {
 }
 
 impl Scripted {
-    pub(crate) fn key(side: &Side, terminal_id: &str) -> PaneKey {
+    pub fn key(side: &Side, terminal_id: &str) -> PaneKey {
         PaneKey {
             multiplexer: MultiplexerKind::Scripted,
             side: side.clone(),
@@ -85,7 +79,7 @@ impl Scripted {
 
     /// A pane carrying only an identity, for the tests that care about nothing
     /// else.  `with_*` fills in what a particular test does care about.
-    pub(crate) fn pane(terminal_id: &str) -> Pane {
+    pub fn pane(terminal_id: &str) -> Pane {
         Pane {
             terminal_id: terminal_id.to_string(),
             pane_id: format!("p:{terminal_id}"),
@@ -99,29 +93,29 @@ impl Scripted {
         }
     }
 
-    pub(crate) fn enable(&mut self) -> &mut Self {
+    pub fn enable(&mut self) -> &mut Self {
         self.enabled = true;
         self
     }
 
-    pub(crate) fn disable(&mut self) -> &mut Self {
+    pub fn disable(&mut self) -> &mut Self {
         self.enabled = false;
         self
     }
 
     /// Open a row's pane on its own rather than by sharing the whole view.
-    pub(crate) fn attach_directly(&mut self, direct: bool) -> &mut Self {
+    pub fn attach_directly(&mut self, direct: bool) -> &mut Self {
         self.direct = direct;
         self
     }
 
-    pub(crate) fn show_unmatched(&mut self, show: bool) -> &mut Self {
+    pub fn show_unmatched(&mut self, show: bool) -> &mut Self {
         self.show_unmatched = show;
         self
     }
 
     /// The glyph a row draws for this multiplexer.
-    pub(crate) fn set_icon(&mut self, icon: IconStyle) -> &mut Self {
+    pub fn set_icon(&mut self, icon: IconStyle) -> &mut Self {
         self.icon = icon;
         self
     }
@@ -129,7 +123,7 @@ impl Scripted {
     /// Replace what `side` is listing.  Every pane the side was carrying and
     /// this listing does not is remembered as dropped, so `retained` keeps
     /// describing a pane a session still holds.
-    pub(crate) fn set_panes(&mut self, side: &Side, panes: Vec<Pane>) -> &mut Self {
+    pub fn set_panes(&mut self, side: &Side, panes: Vec<Pane>) -> &mut Self {
         if let Some(at) = self.sides.iter().position(|(s, _)| s == side) {
             let (_, previous) = self.sides.remove(at);
             let now = Instant::now();
@@ -151,25 +145,25 @@ impl Scripted {
 
     /// What the next queued attach resolves to.  Answers are taken in the
     /// order they were pushed.
-    pub(crate) fn answer_attach(&mut self, launch: Result<Launch, PaneError>) -> &mut Self {
+    pub fn answer_attach(&mut self, launch: Result<Launch, PaneError>) -> &mut Self {
         self.attach_answers.push(launch);
         self
     }
 
-    pub(crate) fn answer_create(&mut self, pane: Result<CreatedPane, PaneError>) -> &mut Self {
+    pub fn answer_create(&mut self, pane: Result<CreatedPane, PaneError>) -> &mut Self {
         self.create_answers.push(pane);
         self
     }
 
-    pub(crate) fn pending_attach(&self) -> &[QueuedAttach] {
+    pub fn pending_attach(&self) -> &[QueuedAttach] {
         &self.attach_queue
     }
 
-    pub(crate) fn pending_create(&self) -> &[QueuedCreate] {
+    pub fn pending_create(&self) -> &[QueuedCreate] {
         &self.create_queue
     }
 
-    pub(crate) fn attached(&self) -> &[(SessionId, PaneKey)] {
+    pub fn attached(&self) -> &[(SessionId, PaneKey)] {
         &self.attached
     }
 
@@ -181,18 +175,18 @@ impl Scripted {
 /// Spelling a pane for a test.  Every field a multiplexer reports is public,
 /// so these only exist to keep a pane one expression at the call site.
 impl Pane {
-    pub(crate) fn with_agent(mut self, kind: &str, status: PaneStatus) -> Self {
+    pub fn with_agent(mut self, kind: &str, status: PaneStatus) -> Self {
         self.kind = Some(kind.to_string());
         self.status = Some(status);
         self
     }
 
-    pub(crate) fn with_title(mut self, title: &str) -> Self {
+    pub fn with_title(mut self, title: &str) -> Self {
         self.title = Some(title.to_string());
         self
     }
 
-    pub(crate) fn in_dir(mut self, cwd: &str) -> Self {
+    pub fn in_dir(mut self, cwd: &str) -> Self {
         self.cwd = Some(cwd.to_string());
         self
     }
@@ -203,8 +197,8 @@ impl MultiplexerSession for Scripted {
         self.enabled
     }
 
-    fn icon(&self) -> (&IconStyle, BakedGlyph) {
-        (&self.icon, SCRIPTED_ICON)
+    fn icon(&self) -> &IconStyle {
+        &self.icon
     }
 
     /// The listing is whatever `set_panes` wrote, so there is nothing to

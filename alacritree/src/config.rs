@@ -17,7 +17,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use alacritree_common::settings::{ClosedSet, moved_key};
+pub use alacritree_common::settings::IconStyle;
+use alacritree_common::settings::{ClosedSet, RawIconStyle, RgbStr};
 use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Rgb};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -603,8 +604,8 @@ pub struct IntegrationsConfig {
     pub gh: alacritree_gh::GhConfig,
     pub doppler: alacritree_doppler::DopplerConfig,
     pub checkout_hooks: Vec<alacritree_checkout_hooks::CommandHook>,
-    pub herdr: HerdrConfig,
-    pub zellij: ZellijConfig,
+    pub herdr: alacritree_herdr::HerdrConfig,
+    pub zellij: alacritree_zellij::ZellijConfig,
     pub delta: ToolConfig,
     pub tuicr: ToolConfig,
     pub taskwarrior: TaskwarriorConfig,
@@ -627,6 +628,7 @@ impl IntegrationsConfig {
             Tool::Herdr => (&self.herdr.path, &self.herdr.wsl_path),
             Tool::Tuicr => (&self.tuicr.path, &self.tuicr.wsl_path),
             Tool::Task => (&self.taskwarrior.path, &self.taskwarrior.wsl_path),
+            Tool::Zellij => (&self.zellij.path, &self.zellij.wsl_path),
         };
         ToolPaths { native: native.clone(), wsl: wsl.clone() }
     }
@@ -637,69 +639,6 @@ impl IntegrationsConfig {
     }
 }
 
-/// What opening a herdr agent row attaches to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
-#[serde(into = "&'static str")]
-#[strum(serialize_all = "snake_case")]
-pub enum AttachMode {
-    /// The agent's own pane.
-    #[default]
-    Agent,
-    /// The herdr session that pane belongs to, with the pane focused.
-    Session,
-}
-
-/// Whether a focus change made inside herdr may move alacritree, and from
-/// which sessions.  Following moves the keyboard, so the default is the
-/// narrower rule: only a session that is already showing herdr's view
-/// follows it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, EnumIter, IntoStaticStr)]
-#[serde(into = "&'static str")]
-#[strum(serialize_all = "snake_case")]
-pub enum FollowFocus {
-    /// herdr never moves alacritree.  alacritree still tells herdr where to
-    /// point when the user picks a row.
-    Off,
-    /// Follow only while the active session is herdr-backed.
-    #[default]
-    Herdr,
-    /// Follow from a native session too, on any reachable side.
-    Always,
-}
-
-/// `[integrations.herdr]`: whether alacritree lists agents running under a
-/// herdr server in the sidebar, what opening one attaches to, and the glyph
-/// that marks them. A probe with no herdr binary or server present costs
-/// nothing.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct HerdrConfig {
-    /// The native herdr binary, as `[integrations.herdr] path` names it.
-    pub path: String,
-    /// The herdr binary inside WSL, or `None` to find it by name there.
-    pub wsl_path: Option<String>,
-    /// The glyph on a herdr pane's sidebar row and palette entry.
-    pub icon: IconStyle,
-    /// Discover herdr servers and list their agents in the sidebar.
-    pub enabled: bool,
-    /// List panes whose working directory matches no worktree, under Home.
-    pub show_unmatched: bool,
-    /// List every pane a herdr server owns, not only the ones it detected an
-    /// agent in.
-    pub show_panes: bool,
-    /// What a row opens.  Honoured per side; the native side of a Windows
-    /// host attaches to the session whatever this says.
-    pub attach: AttachMode,
-    /// Whether a focus change inside herdr moves alacritree, and from which
-    /// sessions.
-    pub follow_focus: FollowFocus,
-}
-
-impl Default for HerdrConfig {
-    fn default() -> Self {
-        RawHerdr::default().resolve(None)
-    }
-}
-
 /// `[integrations.taskwarrior]`: where `task` lives on each side, and
 /// whether the tasks tab is on.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -707,34 +646,6 @@ pub struct TaskwarriorConfig {
     pub path: String,
     pub wsl_path: Option<String>,
     pub enabled: bool,
-}
-
-/// `[integrations.zellij]`: whether alacritree lists the panes of running
-/// zellij sessions in the sidebar, where a new one opens, and the glyph that
-/// marks them.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct ZellijConfig {
-    /// The native zellij binary.
-    pub path: String,
-    /// The zellij binary inside WSL, or `None` to find it by name there.
-    pub wsl_path: Option<String>,
-    /// The glyph on a zellij pane's sidebar row and palette entry.
-    pub icon: IconStyle,
-    /// Discover zellij sessions and list their panes in the sidebar.
-    pub enabled: bool,
-    /// How often each side's zellij sessions are re-listed.
-    pub poll_interval: Duration,
-    /// List panes whose working directory matches no worktree, under Home.
-    pub show_unmatched: bool,
-    /// The session a new pane opens in.  `None` takes the one session
-    /// running on the side, and refuses when there are several.
-    pub session: Option<String>,
-}
-
-impl Default for ZellijConfig {
-    fn default() -> Self {
-        RawZellij::default().resolve()
-    }
 }
 
 /// Disposable by nature.  Unix keeps captures in the user's cache rather than
@@ -791,7 +702,7 @@ impl BakedGlyph {
 /// Declares a glyph constant and enrols it in `$slice` in one step, so the
 /// aggregate cannot drift from the constants it describes.
 macro_rules! baked_glyphs {
-    ($slice:ident: $($(#[$m:meta])* $name:ident = $glyph:literal;)*) => {
+    ($slice:ident: $($(#[$m:meta])* $name:ident = $glyph:expr;)*) => {
         $($(#[$m])* pub(crate) const $name: BakedGlyph = BakedGlyph($glyph);)*
         #[cfg(test)]
         pub(crate) const $slice: &[BakedGlyph] = &[$($name),*];
@@ -813,11 +724,11 @@ baked_glyphs! {
     /// herdr's ram, drawn from `assets/herdr-ram.svg`.  A geometric shape
     /// reads as a missing glyph at row size, which is what the bisected
     /// square used here did, so each multiplexer gets its own silhouette.
-    DEFAULT_HERDR_ICON = "\u{10FF00}";
+    DEFAULT_HERDR_ICON = alacritree_herdr::DEFAULT_ICON;
     /// zellij's hexagon, drawn from `assets/zellij-hexagon.svg`.  DejaVu's
     /// U+2B21 was used here first and its hairline stroke closes up at row
     /// size, so this one is drawn with a stroke an eighth of its height.
-    DEFAULT_ZELLIJ_ICON = "\u{10FF01}";
+    DEFAULT_ZELLIJ_ICON = alacritree_zellij::DEFAULT_ICON;
     DEFAULT_HOME_ICON = "⌂";
     DEFAULT_PROJECT_EXPANDED_ICON = "▾";
     DEFAULT_PROJECT_COLLAPSED_ICON = "▸";
@@ -1210,37 +1121,6 @@ impl Default for FocusOutline {
 impl Default for Icons {
     fn default() -> Self {
         build_icons(RawIcons::default())
-    }
-}
-
-/// A sidebar icon's glyph and how to paint it.  Parses from a bare string,
-/// accepted as glyph-only, or a table that also styles color, weight, slant,
-/// and size.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
-pub struct IconStyle<C = Rgb> {
-    pub glyph: Option<String>,
-    pub color: Option<C>,
-    pub bold: bool,
-    pub italic: bool,
-    /// Logical pixels before `ui_scale`; clamped to the icon's slot at paint.
-    pub size: Option<f32>,
-}
-
-impl<C> IconStyle<C> {
-    pub fn or_glyph<'a>(&'a self, default: &'a str) -> &'a str {
-        self.glyph.as_deref().map(str::trim).filter(|g| !g.is_empty()).unwrap_or(default)
-    }
-}
-
-impl<C: Copy> IconStyle<C> {
-    pub fn map_color<D>(&self, f: impl Fn(C) -> D) -> IconStyle<D> {
-        IconStyle {
-            glyph: self.glyph.clone(),
-            color: self.color.map(f),
-            bold: self.bold,
-            italic: self.italic,
-            size: self.size,
-        }
     }
 }
 
@@ -2775,49 +2655,6 @@ fn build_icons(raw: RawIcons) -> Icons {
     }
 }
 
-// The bare form is listed first so a plain string never attempts the table
-// arm.
-/// A styled icon override: either a bare glyph string (`worktree = "◆"`) or a
-/// table (`worktree = { glyph = "◆", color = "#ff5555", bold = true }`).
-#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
-#[serde(untagged)]
-enum RawIconStyle {
-    /// The glyph alone.
-    Glyph(String),
-    /// The glyph with styling.
-    Table {
-        /// The character to draw.  Unset keeps the built-in glyph and applies
-        /// only the styling.
-        glyph: Option<String>,
-        /// Glyph color.  Unset inherits the row's foreground.
-        color: Option<RgbStr>,
-        /// Draw the glyph bold.
-        #[serde(default)]
-        bold: bool,
-        /// Draw the glyph italic.
-        #[serde(default)]
-        italic: bool,
-        /// Point size, clamped to a minimum of `1.0`.  Unset uses the sidebar
-        /// font size.
-        size: Option<f32>,
-    },
-}
-
-impl From<RawIconStyle> for IconStyle {
-    fn from(raw: RawIconStyle) -> Self {
-        match raw {
-            RawIconStyle::Glyph(glyph) => IconStyle { glyph: Some(glyph), ..Default::default() },
-            RawIconStyle::Table { glyph, color, bold, italic, size } => IconStyle {
-                glyph,
-                color: color.map(|c| c.0),
-                bold,
-                italic,
-                size: size.map(|s| s.max(1.0)),
-            },
-        }
-    }
-}
-
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(default)]
 struct RawUiWsl {
@@ -3005,9 +2842,9 @@ struct RawIntegrations {
     /// Programs to run when a worktree is created, first opened, or removed.
     checkout_hooks: alacritree_checkout_hooks::RawCheckoutHooks,
     /// Agents running under a herdr server.
-    herdr: RawHerdr,
+    herdr: alacritree_herdr::RawHerdr,
     /// Panes of running zellij sessions.
-    zellij: RawZellij,
+    zellij: alacritree_zellij::RawZellij,
     /// The pager the delta diff viewer runs.
     delta: alacritree_diff_viewer::RawDelta,
     /// The review TUI the tuicr diff viewer runs.
@@ -3071,100 +2908,6 @@ struct MovedUiKeys {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
-struct RawHerdr {
-    /// The program to run on Windows or natively. Its own name is looked up
-    /// on PATH; any other value runs as written.
-    path: String,
-    /// The program to run inside every WSL distro, as written. Empty finds it
-    /// by name through the distro's login shell.
-    wsl_path: String,
-    /// The glyph on a herdr pane's sidebar row and palette entry. A bare
-    /// string sets the glyph; a table also styles its color, weight, slant
-    /// and size, the way `[ui.icons]` keys do. The default draws a ram's head
-    /// from the bundled symbol font. An ordinary character such as `"◫"` is
-    /// drawn by your own fonts instead.
-    #[schemars(default = "default_herdr_icon")]
-    icon: Option<RawIconStyle>,
-    /// Discover herdr servers and list their agents in the sidebar.  Inert
-    /// when no herdr binary or server is present.
-    ///
-    /// Changes arrive on herdr's event stream, read through `herdr
-    /// remote-api-bridge`.  0.9.1 has it and 0.8.2 does not; a herdr without
-    /// it lists nothing.
-    enabled: bool,
-    /// List panes whose working directory matches no worktree, under Home.
-    show_unmatched: bool,
-    /// List every pane a herdr server owns, not only the ones it detected an
-    /// agent in.  A pane running a plain shell gets a row named by its own
-    /// title, carrying no status, and opening it shares herdr's view of the
-    /// tab that holds it rather than attaching to the pane.
-    ///
-    /// Needs a herdr that knows `pane list` (0.8.2 does).  An older one
-    /// answers with a usage error, which reads as no herdr on that side.  A
-    /// side that has never answered is then abandoned for the process
-    /// lifetime; one that answered before this was turned on keeps retrying
-    /// and recovers when it goes back off.
-    show_panes: bool,
-    /// Whether opening a row attaches to that agent's pane directly
-    /// ("agent") or to the herdr session around it with the pane focused
-    /// ("session").
-    ///
-    /// "session" hands the mouse to herdr's own client, where a selection
-    /// joins soft-wrapped rows and copy mode works; a direct attach is
-    /// repainted row by row, so the host terminal sees every wrap as a line
-    /// break.  Honoured per side: the native side of a Windows host always
-    /// attaches to the session, because herdr implements no direct attach
-    /// there.
-    attach: ClosedSet<AttachMode>,
-    /// Whether a focus change made inside herdr moves alacritree to the
-    /// matching session.
-    ///
-    /// "off" never moves it.  "herdr" moves it only while the active session
-    /// is already showing herdr's view, which is what an unmodified config
-    /// has always done.  "always" also moves it from a plain native session,
-    /// on any reachable side, after a gap in typing.
-    follow_focus: ClosedSet<FollowFocus>,
-}
-
-impl Default for RawHerdr {
-    fn default() -> Self {
-        Self {
-            path: "herdr".to_string(),
-            wsl_path: String::new(),
-            icon: None,
-            enabled: true,
-            show_unmatched: true,
-            show_panes: false,
-            attach: ClosedSet::default(),
-            follow_focus: ClosedSet::default(),
-        }
-    }
-}
-
-fn default_herdr_icon() -> RawIconStyle {
-    raw_glyph(DEFAULT_HERDR_ICON)
-}
-
-impl RawHerdr {
-    fn resolve(self, old_icon: Option<RawIconStyle>) -> HerdrConfig {
-        let tool = tool_config(self.path, self.wsl_path, Tool::Herdr);
-        HerdrConfig {
-            path: tool.path,
-            wsl_path: tool.wsl_path,
-            icon: moved_key(self.icon, old_icon, "[ui.icons] herdr", "[integrations.herdr] icon")
-                .unwrap_or_else(default_herdr_icon)
-                .into(),
-            enabled: self.enabled,
-            show_unmatched: self.show_unmatched,
-            show_panes: self.show_panes,
-            attach: self.attach.get(),
-            follow_focus: self.follow_focus.get(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(default)]
 struct RawTaskwarrior {
     /// The program to run on Windows or natively. Its own name is looked up
     /// on PATH; any other value runs as written.
@@ -3189,69 +2932,6 @@ impl RawTaskwarrior {
     fn resolve(self) -> TaskwarriorConfig {
         let tool = tool_config(self.path, self.wsl_path, Tool::Task);
         TaskwarriorConfig { path: tool.path, wsl_path: tool.wsl_path, enabled: self.enabled }
-    }
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(default)]
-struct RawZellij {
-    /// The program to run on Windows or natively. Its own name is looked up
-    /// on PATH; any other value runs as written.
-    path: String,
-    /// The program to run inside every WSL distro, as written. Empty finds it
-    /// by name through the distro's login shell.
-    wsl_path: String,
-    /// The glyph on a zellij pane's sidebar row and palette entry. A bare
-    /// string sets the glyph; a table also styles its color, weight, slant
-    /// and size, the way `[ui.icons]` keys do. The default draws a hexagon
-    /// from the bundled symbol font. An ordinary character such as `"⬡"` is
-    /// drawn by your own fonts instead.
-    #[schemars(default = "default_zellij_icon")]
-    icon: Option<RawIconStyle>,
-    /// List the panes of every running zellij session in the sidebar.
-    /// Opening one attaches to its whole session with the pane focused, since
-    /// zellij has no attach for a single pane.
-    enabled: bool,
-    /// How often each side's zellij sessions are re-listed.
-    poll_interval_ms: u64,
-    /// List panes whose working directory matches no worktree, under Home.
-    show_unmatched: bool,
-    /// The session a new pane opens in. Empty takes the one session running
-    /// on that side and refuses when there are several.
-    session: String,
-}
-
-impl Default for RawZellij {
-    fn default() -> Self {
-        Self {
-            path: "zellij".to_string(),
-            wsl_path: String::new(),
-            icon: None,
-            enabled: false,
-            poll_interval_ms: 2000,
-            show_unmatched: true,
-            session: String::new(),
-        }
-    }
-}
-
-fn default_zellij_icon() -> RawIconStyle {
-    raw_glyph(DEFAULT_ZELLIJ_ICON)
-}
-
-impl RawZellij {
-    fn resolve(self) -> ZellijConfig {
-        ZellijConfig {
-            path: Some(self.path)
-                .filter(|path| !path.trim().is_empty())
-                .unwrap_or_else(|| RawZellij::default().path),
-            wsl_path: Some(self.wsl_path).filter(|path| !path.trim().is_empty()),
-            icon: self.icon.unwrap_or_else(default_zellij_icon).into(),
-            enabled: self.enabled,
-            poll_interval: Duration::from_millis(self.poll_interval_ms),
-            show_unmatched: self.show_unmatched,
-            session: Some(self.session).filter(|session| !session.trim().is_empty()),
-        }
     }
 }
 
@@ -3526,61 +3206,6 @@ struct RawWorktreeOverride {
     project: String,
     /// Where that project's worktrees are created.
     worktree_dir: String,
-}
-
-/// Wrapper that parses `"0xrrggbb"`, `"#rrggbb"`, or `"rrggbb"` into an `Rgb`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct RgbStr(Rgb);
-
-/// Hand-written because `RgbStr` deserializes from a string it parses itself,
-/// so nothing about the accepted spellings is visible to a derive.
-impl JsonSchema for RgbStr {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
-        "Color".into()
-    }
-
-    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        schemars::json_schema!({
-            "type": "string",
-            "pattern": "^(0[xX]|#)?[0-9a-fA-F]{6}$",
-            "description": "An RGB color, written as \"#rrggbb\", \"0xrrggbb\" or \"rrggbb\".",
-            "examples": ["#1c1c1c", "0x6a9fb5"],
-        })
-    }
-}
-
-impl<'de> Deserialize<'de> for RgbStr {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        parse_hex_rgb(&s)
-            .map(RgbStr)
-            .ok_or_else(|| serde::de::Error::custom(format!("invalid color string: {s:?}")))
-    }
-}
-
-/// Hand-written for the same reason `Deserialize` is: the accepted spellings
-/// live in `parse_hex_rgb`, and a derive on the inner `Rgb` would emit an
-/// object against a schema that says `"type": "string"`.
-impl serde::Serialize for RgbStr {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let Rgb { r, g, b } = self.0;
-        serializer.serialize_str(&format!("#{r:02x}{g:02x}{b:02x}"))
-    }
-}
-
-fn parse_hex_rgb(s: &str) -> Option<Rgb> {
-    let stripped = s
-        .strip_prefix("0x")
-        .or_else(|| s.strip_prefix("0X"))
-        .or_else(|| s.strip_prefix('#'))
-        .unwrap_or(s);
-    if stripped.len() != 6 {
-        return None;
-    }
-    let r = u8::from_str_radix(&stripped[0..2], 16).ok()?;
-    let g = u8::from_str_radix(&stripped[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&stripped[4..6], 16).ok()?;
-    Some(Rgb { r, g, b })
 }
 
 /// Expand a leading `~` to the home directory and require the result to be
@@ -4074,6 +3699,7 @@ mod tests {
     }
 
     use alacritree_common::settings::ClosedSetValue;
+    use alacritree_herdr::{AttachMode, FollowFocus, HerdrConfig, RawHerdr};
 
     use super::*;
 

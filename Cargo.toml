@@ -32,6 +32,9 @@ alacritree_diff_viewer = { path = "crates/alacritree_diff_viewer" }
 alacritree_doppler = { path = "crates/alacritree_doppler" }
 alacritree_forge = { path = "crates/alacritree_forge" }
 alacritree_gh = { path = "crates/alacritree_gh" }
+alacritree_herdr = { path = "crates/alacritree_herdr" }
+alacritree_multiplexer = { path = "crates/alacritree_multiplexer" }
+alacritree_zellij = { path = "crates/alacritree_zellij" }
 ambassador = "0.5.1"
 thiserror = "2"
 toml = "0.9.11"

@@ -1,7 +1,7 @@
 //! What alacritree reads from herdr, and the pure questions it asks about a
 //! pane herdr lists.
 
-use crate::multiplexer::{MultiplexerKind, Pane, PaneKey, Side};
+use alacritree_multiplexer::{MultiplexerKind, Pane, PaneKey, Side};
 
 /// What alacritree reads out of herdr's config: how to leave a pane.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -56,7 +56,7 @@ pub(super) fn unattached<'a>(
 }
 
 /// The key a herdr pane on `side` is known by.
-pub(crate) fn pane_key(side: Side, terminal_id: String) -> PaneKey {
+pub fn pane_key(side: Side, terminal_id: String) -> PaneKey {
     PaneKey { multiplexer: MultiplexerKind::Herdr, side, terminal_id }
 }
 
@@ -86,7 +86,7 @@ impl PollError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::multiplexer::PaneStatus;
+    use alacritree_multiplexer::PaneStatus;
 
     #[test]
     fn status_label_names_each_variant() {

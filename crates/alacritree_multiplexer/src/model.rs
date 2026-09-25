@@ -4,10 +4,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
-use super::{MultiplexerKind, PaneTarget, Side};
-use crate::ipc::protocol::IpcResult;
-use crate::workspace::WorkspaceKey;
-use crate::wsl;
+use alacritree_common::wsl;
+
+use crate::{
+    CreatedPane, Launch, MultiplexerKind, PaneError, PaneTarget, Reply, SessionId, Side,
+    WorkspaceKey,
+};
 
 /// Identifies one pane across polls.  `terminal_id` is unique only within one
 /// server, which is why the side and the multiplexer are part of it.
@@ -133,7 +135,7 @@ fn starts_with(cwd: &Path, workspace: &Path) -> bool {
 }
 
 /// A listed pane no session holds, with the workspace it belongs under.
-pub(crate) struct ListedPane<'a> {
+pub struct ListedPane<'a> {
     pub workspace: WorkspaceKey,
     pub key: PaneKey,
     pub pane: &'a Pane,
@@ -144,7 +146,7 @@ pub(crate) struct ListedPane<'a> {
 /// out, whether the attach is exclusive) varies by multiplexer rather than by
 /// row.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Managed {
+pub struct Managed {
     pub multiplexer: MultiplexerKind,
     /// The multiplexer's own detach chord, already rendered.  `None` when its
     /// config could not be read or binds detach to nothing, both of which are
@@ -167,7 +169,7 @@ pub(crate) struct Managed {
 impl Managed {
     /// What the multiplexer calls this pane: the agent kind backquoted as the
     /// command it is, and the title quoted as the words it is.
-    pub(crate) fn pane_name(&self) -> Option<String> {
+    pub fn pane_name(&self) -> Option<String> {
         match (&self.kind, &self.title) {
             (Some(kind), Some(title)) => Some(format!("`{kind}` \"{title}\"")),
             (Some(kind), None) => Some(format!("`{kind}`")),
@@ -182,17 +184,17 @@ impl Managed {
 /// leaves it, so the workspace on screen, each workspace's active tab and the
 /// multiplexer's own focus all stay where they were.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AttachFocus {
+pub enum AttachFocus {
     Take,
     Leave,
 }
 
 impl AttachFocus {
-    pub(crate) fn requested(no_focus: bool) -> Self {
+    pub fn requested(no_focus: bool) -> Self {
         if no_focus { Self::Leave } else { Self::Take }
     }
 
-    pub(crate) fn takes(self) -> bool {
+    pub fn takes(self) -> bool {
         self == Self::Take
     }
 }
@@ -200,7 +202,7 @@ impl AttachFocus {
 /// The side of an attach the app keeps: where its session opens, where a
 /// refusal hands the user back to, and the clients waiting on it.  A queued
 /// attach carries it unread and hands it back with the answer.
-pub(crate) struct AttachRequest {
+pub struct AttachRequest {
     pub workspace: WorkspaceKey,
     /// Where to hand the user back when the attach fails.  A queued attach
     /// answers frames after the switch, so the caller cannot restore the
@@ -208,41 +210,41 @@ pub(crate) struct AttachRequest {
     pub previous: WorkspaceKey,
     /// Clients parked on this attach.  There is nothing to answer them with
     /// until the queued attach resolves.
-    pub waiters: Vec<Sender<IpcResult>>,
+    pub waiters: Vec<Sender<Reply>>,
     /// Taken when any request merged into this one asked for it.
     pub focus: AttachFocus,
 }
 
 /// A queued attach the multiplexer has answered: the command its session
 /// runs, or why there is none.
-pub(crate) struct AttachAnswer {
+pub struct AttachAnswer {
     pub key: PaneKey,
     pub request: AttachRequest,
-    pub launch: Result<super::Launch, super::PaneError>,
+    pub launch: Result<Launch, PaneError>,
 }
 
 /// The app's side of a pane create.  One waiter, not a list: nothing merges
 /// two creates, since the pane they would be merged on has no identity until
 /// the multiplexer answers.
-pub(crate) struct CreateRequest {
+pub struct CreateRequest {
     pub workspace: WorkspaceKey,
-    pub waiter: Option<Sender<IpcResult>>,
+    pub waiter: Option<Sender<Reply>>,
     pub focus: AttachFocus,
 }
 
 /// A create the multiplexer has answered.  The attach it turns into is the
 /// ordinary one, so the pane goes back to the app's attach path.
-pub(crate) struct CreateAnswer {
+pub struct CreateAnswer {
     pub side: Side,
     pub request: CreateRequest,
-    pub pane: Result<super::CreatedPane, super::PaneError>,
+    pub pane: Result<CreatedPane, PaneError>,
 }
 
 /// What the view sync needs to know about the app this frame.
-pub(crate) struct ViewState<'a> {
+pub struct ViewState<'a> {
     /// The active session, the pane it holds when this multiplexer owns one,
     /// and whether that session shares the multiplexer's whole view.
-    pub active: Option<(crate::session::SessionId, Option<&'a PaneKey>, bool)>,
+    pub active: Option<(SessionId, Option<&'a PaneKey>, bool)>,
     /// The window is focused, the terminal has pane focus, and neither a
     /// modal nor the palette is open.
     pub attentive: bool,
@@ -250,12 +252,12 @@ pub(crate) struct ViewState<'a> {
     pub last_direct_input: Option<std::time::Instant>,
     /// Whether a session is still open.  A focus call for one that closed
     /// meanwhile has nothing left to report to.
-    pub is_open: &'a dyn Fn(crate::session::SessionId) -> bool,
+    pub is_open: &'a dyn Fn(SessionId) -> bool,
 }
 
 /// What the view sync asks of the app after a frame.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct ViewStep {
+pub struct ViewStep {
     /// A pane the user moved to inside the multiplexer, for the app to follow.
     pub follow: Option<PaneKey>,
     pub repaint: bool,

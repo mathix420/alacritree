@@ -16,8 +16,8 @@ use serde_json::{Value, json};
 use super::PollError;
 use super::cli::bridge_command;
 use super::wire::{parse_pane_info, parse_status};
-use crate::multiplexer::{Pane, PaneStatus, Side};
-use crate::{command_ext, jobs};
+use alacritree_common::{command_ext, jobs};
+use alacritree_multiplexer::{Pane, PaneStatus, Side};
 
 /// Every kind that can change which panes a side has or how one renders,
 /// apart from agent status, which herdr only streams per pane.

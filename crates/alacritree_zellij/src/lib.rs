@@ -8,24 +8,34 @@
 
 mod cli;
 mod listing;
+mod settings;
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use alacritree_common::settings::IconStyle;
+use alacritree_common::{jobs, wsl};
+use alacritree_multiplexer::{
+    AttachAnswer, AttachRequest, CreateAnswer, CreateRequest, CreatedPane, Launch, ListedPane,
+    Managed, MultiplexerKind, MultiplexerSession, Pane, PaneError, PaneKey, PaneTarget, SessionId,
+    Side, ViewState, ViewStep,
+};
 pub use cli::{CallError, SideListing, ZellijError, attach, create_pane, focus_pane, list_side};
 pub use listing::{split_terminal_id, terminal_id};
 use serde_json::{Value, json};
+pub use settings::{RawZellij, ZellijConfig};
 
-use crate::config::{BakedGlyph, DEFAULT_ZELLIJ_ICON, IconStyle, ZellijConfig};
-use crate::multiplexer::{
-    AttachAnswer, AttachRequest, CreateAnswer, CreateRequest, CreatedPane, Launch, ListedPane,
-    Managed, MultiplexerKind, MultiplexerSession, Pane, PaneError, PaneKey, PaneTarget, Side,
-    ViewState, ViewStep,
-};
-use crate::session::SessionId;
-use crate::{jobs, wsl};
+/// zellij's hexagon, spelled at a private-use codepoint the app's bundled
+/// symbol font draws.
+pub const DEFAULT_ICON: &str = "\u{10FF01}";
+
+impl From<ZellijError> for PaneError {
+    fn from(error: ZellijError) -> Self {
+        Self::Backend(Box::new(error))
+    }
+}
 
 /// A shared-view attach waiting on its focus call.  `job` is `None` until the
 /// attach at the head of the queue starts it.
@@ -50,7 +60,7 @@ struct PendingCreate {
     request: CreateRequest,
 }
 
-pub(crate) struct Zellij {
+pub struct Zellij {
     config: ZellijConfig,
     /// What each side answered in the last poll that landed.  A side that
     /// did not answer is absent rather than empty.
@@ -64,7 +74,7 @@ pub(crate) struct Zellij {
 }
 
 impl Zellij {
-    pub(crate) fn new(config: ZellijConfig) -> Self {
+    pub fn new(config: ZellijConfig) -> Self {
         Self {
             config,
             sides: Vec::new(),
@@ -146,8 +156,8 @@ impl Zellij {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn adopt_for_test(&mut self, sides: Vec<SideListing>) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn adopt_for_test(&mut self, sides: Vec<SideListing>) {
         self.config.enabled = true;
         self.sides = sides;
     }
@@ -158,8 +168,8 @@ impl MultiplexerSession for Zellij {
         self.config.enabled
     }
 
-    fn icon(&self) -> (&IconStyle, BakedGlyph) {
-        (&self.config.icon, DEFAULT_ZELLIJ_ICON)
+    fn icon(&self) -> &IconStyle {
+        &self.config.icon
     }
 
     fn poll(&mut self, _attached: &dyn Fn(&Side) -> bool) {
@@ -419,7 +429,7 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
-    use crate::multiplexer::AttachFocus;
+    use alacritree_multiplexer::AttachFocus;
 
     fn pane(session: &str, id: u32, cwd: &str) -> Pane {
         Pane {

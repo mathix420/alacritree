@@ -911,8 +911,7 @@ fn native_palette_content(
 
 /// The glyph a palette row names `multiplexer`'s panes with.
 fn pane_glyph(multiplexer: &Multiplexer) -> &str {
-    let (icon, default) = multiplexer.icon();
-    icon.or_glyph(default.as_str())
+    multiplexer.icon().or_glyph(multiplexer.default_icon().as_str())
 }
 
 fn pane_subtitle(glyph: &str, location: Option<&str>) -> String {

@@ -9,9 +9,10 @@ use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use alacritree_common::{command_ext, wsl, wsl_helper};
+use alacritree_multiplexer::{CreatedPane, Pane, Side};
+
 use super::listing;
-use crate::multiplexer::{CreatedPane, Pane, Side};
-use crate::{command_ext, wsl, wsl_helper};
 
 /// How long one zellij call may take before it counts as no answer.  Each
 /// call is a local socket round trip; this covers a cold `wsl.exe` start and

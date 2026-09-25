@@ -7,7 +7,6 @@ use std::sync::OnceLock;
 use git2::Repository;
 
 use crate::config::IntegrationsConfig;
-use crate::herdr;
 use crate::multiplexer::{
     Managed, MultiplexerKind, MultiplexerSession, Multiplexers, Pane, PaneKey, PaneStatus,
     Scripted, Side,
@@ -21,7 +20,7 @@ pub(crate) fn pane_key(side: Side, terminal_id: &str) -> PaneKey {
 /// The key a herdr pane on `side` is known by, for the tests that are about
 /// herdr rather than about what the app does with a multiplexer.
 pub(crate) fn herdr_pane_key(side: Side, terminal_id: &str) -> PaneKey {
-    herdr::pane_key(side, terminal_id.to_string())
+    alacritree_herdr::pane_key(side, terminal_id.to_string())
 }
 
 /// How a row describes a pane on `side`.  `shared_view` is what a multiplexer

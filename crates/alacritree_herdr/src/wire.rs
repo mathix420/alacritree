@@ -6,8 +6,9 @@
 
 use serde::Deserialize;
 
+use alacritree_multiplexer::{Pane, PaneStatus};
+
 use super::Listing;
-use crate::multiplexer::{Pane, PaneStatus};
 
 impl Listing {
     /// Panes from one reply.  An entry missing an identity — or, where the

@@ -38,6 +38,7 @@ pub enum Tool {
     Herdr,
     Tuicr,
     Task,
+    Zellij,
 }
 
 impl Tool {
@@ -299,7 +300,7 @@ mod tests {
     #[test]
     fn tool_names_are_the_lowercase_program_names() {
         let names: Vec<&str> = Tool::VARIANTS.iter().map(|t| t.name()).collect();
-        assert_eq!(names, ["git", "gh", "delta", "doppler", "herdr", "tuicr", "task"]);
+        assert_eq!(names, ["git", "gh", "delta", "doppler", "herdr", "tuicr", "task", "zellij"]);
         assert_eq!(Tool::Doppler.to_string(), "doppler");
     }
 
@@ -326,13 +327,6 @@ mod tests {
             assert!(Instant::now() < deadline, "the lookup never landed");
             std::thread::sleep(Duration::from_millis(5));
         }
-    }
-
-    #[test]
-    fn the_helper_hello_probes_the_registry_in_order() {
-        let (registry, rest) = crate::wsl_helper::HELLO_TOOLS.split_at(Tool::COUNT);
-        assert_eq!(registry, Tool::table(Tool::name));
-        assert_eq!(rest, ["zellij"]);
     }
 
     #[test]

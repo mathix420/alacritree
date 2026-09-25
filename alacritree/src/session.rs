@@ -1775,7 +1775,7 @@ mod tests {
         let mut session = pty_less_probe(SessionKind::Shell, "shell");
         session.exit_status = Some(status);
         if herdr_keyed {
-            session.pane_key = Some(crate::herdr::pane_key(Side::Native, "t1".into()));
+            session.pane_key = Some(alacritree_herdr::pane_key(Side::Native, "t1".into()));
         }
         session
     }
@@ -2668,7 +2668,7 @@ mod tests {
     fn a_direct_herdr_attach_never_takes_the_focus_keys() {
         let mut session = pty_less_probe(SessionKind::Shell, "shell");
         session.probe.force_nav_tui_for_test();
-        let key = crate::herdr::pane_key(Side::Native, "t1".into());
+        let key = alacritree_herdr::pane_key(Side::Native, "t1".into());
 
         session.bind_pane(key.clone(), false);
         assert!(!session.nav_tui_running());

@@ -36,7 +36,6 @@ pub(crate) mod glyph_cache;
 pub(crate) mod gpu_timing;
 pub(crate) mod grid_gl;
 pub(crate) mod grid_instances;
-pub mod herdr;
 pub(crate) mod ime;
 pub mod in_flight;
 pub(crate) mod input;
@@ -84,7 +83,6 @@ pub(crate) mod worktree;
 pub(crate) mod worktree_liveness;
 pub use alacritree_common::{wsl, wsl_helper};
 pub mod wsl_spare;
-pub mod zellij;
 
 /// The timing reports inside unit tests read allocation counts too.
 #[cfg(test)]

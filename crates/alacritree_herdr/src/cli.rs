@@ -11,11 +11,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::config::AttachMode;
-use crate::multiplexer::{CreatedPane, Side};
-use crate::tools::{self, Tool};
-use crate::wsl_helper::{self, TransportError};
-use crate::{command_ext, jobs};
+use alacritree_common::tools::{self, Tool};
+use alacritree_common::wsl_helper::{self, TransportError};
+use alacritree_common::{command_ext, jobs};
+use alacritree_multiplexer::{CreatedPane, Side};
+
+use crate::settings::AttachMode;
 
 use super::wire::{CreatedTab, SessionList};
 use super::{Listing, ListingReply, PollError, error_code};

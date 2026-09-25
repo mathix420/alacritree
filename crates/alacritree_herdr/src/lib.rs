@@ -9,6 +9,7 @@
 
 mod cli;
 mod events;
+mod herdr_config;
 mod host;
 mod model;
 mod poll;
@@ -16,17 +17,26 @@ mod settings;
 mod view;
 mod wire;
 
-pub(crate) use host::Herdr;
-#[cfg(test)]
-pub(crate) use host::{PendingAttach, PendingCreate};
-pub(in crate::herdr) use poll::ListingReply;
-
 pub use cli::{CallError, Gesture, HerdrError};
 use cli::{attaches_directly, focus_pane, program, running_session_name};
-pub(crate) use model::pane_key;
+use herdr_config::settings;
+pub use host::Herdr;
+#[cfg(any(test, feature = "test-support"))]
+pub use host::{PendingAttach, PendingCreate};
 use model::unattached;
-pub use model::{Listing, PollError, Settings};
+pub use model::{Listing, PollError, Settings, pane_key};
+use poll::ListingReply;
 pub use poll::{EndpointCache, Endpoints};
-use settings::settings;
+pub use settings::{AttachMode, FollowFocus, HerdrConfig, RawHerdr};
 pub use view::{HerdrViewAction, HerdrViewFocus, HerdrViewSync, ViewInputs};
 pub use wire::error_code;
+
+/// herdr's ram, spelled at a private-use codepoint the app's bundled symbol
+/// font draws.
+pub const DEFAULT_ICON: &str = "\u{10FF00}";
+
+impl From<HerdrError> for alacritree_multiplexer::PaneError {
+    fn from(error: HerdrError) -> Self {
+        Self::Backend(Box::new(error))
+    }
+}

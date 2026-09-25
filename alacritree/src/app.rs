@@ -4050,8 +4050,10 @@ fn unknown_worktree(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use alacritree_herdr::{self as herdr, AttachMode, PendingAttach, PendingCreate};
+
     use super::*;
-    use crate::config::{AttachMode, SidebarFocus, UiTheme};
+    use crate::config::{SidebarFocus, UiTheme};
     use crate::multiplexer::{CreatedPane, Launch};
 
     use super::focus::search_reveal_root;
@@ -4067,7 +4069,6 @@ mod tests {
         sessions_filter_passes, upstream_badge, worktree_row,
     };
     use super::widgets::agent_hint;
-    use crate::herdr::{self, PendingAttach, PendingCreate};
     use crate::multiplexer::{
         AttachRequest, MultiplexerKind, Pane, PaneError, PaneStatus, Scripted,
     };
@@ -4642,13 +4643,15 @@ mod tests {
             cwd: Some("/repo".into()),
             foreground_cwd: None,
         };
-        app.multiplexers.zellij_mut_for_test().adopt_for_test(vec![crate::zellij::SideListing {
-            side: Side::Native,
-            sessions: vec!["work".into()],
-            read: vec!["work".into()],
-            panes: vec![pane],
-            sampled_at: Instant::now(),
-        }]);
+        app.multiplexers.zellij_mut_for_test().adopt_for_test(vec![
+            alacritree_zellij::SideListing {
+                side: Side::Native,
+                sessions: vec!["work".into()],
+                read: vec!["work".into()],
+                panes: vec![pane],
+                sampled_at: Instant::now(),
+            },
+        ]);
 
         let json = app.multiplexer_panes_json();
 

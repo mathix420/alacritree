@@ -7,13 +7,11 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::config::FollowFocus;
-use crate::herdr::EndpointCache;
-use crate::jobs;
-use crate::session::SessionId;
+use alacritree_common::jobs;
+use alacritree_multiplexer::{PaneError, PaneKey, SessionId, Side};
 
-use super::pane_key;
-use crate::multiplexer::{PaneError, PaneKey, Side};
+use crate::settings::FollowFocus;
+use crate::{EndpointCache, pane_key};
 
 /// Where a side's focus was last established, and when.  The stamp is a
 /// watermark: a listing sampled at or before it cannot form an edge, so one
@@ -371,11 +369,9 @@ mod tests {
 
     use std::time::Duration;
 
-    use crate::herdr;
-
     fn inputs<'a>(
         active: Option<(SessionId, Option<&'a PaneKey>, bool)>,
-        caches: &'a [herdr::EndpointCache],
+        caches: &'a [EndpointCache],
         busy: bool,
     ) -> ViewInputs<'a> {
         ViewInputs {
@@ -391,7 +387,7 @@ mod tests {
 
     fn always<'a>(
         active: Option<(SessionId, Option<&'a PaneKey>, bool)>,
-        caches: &'a [herdr::EndpointCache],
+        caches: &'a [EndpointCache],
         now: Instant,
     ) -> ViewInputs<'a> {
         ViewInputs {
@@ -405,23 +401,23 @@ mod tests {
         }
     }
 
-    fn one_focused(side: &Side, terminal_id: &str, at: Instant) -> Vec<herdr::EndpointCache> {
-        let panes = herdr::Listing::Panes.parse(&format!(
+    fn one_focused(side: &Side, terminal_id: &str, at: Instant) -> Vec<EndpointCache> {
+        let panes = crate::Listing::Panes.parse(&format!(
             r#"{{"result":{{"panes":[
                 {{"terminal_id":"{terminal_id}","pane_id":"w1:p1","tab_id":"w1:t1","focused":true}}
             ]}}}}"#
         ));
-        vec![herdr::EndpointCache::for_test(side.clone(), panes, at)]
+        vec![EndpointCache::for_test(side.clone(), panes, at)]
     }
 
     /// A side whose listing also carries herdr's full pane membership, as an
     /// attached side's does.
-    fn inventoried(side: &Side, panes: &str, at: Instant) -> Vec<herdr::EndpointCache> {
-        let mut cache = herdr::EndpointCache::new(side.clone());
+    fn inventoried(side: &Side, panes: &str, at: Instant) -> Vec<EndpointCache> {
+        let mut cache = EndpointCache::new(side.clone());
         cache.complete_listing_for_test(
             Ok(&format!(r#"{{"result":{{"panes":[{panes}]}}}}"#)),
-            herdr::Listing::Panes,
-            herdr::Listing::Panes,
+            crate::Listing::Panes,
+            crate::Listing::Panes,
             at,
         );
         vec![cache]
@@ -571,12 +567,12 @@ mod tests {
         assert_eq!(sync.next(always(Some((1, None, false)), &first, start)), None);
 
         let silent_at = start + Duration::from_millis(1);
-        let silent = vec![herdr::EndpointCache::for_test(side.clone(), Vec::new(), silent_at)];
+        let silent = vec![EndpointCache::for_test(side.clone(), Vec::new(), silent_at)];
         assert_eq!(sync.next(always(Some((1, None, false)), &silent, silent_at)), None);
         let after_silence = silent_at + FOLLOW_QUIET_GAP + Duration::from_millis(1);
         assert_eq!(sync.next(always(Some((1, None, false)), &silent, after_silence)), None);
 
-        let gone: Vec<herdr::EndpointCache> = Vec::new();
+        let gone: Vec<EndpointCache> = Vec::new();
         let gone_at = after_silence + Duration::from_millis(1);
         assert_eq!(sync.next(always(Some((1, None, false)), &gone, gone_at)), None);
 
@@ -631,9 +627,9 @@ mod tests {
     #[test]
     fn herdr_shared_view_follows_new_tabs_and_refocuses_on_return() {
         let side = Side::Native;
-        let t1 = herdr::pane_key(side.clone(), "t1".into());
-        let t2 = herdr::pane_key(side.clone(), "t2".into());
-        let panes = herdr::Listing::Panes.parse(
+        let t1 = pane_key(side.clone(), "t1".into());
+        let t2 = pane_key(side.clone(), "t2".into());
+        let panes = crate::Listing::Panes.parse(
             r#"{"result":{"panes":[
                 {"terminal_id":"t1","pane_id":"w1:p1","tab_id":"w1:t1","focused":false},
                 {"terminal_id":"t2","pane_id":"w2:p1","tab_id":"w2:t1","focused":true}
@@ -641,11 +637,11 @@ mod tests {
         );
         let mut sync = HerdrViewSync::default();
         let active = Some((1, Some(&t1), true));
-        let no_caches: Vec<herdr::EndpointCache> = Vec::new();
+        let no_caches: Vec<EndpointCache> = Vec::new();
         assert_eq!(sync.next(inputs(active, &no_caches, false)), Some(HerdrViewAction::Focus(1)));
         let focused_at = Instant::now();
         sync.settled(1, true, focused_at);
-        let caches = vec![herdr::EndpointCache::for_test(
+        let caches = vec![EndpointCache::for_test(
             side.clone(),
             panes.clone(),
             focused_at + Duration::from_millis(1),
@@ -662,10 +658,10 @@ mod tests {
 
     #[test]
     fn herdr_shared_view_refocuses_after_an_ordinary_session() {
-        let key = herdr::pane_key(Side::Native, "t1".into());
+        let key = pane_key(Side::Native, "t1".into());
         let mut sync = HerdrViewSync::default();
         sync.attached(1, None, Instant::now());
-        let no_caches: Vec<herdr::EndpointCache> = Vec::new();
+        let no_caches: Vec<EndpointCache> = Vec::new();
         assert_eq!(sync.next(inputs(None, &no_caches, false)), None);
         assert_eq!(
             sync.next(inputs(Some((1, Some(&key), true)), &no_caches, false)),
@@ -676,8 +672,8 @@ mod tests {
     #[test]
     fn herdr_follow_attempts_wait_for_a_new_snapshot() {
         let side = Side::Native;
-        let key = herdr::pane_key(side.clone(), "t1".into());
-        let panes = herdr::Listing::Panes.parse(
+        let key = pane_key(side.clone(), "t1".into());
+        let panes = crate::Listing::Panes.parse(
             r#"{"result":{"panes":[
                 {"terminal_id":"t2","pane_id":"w2:p1","tab_id":"w2:t1","focused":true}
             ]}}"#,
@@ -686,7 +682,7 @@ mod tests {
         let focused_at = Instant::now();
         sync.attached(1, None, focused_at);
         let active = Some((1, Some(&key), true));
-        let caches = vec![herdr::EndpointCache::for_test(
+        let caches = vec![EndpointCache::for_test(
             side.clone(),
             panes.clone(),
             focused_at + Duration::from_millis(1),
@@ -696,7 +692,7 @@ mod tests {
             Some(HerdrViewAction::Follow(_))
         ));
         assert_eq!(sync.next(inputs(active, &caches, false)), None);
-        let caches = vec![herdr::EndpointCache::for_test(
+        let caches = vec![EndpointCache::for_test(
             side.clone(),
             panes.clone(),
             focused_at + Duration::from_millis(2),
@@ -706,7 +702,7 @@ mod tests {
             Some(HerdrViewAction::Follow(_))
         ));
         sync.settled(1, false, focused_at + Duration::from_millis(3));
-        let caches = vec![herdr::EndpointCache::for_test(
+        let caches = vec![EndpointCache::for_test(
             side.clone(),
             panes.clone(),
             focused_at + Duration::from_millis(4),
@@ -718,27 +714,26 @@ mod tests {
     fn herdr_shared_view_rejects_stale_and_foreign_focus_snapshots() {
         let side = Side::Wsl("ubuntu".into());
         let other_side = Side::Wsl("debian".into());
-        let key = herdr::pane_key(side.clone(), "t1".into());
-        let panes = herdr::Listing::Panes.parse(
+        let key = pane_key(side.clone(), "t1".into());
+        let panes = crate::Listing::Panes.parse(
             r#"{"result":{"panes":[
                 {"terminal_id":"t2","pane_id":"w2:p1","tab_id":"w2:t1","focused":true}
             ]}}"#,
         );
         let mut sync = HerdrViewSync::default();
         let active = Some((1, Some(&key), true));
-        let no_caches: Vec<herdr::EndpointCache> = Vec::new();
+        let no_caches: Vec<EndpointCache> = Vec::new();
         let started = Instant::now();
         assert_eq!(sync.next(inputs(active, &no_caches, false)), Some(HerdrViewAction::Focus(1)));
         assert_eq!(sync.next(inputs(active, &no_caches, true)), None);
         let settled = started + Duration::from_millis(1);
         sync.settled(1, true, settled);
-        let stale = vec![herdr::EndpointCache::for_test(side.clone(), panes.clone(), started)];
+        let stale = vec![EndpointCache::for_test(side.clone(), panes.clone(), started)];
         assert_eq!(sync.next(inputs(active, &stale, false)), None);
         let fresh_at = settled + Duration::from_millis(1);
-        let foreign =
-            vec![herdr::EndpointCache::for_test(other_side.clone(), panes.clone(), fresh_at)];
+        let foreign = vec![EndpointCache::for_test(other_side.clone(), panes.clone(), fresh_at)];
         assert_eq!(sync.next(inputs(active, &foreign, false)), None);
-        let fresh = vec![herdr::EndpointCache::for_test(side.clone(), panes.clone(), fresh_at)];
+        let fresh = vec![EndpointCache::for_test(side.clone(), panes.clone(), fresh_at)];
         assert_eq!(sync.next(inputs(active, &fresh, true)), None);
         assert_eq!(sync.next(inputs(Some((2, None, false)), &fresh, false)), None);
         assert_eq!(sync.next(inputs(active, &fresh, false)), Some(HerdrViewAction::Focus(1)));
@@ -746,10 +741,10 @@ mod tests {
 
     #[test]
     fn herdr_focus_completion_cannot_restore_a_view_left_while_pending() {
-        let key = herdr::pane_key(Side::Native, "t1".into());
+        let key = pane_key(Side::Native, "t1".into());
         let active = Some((1, Some(&key), true));
         let mut sync = HerdrViewSync::default();
-        let no_caches: Vec<herdr::EndpointCache> = Vec::new();
+        let no_caches: Vec<EndpointCache> = Vec::new();
         assert_eq!(sync.next(inputs(active, &no_caches, false)), Some(HerdrViewAction::Focus(1)));
         assert_eq!(sync.next(inputs(None, &no_caches, true)), None);
         sync.settled(1, true, Instant::now());
@@ -762,8 +757,8 @@ mod tests {
     /// still owes herdr a focus call, or it draws the wrong pane.
     #[test]
     fn off_still_asks_herdr_for_the_shared_view_pane() {
-        let key = herdr::pane_key(Side::Native, "t1".into());
-        let caches: Vec<herdr::EndpointCache> = Vec::new();
+        let key = pane_key(Side::Native, "t1".into());
+        let caches: Vec<EndpointCache> = Vec::new();
         let mut sync = HerdrViewSync::default();
         let mut off = inputs(Some((1, Some(&key), true)), &caches, false);
         off.follow = FollowFocus::Off;
@@ -778,7 +773,7 @@ mod tests {
             let side = Side::Native;
             let t1 = pane_key(side.clone(), "t1".into());
             let t2 = pane_key(side.clone(), "t2".into());
-            let panes = herdr::Listing::Panes.parse(
+            let panes = crate::Listing::Panes.parse(
                 r#"{"result":{"panes":[
                     {"terminal_id":"t2","pane_id":"w2:p1","tab_id":"w2:t1","focused":true}
                 ]}}"#,
@@ -786,7 +781,7 @@ mod tests {
             let mut sync = HerdrViewSync::default();
             let focused_at = Instant::now();
             sync.attached(1, None, focused_at);
-            let caches = vec![herdr::EndpointCache::for_test(
+            let caches = vec![EndpointCache::for_test(
                 side.clone(),
                 panes.clone(),
                 focused_at + Duration::from_millis(1),
@@ -807,7 +802,7 @@ mod tests {
     fn off_suppresses_a_shared_view_follow() {
         let side = Side::Native;
         let t1 = pane_key(side.clone(), "t1".into());
-        let panes = herdr::Listing::Panes.parse(
+        let panes = crate::Listing::Panes.parse(
             r#"{"result":{"panes":[
                 {"terminal_id":"t2","pane_id":"w2:p1","tab_id":"w2:t1","focused":true}
             ]}}"#,
@@ -815,7 +810,7 @@ mod tests {
         let mut sync = HerdrViewSync::default();
         let focused_at = Instant::now();
         sync.attached(1, None, focused_at);
-        let caches = vec![herdr::EndpointCache::for_test(
+        let caches = vec![EndpointCache::for_test(
             side.clone(),
             panes.clone(),
             focused_at + Duration::from_millis(1),
@@ -830,7 +825,7 @@ mod tests {
     #[test]
     fn every_row_holding_a_pane_asks_herdr_for_it() {
         for side in [Side::Native, Side::Wsl("d".into())] {
-            let key = herdr::pane_key(side, "t1".into());
+            let key = pane_key(side, "t1".into());
             assert!(needs_view_focus(Some(&key), 1, None));
         }
     }
@@ -846,7 +841,7 @@ mod tests {
     /// again every frame would spawn a herdr per frame.
     #[test]
     fn a_row_asks_once_per_switch() {
-        let key = herdr::pane_key(Side::Native, "t1".into());
+        let key = pane_key(Side::Native, "t1".into());
         assert!(!needs_view_focus(Some(&key), 1, Some(1)));
         assert!(needs_view_focus(Some(&key), 2, Some(1)));
     }

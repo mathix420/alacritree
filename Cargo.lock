@@ -68,6 +68,9 @@ dependencies = [
  "alacritree_doppler",
  "alacritree_forge",
  "alacritree_gh",
+ "alacritree_herdr",
+ "alacritree_multiplexer",
+ "alacritree_zellij",
  "alacritty_terminal",
  "ambassador",
  "arboard",
@@ -142,6 +145,7 @@ dependencies = [
  "strum",
  "tempfile",
  "thiserror 2.0.17",
+ "vte",
  "windows-sys 0.59.0",
  "winreg",
 ]
@@ -195,6 +199,47 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "alacritree_herdr"
+version = "0.0.0"
+dependencies = [
+ "alacritree_common",
+ "alacritree_multiplexer",
+ "log",
+ "schemars",
+ "serde",
+ "serde_json",
+ "strum",
+ "tempfile",
+ "thiserror 2.0.17",
+ "toml",
+]
+
+[[package]]
+name = "alacritree_multiplexer"
+version = "0.0.0"
+dependencies = [
+ "alacritree_common",
+ "ambassador",
+ "serde_json",
+ "strum",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "alacritree_zellij"
+version = "0.0.0"
+dependencies = [
+ "alacritree_common",
+ "alacritree_multiplexer",
+ "log",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.17",
 ]
 
 [[package]]

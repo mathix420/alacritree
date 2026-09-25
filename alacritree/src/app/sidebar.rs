@@ -660,8 +660,8 @@ impl PaintedIcons {
         let panes = multiplexers
             .iter()
             .map(|multiplexer| {
-                let (icon, default) = multiplexer.icon();
-                (multiplexer.kind(), icon.map_color(rgb_to_color32), default)
+                let icon = multiplexer.icon().map_color(rgb_to_color32);
+                (multiplexer.kind(), icon, multiplexer.default_icon())
             })
             .collect();
         Self { ui: config.ui.icons.map_colors(rgb_to_color32), panes }

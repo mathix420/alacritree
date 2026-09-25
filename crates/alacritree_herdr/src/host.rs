@@ -11,34 +11,35 @@ use super::{
     EndpointCache, Endpoints, HerdrError, Listing, Settings, attaches_directly, cli, focus_pane,
     pane_key, program, unattached,
 };
-use crate::config::{BakedGlyph, DEFAULT_HERDR_ICON, HerdrConfig, IconStyle};
-use crate::jobs;
-use crate::multiplexer::{
+use alacritree_common::jobs;
+use alacritree_common::settings::IconStyle;
+use alacritree_multiplexer::{
     AttachAnswer, AttachRequest, CreateAnswer, CreateRequest, CreatedPane, Launch, ListedPane,
-    Managed, MultiplexerKind, MultiplexerSession, Pane, PaneError, PaneKey, PaneTarget, Side,
-    ViewState, ViewStep,
+    Managed, MultiplexerKind, MultiplexerSession, Pane, PaneError, PaneKey, PaneTarget, SessionId,
+    Side, ViewState, ViewStep,
 };
-use crate::session::SessionId;
+
+use crate::settings::HerdrConfig;
 
 /// A shared-view attach waiting on herdr.  The gesture answers with the argv
 /// its client runs, so everything the session needs is in hand by the time it
 /// opens.
-pub(crate) struct PendingAttach {
-    pub(crate) job: Option<jobs::Job<Result<Launch, PaneError>>>,
+pub struct PendingAttach {
+    pub job: Option<jobs::Job<Result<Launch, PaneError>>>,
     /// The pane to focus once the gesture runs.  A pane the listing has since
     /// dropped is focused as this said, since nothing newer says otherwise.
-    pub(crate) target: PaneTarget,
-    pub(crate) key: PaneKey,
-    pub(crate) request: AttachRequest,
+    pub target: PaneTarget,
+    pub key: PaneKey,
+    pub request: AttachRequest,
 }
 
-pub(crate) struct PendingCreate {
-    pub(crate) job: jobs::Job<Result<CreatedPane, PaneError>>,
-    pub(crate) side: Side,
-    pub(crate) request: CreateRequest,
+pub struct PendingCreate {
+    pub job: jobs::Job<Result<CreatedPane, PaneError>>,
+    pub side: Side,
+    pub request: CreateRequest,
 }
 
-pub(crate) struct Herdr {
+pub struct Herdr {
     config: HerdrConfig,
     /// The herdr servers this app talks to: the native side plus one per
     /// running WSL distro, kept in step with which distros are up.
@@ -52,7 +53,7 @@ pub(crate) struct Herdr {
 }
 
 impl Herdr {
-    pub(crate) fn new(config: HerdrConfig) -> Self {
+    pub fn new(config: HerdrConfig) -> Self {
         Self {
             config,
             endpoints: Endpoints::default(),
@@ -80,7 +81,7 @@ impl Herdr {
     fn note_gesture<T>(&mut self, side: &Side, result: &Result<T, PaneError>) {
         let Err(error) = result else { return };
         log::warn!("herdr ({side:?}): {error}");
-        if matches!(error, PaneError::Herdr(HerdrError::NoAnswer(_))) {
+        if matches!(error.backend(), Some(HerdrError::NoAnswer(_))) {
             self.reconnect_now(side);
         }
     }
@@ -115,19 +116,19 @@ impl Herdr {
             .map(|agent| agent.target(&key.side))
     }
 
-    #[cfg(test)]
-    pub(crate) fn config_mut_for_test(&mut self) -> &mut HerdrConfig {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn config_mut_for_test(&mut self) -> &mut HerdrConfig {
         &mut self.config
     }
 
-    #[cfg(test)]
-    pub(crate) fn caches_mut_for_test(&mut self) -> &mut Vec<EndpointCache> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn caches_mut_for_test(&mut self) -> &mut Vec<EndpointCache> {
         self.endpoints.caches_mut_for_test()
     }
 
     /// Settle `side`'s listing from a raw `pane list` reply, as a poll would.
-    #[cfg(test)]
-    pub(crate) fn adopt_listing_for_test(&mut self, side: &Side, json: &str, at: Instant) {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn adopt_listing_for_test(&mut self, side: &Side, json: &str, at: Instant) {
         let display = Listing::wanted(self.config.show_panes);
         let caches = self.endpoints.caches_mut_for_test();
         if !caches.iter().any(|cache| cache.side() == side) {
@@ -141,38 +142,38 @@ impl Herdr {
         );
     }
 
-    #[cfg(test)]
-    pub(crate) fn caches_for_test(&self) -> &[EndpointCache] {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn caches_for_test(&self) -> &[EndpointCache] {
         self.endpoints.caches()
     }
 
-    #[cfg(test)]
-    pub(crate) fn pending_attach_for_test(&self) -> &Vec<PendingAttach> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pending_attach_for_test(&self) -> &Vec<PendingAttach> {
         &self.pending_attach
     }
 
-    #[cfg(test)]
-    pub(crate) fn pending_attach_mut_for_test(&mut self) -> &mut Vec<PendingAttach> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pending_attach_mut_for_test(&mut self) -> &mut Vec<PendingAttach> {
         &mut self.pending_attach
     }
 
-    #[cfg(test)]
-    pub(crate) fn pending_create_for_test(&self) -> &Vec<PendingCreate> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pending_create_for_test(&self) -> &Vec<PendingCreate> {
         &self.pending_create
     }
 
-    #[cfg(test)]
-    pub(crate) fn pending_create_mut_for_test(&mut self) -> &mut Vec<PendingCreate> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pending_create_mut_for_test(&mut self) -> &mut Vec<PendingCreate> {
         &mut self.pending_create
     }
 
-    #[cfg(test)]
-    pub(crate) fn view_mut_for_test(&mut self) -> &mut HerdrViewSync {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn view_mut_for_test(&mut self) -> &mut HerdrViewSync {
         &mut self.focused_view
     }
 
-    #[cfg(test)]
-    pub(crate) fn view_focus_mut_for_test(&mut self) -> &mut Option<HerdrViewFocus> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn view_focus_mut_for_test(&mut self) -> &mut Option<HerdrViewFocus> {
         &mut self.view_focus
     }
 }
@@ -182,8 +183,8 @@ impl MultiplexerSession for Herdr {
         self.config.enabled
     }
 
-    fn icon(&self) -> (&IconStyle, BakedGlyph) {
-        (&self.config.icon, DEFAULT_HERDR_ICON)
+    fn icon(&self) -> &IconStyle {
+        &self.config.icon
     }
 
     fn poll(&mut self, attached: &dyn Fn(&Side) -> bool) {
@@ -513,8 +514,9 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
-    use crate::config::AttachMode;
-    use crate::multiplexer::AttachFocus;
+    use alacritree_multiplexer::{AttachFocus, PaneStatus, Reply};
+
+    use crate::settings::AttachMode;
 
     fn herdr(attach: AttachMode) -> Herdr {
         Herdr::new(HerdrConfig { attach, ..HerdrConfig::default() })
@@ -524,7 +526,27 @@ mod tests {
         PaneTarget { side, pane_id: "w1:p1".into(), has_agent }
     }
 
-    fn request(waiters: Vec<mpsc::Sender<crate::ipc::protocol::IpcResult>>) -> AttachRequest {
+    /// An idle agent on a native endpoint, the base every other agent varies
+    /// from.
+    fn listed_agent(kind: Option<&str>) -> Pane {
+        Pane {
+            terminal_id: "term_65abfc8e300361".into(),
+            pane_id: "w5:p1".into(),
+            tab_id: Some("w5:t1".into()),
+            kind: kind.map(String::from),
+            title: None,
+            status: Some(PaneStatus::Idle),
+            focused: false,
+            cwd: None,
+            foreground_cwd: None,
+        }
+    }
+
+    fn titled_agent(kind: Option<&str>, title: Option<&str>) -> Pane {
+        Pane { title: title.map(String::from), ..listed_agent(kind) }
+    }
+
+    fn request(waiters: Vec<mpsc::Sender<Reply>>) -> AttachRequest {
         AttachRequest { workspace: None, previous: None, waiters, focus: AttachFocus::Take }
     }
 
@@ -550,10 +572,10 @@ mod tests {
     #[test]
     fn a_title_repeating_the_kind_is_not_reported() {
         let herdr = herdr(AttachMode::Agent);
-        let repeated = crate::test_util::titled_agent(Some("codex"), Some("codex"));
+        let repeated = titled_agent(Some("codex"), Some("codex"));
         assert_eq!(herdr.managed(&Side::Native, Some(&repeated)).title, None);
 
-        let distinct = crate::test_util::titled_agent(Some("codex"), Some("primary"));
+        let distinct = titled_agent(Some("codex"), Some("primary"));
         assert_eq!(herdr.managed(&Side::Native, Some(&distinct)).title.as_deref(), Some("primary"));
     }
 
@@ -562,7 +584,7 @@ mod tests {
     #[test]
     fn a_row_shares_the_view_wherever_a_pane_cannot_be_handed_over() {
         let herdr = herdr(AttachMode::Agent);
-        let agent = crate::test_util::listed_agent(None);
+        let agent = listed_agent(None);
 
         let native = herdr.managed(&Side::Native, Some(&agent));
         assert_eq!(native.shared_view, cfg!(windows));
@@ -635,7 +657,7 @@ mod tests {
         herdr.caches_mut_for_test().push(cache);
 
         let timed_out: Result<(), PaneError> =
-            Err(HerdrError::NoAnswer(crate::herdr::Gesture::Focus).into());
+            Err(HerdrError::NoAnswer(crate::Gesture::Focus).into());
         herdr.note_gesture(&side, &timed_out);
 
         assert!(herdr.cache(&side).unwrap().stream_up_for_test(), "a live stream was restarted");

@@ -19,6 +19,9 @@ schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 strum = { version = "0.26", features = ["derive"] }
 thiserror.workspace = true
+# The color type the terminal's own palette uses, so an icon color configured
+# here needs no conversion on its way to the app.
+vte = { version = "0.15.0", default-features = false, features = ["std", "ansi", "serde"] }
 
 [dev-dependencies]
 tempfile = "3"

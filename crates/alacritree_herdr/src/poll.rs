@@ -5,11 +5,11 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-use crate::{jobs, wsl};
+use alacritree_common::{jobs, wsl};
+use alacritree_multiplexer::{Pane, Side};
 
 use super::events::{self, Event, Message, Stream};
 use super::{Listing, PollError, Settings, running_session_name, settings};
-use crate::multiplexer::{Pane, Side};
 
 /// How long a side with no stream waits before each reconnect in a run of
 /// failures.  The last step repeats, so a herdr started after alacritree is
@@ -268,12 +268,12 @@ impl EndpointCache {
         self.inventory.as_ref()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn set_agents_for_test(&mut self, agents: Vec<Pane>) {
         self.agents = agents;
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn set_settings_for_test(&mut self, settings: Settings) {
         self.settings = Read::Done(settings);
     }
@@ -295,7 +295,7 @@ impl EndpointCache {
     /// long enough to have given its rows up; the grace period holding the
     /// first of a run is its own concern, and `fail_listing_for_test` drives
     /// that.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn complete_listing_for_test(
         &mut self,
         result: Result<&str, PollError>,
@@ -317,7 +317,7 @@ impl EndpointCache {
 
     /// One listing that did not answer, with the grace period holding what
     /// herdr last reported still running.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn fail_listing_for_test(&mut self, error: PollError) {
         self.settings = Read::Done(Settings::default());
         self.session_name = Read::Done("fixture".into());
@@ -341,7 +341,7 @@ impl EndpointCache {
     /// Ages the current run of failures past its grace period, so a test
     /// reaches the state a side that stopped answering ends up in without
     /// waiting the polls out.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn expire_grace_for_test(&mut self) {
         self.blank_at = Some(Instant::now());
     }
@@ -924,7 +924,7 @@ impl Default for Endpoints {
 }
 
 impl Endpoints {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn caches_mut_for_test(&mut self) -> &mut Vec<EndpointCache> {
         &mut self.caches
     }
@@ -1073,7 +1073,7 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
-    use crate::multiplexer::PaneStatus;
+    use alacritree_multiplexer::PaneStatus;
 
     /// One working agent, for the tests about what survives a poll that did
     /// not answer.

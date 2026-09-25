@@ -1,0 +1,20 @@
+[package]
+name = "alacritree_multiplexer"
+version = "0.0.0"
+license = "Apache-2.0"
+description = "What alacritree asks a terminal multiplexer to host its panes"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+# The scripted multiplexer, and the `Scripted` kind it answers under, for
+# other crates' tests.
+test-support = []
+
+[dependencies]
+alacritree_common.workspace = true
+ambassador.workspace = true
+serde_json = "1"
+strum = { version = "0.26", features = ["derive"] }
+thiserror.workspace = true

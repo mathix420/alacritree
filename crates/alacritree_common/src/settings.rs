@@ -3,6 +3,7 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 use strum::IntoEnumIterator;
+use vte::ansi::Rgb;
 
 /// A deprecated key applies only where the file omits its replacement, so a
 /// replacement written at its default still wins. Raw config structs accept
@@ -100,4 +101,133 @@ impl<T: ClosedSetValue> JsonSchema for ClosedSet<T> {
         let default: &'static str = T::default().into();
         schemars::json_schema!({ "type": "string", "enum": values, "default": default })
     }
+}
+
+/// A sidebar icon's glyph and how to paint it.  Parses from a bare string,
+/// accepted as glyph-only, or a table that also styles color, weight, slant,
+/// and size.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct IconStyle<C = Rgb> {
+    pub glyph: Option<String>,
+    pub color: Option<C>,
+    pub bold: bool,
+    pub italic: bool,
+    /// Logical pixels before `ui_scale`; clamped to the icon's slot at paint.
+    pub size: Option<f32>,
+}
+
+impl<C> IconStyle<C> {
+    pub fn or_glyph<'a>(&'a self, default: &'a str) -> &'a str {
+        self.glyph.as_deref().map(str::trim).filter(|g| !g.is_empty()).unwrap_or(default)
+    }
+}
+
+impl<C: Copy> IconStyle<C> {
+    pub fn map_color<D>(&self, f: impl Fn(C) -> D) -> IconStyle<D> {
+        IconStyle {
+            glyph: self.glyph.clone(),
+            color: self.color.map(f),
+            bold: self.bold,
+            italic: self.italic,
+            size: self.size,
+        }
+    }
+}
+
+// The bare form is listed first so a plain string never attempts the table
+// arm.
+/// A styled icon override: either a bare glyph string (`worktree = "◆"`) or a
+/// table (`worktree = { glyph = "◆", color = "#ff5555", bold = true }`).
+#[derive(Debug, Deserialize, serde::Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum RawIconStyle {
+    /// The glyph alone.
+    Glyph(String),
+    /// The glyph with styling.
+    Table {
+        /// The character to draw.  Unset keeps the built-in glyph and applies
+        /// only the styling.
+        glyph: Option<String>,
+        /// Glyph color.  Unset inherits the row's foreground.
+        color: Option<RgbStr>,
+        /// Draw the glyph bold.
+        #[serde(default)]
+        bold: bool,
+        /// Draw the glyph italic.
+        #[serde(default)]
+        italic: bool,
+        /// Point size, clamped to a minimum of `1.0`.  Unset uses the sidebar
+        /// font size.
+        size: Option<f32>,
+    },
+}
+
+impl From<RawIconStyle> for IconStyle {
+    fn from(raw: RawIconStyle) -> Self {
+        match raw {
+            RawIconStyle::Glyph(glyph) => IconStyle { glyph: Some(glyph), ..Default::default() },
+            RawIconStyle::Table { glyph, color, bold, italic, size } => IconStyle {
+                glyph,
+                color: color.map(|c| c.0),
+                bold,
+                italic,
+                size: size.map(|s| s.max(1.0)),
+            },
+        }
+    }
+}
+
+/// Wrapper that parses `"0xrrggbb"`, `"#rrggbb"`, or `"rrggbb"` into an `Rgb`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RgbStr(pub Rgb);
+
+/// Hand-written because `RgbStr` deserializes from a string it parses itself,
+/// so nothing about the accepted spellings is visible to a derive.
+impl JsonSchema for RgbStr {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Color".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "pattern": "^(0[xX]|#)?[0-9a-fA-F]{6}$",
+            "description": "An RGB color, written as \"#rrggbb\", \"0xrrggbb\" or \"rrggbb\".",
+            "examples": ["#1c1c1c", "0x6a9fb5"],
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for RgbStr {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        parse_hex_rgb(&s)
+            .map(RgbStr)
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid color string: {s:?}")))
+    }
+}
+
+/// Hand-written for the same reason `Deserialize` is: the accepted spellings
+/// live in `parse_hex_rgb`, and a derive on the inner `Rgb` would emit an
+/// object against a schema that says `"type": "string"`.
+impl serde::Serialize for RgbStr {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Rgb { r, g, b } = self.0;
+        serializer.serialize_str(&format!("#{r:02x}{g:02x}{b:02x}"))
+    }
+}
+
+fn parse_hex_rgb(s: &str) -> Option<Rgb> {
+    let stripped = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .or_else(|| s.strip_prefix('#'))
+        .unwrap_or(s);
+    if stripped.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&stripped[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&stripped[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&stripped[4..6], 16).ok()?;
+    Some(Rgb { r, g, b })
 }

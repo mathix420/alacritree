@@ -4,12 +4,12 @@
 use std::path::PathBuf;
 use std::process::Stdio;
 
-use crate::{command_ext, jobs, wsl};
+use alacritree_common::{command_ext, jobs, wsl};
+use alacritree_multiplexer::Side;
 use serde::Deserialize;
 
 use super::Settings;
 use super::cli::bounded;
-use crate::multiplexer::Side;
 
 const DEFAULT_PREFIX: &str = "ctrl+b";
 const DEFAULT_DETACH: &str = "prefix+q";

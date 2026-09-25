@@ -1,0 +1,29 @@
+[package]
+name = "alacritree_herdr"
+version = "0.0.0"
+license = "Apache-2.0"
+description = "Hosts panes and agents from a herdr server"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+# Reaches into the endpoint caches and the calls in flight, for the app's
+# tests of what it does with a herdr listing.
+test-support = ["alacritree_common/test-support", "alacritree_multiplexer/test-support"]
+
+[dependencies]
+alacritree_common.workspace = true
+alacritree_multiplexer.workspace = true
+log = "0.4"
+schemars = "1.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+strum = { version = "0.26", features = ["derive"] }
+thiserror.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+alacritree_common = { workspace = true, features = ["test-support"] }
+alacritree_multiplexer = { workspace = true, features = ["test-support"] }
+tempfile = "3"

@@ -6,17 +6,18 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
+use strum::VariantArray;
+
+use crate::tools::Tool;
 
 /// Bumped only when the request/response framing changes incompatibly; a
 /// client seeing any other version treats the helper as unusable and stays
 /// on one-shot spawns.
 pub const PROTOCOL_VERSION: &str = "2";
 
-/// The programs the hello resolves, in the order its fields carry them: the
-/// tool registry's, then zellij, which has a config table of its own.
+/// The programs the hello resolves, in the order its fields carry them.
 /// `HELPER_SCRIPT` spells the same list.
-pub const HELLO_TOOLS: [&str; 8] =
-    ["git", "gh", "delta", "doppler", "herdr", "tuicr", "task", "zellij"];
+pub const HELLO_TOOLS: &[Tool] = Tool::VARIANTS;
 
 /// Login-shell-resolved tool paths and the distro-side runtime dir, from
 /// the helper's hello line.
@@ -30,7 +31,7 @@ pub struct Capabilities {
 
 impl Capabilities {
     pub fn path(&self, program: &str) -> Option<&str> {
-        let slot = HELLO_TOOLS.iter().position(|p| *p == program)?;
+        let slot = HELLO_TOOLS.iter().position(|tool| tool.name() == program)?;
         self.paths.get(slot)?.as_deref()
     }
 }

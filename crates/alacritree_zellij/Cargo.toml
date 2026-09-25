@@ -1,0 +1,26 @@
+[package]
+name = "alacritree_zellij"
+version = "0.0.0"
+license = "Apache-2.0"
+description = "Hosts panes from running zellij sessions"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+# Hands a listing straight to the backend, for the app's tests of what it
+# does with zellij panes.
+test-support = []
+
+[dependencies]
+alacritree_common.workspace = true
+alacritree_multiplexer.workspace = true
+log = "0.4"
+schemars = "1.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror.workspace = true
+
+[dev-dependencies]
+alacritree_multiplexer = { workspace = true, features = ["test-support"] }
+tempfile = "3"

@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 
-use crate::multiplexer::Pane;
+use alacritree_multiplexer::Pane;
 
 /// The live sessions in `zellij list-sessions --no-formatting` output.  A
 /// session zellij keeps only so it can be resurrected is listed too, marked

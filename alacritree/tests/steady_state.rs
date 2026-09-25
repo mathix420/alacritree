@@ -5,13 +5,12 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use alacritree::alloc_count::{CountingAllocator, measure};
-use alacritree::config::FollowFocus;
-use alacritree::herdr;
 use alacritree::in_flight::InFlight;
 use alacritree::multiplexer::Side;
 use alacritree::projects::{Project, Worktree};
 use alacritree::sidebar_focus::{ObservedInputs, SessionInput, UiInputs};
 use alacritree::sidebar_model::{SidebarInputs, SidebarModel};
+use alacritree_herdr::{self as herdr, FollowFocus};
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
