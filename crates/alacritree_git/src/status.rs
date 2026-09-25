@@ -283,6 +283,7 @@ fn diff_against_branch(
 fn status_batch() -> wsl::Batch {
     wsl::Batch::new(r#"p="$1"; hint="$2""#)
         .section("branch", r#"git -C "$p" symbolic-ref --short HEAD 2>/dev/null"#)
+        .section("revision", r#"git -C "$p" rev-parse --short=7 HEAD 2>/dev/null"#)
         .section("status", r#"git -C "$p" status --porcelain=v2 -z 2>/dev/null"#)
         .section(
             "default_branch",
@@ -302,7 +303,6 @@ printf '%s' "$base""#,
             "numstat",
             r#"if [ -n "$base" ]; then git -C "$p" diff --numstat -z "$base...HEAD" 2>/dev/null; fi"#,
         )
-        .section("revision", r#"git -C "$p" rev-parse --short=7 HEAD 2>/dev/null"#)
 }
 
 /// One wsl.exe round trip per refresh tick.  Runs on `spawn_compute`'s
@@ -511,11 +511,11 @@ mod tests {
             None,
             recorded(&[
                 "feat-x",
+                "abc1234",
                 "1 .M N... 100644 100644 100644 aaa bbb src/lib.rs\0",
                 "main",
                 "refs/remotes/origin/main",
                 "3\t1\tsrc/lib.rs\0",
-                "abc1234",
             ]),
         )
         .unwrap();
@@ -547,7 +547,7 @@ mod tests {
         let status = status_from_batch(
             "/home/lev/proj",
             None,
-            recorded(&["feat-x", "", "main", "", "3\t1\tsrc/lib.rs\0"]),
+            recorded(&["feat-x", "abc1234", "", "main", "", "3\t1\tsrc/lib.rs\0"]),
         )
         .unwrap();
         assert_eq!(status.trunk.as_deref(), Some("main"));
@@ -559,10 +559,17 @@ mod tests {
         let status = status_from_batch(
             "/home/lev/proj",
             None,
-            recorded(&["", "", "main", "", "", "abc1234"]),
+            recorded(&["", "abc1234", "", "main", "", ""]),
         )
         .unwrap();
         assert_eq!(status.head.name, None);
+        assert_eq!(status.head.label(), Some("abc1234"));
+    }
+
+    #[test]
+    fn a_detached_checkout_whose_batch_stopped_early_still_reports_a_status() {
+        let status =
+            status_from_batch("/home/lev/proj", None, recorded(&["", "abc1234"])).unwrap();
         assert_eq!(status.head.label(), Some("abc1234"));
     }
 
