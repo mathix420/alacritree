@@ -448,6 +448,23 @@ mod tests {
         assert!(created.is_dir());
     }
 
+    /// With git disabled no backend answers, so a status over IPC reports
+    /// that rather than a clean tree.
+    #[test]
+    fn an_ipc_status_with_git_disabled_says_version_control_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = alacritree_git::test_support::init_repo(dir.path());
+        let path = socket_dir().join(format!("alacritree-status-test-{}.sock", std::process::id()));
+        let config = CreateConfig { vcs: Vec::new(), ..CreateConfig::default() };
+        let (handle, _rx) = listen_at(path, Recorder::default(), config).expect("listener");
+
+        let request = IpcRequest::GitStatus { path: repo };
+        let reply =
+            send_request(Some(handle.path()), &request, Duration::from_secs(30)).expect("a reply");
+
+        assert_eq!(reply["error"], "version control is disabled");
+    }
+
     /// The deadline is absolute.  A per-message timeout resets on every progress
     /// step, so a job that keeps reporting outlives the budget indefinitely: the
     /// same parked worker, reached more slowly.

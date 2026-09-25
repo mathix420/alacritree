@@ -1422,6 +1422,30 @@ mod tests {
         (app, survivor_id)
     }
 
+    /// With git disabled a repository gets no status cache, so nothing runs
+    /// git for it and the panel draws no rows.
+    #[test]
+    fn the_panel_shows_nothing_for_a_repository_when_git_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = alacritree_git::test_support::init_repo(dir.path());
+        let mut config = Config::default();
+        config.integrations.git.enabled = false;
+        let (_, notify_rx) = std::sync::mpsc::channel();
+        let mut app = AlacritreeApp::from_parts(
+            config,
+            Theme::from_config(&Config::default()),
+            crate::state::PersistedState::default(),
+            Vec::new(),
+            (Vec::new(), crate::fonts::FaceMetrics::default()),
+            notify_rx,
+            (None, None),
+        );
+        app.current_workspace = Some(repo);
+
+        assert!(app.git_sidebar_view(&Context::default()).is_none());
+        assert!(app.git_panel.status.is_empty());
+    }
+
     fn has_diff_pane(app: &AlacritreeApp) -> bool {
         app.sessions.iter().any(|s| matches!(s.kind, SessionKind::Diff { .. }))
     }

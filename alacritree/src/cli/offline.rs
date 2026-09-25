@@ -353,6 +353,18 @@ mod tests {
         assert_eq!(result, Err("alacritree is not running".to_string()));
     }
 
+    #[test]
+    fn an_offline_status_with_git_disabled_says_version_control_is_off() {
+        let dir = TempDir::new().unwrap();
+        let repo = alacritree_git::test_support::init_repo(dir.path());
+        let config = CreateConfig { vcs: Vec::new(), ..CreateConfig::default() };
+
+        let reply = handle_at(&state_file(&dir), &IpcRequest::GitStatus { path: repo }, &config)
+            .expect("a reply");
+
+        assert_eq!(reply["error"], "version control is disabled");
+    }
+
     /// The CLI with no window running puts a worktree where `[workspace]`
     /// says, the same place the sidebar's "+" does.
     #[test]
