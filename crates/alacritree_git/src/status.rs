@@ -7,7 +7,8 @@ use alacritree_common::{jobs, wsl};
 use alacritree_vcs::{ChangeKind, DiffStat, Dirty, FileChange, Head, Status, VcsError};
 use git2::{Delta, DiffOptions, Repository, Status as Flags, StatusOptions};
 
-use crate::default_branch::{self, Evidence, WellKnown};
+use crate::default_branch;
+use crate::discover::{current_head, detect_default_branch};
 
 pub(crate) fn status(
     path: &Path,
@@ -124,45 +125,6 @@ fn compute_inner(path: &Path, default_branch_hint: Option<&str>) -> Result<Statu
     };
 
     Ok(Status { head, trunk, base, staged: Some(staged), working, base_diff })
-}
-
-/// The branch HEAD names, and the commit it points at either way, so a
-/// detached checkout is told apart from a branch rather than showing as one.
-fn current_head(repo: &Repository) -> Head {
-    let Ok(head) = repo.head() else {
-        return Head::default();
-    };
-    let revision = head.target().map(|oid| oid.to_string().chars().take(7).collect());
-    let name = if head.is_branch() { head.shorthand().map(str::to_string) } else { None };
-    Head { name, revision, distance: None }
-}
-
-/// What git2 can see about this repository's default branch, ranked by
-/// [`default_branch::resolve`].
-fn detect_default_branch(repo: &Repository) -> Option<String> {
-    let has = |name: &str| repo.find_reference(&format!("refs/heads/{name}")).is_ok();
-
-    let origin_head = repo
-        .find_reference("refs/remotes/origin/HEAD")
-        .ok()
-        .and_then(|r| r.symbolic_target().map(str::to_string))
-        .and_then(|t| t.strip_prefix("refs/remotes/origin/").map(str::to_string));
-
-    let present: Vec<&str> =
-        WellKnown::ALL.iter().map(|c| c.as_str()).filter(|name| has(name)).collect();
-
-    let init_default = repo
-        .config()
-        .ok()
-        .and_then(|cfg| cfg.get_string("init.defaultBranch").ok())
-        .filter(|name| !name.is_empty() && has(name));
-
-    default_branch::resolve(&Evidence {
-        origin_head: origin_head.as_deref(),
-        present,
-        init_default: init_default.as_deref(),
-        ..Evidence::default()
-    })
 }
 
 fn staged_kind(s: Flags) -> Option<ChangeKind> {

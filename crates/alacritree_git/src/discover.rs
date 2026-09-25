@@ -168,7 +168,7 @@ fn from_repo(root: &Path, repo: &GitRepo, upstream: bool) -> Repository {
 /// The branch HEAD names, when it names one, and the short OID either way.
 /// Keeping them apart is what tells a detached head from a branch that
 /// happens to be named like an OID.
-fn current_head(repo: &GitRepo) -> Head {
+pub(crate) fn current_head(repo: &GitRepo) -> Head {
     let Ok(head) = repo.head() else {
         return Head::default();
     };
@@ -188,7 +188,7 @@ fn branch_from_admin_head(repo: &GitRepo, worktree_name: &str) -> Option<String>
 
 /// What git2 can see about this repository's default branch, ranked by
 /// [`default_branch::resolve`].
-fn detect_default_branch(repo: &GitRepo) -> Option<String> {
+pub(crate) fn detect_default_branch(repo: &GitRepo) -> Option<String> {
     let has = |name: &str| repo.find_reference(&format!("refs/heads/{name}")).is_ok();
 
     let origin_head = repo
