@@ -200,13 +200,14 @@ impl Drop for PriorityJob {
 mod tests {
     use std::collections::HashMap;
     use std::fmt;
+    use std::io::Read;
     use std::num::NonZeroU32;
     use std::process::{Child, Command, Stdio};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     use alacritty_terminal::event::WindowSize;
-    use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
+    use alacritty_terminal::tty::{self, EventedReadWrite as _, Options as PtyOptions, Shell};
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
     use windows_sys::Win32::System::JobObjects::IsProcessInJob;
     use windows_sys::Win32::System::Threading::{
@@ -451,6 +452,9 @@ mod tests {
 
     /// A real ConPTY session torn down, and what outlived it.
     struct Teardown {
+        /// False when the session never printed its [`Session::ready`] text.
+
+        ready: bool,
         /// False when `ClosePseudoConsole` had not returned by the deadline.
         /// It blocks until the conout pipe drains, so a session whose shell
         /// never exits wedges the drop rather than reporting anything.
@@ -543,6 +547,41 @@ mod tests {
         }
     }
 
+    /// Read `reader` until `text` shows outside an OSC sequence, or give up
+    /// after a deadline. The window title is one, and `cmd` puts the command
+    /// line there before the command has even started.
+    fn printed(reader: &mut impl Read, text: &str) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut output = Vec::new();
+        let mut buf = [0; 4096];
+        while Instant::now() < deadline {
+            if without_osc(&output).contains(text) {
+                return true;
+            }
+            match reader.read(&mut buf) {
+                Ok(n) if n > 0 => output.extend_from_slice(&buf[..n]),
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        false
+    }
+
+    fn without_osc(output: &[u8]) -> String {
+        let text = String::from_utf8_lossy(output);
+        let mut kept = String::new();
+        let mut rest = &*text;
+        while let Some(start) = rest.find("\x1b]") {
+            kept.push_str(&rest[..start]);
+            let body = &rest[start + 2..];
+            // BEL ends a sequence, and so does ESC `\`, whose trailing
+            // backslash is left behind as harmless text.
+            let end = body.find(['\x07', '\x1b']).map_or(body.len(), |i| i + 1);
+            rest = &body[end..];
+        }
+        kept.push_str(rest);
+        kept
+    }
+
     /// Which of `members` are still running once they have had `grace` to go.
     fn still_running_after(members: &[Member], grace: Duration) -> Vec<Member> {
         let deadline = Instant::now() + grace;
@@ -560,7 +599,7 @@ mod tests {
         }
     }
 
-    /// Run `shell` inside a real pseudoconsole, wait for its tree to come up,
+    /// Run a session inside a real pseudoconsole, wait for it to come up,
     /// then close the console and report what survived.
     ///
     /// `job` is the only difference between the arms: `None` leaves the
@@ -568,13 +607,13 @@ mod tests {
     /// Everything runs on a worker thread because closing a console can block
     /// forever, and a teardown that never returns is a result here rather than
     /// a reason to hang the suite.
-    fn tear_down_a_conpty_session(job: Option<bool>, shell: Shell, want: usize) -> Teardown {
+    fn tear_down_a_conpty_session(job: Option<bool>, session: Session, want: usize) -> Teardown {
         let (members_tx, members_rx) = mpsc::channel();
         let (closed_tx, closed_rx) = mpsc::channel();
 
         std::thread::spawn(move || {
             let options = PtyOptions {
-                shell: Some(shell),
+                shell: Some(session.shell),
                 working_directory: None,
                 drain_on_exit: false,
                 env: HashMap::new(),
@@ -582,12 +621,16 @@ mod tests {
             };
             let size = WindowSize { num_lines: 24, num_cols: 80, cell_width: 8, cell_height: 16 };
             crate::dll_search::harden_dll_search_path();
-            let pty = tty::new(&options, size, 0).expect("open a pseudoconsole");
+            let mut pty = tty::new(&options, size, 0).expect("open a pseudoconsole");
             let root = pty.child_watcher().pid().map(NonZeroU32::get).expect("the shell's pid");
             // Jobbed before the tree is waited for, as a session does it: a
             // process joins a job when it is created, so anything already
             // running when the job appears stays outside it for good.
             let job = job.map(|reaping| PriorityJob::adopt(root, reaping).expect("job the shell"));
+            // A process is in the tree before it has finished starting, and a
+            // busy machine stretches that gap. A console closed inside it
+            // judges a session that never came up.
+            let ready = printed(pty.reader(), session.ready);
             let started = tree_once_grown(root, want);
 
             let sys = snapshot();
@@ -600,7 +643,7 @@ mod tests {
                 })
                 .collect();
 
-            members_tx.send(members).expect("report the session's tree");
+            members_tx.send((ready, members)).expect("report the session's tree");
             // Session drops its fields, the job among them, before the event
             // loop gets to the PTY, so the job goes first here too.
             drop(job);
@@ -608,8 +651,8 @@ mod tests {
             let _ = closed_tx.send(());
         });
 
-        let started =
-            members_rx.recv_timeout(Duration::from_secs(45)).expect("the session came up");
+        let (ready, started) =
+            members_rx.recv_timeout(Duration::from_secs(60)).expect("the session came up");
         let closed = closed_rx.recv_timeout(Duration::from_secs(20)).is_ok();
 
         // Closing the console returns before the kernel has finished tearing
@@ -626,12 +669,22 @@ mod tests {
             let _ =
                 Command::new("taskkill").args(["/F", "/T", "/PID", &pid]).hide_console().output();
         }
-        Teardown { closed, started, survivors }
+        Teardown { ready, closed, started, survivors }
+    }
+
+    /// What a session runs, and the text it prints once everything it starts
+    /// is running.
+    struct Session {
+        shell: Shell,
+        ready: &'static str,
     }
 
     /// A shell and the command it is running, both clients of the console.
-    fn console_clients() -> Shell {
-        Shell::new("cmd.exe".into(), vec!["/c".into(), "ping -n 60 127.0.0.1 > nul".into()])
+    /// Ping names its target in its first line in every locale, and prints
+    /// it only once it has joined the console.
+    fn console_clients() -> Session {
+        let shell = Shell::new("cmd.exe".into(), vec!["/c".into(), "ping -n 60 127.0.0.1".into()]);
+        Session { shell, ready: "127.0.0.1" }
     }
 
     /// A shell that starts a process with no console of its own, which is the
@@ -641,14 +694,21 @@ mod tests {
     /// Only a process already inside the session can start one, so the session
     /// runs this test binary again and [`a_child_that_leaves_the_console`] does
     /// the spawning.
-    fn a_shell_that_escapes_its_console() -> Shell {
+    fn a_shell_that_escapes_its_console() -> Session {
         let exe = std::env::current_exe().expect("the test binary's own path");
-        Shell::new(exe.display().to_string(), vec![
+        let shell = Shell::new(exe.display().to_string(), vec![
             "--exact".into(),
             "focus_priority::windows::tests::a_child_that_leaves_the_console".into(),
             "--ignored".into(),
-        ])
+        ]);
+        Session { shell, ready: ESCAPED }
     }
+
+    /// What [`a_child_that_leaves_the_console`] prints once its child is fully
+    /// started. Until `spawn` returns, the child shows in the tree while its
+    /// parent is still creating it, and closing the console then can take it
+    /// down with the parent.
+    const ESCAPED: &str = "escaped the console";
 
     /// Not a test on its own: the escaping child that
     /// [`a_shell_that_escapes_its_console`] runs as a session's shell.
@@ -674,6 +734,10 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("start a child outside the console");
+        // Written to the handle itself, since libtest captures `print!`.
+        let mut console = std::io::stdout();
+        let _ = std::io::Write::write_all(&mut console, ESCAPED.as_bytes());
+        let _ = std::io::Write::flush(&mut console);
         std::thread::sleep(Duration::from_secs(60));
     }
 
@@ -684,6 +748,7 @@ mod tests {
     #[test]
     fn closing_a_pseudoconsole_reaps_its_console_clients() {
         let torn = tear_down_a_conpty_session(None, console_clients(), 2);
+        assert!(torn.ready, "the command never reached the console");
         assert!(torn.closed, "closing the pseudoconsole never returned");
         assert!(torn.started.len() >= 2, "no command ran: {}", render(&torn.started));
         assert!(torn.survivors.is_empty(), "outlived the console: {}", render(&torn.survivors));
@@ -695,7 +760,9 @@ mod tests {
     #[test]
     fn a_job_does_not_cost_the_session_its_reaping() {
         let torn = tear_down_a_conpty_session(Some(true), console_clients(), 2);
+        assert!(torn.ready, "the command never reached the console");
         assert!(torn.closed, "closing the jobbed pseudoconsole never returned");
+
         assert!(torn.started.len() >= 2, "no command ran: {}", render(&torn.started));
         assert!(
             torn.survivors.is_empty(),
@@ -711,6 +778,7 @@ mod tests {
     #[test]
     fn the_console_alone_strands_what_leaves_it() {
         let torn = tear_down_a_conpty_session(None, a_shell_that_escapes_its_console(), 2);
+        assert!(torn.ready, "the shell never started its escaping child");
         assert!(torn.closed, "closing the pseudoconsole never returned");
         assert!(torn.started.len() >= 2, "nothing left the console: {}", render(&torn.started));
         assert!(
@@ -725,7 +793,9 @@ mod tests {
     #[test]
     fn a_reaping_job_ends_what_leaves_the_console() {
         let torn = tear_down_a_conpty_session(Some(true), a_shell_that_escapes_its_console(), 2);
+        assert!(torn.ready, "the shell never started its escaping child");
         assert!(torn.closed, "closing the jobbed pseudoconsole never returned");
+
         assert!(torn.started.len() >= 2, "nothing left the console: {}", render(&torn.started));
         assert!(torn.survivors.is_empty(), "stranded by the teardown: {}", render(&torn.survivors));
     }
