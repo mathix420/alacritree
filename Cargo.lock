@@ -259,6 +259,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "alacritree_vcs"
+version = "0.0.0"
+dependencies = [
+ "alacritree_common",
+ "ambassador",
+ "strum",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "alacritree_zellij"
 version = "0.0.0"
 dependencies = [

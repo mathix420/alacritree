@@ -36,6 +36,7 @@ alacritree_herdr = { path = "crates/alacritree_herdr" }
 alacritree_multiplexer = { path = "crates/alacritree_multiplexer" }
 alacritree_tasks = { path = "crates/alacritree_tasks" }
 alacritree_taskwarrior = { path = "crates/alacritree_taskwarrior" }
+alacritree_vcs = { path = "crates/alacritree_vcs" }
 alacritree_zellij = { path = "crates/alacritree_zellij" }
 ambassador = "0.5.1"
 thiserror = "2"
