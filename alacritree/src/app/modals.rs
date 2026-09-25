@@ -517,7 +517,7 @@ impl AlacritreeApp {
             dirty: Option<DirtyCounts>,
             delete_branch: bool,
             prunable: bool,
-            result: Result<(), String>,
+            result: Result<(), wt::WorktreeError>,
         }
         let mut finished: Vec<Finished> = Vec::new();
         self.modals.pending_deletes.retain(|task| match task.job.poll() {
@@ -546,7 +546,7 @@ impl AlacritreeApp {
                     dirty: task.dirty,
                     delete_branch: task.delete_branch,
                     prunable: task.prunable,
-                    result: Err("the background worker panicked".to_string()),
+                    result: Err(wt::WorktreeError::WorkerPanicked),
                 });
                 false
             },
@@ -594,7 +594,7 @@ impl AlacritreeApp {
     /// not activated: the user minimized to work elsewhere, so don't yank them
     /// into the new worktree.
     pub(super) fn poll_pending_creates(&mut self, ctx: &Context) {
-        let mut finished: Vec<(usize, Result<PathBuf, String>)> = Vec::new();
+        let mut finished: Vec<(usize, Result<PathBuf, wt::WorktreeError>)> = Vec::new();
         self.modals.pending_creates.retain_mut(|task| {
             let mut done = None;
             loop {
@@ -612,8 +612,8 @@ impl AlacritreeApp {
                 }
             }
             let _ = task.job.poll();
-            let done =
-                done.or_else(|| task.job.failed().then(|| Err(CREATE_WORKER_PANICKED.to_string())));
+            let done = done
+                .or_else(|| task.job.failed().then_some(Err(wt::WorktreeError::WorkerPanicked)));
             match done {
                 Some(result) => {
                     finished.push((task.project_idx, result));
@@ -712,7 +712,7 @@ impl AlacritreeApp {
                 // so the picker shows the failure row instead of "loading
                 // branches…" forever.
                 None if job.failed() => {
-                    picker.branches = Some(Err("branch listing did not complete".to_string()));
+                    picker.branches = Some(Err(wt::WorktreeError::WorkerPanicked));
                     picker.branches_job = None;
                 },
                 None => {},
@@ -764,7 +764,7 @@ impl AlacritreeApp {
                 focus_default(ui.ctx(), input_id);
 
                 if let Some(Err(e)) = &picker.branches {
-                    ui.label(RichText::new(e).color(danger).small());
+                    ui.label(RichText::new(e.to_string()).color(danger).small());
                 }
 
                 filtered = match &picker.branches {
@@ -851,7 +851,7 @@ impl AlacritreeApp {
                 self.show_create_prompt(ctx, project_idx, branch, error)
             },
             CreateState::Running { project_idx, branch, mut steps, rx, job } => {
-                let mut done: Option<Result<PathBuf, String>> = None;
+                let mut done: Option<Result<PathBuf, wt::WorktreeError>> = None;
                 while let Ok(p) = rx.try_recv() {
                     match p {
                         Progress::Step(s) => steps.push(s),
@@ -862,7 +862,7 @@ impl AlacritreeApp {
                 // latch the modal would sit on its last step forever.
                 let _ = job.poll();
                 if done.is_none() && job.failed() {
-                    done = Some(Err(CREATE_WORKER_PANICKED.to_string()));
+                    done = Some(Err(wt::WorktreeError::WorkerPanicked));
                 }
                 let minimized = self.show_create_running(ctx, project_idx, &branch, &steps);
                 match done {
@@ -904,7 +904,7 @@ impl AlacritreeApp {
         ctx: &Context,
         project_idx: usize,
         mut branch: String,
-        mut error: Option<String>,
+        mut error: Option<wt::BranchNameError>,
     ) -> Option<CreateState> {
         let theme = self.theme;
         let danger = self.theme.error;
@@ -948,7 +948,7 @@ impl AlacritreeApp {
                     create_clicked = true;
                 }
                 if let Some(e) = &error {
-                    ui.label(RichText::new(e).color(danger).small());
+                    ui.label(RichText::new(e.to_string()).color(danger).small());
                 }
                 ui.add_space(4.0 * s);
                 ui.horizontal(|ui| {
@@ -976,8 +976,8 @@ impl AlacritreeApp {
             // Whitespace runs become single hyphens: `some text like this` →
             // `some-text-like-this`.
             let canonical: String = branch.split_whitespace().collect::<Vec<_>>().join("-");
-            if let Err(msg) = wt::validate_branch_name(&canonical) {
-                error = Some(msg);
+            if let Err(invalid) = wt::validate_branch_name(&canonical) {
+                error = Some(invalid);
                 return Some(CreateState::Prompt { project_idx, branch, error });
             }
             let req = CreateRequest::new(
@@ -1055,7 +1055,7 @@ impl AlacritreeApp {
         ctx: &Context,
         project_idx: usize,
         steps: &[String],
-        result: &Result<PathBuf, String>,
+        result: &Result<PathBuf, wt::WorktreeError>,
     ) -> bool {
         let theme = self.theme;
         let danger = self.theme.error;
@@ -1089,7 +1089,7 @@ impl AlacritreeApp {
                 }
                 if let Err(e) = result {
                     ui.add_space(4.0 * s);
-                    ui.label(RichText::new(e).color(danger).small());
+                    ui.label(RichText::new(e.to_string()).color(danger).small());
                 }
                 ui.add_space(4.0 * s);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1164,11 +1164,6 @@ impl AlacritreeApp {
     }
 }
 
-/// What a create reports when its worker unwound instead of returning: the
-/// pool records only that a panic happened, and the step list stops wherever
-/// it got to.
-const CREATE_WORKER_PANICKED: &str = "the background worker panicked";
-
 /// A modal action button. Framed and filled so it reads as clickable.
 /// Frameless text buttons looked like captions and users reached for the
 /// keyboard hint instead of the mouse.
@@ -1227,14 +1222,14 @@ pub(super) struct DeleteTask {
     pub(super) delete_branch: bool,
     /// Distinguishes the "prune" vs "delete" wording in a failure message.
     pub(super) prunable: bool,
-    pub(super) job: jobs::Job<Result<(), String>>,
+    pub(super) job: jobs::Job<Result<(), wt::WorktreeError>>,
 }
 
 pub(super) enum CreateState {
     Prompt {
         project_idx: usize,
         branch: String,
-        error: Option<String>,
+        error: Option<wt::BranchNameError>,
     },
     Running {
         project_idx: usize,
@@ -1249,7 +1244,7 @@ pub(super) enum CreateState {
     Done {
         project_idx: usize,
         steps: Vec<String>,
-        result: Result<PathBuf, String>,
+        result: Result<PathBuf, wt::WorktreeError>,
     },
 }
 
@@ -1288,30 +1283,27 @@ pub(super) struct BaseBranchPicker {
     pub(super) query: String,
     /// `None` until the listing lands; the picker opens before git answers.
     /// `Err` is what git said when listing failed (not a repo, WSL down…).
-    pub(super) branches: Option<Result<Vec<String>, String>>,
-    pub(super) branches_job: Option<jobs::Job<Result<Vec<String>, String>>>,
+    pub(super) branches: Option<Result<Vec<String>, wt::WorktreeError>>,
+    pub(super) branches_job: Option<jobs::Job<Result<Vec<String>, wt::WorktreeError>>>,
     /// Auto-detected base shown on the "Auto" row.
     pub(super) detected: Option<String>,
     pub(super) cursor: usize,
 }
 
 /// `git worktree remove` refuses a tree with work in it, and that refusal is
-/// the authority on whether removing would lose anything. Both fragments are
-/// real git wording: `contains modified or untracked files` is the current
-/// message, `is dirty` is what git 2.17 (the version that introduced
-/// `worktree remove`) said before the message was reworded.
+/// the authority on whether removing would lose anything. `contains modified
+/// or untracked files` is git's current wording, `is dirty` what git 2.17
+/// said before the rewording.
 ///
-/// `worktree.rs`'s failure string is `git <args>: fatal: '<path>' <reason>`,
-/// and `<path>` (attacker- or at least user-controlled) is echoed twice,
-/// once in the command args and once quoted right after `fatal:`. Matching
-/// against the raw message would let a worktree path that happens to spell
-/// out one of these fragments turn an unrelated failure (locked tree, main
-/// worktree, filesystem error) into a false "needs --force" prompt. Git's own
-/// wording always lands after the closing quote of the path, never inside it,
-/// so cutting the tail at the last `'` drops both copies of the path and
-/// leaves only text git itself authored.
-pub(super) fn refused_for_unsaved_work(message: &str) -> bool {
-    let tail = message.rsplit_once("fatal:").map_or(message, |(_, tail)| tail);
+/// git prints `fatal: '<path>' <reason>`, and a user-chosen path that spells
+/// out a fragment must not turn an unrelated failure into a false "needs
+/// --force" prompt. git's reason always follows the path's closing quote, so
+/// only the text after the last `'` is read.
+pub(super) fn refused_for_unsaved_work(error: &wt::WorktreeError) -> bool {
+    let wt::WorktreeError::Git { output, .. } = error else {
+        return false;
+    };
+    let tail = output.rsplit_once("fatal:").map_or(output.as_str(), |(_, tail)| tail);
     let reason = tail.rsplit_once('\'').map_or(tail, |(_, after)| after).to_ascii_lowercase();
     reason.contains("contains modified or untracked files, use --force")
         || reason.contains("is dirty, use --force")
@@ -1438,18 +1430,26 @@ mod tests {
         assert!(!unavailable.to_lowercase().contains("checking"));
     }
 
+    fn git_refused(path: &str, output: &str) -> wt::WorktreeError {
+        wt::WorktreeError::Git { args: format!("worktree remove {path}"), output: output.into() }
+    }
+
     #[test]
     fn refused_for_unsaved_work_matches_a_real_git_refusal() {
-        let message = "git worktree remove ../wt1: fatal: '../wt1' contains modified or untracked \
-                       files, use --force to delete it";
-        assert!(refused_for_unsaved_work(message));
+        let refusal = git_refused(
+            "../wt1",
+            "fatal: '../wt1' contains modified or untracked files, use --force to delete it",
+        );
+        assert!(refused_for_unsaved_work(&refusal));
     }
 
     #[test]
     fn refused_for_unsaved_work_ignores_unrelated_failures() {
-        assert!(!refused_for_unsaved_work(
-            "git worktree remove ../wt1: fatal: '../wt1' is a main working tree"
-        ));
+        assert!(!refused_for_unsaved_work(&git_refused(
+            "../wt1",
+            "fatal: '../wt1' is a main working tree"
+        )));
+        assert!(!refused_for_unsaved_work(&wt::WorktreeError::WorkerPanicked));
     }
 
     /// A worktree path that happens to contain the matched phrase must not
@@ -1459,10 +1459,9 @@ mod tests {
     #[test]
     fn refused_for_unsaved_work_is_not_fooled_by_a_path_spelling_out_the_phrase() {
         let path = "../is dirty, use --force to delete it";
-        let message = format!(
-            "git worktree remove {path}: fatal: '{path}' cannot be locked: filesystem error"
-        );
-        assert!(!refused_for_unsaved_work(&message));
+        let refusal =
+            git_refused(path, &format!("fatal: '{path}' cannot be locked: filesystem error"));
+        assert!(!refused_for_unsaved_work(&refusal));
     }
 
     #[test]

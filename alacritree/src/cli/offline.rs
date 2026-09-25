@@ -141,12 +141,13 @@ fn discover_all(state_path: &Path) -> Vec<Project> {
 /// no sidebar to tell, and the next `project list` discovers the new worktree
 /// from git anyway.
 fn create_worktree(project_root: PathBuf, branch: String, config: &CreateConfig) -> IpcResult {
-    wt::validate_branch_name(&branch)?;
+    wt::validate_branch_name(&branch).map_err(|e| e.to_string())?;
     let request = CreateRequest::new(project_root, None, branch, &config.workspace);
     let mut steps = Vec::new();
     let path = jobs::on_this_thread(|blocking| {
         wt::create(&request, config.hooks.as_slice(), |step| steps.push(step.to_string()), blocking)
-    })?;
+    })
+    .map_err(|e| e.to_string())?;
     Ok(json!({ "path": path, "steps": steps }))
 }
 

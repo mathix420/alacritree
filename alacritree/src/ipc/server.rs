@@ -238,7 +238,7 @@ fn create_worktree(
     repaint: &impl Repaint,
     config: &CreateConfig,
 ) -> IpcResult {
-    wt::validate_branch_name(&branch)?;
+    wt::validate_branch_name(&branch).map_err(|e| e.to_string())?;
     let req = CreateRequest::new(project_root.clone(), None, branch, &config.workspace);
     let (rx, job) = wt::spawn_create(req, config.hooks.clone(), repaint.clone());
     let outcome = drain_create(&rx, IPC_CREATE_BUDGET);
@@ -254,8 +254,19 @@ fn create_worktree(
             let _ = call_app(refresh.into(), app_tx, repaint);
             Ok(json!({ "path": path, "steps": steps }))
         },
-        Err(e) => Err(e),
+        Err(e) => Err(e.to_string()),
     }
+}
+
+/// Why a create gave the connection no worktree.
+#[derive(Debug, thiserror::Error)]
+enum CreateError {
+    #[error(transparent)]
+    Failed(#[from] wt::WorktreeError),
+    #[error("worktree create exceeded {}s", .0.as_secs())]
+    OverBudget(Duration),
+    #[error("the worktree create ended without reporting")]
+    Unreported,
 }
 
 /// Collect a create's progress until it finishes or the budget runs out.
@@ -265,7 +276,7 @@ fn create_worktree(
 fn drain_create(
     rx: &Receiver<Progress>,
     budget: Duration,
-) -> Result<(PathBuf, Vec<String>), String> {
+) -> Result<(PathBuf, Vec<String>), CreateError> {
     let deadline = Instant::now() + budget;
     let mut steps = Vec::new();
     loop {
@@ -273,13 +284,9 @@ fn drain_create(
         match rx.recv_timeout(left) {
             Ok(Progress::Step(s)) => steps.push(s),
             Ok(Progress::Done(Ok(path))) => return Ok((path, steps)),
-            Ok(Progress::Done(Err(e))) => return Err(e),
-            Err(RecvTimeoutError::Timeout) => {
-                return Err(format!("worktree create exceeded {}s", budget.as_secs()));
-            },
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err("the worktree create ended without reporting".into());
-            },
+            Ok(Progress::Done(Err(e))) => return Err(e.into()),
+            Err(RecvTimeoutError::Timeout) => return Err(CreateError::OverBudget(budget)),
+            Err(RecvTimeoutError::Disconnected) => return Err(CreateError::Unreported),
         }
     }
 }
@@ -457,7 +464,10 @@ mod tests {
         let outcome = drain_create(&rx, budget);
         let elapsed = started.elapsed();
 
-        assert!(outcome.is_err(), "a create that never finished reported success");
+        assert!(
+            matches!(outcome, Err(CreateError::OverBudget(_))),
+            "a create that never finished ended as {outcome:?}"
+        );
         // The two behaviours are seconds apart: a per-message timeout runs the
         // whole dribble, an absolute deadline stops at the budget.  Splitting
         // that gap separates them without measuring `recv_timeout`'s precision.

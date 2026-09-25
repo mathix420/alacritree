@@ -5,8 +5,9 @@
 //! `jobs::Job`. Both submit to the shared pool rather than spawning their
 //! own thread.
 
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver};
 
 use alacritree_checkout_hooks::{Checkout, CheckoutHook, CheckoutHooks};
@@ -18,10 +19,71 @@ use crate::repaint::Repaint;
 use crate::tools::{self, Tool};
 use crate::{command_ext, jobs, wsl};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum Progress {
     Step(String),
-    Done(Result<PathBuf, String>),
+    Done(Result<PathBuf, WorktreeError>),
+}
+
+/// Why creating, removing or pruning a worktree, or listing its branches,
+/// failed.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WorktreeError {
+    #[error("worktree create cancelled")]
+    Cancelled,
+    /// The worker unwound instead of returning. The pool records only that a
+    /// panic happened, so a create's step list stops wherever it got to.
+    #[error("the background worker panicked")]
+    WorkerPanicked,
+    #[error("no `origin` remote configured")]
+    NoOrigin,
+    #[error("could not determine base branch (tried: {})", tried.join(", "))]
+    NoBaseBranch { tried: Vec<String> },
+    #[error("failed to run git: {0}")]
+    Spawn(#[source] io::Error),
+    /// git ran and refused. `output` is what git printed, kept apart from
+    /// `args` so a caller can read git's reason without the command line.
+    #[error("git {args}: {output}")]
+    Git { args: String, output: String },
+    #[error("invalid worktree path")]
+    NonUtf8Path,
+    #[error("worktree path is outside the distro")]
+    OutsideDistro,
+    #[error("failed to create {}: {source}", path.display())]
+    CreateDir { path: PathBuf, source: io::Error },
+    #[error("could not locate home directory")]
+    NoHome,
+    #[error("could not query WSL home: {0}")]
+    WslHome(#[source] wsl::BatchError),
+    #[error("could not determine the distro home directory")]
+    EmptyWslHome,
+    #[error("failed to open repository: {}", .0.message())]
+    OpenRepo(#[source] git2::Error),
+    #[error("failed to find worktree `{name}`: {}", source.message())]
+    FindWorktree { name: String, source: git2::Error },
+    #[error("failed to prune: {}", .0.message())]
+    Prune(#[source] git2::Error),
+}
+
+/// Why a branch name is not one git would accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum BranchNameError {
+    #[error("Branch name is empty.")]
+    Empty,
+    #[error("Branch name cannot start with `-`.")]
+    LeadingDash,
+    #[error("Branch name cannot start or end with `.`.")]
+    EdgeDot,
+    #[error("Branch name cannot end with `.lock`.")]
+    LockSuffix,
+    #[error("Branch name cannot contain `..` or `@{{`.")]
+    ReservedSequence,
+    #[error("Branch name cannot contain whitespace.")]
+    Whitespace,
+    #[error("Branch name contains a control character.")]
+    Control,
+    #[error("Branch name cannot contain `{0}`.")]
+    Forbidden(char),
 }
 
 /// What a create from IPC or the offline CLI reads from config: where the
@@ -68,31 +130,31 @@ impl CreateRequest {
 /// git-check-ref-format rules, abridged: no whitespace/control chars, no
 /// `..`, `~`, `^`, `:`, `?`, `*`, `[`, `\`, `@{`; can't start with `-` or `.`,
 /// or end with `.` or `.lock`.
-pub(crate) fn validate_branch_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_branch_name(name: &str) -> Result<(), BranchNameError> {
     if name.is_empty() {
-        return Err("Branch name is empty.".into());
+        return Err(BranchNameError::Empty);
     }
     if name.starts_with('-') {
-        return Err("Branch name cannot start with `-`.".into());
+        return Err(BranchNameError::LeadingDash);
     }
     if name.starts_with('.') || name.ends_with('.') {
-        return Err("Branch name cannot start or end with `.`.".into());
+        return Err(BranchNameError::EdgeDot);
     }
     if name.ends_with(".lock") {
-        return Err("Branch name cannot end with `.lock`.".into());
+        return Err(BranchNameError::LockSuffix);
     }
     if name.contains("..") || name.contains("@{") {
-        return Err("Branch name cannot contain `..` or `@{`.".into());
+        return Err(BranchNameError::ReservedSequence);
     }
     for c in name.chars() {
         if c.is_whitespace() {
-            return Err("Branch name cannot contain whitespace.".into());
+            return Err(BranchNameError::Whitespace);
         }
         if (c as u32) < 0x20 || c == '\u{7f}' {
-            return Err("Branch name contains a control character.".into());
+            return Err(BranchNameError::Control);
         }
         if matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\') {
-            return Err(format!("Branch name cannot contain `{c}`."));
+            return Err(BranchNameError::Forbidden(c));
         }
     }
     Ok(())
@@ -135,14 +197,14 @@ pub(crate) fn create<H: CheckoutHooks + ?Sized>(
     hooks: &H,
     mut on_step: impl FnMut(&str),
     blocking: &jobs::Blocking,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, WorktreeError> {
     let send = &mut on_step;
     // A cancel that lands between children has nothing to kill, so each step
     // asks before starting rather than running for a caller that is gone.
     macro_rules! bail_if_cancelled {
         () => {
             if blocking.cancelled() {
-                return Err("worktree create cancelled".into());
+                return Err(WorktreeError::Cancelled);
             }
         };
     }
@@ -150,7 +212,7 @@ pub(crate) fn create<H: CheckoutHooks + ?Sized>(
     bail_if_cancelled!();
     send("Syncing with remote…");
     if !has_remote(&req.project_root, "origin") {
-        return Err("no `origin` remote configured".into());
+        return Err(WorktreeError::NoOrigin);
     }
 
     // The cached `default_branch` is a hint; if it's missing or stale (e.g.
@@ -162,9 +224,7 @@ pub(crate) fn create<H: CheckoutHooks + ?Sized>(
     // misleading "could not determine base branch" for a caller that is
     // actually just gone.
     bail_if_cancelled!();
-    let (base, base_ref) = resolved.map_err(|attempts| {
-        format!("could not determine base branch (tried: {})", attempts.join(", "))
-    })?;
+    let (base, base_ref) = resolved.map_err(|tried| WorktreeError::NoBaseBranch { tried })?;
     send(&format!("Verifying base branch `{base}`"));
 
     bail_if_cancelled!();
@@ -240,46 +300,53 @@ fn git_command(cwd: &Path) -> Command {
 
 /// The form of `path` git receives as an argument: Linux for WSL repos
 /// (in-distro git can't resolve UNC paths), the Windows string otherwise.
-fn git_path_arg(repo: &Path, path: &Path) -> Result<String, String> {
+fn git_path_arg(repo: &Path, path: &Path) -> Result<String, WorktreeError> {
     match wsl::classify(repo) {
-        wsl::Location::Windows(_) => Ok(path.to_str().ok_or("invalid worktree path")?.to_string()),
-        wsl::Location::Wsl { .. } => wsl::windows_to_linux(path)
-            .ok_or_else(|| "worktree path is outside the distro".to_string()),
+        wsl::Location::Windows(_) => {
+            Ok(path.to_str().ok_or(WorktreeError::NonUtf8Path)?.to_string())
+        },
+        wsl::Location::Wsl { .. } => {
+            wsl::windows_to_linux(path).ok_or(WorktreeError::OutsideDistro)
+        },
     }
 }
 
 #[allow(clippy::disallowed_methods)] // Running git is this function's job.
-fn run_git(cwd: &Path, args: &[&str]) -> Result<(), String> {
+fn run_git(cwd: &Path, args: &[&str]) -> Result<(), WorktreeError> {
     let output = git_command(cwd)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .map_err(|e| format!("failed to run git: {e}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let msg = if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() };
-    Err(format!("git {}: {msg}", args.join(" ")))
+        .map_err(WorktreeError::Spawn)?;
+    git_succeeded(args, output).map(drop)
 }
 
 /// `run_git`, for a call a cancel is allowed to end.  Progress goes to a
 /// pipe, where git suppresses it, so the output stays small enough that the
 /// undrained pipes cannot fill.
-fn run_git_cancellable(blocking: &jobs::Blocking, cwd: &Path, args: &[&str]) -> Result<(), String> {
+fn run_git_cancellable(
+    blocking: &jobs::Blocking,
+    cwd: &Path,
+    args: &[&str],
+) -> Result<(), WorktreeError> {
     let mut cmd = git_command(cwd);
     let output = blocking
         .run_cancellable(cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped()))
-        .map_err(|e| format!("failed to run git: {e}"))?;
+        .map_err(WorktreeError::Spawn)?;
+    git_succeeded(args, output).map(drop)
+}
+
+/// `output` when git exited cleanly. Otherwise what git said on stderr, or on
+/// stdout when stderr was empty.
+fn git_succeeded(args: &[&str], output: Output) -> Result<Output, WorktreeError> {
     if output.status.success() {
-        return Ok(());
+        return Ok(output);
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let msg = if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() };
-    Err(format!("git {}: {msg}", args.join(" ")))
+    let said = if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() };
+    Err(WorktreeError::Git { args: args.join(" "), output: said.to_string() })
 }
 
 #[allow(clippy::disallowed_methods)] // Running git is this function's job.
@@ -298,16 +365,18 @@ fn has_remote(cwd: &Path, name: &str) -> bool {
 /// rather than using git2 so WSL worktrees resolve the same way everything
 /// else in this module does.
 #[allow(clippy::disallowed_methods)] // Running git is this function's job.
-pub(crate) fn list_branches(cwd: &Path, _blocking: &jobs::Blocking) -> Result<Vec<String>, String> {
+pub(crate) fn list_branches(
+    cwd: &Path,
+    _blocking: &jobs::Blocking,
+) -> Result<Vec<String>, WorktreeError> {
+    let args = ["for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes/origin"];
     let output = git_command(cwd)
-        .args(["for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes/origin"])
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
-    }
+        .map_err(WorktreeError::Spawn)?;
+    let output = git_succeeded(&args, output)?;
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(str::trim)
@@ -439,10 +508,10 @@ fn pick_worktree_path(
     branch: &str,
     base: Option<&Path>,
     blocking: &jobs::Blocking,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, WorktreeError> {
     let parent = project_worktree_dir(repo, base, blocking)?;
     std::fs::create_dir_all(&parent)
-        .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        .map_err(|source| WorktreeError::CreateDir { path: parent.clone(), source })?;
     let safe_branch: String =
         branch.chars().map(|c| if c == '/' || c.is_whitespace() { '-' } else { c }).collect();
     let mut candidate = parent.join(&safe_branch);
@@ -463,20 +532,18 @@ fn project_worktree_dir(
     repo: &Path,
     base: Option<&Path>,
     blocking: &jobs::Blocking,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, WorktreeError> {
     let base = match base {
         Some(dir) => dir.to_path_buf(),
         None => {
             let home = match wsl::classify(repo) {
-                wsl::Location::Windows(_) => {
-                    home::home_dir().ok_or_else(|| "could not locate home directory".to_string())?
-                },
+                wsl::Location::Windows(_) => home::home_dir().ok_or(WorktreeError::NoHome)?,
                 wsl::Location::Wsl { distro, .. } => {
                     let stdout = wsl::run_batch(&distro, r#"printf '%s' "$HOME""#, &[], blocking)
-                        .map_err(|e| format!("could not query WSL home: {e}"))?;
+                        .map_err(WorktreeError::WslHome)?;
                     let linux_home = String::from_utf8_lossy(&stdout).trim().to_string();
                     if linux_home.is_empty() {
-                        return Err("could not determine the distro home directory".into());
+                        return Err(WorktreeError::EmptyWslHome);
                     }
                     wsl::linux_to_windows(&linux_home, &distro)
                 },
@@ -547,21 +614,21 @@ mod windows_tests {
     fn git_path_arg_windows_repo_passes_path_through() {
         let repo = Path::new(r"C:\x");
         let path = Path::new(r"C:\x\y");
-        assert_eq!(git_path_arg(repo, path).as_deref(), Ok(r"C:\x\y"));
+        assert_eq!(git_path_arg(repo, path).unwrap(), r"C:\x\y");
     }
 
     #[test]
     fn git_path_arg_wsl_repo_translates_worktree_path() {
         let repo = Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj");
         let path = Path::new(r"\\wsl.localhost\kali-linux\home\lev\wt");
-        assert_eq!(git_path_arg(repo, path).as_deref(), Ok("/home/lev/wt"));
+        assert_eq!(git_path_arg(repo, path).unwrap(), "/home/lev/wt");
     }
 
     #[test]
     fn git_path_arg_wsl_repo_errors_outside_distro_mapping() {
         let repo = Path::new(r"\\wsl.localhost\kali-linux\home\lev\proj");
         let path = Path::new("wt");
-        assert!(git_path_arg(repo, path).is_err());
+        assert!(matches!(git_path_arg(repo, path), Err(WorktreeError::OutsideDistro)));
     }
 }
 
@@ -591,7 +658,7 @@ pub(crate) fn delete_worktree<H: CheckoutHooks + ?Sized>(
     force: bool,
     hooks: &H,
     blocking: &jobs::Blocking,
-) -> Result<(), String> {
+) -> Result<(), WorktreeError> {
     let path_arg = git_path_arg(project_root, worktree_path)?;
     // Resolve before removal: canonicalize needs the directory to still
     // exist, and the checkout hooks below run after git has deleted it.
@@ -632,7 +699,7 @@ pub(crate) fn spawn_delete<H: CheckoutHook + Send + 'static>(
     job: DeleteJob,
     hooks: Vec<H>,
     repaint: impl Repaint,
-) -> jobs::Job<Result<(), String>> {
+) -> jobs::Job<Result<(), WorktreeError>> {
     jobs::pool().spawn(jobs::Priority::Interactive, move |blocking| {
         let result = match job {
             DeleteJob::Remove { worktree_path, branch, force } => {
@@ -664,16 +731,16 @@ fn prune_worktree(
     worktree_name: &str,
     branch: Option<&str>,
     delete_branch: bool,
-) -> Result<(), String> {
-    let repo = git2::Repository::open(project_root)
-        .map_err(|e| format!("failed to open repository: {}", e.message()))?;
-    let wt = repo
-        .find_worktree(worktree_name)
-        .map_err(|e| format!("failed to find worktree `{worktree_name}`: {}", e.message()))?;
+) -> Result<(), WorktreeError> {
+    let repo = git2::Repository::open(project_root).map_err(WorktreeError::OpenRepo)?;
+    let wt = repo.find_worktree(worktree_name).map_err(|source| WorktreeError::FindWorktree {
+        name: worktree_name.to_string(),
+        source,
+    })?;
     // Default prune options refuse valid or locked worktrees. That is exactly
     // the safety we want if the directory reappeared since discovery; the
     // error surfaces to the caller.
-    wt.prune(None).map_err(|e| format!("failed to prune: {}", e.message()))?;
+    wt.prune(None).map_err(WorktreeError::Prune)?;
     if delete_branch {
         if let Some(branch) = branch {
             // Ignore errors as delete_worktree does. The branch may be gone.
@@ -885,9 +952,8 @@ mod tests {
         let _ = gate_tx.send(());
         let result = rx.recv_timeout(Duration::from_secs(10));
         match result {
-            Ok(Err(msg)) => {
-                assert!(msg.contains("cancelled"), "create failed for the wrong reason: {msg}")
-            },
+            Ok(Err(WorktreeError::Cancelled)) => {},
+            Ok(Err(e)) => panic!("create failed for the wrong reason: {e}"),
             Ok(Ok(path)) => panic!("create finished a worktree nobody was waiting for: {path:?}"),
             Err(e) => panic!("create never returned: {e}"),
         }
@@ -949,9 +1015,8 @@ mod tests {
         drop(job);
         let result = rx.recv_timeout(Duration::from_secs(5));
         match result {
-            Ok(Err(msg)) => {
-                assert!(msg.contains("cancelled"), "create failed for the wrong reason: {msg}")
-            },
+            Ok(Err(WorktreeError::Cancelled)) => {},
+            Ok(Err(e)) => panic!("create failed for the wrong reason: {e}"),
             Ok(Ok(path)) => panic!("create finished a worktree nobody was waiting for: {path:?}"),
             Err(e) => panic!("create never returned: {e}"),
         }
@@ -988,7 +1053,7 @@ mod tests {
         drop(job);
         let _ = gate_tx.send(());
         let result = rx.recv_timeout(Duration::from_secs(10)).expect("create never returned");
-        assert!(matches!(result, Err(ref msg) if msg.contains("cancelled")), "{result:?}");
+        assert!(matches!(result, Err(WorktreeError::Cancelled)), "{result:?}");
         assert_eq!(hook.events(), []);
     }
 

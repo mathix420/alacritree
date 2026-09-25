@@ -6369,7 +6369,10 @@ mod tests {
                 dirty: None,
                 delete_branch: true,
                 prunable: false,
-                job: jobs::Job::ready(Err(reason.to_string())),
+                job: jobs::Job::ready(Err(wt::WorktreeError::Git {
+                    args: format!("worktree remove {path}"),
+                    output: reason.to_string(),
+                })),
             });
         }
 
