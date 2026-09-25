@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use alacritree_common::jobs::Blocking;
 
-use crate::{Checkout, CheckoutHook, HookError, Outcome};
+use crate::{CheckoutEvent, CheckoutHook, HookError, Outcome};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -53,15 +53,15 @@ impl FakeHook {
 }
 
 impl CheckoutHook for FakeHook {
-    fn on_created(&self, e: &Checkout<'_>, _: &Blocking) -> Outcome {
+    fn on_created(&self, e: &CheckoutEvent<'_>, _: &Blocking) -> Outcome {
         self.record(Event::Created { main: e.main.into(), checkout: e.checkout.into() })
     }
 
-    fn on_opened(&self, e: &Checkout<'_>, _: &Blocking) -> Outcome {
+    fn on_opened(&self, e: &CheckoutEvent<'_>, _: &Blocking) -> Outcome {
         self.record(Event::Opened { main: e.main.into(), checkout: e.checkout.into() })
     }
 
-    fn on_removed(&self, e: &Checkout<'_>, _: &Blocking) -> Outcome {
+    fn on_removed(&self, e: &CheckoutEvent<'_>, _: &Blocking) -> Outcome {
         self.record(Event::Removed { main: e.main.into(), checkout: e.checkout.into() })
     }
 }

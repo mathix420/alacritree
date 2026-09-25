@@ -8,7 +8,7 @@ use alacritree_common::side::{self, Program, Ran, Side, lookup_name};
 use alacritree_common::wsl;
 use serde::Deserialize;
 
-use crate::{Checkout, CheckoutHook, HookError, Outcome};
+use crate::{CheckoutEvent, CheckoutHook, HookError, Outcome};
 
 /// `[integrations.checkout_hooks]`.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
@@ -90,7 +90,7 @@ pub struct CommandHook {
 
 /// Fill `{checkout}` and `{main}` with each path as the checkout's side
 /// spells it. Each template word stays one argument.
-fn expand(template: &[String], event: &Checkout<'_>) -> Vec<String> {
+fn expand(template: &[String], event: &CheckoutEvent<'_>) -> Vec<String> {
     let spell = |path| {
         let spelled = side::spelling(&wsl::classify(path));
         if cfg!(windows) { without_verbatim(&spelled) } else { spelled }
@@ -121,7 +121,7 @@ impl CommandHook {
     fn run(
         &self,
         template: &[String],
-        event: &Checkout<'_>,
+        event: &CheckoutEvent<'_>,
         cwd: &std::path::Path,
         blocking: &Blocking,
     ) -> Outcome {
@@ -159,16 +159,16 @@ impl CommandHook {
 }
 
 impl CheckoutHook for CommandHook {
-    fn on_created(&self, event: &Checkout<'_>, blocking: &Blocking) -> Outcome {
+    fn on_created(&self, event: &CheckoutEvent<'_>, blocking: &Blocking) -> Outcome {
         self.run(&self.on_created, event, event.checkout, blocking)
     }
 
-    fn on_opened(&self, event: &Checkout<'_>, blocking: &Blocking) -> Outcome {
+    fn on_opened(&self, event: &CheckoutEvent<'_>, blocking: &Blocking) -> Outcome {
         self.run(&self.on_opened, event, event.checkout, blocking)
     }
 
     /// The worktree is gone, so the command runs in the main checkout.
-    fn on_removed(&self, event: &Checkout<'_>, blocking: &Blocking) -> Outcome {
+    fn on_removed(&self, event: &CheckoutEvent<'_>, blocking: &Blocking) -> Outcome {
         self.run(&self.on_removed, event, event.main, blocking)
     }
 }
@@ -190,7 +190,7 @@ mod tests {
     }
 
     fn created(hook: &CommandHook, main: &Path, checkout: &Path) -> Outcome {
-        let e = Checkout { main, checkout };
+        let e = CheckoutEvent { main, checkout };
         jobs::on_this_thread(|b| hook.on_created(&e, b))
     }
 
@@ -198,7 +198,8 @@ mod tests {
     /// directly, never through a shell that would split it.
     #[test]
     fn placeholders_expand_to_exactly_one_argument_each() {
-        let e = Checkout { main: Path::new("/src/my repo"), checkout: Path::new("/wt/it's ü") };
+        let e =
+            CheckoutEvent { main: Path::new("/src/my repo"), checkout: Path::new("/wt/it's ü") };
         let args = expand(&["trust".into(), "{checkout}".into(), "--from={main}".into()], &e);
         assert_eq!(args, ["trust", "/wt/it's ü", "--from=/src/my repo"]);
     }

@@ -79,11 +79,11 @@ mod tests {
     /// delegation, in list order, and a failing hook does not stop the next.
     #[test]
     fn hooks_run_in_order_past_a_failure() {
-        use alacritree_checkout_hooks::{Checkout, CheckoutHooks, HookError};
+        use alacritree_checkout_hooks::{CheckoutEvent, CheckoutHooks, HookError};
 
         let dir = tempfile::tempdir().unwrap();
         let hooks = [exiting_with("broken", 3), exiting_with("after", 0)];
-        let event = Checkout { main: dir.path(), checkout: dir.path() };
+        let event = CheckoutEvent { main: dir.path(), checkout: dir.path() };
         let outcomes = crate::jobs::on_this_thread(|b| hooks[..].created(&event, b));
         assert!(
             matches!(&outcomes[0], Err(HookError::Failed { hook, .. }) if hook == "broken"),

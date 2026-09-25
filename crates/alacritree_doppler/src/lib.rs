@@ -5,7 +5,7 @@
 mod scopes;
 mod settings;
 
-use alacritree_checkout_hooks::{Checkout, CheckoutHook, Outcome};
+use alacritree_checkout_hooks::{CheckoutEvent, CheckoutHook, Outcome};
 use alacritree_common::jobs::Blocking;
 
 pub use settings::{DopplerConfig, RawDoppler, is_set_up};
@@ -16,24 +16,24 @@ pub use settings::{DopplerConfig, RawDoppler, is_set_up};
 pub struct DopplerHook;
 
 impl DopplerHook {
-    fn mirror(event: &Checkout<'_>, blocking: &Blocking) -> Outcome {
+    fn mirror(event: &CheckoutEvent<'_>, blocking: &Blocking) -> Outcome {
         let linked = scopes::mirror_scopes(event.main, event.checkout, blocking);
         Ok((linked > 0).then(|| format!("Linked {linked} Doppler scope(s)")))
     }
 }
 
 impl CheckoutHook for DopplerHook {
-    fn on_created(&self, event: &Checkout<'_>, blocking: &Blocking) -> Outcome {
+    fn on_created(&self, event: &CheckoutEvent<'_>, blocking: &Blocking) -> Outcome {
         Self::mirror(event, blocking)
     }
 
     /// Covers worktrees created outside alacritree, which otherwise hit
     /// "Doppler Error: You must specify a project".
-    fn on_opened(&self, event: &Checkout<'_>, blocking: &Blocking) -> Outcome {
+    fn on_opened(&self, event: &CheckoutEvent<'_>, blocking: &Blocking) -> Outcome {
         Self::mirror(event, blocking)
     }
 
-    fn on_removed(&self, event: &Checkout<'_>, blocking: &Blocking) -> Outcome {
+    fn on_removed(&self, event: &CheckoutEvent<'_>, blocking: &Blocking) -> Outcome {
         let dropped = scopes::forget_scopes(event.checkout, blocking);
         Ok((dropped > 0).then(|| format!("Dropped {dropped} Doppler scope(s)")))
     }
@@ -42,7 +42,7 @@ impl CheckoutHook for DopplerHook {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use alacritree_checkout_hooks::{Checkout, CheckoutHook};
+    use alacritree_checkout_hooks::{CheckoutEvent, CheckoutHook};
     use alacritree_common::jobs;
     use alacritree_common::tools::{self, Tool, ToolPaths};
     use std::os::unix::fs::PermissionsExt;
@@ -111,7 +111,7 @@ mod tests {
     }
 
     fn created(main: &Path, wt: &Path) -> alacritree_checkout_hooks::Outcome {
-        let e = Checkout { main, checkout: wt };
+        let e = CheckoutEvent { main, checkout: wt };
         jobs::on_this_thread(|b| DopplerHook.on_created(&e, b))
     }
 
@@ -163,7 +163,7 @@ mod tests {
         let (_tmp, main, wt) = dirs();
         let scopes = format!(r#"{{"{}": {{"enclave.project": "api"}}}}"#, wt.display());
         let doppler = FakeDoppler::answering(&scopes);
-        let e = Checkout { main: &main, checkout: &wt };
+        let e = CheckoutEvent { main: &main, checkout: &wt };
         let outcome = jobs::on_this_thread(|b| DopplerHook.on_removed(&e, b)).unwrap();
         assert_eq!(outcome.as_deref(), Some("Dropped 1 Doppler scope(s)"));
         assert_eq!(doppler.calls(), [format!(

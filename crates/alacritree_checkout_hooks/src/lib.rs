@@ -22,7 +22,7 @@ pub use command::{CommandHook, RawCheckoutHooks, RawCommandHook};
 /// A worktree event. `checkout` is the linked worktree, and `main` is the
 /// project's main checkout it belongs to.
 #[derive(Debug, Clone, Copy)]
-pub struct Checkout<'a> {
+pub struct CheckoutEvent<'a> {
     pub main: &'a Path,
     pub checkout: &'a Path,
 }
@@ -52,7 +52,7 @@ pub trait CheckoutHook {
     /// alacritree just created `event.checkout` as a worktree of `event.main`.
     fn on_created(
         &self,
-        event: &::alacritree_checkout_hooks::Checkout<'_>,
+        event: &::alacritree_checkout_hooks::CheckoutEvent<'_>,
         blocking: &::alacritree_common::jobs::Blocking,
     ) -> ::alacritree_checkout_hooks::Outcome;
 
@@ -60,7 +60,7 @@ pub trait CheckoutHook {
     /// after a restart, so implementations must be idempotent.
     fn on_opened(
         &self,
-        event: &::alacritree_checkout_hooks::Checkout<'_>,
+        event: &::alacritree_checkout_hooks::CheckoutEvent<'_>,
         blocking: &::alacritree_common::jobs::Blocking,
     ) -> ::alacritree_checkout_hooks::Outcome;
 
@@ -68,7 +68,7 @@ pub trait CheckoutHook {
     /// before git deleted the directory, which cannot be canonicalized after.
     fn on_removed(
         &self,
-        event: &::alacritree_checkout_hooks::Checkout<'_>,
+        event: &::alacritree_checkout_hooks::CheckoutEvent<'_>,
         blocking: &::alacritree_common::jobs::Blocking,
     ) -> ::alacritree_checkout_hooks::Outcome;
 }
@@ -77,21 +77,21 @@ pub trait CheckoutHook {
 /// the next. Each carries an unrelated tool, and a broken `mise` must not
 /// keep doppler from scoping the worktree.
 pub trait CheckoutHooks {
-    fn created(&self, event: &Checkout<'_>, blocking: &Blocking) -> Vec<Outcome>;
-    fn opened(&self, event: &Checkout<'_>, blocking: &Blocking) -> Vec<Outcome>;
-    fn removed(&self, event: &Checkout<'_>, blocking: &Blocking) -> Vec<Outcome>;
+    fn created(&self, event: &CheckoutEvent<'_>, blocking: &Blocking) -> Vec<Outcome>;
+    fn opened(&self, event: &CheckoutEvent<'_>, blocking: &Blocking) -> Vec<Outcome>;
+    fn removed(&self, event: &CheckoutEvent<'_>, blocking: &Blocking) -> Vec<Outcome>;
 }
 
 impl<H: CheckoutHook> CheckoutHooks for [H] {
-    fn created(&self, event: &Checkout<'_>, blocking: &Blocking) -> Vec<Outcome> {
+    fn created(&self, event: &CheckoutEvent<'_>, blocking: &Blocking) -> Vec<Outcome> {
         self.iter().map(|hook| hook.on_created(event, blocking)).collect()
     }
 
-    fn opened(&self, event: &Checkout<'_>, blocking: &Blocking) -> Vec<Outcome> {
+    fn opened(&self, event: &CheckoutEvent<'_>, blocking: &Blocking) -> Vec<Outcome> {
         self.iter().map(|hook| hook.on_opened(event, blocking)).collect()
     }
 
-    fn removed(&self, event: &Checkout<'_>, blocking: &Blocking) -> Vec<Outcome> {
+    fn removed(&self, event: &CheckoutEvent<'_>, blocking: &Blocking) -> Vec<Outcome> {
         self.iter().map(|hook| hook.on_removed(event, blocking)).collect()
     }
 }
@@ -124,7 +124,7 @@ mod tests {
     fn every_hook_sees_every_event_in_order() {
         let (main, checkout) = event();
         let hooks = [FakeHook::reporting("first"), FakeHook::reporting("second")];
-        let e = Checkout { main: &main, checkout: &checkout };
+        let e = CheckoutEvent { main: &main, checkout: &checkout };
         let lines: Vec<_> = jobs::on_this_thread(|b| hooks[..].created(&e, b))
             .into_iter()
             .map(|o| o.expect("fake succeeds"))
@@ -146,7 +146,7 @@ mod tests {
     fn a_failing_hook_does_not_stop_the_next() {
         let (main, checkout) = event();
         let hooks = [FakeHook::failing(), FakeHook::reporting("after")];
-        let e = Checkout { main: &main, checkout: &checkout };
+        let e = CheckoutEvent { main: &main, checkout: &checkout };
         let outcomes = jobs::on_this_thread(|b| hooks[..].opened(&e, b));
         assert!(outcomes[0].is_err());
         assert_eq!(outcomes[1].as_ref().expect("second hook ran"), &Some("after".to_string()));

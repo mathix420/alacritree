@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver};
 
-use alacritree_checkout_hooks::{Checkout, CheckoutHook, CheckoutHooks};
+use alacritree_checkout_hooks::{CheckoutEvent, CheckoutHook, CheckoutHooks};
 
 use crate::checkout_hooks::Hook;
 use crate::config::{Config, WorkspaceConfig};
@@ -254,7 +254,7 @@ pub(crate) fn create<H: CheckoutHooks + ?Sized>(
     }
 
     bail_if_cancelled!();
-    let event = Checkout { main: &req.project_root, checkout: &target };
+    let event = CheckoutEvent { main: &req.project_root, checkout: &target };
     crate::checkout_hooks::report(hooks.created(&event, blocking), |_, line| send(line));
 
     Ok(target)
@@ -674,7 +674,7 @@ pub(crate) fn delete_worktree<H: CheckoutHooks + ?Sized>(
         // Branch may already be gone (e.g. detached HEAD), so ignore errors.
         let _ = run_git(project_root, &["branch", "-D", branch]);
     }
-    let event = Checkout { main: project_root, checkout: &scope_root };
+    let event = CheckoutEvent { main: project_root, checkout: &scope_root };
     crate::checkout_hooks::report(hooks.removed(&event, blocking), |level, line| {
         log::log!(level, "{line} (removed {})", scope_root.display())
     });

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-use alacritree_checkout_hooks::{Checkout, CheckoutHook, CheckoutHooks};
+use alacritree_checkout_hooks::{CheckoutEvent, CheckoutHook, CheckoutHooks};
 use alacritree_forge::{PrInfo, PrState};
 use eframe::CreationContext;
 use egui::{Color32, Context, Frame, Margin, RichText, ScrollArea, SidePanel, Stroke};
@@ -1164,7 +1164,7 @@ impl AlacritreeApp {
         };
         let hooks = hooks(&self.config.integrations);
         self.detached_jobs.push(jobs::pool().spawn(jobs::Priority::Background, move |blocking| {
-            let event = Checkout { main: &main_checkout, checkout: &worktree };
+            let event = CheckoutEvent { main: &main_checkout, checkout: &worktree };
             crate::checkout_hooks::report(hooks.opened(&event, blocking), |level, line| {
                 log::log!(level, "{line} ({})", worktree.display())
             });
