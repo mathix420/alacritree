@@ -3,15 +3,18 @@
 //! refresh costs one `wsl.exe` round trip rather than one per git command.
 
 mod default_branch;
+mod discover;
+mod liveness;
 mod settings;
 mod status;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+mod upstream;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use alacritree_common::jobs::Blocking;
-use alacritree_vcs::{Dirty, Status, VcsError, VcsKind, VersionControl};
+use alacritree_vcs::{Dirty, Probe, Repository, Status, VcsError, VcsKind, VersionControl};
 
 #[doc(hidden)]
 pub use default_branch::{Evidence, WellKnown, resolve, shell_ranking};
@@ -57,5 +60,19 @@ impl VersionControl for GitBackend {
 
     fn dirty(&self, checkout: &Path, blocking: &Blocking) -> Result<Dirty, VcsError> {
         status::dirty(checkout, blocking)
+    }
+
+    fn discover(
+        &self,
+        root: &Path,
+        _: &[PathBuf],
+        upstream: bool,
+        blocking: &Blocking,
+    ) -> Result<Repository, VcsError> {
+        discover::discover(root, upstream, blocking)
+    }
+
+    fn probe(&self, checkout: &Path) -> Probe {
+        liveness::probe_checkout(checkout)
     }
 }

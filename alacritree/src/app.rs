@@ -56,7 +56,7 @@ use crate::{
     clipboard_image, file_drop, ipc, jobs, mouse_hide, notify, paste, path_style, scratchpad,
     sidebar_focus, terminal_view, worktree_liveness,
 };
-use alacritree_vcs::{Checkout, Dirty, UpstreamState, VersionControl};
+use alacritree_vcs::{Checkout, Dirty, Liveness, UpstreamState, VersionControl};
 
 mod actions;
 mod focus;
@@ -444,7 +444,7 @@ pub struct AlacritreeApp {
     liveness: worktree_liveness::LivenessCache,
     /// The probe job in flight, if any.  One at a time: a path slower than
     /// the interval stretches freshness rather than queueing more work.
-    liveness_probe: Option<jobs::Job<Vec<(PathBuf, worktree_liveness::Probe)>>>,
+    liveness_probe: Option<jobs::Job<Vec<(PathBuf, alacritree_vcs::Probe)>>>,
     /// When the user last gave the app an event.  Timed wake-ups are armed
     /// only just after one, so an app left open overnight goes fully quiet.
     last_input: Instant,
@@ -811,7 +811,12 @@ impl AlacritreeApp {
         }
 
         if probing {
-            let batch = self.liveness.batch(drawn);
+            let batch: Vec<(PathBuf, crate::vcs::Vcs)> = self
+                .liveness
+                .batch(drawn)
+                .into_iter()
+                .filter_map(|p| self.vcs_for(&p).map(|vcs| (p, vcs)))
+                .collect();
             if batch.is_empty() {
                 // No job will land to close the interval, so close it here.
                 self.liveness.adopt(Vec::new(), now);
@@ -819,8 +824,11 @@ impl AlacritreeApp {
                 let ctx = ctx.clone();
                 let job = jobs::pool().spawn(jobs::Priority::Background, move |_blocking| {
                     let results: Vec<_> = batch
-                        .iter()
-                        .map(|p| (p.clone(), worktree_liveness::probe_checkout(p)))
+                        .into_iter()
+                        .map(|(p, vcs)| {
+                            let probe = vcs.probe(&p);
+                            (p, probe)
+                        })
                         .collect();
                     ctx.request_repaint();
                     results
@@ -852,7 +860,7 @@ impl AlacritreeApp {
     fn refresh_moved_branches(
         &mut self,
         ctx: &Context,
-        results: &[(PathBuf, worktree_liveness::Probe)],
+        results: &[(PathBuf, alacritree_vcs::Probe)],
     ) {
         let mut moved: Vec<&Path> = Vec::new();
         for (path, probe) in results {
@@ -1447,7 +1455,7 @@ impl AlacritreeApp {
         // Discovery marking can be stale; a dir deleted since the last
         // refresh should still get the prune flow, not a doomed
         // `git worktree remove`.
-        let prunable = wt.gone || worktree_liveness::is_gone(&wt.path);
+        let prunable = wt.gone || self.is_gone(&wt.path);
         // A missing dir has nothing to be dirty; skip the status probe. A
         // worktree the git panel has already completed a compute for answers
         // from that cache instead of walking the tree again. A cache entry
@@ -1539,7 +1547,16 @@ impl AlacritreeApp {
             .flat_map(|p| &p.checkouts)
             .filter(|wt| wt.path == path)
             .any(|wt| !wt.is_main);
-        if linked { worktree_liveness::is_gone(path) } else { !path.is_dir() }
+        if linked { self.is_gone(path) } else { !path.is_dir() }
+    }
+
+    /// Whether the owning backend calls this checkout gone.  The row, the
+    /// activate guard and the spawn guard all ask this, so a greyed row and a
+    /// refused shell never disagree about the same directory.  A probe that
+    /// could not tell answers `false`: an unreachable filesystem must not
+    /// turn into a refusal.
+    fn is_gone(&self, path: &Path) -> bool {
+        self.vcs_for(path).is_some_and(|vcs| vcs.probe(path).liveness == Liveness::Missing)
     }
 
     /// Report a failed spawn, and re-run discovery when the cause was a

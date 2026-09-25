@@ -74,7 +74,6 @@ pub(crate) mod terminal_view;
 #[cfg(test)]
 mod test_util;
 pub use alacritree_common::tools;
-pub(crate) mod upstream;
 pub mod vcs;
 #[cfg(windows)]
 pub mod win_session;

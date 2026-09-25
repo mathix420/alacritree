@@ -1,6 +1,6 @@
 //! Whether a worktree's checkout is still on disk, for the sidebar's benefit.
 //!
-//! `Project::discover` owns `Worktree::prunable` and stays the only writer of
+//! `Project::discover` owns `Checkout::gone` and stays the only writer of
 //! it: the delete flow reads that flag to choose between `git worktree remove`
 //! and a prune, and `Project::apply` reads it to decide which rows survive a
 //! refresh.  This cache never touches it.  It answers one question — "should
@@ -18,94 +18,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use alacritree_vcs::Liveness;
+
 /// How long a batch of results stands before the visible rows are checked
 /// again.  Matches `status_cache::StatusCache`, which answers the same "did this
 /// worktree change under us" question at the same human timescale.
 const FRESH_FOR: Duration = Duration::from_millis(1500);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Liveness {
-    Present,
-    Missing,
-    /// The probe failed for a reason other than "not found" — a distro that
-    /// did not answer, a permission error.  Distinct from `Missing` because a
-    /// filesystem that cannot be reached is not a filesystem without the
-    /// directory, and greying the row on that would be a lie.
-    Unknown,
-}
-
-/// Whether `path` is still a worktree checkout, which is `.git`'s presence
-/// rather than the directory's.  `git worktree remove` deletes the contents
-/// first and only then the directory itself, so a remove that loses the last
-/// step — the usual outcome on Windows, where a shell sitting in the directory
-/// pins it — leaves an empty husk behind.  Git calls that worktree gone and
-/// refuses to remove it twice ("validation failed: '<path>/.git' does not
-/// exist"); stat'ing the directory would call it alive.
-///
-/// `metadata` rather than `exists` so the difference between "not there" and
-/// "could not tell" survives: `exists` folds every error into `false`.
-pub(crate) fn probe(path: &Path) -> Liveness {
-    match std::fs::metadata(path.join(".git")) {
-        Ok(_) => Liveness::Present,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Liveness::Missing,
-        Err(_) => Liveness::Unknown,
-    }
-}
-
-/// What one probe learned about a checkout: whether it is there, and the raw
-/// contents of its `HEAD` when that could be read.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Probe {
-    pub(crate) liveness: Liveness,
-    pub(crate) head: Option<String>,
-}
-
-/// [`probe`], plus the checkout's `HEAD`, read with two plain file reads
-/// because opening a `git2` repository costs far more.  `.git` is read as a
-/// file first: a linked worktree's names its admin directory, answering both
-/// questions at once, and the main checkout's directory fails that read fast.
-pub(crate) fn probe_checkout(path: &Path) -> Probe {
-    let dot_git = path.join(".git");
-    let (head_path, liveness) = match std::fs::read_to_string(&dot_git) {
-        Ok(link) => match link.trim().strip_prefix("gitdir:") {
-            // `join` keeps an absolute gitdir as is and resolves a relative
-            // one against the checkout, the two forms git writes.
-            Some(gitdir) => (path.join(gitdir.trim()).join("HEAD"), Some(Liveness::Present)),
-            None => return Probe { liveness: Liveness::Present, head: None },
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Probe { liveness: Liveness::Missing, head: None };
-        },
-        Err(_) => (dot_git.join("HEAD"), None),
-    };
-    match std::fs::read_to_string(head_path) {
-        Ok(head) => Probe { liveness: Liveness::Present, head: Some(head) },
-        Err(_) => Probe { liveness: liveness.unwrap_or_else(|| probe(path)), head: None },
-    }
-}
-
-/// The branch a `HEAD` file names, spelled the way discovery records it: the
-/// shorthand for a branch, the first seven hex digits of a detached commit.
-pub(crate) fn head_branch(head: &str) -> Option<&str> {
-    let head = head.trim();
-    match head.strip_prefix("ref:") {
-        Some(target) => {
-            let target = target.trim();
-            Some(target.strip_prefix("refs/heads/").unwrap_or(target))
-        },
-        None if head.len() >= 40 && head.bytes().all(|b| b.is_ascii_hexdigit()) => head.get(..7),
-        None => None,
-    }
-}
-
-/// Whether git would call this checkout gone.  The single question the row,
-/// the activate guard, the spawn guard and discovery all ask, so a greyed row
-/// and a refused shell never disagree about the same directory.  A probe that
-/// could not tell answers `false`: an unreachable filesystem must not turn
-/// into a refusal.
-pub(crate) fn is_gone(path: &Path) -> bool {
-    probe(path) == Liveness::Missing
-}
 
 /// Probe results keyed by worktree path, plus when the next batch is due.
 /// Entries live only as long as the sidebar keeps drawing their path, so a
@@ -153,12 +71,11 @@ impl LivenessCache {
         visible.to_vec()
     }
 
-    /// Whether `head`, just read from `path`, names a branch other than
-    /// `known`, the one discovery recorded, under a `HEAD` no refresh has
-    /// been asked for yet.  Allocates only when it answers `true`.
+    /// Whether `head`, the label just read from `path`, differs from `known`,
+    /// the one discovery recorded, under a head no refresh has been asked for
+    /// yet.  Allocates only when it answers `true`.
     pub(crate) fn branch_moved(&mut self, path: &Path, head: &str, known: Option<&str>) -> bool {
-        let Some(branch) = head_branch(head) else { return false };
-        if Some(branch) == known || self.refreshed_heads.get(path).is_some_and(|h| h == head) {
+        if Some(head) == known || self.refreshed_heads.get(path).is_some_and(|h| h == head) {
             return false;
         }
         self.refreshed_heads.insert(path.to_path_buf(), head.to_string());
@@ -167,8 +84,8 @@ impl LivenessCache {
 
     /// An `Unknown` result replaces the last answer rather than preserving
     /// it.  Keeping it would leave the row claiming a checkout is gone while
-    /// `is_gone` — which has no memory, and refuses to call an unreadable path
-    /// missing — lets that same path spawn a shell.  Forgetting instead makes
+    /// the backend's probe, which has no memory and refuses to call an
+    /// unreadable path missing, lets that same path spawn a shell.  Forgetting instead makes
     /// both say "cannot tell" and hands the row back to discovery's word.
     ///
     /// A round that probed nothing still restarts the interval, so a frame
@@ -204,70 +121,23 @@ mod tests {
         PathBuf::from(s)
     }
 
-    #[test]
-    fn a_checkout_with_its_git_link_is_present() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".git"), "gitdir: /somewhere/.git/worktrees/x").unwrap();
-
-        assert_eq!(probe(dir.path()), Liveness::Present);
-    }
-
-    /// `git worktree remove` deletes the contents and only then the directory,
-    /// so on Windows a shell sitting in it leaves this behind.  Git treats the
-    /// worktree as gone; stat'ing the directory would not.
-    #[test]
-    fn the_husk_left_by_a_half_finished_remove_is_missing() {
-        let dir = tempfile::tempdir().unwrap();
-
-        assert_eq!(probe(dir.path()), Liveness::Missing);
-    }
-
-    #[test]
-    fn a_checkout_deleted_outright_is_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_path_buf();
-        drop(dir);
-
-        assert_eq!(probe(&path), Liveness::Missing);
-    }
-
-    #[test]
-    fn a_linked_checkout_reads_head_through_its_gitdir() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = crate::test_util::init_repo(&dir.path().join("main"));
-        let linked = crate::test_util::add_worktree(&repo, "topic");
-
-        let found = probe_checkout(&linked);
-
-        assert_eq!(found.liveness, Liveness::Present);
-        assert_eq!(found.head.as_deref().and_then(head_branch), Some("topic"));
-    }
-
-    #[test]
-    fn a_detached_head_reads_as_discovery_spells_it() {
-        let oid = "0123456789abcdef0123456789abcdef01234567\n";
-        assert_eq!(head_branch(oid), Some("0123456"));
-        assert_eq!(head_branch("ref: refs/heads/feat/x\n"), Some("feat/x"));
-        assert_eq!(head_branch("garbage"), None);
-    }
-
     /// An unborn branch has a `HEAD` discovery reads as no branch at all, so
     /// the two never agree.  Asking once is the most that can help.
     #[test]
     fn a_moved_head_asks_for_one_refresh() {
         let mut cache = LivenessCache::default();
-        let head = "ref: refs/heads/other\n";
+        let head = "other";
 
         assert!(!cache.branch_moved(&p("/a"), head, Some("other")), "discovery agrees");
         assert!(cache.branch_moved(&p("/a"), head, Some("main")));
         assert!(!cache.branch_moved(&p("/a"), head, Some("main")), "already asked");
-        assert!(cache.branch_moved(&p("/a"), "ref: refs/heads/third\n", Some("main")));
+        assert!(cache.branch_moved(&p("/a"), "third", Some("main")));
     }
 
     #[test]
     fn a_path_the_sidebar_stopped_drawing_can_ask_again() {
         let mut cache = LivenessCache::default();
-        let head = "ref: refs/heads/other\n";
+        let head = "other";
         assert!(cache.branch_moved(&p("/a"), head, None));
 
         cache.batch(&[]);

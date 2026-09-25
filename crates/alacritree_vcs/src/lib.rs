@@ -82,4 +82,19 @@ pub trait VersionControl {
         checkout: &::std::path::Path,
         blocking: &::alacritree_common::jobs::Blocking,
     ) -> ::std::result::Result<::alacritree_vcs::Dirty, ::alacritree_vcs::VcsError>;
+
+    /// `recorded` holds checkouts the app recorded because `Created::record`
+    /// asked it to. The backend keeps the ones that still belong to `root`.
+    /// Git ignores it.
+    fn discover(
+        &self,
+        root: &::std::path::Path,
+        recorded: &[::std::path::PathBuf],
+        upstream: bool,
+        blocking: &::alacritree_common::jobs::Blocking,
+    ) -> ::std::result::Result<::alacritree_vcs::Repository, ::alacritree_vcs::VcsError>;
+
+    /// Runs on the probe worker for rows the sidebar draws. A filesystem
+    /// read, never a process.
+    fn probe(&self, checkout: &::std::path::Path) -> ::alacritree_vcs::Probe;
 }

@@ -34,6 +34,13 @@ pub fn clone_with_origin(dir: &Path) -> PathBuf {
     project
 }
 
+/// A bare clone of `src` at `dest`, the layout a project rooted at `repo.git`
+/// has.
+pub fn bare_clone(src: &Path, dest: &Path) -> PathBuf {
+    git2::build::RepoBuilder::new().bare(true).clone(src.to_str().unwrap(), dest).unwrap();
+    dest.to_path_buf()
+}
+
 /// Add a linked worktree named `name` (git2 also creates a branch `name`).
 /// Returns the worktree's checkout path, a sibling of the repo directory.
 pub fn add_worktree(repo: &Path, name: &str) -> PathBuf {

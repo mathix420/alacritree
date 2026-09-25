@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use alacritree_common::jobs::Blocking;
 
-use crate::{Dirty, Status, VcsError, VcsKind, VersionControl};
+use crate::{Dirty, Liveness, Probe, Repository, Status, VcsError, VcsKind, VersionControl};
 
 /// Clones share the recorded requests, so a test keeps one clone and hands
 /// the other to the code under test.
@@ -17,6 +17,8 @@ pub struct FakeVcs {
     calls: Arc<Mutex<Vec<String>>>,
     status: Option<Status>,
     dirty: Dirty,
+    repository: Option<Repository>,
+    probe: Option<Probe>,
 }
 
 impl FakeVcs {
@@ -27,6 +29,8 @@ impl FakeVcs {
             calls: Arc::default(),
             status: None,
             dirty: Dirty::default(),
+            repository: None,
+            probe: None,
         }
     }
 
@@ -42,6 +46,16 @@ impl FakeVcs {
 
     pub fn with_dirty(mut self, dirty: Dirty) -> Self {
         self.dirty = dirty;
+        self
+    }
+
+    pub fn with_repository(mut self, repository: Repository) -> Self {
+        self.repository = Some(repository);
+        self
+    }
+
+    pub fn with_probe(mut self, probe: Probe) -> Self {
+        self.probe = Some(probe);
         self
     }
 
@@ -75,6 +89,22 @@ impl VersionControl for FakeVcs {
     fn dirty(&self, checkout: &Path, _: &Blocking) -> Result<Dirty, VcsError> {
         self.record("dirty", checkout);
         Ok(self.dirty)
+    }
+
+    fn discover(
+        &self,
+        root: &Path,
+        _: &[PathBuf],
+        _: bool,
+        _: &Blocking,
+    ) -> Result<Repository, VcsError> {
+        self.record("discover", root);
+        self.repository.clone().ok_or_else(|| VcsError::NotARepository(root.to_path_buf()))
+    }
+
+    fn probe(&self, checkout: &Path) -> Probe {
+        self.record("probe", checkout);
+        self.probe.clone().unwrap_or(Probe { liveness: Liveness::Present, head: None })
     }
 }
 
