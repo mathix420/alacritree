@@ -965,6 +965,9 @@ mod tests {
     /// to before it was routed through `run_git_cancellable`.
     #[test]
     fn create_stops_while_resolving_the_base_branch() {
+        // The waits bound a hang, not speed: git launches take seconds on a
+        // loaded Windows host, and the probes after the cancel are a dozen.
+        const HANG: Duration = Duration::from_secs(30);
         // Stands in for an unreachable `origin`: accepts the connection
         // `ls-remote` opens and never answers, so the client blocks on read
         // exactly as it would against a remote that never responds.
@@ -1011,9 +1014,9 @@ mod tests {
         // Cancelling only once the fake remote has observed a connection
         // proves the job is genuinely blocked in `ls-remote`, not merely
         // queued or still on an earlier step.
-        conn_rx.recv_timeout(Duration::from_secs(5)).expect("ls-remote never connected");
+        conn_rx.recv_timeout(HANG).expect("ls-remote never connected");
         drop(job);
-        let result = rx.recv_timeout(Duration::from_secs(5));
+        let result = rx.recv_timeout(HANG);
         match result {
             Ok(Err(WorktreeError::Cancelled)) => {},
             Ok(Err(e)) => panic!("create failed for the wrong reason: {e}"),
