@@ -85,6 +85,12 @@ pub struct Frame {
     pub payload: Vec<u8>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("malformed helper frame header: {header:?}")]
+pub struct MalformedFrame {
+    header: String,
+}
+
 /// Incremental response parser fed arbitrary read chunks; complete frames
 /// come out as they close. A malformed header is unrecoverable, because the
 /// byte count is the only framing and there is no resync point. It surfaces
@@ -95,7 +101,7 @@ pub struct FrameReader {
 }
 
 impl FrameReader {
-    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<Frame>, String> {
+    pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<Frame>, MalformedFrame> {
         self.buf.extend_from_slice(bytes);
         let mut frames = Vec::new();
         loop {
@@ -103,22 +109,13 @@ impl FrameReader {
                 return Ok(frames);
             };
             let Some((id, exit, len)) = parse_header(&self.buf[..newline]) else {
-                return Err(format!(
-                    "malformed helper frame header: {:?}",
-                    String::from_utf8_lossy(&self.buf[..newline])
-                ));
+                return Err(self.malformed(newline));
             };
             let Some(payload_start) = newline.checked_add(1) else {
-                return Err(format!(
-                    "malformed helper frame header: {:?}",
-                    String::from_utf8_lossy(&self.buf[..newline])
-                ));
+                return Err(self.malformed(newline));
             };
             let Some(frame_end) = payload_start.checked_add(len) else {
-                return Err(format!(
-                    "malformed helper frame header: {:?}",
-                    String::from_utf8_lossy(&self.buf[..newline])
-                ));
+                return Err(self.malformed(newline));
             };
             if self.buf.len() < frame_end {
                 return Ok(frames);
@@ -126,6 +123,10 @@ impl FrameReader {
             frames.push(Frame { id, exit, payload: self.buf[payload_start..frame_end].to_vec() });
             self.buf.drain(..frame_end);
         }
+    }
+
+    fn malformed(&self, newline: usize) -> MalformedFrame {
+        MalformedFrame { header: String::from_utf8_lossy(&self.buf[..newline]).into_owned() }
     }
 }
 
@@ -472,9 +473,11 @@ pub fn enabled() -> bool {
 /// as a one-shot. `NoReply` was written and may have executed, and batch
 /// scripts have side effects, so it must surface as an error, never a silent
 /// retry.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum TransportError {
-    NotWritten(String),
+    #[error("{0}")]
+    NotWritten(#[source] std::io::Error),
+    #[error("{0}")]
     NoReply(String),
 }
 
@@ -591,7 +594,7 @@ impl HelperClient {
                                 }
                             }
                         },
-                        Err(e) => return self.mark_down(&e),
+                        Err(e) => return self.mark_down(&e.to_string()),
                     }
                 },
             }
@@ -681,18 +684,20 @@ impl HelperClient {
 
     fn request(&self, id: u64, line: String, timeout: Duration) -> Result<Frame, TransportError> {
         if !self.is_ready() {
-            return Err(TransportError::NotWritten("helper not ready".to_string()));
+            return Err(TransportError::NotWritten(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "helper not ready",
+            )));
         }
         let (tx, rx) = mpsc::channel();
         lock(&self.pending).insert(id, tx);
         let write = {
             let mut guard = lock(&self.stdin);
             match guard.as_mut() {
-                None => Err("helper stdin closed".to_string()),
-                Some(stdin) => stdin
-                    .write_all(line.as_bytes())
-                    .and_then(|()| stdin.flush())
-                    .map_err(|e| e.to_string()),
+                None => {
+                    Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "helper stdin closed"))
+                },
+                Some(stdin) => stdin.write_all(line.as_bytes()).and_then(|()| stdin.flush()),
             }
         };
         if let Err(e) = write {
@@ -817,7 +822,11 @@ pub fn client(distro: &str) -> Option<Arc<HelperClient>> {
 /// unavailable before anything was sent (fall back to a one-shot spawn);
 /// `Some(Err)` = sent but unanswered, which must not be retried;
 /// `Some(Ok)` = script stdout, one-shot-compatible.
-pub fn try_run(distro: &str, script: &str, args: &[&str]) -> Option<Result<Vec<u8>, String>> {
+pub fn try_run(
+    distro: &str,
+    script: &str,
+    args: &[&str],
+) -> Option<Result<Vec<u8>, crate::wsl::BatchError>> {
     let client = client(distro)?;
     match client.run(script, args) {
         Ok((exit, stdout)) => {
@@ -825,7 +834,7 @@ pub fn try_run(distro: &str, script: &str, args: &[&str]) -> Option<Result<Vec<u
             // sections, so hard failure with silence means the script
             // itself refused.
             if exit != 0 && stdout.is_empty() {
-                Some(Err(format!("wsl helper script exited {exit}")))
+                Some(Err(crate::wsl::BatchError::HelperExit(exit)))
             } else {
                 Some(Ok(stdout))
             }
@@ -834,7 +843,7 @@ pub fn try_run(distro: &str, script: &str, args: &[&str]) -> Option<Result<Vec<u
             log::debug!("wsl helper ({distro}): {e}; falling back to one-shot spawns");
             None
         },
-        Err(TransportError::NoReply(e)) => Some(Err(e)),
+        Err(e @ TransportError::NoReply(_)) => Some(Err(e.into())),
     }
 }
 

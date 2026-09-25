@@ -575,12 +575,12 @@ fn compute_wsl(
 fn status_from_batch(
     linux_path: &str,
     hint: Option<&str>,
-    run: impl Fn(&str, &[&str]) -> Result<Vec<u8>, String>,
+    run: impl Fn(&str, &[&str]) -> Result<Vec<u8>, wsl::BatchError>,
 ) -> GitStatus {
     let batch = status_batch();
     let stdout = match run(&batch.script(), &[linux_path, hint.unwrap_or("")]) {
         Ok(s) => s,
-        Err(e) => return GitStatus { error: Some(e), ..Default::default() },
+        Err(e) => return GitStatus { error: Some(e.to_string()), ..Default::default() },
     };
     let reply = batch.read(&stdout);
 
@@ -750,7 +750,7 @@ mod tests {
 
     /// What a distro sends back for a batch, section by section, so a WSL
     /// refresh can be tested without one.
-    fn recorded(sections: &[&str]) -> impl Fn(&str, &[&str]) -> Result<Vec<u8>, String> {
+    fn recorded(sections: &[&str]) -> impl Fn(&str, &[&str]) -> Result<Vec<u8>, wsl::BatchError> {
         let mut stdout = Vec::new();
         for (i, section) in sections.iter().enumerate() {
             if i > 0 {
@@ -810,12 +810,9 @@ mod tests {
 
     #[test]
     fn a_round_trip_that_never_landed_is_reported_as_the_error_it_was() {
-        let status =
-            status_from_batch(
-                "/home/lev/proj",
-                None,
-                |_: &str, _: &[&str]| Err("no distro".into()),
-            );
+        let status = status_from_batch("/home/lev/proj", None, |_: &str, _: &[&str]| {
+            Err(wsl::BatchError::Refused { stderr: "no distro".into() })
+        });
         assert_eq!(status.error.as_deref(), Some("no distro"));
     }
     use crate::repaint::Recorder;

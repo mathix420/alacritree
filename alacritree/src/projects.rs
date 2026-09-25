@@ -153,7 +153,7 @@ impl Project {
         distro: &str,
         linux_path: &str,
         upstream: bool,
-        run: impl Fn(&str, &[&str]) -> Result<Vec<u8>, String>,
+        run: impl Fn(&str, &[&str]) -> Result<Vec<u8>, wsl::BatchError>,
     ) -> Discovered {
         let upstream_arg = if upstream { "1" } else { "0" };
         let batch = discover_batch();
@@ -758,7 +758,7 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
 
     /// What a distro sends back for a batch, section by section, so WSL
     /// discovery can be tested without one.
-    fn recorded(sections: &[&[u8]]) -> impl Fn(&str, &[&str]) -> Result<Vec<u8>, String> {
+    fn recorded(sections: &[&[u8]]) -> impl Fn(&str, &[&str]) -> Result<Vec<u8>, wsl::BatchError> {
         let mut stdout = Vec::new();
         for (i, section) in sections.iter().enumerate() {
             if i > 0 {
@@ -851,7 +851,7 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
             "Ubuntu",
             "/home/lev/proj",
             false,
-            |_: &str, _: &[&str]| Err("no distro".into()),
+            |_: &str, _: &[&str]| Err(wsl::BatchError::Refused { stderr: "no distro".into() }),
         );
         assert!(!discovered.authoritative);
     }

@@ -243,7 +243,15 @@ const WSL_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// What a probe of one distro found. It has a path per [`tools::Tool`], by discriminant, or
 /// why the distro could not be asked.
-type Probe = Result<Vec<Option<String>>, String>;
+type Probe = Result<Vec<Option<String>>, ProbeError>;
+
+#[derive(Debug, thiserror::Error)]
+enum ProbeError {
+    #[error(transparent)]
+    Batch(#[from] wsl::BatchError),
+    #[error("no answer in {}s", WSL_PROBE_TIMEOUT.as_secs())]
+    NoAnswer,
+}
 
 /// What each installed distro can actually do for alacritree.  Nothing else
 /// reports on the inside of a distro: git, gh and delta are resolved there
@@ -275,7 +283,8 @@ fn probe_distros(distros: &[wsl::WslDistro]) -> Vec<(String, Probe)> {
         let name = distro.name.clone();
         let names = names;
         std::thread::spawn(move || {
-            let probe = jobs::on_this_thread(|blocking| wsl::probe_tools(&name, &names, blocking));
+            let probe = jobs::on_this_thread(|blocking| wsl::probe_tools(&name, &names, blocking))
+                .map_err(ProbeError::from);
             let _ = tx.send((name, probe));
         });
     }
@@ -295,9 +304,7 @@ fn probe_distros(distros: &[wsl::WslDistro]) -> Vec<(String, Probe)> {
     distros
         .iter()
         .map(|d| {
-            let probe = answered
-                .remove(&d.name)
-                .unwrap_or_else(|| Err(format!("no answer in {}s", WSL_PROBE_TIMEOUT.as_secs())));
+            let probe = answered.remove(&d.name).unwrap_or(Err(ProbeError::NoAnswer));
             (d.name.clone(), probe)
         })
         .collect()
@@ -851,7 +858,7 @@ mod tests {
 
     #[test]
     fn a_distro_that_cannot_be_reached_says_why() {
-        let probe: Probe = Err("no answer in 15s".to_string());
+        let probe: Probe = Err(ProbeError::NoAnswer);
         let check = wsl_distro_check("Ubuntu", &probe);
         assert_eq!(check.status, Status::Warn);
         assert!(check.detail.contains("no answer in 15s"), "{:?}", check.detail);

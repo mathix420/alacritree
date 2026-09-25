@@ -458,6 +458,35 @@ fn drain_capped(pipe: impl Read, cap: u64) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Why a script run inside a distro produced no output to read.
+#[derive(Debug, thiserror::Error)]
+pub enum BatchError {
+    #[error("failed to run wsl.exe: {0}")]
+    Spawn(#[source] std::io::Error),
+    #[error("wsl.exe did not finish within {}s", ONE_SHOT_TIMEOUT.as_secs())]
+    TimedOut,
+    #[error("wsl.exe {stream} drainer thread panicked")]
+    DrainerPanicked { stream: &'static str },
+    #[error("failed to read wsl.exe {stream}: {source}")]
+    Read { stream: &'static str, source: std::io::Error },
+    #[error("failed to wait on wsl.exe: {0}")]
+    Wait(#[source] std::io::Error),
+    /// wsl.exe exited non-zero with nothing on stdout: a deregistered distro
+    /// or no WSL at all, not a script whose guarded commands came back empty.
+    #[error("{}", if stderr.is_empty() { "wsl.exe failed" } else { stderr })]
+    Refused { stderr: String },
+    #[error("wsl helper script exited {0}")]
+    HelperExit(i32),
+    #[error(transparent)]
+    Helper(#[from] crate::wsl_helper::TransportError),
+}
+
+impl BatchError {
+    fn refused(stderr: &[u8]) -> Self {
+        Self::Refused { stderr: String::from_utf8_lossy(stderr).trim().to_string() }
+    }
+}
+
 /// Run `script` through `sh -c` inside `distro`, with `args` bound to
 /// `$1..`. Rides the resident helper's pipe when it is up, and otherwise
 /// makes one wsl.exe round trip of about 400 ms warm on a dev machine, or
@@ -479,7 +508,7 @@ pub fn run_batch(
     script: &str,
     args: &[&str],
     _blocking: &jobs::Blocking,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, BatchError> {
     // A request the helper may have executed is never re-run as a one-shot,
     // because batch scripts have side effects. Only a transport that failed
     // before the write falls through to the spawn below.
@@ -496,7 +525,7 @@ pub fn run_batch(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("failed to run wsl.exe: {e}"))?;
+        .map_err(BatchError::Spawn)?;
     let deadline = Instant::now() + ONE_SHOT_TIMEOUT;
 
     // `output()` waits for exit with no deadline, so a wsl.exe that never
@@ -516,19 +545,17 @@ pub fn run_batch(
         let _ = err_tx.send(drain_capped(stderr, MAX_ONE_SHOT_OUTPUT));
     });
 
-    let timed_out =
-        || Err(format!("wsl.exe did not finish within {}s", ONE_SHOT_TIMEOUT.as_secs()));
     let remaining = || deadline.saturating_duration_since(Instant::now());
 
     let stdout_read = match out_rx.recv_timeout(remaining()) {
         Ok(read) => read,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             kill_and_reap(&mut child);
-            return timed_out();
+            return Err(BatchError::TimedOut);
         },
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             kill_and_reap(&mut child);
-            return Err("wsl.exe stdout drainer thread panicked".to_string());
+            return Err(BatchError::DrainerPanicked { stream: "stdout" });
         },
     };
     // The drainer has sent, so its only remaining work is dropping locals and
@@ -538,7 +565,7 @@ pub fn run_batch(
         Ok(bytes) => bytes,
         Err(e) => {
             kill_and_reap(&mut child);
-            return Err(format!("failed to read wsl.exe stdout: {e}"));
+            return Err(BatchError::Read { stream: "stdout", source: e });
         },
     };
 
@@ -546,11 +573,11 @@ pub fn run_batch(
         Ok(read) => read,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             kill_and_reap(&mut child);
-            return timed_out();
+            return Err(BatchError::TimedOut);
         },
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             kill_and_reap(&mut child);
-            return Err("wsl.exe stderr drainer thread panicked".to_string());
+            return Err(BatchError::DrainerPanicked { stream: "stderr" });
         },
     };
     let _ = err_handle.join();
@@ -558,7 +585,7 @@ pub fn run_batch(
         Ok(bytes) => bytes,
         Err(e) => {
             kill_and_reap(&mut child);
-            return Err(format!("failed to read wsl.exe stderr: {e}"));
+            return Err(BatchError::Read { stream: "stderr", source: e });
         },
     };
 
@@ -570,12 +597,12 @@ pub fn run_batch(
             Ok(None) => {},
             Err(e) => {
                 kill_and_reap(&mut child);
-                return Err(format!("failed to wait on wsl.exe: {e}"));
+                return Err(BatchError::Wait(e));
             },
         }
         if remaining() == Duration::ZERO {
             kill_and_reap(&mut child);
-            return timed_out();
+            return Err(BatchError::TimedOut);
         }
         std::thread::sleep(ONE_SHOT_REAP_POLL.min(remaining()));
     };
@@ -583,8 +610,7 @@ pub fn run_batch(
     // fallbacks; a hard failure with no stdout means wsl.exe itself refused
     // (deregistered distro, WSL not installed).
     if !status.success() && stdout_bytes.is_empty() {
-        let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
-        return Err(if stderr.is_empty() { "wsl.exe failed".to_string() } else { stderr });
+        return Err(BatchError::refused(&stderr_bytes));
     }
     Ok(stdout_bytes)
 }
@@ -607,7 +633,7 @@ pub fn probe_tools(
     distro: &str,
     programs: &[&str],
     _blocking: &jobs::Blocking,
-) -> Result<Vec<Option<String>>, String> {
+) -> Result<Vec<Option<String>>, BatchError> {
     let probes: Vec<String> = programs.iter().map(|p| format!("command -v {p} || echo")).collect();
     let script = format!(
         r#"s=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7); [ -x "$s" ] || s=${{SHELL:-/bin/sh}}; exec "$s" -lc '{}'"#,
@@ -621,12 +647,11 @@ pub fn probe_tools(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .map_err(|e| format!("failed to run wsl.exe: {e}"))?;
+        .map_err(BatchError::Spawn)?;
     // Empty stdout with a failing exit means wsl.exe itself refused, not that
     // the probes came back empty-handed.
     if !output.status.success() && output.stdout.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if stderr.is_empty() { "wsl.exe failed".to_string() } else { stderr });
+        return Err(BatchError::refused(&output.stderr));
     }
     Ok(parse_tool_paths(&output.stdout, programs.len()))
 }
