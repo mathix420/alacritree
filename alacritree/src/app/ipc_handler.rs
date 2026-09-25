@@ -121,8 +121,7 @@ impl AlacritreeApp {
         reply_tx: mpsc::Sender<ipc::protocol::IpcResult>,
     ) {
         let Some(idx) = self.projects.iter().position(|p| p.root == root) else {
-            let _ =
-                reply_tx.send(Err(format!("{} is not a project in the sidebar", root.display())));
+            let _ = reply_tx.send(Err(NotAProject(root).to_string()));
             return;
         };
         self.refresh_project(ctx, idx);
@@ -228,7 +227,9 @@ impl AlacritreeApp {
             Req::MoveSession { session_id, path } => {
                 let target =
                     self.workspace_for_path(&path).ok_or_else(|| unknown_worktree(&path))?;
-                let workspace = self.move_session_to_key(session_id, Some(target))?;
+                let workspace = self
+                    .move_session_to_key(session_id, Some(target))
+                    .map_err(|e| e.to_string())?;
                 // A silent re-grouping produces no PTY events, so nothing
                 // else would wake the next paint.
                 ctx.request_repaint();
@@ -273,17 +274,18 @@ impl AlacritreeApp {
                             .ok_or_else(|| unknown_worktree(Path::new(path)))?,
                     ),
                 };
-                scratchpad::read_json(&workspace)
+                scratchpad::read_json(&workspace).map_err(|e| e.to_string())
             },
             Req::RemoveProject { root } => {
-                let idx =
-                    self.projects.iter().position(|p| p.root == root).ok_or_else(|| {
-                        format!("{} is not a project in the sidebar", root.display())
-                    })?;
+                let idx = self
+                    .projects
+                    .iter()
+                    .position(|p| p.root == root)
+                    .ok_or_else(|| NotAProject(root).to_string())?;
                 Ok(json!({ "removed": self.remove_project(idx) }))
             },
             Req::RenameProject { root, label } => {
-                let idx = self.rename_project(&root, label)?;
+                let idx = self.rename_project(&root, label).map_err(|e| e.to_string())?;
                 Ok(project_json(&self.projects[idx]))
             },
             Req::ListMultiplexerPanes => Ok(self.multiplexer_panes_json()),

@@ -231,13 +231,21 @@ fn slug(input: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-pub(crate) fn read_json(workspace: &WorkspaceKey) -> Result<Value, String> {
-    let path = path_for(workspace)
-        .ok_or_else(|| "could not locate alacritree's config directory".to_string())?;
+/// Why a scratchpad could not be read for a client.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ReadError {
+    #[error("could not locate alacritree's config directory")]
+    NoConfigDir,
+    #[error("failed to read {}: {source}", path.display())]
+    Read { path: PathBuf, source: io::Error },
+}
+
+pub(crate) fn read_json(workspace: &WorkspaceKey) -> Result<Value, ReadError> {
+    let path = path_for(workspace).ok_or(ReadError::NoConfigDir)?;
     read_json_at(&path, workspace)
 }
 
-fn read_json_at(path: &Path, workspace: &WorkspaceKey) -> Result<Value, String> {
+fn read_json_at(path: &Path, workspace: &WorkspaceKey) -> Result<Value, ReadError> {
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -249,7 +257,7 @@ fn read_json_at(path: &Path, workspace: &WorkspaceKey) -> Result<Value, String> 
                 "truncated": false,
             }));
         },
-        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
+        Err(source) => return Err(ReadError::Read { path: path.to_path_buf(), source }),
     };
     let truncated = bytes.len() > MAX_MCP_BYTES;
     let content = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_MCP_BYTES)]).into_owned();

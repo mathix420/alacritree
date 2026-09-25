@@ -124,6 +124,9 @@ pub(crate) enum IpcRequest {
     },
 }
 
+/// A request's answer. The wire carries a refusal as plain text, so the error
+/// is the message the client shows, and a handler turns its typed error into
+/// that text only when it answers.
 pub(crate) type IpcResult = Result<Value, String>;
 
 pub(crate) fn git_status_json(status: &GitStatus) -> Value {

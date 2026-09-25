@@ -111,6 +111,20 @@ pub(crate) struct GpuGrid {
     failed: Arc<AtomicBool>,
 }
 
+/// Why the GL side will not build. glow reports each GL failure as the
+/// driver's own text, which the variants carry.
+#[derive(Debug, thiserror::Error)]
+enum BuildError {
+    #[error("{0:?} has no instanced arrays")]
+    NoInstancing(ShaderVersion),
+    #[error("could not create a GL object: {0}")]
+    Create(String),
+    #[error("shader did not compile: {0}")]
+    Compile(String),
+    #[error("program did not link: {0}")]
+    Link(String),
+}
+
 /// Building the GL side is attempted exactly once.  A driver that rejects the
 /// shaders rejects them every frame, and each attempt allocates before it
 /// discovers that, so a retrying build is a leak with no visible cause.
@@ -216,7 +230,7 @@ impl Program {
 }
 
 impl GlResources {
-    fn new(gl: &glow::Context, time_gpu: bool) -> Result<Self, String> {
+    fn new(gl: &glow::Context, time_gpu: bool) -> Result<Self, BuildError> {
         let version = ShaderVersion::get(gl);
         // Instanced arrays, `texelFetch` and integer vertex attributes all
         // arrive together in GL 3 / GLES 3.  Older contexts keep the mesh path.
@@ -224,7 +238,7 @@ impl GlResources {
             ShaderVersion::Gl140 => "#version 140\n",
             ShaderVersion::Es300 => "#version 300 es\nprecision highp float;\n",
             ShaderVersion::Gl120 | ShaderVersion::Es100 => {
-                return Err(format!("{version:?} has no instanced arrays"));
+                return Err(BuildError::NoInstancing(version));
             },
         };
         unsafe {
@@ -258,9 +272,9 @@ impl GlResources {
             // `glGen*` returns zero only on a context that is already dead, and
             // the caller latches the failure, so the objects a partial run
             // leaves behind are made at most once.
-            let vao = gl.create_vertex_array()?;
-            let instances = gl.create_buffer()?;
-            let slot_texture = gl.create_texture()?;
+            let vao = gl.create_vertex_array().map_err(BuildError::Create)?;
+            let instances = gl.create_buffer().map_err(BuildError::Create)?;
+            let slot_texture = gl.create_texture().map_err(BuildError::Create)?;
             gl.bind_texture(glow::TEXTURE_2D, Some(slot_texture));
             for (name, value) in [
                 (glow::TEXTURE_MIN_FILTER, glow::NEAREST),
@@ -580,9 +594,9 @@ unsafe fn link(
     header: &str,
     vertex: &str,
     fragment: &str,
-) -> Result<Program, String> {
+) -> Result<Program, BuildError> {
     unsafe {
-        let program = gl.create_program()?;
+        let program = gl.create_program().map_err(BuildError::Create)?;
         for (index, name) in ATTRIBUTES {
             gl.bind_attrib_location(program, index, name);
         }
@@ -592,7 +606,7 @@ unsafe fn link(
                 Ok(shader) => shader,
                 Err(err) => {
                     discard(gl, program, &shaders);
-                    return Err(err);
+                    return Err(BuildError::Create(err));
                 },
             };
             shaders.push(shader);
@@ -601,7 +615,7 @@ unsafe fn link(
             if !gl.get_shader_compile_status(shader) {
                 let log = gl.get_shader_info_log(shader);
                 discard(gl, program, &shaders);
-                return Err(log);
+                return Err(BuildError::Compile(log));
             }
             gl.attach_shader(program, shader);
         }
@@ -609,7 +623,7 @@ unsafe fn link(
         if !gl.get_program_link_status(program) {
             let log = gl.get_program_info_log(program);
             discard(gl, program, &shaders);
-            return Err(log);
+            return Err(BuildError::Link(log));
         }
         for shader in shaders {
             gl.detach_shader(program, shader);

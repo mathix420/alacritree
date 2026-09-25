@@ -642,14 +642,14 @@ fn taskwarrior_checks(distros: &[wsl::WslDistro]) -> Vec<Check> {
             });
             let declared = match &declared {
                 Ok((subof, order)) => Ok((subof.as_deref(), order.as_deref())),
-                Err(e) => Err(e.to_string()),
+                Err(e) => Err(e),
             };
             uda_check(&name, declared)
         })
         .collect()
 }
 
-fn uda_check(side: &str, declared: Result<(Option<&str>, Option<&str>), String>) -> Check {
+fn uda_check(side: &str, declared: Result<(Option<&str>, Option<&str>), &TaskError>) -> Check {
     match declared {
         Ok((Some("uuid"), Some("numeric"))) => {
             check("taskwarrior", side, Status::Ok, "subof and order declared")
@@ -660,7 +660,7 @@ fn uda_check(side: &str, declared: Result<(Option<&str>, Option<&str>), String>)
             Status::Warn,
             "subof and order are not declared; run `alacritree task setup`",
         ),
-        Err(e) => check("taskwarrior", side, Status::Warn, e),
+        Err(e) => check("taskwarrior", side, Status::Warn, e.to_string()),
     }
 }
 
@@ -851,7 +851,7 @@ mod tests {
         assert_eq!(uda_check("native", Ok((Some("uuid"), Some("numeric")))).status, Status::Ok);
         assert_eq!(uda_check("native", Ok((Some("uuid"), None))).status, Status::Warn);
         assert_eq!(uda_check("wsl:Ubuntu", Ok((None, None))).status, Status::Warn);
-        let missing = uda_check("native", Err("taskwarrior not found: task".into()));
+        let missing = uda_check("native", Err(&TaskError::Missing { program: "task".into() }));
         assert_eq!(missing.status, Status::Warn);
         assert!(missing.detail.contains("not found"), "{:?}", missing.detail);
     }

@@ -37,7 +37,7 @@ use crate::multiplexer::{
 use crate::panel_filter::{self, PanelFilter};
 use crate::path_style::PathStyle;
 use crate::pr_status::{self, PrCache, PrInfo, PrState};
-use crate::projects::{Discovered, Project, Worktree, project_json};
+use crate::projects::{Discovered, NotAProject, Project, Worktree, project_json};
 use crate::session::{
     self, Attachment, AttentionVerdict, LiveState, PendingAttention, Session, SessionActivity,
     SessionId, SessionKind, ShellCommand, ShownState, TermSize, poll_attention_debounce,
@@ -725,12 +725,12 @@ impl AlacritreeApp {
 
     /// Set or clear a project's display label and persist it.  Returns the
     /// project's index so IPC can reply with its JSON.
-    fn rename_project(&mut self, root: &Path, label: Option<String>) -> Result<usize, String> {
+    fn rename_project(&mut self, root: &Path, label: Option<String>) -> Result<usize, NotAProject> {
         let idx = self
             .projects
             .iter()
             .position(|p| p.root == *root)
-            .ok_or_else(|| format!("{} is not a project in the sidebar", root.display()))?;
+            .ok_or_else(|| NotAProject(root.to_path_buf()))?;
         self.projects[idx].label = crate::projects::normalize_label(label);
         self.persist_project_label(root);
         Ok(idx)
@@ -892,7 +892,7 @@ impl AlacritreeApp {
                     project.apply(found, &occupied);
                     Ok(project_json(project))
                 },
-                None => Err(format!("{} is not a project in the sidebar", root.display())),
+                None => Err(NotAProject(root).to_string()),
             };
             waiters.answer(reply);
         }
@@ -1474,23 +1474,16 @@ impl AlacritreeApp {
         &mut self,
         id: SessionId,
         target: WorkspaceKey,
-    ) -> Result<WorkspaceKey, String> {
-        let idx = self
-            .sessions
-            .iter()
-            .position(|s| s.id == id)
-            .ok_or_else(|| format!("no session with id {id}. See list_sessions"))?;
-        if matches!(&self.sessions[idx].kind, SessionKind::Scratchpad { .. }) {
-            return Err("scratchpads belong to their backing workspace and cannot be moved".into());
-        }
-        if matches!(&self.sessions[idx].kind, SessionKind::Tasks) {
-            return Err("a tasks tab shows the lists of the workspace it was opened in".into());
-        }
-        // A workspace's diff pane is found by workspace plus kind, so a pane
-        // carried elsewhere becomes the one the next git click closes while
-        // the workspace it left opens a second.
-        if matches!(&self.sessions[idx].kind, SessionKind::Diff { .. }) {
-            return Err("diff panes belong to the workspace they were opened from".into());
+    ) -> Result<WorkspaceKey, MoveError> {
+        let idx = self.sessions.iter().position(|s| s.id == id).ok_or(MoveError::NoSession(id))?;
+        match &self.sessions[idx].kind {
+            SessionKind::Scratchpad { .. } => return Err(MoveError::Scratchpad),
+            SessionKind::Tasks => return Err(MoveError::Tasks),
+            // A workspace's diff pane is found by workspace plus kind, so a
+            // pane carried elsewhere becomes the one the next git click closes
+            // while the workspace it left opens a second.
+            SessionKind::Diff { .. } => return Err(MoveError::Diff),
+            _ => {},
         }
         if self.sessions.move_to(idx, &target, &self.current_workspace) {
             self.current_workspace = target.clone();
@@ -3763,6 +3756,19 @@ enum CloseFallback {
     ActivateSession(SessionId),
     /// Switch to home; `activate_home` spawns a shell there if none exists.
     Home,
+}
+
+/// Why a session cannot move to another workspace.
+#[derive(Debug, thiserror::Error)]
+enum MoveError {
+    #[error("no session with id {0}. See list_sessions")]
+    NoSession(SessionId),
+    #[error("scratchpads belong to their backing workspace and cannot be moved")]
+    Scratchpad,
+    #[error("a tasks tab shows the lists of the workspace it was opened in")]
+    Tasks,
+    #[error("diff panes belong to the workspace they were opened from")]
+    Diff,
 }
 
 /// Why a session record is going away.  The distinction exists because

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::ipc::protocol::{self, IpcRequest, IpcResult};
-use crate::projects::{self, Project, project_json};
+use crate::projects::{self, NotAProject, Project, project_json};
 use crate::state::{self, PersistedProject, PersistedState};
 use crate::worktree::{self as wt, CreateConfig, CreateRequest};
 use crate::{git_status, jobs, scratchpad};
@@ -36,15 +36,15 @@ fn handle_at(state_path: &Path, request: &IpcRequest, config: &CreateConfig) -> 
         })),
         IpcRequest::AddProject { path } => Ok(project_json(&add(state_path, path))),
         IpcRequest::RemoveProject { root } => {
-            remove(state_path, root)?;
+            remove(state_path, root).map_err(|e| e.to_string())?;
             Ok(json!({ "removed": root }))
         },
         IpcRequest::RenameProject { root, label } => {
-            rename(state_path, root, label.clone())?;
+            rename(state_path, root, label.clone()).map_err(|e| e.to_string())?;
             let renamed = discover_all(state_path)
                 .into_iter()
                 .find(|p| p.root == *root)
-                .ok_or_else(|| not_a_project(root))?;
+                .ok_or_else(|| NotAProject(root.clone()).to_string())?;
             Ok(project_json(&renamed))
         },
         // Nothing is cached without an app, so a refresh is just a fresh look.
@@ -54,7 +54,7 @@ fn handle_at(state_path: &Path, request: &IpcRequest, config: &CreateConfig) -> 
             let known = discover_all(state_path)
                 .into_iter()
                 .find(|p| p.root == *root)
-                .ok_or_else(|| not_a_project(root))?;
+                .ok_or_else(|| NotAProject(root.clone()).to_string())?;
             Ok(project_json(&known))
         },
         IpcRequest::GitStatus { path } => {
@@ -69,8 +69,10 @@ fn handle_at(state_path: &Path, request: &IpcRequest, config: &CreateConfig) -> 
             None | Some("current") => {
                 Err("alacritree is not running; specify `home` or a workspace path".to_string())
             },
-            Some("home") => scratchpad::read_json(&None),
-            Some(path) => scratchpad::read_json(&Some(PathBuf::from(path))),
+            Some("home") => scratchpad::read_json(&None).map_err(|e| e.to_string()),
+            Some(path) => {
+                scratchpad::read_json(&Some(PathBuf::from(path))).map_err(|e| e.to_string())
+            },
         },
         IpcRequest::ListSessions
         | IpcRequest::SelectWorkspace { .. }
@@ -96,22 +98,22 @@ fn add(state_path: &Path, path: &Path) -> Project {
     jobs::on_this_thread(|blocking| Project::discover(path.to_path_buf(), false, blocking)).project
 }
 
-fn remove(state_path: &Path, root: &Path) -> Result<(), String> {
+fn remove(state_path: &Path, root: &Path) -> Result<(), NotAProject> {
     // `mutate_at` takes a closure that cannot fail, so the check has to happen
     // against the file we are about to mutate rather than inside the mutation.
     if !state::load_from(state_path).projects.iter().any(|p| p.root == root) {
-        return Err(not_a_project(root));
+        return Err(NotAProject(root.to_path_buf()));
     }
     let root = root.to_path_buf();
     state::mutate_at(state_path, move |s| s.projects.retain(|p| p.root != root));
     Ok(())
 }
 
-fn rename(state_path: &Path, root: &Path, label: Option<String>) -> Result<(), String> {
+fn rename(state_path: &Path, root: &Path, label: Option<String>) -> Result<(), NotAProject> {
     // Same shape as `remove`: the existence check happens against the file
     // because the mutation closure cannot fail.
     if !state::load_from(state_path).projects.iter().any(|p| p.root == root) {
-        return Err(not_a_project(root));
+        return Err(NotAProject(root.to_path_buf()));
     }
     let label = projects::normalize_label(label);
     let root = root.to_path_buf();
@@ -149,10 +151,6 @@ fn create_worktree(project_root: PathBuf, branch: String, config: &CreateConfig)
     })
     .map_err(|e| e.to_string())?;
     Ok(json!({ "path": path, "steps": steps }))
-}
-
-fn not_a_project(root: &Path) -> String {
-    format!("{} is not a project in the sidebar", root.display())
 }
 
 #[cfg(test)]

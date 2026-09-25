@@ -117,14 +117,29 @@ const STARTER: &str = r##"
 # worktree_dir = "~/Git/$project-worktrees"
 "##;
 
+/// A file operation of `schema init` that failed, and the path it was on.
+#[derive(Debug, thiserror::Error)]
+#[error("{doing} {}: {source}", path.display())]
+pub(super) struct InitError {
+    doing: &'static str,
+    path: PathBuf,
+    source: std::io::Error,
+}
+
+impl InitError {
+    fn at(doing: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> Self {
+        move |source| Self { doing, path: path.to_path_buf(), source }
+    }
+}
+
 /// Point `path` at the published schema, creating it from [`STARTER`] when it
 /// does not exist.  Idempotent: a file that already carries a directive is left
 /// exactly as it is, so this is safe to run against a config under review.
-pub(super) fn init(path: &Path) -> Result<(), String> {
+pub(super) fn init(path: &Path) -> Result<(), InitError> {
     let existing = match std::fs::read_to_string(path) {
         Ok(body) => Some(body),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(format!("reading {}: {e}", path.display())),
+        Err(e) => return Err(InitError::at("reading", path)(e)),
     };
 
     let body = match existing {
@@ -137,10 +152,9 @@ pub(super) fn init(path: &Path) -> Result<(), String> {
     };
 
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(InitError::at("creating", parent))?;
     }
-    std::fs::write(path, &body).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    std::fs::write(path, &body).map_err(InitError::at("writing", path))?;
     println!("{} now points at {ID}", path.display());
     Ok(())
 }

@@ -373,6 +373,11 @@ fn detect_default_branch(repo: &Repository) -> Option<String> {
     })
 }
 
+/// A root the sidebar holds no project at.
+#[derive(Debug, thiserror::Error)]
+#[error("{} is not a project in the sidebar", .0.display())]
+pub(crate) struct NotAProject(pub(crate) PathBuf);
+
 /// A label is user text: trimmed, with an empty result meaning "no label", so
 /// clearing the rename field falls back to the directory name.
 pub fn normalize_label(label: Option<String>) -> Option<String> {
