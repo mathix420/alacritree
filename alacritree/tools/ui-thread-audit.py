@@ -16,7 +16,9 @@ nothing.
 ## How it decides
 
 ast-grep supplies the structure: function extents, `impl` blocks, background-job
-extents (`thread::spawn` and `jobs::pool().spawn`), test modules.  Call
+extents (`thread::spawn` and `jobs::pool().spawn`), test modules, and the
+blocking primitives themselves, so a primitive named in a comment or a string
+does not count. Call
 resolution is textual but scoped, and the scoping is what separates a readable
 answer from noise:
 
@@ -40,31 +42,57 @@ everything only it reaches are excluded by construction.  Calls through trait
 objects, function pointers, and closures stored in fields produce no edge.
 `PRIMS` covers process spawn and wait, git2 status and diff walks, channel
 receives, and directory walks; plain file reads, lock contention and pure CPU
-work are not counted.  A reachable site is not proof that it blocks in
-practice, only that nothing structural stops it.
+work are not counted. The `PRIMS` rules read syntax, not types, so a spawn
+through `use std::process::Command as Cmd` goes unseen and a local type named
+`Command` trips the rule. clippy's `disallowed_methods` is the type-aware
+check, and this audit adds reachability from `update`, which clippy cannot see.
+A reachable site is not proof that it blocks in practice, only that nothing
+structural stops it.
 """
 import collections
 import json
 import re
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 ROOT = Path(sys.argv[1])
 SRCS = ["alacritree/src", "crates"]
 
-# Work that can hold the caller for an unbounded time.  Deliberately narrow: a
-# config file read blocks too, but it is not what stalls a dialog for seconds
-# under load.
+
+def path_call(names):
+    """A call through a path ending in one of `names`, however qualified, so
+    `std::process::Command::new` matches and `ShellCommand::new` does not."""
+    return ("kind: scoped_identifier\nregex: '^(.*::)?(%s)$'\n"
+            "inside: {kind: call_expression, field: function}" % names)
+
+
+def method_call(names, no_args=False):
+    """A call of a method named one of `names`. The rule matches the name
+    rather than the call, whose extent starts at the receiver, so a chain
+    split over several lines reports the line the method is on."""
+    args = ", has: {field: arguments, regex: '^\\(\\s*\\)$'}" if no_args else ""
+    return ("kind: field_identifier\nregex: '^(%s)$'\n"
+            "inside:\n  kind: field_expression\n  field: field\n"
+            "  inside: {kind: call_expression, field: function%s}" % (names, args))
+
+
+# Work that can hold the caller for an unbounded time. A config file read blocks
+# too, but it is not what stalls a dialog for seconds under load.
 PRIMS = [
-    (re.compile(r"\bCommand::new\("), "spawns a process"),
-    (re.compile(r"\.output\(\)|wait_with_output\(|\.wait\(\)"), "waits on a process"),
-    (re.compile(r"\.statuses\("), "walks the repository status"),
-    (re.compile(r"diff_tree_to_workdir|diff_tree_to_index|diff_index_to_workdir"), "diffs the working tree"),
-    (re.compile(r"Repository::open|Repository::discover"), "opens a repository"),
-    (re.compile(r"\.revwalk\("), "walks history"),
-    (re.compile(r"\.recv\(\)|\.recv_timeout\("), "blocks on a channel"),
-    (re.compile(r"fs::read_dir\(|WalkDir::"), "walks a directory"),
+    (path_call(r"Command::new"), "spawns a process"),
+    # A `wait` that takes an argument is a condvar or a deadline, not a child.
+    (method_call(r"output|wait", no_args=True), "waits on a process"),
+    (method_call(r"wait_with_output"), "waits on a process"),
+    (method_call(r"statuses"), "walks the repository status"),
+    (method_call(r"diff_tree_to_workdir\w*|diff_tree_to_index|diff_index_to_workdir"),
+     "diffs the working tree"),
+    (path_call(r"Repository::(open|discover)\w*"), "opens a repository"),
+    (method_call(r"revwalk"), "walks history"),
+    (method_call(r"recv", no_args=True), "blocks on a channel"),
+    (method_call(r"recv_timeout"), "blocks on a channel"),
+    (path_call(r"fs::read_dir|WalkDir::\w+"), "walks a directory"),
 ]
 
 QUALIFIED = re.compile(r"\b([A-Za-z_]\w*)::([a-z_]\w*)\s*\(")
@@ -95,9 +123,16 @@ def sg(args):
     return json.loads(out.stdout or "[]")
 
 
+def scan(rules):
+    """Run `{id: rule body}` through ast-grep in one pass."""
+    docs = ("id: %s\nlanguage: rust\nrule:\n%s" % (rid, textwrap.indent(body, "  "))
+            for rid, body in rules.items())
+    return sg(["ast-grep", "scan", "--inline-rules", "\n---\n".join(docs),
+               *SRCS, "--json=compact"])
+
+
 def by_kind(kind):
-    rule = "id: k\nlanguage: rust\nrule:\n  kind: " + kind
-    return sg(["ast-grep", "scan", "--inline-rules", rule, *SRCS, "--json=compact"])
+    return scan({"k": "kind: " + kind})
 
 
 def by_pattern(pat):
@@ -129,6 +164,17 @@ for m in by_kind("impl_item"):
     hit = IMPL_FOR.search(head) or IMPL_TY.search(head)
     if hit:
         impl_regions[f].append((s_, e_, hit.group(1)))
+
+# A line two rules match is named by the one earlier in `PRIMS`.
+prim_ranks = collections.defaultdict(dict)
+for m in scan({str(rank): rule for rank, (rule, _) in enumerate(PRIMS)}):
+    f, ln, _ = extent(m)
+    rank = int(m["ruleId"])
+    prim_ranks[f][ln] = min(rank, prim_ranks[f].get(ln, rank))
+# This code spawns processes, so rules that match nothing anywhere have stopped
+# parsing rather than found a codebase that never blocks.
+if not prim_ranks:
+    scan_failed("no PRIMS rule matched anywhere under %s" % ", ".join(SRCS))
 
 aliases = collections.defaultdict(dict)
 for path in (p for src in SRCS for p in (ROOT / src).rglob("*.rs")):
@@ -171,10 +217,8 @@ for m in by_kind("function_item"):
         stripped = line.lstrip()
         if stripped.startswith("//") or inside(spawn_regions, f, ln):
             continue
-        for rx, why in PRIMS:
-            if rx.search(line):
-                fn.prims.append((ln, why, stripped[:110]))
-                break
+        if ln in prim_ranks[f]:
+            fn.prims.append((ln, PRIMS[prim_ranks[f][ln]][1], stripped[:110]))
         fn.raw += [("mod", mod, name) for mod, name in QUALIFIED.findall(line)]
         fn.raw += [("local", None, name) for name in SELFCALL.findall(line)]
         fn.raw += [("local", None, name) for name in BARE.findall(line)]
