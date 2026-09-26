@@ -17,7 +17,7 @@ pub(crate) fn event_to_bytes(
                 Some(text.as_bytes().to_vec())
             }
         },
-        Event::Key { key, pressed: true, modifiers, repeat: _, .. } => {
+        Event::Key { key, pressed: true, modifiers, .. } => {
             key_to_bytes(*key, *modifiers, key_text, mode)
         },
         // `Event::Paste` is handled by the caller via `paste::paste` so it

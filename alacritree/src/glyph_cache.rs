@@ -80,7 +80,8 @@ pub(crate) const MAX_EXTRA_CELLS: usize = 4;
 /// follow rather than letting it overrun them; blanks are the only cells it
 /// may take, since anything else is a character it would paint over.
 pub(crate) fn grown_cells(glyph_w: f32, cell_w: f32, spare: usize) -> usize {
-    if !(glyph_w > cell_w * OVERFLOW_SLACK) || cell_w <= 0.0 {
+    let overflows = glyph_w > cell_w * OVERFLOW_SLACK;
+    if !overflows || cell_w <= 0.0 {
         return 1;
     }
     let wanted = (glyph_w / cell_w).ceil() as usize;
@@ -303,8 +304,6 @@ mod tests {
             "cache served a galley addressing the discarded atlas"
         );
     }
-
-    /// The cell is floored to whole device pixels, so an ordinary glyph's
 
     /// Icons live in the private use areas.  Nothing else grows, whatever
     /// face served it and however far it overruns.

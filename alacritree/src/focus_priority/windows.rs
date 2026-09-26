@@ -719,8 +719,9 @@ mod tests {
     #[test]
     #[ignore = "the escaping child a reaping test runs as its session's shell"]
     // DETACHED_PROCESS is the subject of the test, so `hidden`'s
-    // CREATE_NO_WINDOW would spawn the wrong kind of child.
-    #[allow(clippy::disallowed_methods)]
+    // CREATE_NO_WINDOW would spawn the wrong kind of child. Nothing waits on
+    // the child, because outliving the session is what the reaping test checks.
+    #[allow(clippy::disallowed_methods, clippy::zombie_processes)]
     fn a_child_that_leaves_the_console() {
         use std::os::windows::process::CommandExt as _;
         const DETACHED_PROCESS: u32 = 0x0000_0008;

@@ -12,6 +12,7 @@
 //! so `painter.image(..., tint)` produces fg-colored output.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::{cmp, mem, ops};
 
@@ -60,14 +61,14 @@ impl BuiltinGlyphCache {
             self.entries.clear();
             self.cell_size = size;
         }
-        if !self.entries.contains_key(&c) {
+        if let Entry::Vacant(entry) = self.entries.entry(c) {
             let glyph = builtin_glyph(c, metrics, offset, glyph_offset)?;
             // `clone` here just unwraps Arc; the Vec<Color32> backing the
             // image is moved into egui's texture upload.
             let image = Arc::try_unwrap(glyph.image).unwrap_or_else(|arc| (*arc).clone());
             let texture =
                 ctx.load_texture(format!("builtin_{:x}", c as u32), image, TextureOptions::NEAREST);
-            self.entries.insert(c, CachedGlyph {
+            entry.insert(CachedGlyph {
                 texture,
                 top: glyph.top,
                 left: glyph.left,

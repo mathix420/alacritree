@@ -776,7 +776,7 @@ impl AlacritreeApp {
     /// Persist one project's `expanded` / `shell` fields without touching the
     /// rest of the file, so a second window's project list survives.
     fn persist_project(&self, root: &Path) {
-        let Some(p) = self.projects.iter().find(|p| &p.root == root) else {
+        let Some(p) = self.projects.iter().find(|p| p.root == root) else {
             return;
         };
         let (expanded, shell, label) =
@@ -1009,7 +1009,11 @@ impl AlacritreeApp {
                     // The record went in before the open, so it comes back out
                     // before the error does: with the gate off, a caller that
                     // gets `Err` must see no trace of the session.
-                    self.sessions.remove(&[id], self.config.ui.sidebar_focus);
+                    self.sessions.remove(
+                        &[id],
+                        self.config.ui.sidebar_focus,
+                        self.config.ui.return_to_previous_session,
+                    );
                     return Err(e);
                 },
             }
@@ -1417,12 +1421,24 @@ impl AlacritreeApp {
         reason: CloseReason,
     ) {
         let policy = self.config.ui.last_session_close;
-        let ring = policy.rings().then(|| self.session_ring()).unwrap_or_default();
-        for session in self.sessions.remove(ids, self.config.ui.sidebar_focus) {
+        let ring = if policy.rings() { self.session_ring() } else { Default::default() };
+        let returns = self.config.ui.return_to_previous_session;
+        // A cursor left on the closed tab's row would slide to a sibling and,
+        // under `sidebar_focus = "follow"`, take the terminal there too.
+        let cursor_return = match self.sidebar.model.cursor() {
+            Some(SidebarRow::Session(id)) if ids.contains(id) => {
+                self.sessions.return_target(*id, returns)
+            },
+            _ => None,
+        };
+        for session in self.sessions.remove(ids, self.config.ui.sidebar_focus, returns) {
             self.multiplexers.session_closed(session.id, session.pane_key.as_ref());
             if self.modals.pending_session_close == Some(session.id) {
                 self.modals.pending_session_close = None;
             }
+        }
+        if let Some(target) = cursor_return {
+            self.sidebar.model.pin_cursor(SidebarRow::Session(target));
         }
 
         let remaining: Vec<(WorkspaceKey, SessionId)> =
@@ -3237,7 +3253,7 @@ impl AlacritreeApp {
 
         let mut sidebar_rect = None;
         if self.show_left_sidebar {
-            let r = self.show_project_sidebar(ctx, panel_frame.clone());
+            let r = self.show_project_sidebar(ctx, panel_frame);
             paint_panel_border(ctx, r.right(), r.y_range(), theme.sidebar_border);
             if theme.focus_outline.sidebar
                 && !modal_open
@@ -6249,6 +6265,61 @@ mod tests {
         assert_eq!(app.sessions.active(&None), Some(home));
     }
 
+    /// Home holding shells `first`, `watched` and `third`, with `watched` on
+    /// screen and a tasks tab toggled open over it.
+    fn app_with_tasks_over(returns: bool) -> (AlacritreeApp, [SessionId; 4]) {
+        let mut app = test_app();
+        app.config.ui.return_to_previous_session = returns;
+        let first = app.sessions[0].id;
+        let watched = push_shell(&mut app, None);
+        let third = push_shell(&mut app, None);
+        app.sessions.set_active(None, watched);
+        app.toggle_tasks_tab(&Context::default());
+        let tasks = app.sessions.active(&None).unwrap();
+        assert!(![first, watched, third].contains(&tasks), "the toggle opened a tasks tab");
+        (app, [first, watched, third, tasks])
+    }
+
+    #[test]
+    fn toggling_a_tasks_tab_closed_returns_to_the_session_it_opened_over() {
+        let (mut app, [_, watched, _, _]) = app_with_tasks_over(true);
+        app.toggle_tasks_tab(&Context::default());
+        assert_eq!(app.sessions.active(&None), Some(watched));
+    }
+
+    #[test]
+    fn without_the_option_a_tasks_tab_close_lands_where_sidebar_focus_says() {
+        let (mut app, [first, ..]) = app_with_tasks_over(false);
+        app.toggle_tasks_tab(&Context::default());
+        assert_eq!(app.sessions.active(&None), Some(first), "preserve takes the first session");
+    }
+
+    #[test]
+    fn a_tasks_tab_whose_session_closed_meanwhile_lands_where_sidebar_focus_says() {
+        let (mut app, [first, watched, ..]) = app_with_tasks_over(true);
+        app.close_session(&Context::default(), watched);
+        app.toggle_tasks_tab(&Context::default());
+        assert_eq!(app.sessions.active(&None), Some(first));
+    }
+
+    /// Under `follow`, a sidebar cursor on the tab's row would slide to the
+    /// previous row and drag the terminal after it.
+    #[test]
+    fn the_sidebar_cursor_on_a_closed_tasks_tab_returns_with_the_terminal() {
+        let (mut app, [_, watched, _, tasks]) = app_with_tasks_over(true);
+        app.config.ui.sidebar_focus = SidebarFocus::Follow;
+        let ctx = Context::default();
+        app.reconcile_sidebar_focus(&ctx);
+        app.sidebar.model.set_cursor(SidebarRow::Session(tasks));
+        app.reconcile_sidebar_focus(&ctx);
+
+        app.close_session(&ctx, tasks);
+        app.reconcile_sidebar_focus(&ctx);
+
+        assert_eq!(app.sessions.active(&None), Some(watched));
+        assert_eq!(app.sidebar.model.cursor(), Some(&SidebarRow::Session(watched)));
+    }
+
     /// A move re-points both workspaces' active entries, so a close right
     /// after it still leaves each one naming a live session.
     #[test]
@@ -8899,14 +8970,14 @@ mod tests {
             })
         };
 
-        let first = resolve_pr_info(&mut memo, &path, true, &poll);
-        let second = resolve_pr_info(&mut memo, &path, true, &poll);
+        let first = resolve_pr_info(&mut memo, &path, true, poll);
+        let second = resolve_pr_info(&mut memo, &path, true, poll);
 
         assert_eq!(lookups.get(), 1, "one lookup per path per frame");
         assert!(second.is_some(), "the duplicate row still renders its badge");
         assert_eq!(first.map(|i| i.number), second.map(|i| i.number));
 
-        let ineligible = resolve_pr_info(&mut memo, &PathBuf::from("/repo/other"), false, &poll);
+        let ineligible = resolve_pr_info(&mut memo, &PathBuf::from("/repo/other"), false, poll);
         assert_eq!(lookups.get(), 1, "an ineligible path never runs the lookup");
         assert!(ineligible.is_none());
     }

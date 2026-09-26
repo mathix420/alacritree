@@ -7,13 +7,16 @@ use std::ops::{Deref, DerefMut};
 
 use super::{AppSession, SourceRepair, close_landing, plan_move};
 use crate::config::SidebarFocus;
-use crate::session::SessionId;
+use crate::session::{SessionId, SessionKind};
 use crate::workspace::WorkspaceKey;
 
 #[derive(Default)]
 pub(super) struct SessionList {
     sessions: Vec<AppSession>,
     active: HashMap<WorkspaceKey, SessionId>,
+    /// For each scratchpad and tasks tab, the session its workspace had on
+    /// screen when the tab last took over.
+    returns_to: HashMap<SessionId, SessionId>,
 }
 
 /// Read and per-session access.  A slice has no way to add or drop an element,
@@ -55,25 +58,59 @@ impl SessionList {
     }
 
     pub(super) fn set_active(&mut self, workspace: WorkspaceKey, id: SessionId) {
-        self.active.insert(workspace, id);
+        let Some(previous) = self.active.insert(workspace, id).filter(|&p| p != id) else {
+            return;
+        };
+        let takes_over = self.sessions.iter().any(|s| {
+            s.id == id && matches!(s.kind, SessionKind::Scratchpad { .. } | SessionKind::Tasks)
+        });
+        if takes_over {
+            self.returns_to.insert(id, previous);
+        }
+    }
+
+    /// The session closing the on-screen tab `id` goes back to under
+    /// `[ui] return_to_previous_session`: the one it took over from, while
+    /// that one is still open in the same workspace.
+    pub(super) fn return_target(&self, id: SessionId, enabled: bool) -> Option<SessionId> {
+        if !enabled {
+            return None;
+        }
+        let workspace = &self.sessions.iter().find(|s| s.id == id)?.working_directory;
+        if self.active(workspace) != Some(id) {
+            return None;
+        }
+        let previous = *self.returns_to.get(&id)?;
+        self.sessions
+            .iter()
+            .any(|s| s.id == previous && s.working_directory == *workspace)
+            .then_some(previous)
     }
 
     /// Take `ids` out of the list and hand them back, in the order given.  A
-    /// workspace whose active session went hands its entry to the sibling
-    /// `mode` lands on, or loses it when no sibling is left.  Ids not in the
-    /// list are skipped.
-    pub(super) fn remove(&mut self, ids: &[SessionId], mode: SidebarFocus) -> Vec<AppSession> {
+    /// workspace whose active session went hands its entry to the
+    /// [`Self::return_target`] when `return_to_previous` allows one, else to
+    /// the sibling `mode` lands on, or loses it when no sibling is left.  Ids
+    /// not in the list are skipped.
+    pub(super) fn remove(
+        &mut self,
+        ids: &[SessionId],
+        mode: SidebarFocus,
+        return_to_previous: bool,
+    ) -> Vec<AppSession> {
         let mut removed = Vec::with_capacity(ids.len());
         for &id in ids {
             let Some(idx) = self.sessions.iter().position(|s| s.id == id) else {
                 continue;
             };
+            let returned = self.return_target(id, return_to_previous);
+            self.returns_to.remove(&id);
             let session = self.sessions.remove(idx);
             let workspace = session.working_directory.clone();
             if self.active(&workspace) == Some(id) {
                 let remaining: Vec<(WorkspaceKey, SessionId)> =
                     self.sessions.iter().map(|s| (s.working_directory.clone(), s.id)).collect();
-                match close_landing(&remaining, &workspace, idx, mode) {
+                match returned.or_else(|| close_landing(&remaining, &workspace, idx, mode)) {
                     Some(next) => {
                         self.active.insert(workspace, next);
                     },
@@ -169,12 +206,12 @@ mod tests {
         let ws = Some(PathBuf::from("wt"));
         let (mut preserve, ids) = list_of(&ws, 3);
         preserve.set_active(ws.clone(), ids[1]);
-        preserve.remove(&[ids[1]], SidebarFocus::Preserve);
+        preserve.remove(&[ids[1]], SidebarFocus::Preserve, false);
         assert_eq!(preserve.active(&ws), Some(ids[0]));
 
         let (mut follow, ids) = list_of(&ws, 3);
         follow.set_active(ws.clone(), ids[1]);
-        follow.remove(&[ids[1]], SidebarFocus::Follow);
+        follow.remove(&[ids[1]], SidebarFocus::Follow, false);
         assert_eq!(follow.active(&ws), Some(ids[2]));
     }
 
@@ -182,7 +219,7 @@ mod tests {
     fn removing_every_session_in_a_workspace_drops_its_entry() {
         let ws = Some(PathBuf::from("wt"));
         let (mut list, ids) = list_of(&ws, 2);
-        let removed = list.remove(&ids, SidebarFocus::Follow);
+        let removed = list.remove(&ids, SidebarFocus::Follow, false);
         assert_eq!(removed.iter().map(|s| s.id).collect::<Vec<_>>(), ids);
         assert!(list.is_empty());
         assert!(!list.has_active(&ws));
@@ -192,7 +229,7 @@ mod tests {
     fn removing_an_inactive_session_keeps_the_entry() {
         let ws = Some(PathBuf::from("wt"));
         let (mut list, ids) = list_of(&ws, 2);
-        list.remove(&[ids[1]], SidebarFocus::Preserve);
+        list.remove(&[ids[1]], SidebarFocus::Preserve, false);
         assert_eq!(list.active(&ws), Some(ids[0]));
     }
 }

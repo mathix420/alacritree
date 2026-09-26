@@ -283,7 +283,6 @@ fn probe_distros(distros: &[wsl::WslDistro]) -> Vec<(String, Probe)> {
     for distro in distros {
         let tx = tx.clone();
         let name = distro.name.clone();
-        let names = names;
         std::thread::spawn(move || {
             let probe = jobs::on_this_thread(|blocking| wsl::probe_tools(&name, &names, blocking))
                 .map_err(ProbeError::from);

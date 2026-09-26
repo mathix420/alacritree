@@ -713,7 +713,7 @@ pub(crate) mod tests {
             home_name: true,
             project_self: &|_p| false,
             gate: &|_ws| true,
-            name: &mut |_p, wt| wt.path == PathBuf::from("/a/wt1"),
+            name: &mut |_p, wt| wt.path == Path::new("/a/wt1"),
             child: None,
         };
         assert_eq!(filtered_rows(&projects, &no_sessions(), preds), vec![
@@ -729,7 +729,7 @@ pub(crate) mod tests {
         let preds = RowPredicates {
             home_gate: true,
             home_name: true,
-            project_self: &|p| p.root == PathBuf::from("/a"),
+            project_self: &|p| p.root == Path::new("/a"),
             gate: &|_ws| true,
             name: &mut |_p, _wt| false,
             child: None,
@@ -746,7 +746,7 @@ pub(crate) mod tests {
         let preds = RowPredicates {
             home_gate: true,
             home_name: false,
-            project_self: &|p| p.root == PathBuf::from("/a"),
+            project_self: &|p| p.root == Path::new("/a"),
             gate: &|_ws| true,
             name: &mut |_p, _wt| true,
             child: None,
@@ -765,7 +765,7 @@ pub(crate) mod tests {
         let preds = RowPredicates {
             home_gate: false,
             home_name: true,
-            project_self: &|p| p.root == PathBuf::from("/a"),
+            project_self: &|p| p.root == Path::new("/a"),
             gate: &|_ws| true,
             name: &mut |_p, _wt| true,
             child: None,
@@ -782,9 +782,9 @@ pub(crate) mod tests {
         let preds = RowPredicates {
             home_gate: true,
             home_name: true,
-            project_self: &|p| p.root == PathBuf::from("/a"),
+            project_self: &|p| p.root == Path::new("/a"),
             gate: &|_ws| true,
-            name: &mut |p, _wt| p.root == PathBuf::from("/a"),
+            name: &mut |p, _wt| p.root == Path::new("/a"),
             child: None,
         };
         assert_eq!(filtered_rows(&projects, &no_sessions(), preds), vec![
@@ -904,7 +904,7 @@ pub(crate) mod tests {
             home_name: true,
             project_self: &|_p| false,
             gate: &|_ws| true,
-            name: &mut |_p, wt| wt.path == PathBuf::from("/a/wt1"),
+            name: &mut |_p, wt| wt.path == Path::new("/a/wt1"),
             child: None,
         };
         assert_eq!(filtered_rows(&projects, &sessions_only(sessions), preds), vec![

@@ -934,7 +934,7 @@ fn install_ui_variant(
             candidate,
             None,
             variant,
-            &[target.clone()],
+            std::slice::from_ref(&target),
             fonts,
             &mut book,
         );
