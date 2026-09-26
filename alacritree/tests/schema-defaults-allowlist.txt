@@ -81,6 +81,8 @@ RawUiFont.family
 RawUiFont.italic_family
 RawUiFont.size
 RawUiPaste.image_dir
+RawUiTasks.active_background
+RawUiTasks.active_marker
 RawUiTasks.chevron
 RawUiTasks.chevron_hover
 RawUiTasks.hidden_count

@@ -2216,6 +2216,28 @@
     },
     "RawUiTasks": {
       "properties": {
+        "active_background": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Background behind a started task's row. Unset is a faint tint of the\ntab's text color over the pane; set it to the terminal background to\nleave started rows unfilled."
+        },
+        "active_marker": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "The chevron marking a started task. Unset uses the tab's text color."
+        },
+        "active_marker_thickness": {
+          "default": 2.5,
+          "description": "Stroke width of the started-task chevron, in points.",
+          "format": "float",
+          "type": "number"
+        },
         "add_button": {
           "$ref": "#/$defs/RawTasksButton",
           "description": "The `+ add a task` button under each section."

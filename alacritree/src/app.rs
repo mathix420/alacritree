@@ -280,6 +280,11 @@ fn tasks_style(
         chevron: egui::Stroke::new(tasks.chevron_thickness, color(tasks.chevron, hint)),
         chevron_hover: color(tasks.chevron_hover, text),
         hidden_count: color(tasks.hidden_count, hint),
+        active_marker: egui::Stroke::new(
+            tasks.active_marker_thickness,
+            color(tasks.active_marker, text),
+        ),
+        active_background: color(tasks.active_background, blend_toward(text, background, 0.9)),
         add_button: crate::tasks::view::ButtonStyle {
             text: color(b.text, accent),
             hover_text: color(b.hover_text, text),

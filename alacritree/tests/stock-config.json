@@ -571,6 +571,9 @@
     "sidebar_tooltips": "elided",
     "status_indicators": "dots",
     "tasks": {
+      "active_background": null,
+      "active_marker": null,
+      "active_marker_thickness": 2.5,
       "add_button": {
         "fill": null,
         "hover_fill": null,

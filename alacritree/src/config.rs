@@ -1125,6 +1125,9 @@ pub struct TasksUi {
     pub chevron_hover: Option<Rgb>,
     pub chevron_thickness: f32,
     pub hidden_count: Option<Rgb>,
+    pub active_marker: Option<Rgb>,
+    pub active_marker_thickness: f32,
+    pub active_background: Option<Rgb>,
     pub add_button: TasksButton,
 }
 
@@ -2817,6 +2820,14 @@ struct RawUiTasks {
     /// The `+N` count of sub-tasks a collapsed task hides. Unset uses the
     /// tab's hint color.
     hidden_count: Option<RgbStr>,
+    /// The chevron marking a started task. Unset uses the tab's text color.
+    active_marker: Option<RgbStr>,
+    /// Stroke width of the started-task chevron, in points.
+    active_marker_thickness: f32,
+    /// Background behind a started task's row. Unset is a faint tint of the
+    /// tab's text color over the pane; set it to the terminal background to
+    /// leave started rows unfilled.
+    active_background: Option<RgbStr>,
     /// The `+ add a task` button under each section.
     add_button: RawTasksButton,
 }
@@ -2828,6 +2839,9 @@ impl Default for RawUiTasks {
             chevron_hover: None,
             chevron_thickness: 1.5,
             hidden_count: None,
+            active_marker: None,
+            active_marker_thickness: 2.5,
+            active_background: None,
             add_button: RawTasksButton::default(),
         }
     }
@@ -2842,6 +2856,9 @@ impl RawUiTasks {
             chevron_hover: rgb(&self.chevron_hover),
             chevron_thickness: self.chevron_thickness.max(0.5),
             hidden_count: rgb(&self.hidden_count),
+            active_marker: rgb(&self.active_marker),
+            active_marker_thickness: self.active_marker_thickness.max(0.5),
+            active_background: rgb(&self.active_background),
             add_button: TasksButton {
                 text: rgb(&b.text),
                 hover_text: rgb(&b.hover_text),

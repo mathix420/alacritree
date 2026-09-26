@@ -340,6 +340,8 @@ pub(crate) struct Style {
     pub chevron: Stroke,
     pub chevron_hover: Color32,
     pub hidden_count: Color32,
+    pub active_marker: Stroke,
+    pub active_background: Color32,
     pub add_button: ButtonStyle,
 }
 
@@ -412,7 +414,10 @@ fn show_row(
         return;
     }
     let refs: Vec<&Task> = tasks.iter().collect();
-    ui.horizontal(|ui| {
+    // Reserved before the row's widgets so the fill paints under them once
+    // the row's full rect is known.
+    let background = ui.painter().add(Shape::Noop);
+    let line = ui.horizontal(|ui| {
         ui.add_space(row.depth as f32 * INDENT);
         let collapsed = view.collapsed_tasks.contains(&row.id);
         if toggle(ui, (below > 0).then_some(!collapsed), c.chevron, c.chevron_hover)
@@ -428,7 +433,8 @@ fn show_row(
             view.write_one(&row.id, if checked { Edit::Done(id) } else { Edit::Undone(id) });
         }
         if row.started {
-            ui.label(RichText::new(">").color(c.text));
+            let (rect, _) = ui.allocate_exact_size(glyph_size(ui), Sense::hover());
+            paint_chevron(ui, rect.center(), false, c.active_marker);
         }
         if collapsed && below > 0 {
             ui.label(RichText::new(format!("+{below}")).color(c.hidden_count));
@@ -505,6 +511,11 @@ fn show_row(
             }
         }
     });
+    if row.started {
+        let radius = ui.visuals().widgets.inactive.corner_radius;
+        let fill = Shape::rect_filled(line.response.rect, radius, c.active_background);
+        ui.painter().set(background, fill);
+    }
     // Below the row, since the text beside it takes the full width.
     if let Some(e) = view.row_errors.get(&row.id) {
         ui.horizontal(|ui| {
@@ -525,6 +536,10 @@ fn toggle(ui: &mut Ui, open: Option<bool>, stroke: Stroke, hover: Color32) -> bo
     let color = if response.hovered() { hover } else { stroke.color };
     paint_chevron(ui, rect.center(), open, Stroke { color, ..stroke });
     response.clicked()
+}
+
+fn glyph_size(ui: &Ui) -> Vec2 {
+    Vec2::new(CHEVRON, ui.spacing().interact_size.y)
 }
 
 /// A chevron centred on `center`, pointing down when `open` and right
@@ -705,6 +720,8 @@ mod tests {
             chevron: Stroke::new(1.5_f32, Color32::GRAY),
             chevron_hover: Color32::WHITE,
             hidden_count: Color32::GRAY,
+            active_marker: Stroke::new(2.5_f32, Color32::WHITE),
+            active_background: Color32::from_rgb(40, 40, 60),
             add_button: ButtonStyle {
                 text: Color32::LIGHT_BLUE,
                 hover_text: Color32::WHITE,
@@ -1018,6 +1035,19 @@ mod tests {
         assert_eq!(h.text("parent").left(), h.text("alone").left());
         h.click(h.chevron("alone"));
         assert!(h.view.collapsed_tasks.is_empty());
+    }
+
+    #[test]
+    fn a_started_task_sits_on_the_active_background() {
+        let mut idle = pending("b", "idle");
+        idle.order = Some(2048);
+        let h = Harness::new(vec![Task { started: true, ..pending("a", "busy") }, idle]);
+        let filled = |text: &str| {
+            let at = h.text(text).center();
+            h.fills.iter().any(|(c, r)| *c == h.style.active_background && r.contains(at))
+        };
+        assert!(filled("busy"));
+        assert!(!filled("idle"));
     }
 
     #[test]

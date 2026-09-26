@@ -578,6 +578,9 @@ Whether session rows can be dragged, and how far a reorder may carry a session.
 
 How the tasks tab draws.
 
+- `active_background` (string): Background behind a started task's row. Unset is a faint tint of the tab's text color over the pane; set it to the terminal background to leave started rows unfilled.
+- `active_marker` (string): The chevron marking a started task. Unset uses the tab's text color.
+- `active_marker_thickness` (number, default `2.5`): Stroke width of the started-task chevron, in points.
 - `chevron` (string): The sub-task chevron. Unset uses the tab's hint color.
 - `chevron_hover` (string): The sub-task chevron under the pointer. Unset uses the tab's text color.
 - `chevron_thickness` (number, default `1.5`): Stroke width of the sub-task chevron, in points.
