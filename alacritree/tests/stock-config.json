@@ -571,6 +571,13 @@
     "sidebar_tooltips": "elided",
     "status_indicators": "dots",
     "tasks": {
+      "add_button": {
+        "fill": null,
+        "hover_fill": null,
+        "hover_text": null,
+        "pressed_fill": null,
+        "text": null
+      },
       "chevron": null,
       "chevron_hover": null,
       "chevron_thickness": 1.5,

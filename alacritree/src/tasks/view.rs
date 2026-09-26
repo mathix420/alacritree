@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use egui::{
-    Color32, Key, Modifiers, Response, RichText, ScrollArea, Sense, Shape, Stroke, TextEdit, Ui,
-    Vec2, vec2,
+    Color32, Key, Modifiers, Response, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind,
+    TextEdit, Ui, Vec2, WidgetText, vec2,
 };
 
 use alacritree_common::jobs::{self, Job, Priority};
@@ -340,6 +340,16 @@ pub(crate) struct Style {
     pub chevron: Stroke,
     pub chevron_hover: Color32,
     pub hidden_count: Color32,
+    pub add_button: ButtonStyle,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ButtonStyle {
+    pub text: Color32,
+    pub hover_text: Color32,
+    pub fill: Color32,
+    pub hover_fill: Color32,
+    pub pressed_fill: Color32,
 }
 
 fn show_section(ui: &mut Ui, view: &mut TasksView, section: &Section, allow_focus: bool, c: Style) {
@@ -368,7 +378,7 @@ fn show_section(ui: &mut Ui, view: &mut TasksView, section: &Section, allow_focu
     let adding_first = |n: &NewRow| n.node == section.node && n.after.is_none();
     if view.new_row.as_ref().is_some_and(adding_first) {
         show_new_row(ui, view, &tasks, c);
-    } else if ui.small_button(RichText::new("+ add a task").color(c.dim)).clicked() {
+    } else if button(ui, "+ add a task", c.add_button).clicked() {
         // Drawn below the last root row from the next frame on.
         let last_root = section.rows.iter().rev().find(|r| r.depth == 0).map(|r| r.id.clone());
         view.new_row = Some(NewRow {
@@ -529,6 +539,29 @@ fn paint_chevron(ui: &Ui, center: egui::Pos2, open: bool, stroke: Stroke) {
     ui.painter().add(Shape::line(points, stroke));
 }
 
+/// A filled button whose fill and label change under the pointer and
+/// again while pressed, outlined in the label color while either holds.
+fn button(ui: &mut Ui, label: &str, b: ButtonStyle) -> Response {
+    let galley =
+        WidgetText::from(label).into_galley(ui, None, f32::INFINITY, egui::TextStyle::Button);
+    let padding = ui.spacing().button_padding;
+    let (rect, response) = ui.allocate_exact_size(galley.size() + 2.0 * padding, Sense::click());
+    let (fill, text) = if response.is_pointer_button_down_on() {
+        (b.pressed_fill, b.hover_text)
+    } else if response.hovered() {
+        (b.hover_fill, b.hover_text)
+    } else {
+        (b.fill, b.text)
+    };
+    let radius = ui.visuals().widgets.inactive.corner_radius;
+    ui.painter().rect_filled(rect, radius, fill);
+    if response.hovered() {
+        ui.painter().rect_stroke(rect, radius, Stroke::new(1.0_f32, text), StrokeKind::Inside);
+    }
+    ui.painter().galley(rect.min + padding, galley, text);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// A store may reject an empty description, so a new row exists only here
 /// until it has text; leaving it empty drops it.
 fn show_new_row(ui: &mut Ui, view: &mut TasksView, tasks: &[Task], c: Style) {
@@ -672,6 +705,13 @@ mod tests {
             chevron: Stroke::new(1.5_f32, Color32::GRAY),
             chevron_hover: Color32::WHITE,
             hidden_count: Color32::GRAY,
+            add_button: ButtonStyle {
+                text: Color32::LIGHT_BLUE,
+                hover_text: Color32::WHITE,
+                fill: Color32::DARK_BLUE,
+                hover_fill: Color32::BLUE,
+                pressed_fill: Color32::BLUE,
+            },
         }
     }
 

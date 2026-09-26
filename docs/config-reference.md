@@ -583,6 +583,16 @@ How the tasks tab draws.
 - `chevron_thickness` (number, default `1.5`): Stroke width of the sub-task chevron, in points.
 - `hidden_count` (string): The `+N` count of sub-tasks a collapsed task hides. Unset uses the tab's hint color.
 
+### `[ui.tasks.add_button]`
+
+The `+ add a task` button under each section.
+
+- `fill` (string): Background. Unset tints the terminal background with the accent.
+- `hover_fill` (string): Background under the pointer. Unset is a stronger accent tint.
+- `hover_text` (string): Label color under the pointer and while pressed. Unset uses the tab's text color.
+- `pressed_fill` (string): Background while pressed. Unset is a stronger accent tint again.
+- `text` (string): Label color. Unset uses the sidebar accent.
+
 ### `[ui.wsl]`
 
 Deprecated WSL options, superseded by the top-level `[wsl]` table.

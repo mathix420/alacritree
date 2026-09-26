@@ -239,7 +239,14 @@ impl Theme {
             ok: rgb_to_color32(config.palette.normal[2]),
             editor_text,
             editor_hint,
-            tasks: tasks_style(&config.ui.tasks, editor_text, editor_hint, error),
+            tasks: tasks_style(
+                &config.ui.tasks,
+                editor_text,
+                editor_hint,
+                error,
+                accent,
+                terminal_bg,
+            ),
             git: GitColors {
                 added: rgb_to_color32(config.palette.normal[2]),
                 modified: rgb_to_color32(config.palette.normal[3]),
@@ -252,16 +259,20 @@ impl Theme {
 }
 
 /// `[ui.tasks]` with each unset color derived from the tab's text and hint
-/// colors.
+/// colors, and the add button tinted with the accent over the pane.
 fn tasks_style(
     tasks: &crate::config::TasksUi,
     text: Color32,
     hint: Color32,
     error: Color32,
+    accent: Color32,
+    background: Color32,
 ) -> crate::tasks::view::Style {
     let color = |c: Option<alacritty_terminal::vte::ansi::Rgb>, fallback| {
         c.map_or(fallback, rgb_to_color32)
     };
+    let tint = |amount| blend_toward(accent, background, amount);
+    let b = &tasks.add_button;
     crate::tasks::view::Style {
         text,
         dim: hint,
@@ -269,6 +280,13 @@ fn tasks_style(
         chevron: egui::Stroke::new(tasks.chevron_thickness, color(tasks.chevron, hint)),
         chevron_hover: color(tasks.chevron_hover, text),
         hidden_count: color(tasks.hidden_count, hint),
+        add_button: crate::tasks::view::ButtonStyle {
+            text: color(b.text, accent),
+            hover_text: color(b.hover_text, text),
+            fill: color(b.fill, tint(0.85)),
+            hover_fill: color(b.hover_fill, tint(0.70)),
+            pressed_fill: color(b.pressed_fill, tint(0.55)),
+        },
     }
 }
 

@@ -1125,6 +1125,16 @@ pub struct TasksUi {
     pub chevron_hover: Option<Rgb>,
     pub chevron_thickness: f32,
     pub hidden_count: Option<Rgb>,
+    pub add_button: TasksButton,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct TasksButton {
+    pub text: Option<Rgb>,
+    pub hover_text: Option<Rgb>,
+    pub fill: Option<Rgb>,
+    pub hover_fill: Option<Rgb>,
+    pub pressed_fill: Option<Rgb>,
 }
 
 impl Default for TasksUi {
@@ -2807,24 +2817,56 @@ struct RawUiTasks {
     /// The `+N` count of sub-tasks a collapsed task hides. Unset uses the
     /// tab's hint color.
     hidden_count: Option<RgbStr>,
+    /// The `+ add a task` button under each section.
+    add_button: RawTasksButton,
 }
 
 impl Default for RawUiTasks {
     fn default() -> Self {
-        Self { chevron: None, chevron_hover: None, chevron_thickness: 1.5, hidden_count: None }
+        Self {
+            chevron: None,
+            chevron_hover: None,
+            chevron_thickness: 1.5,
+            hidden_count: None,
+            add_button: RawTasksButton::default(),
+        }
     }
 }
 
 impl RawUiTasks {
     fn resolve(&self) -> TasksUi {
         let rgb = |c: &Option<RgbStr>| c.as_ref().map(|v| v.0);
+        let b = &self.add_button;
         TasksUi {
             chevron: rgb(&self.chevron),
             chevron_hover: rgb(&self.chevron_hover),
             chevron_thickness: self.chevron_thickness.max(0.5),
             hidden_count: rgb(&self.hidden_count),
+            add_button: TasksButton {
+                text: rgb(&b.text),
+                hover_text: rgb(&b.hover_text),
+                fill: rgb(&b.fill),
+                hover_fill: rgb(&b.hover_fill),
+                pressed_fill: rgb(&b.pressed_fill),
+            },
         }
     }
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default)]
+struct RawTasksButton {
+    /// Label color. Unset uses the sidebar accent.
+    text: Option<RgbStr>,
+    /// Label color under the pointer and while pressed. Unset uses the
+    /// tab's text color.
+    hover_text: Option<RgbStr>,
+    /// Background. Unset tints the terminal background with the accent.
+    fill: Option<RgbStr>,
+    /// Background under the pointer. Unset is a stronger accent tint.
+    hover_fill: Option<RgbStr>,
+    /// Background while pressed. Unset is a stronger accent tint again.
+    pressed_fill: Option<RgbStr>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -4936,7 +4978,7 @@ program = "second"
     fn tasks_colors_default_to_the_palette() {
         let tasks = ui_from_toml("").tasks;
         assert_eq!(tasks.chevron, None);
-        assert_eq!(tasks.hidden_count, None);
+        assert_eq!(tasks.add_button.fill, None);
     }
 
     #[test]
@@ -4946,11 +4988,14 @@ program = "second"
             [ui.tasks]
             chevron = "#89b4fa"
             chevron_thickness = 0.1
+            [ui.tasks.add_button]
+            hover_fill = "#313244"
             "##,
         )
         .tasks;
         assert_eq!(tasks.chevron, Some(Rgb { r: 0x89, g: 0xb4, b: 0xfa }));
         assert_eq!(tasks.chevron_thickness, 0.5);
+        assert_eq!(tasks.add_button.hover_fill, Some(Rgb { r: 0x31, g: 0x32, b: 0x44 }));
     }
 
     #[test]

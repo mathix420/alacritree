@@ -57,6 +57,11 @@ RawSet.red
 RawSet.white
 RawSet.yellow
 RawShell.program
+RawTasksButton.fill
+RawTasksButton.hover_fill
+RawTasksButton.hover_text
+RawTasksButton.pressed_fill
+RawTasksButton.text
 RawTerminal.shell
 RawTextEmphasis.color
 RawUi.default_profile
