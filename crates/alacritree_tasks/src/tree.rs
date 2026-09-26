@@ -1,5 +1,6 @@
 //! The tab's model: tasks split into scope sections, nested by `parent`,
-//! ordered by `order`, and the edits that inserting or indenting turns into.
+//! ordered by `order`, folded under collapsed rows, and the edits that
+//! inserting or indenting turns into.
 //! Free of egui so it can be tested without a frame.
 
 use std::collections::{HashMap, HashSet};
@@ -123,6 +124,24 @@ fn row(t: &Task, depth: usize) -> Row {
         status: t.status,
         started: t.started,
     }
+}
+
+/// How many rows after `rows[i]` sit below it.
+pub fn descendants(rows: &[Row], i: usize) -> usize {
+    rows[i + 1..].iter().take_while(|r| r.depth > rows[i].depth).count()
+}
+
+/// The rows left showing when each row in `collapsed` hides the ones below
+/// it, each with its descendant count.
+pub fn fold<'a>(rows: &'a [Row], collapsed: &HashSet<String>) -> Vec<(&'a Row, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        let below = descendants(rows, i);
+        out.push((&rows[i], below));
+        i += 1 + if collapsed.contains(&rows[i].id) { below } else { 0 };
+    }
+    out
 }
 
 fn siblings<'a>(tasks: &[&'a Task], parent: Option<&str>) -> Vec<&'a Task> {
@@ -259,6 +278,25 @@ mod tests {
         let t = [task("a", "r", Some("b"), Some(1)), task("b", "r", Some("a"), Some(2))];
         let got = rows(&refs(&t));
         assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn a_collapsed_task_hides_its_whole_subtree_and_nothing_after() {
+        let t = [
+            task("a", "r", None, Some(1024)),
+            task("a1", "r", Some("a"), Some(1024)),
+            task("a1x", "r", Some("a1"), Some(1024)),
+            task("a2", "r", Some("a"), Some(2048)),
+            task("b", "r", None, Some(2048)),
+        ];
+        let all = rows(&refs(&t));
+        let shown = |collapsed: &[&str]| -> Vec<(&str, usize)> {
+            let collapsed = collapsed.iter().map(|id| id.to_string()).collect();
+            fold(&all, &collapsed).into_iter().map(|(r, below)| (r.id.as_str(), below)).collect()
+        };
+        assert_eq!(shown(&["a"]), [("a", 3), ("b", 0)]);
+        assert_eq!(shown(&["a1"]), [("a", 3), ("a1", 1), ("a2", 0), ("b", 0)]);
+        assert_eq!(shown(&["b"]).len(), 5, "a leaf has nothing to hide");
     }
 
     #[test]

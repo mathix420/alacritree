@@ -113,6 +113,8 @@ pub(crate) struct TasksView {
     added: Vec<NewRow>,
     new_row: Option<NewRow>,
     collapsed: HashSet<String>,
+    /// Tasks whose sub-tasks are hidden, by id.
+    collapsed_tasks: HashSet<String>,
 }
 
 impl TasksView {
@@ -148,6 +150,7 @@ impl TasksView {
             added: Vec::new(),
             new_row: None,
             collapsed: HashSet::new(),
+            collapsed_tasks: HashSet::new(),
         }
     }
 
@@ -170,10 +173,7 @@ impl TasksView {
                 let rows = &section.rows;
                 let anchor =
                     add.after.as_ref().and_then(|id| rows.iter().position(|r| &r.id == id));
-                let at = anchor.map_or(rows.len(), |i| {
-                    let below = rows[i + 1..].iter().take_while(|r| r.depth > rows[i].depth);
-                    i + 1 + below.count()
-                });
+                let at = anchor.map_or(rows.len(), |i| i + 1 + tree::descendants(rows, i));
                 section.rows.insert(at, Row {
                     id: String::new(),
                     depth: add.depth,
@@ -363,8 +363,8 @@ fn show_section(
         return;
     }
     let tasks = view.section_tasks(&section.node);
-    for row in &section.rows {
-        show_row(ui, view, section, &tasks, row, allow_focus, c);
+    for (row, below) in tree::fold(&section.rows, &view.collapsed_tasks) {
+        show_row(ui, view, section, &tasks, row, below, allow_focus, c);
         let follows = |n: &NewRow| n.node == section.node && n.after.as_deref() == Some(&row.id);
         if view.new_row.as_ref().is_some_and(follows) {
             show_new_row(ui, view, &tasks);
@@ -386,12 +386,14 @@ fn show_section(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn show_row(
     ui: &mut Ui,
     view: &mut TasksView,
     section: &Section,
     tasks: &[Task],
     row: &Row,
+    below: usize,
     allow_focus: bool,
     c: Colors,
 ) {
@@ -415,6 +417,15 @@ fn show_row(
         }
         if row.started {
             ui.label(RichText::new(">").color(c.text));
+        }
+        let collapsed = below > 0 && view.collapsed_tasks.contains(&row.id);
+        if collapsed
+            && ui
+                .small_button(RichText::new(format!("+{below}")).color(c.dim))
+                .on_hover_text("Show sub-tasks")
+                .clicked()
+        {
+            view.collapsed_tasks.remove(&row.id);
         }
         let mut buffer = view.drafts.get(&row.id).cloned().unwrap_or_else(|| row.text.clone());
         // Backspace on a row that is already empty deletes it. TextEdit reads
@@ -442,6 +453,14 @@ fn show_row(
                     ui.close_menu();
                 }
             }
+            if below > 0 && ui.button(if collapsed { "Expand" } else { "Collapse" }).clicked() {
+                if collapsed {
+                    view.collapsed_tasks.remove(&row.id);
+                } else {
+                    view.collapsed_tasks.insert(row.id.clone());
+                }
+                ui.close_menu();
+            }
         });
         if edit.has_focus() {
             let (tab, shift_tab, erase) = ui.input_mut(|i| {
@@ -452,7 +471,14 @@ fn show_row(
                 )
             });
             if tab {
-                view.write(Some(row.id.clone()), tree::indent(&refs, &row.id));
+                let edits = tree::indent(&refs, &row.id);
+                // A row indented under a collapsed task would vanish mid-edit.
+                for edit in &edits {
+                    if let Edit::Move { parent: Some(parent), .. } = edit {
+                        view.collapsed_tasks.remove(parent);
+                    }
+                }
+                view.write(Some(row.id.clone()), edits);
             }
             if shift_tab {
                 view.write(Some(row.id.clone()), tree::dedent(&refs, &row.id));
@@ -707,14 +733,18 @@ mod tests {
         }
 
         fn click(&mut self, pos: Pos2) {
-            let button = |pressed| Event::PointerButton {
-                pos,
-                button: PointerButton::Primary,
-                pressed,
-                modifiers: Modifiers::NONE,
-            };
-            self.frame(vec![Event::PointerMoved(pos), button(true)]);
-            self.frame(vec![button(false)]);
+            self.press(pos, PointerButton::Primary);
+        }
+
+        fn right_click(&mut self, pos: Pos2) {
+            self.press(pos, PointerButton::Secondary);
+        }
+
+        fn press(&mut self, pos: Pos2, button: PointerButton) {
+            let event =
+                |pressed| Event::PointerButton { pos, button, pressed, modifiers: Modifiers::NONE };
+            self.frame(vec![Event::PointerMoved(pos), event(true)]);
+            self.frame(vec![event(false)]);
             self.frame(Vec::new());
         }
 
@@ -839,5 +869,48 @@ mod tests {
         assert!(matches!(h.ops.as_slice(), [(None, edits)] if edits.len() == 1), "{:?}", h.ops);
 
         assert_eq!(h.view.plain_lines(), ["## global", "- [ ] milk"]);
+    }
+
+    fn child(id: &str, parent: &str, text: &str) -> Task {
+        Task { parent: Some(parent.into()), ..pending(id, text) }
+    }
+
+    #[test]
+    fn collapsing_a_task_hides_its_subtasks_until_expanded() {
+        let mut h = Harness::new(vec![
+            pending("a", "parent"),
+            child("b", "a", "child"),
+            child("c", "b", "grandchild"),
+        ]);
+        h.right_click(h.text("parent").center());
+        h.click(h.text("Collapse").center());
+        assert_eq!(h.visible("child"), None);
+        assert_eq!(h.visible("grandchild"), None);
+        assert_eq!(h.view.plain_lines().len(), 4, "agents still read every task");
+
+        h.click(h.text("+2").center());
+        h.text("child");
+        h.text("grandchild");
+    }
+
+    #[test]
+    fn indenting_under_a_collapsed_task_expands_it() {
+        let mut h = Harness::new(vec![pending("a", "parent"), child("a1", "a", "child"), Task {
+            order: Some(2048),
+            ..pending("b", "next")
+        }]);
+        h.right_click(h.text("parent").center());
+        h.click(h.text("Collapse").center());
+        h.edit_end("next");
+        h.key(Key::Tab);
+        h.text("child");
+    }
+
+    #[test]
+    fn a_task_without_subtasks_offers_no_collapse() {
+        let mut h = Harness::new(vec![pending("a", "alone")]);
+        h.right_click(h.text("alone").center());
+        h.text("Start");
+        assert_eq!(h.visible("Collapse"), None);
     }
 }
