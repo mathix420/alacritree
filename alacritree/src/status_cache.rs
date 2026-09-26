@@ -160,8 +160,8 @@ impl StatusCache {
         }
 
         let hint_changed = self.last_hint.as_deref() != default_branch_hint;
-        let stale = self.last_refreshed.map_or(true, |when| when.elapsed() > REFRESH_INTERVAL);
-        let needs_refresh = self.last_refreshed.is_none() || hint_changed || stale;
+        let stale = self.last_refreshed.is_none_or(|when| when.elapsed() > REFRESH_INTERVAL);
+        let needs_refresh = hint_changed || stale;
 
         if needs_refresh && self.pending.is_none() {
             self.pending = Some(spawn_compute(

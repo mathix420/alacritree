@@ -11,6 +11,8 @@ use crate::config::IntegrationsConfig;
 
 #[derive(Debug, Clone, Delegate)]
 #[delegate(VersionControl)]
+// Only the test-only fake is large, so the size spread never ships.
+#[cfg_attr(test, allow(clippy::large_enum_variant))]
 pub enum Vcs {
     Git(GitBackend),
     #[cfg(test)]
