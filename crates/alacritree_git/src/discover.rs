@@ -510,7 +510,14 @@ worktree /home/lev/wt/tmp\0HEAD 0011223344556677\0detached\0\0";
         let backend = GitBackend;
         assert!(backend.claims(&bare));
         let repo = jobs::on_this_thread(|b| backend.discover(&bare, &[], false, b)).unwrap();
-        assert!(repo.checkouts.iter().any(|c| c.path == wt), "{:?}", repo.checkouts);
+        // Git reports the long form of a temp dir Windows may hand out as an
+        // 8.3 short path, so the paths compare canonicalized.
+        let wt = wt.canonicalize().unwrap();
+        assert!(
+            repo.checkouts.iter().any(|c| c.path.canonicalize().ok().as_ref() == Some(&wt)),
+            "{:?}",
+            repo.checkouts
+        );
     }
 
     #[test]
