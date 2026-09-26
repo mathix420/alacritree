@@ -59,6 +59,8 @@ below is hard-coded.
 | `Shift+PageDown`     | Scroll one page down                                  |
 | `Shift+Tab`          | Send `CSI Z` (reverse tab — readline/vim)             |
 | `Alt+Shift+Tab`      | Send `ESC` + `CSI Z`                                  |
+| `Tab` / `Shift+Tab`  | Tasks tab: indent / dedent the current task           |
+| `Alt+Up` / `Alt+Down`| Tasks tab: move the current task up / down            |
 | `Ctrl+Shift+B`       | Toggle keyboard focus between terminal and sidebar    |
 | `Ctrl+Shift+G`       | Move focus to the git status sidebar                  |
 | `Ctrl+Shift+W`       | Close the cursored session (sidebar) or the current shell |
@@ -249,6 +251,15 @@ caret there; bind them elsewhere if you want the caret back.
   the cursored workspace's active session when the cursor is on a Home or worktree
   row; from the terminal it moves the session on screen. How far a session may
   travel is `[ui.session_reorder] scope`. No default keys.
+
+### Tasks tab
+
+These act on the tasks tab's current task: the row being edited, or the last one that was. They fire only while the tasks tab is focused, so their keys reach the shell in every other session, and the palette lists them only while a task integration is on.
+
+- `IndentTask` / `DedentTask`: nest the task under the one above it, or move it back out to its parent's level. Default keys `Tab` / `Shift+Tab`.
+- `MoveTaskUp` / `MoveTaskDown`: move the task past its neighbouring sibling. Default keys `Alt+Up` / `Alt+Down`.
+- `DeleteTask`: delete the task, asking first when it has subtasks, which go with it. No default key.
+- `ToggleCompletedTasks`: show or hide completed tasks. No default key.
 
 ### Focus navigation
 

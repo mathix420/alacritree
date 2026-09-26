@@ -22,6 +22,11 @@ pub struct PersistedState {
     /// Per-worktree override of the branch the git panel diffs against.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub base_branches: Vec<PersistedBaseBranch>,
+    /// Tasks tab sections drawn folded, by project node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collapsed_task_sections: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hide_completed_tasks: bool,
 }
 
 /// The `default_true` attributes above only speak for a file that omits the
@@ -34,6 +39,8 @@ impl Default for PersistedState {
             show_left_sidebar: true,
             show_right_sidebar: true,
             base_branches: Vec::new(),
+            collapsed_task_sections: Vec::new(),
+            hide_completed_tasks: false,
         }
     }
 }

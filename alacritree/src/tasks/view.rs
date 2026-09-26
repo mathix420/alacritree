@@ -2,26 +2,30 @@
 //! rows. Each change is a batch of edits on the pool, typed text shows at
 //! once, and a reload replaces it with what the store holds. Agents write
 //! the same store, so the tab re-lists while visible instead of trusting its
-//! own copy.
+//! own copy. The last listing is kept on disk, so the tab opens on it and the
+//! first listing only corrects it.
 
 use alacritree_vcs::Checkout;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use egui::{
-    Color32, Key, Modifiers, Response, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind,
-    TextEdit, Ui, Vec2, WidgetText, vec2,
+    Align, Color32, DragAndDrop, Frame, Id, Key, Layout, Margin, Modal, Modifiers, Response,
+    RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextEdit, Ui, Vec2, WidgetText, vec2,
 };
 
 use alacritree_common::jobs::{self, Job, Priority};
 use alacritree_common::side::Side;
 use alacritree_common::wsl;
 use alacritree_tasks::scope::{GLOBAL, Place, node};
-use alacritree_tasks::tree::{self, Row, Section};
+use alacritree_tasks::tree::{self, Landing, Row, Section};
 use alacritree_tasks::{Edit, Filter, NodeMatch, Status, Task, TaskBackend, TaskError};
 
+use crate::bindings::{NamedAction, action};
 use crate::projects::Project;
+use crate::shortcut::Shortcuts;
+use crate::state::PersistedState;
 use crate::tasks::backend::{self, Backend};
 use crate::tasks::facts;
 use crate::vcs::Vcs;
@@ -75,6 +79,97 @@ impl Scope {
     pub(crate) fn filter(&self) -> Filter {
         let repo = self.repo.iter().map(|repo| NodeMatch::Subtree(repo.clone()));
         Filter { nodes: repo.chain([NodeMatch::Exact(GLOBAL.to_string())]).collect() }
+    }
+
+    /// The listing's file under the cache directory. Two scopes that differ
+    /// only in characters a file name cannot hold share one file, which the
+    /// first listing corrects.
+    fn cache_file(&self, dir: &Path) -> PathBuf {
+        let side = match &self.side {
+            Side::Native => "native".to_string(),
+            Side::Wsl(distro) => format!("wsl-{distro}"),
+        };
+        let name: String = format!("{side}-{}", self.repo.as_deref().unwrap_or(GLOBAL))
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '_' })
+            .collect();
+        dir.join(format!("{name}.json"))
+    }
+}
+
+/// What a task action does to the row it runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowAction {
+    Indent,
+    Dedent,
+    MoveUp,
+    MoveDown,
+    Delete,
+}
+
+impl RowAction {
+    const MENU: [Self; 5] =
+        [Self::Indent, Self::Dedent, Self::MoveUp, Self::MoveDown, Self::Delete];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Indent => "Indent",
+            Self::Dedent => "Dedent",
+            Self::MoveUp => "Move up",
+            Self::MoveDown => "Move down",
+            Self::Delete => "Delete",
+        }
+    }
+
+    /// The action a binding names, whose keys the menu shows.
+    fn named(self) -> NamedAction {
+        match self {
+            Self::Indent => NamedAction::IndentTask(action::IndentTask),
+            Self::Dedent => NamedAction::DedentTask(action::DedentTask),
+            Self::MoveUp => NamedAction::MoveTaskUp(action::MoveTaskUp),
+            Self::MoveDown => NamedAction::MoveTaskDown(action::MoveTaskDown),
+            Self::Delete => NamedAction::DeleteTask(action::DeleteTask),
+        }
+    }
+}
+
+/// What the tab keeps in `state.toml`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Prefs {
+    /// Sections drawn folded, by node.
+    pub collapsed: HashSet<String>,
+    pub hide_completed: bool,
+}
+
+impl Prefs {
+    pub(crate) fn from_state(state: &PersistedState) -> Self {
+        Self {
+            collapsed: state.collapsed_task_sections.iter().cloned().collect(),
+            hide_completed: state.hide_completed_tasks,
+        }
+    }
+}
+
+/// One change to [`Prefs`], for the app to persist and hand the other tabs.
+/// A change rather than the whole set, since other windows write the same
+/// file.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PrefChange {
+    Collapsed { node: String, collapsed: bool },
+    HideCompleted(bool),
+}
+
+impl PrefChange {
+    pub(crate) fn persist(&self, state: &mut PersistedState) {
+        match self {
+            Self::Collapsed { node, collapsed } => {
+                state.collapsed_task_sections.retain(|n| n != node);
+                if *collapsed {
+                    state.collapsed_task_sections.push(node.clone());
+                }
+            },
+            Self::HideCompleted(hide) => state.hide_completed_tasks = *hide,
+        }
     }
 }
 
@@ -155,12 +250,46 @@ struct NewRow {
     focus: bool,
 }
 
+/// A delete that would take subtasks with it, waiting for a yes.
+struct ConfirmDelete {
+    id: String,
+    text: String,
+    subtasks: usize,
+}
+
+/// Where a drawn row's text starts and ends, for the arrow that steps into it.
+struct RowSpot {
+    id: String,
+    first_line_chars: usize,
+    last_line_start: usize,
+    last_line_chars: usize,
+}
+
+/// Where the cursor sat in the focused row last frame. Up on the first line
+/// or Down on the last one steps to the next row instead of moving within it.
+struct Caret {
+    id: String,
+    first_line: bool,
+    last_line: bool,
+    column: usize,
+}
+
+/// The payload a row's grip carries while it is dragged.
+struct DraggedTask {
+    id: String,
+    node: String,
+}
+
 pub(crate) struct TasksView {
     backend: Backend,
     scope: Scope,
     /// The worktree's names as `task scope` reads them from git.
     resolving: Option<Resolver>,
     tasks: Vec<Task>,
+    /// Whether a listing has landed, so an empty tab can say it is waiting.
+    loaded: bool,
+    cache_dir: Option<PathBuf>,
+    cache_write: Option<Job<()>>,
     load_error: Option<String>,
     /// A failed add has no row to show on; it stays until the next write.
     write_error: Option<String>,
@@ -176,31 +305,48 @@ pub(crate) struct TasksView {
     /// Typed text a reload has not confirmed yet, by id.
     drafts: HashMap<String, String>,
     /// What the rows show until a listing started after every write has
-    /// landed: toggled statuses, deleted rows, and added rows.
+    /// landed: toggled statuses, deleted rows, moved rows and added rows.
     statuses: HashMap<String, Status>,
     deleted: HashSet<String>,
+    moves: Vec<Edit>,
     added: Vec<NewRow>,
     new_row: Option<NewRow>,
-    collapsed: HashSet<String>,
     /// Tasks whose sub-tasks are hidden, by id.
     collapsed_tasks: HashSet<String>,
+    /// The row a task action runs on: the one being edited, or the last one
+    /// that was, so the palette can still reach it.
+    current: Option<String>,
+    confirm: Option<ConfirmDelete>,
+    /// The rows drawn last frame, top to bottom across every section.
+    spots: Vec<RowSpot>,
+    drawing: Vec<RowSpot>,
+    caret: Option<Caret>,
+    prefs: Prefs,
+    pref_changes: Vec<PrefChange>,
 }
 
 impl TasksView {
-    /// Shows `scope` at once, and switches to the names git gives `worktree`
-    /// once they are read.
+    /// Shows `scope` at once, from the last listing under `cache_dir` when
+    /// there is one, and switches to the names git gives `worktree` once
+    /// they are read.
     pub(crate) fn new(
         backend: Backend,
         scope: Scope,
         worktree: Option<PathBuf>,
         backends: Vec<Vcs>,
+        prefs: Prefs,
+        cache_dir: Option<PathBuf>,
     ) -> Self {
         let resolving = worktree.map(|dir| Resolver::new(dir, backends));
+        let tasks = cache_dir.as_deref().and_then(|dir| read_cache(&scope.cache_file(dir)));
         Self {
             backend,
             scope,
             resolving,
-            tasks: Vec::new(),
+            tasks: tasks.unwrap_or_default(),
+            loaded: false,
+            cache_dir,
+            cache_write: None,
             load_error: None,
             write_error: None,
             reload: None,
@@ -213,28 +359,43 @@ impl TasksView {
             drafts: HashMap::new(),
             statuses: HashMap::new(),
             deleted: HashSet::new(),
+            moves: Vec::new(),
             added: Vec::new(),
             new_row: None,
-            collapsed: HashSet::new(),
             collapsed_tasks: HashSet::new(),
+            current: None,
+            confirm: None,
+            spots: Vec::new(),
+            drawing: Vec::new(),
+            caret: None,
+            prefs,
+            pref_changes: Vec::new(),
         }
     }
 
-    /// The store's sections with the unconfirmed changes laid over them.
-    /// An added row has no id yet.
-    fn sections(&self) -> Vec<Section> {
-        let mut sections = tree::sections(
-            &self.tasks,
-            self.scope.repo.as_deref(),
-            self.scope.workspace.as_deref(),
-        );
-        for section in &mut sections {
-            section.rows.retain(|r| !self.deleted.contains(&r.id));
-            for row in &mut section.rows {
-                if let Some(status) = self.statuses.get(&row.id) {
-                    row.status = *status;
-                }
+    /// The store's tasks with the unconfirmed toggles, deletes and moves
+    /// laid over them.
+    fn shown_tasks(&self) -> Vec<Task> {
+        let mut tasks: Vec<Task> =
+            self.tasks.iter().filter(|t| !self.deleted.contains(&t.id)).cloned().collect();
+        for task in &mut tasks {
+            if let Some(status) = self.statuses.get(&task.id) {
+                task.status = *status;
             }
+        }
+        for edit in &self.moves {
+            tree::replay(&mut tasks, edit);
+        }
+        tasks
+    }
+
+    /// The shown tasks as sections, with the added rows placed in them. An
+    /// added row has no id yet.
+    fn sections(&self) -> Vec<Section> {
+        let tasks = self.shown_tasks();
+        let mut sections =
+            tree::sections(&tasks, self.scope.repo.as_deref(), self.scope.workspace.as_deref());
+        for section in &mut sections {
             for add in self.added.iter().filter(|a| a.node == section.node) {
                 let rows = &section.rows;
                 let anchor =
@@ -246,6 +407,7 @@ impl TasksView {
                     text: add.text.clone(),
                     status: Status::Pending,
                     started: false,
+                    subtasks: tree::Progress::default(),
                 });
             }
         }
@@ -264,8 +426,100 @@ impl TasksView {
         lines
     }
 
-    fn section_tasks(&self, node: &str) -> Vec<Task> {
-        self.tasks.iter().filter(|t| t.node() == node).cloned().collect()
+    /// Runs `action` on the current row. Waits out an open delete prompt,
+    /// so a key pressed under it does not act on the row behind it.
+    pub(crate) fn act(&mut self, action: RowAction) {
+        if self.confirm.is_some() {
+            return;
+        }
+        if let Some(id) = self.current.clone() {
+            self.act_on(&id, action);
+        }
+    }
+
+    fn act_on(&mut self, id: &str, action: RowAction) {
+        let shown = self.shown_tasks();
+        let Some(task) = shown.iter().find(|t| t.id == id) else { return };
+        let refs: Vec<&Task> = shown.iter().filter(|t| t.node() == task.node()).collect();
+        let edits = match action {
+            RowAction::Indent => tree::indent(&refs, id),
+            RowAction::Dedent => tree::dedent(&refs, id),
+            RowAction::MoveUp => tree::move_up(&refs, id),
+            RowAction::MoveDown => tree::move_down(&refs, id),
+            RowAction::Delete => {
+                let subtasks = tree::descendant_ids(&refs, id).len();
+                if subtasks == 0 {
+                    self.delete(id);
+                } else {
+                    let text = task.description.clone();
+                    self.confirm = Some(ConfirmDelete { id: id.to_string(), text, subtasks });
+                }
+                return;
+            },
+        };
+        // A row moved under a collapsed task would vanish mid-edit.
+        for edit in &edits {
+            if let Edit::Move { parent: Some(parent), .. } = edit {
+                self.collapsed_tasks.remove(parent);
+            }
+        }
+        self.rearrange(id, edits);
+    }
+
+    /// Deletes `id` and everything nested below it, the subtasks first so a
+    /// failure part way never leaves them orphaned at the top level.
+    fn delete(&mut self, id: &str) {
+        let shown = self.shown_tasks();
+        let refs: Vec<&Task> = shown.iter().collect();
+        let mut ids = tree::descendant_ids(&refs, id);
+        ids.push(id.to_string());
+        for gone in &ids {
+            self.drafts.remove(gone);
+            self.deleted.insert(gone.clone());
+        }
+        if self.current.as_ref().is_some_and(|c| ids.contains(c)) {
+            self.current = None;
+        }
+        self.write(Some(id.to_string()), ids.into_iter().map(Edit::Delete).collect());
+    }
+
+    /// Writes edits that place `id`, and shows them before the store has.
+    fn rearrange(&mut self, id: &str, edits: Vec<Edit>) {
+        let placing =
+            edits.iter().filter(|e| matches!(e, Edit::Move { .. } | Edit::Reorder { .. }));
+        self.moves.extend(placing.cloned());
+        self.write(Some(id.to_string()), edits);
+    }
+
+    fn toggle_collapsed(&mut self, node: &str) {
+        let collapsed = !self.prefs.collapsed.contains(node);
+        let change = PrefChange::Collapsed { node: node.to_string(), collapsed };
+        self.apply_pref(&change);
+        self.pref_changes.push(change);
+    }
+
+    pub(crate) fn toggle_completed(&mut self) {
+        let change = PrefChange::HideCompleted(!self.prefs.hide_completed);
+        self.apply_pref(&change);
+        self.pref_changes.push(change);
+    }
+
+    /// Takes a change another tab made, or this one.
+    pub(crate) fn apply_pref(&mut self, change: &PrefChange) {
+        match change {
+            PrefChange::Collapsed { node, collapsed: true } => {
+                self.prefs.collapsed.insert(node.clone());
+            },
+            PrefChange::Collapsed { node, collapsed: false } => {
+                self.prefs.collapsed.remove(node);
+            },
+            PrefChange::HideCompleted(hide) => self.prefs.hide_completed = *hide,
+        }
+    }
+
+    /// The changes made since the last call, for the app to persist.
+    pub(crate) fn take_pref_changes(&mut self) -> Vec<PrefChange> {
+        std::mem::take(&mut self.pref_changes)
     }
 
     fn write(&mut self, row: Option<String>, edits: Vec<Edit>) {
@@ -305,6 +559,7 @@ impl TasksView {
         match result {
             Ok(tasks) => {
                 self.load_error = None;
+                self.loaded = true;
                 // A draft stays until the store holds its text or the task
                 // is gone.
                 self.drafts
@@ -315,12 +570,23 @@ impl TasksView {
                 if settled {
                     self.statuses.clear();
                     self.deleted.clear();
+                    self.moves.clear();
                     self.added.clear();
+                }
+                if tasks != self.tasks {
+                    self.save_cache(&tasks);
                 }
                 self.tasks = tasks;
             },
             Err(e) => self.load_error = Some(e.to_string()),
         }
+    }
+
+    fn save_cache(&mut self, tasks: &[Task]) {
+        let Some(dir) = &self.cache_dir else { return };
+        let (path, tasks) = (self.scope.cache_file(dir), tasks.to_vec());
+        let job = jobs::pool().spawn(Priority::Background, move |_| write_cache(&path, &tasks));
+        self.cache_write = Some(job);
     }
 
     /// Spawns queued writes, drains finished jobs, and reloads after any
@@ -369,9 +635,49 @@ impl TasksView {
     }
 }
 
-pub(crate) fn show(ui: &mut Ui, view: &mut TasksView, allow_focus: bool, style: Style) -> Response {
+#[cfg(test)]
+impl TasksView {
+    /// A tab showing `tasks` with `current` as the row actions run on, and no
+    /// backend or cache behind it.
+    pub(crate) fn for_test(tasks: Vec<Task>, current: &str) -> Self {
+        let backend = Backend::from_config(&Default::default());
+        let scope = Scope::for_workspace(None, None);
+        let mut view = Self::new(backend, scope, None, Vec::new(), Prefs::default(), None);
+        view.tasks = tasks;
+        view.current = Some(current.to_string());
+        view
+    }
+}
+
+fn read_cache(path: &Path) -> Option<Vec<Task>> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+/// Through a file beside it and a rename, so another window opening the tab
+/// never reads half a listing.
+fn write_cache(path: &Path, tasks: &[Task]) {
+    let result = (|| -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let partial = path.with_extension(format!("json.{}", std::process::id()));
+        std::fs::write(&partial, serde_json::to_vec(tasks)?)?;
+        std::fs::rename(&partial, path)
+    })();
+    if let Err(e) = result {
+        log::debug!("cannot cache the task listing at {}: {e}", path.display());
+    }
+}
+
+pub(crate) fn show(
+    ui: &mut Ui,
+    view: &mut TasksView,
+    allow_focus: bool,
+    shortcuts: &Shortcuts,
+    style: Style,
+) -> Response {
     view.tick();
-    let response = draw(ui, view, allow_focus, style);
+    let response = draw(ui, view, allow_focus, shortcuts, style);
     if view.outbox.is_empty() {
         ui.ctx().request_repaint_after(RELOAD_EVERY);
     } else {
@@ -380,18 +686,39 @@ pub(crate) fn show(ui: &mut Ui, view: &mut TasksView, allow_focus: bool, style: 
     response
 }
 
-fn draw(ui: &mut Ui, view: &mut TasksView, allow_focus: bool, style: Style) -> Response {
+fn draw(
+    ui: &mut Ui,
+    view: &mut TasksView,
+    allow_focus: bool,
+    shortcuts: &Shortcuts,
+    style: Style,
+) -> Response {
     // Registered before the rows: egui gives a click to the last widget
     // registered under the pointer, so every row widget wins over this.
     let background = ui.interact(ui.max_rect(), ui.id().with("tasks-tab"), Sense::click());
-    ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        for e in view.load_error.iter().chain(&view.write_error) {
-            ui.label(RichText::new(e).color(style.error));
-        }
-        for section in view.sections() {
-            show_section(ui, view, &section, allow_focus, style);
-        }
+    if background.clicked() {
+        view.current = None;
+    }
+    let paint = Paint { allow_focus, shortcuts, c: style };
+    Frame::default().inner_margin(Margin::symmetric(10, 6)).show(ui, |ui| {
+        ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            for e in view.load_error.iter().chain(&view.write_error) {
+                ui.label(RichText::new(e).color(style.error));
+            }
+            let label = if view.prefs.hide_completed { "show completed" } else { "hide completed" };
+            if button(ui, label, style.add_button).clicked() {
+                view.toggle_completed();
+            }
+            if !view.loaded && view.tasks.is_empty() && view.load_error.is_none() {
+                ui.label(RichText::new("loading tasks").color(style.dim));
+            }
+            for section in view.sections() {
+                show_section(ui, view, &section, &paint);
+            }
+        });
     });
+    view.spots = std::mem::take(&mut view.drawing);
+    show_confirm(ui.ctx(), view);
     background
 }
 
@@ -419,23 +746,31 @@ pub(crate) struct ButtonStyle {
     pub pressed_fill: Color32,
 }
 
-fn show_section(ui: &mut Ui, view: &mut TasksView, section: &Section, allow_focus: bool, c: Style) {
-    let open = !view.collapsed.contains(&section.node);
+struct Paint<'a> {
+    allow_focus: bool,
+    shortcuts: &'a Shortcuts,
+    c: Style,
+}
+
+fn show_section(ui: &mut Ui, view: &mut TasksView, section: &Section, paint: &Paint<'_>) {
+    let c = paint.c;
+    let open = !view.prefs.collapsed.contains(&section.node);
     let done = section.rows.iter().filter(|r| r.status == Status::Completed).count();
     let header = format!("{}  {done}/{}", section.node, section.rows.len());
     if heading(ui, open, &header, c).clicked() {
-        if open {
-            view.collapsed.insert(section.node.clone());
-        } else {
-            view.collapsed.remove(&section.node);
-        }
+        view.toggle_collapsed(&section.node);
     }
     if !open {
         return;
     }
-    let tasks = view.section_tasks(&section.node);
-    for (row, below) in tree::fold(&section.rows, &view.collapsed_tasks) {
-        show_row(ui, view, section, &tasks, row, below, allow_focus, c);
+    let tasks: Vec<Task> =
+        view.shown_tasks().into_iter().filter(|t| t.node() == section.node).collect();
+    let rows = match view.prefs.hide_completed {
+        true => tree::without_completed(section.rows.clone()),
+        false => section.rows.clone(),
+    };
+    for (row, below) in tree::fold(&rows, &view.collapsed_tasks) {
+        show_row(ui, view, section, &tasks, row, below, paint);
         let follows = |n: &NewRow| n.node == section.node && n.after.as_deref() == Some(&row.id);
         if view.new_row.as_ref().is_some_and(follows) {
             show_new_row(ui, view, &tasks, c);
@@ -465,12 +800,15 @@ fn show_row(
     tasks: &[Task],
     row: &Row,
     below: usize,
-    allow_focus: bool,
-    c: Style,
+    paint: &Paint<'_>,
 ) {
+    let c = paint.c;
     if row.id.is_empty() {
-        ui.horizontal(|ui| {
+        ui.horizontal_top(|ui| {
             ui.add_space(row.depth as f32 * INDENT);
+            // Drawn so the row does not shift once the store gives it an id,
+            // though nothing can be dragged before then.
+            grip(ui, c, Sense::hover());
             toggle(ui, None, c.chevron, c.chevron_hover);
             ui.add_enabled(false, egui::Checkbox::without_text(&mut false));
             ui.label(RichText::new(&row.text).color(c.dim));
@@ -478,12 +816,27 @@ fn show_row(
         return;
     }
     let refs: Vec<&Task> = tasks.iter().collect();
-    // Reserved before the row's widgets so the fill paints under them once
+    let id = Id::new(("task-row", &row.id));
+    let mut buffer = view.drafts.get(&row.id).cloned().unwrap_or_else(|| row.text.clone());
+    // Read before the text field: it would take Enter as a line break, and
+    // Backspace on a row that is already empty deletes the row instead.
+    let (enter, erase) = match ui.memory(|m| m.has_focus(id)) {
+        true => ui.input_mut(|i| {
+            let enter = i.consume_key(Modifiers::NONE, Key::Enter);
+            (enter, buffer.is_empty() && i.consume_key(Modifiers::NONE, Key::Backspace))
+        }),
+        false => (false, false),
+    };
+    step_at_edge(ui, view, &row.id);
+    // Reserved before the row's widgets so the fills paint under them once
     // the row's full rect is known.
     let background = ui.painter().add(Shape::Noop);
-    let line = ui.horizontal(|ui| {
+    let highlight = ui.painter().add(Shape::Noop);
+    let collapsed = view.collapsed_tasks.contains(&row.id);
+    let line = ui.horizontal_top(|ui| {
         ui.add_space(row.depth as f32 * INDENT);
-        let collapsed = view.collapsed_tasks.contains(&row.id);
+        grip(ui, c, Sense::drag())
+            .dnd_set_drag_payload(DraggedTask { id: row.id.clone(), node: section.node.clone() });
         if toggle(ui, (below > 0).then_some(!collapsed), c.chevron, c.chevron_hover)
             && !view.collapsed_tasks.remove(&row.id)
         {
@@ -503,83 +856,69 @@ fn show_row(
         if collapsed && below > 0 {
             ui.label(RichText::new(format!("+{below}")).color(c.hidden_count));
         }
-        let mut buffer = view.drafts.get(&row.id).cloned().unwrap_or_else(|| row.text.clone());
-        // Backspace on a row that is already empty deletes it. TextEdit reads
-        // key events without consuming them, so the press that empties the
-        // row is still in the queue after it.
-        let was_empty = buffer.is_empty();
         // Locking focus keeps Tab for indenting instead of moving to the
         // next widget.
-        let edit = ui.add_enabled(
-            allow_focus,
-            TextEdit::singleline(&mut buffer)
-                .frame(false)
-                .lock_focus(true)
-                .text_color(if checked { c.dim } else { c.text })
-                .desired_width(f32::INFINITY),
-        );
-        if edit.changed() {
-            view.drafts.insert(row.id.clone(), buffer.clone());
+        let field = TextEdit::multiline(&mut buffer)
+            .id(id)
+            .desired_rows(1)
+            .frame(false)
+            .lock_focus(true)
+            .text_color(if checked { c.dim } else { c.text })
+            .desired_width(f32::INFINITY);
+        let show = |ui: &mut Ui| ui.add_enabled_ui(paint.allow_focus, |ui| field.show(ui)).inner;
+        let subtasks = row.subtasks;
+        if subtasks.total == 0 {
+            return show(ui);
         }
-        edit.context_menu(|ui| {
-            for (label, start) in [("Start", true), ("Stop", false)] {
-                if ui.button(label).clicked() {
-                    let id = row.id.clone();
-                    view.write_one(&row.id, if start { Edit::Start(id) } else { Edit::Stop(id) });
-                    ui.close_menu();
-                }
-            }
-        });
-        if edit.has_focus() {
-            let (tab, shift_tab, erase) = ui.input_mut(|i| {
-                (
-                    i.consume_key(Modifiers::NONE, Key::Tab),
-                    i.consume_key(Modifiers::SHIFT, Key::Tab),
-                    was_empty && i.consume_key(Modifiers::NONE, Key::Backspace),
-                )
-            });
-            if tab {
-                let edits = tree::indent(&refs, &row.id);
-                // A row indented under a collapsed task would vanish mid-edit.
-                for edit in &edits {
-                    if let Edit::Move { parent: Some(parent), .. } = edit {
-                        view.collapsed_tasks.remove(parent);
-                    }
-                }
-                view.write(Some(row.id.clone()), edits);
-            }
-            if shift_tab {
-                view.write(Some(row.id.clone()), tree::dedent(&refs, &row.id));
-            }
-            if erase {
-                view.drafts.remove(&row.id);
-                view.deleted.insert(row.id.clone());
-                view.write_one(&row.id, Edit::Delete(row.id.clone()));
-            }
-        }
-        if edit.lost_focus() {
-            let text = buffer.trim().to_string();
-            if text != row.text && !text.is_empty() {
-                view.write_one(&row.id, Edit::Describe { id: row.id.clone(), description: text });
-            } else {
-                view.drafts.remove(&row.id);
-            }
-            if ui.input(|i| i.key_pressed(Key::Enter)) {
-                view.new_row = Some(NewRow {
-                    node: section.node.clone(),
-                    after: Some(row.id.clone()),
-                    depth: row.depth,
-                    text: String::new(),
-                    focus: true,
-                });
-            }
-        }
+        let counter = format!("({}/{})", subtasks.done, subtasks.total);
+        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+            ui.label(RichText::new(counter).color(c.dim));
+            show(ui)
+        })
+        .inner
     });
+    let output = line.inner;
+    record_spot(view, &row.id, &output);
+    let edit = output.response;
+    if edit.changed() {
+        view.drafts.insert(row.id.clone(), buffer.clone());
+    }
+    edit.context_menu(|ui| row_menu(ui, view, &row.id, paint.shortcuts));
+    if edit.has_focus() {
+        view.current = Some(row.id.clone());
+    }
+    if erase {
+        view.act_on(&row.id, RowAction::Delete);
+    }
+    if enter {
+        // The new row takes focus next frame, and this one commits its text
+        // as it loses it.
+        view.new_row = Some(NewRow {
+            node: section.node.clone(),
+            after: Some(row.id.clone()),
+            depth: row.depth,
+            text: String::new(),
+            focus: true,
+        });
+    }
+    if edit.lost_focus() {
+        let text = one_line(&buffer);
+        if text != row.text && !text.is_empty() {
+            view.write_one(&row.id, Edit::Describe { id: row.id.clone(), description: text });
+        } else {
+            view.drafts.remove(&row.id);
+        }
+    }
+    let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), line.response.rect.y_range());
     if row.started {
         let radius = ui.visuals().widgets.inactive.corner_radius;
-        let fill = Shape::rect_filled(line.response.rect, radius, c.active_background);
-        ui.painter().set(background, fill);
+        ui.painter().set(background, Shape::rect_filled(rect, radius, c.active_background));
     }
+    if view.current.as_deref() == Some(&row.id) && !edit.has_focus() {
+        let fill = ui.visuals().faint_bg_color;
+        ui.painter().set(highlight, Shape::rect_filled(rect, 2.0, fill));
+    }
+    accept_drop(ui, view, section, &refs, row, rect, c);
     // Below the row, since the text beside it takes the full width.
     if let Some(e) = view.row_errors.get(&row.id) {
         ui.horizontal(|ui| {
@@ -667,27 +1006,206 @@ fn button(ui: &mut Ui, label: &str, b: ButtonStyle) -> Response {
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Keeps where this row's text lines start for the arrows, and, when it has
+/// focus, which line the cursor is on.
+fn record_spot(view: &mut TasksView, id: &str, output: &egui::text_edit::TextEditOutput) {
+    let lines = &output.galley.rows;
+    let before_last = lines.len().saturating_sub(1);
+    view.drawing.push(RowSpot {
+        id: id.to_string(),
+        first_line_chars: lines.first().map_or(0, |l| l.char_count_excluding_newline()),
+        last_line_start: lines[..before_last]
+            .iter()
+            .map(|l| l.char_count_including_newline())
+            .sum(),
+        last_line_chars: lines.last().map_or(0, |l| l.char_count_excluding_newline()),
+    });
+    if !output.response.has_focus() {
+        return;
+    }
+    view.caret = output.cursor_range.filter(|range| range.is_empty()).map(|range| {
+        let at = range.primary.rcursor;
+        Caret {
+            id: id.to_string(),
+            first_line: at.row == 0,
+            last_line: at.row >= before_last,
+            column: at.column,
+        }
+    });
+}
+
+/// Up on the focused row's first line moves to the row above, landing on its
+/// last line at the same column, and Down on the last line moves to the row
+/// below. Unmodified only, so Shift+arrows still select.
+fn step_at_edge(ui: &mut Ui, view: &mut TasksView, id: &str) {
+    let Some(caret) = view.caret.as_ref().filter(|c| c.id == id) else { return };
+    if !ui.memory(|m| m.has_focus(Id::new(("task-row", id)))) {
+        return;
+    }
+    let (up, down) = ui.input_mut(|i| {
+        (
+            caret.first_line && take_plain(i, Key::ArrowUp),
+            caret.last_line && take_plain(i, Key::ArrowDown),
+        )
+    });
+    let Some(at) = view.spots.iter().position(|s| s.id == id) else { return };
+    let target = match (up, down) {
+        (true, _) => at.checked_sub(1).and_then(|i| view.spots.get(i)),
+        (_, true) => view.spots.get(at + 1),
+        _ => None,
+    };
+    let Some(target) = target else { return };
+    let index = match up {
+        true => target.last_line_start + caret.column.min(target.last_line_chars),
+        false => caret.column.min(target.first_line_chars),
+    };
+    let target_id = Id::new(("task-row", &target.id));
+    let mut state = egui::text_edit::TextEditState::load(ui.ctx(), target_id).unwrap_or_default();
+    let cursor = egui::text::CCursorRange::one(egui::text::CCursor::new(index));
+    state.cursor.set_char_range(Some(cursor));
+    state.store(ui.ctx(), target_id);
+    ui.memory_mut(|m| m.request_focus(target_id));
+    view.current = Some(target.id.clone());
+    view.caret = None;
+}
+
+fn take_plain(input: &mut egui::InputState, key: Key) -> bool {
+    let pressed = |e: &egui::Event| matches!(e, egui::Event::Key { key: k, pressed: true, modifiers, .. } if *k == key && modifiers.is_none());
+    let at = input.events.iter().position(pressed);
+    at.map(|at| input.events.remove(at)).is_some()
+}
+
+/// A description is one line, so a pasted break or tab becomes a space.
+fn one_line(text: &str) -> String {
+    text.replace(['\r', '\n', '\t'], " ").trim().to_string()
+}
+
+fn row_menu(ui: &mut Ui, view: &mut TasksView, id: &str, shortcuts: &Shortcuts) {
+    for (label, start) in [("Start", true), ("Stop", false)] {
+        if ui.button(label).clicked() {
+            let edit = if start { Edit::Start(id.to_string()) } else { Edit::Stop(id.to_string()) };
+            view.write_one(id, edit);
+            ui.close_menu();
+        }
+    }
+    for action in RowAction::MENU {
+        if action == RowAction::Delete || action == RowAction::Indent {
+            ui.separator();
+        }
+        let mut button = egui::Button::new(action.label());
+        if let Some(keys) = crate::command_palette::first_key(shortcuts, action.named()) {
+            button = button.shortcut_text(keys);
+        }
+        if ui.add(button).clicked() {
+            view.act_on(id, action);
+            ui.close_menu();
+        }
+    }
+}
+
+const GRIP_WIDTH: f32 = 12.0;
+
+fn grip(ui: &mut Ui, c: Style, sense: Sense) -> Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(GRIP_WIDTH, ui.spacing().interact_size.y), sense);
+    let lit = response.dragged() || (response.hovered() && sense.senses_drag());
+    let color = if lit { c.text } else { c.dim };
+    let font = egui::FontId::proportional(12.0);
+    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "⠿", font, color);
+    response
+}
+
+/// A task dragged over `row` from the same section lands beside it, on the
+/// side of the row the pointer is on. Read from the raw payload rather than a
+/// drop zone widget, so no extra rect takes the row's own hover.
+fn accept_drop(
+    ui: &mut Ui,
+    view: &mut TasksView,
+    section: &Section,
+    refs: &[&Task],
+    row: &Row,
+    rect: egui::Rect,
+    c: Style,
+) {
+    let Some(dragged) = DragAndDrop::payload::<DraggedTask>(ui.ctx()) else { return };
+    if dragged.node != section.node || dragged.id == row.id {
+        return;
+    }
+    let pointer = ui.input(|i| i.pointer.interact_pos()).filter(|p| rect.contains(*p));
+    let Some(pointer) = pointer else { return };
+    let landing = if pointer.y < rect.center().y { Landing::Before } else { Landing::After };
+    let y = match landing {
+        Landing::Before => rect.top(),
+        Landing::After => rect.bottom(),
+    };
+    ui.painter().hline(rect.x_range(), y, Stroke::new(2.0_f32, c.text));
+    if ui.input(|i| i.pointer.any_released()) {
+        let edits = tree::move_to(refs, &dragged.id, &row.id, landing);
+        view.rearrange(&dragged.id, edits);
+        DragAndDrop::clear_payload(ui.ctx());
+    }
+}
+
+fn show_confirm(ctx: &egui::Context, view: &mut TasksView) {
+    let Some(confirm) = &view.confirm else { return };
+    let mut answer = None;
+    let modal = Modal::new(Id::new("tasks-confirm-delete")).show(ctx, |ui| {
+        let noun = if confirm.subtasks == 1 { "subtask" } else { "subtasks" };
+        ui.label(format!("Delete \"{}\" and its {} {noun}?", confirm.text, confirm.subtasks));
+        ui.horizontal(|ui| {
+            if ui.button("Delete").clicked() {
+                answer = Some(true);
+            }
+            if ui.button("Cancel").clicked() {
+                answer = Some(false);
+            }
+        });
+        if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter)) {
+            answer = Some(true);
+        }
+    });
+    if answer.is_none() && modal.should_close() {
+        answer = Some(false);
+    }
+    match answer {
+        Some(true) => {
+            let id = view.confirm.take().map(|c| c.id).expect("present above");
+            view.delete(&id);
+        },
+        Some(false) => view.confirm = None,
+        None => {},
+    }
+}
+
 /// A store may reject an empty description, so a new row exists only here
 /// until it has text; leaving it empty drops it.
 fn show_new_row(ui: &mut Ui, view: &mut TasksView, tasks: &[Task], c: Style) {
     let Some(new) = view.new_row.as_mut() else { return };
     let mut committed = None;
     let mut dropped = false;
+    let mut focused = false;
     ui.horizontal(|ui| {
-        ui.add_space(new.depth as f32 * INDENT);
+        ui.add_space(new.depth as f32 * INDENT + GRIP_WIDTH);
         toggle(ui, None, c.chevron, c.chevron_hover);
         let edit = ui.add(
-            TextEdit::singleline(&mut new.text).hint_text("new task").desired_width(f32::INFINITY),
+            TextEdit::singleline(&mut new.text)
+                .hint_text("new task")
+                .lock_focus(true)
+                .desired_width(f32::INFINITY),
         );
         if new.focus {
             edit.request_focus();
             new.focus = false;
         }
+        focused = edit.has_focus();
         if edit.lost_focus() {
-            let text = new.text.trim().to_string();
+            let text = one_line(&new.text);
             if text.is_empty() { dropped = true } else { committed = Some(text) }
         }
     });
+    if focused {
+        view.current = None;
+    }
     if dropped {
         view.new_row = None;
     }
@@ -824,7 +1342,8 @@ mod tests {
     #[test]
     fn a_listing_that_panicked_does_not_stop_reloads() {
         let backend = Backend::from_config(&Default::default());
-        let mut view = TasksView::new(backend, Scope::for_workspace(None, None), None, Vec::new());
+        let scope = Scope::for_workspace(None, None);
+        let mut view = TasksView::new(backend, scope, None, Vec::new(), Prefs::default(), None);
         view.reload = Some((0, Job::panicked()));
         view.last_reload = Some(Instant::now());
         view.tick();
@@ -879,7 +1398,7 @@ mod tests {
     }
 
     use egui::epaint::ClippedShape;
-    use egui::{CentralPanel, Event, PointerButton, Pos2, RawInput, Rect, Shape, Vec2};
+    use egui::{CentralPanel, Event, PointerButton, Pos2, RawInput, Rect, Vec2};
 
     fn test_style() -> Style {
         Style {
@@ -910,11 +1429,27 @@ mod tests {
         }
     }
 
+    fn child(id: &str, text: &str, parent: &str) -> Task {
+        Task { parent: Some(parent.into()), ..pending(id, text) }
+    }
+
+    fn view_with(tasks: Vec<Task>, cache_dir: Option<PathBuf>) -> TasksView {
+        let scope = Scope::for_workspace(None, None);
+        let backend = Backend::from_config(&Default::default());
+        let mut view =
+            TasksView::new(backend, scope, None, Vec::new(), Prefs::default(), cache_dir);
+        if !tasks.is_empty() {
+            view.tasks = tasks;
+        }
+        view
+    }
+
     /// The tab drawn frame by frame with real egui input and no backend:
     /// writes collect in `ops` instead of reaching the pool.
     struct Harness {
         ctx: egui::Context,
         view: TasksView,
+        shortcuts: Shortcuts,
         ops: Vec<QueuedWrite>,
         /// Painted text and where it shows, clipped to what is on screen.
         texts: Vec<(String, Rect)>,
@@ -950,19 +1485,18 @@ mod tests {
 
     impl Harness {
         fn new(tasks: Vec<Task>) -> Self {
-            let ctx = egui::Context::default();
-            let scope = Scope::for_workspace(None, None);
-            let mut view =
-                TasksView::new(Backend::from_config(&Default::default()), scope, None, Vec::new());
-            view.tasks = tasks;
-            let (ops, texts, fills, paths) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            Self::with_view(view_with(tasks, None))
+        }
+
+        fn with_view(view: TasksView) -> Self {
             let mut h = Self {
-                ctx,
+                ctx: egui::Context::default(),
                 view,
-                ops,
-                texts,
-                fills,
-                paths,
+                shortcuts: Shortcuts::new(&[]),
+                ops: Vec::new(),
+                texts: Vec::new(),
+                fills: Vec::new(),
+                paths: Vec::new(),
                 background_clicked: false,
                 style: test_style(),
             };
@@ -976,12 +1510,12 @@ mod tests {
                 events,
                 ..Default::default()
             };
-            let view = &mut self.view;
+            let (view, shortcuts) = (&mut self.view, &self.shortcuts);
             let mut clicked = false;
             let style = self.style;
             let out = self.ctx.run(input, |ctx| {
                 CentralPanel::default().show(ctx, |ui| {
-                    clicked = draw(ui, view, true, style).clicked();
+                    clicked = draw(ui, view, true, shortcuts, style).clicked();
                 });
             });
             self.background_clicked = clicked;
@@ -1025,25 +1559,29 @@ mod tests {
             self.checkbox(text) - vec2(22.0, 0.0)
         }
 
-        fn click(&mut self, pos: Pos2) {
-            let button = |pressed| Event::PointerButton {
-                pos,
-                button: PointerButton::Primary,
-                pressed,
-                modifiers: Modifiers::NONE,
-            };
-            self.frame(vec![Event::PointerMoved(pos), button(true)]);
-            self.frame(vec![button(false)]);
+        fn press(&mut self, pos: Pos2, button: PointerButton) {
+            let event =
+                |pressed| Event::PointerButton { pos, button, pressed, modifiers: Modifiers::NONE };
+            self.frame(vec![Event::PointerMoved(pos), event(true)]);
+            self.frame(vec![event(false)]);
             self.frame(Vec::new());
         }
 
+        fn click(&mut self, pos: Pos2) {
+            self.press(pos, PointerButton::Primary);
+        }
+
         fn key(&mut self, key: Key) {
+            self.key_with(key, Modifiers::NONE);
+        }
+
+        fn key_with(&mut self, key: Key, modifiers: Modifiers) {
             self.frame(vec![Event::Key {
                 key,
                 physical_key: None,
                 pressed: true,
                 repeat: false,
-                modifiers: Modifiers::NONE,
+                modifiers,
             }]);
             self.frame(Vec::new());
         }
@@ -1054,8 +1592,12 @@ mod tests {
             self.click(Pos2::new(rect.right() + 200.0, rect.center().y));
         }
 
+        fn edits(&self) -> Vec<&Edit> {
+            self.ops.iter().flat_map(|(_, edits)| edits).collect()
+        }
+
         fn deleted(&self) -> bool {
-            self.ops.iter().flat_map(|(_, edits)| edits).any(|e| matches!(e, Edit::Delete(_)))
+            self.edits().iter().any(|e| matches!(e, Edit::Delete(_)))
         }
     }
 
@@ -1158,18 +1700,204 @@ mod tests {
         assert!(matches!(h.ops.as_slice(), [(None, edits)] if edits.len() == 1), "{:?}", h.ops);
 
         assert_eq!(h.view.plain_lines(), ["## global", "- [ ] milk"]);
+        let grips = h.texts.iter().filter(|(t, _)| t == "⠿").count();
+        assert_eq!(grips, 1, "the new row has its grip before the store answers");
     }
 
-    fn child(id: &str, parent: &str, text: &str) -> Task {
-        Task { parent: Some(parent.into()), ..pending(id, text) }
+    #[test]
+    fn enter_in_a_row_opens_a_new_row_below_it() {
+        let mut h = Harness::new(vec![pending("a", "one")]);
+        h.edit_end("one");
+        h.key(Key::Enter);
+        h.frame(vec![Event::Text("two".into())]);
+        h.key(Key::Enter);
+        assert_eq!(h.view.plain_lines(), ["## global", "- [ ] one", "- [ ] two"]);
+        assert!(!h.edits().iter().any(|e| matches!(e, Edit::Describe { .. })), "{:?}", h.ops);
+    }
+
+    fn two_rows() -> Harness {
+        let mut b = pending("b", "two");
+        b.order = Some(2048);
+        Harness::new(vec![pending("a", "one"), b])
+    }
+
+    #[test]
+    fn down_on_the_last_line_moves_to_the_next_row_at_the_same_column() {
+        let mut h = two_rows();
+        h.edit_end("one");
+        h.key(Key::ArrowDown);
+        assert_eq!(h.view.current.as_deref(), Some("b"));
+        h.frame(vec![Event::Text("!".into())]);
+        assert_eq!(h.view.drafts.get("b").map(String::as_str), Some("two!"));
+    }
+
+    #[test]
+    fn up_on_the_first_line_moves_to_the_row_above() {
+        let mut h = two_rows();
+        h.edit_end("two");
+        h.key(Key::ArrowUp);
+        assert_eq!(h.view.current.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn up_on_the_top_row_stays_put() {
+        let mut h = two_rows();
+        h.edit_end("one");
+        h.key(Key::ArrowUp);
+        assert_eq!(h.view.current.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn shift_down_selects_instead_of_leaving_the_row() {
+        let mut h = two_rows();
+        h.edit_end("one");
+        h.key_with(Key::ArrowDown, Modifiers::SHIFT);
+        assert_eq!(h.view.current.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn down_inside_a_wrapped_row_moves_within_it() {
+        let long = "word ".repeat(60).trim_end().to_string();
+        let mut h = Harness::new(vec![pending("a", &long), Task {
+            order: Some(2048),
+            ..pending("b", "two")
+        }]);
+        let rect = h.text(&long);
+        h.click(Pos2::new(rect.left() + 2.0, rect.top() + 3.0));
+        h.key(Key::ArrowDown);
+        assert_eq!(h.view.current.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn a_long_task_wraps_beside_its_checkbox() {
+        let long = "word ".repeat(60).trim_end().to_string();
+        let h = Harness::new(vec![pending("a", &long)]);
+        let rect = h.text(&long);
+        let line = h.text("+ add a task").height();
+        assert!(rect.height() > 2.0 * line, "{rect:?}");
+        assert!(rect.right() <= 800.0, "{rect:?}");
+    }
+
+    #[test]
+    fn a_parent_shows_how_many_subtasks_are_done() {
+        let mut done = child("a1", "first", "a");
+        done.status = Status::Completed;
+        let h = Harness::new(vec![pending("a", "big"), done, child("a2", "second", "a")]);
+        h.text("(1/2)");
+    }
+
+    #[test]
+    fn hiding_completed_leaves_them_out_and_is_remembered() {
+        let mut finished = pending("b", "finished");
+        finished.status = Status::Completed;
+        let mut h = Harness::new(vec![pending("a", "open"), finished]);
+        h.click(h.text("hide completed").center());
+        assert!(h.visible("finished").is_none());
+        h.text("open");
+        assert_eq!(h.view.take_pref_changes(), [PrefChange::HideCompleted(true)]);
+    }
+
+    #[test]
+    fn folding_a_section_is_remembered() {
+        let mut h = Harness::new(vec![pending("a", "one")]);
+        h.click(h.text("global  0/1").center());
+        assert!(h.visible("one").is_none());
+        assert_eq!(h.view.take_pref_changes(), [PrefChange::Collapsed {
+            node: GLOBAL.into(),
+            collapsed: true
+        }]);
+    }
+
+    #[test]
+    fn a_task_with_subtasks_is_deleted_only_once_confirmed() {
+        let mut h = Harness::new(vec![pending("a", "big"), child("a1", "small", "a")]);
+        h.view.act_on("a", RowAction::Delete);
+        // A new modal spends its first frame sizing itself, drawn invisible.
+        h.frame(Vec::new());
+        h.frame(Vec::new());
+        assert!(!h.deleted());
+        h.click(h.text("Delete").center());
+        assert_eq!(h.edits(), [&Edit::Delete("a1".into()), &Edit::Delete("a".into())]);
+        assert_eq!(h.view.plain_lines(), ["## global"]);
+    }
+
+    #[test]
+    fn a_cancelled_delete_keeps_the_task() {
+        let mut h = Harness::new(vec![pending("a", "big"), child("a1", "small", "a")]);
+        h.view.act_on("a", RowAction::Delete);
+        h.frame(Vec::new());
+        h.frame(Vec::new());
+        h.click(h.text("Cancel").center());
+        assert!(!h.deleted());
+        assert!(h.view.confirm.is_none());
+    }
+
+    #[test]
+    fn the_row_menu_deletes_a_task() {
+        let mut h = Harness::new(vec![pending("a", "one")]);
+        h.press(h.text("one").center(), PointerButton::Secondary);
+        h.click(h.text("Delete").center());
+        assert_eq!(h.edits(), [&Edit::Delete("a".into())]);
+    }
+
+    #[test]
+    fn a_move_shows_before_the_store_confirms_it() {
+        let mut b = pending("b", "two");
+        b.order = Some(2048);
+        let mut h = Harness::new(vec![pending("a", "one"), b]);
+        h.view.act_on("a", RowAction::MoveDown);
+        assert_eq!(h.view.plain_lines(), ["## global", "- [ ] two", "- [ ] one"]);
+        h.view.act_on("a", RowAction::MoveUp);
+        assert_eq!(h.view.plain_lines(), ["## global", "- [ ] one", "- [ ] two"]);
+    }
+
+    #[test]
+    fn dragging_a_row_above_another_moves_it_there() {
+        let mut b = pending("b", "two");
+        b.order = Some(2048);
+        let mut h = Harness::new(vec![pending("a", "one"), b]);
+        let grip = h.text("⠿").center();
+        let from = Pos2::new(grip.x, h.text("two").center().y);
+        let to = Pos2::new(400.0, h.text("one").top() + 1.0);
+        let button = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        h.frame(vec![Event::PointerMoved(from), button(from, true)]);
+        h.frame(vec![Event::PointerMoved(from + Vec2::new(0.0, -8.0))]);
+        h.frame(vec![Event::PointerMoved(to)]);
+        h.frame(vec![button(to, false)]);
+        assert_eq!(h.view.plain_lines(), ["## global", "- [ ] two", "- [ ] one"]);
+    }
+
+    #[test]
+    fn the_tab_opens_on_the_cached_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = Scope::for_workspace(None, None);
+        write_cache(&scope.cache_file(dir.path()), &[pending("a", "cached")]);
+        let view = view_with(Vec::new(), Some(dir.path().to_path_buf()));
+        assert_eq!(view.plain_lines(), ["## global", "- [ ] cached"]);
+    }
+
+    #[test]
+    fn separate_repos_and_sides_cache_apart() {
+        let dir = Path::new("cache");
+        let file = |side, repo: Option<&str>| {
+            Scope { side, repo: repo.map(Into::into), workspace: None }.cache_file(dir)
+        };
+        assert_ne!(file(Side::Native, Some("r")), file(Side::Native, Some("s")));
+        assert_ne!(file(Side::Native, Some("r")), file(Side::Wsl("Ubuntu".into()), Some("r")));
+        assert_eq!(file(Side::Native, Some("a/b")), dir.join("native-a_b.json"));
     }
 
     #[test]
     fn collapsing_a_task_hides_its_subtasks_until_expanded() {
         let mut h = Harness::new(vec![
             pending("a", "parent"),
-            child("b", "a", "child"),
-            child("c", "b", "grandchild"),
+            child("b", "child", "a"),
+            child("c", "grandchild", "b"),
         ]);
         let toggle = h.chevron("parent");
         h.click(toggle);
@@ -1186,19 +1914,20 @@ mod tests {
 
     #[test]
     fn indenting_under_a_collapsed_task_expands_it() {
-        let mut h = Harness::new(vec![pending("a", "parent"), child("a1", "a", "child"), Task {
+        let mut h = Harness::new(vec![pending("a", "parent"), child("a1", "child", "a"), Task {
             order: Some(2048),
             ..pending("b", "next")
         }]);
         h.click(h.chevron("parent"));
         h.edit_end("next");
-        h.key(Key::Tab);
+        h.view.act(RowAction::Indent);
+        h.frame(Vec::new());
         h.text("child");
     }
 
     #[test]
     fn a_leaf_lines_up_with_a_parent_and_has_no_toggle() {
-        let mut h = Harness::new(vec![pending("a", "parent"), child("a1", "a", "child"), Task {
+        let mut h = Harness::new(vec![pending("a", "parent"), child("a1", "child", "a"), Task {
             order: Some(2048),
             ..pending("b", "alone")
         }]);
@@ -1222,7 +1951,7 @@ mod tests {
 
     #[test]
     fn the_toggle_answers_across_a_square_the_row_tall() {
-        let mut h = Harness::new(vec![pending("a", "parent"), child("a1", "a", "child")]);
+        let mut h = Harness::new(vec![pending("a", "parent"), child("a1", "child", "a")]);
         // egui otherwise counts a click near a widget as on it, which would
         // hide how far the toggle's own rect reaches.
         h.ctx.style_mut(|s| s.interaction.interact_radius = 0.0);

@@ -14,6 +14,7 @@ use alacritree_common::jobs::Blocking;
 use alacritree_common::side::Side;
 use alacritree_common::tools::{self, Tool};
 use alacritree_common::wsl;
+use alacritree_common::wsl_helper::{self, TransportError};
 use alacritree_tasks::{Edit, Filter, NodeMatch, Status, Task, TaskBackend, TaskError};
 use serde::Deserialize;
 
@@ -229,6 +230,31 @@ fn edit_args(edit: &Edit) -> Vec<String> {
     }
 }
 
+/// Runs `task` for the resident WSL helper under a login shell, the PATH and
+/// profile the one-shot `sh -lc` gets. The helper discards a script's stderr,
+/// so the script prints stdout's length, stdout, then stderr.
+const HELPER_SCRIPT: &str = r#"o=$(mktemp) && e=$(mktemp) || exit 125
+sh -lc 'exec env "$@"' sh "$@" >"$o" 2>"$e"
+c=$?
+wc -c <"$o"
+cat "$o" "$e"
+rm -f "$o" "$e"
+exit "$c""#;
+
+/// What one `task` call printed, and how it exited.
+#[derive(Debug)]
+struct Ran {
+    code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl Ran {
+    fn success(&self) -> bool {
+        self.code == Some(0)
+    }
+}
+
 /// `task` as found on one side.
 struct Cli<'a> {
     side: Side,
@@ -238,7 +264,23 @@ struct Cli<'a> {
 
 impl Cli<'_> {
     /// One attempt, no overrides: what `task` itself would do with `args`.
-    fn spawn(&self, args: &[String]) -> Result<Output, TaskError> {
+    fn spawn(&self, args: &[String]) -> Result<Ran, TaskError> {
+        let helped = match &self.side {
+            Side::Wsl(distro) => self.via_helper(distro, args),
+            Side::Native => None,
+        };
+        let ran = match helped {
+            Some(ran) => ran?,
+            None => self.one_shot(args)?,
+        };
+        // A WSL login shell reports a missing program as 127, not ENOENT.
+        if ran.code == Some(127) {
+            return Err(TaskError::Missing { program: self.program.clone() });
+        }
+        Ok(ran)
+    }
+
+    fn one_shot(&self, args: &[String]) -> Result<Ran, TaskError> {
         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let (program, argv) = self.side.command(&self.program, &refs);
         // `output` drains both pipes while the child runs, which an export
@@ -250,21 +292,46 @@ impl Cli<'_> {
             .envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::null())
             .output();
-        let missing = || TaskError::Missing { program: self.program.clone() };
-        let output = match output {
-            Ok(output) => output,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(missing()),
-            Err(source) => return Err(TaskError::Spawn { program: self.program.clone(), source }),
-        };
-        // A WSL login shell reports a missing program as 127, not ENOENT.
-        if output.status.code() == Some(127) {
-            return Err(missing());
+        match output {
+            Ok(Output { status, stdout, stderr }) => {
+                Ok(Ran { code: status.code(), stdout, stderr })
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Err(TaskError::Missing { program: self.program.clone() })
+            },
+            Err(source) => Err(TaskError::Spawn { program: self.program.clone(), source }),
         }
-        Ok(output)
+    }
+
+    /// `None` when the distro's helper is not up, before anything was sent,
+    /// so the call falls back to a one-shot. A request the helper may have
+    /// run is never retried, since most calls write.
+    fn via_helper(&self, distro: &str, args: &[String]) -> Option<Result<Ran, TaskError>> {
+        let client = wsl_helper::client(distro)?;
+        let argv: Vec<String> = self
+            .env
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .chain(std::iter::once(self.program.clone()))
+            .chain(args.iter().cloned())
+            .collect();
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        Some(match client.run(HELPER_SCRIPT, &refs) {
+            Ok((exit, printed)) => {
+                split_helper_output(exit, &printed).ok_or_else(|| TaskError::Failed {
+                    program: self.program.clone(),
+                    stderr: format!("the wsl helper script exited {exit} without its output"),
+                })
+            },
+            Err(TransportError::NotWritten(_)) => return None,
+            Err(e @ TransportError::NoReply(_)) => {
+                Err(TaskError::Spawn { program: self.program.clone(), source: io::Error::other(e) })
+            },
+        })
     }
 
     // Runs on a pool worker, where waiting out a busy lock is the point.
-    fn run(&self, args: &[String]) -> Result<Output, TaskError> {
+    fn run(&self, args: &[String]) -> Result<Ran, TaskError> {
         let mut argv: Vec<String> =
             UDA_DECLARATIONS.iter().map(|(k, v)| format!("rc.{k}={v}")).collect();
         argv.push("rc.confirmation=off".into());
@@ -272,7 +339,7 @@ impl Cli<'_> {
         let mut retries = BUSY_RETRIES.iter();
         loop {
             let output = self.spawn(&argv)?;
-            if output.status.success() {
+            if output.success() {
                 return Ok(output);
             }
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -322,6 +389,17 @@ fn native_or_default_distro(native_found: bool, default_distro: Option<String>) 
         Some(distro) if !native_found => Side::Wsl(distro),
         _ => Side::Native,
     }
+}
+
+/// `HELPER_SCRIPT`'s output split back into stdout and stderr. `None` when
+/// the length line is missing, which means the script failed before `task`
+/// ran.
+fn split_helper_output(exit: i32, printed: &[u8]) -> Option<Ran> {
+    let newline = printed.iter().position(|&b| b == b'\n')?;
+    let len: usize = std::str::from_utf8(&printed[..newline]).ok()?.trim().parse().ok()?;
+    let rest = &printed[newline + 1..];
+    let (stdout, stderr) = rest.split_at_checked(len)?;
+    Some(Ran { code: Some(exit), stdout: stdout.to_vec(), stderr: stderr.to_vec() })
 }
 
 fn is_busy(stderr: &str) -> bool {
@@ -525,6 +603,40 @@ mod tests {
         let guide = Taskwarrior::default().agent_guide("r.main.codex-s1");
         assert!(guide.contains("task add project:r.main.codex-s1 order:<n> subof:"), "{guide}");
         assert!(guide.contains("alacritree task setup"), "{guide}");
+    }
+
+    /// The helper drops a script's stderr and carries no environment, so
+    /// both have to arrive some other way for a WSL call through it.
+    #[test]
+    fn a_wsl_call_through_the_helper_keeps_the_env_and_stderr() {
+        let Some((_dir, Side::Wsl(distro), tw)) = private() else { return };
+        let started = std::time::Instant::now();
+        while wsl_helper::client(&distro).is_none() {
+            assert!(started.elapsed() < Duration::from_secs(60), "the helper never came up");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let side = Side::Wsl(distro);
+        let data = tw.env.iter().find(|(k, _)| k == "TASKDATA").map(|(_, v)| v.clone());
+        let location = jobs::on_this_thread(|b| tw.on(side.clone(), b).rc_value("data.location"));
+        assert_eq!(location.unwrap(), data);
+        let missing = "00000000-0000-0000-0000-000000000000".to_string();
+        let err = jobs::on_this_thread(|b| tw.on(side.clone(), b).run(&[missing, "info".into()]))
+            .unwrap_err();
+        assert!(
+            matches!(&err, TaskError::Failed { stderr, .. } if stderr.contains("No matches")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_helper_output_splits_at_the_stdout_length() {
+        let ran = split_helper_output(1, b"  4\nout\nerr\n").unwrap();
+        assert_eq!(
+            (ran.code, ran.stdout, ran.stderr),
+            (Some(1), b"out\n".to_vec(), b"err\n".to_vec())
+        );
+        assert!(split_helper_output(125, b"").is_none(), "no length line");
+        assert!(split_helper_output(0, b"9\nshort").is_none(), "stdout cut short");
     }
 
     #[test]

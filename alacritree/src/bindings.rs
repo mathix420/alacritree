@@ -248,6 +248,18 @@ pub enum NamedAction {
     OpenScratchpad(action::OpenScratchpad),
     /// Open/select the current workspace's task list, or close it when active.
     OpenTasks(action::OpenTasks),
+    /// Nest the tasks tab's current task under the task above it.
+    IndentTask(action::IndentTask),
+    /// Lift the tasks tab's current task out to its parent's level.
+    DedentTask(action::DedentTask),
+    /// Move the tasks tab's current task above its previous sibling.
+    MoveTaskUp(action::MoveTaskUp),
+    /// Move the tasks tab's current task below its next sibling.
+    MoveTaskDown(action::MoveTaskDown),
+    /// Delete the tasks tab's current task, asking first when it has subtasks.
+    DeleteTask(action::DeleteTask),
+    /// Flip whether the tasks tab leaves out completed tasks.
+    ToggleCompletedTasks(action::ToggleCompletedTasks),
     ToggleLeftSidebar(action::ToggleLeftSidebar),
     ToggleRightSidebar(action::ToggleRightSidebar),
     AddProject(action::AddProject),
@@ -428,6 +440,21 @@ impl NamedAction {
         matches!(self, Self::CloseExitedSession(_))
     }
 
+    /// Valid only while a tasks tab is on screen and focused. The default
+    /// triggers are Tab, Shift+Tab and Alt+arrows, which belong to the PTY in
+    /// any other session.
+    pub fn is_tasks_scoped(&self) -> bool {
+        matches!(
+            self,
+            Self::IndentTask(_)
+                | Self::DedentTask(_)
+                | Self::MoveTaskUp(_)
+                | Self::MoveTaskDown(_)
+                | Self::DeleteTask(_)
+                | Self::ToggleCompletedTasks(_)
+        )
+    }
+
     /// The git sidebar's equivalent.
     pub fn is_git_filter_scoped(&self) -> bool {
         matches!(
@@ -535,6 +562,12 @@ impl NamedAction {
             Self::SelectPreviousWorkspace(_) => "Switch to the previous workspace".into(),
             Self::OpenScratchpad(_) => "Toggle the workspace scratchpad tab".into(),
             Self::OpenTasks(_) => "Toggle the workspace tasks tab".into(),
+            Self::IndentTask(_) => "Indent the current task".into(),
+            Self::DedentTask(_) => "Dedent the current task".into(),
+            Self::MoveTaskUp(_) => "Move the current task up".into(),
+            Self::MoveTaskDown(_) => "Move the current task down".into(),
+            Self::DeleteTask(_) => "Delete the current task".into(),
+            Self::ToggleCompletedTasks(_) => "Show or hide completed tasks".into(),
             Self::AddProject(_) => "Add a project to the sidebar".into(),
             Self::ToggleSidebarFocus(_) => {
                 "Toggle keyboard focus between terminal and sidebar".into()
@@ -898,6 +931,28 @@ fn default_bindings() -> Vec<KeyBinding> {
             key: Key::PageUp,
             mods: Modifiers::NONE,
             action: BindingAction::Named(SidebarPreviousProject(action::SidebarPreviousProject)),
+        },
+        // Tasks-tab scoped, so these keys still reach the PTY everywhere
+        // else. Alt+arrows move a line in most editors.
+        KeyBinding {
+            key: Key::Tab,
+            mods: Modifiers::NONE,
+            action: BindingAction::Named(IndentTask(action::IndentTask)),
+        },
+        KeyBinding {
+            key: Key::Tab,
+            mods: shift,
+            action: BindingAction::Named(DedentTask(action::DedentTask)),
+        },
+        KeyBinding {
+            key: Key::ArrowUp,
+            mods: alt,
+            action: BindingAction::Named(MoveTaskUp(action::MoveTaskUp)),
+        },
+        KeyBinding {
+            key: Key::ArrowDown,
+            mods: alt,
+            action: BindingAction::Named(MoveTaskDown(action::MoveTaskDown)),
         },
         KeyBinding {
             key: Key::R,

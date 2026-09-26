@@ -259,6 +259,36 @@ impl Action for action::OpenTasks {
     }
 }
 
+macro_rules! row_actions {
+    ($($name:ident => $row:ident),* $(,)?) => {
+        $(
+            impl Action for action::$name {
+                fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+                    if let Some(view) = app.active_tasks_view() {
+                        view.act(crate::tasks::view::RowAction::$row);
+                    }
+                }
+            }
+        )*
+    };
+}
+
+row_actions!(
+    IndentTask => Indent,
+    DedentTask => Dedent,
+    MoveTaskUp => MoveUp,
+    MoveTaskDown => MoveDown,
+    DeleteTask => Delete,
+);
+
+impl Action for action::ToggleCompletedTasks {
+    fn run(&self, app: &mut AlacritreeApp, _: &Context, _: ActionOrigin) {
+        if let Some(view) = app.active_tasks_view() {
+            view.toggle_completed();
+        }
+    }
+}
+
 impl Action for action::AddProject {
     fn run(&self, app: &mut AlacritreeApp, ctx: &Context, _: ActionOrigin) {
         app.add_project_via_dialog(ctx);

@@ -76,15 +76,20 @@ Every task belongs to one taskwarrior project, and the project name says which s
 
 Subtasks and ordering use two user-defined attributes: `subof` holds the parent's uuid and `order` places a task among its siblings. Run `alacritree task setup` once per machine. It declares both in the taskrc on Windows and in every WSL distro, so an agent calling `task` directly stores them instead of folding them into the description. While the tab is on, `alacritree doctor` reports whether each side has them.
 
-The tab shows the global section, the project, the workspace, and one section for each agent session under the workspace. Home shows only the global section. Clicking a section header collapses it. In a row:
+The tab shows the global section, the project, the workspace, and one section for each agent session under the workspace, newest session first. Home shows only the global section. Clicking a section header collapses it, and the tab remembers which sections are collapsed across restarts. "hide completed" at the top leaves out every completed task whose subtasks are all completed too (`ToggleCompletedTasks`), and is remembered the same way. Siblings keep the order they are moved into, whether done or not, and ties fall back to creation time and then the task's id. A parent shows how many of its direct subtasks are done, as `(done/total)`. Long text wraps beside its checkbox. In a row:
 
 - the checkbox completes the task, and clearing it makes the task pending again
 - Enter starts a new row below, and "+ add a task" starts one at the end of a section
 - Tab nests the row under the one above it, and Shift+Tab moves it back out
+- Up on a row's first line moves to the row above, and Down on its last line to the row below, keeping the column
+- Alt+Up and Alt+Down move the row past its neighbouring sibling
+- dragging the grip left of the checkbox moves the row beside the row it is dropped on, in the same section
 - Backspace on an empty row deletes the task
-- right-click starts or stops the task
+- right-click starts or stops the task, and indents, dedents, moves or deletes it, showing the key bound to each
 
-The tab reloads from taskwarrior every second while it is shown, so tasks an agent adds appear on their own. A project inside WSL reads and writes that distro's taskwarrior. Taskwarrior 3 has no Windows build, so a Windows project uses the default distro's taskwarrior when `task` is not on the Windows `PATH`. Linux and macOS always use the native install.
+Deleting a task that has subtasks deletes them too, after asking. The keys act on the row being edited, or the last one that was, which the tab highlights. They are the task actions under [Keyboard shortcuts](keyboard-shortcuts.md), so they can be rebound, and they fire only while the tasks tab is focused.
+
+The tab reloads from taskwarrior every second while it is shown, so tasks an agent adds appear on their own. The last listing for each project is kept in the local state directory, so reopening the tab shows it at once while the first reload runs. A project inside WSL reads and writes that distro's taskwarrior, through `[wsl] resident_helper` when it is on, so a call skips starting `wsl.exe`. Taskwarrior 3 has no Windows build, so a Windows project uses the default distro's taskwarrior when `task` is not on the Windows `PATH`. Linux and macOS always use the native install.
 
 #### A task store of your own
 
