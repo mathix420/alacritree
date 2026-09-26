@@ -1271,7 +1271,8 @@ pub struct UiTheme {
     /// unattached herdr row as occupying a workspace. Such a row is an agent
     /// nothing is attached to, and, once `show_panes` is on, an agentless
     /// pane. It is a `WorkspaceEntry::Pane`, not a [`crate::session::Session`],
-    /// so `false` reproduces the toggle's original session-only behavior.
+    /// so `false` reproduces the toggle's original session-only behavior and
+    /// leaves such rows out of the workspaces it keeps.
     pub sessions_filter_counts_detached: bool,
     /// What closing the last session in the on-screen workspace does.
     pub last_session_close: LastSessionClose,
@@ -2925,7 +2926,8 @@ struct RawUi {
     /// Whether the sidebar's sessions toggle counts an unattached herdr row
     /// the same as a live session: an agent nothing is attached to, and,
     /// once `show_panes` is on, an agentless pane.  Off keeps the toggle's
-    /// original session-only behavior.
+    /// original session-only behavior, and those rows stay hidden even under
+    /// a workspace a live session keeps.
     sessions_filter_counts_detached: bool,
     /// What happens when the on-screen workspace stops having sessions,
     /// whether a close or a worktree deletion took the last one:

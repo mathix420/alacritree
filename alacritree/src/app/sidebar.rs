@@ -84,6 +84,24 @@ impl AlacritreeApp {
         let any_pr = pr_open || pr_draft || pr_merged || pr_closed;
         let any_toggle = any_project_toggle_active(toggle_sessions, toggle_attention, any_pr);
 
+        // A detached pane the sessions filter does not count must not ride in
+        // under a workspace an attached session let through.
+        let attached_only: sidebar_nav::ListedRows;
+        let listed = if toggle_sessions && !self.sessions_filter_counts_detached {
+            attached_only = listed
+                .iter()
+                .map(|(ws, entries)| {
+                    (
+                        ws.clone(),
+                        entries.iter().filter(|e| e.session().is_some()).cloned().collect(),
+                    )
+                })
+                .collect();
+            &attached_only
+        } else {
+            listed
+        };
+
         // Precompute every fuzzy result before building the closures: the
         // matcher needs `&mut self.sidebar.filter`, and releasing that borrow
         // up-front lets the predicates read the rest of `&self` freely.

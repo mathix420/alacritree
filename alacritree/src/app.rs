@@ -7510,6 +7510,32 @@ mod tests {
         assert!(sessions_filter_passes(&[], &listed, &wt, true));
     }
 
+    /// A workspace an attached session lets through the sessions filter must
+    /// not bring its detached panes along unless the filter counts them.
+    #[test]
+    fn sessions_filter_lists_detached_panes_only_when_it_counts_them() {
+        let mut app = test_app();
+        let id = app.sessions[0].id;
+        let pane = herdr_pane_key(Side::Native, "term_home");
+        let listed = sidebar_nav::ListedRows::from([(None, vec![
+            sidebar_nav::WorkspaceEntry::Session(id),
+            sidebar_nav::WorkspaceEntry::Pane(pane.clone()),
+        ])]);
+        app.sidebar.filter.toggle('s');
+
+        assert_eq!(app.build_project_rows(&listed), vec![
+            SidebarRow::Home,
+            SidebarRow::Session(id)
+        ]);
+
+        app.sessions_filter_counts_detached = true;
+        assert_eq!(app.build_project_rows(&listed), vec![
+            SidebarRow::Home,
+            SidebarRow::Session(id),
+            SidebarRow::Pane(pane),
+        ]);
+    }
+
     #[test]
     fn sessions_filter_fails_a_workspace_with_neither_session_nor_agent() {
         let wt = ws("/a/wt1");
