@@ -354,6 +354,8 @@ impl TasksView {
         {
             self.reload = None;
             self.finish_reload(epoch, result);
+        } else if self.reload.as_ref().is_some_and(|(_, job)| job.failed()) {
+            self.reload = None;
         }
         let due = self.last_reload.is_none_or(|t| t.elapsed() >= RELOAD_EVERY);
         if self.reload.is_none() && (self.stale || due) {
@@ -815,6 +817,18 @@ mod tests {
             settle(&mut resolver, later),
             Some(Place::Workspace { repo: "myrepo".into(), branch: "trunk".into() })
         );
+    }
+
+    /// A listing that panicked frees the slot, so the next due tick lists
+    /// again instead of waiting on it forever.
+    #[test]
+    fn a_listing_that_panicked_does_not_stop_reloads() {
+        let backend = Backend::from_config(&Default::default());
+        let mut view = TasksView::new(backend, Scope::for_workspace(None, None), None, Vec::new());
+        view.reload = Some((0, Job::panicked()));
+        view.last_reload = Some(Instant::now());
+        view.tick();
+        assert!(view.reload.is_none());
     }
 
     #[test]
