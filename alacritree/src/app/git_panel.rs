@@ -814,13 +814,14 @@ fn section_header(
     let mut clicked = false;
     row_with_trailing(ui, leading, |ui| {
         let color = if button.active { theme.text } else { theme.text_muted };
+        let s = theme.ui_scale;
         let response = icon_tooltip(
-            ui.add(
-                egui::Label::new(RichText::new(button.label).color(color).small())
-                    .selectable(false)
-                    .sense(egui::Sense::click()),
-            )
-            .on_hover_cursor(egui::CursorIcon::PointingHand),
+            framed_button(
+                ui,
+                theme,
+                RichText::new(button.label).color(color).small(),
+                egui::vec2(4.0 * s, 1.0 * s),
+            ),
             "Review this section in the diff viewer",
             theme.icon_tooltips,
         );
@@ -1336,6 +1337,68 @@ mod tests {
         assert!(rows.rows.iter().all(|r| r.section != GitSection::Staged));
         assert_eq!(rows.rows.len(), 1);
         assert_eq!(working_section_title(&status), "Changes");
+    }
+
+    /// Paint a section header with a review button for a few frames with the
+    /// pointer at `pointer`, returning the last frame's shapes.
+    fn review_header_shapes(theme: &Theme, pointer: egui::Pos2) -> Vec<egui::Shape> {
+        let ctx = egui::Context::default();
+        let mut shapes = Vec::new();
+        for frame in 0..3 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(300.0, 100.0),
+                )),
+                time: Some(frame as f64),
+                events: vec![egui::Event::PointerMoved(pointer)],
+                ..Default::default()
+            };
+            let output = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let review = ReviewButton { label: "review", active: false };
+                    section_header(ui, theme, Some(review), |ui| {
+                        ui.label("Staged");
+                    });
+                });
+            });
+            shapes = output.shapes.into_iter().map(|clipped| clipped.shape).collect();
+        }
+        shapes
+    }
+
+    /// The fill of the tightest filled rect painted behind `text`, which
+    /// skips the panel background every widget sits on.
+    fn fill_behind(shapes: &[egui::Shape], text: &str) -> Option<(egui::Rect, Color32)> {
+        let text_rect = shapes.iter().find_map(|s| match s {
+            egui::Shape::Text(t) if t.galley.text() == text => {
+                Some(egui::Rect::from_min_size(t.pos, t.galley.size()))
+            },
+            _ => None,
+        })?;
+        shapes
+            .iter()
+            .filter_map(|s| match s {
+                egui::Shape::Rect(r)
+                    if r.rect.contains_rect(text_rect) && r.fill != Color32::TRANSPARENT =>
+                {
+                    Some((r.rect, r.fill))
+                },
+                _ => None,
+            })
+            .min_by(|(a, _), (b, _)| a.area().total_cmp(&b.area()))
+            .filter(|(rect, _)| rect.height() < 40.0)
+    }
+
+    #[test]
+    fn the_review_button_is_framed_and_lights_up_under_the_pointer() {
+        let theme = Theme::from_config(&crate::config::Config::default());
+        let away = egui::pos2(-100.0, -100.0);
+        let (rect, idle) = fill_behind(&review_header_shapes(&theme, away), "review")
+            .expect("the review button paints a filled frame");
+        let (_, hovered) = fill_behind(&review_header_shapes(&theme, rect.center()), "review")
+            .expect("the frame stays under the pointer");
+        assert_ne!(idle, hovered, "hovering must change the button's fill");
     }
 
     #[test]

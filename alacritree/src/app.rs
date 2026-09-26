@@ -84,9 +84,9 @@ use sidebar::{
 };
 use widgets::{
     ATTENTION_HINT, ICON_CLUSTER_SPACING, IconHints, ROW_STATUS_ICON_W, RowStatus,
-    apply_scrollbar_style, attention_mark, braille_loader, icon_tooltip, name_tooltip,
-    paint_cursor_outline, paint_row_status_icon, paint_status_mark, path_text, resolve_icon,
-    row_status_icon_size, row_with_trailing, session_status_mark, styled_icon_button,
+    apply_scrollbar_style, attention_mark, braille_loader, framed_button, icon_tooltip,
+    name_tooltip, paint_cursor_outline, paint_row_status_icon, paint_status_mark, path_text,
+    resolve_icon, row_status_icon_size, row_with_trailing, session_status_mark, styled_icon_button,
     truncating_label,
 };
 

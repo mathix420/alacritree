@@ -400,6 +400,28 @@ pub(super) fn styled_icon_button(
     resp
 }
 
+/// A text button framed and filled so it reads as clickable, with a brighter
+/// fill under the pointer.
+pub(super) fn framed_button(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    text: RichText,
+    padding: egui::Vec2,
+) -> egui::Response {
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = padding;
+        let widgets = &mut ui.visuals_mut().widgets;
+        widgets.inactive.weak_bg_fill = theme.row_hover_bg;
+        widgets.inactive.bg_stroke = Stroke::new(1.0_f32, theme.sidebar_border);
+        widgets.hovered.weak_bg_fill = theme.row_active_bg;
+        widgets.hovered.bg_stroke = Stroke::new(1.0_f32, theme.sidebar_border);
+        widgets.active.weak_bg_fill = theme.row_active_bg;
+        ui.add(egui::Button::new(text))
+    })
+    .inner
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// Lay out a row whose `trailing` widgets pin to the right edge while `leading`
 /// fills the remaining width — so a `Label::truncate()` inside `leading` knows
 /// exactly how much space it has and ellipsizes cleanly when the panel is narrow.

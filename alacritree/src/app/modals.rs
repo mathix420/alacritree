@@ -1193,18 +1193,7 @@ fn modal_button(
     text_color: Color32,
 ) -> egui::Response {
     let s = theme.ui_scale;
-    ui.scope(|ui| {
-        ui.spacing_mut().button_padding = egui::vec2(10.0 * s, 3.0 * s);
-        let widgets = &mut ui.visuals_mut().widgets;
-        widgets.inactive.weak_bg_fill = theme.row_hover_bg;
-        widgets.inactive.bg_stroke = Stroke::new(1.0_f32, theme.sidebar_border);
-        widgets.hovered.weak_bg_fill = theme.row_active_bg;
-        widgets.hovered.bg_stroke = Stroke::new(1.0_f32, theme.sidebar_border);
-        widgets.active.weak_bg_fill = theme.row_active_bg;
-        ui.add(egui::Button::new(RichText::new(label).color(text_color)))
-    })
-    .inner
-    .on_hover_cursor(egui::CursorIcon::PointingHand)
+    framed_button(ui, theme, RichText::new(label).color(text_color), egui::vec2(10.0 * s, 3.0 * s))
 }
 
 pub(super) struct DeleteRequest {
