@@ -89,7 +89,7 @@ The tab shows the global section, the project, the workspace, and one section fo
 
 Deleting a task that has subtasks deletes them too, after asking. The keys act on the row being edited, or the last one that was, which the tab highlights. They are the task actions under [Keyboard shortcuts](keyboard-shortcuts.md), so they can be rebound, and they fire only while the tasks tab is focused.
 
-The tab reloads from taskwarrior every second while it is shown, so tasks an agent adds appear on their own. The last listing for each project is kept in the local state directory, so reopening the tab shows it at once while the first reload runs. A project inside WSL reads and writes that distro's taskwarrior. Taskwarrior 3 has no Windows build, so a Windows project uses the default distro's taskwarrior when `task` is not on the Windows `PATH`. Linux and macOS always use the native install.
+The tab reloads from taskwarrior every second while it is shown, so tasks an agent adds appear on their own. The last listing for each project is kept in the local state directory, so reopening the tab shows it at once while the first reload runs. A project inside WSL reads and writes that distro's taskwarrior, through `[wsl] resident_helper` when it is on, so a call skips starting `wsl.exe`. Taskwarrior 3 has no Windows build, so a Windows project uses the default distro's taskwarrior when `task` is not on the Windows `PATH`. Linux and macOS always use the native install.
 
 #### A task store of your own
 
