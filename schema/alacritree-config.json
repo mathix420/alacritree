@@ -1932,6 +1932,11 @@
           "description": "End everything a session started when that session closes, at any\ndepth, except processes that ask to break away. Windows only;\nchanging it requires a restart.",
           "type": "boolean"
         },
+        "return_to_previous_session": {
+          "default": false,
+          "description": "Whether closing the on-screen scratchpad or tasks tab goes back to the\nsession that was on screen before the tab was. Off lands on the\nsibling `sidebar_focus` picks. Either way a session that has since\nclosed falls back to that sibling.",
+          "type": "boolean"
+        },
         "scrollbar": {
           "default": "floating",
           "description": "Sidebar scrollbar style: \"floating\" | \"solid\".",

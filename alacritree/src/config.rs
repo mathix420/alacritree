@@ -1307,6 +1307,10 @@ pub struct UiTheme {
     pub sessions_filter_counts_detached: bool,
     /// What closing the last session in the on-screen workspace does.
     pub last_session_close: LastSessionClose,
+    /// Whether closing the on-screen scratchpad or tasks tab goes back to the
+    /// session that was on screen before the tab was, rather than the sibling
+    /// [`Self::sidebar_focus`] picks.
+    pub return_to_previous_session: bool,
     /// Whether an exited session stays on screen instead of closing with its
     /// child.
     pub hold_exited_sessions: HoldExitedSessions,
@@ -1423,6 +1427,7 @@ impl Default for UiTheme {
             confirm_session_detach: true,
             sessions_filter_counts_detached: false,
             last_session_close: LastSessionClose::Respawn,
+            return_to_previous_session: false,
             hold_exited_sessions: HoldExitedSessions::default(),
             sidebar_focus: SidebarFocus::default(),
             sidebar_follow_active: false,
@@ -3054,6 +3059,11 @@ struct RawUi {
     /// whether a close or a worktree deletion took the last one:
     /// "respawn" | "navigate" | "ring_global" | "ring_project".
     last_session_close: ClosedSet<LastSessionClose>,
+    /// Whether closing the on-screen scratchpad or tasks tab goes back to the
+    /// session that was on screen before the tab was. Off lands on the
+    /// sibling `sidebar_focus` picks. Either way a session that has since
+    /// closed falls back to that sibling.
+    return_to_previous_session: bool,
     /// Whether a session whose child has exited stays on screen instead of
     /// closing with it: "never" | "on_error" | "always".  A held session
     /// writes one line into its own grid naming the key that closes it.  A
@@ -3188,6 +3198,7 @@ impl Default for RawUi {
             confirm_session_detach: true,
             sessions_filter_counts_detached: false,
             last_session_close: ClosedSet::default(),
+            return_to_previous_session: false,
             hold_exited_sessions: ClosedSet::default(),
             sidebar_focus: ClosedSet::default(),
             sidebar_follow_active: false,
@@ -3367,6 +3378,7 @@ impl RawConfig {
             confirm_session_detach: self.ui.confirm_session_detach,
             sessions_filter_counts_detached: self.ui.sessions_filter_counts_detached,
             last_session_close: self.ui.last_session_close.get(),
+            return_to_previous_session: self.ui.return_to_previous_session,
             hold_exited_sessions: self.ui.hold_exited_sessions.get(),
             sidebar_focus: self.ui.sidebar_focus.get(),
             sidebar_follow_active: self.ui.sidebar_follow_active,
@@ -5024,6 +5036,12 @@ program = "second"
         assert_eq!(tasks.chevron, Some(Rgb { r: 0x89, g: 0xb4, b: 0xfa }));
         assert_eq!(tasks.chevron_thickness, 0.5);
         assert_eq!(tasks.add_button.hover_fill, Some(Rgb { r: 0x31, g: 0x32, b: 0x44 }));
+    }
+
+    #[test]
+    fn return_to_previous_session_defaults_off_and_parses() {
+        assert!(!ui_from_toml("").return_to_previous_session);
+        assert!(ui_from_toml("[ui]\nreturn_to_previous_session = true").return_to_previous_session);
     }
 
     #[test]

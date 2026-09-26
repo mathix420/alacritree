@@ -507,7 +507,11 @@ impl AlacritreeApp {
             return;
         };
         if let Some((id, _)) = existing {
-            self.sessions.remove(&[id], self.config.ui.sidebar_focus);
+            self.sessions.remove(
+                &[id],
+                self.config.ui.sidebar_focus,
+                self.config.ui.return_to_previous_session,
+            );
         }
 
         let repaint = ctx.clone();

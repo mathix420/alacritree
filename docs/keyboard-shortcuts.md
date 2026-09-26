@@ -139,7 +139,9 @@ entry. Names match alacritty's own action names, so existing configs port over.
 - `OpenScratchpad` — open or select the current workspace's persistent
   Markdown scratchpad tab in Alacritree's minimal built-in editor, or close it
   without confirmation when already active. Every text change is saved
-  immediately; closing the tab keeps its backing file. Default: `Ctrl+Backtick`.
+  immediately; closing the tab keeps its backing file. With
+  `ui.return_to_previous_session`, closing it goes back to the session it was
+  opened over, as closing the tasks tab does. Default: `Ctrl+Backtick`.
 - `SelectNextTab` / `SelectPreviousTab` — cycle through sessions in the
   current workspace.
 - `SelectNextSession` / `SelectPreviousSession` — cycle through every open
