@@ -139,11 +139,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = alacritree_git::test_support::init_repo_on(&dir.path().join("myrepo"), "trunk");
         let backends = [crate::vcs::Vcs::Git(alacritree_git::GitBackend)];
-        let (_, place) = crate::jobs::on_this_thread(|b| place_for(&repo, &backends, b));
+        let (_, place) =
+            alacritree_common::jobs::on_this_thread(|b| place_for(&repo, &backends, b));
         assert_eq!(place, Place::Workspace { repo: "myrepo".into(), branch: "trunk".into() });
-        let (_, outside) = crate::jobs::on_this_thread(|b| place_for(dir.path(), &backends, b));
+        let (_, outside) =
+            alacritree_common::jobs::on_this_thread(|b| place_for(dir.path(), &backends, b));
         assert_eq!(outside, Place::Global);
-        let (_, disabled) = crate::jobs::on_this_thread(|b| place_for(&repo, &[], b));
+        let (_, disabled) = alacritree_common::jobs::on_this_thread(|b| place_for(&repo, &[], b));
         assert_eq!(disabled, Place::Global, "with no backend nothing is a repository");
     }
 }

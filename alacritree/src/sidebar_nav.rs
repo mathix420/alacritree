@@ -4,12 +4,12 @@
 //! indices: the project list mutates underneath the cursor (git-status
 //! refresh, worktree add/remove), and an index would silently retarget.
 
+use alacritree_multiplexer::PaneKey;
 use alacritree_vcs::Checkout;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::ReorderScope;
-use crate::multiplexer::PaneKey;
 use crate::projects::Project;
 use crate::session::SessionId;
 use crate::workspace::WorkspaceKey;
@@ -408,7 +408,7 @@ pub(crate) fn ensure_cursor(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::multiplexer::Side;
+    use alacritree_common::side::Side;
 
     use crate::test_util::herdr_pane_key;
 

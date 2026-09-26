@@ -4,8 +4,9 @@
 //! it holds no `Shell` or PTY types: the code that turns a verdict into a
 //! process stays in `app`.
 
+use alacritree_common::wsl::ShellChoice;
+
 use crate::config::Profile;
-use crate::wsl::ShellChoice;
 
 /// What shell a new session should run, decided from plain data so the
 /// precedence chain stays testable off the GUI.

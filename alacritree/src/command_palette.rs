@@ -13,12 +13,12 @@
 
 use std::path::PathBuf;
 
+use alacritree_multiplexer::{MultiplexerKind, PaneKey};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use strum::IntoEnumIterator;
 
 use crate::bindings::{BindingAction, NamedAction, action};
-use crate::multiplexer::{MultiplexerKind, PaneKey};
 use crate::session::SessionId;
 use crate::shortcut::Shortcuts;
 use crate::workspace::WorkspaceKey;
@@ -771,7 +771,7 @@ mod tests {
 
     fn attach(id: &str) -> PaneAttach {
         PaneAttach {
-            key: crate::test_util::pane_key(crate::multiplexer::Side::Native, id),
+            key: crate::test_util::pane_key(alacritree_common::side::Side::Native, id),
             pane_id: "w5:p1".into(),
             workspace: None,
         }

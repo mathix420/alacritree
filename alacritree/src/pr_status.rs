@@ -8,11 +8,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use alacritree_common::{jobs, wsl};
 use alacritree_forge::{Head, PrInfo, PrState, PullRequests, RemoteForge};
 use alacritree_vcs::VersionControl;
 
 use crate::vcs::Vcs;
-use crate::{jobs, wsl};
 
 use crate::repaint::Repaint;
 

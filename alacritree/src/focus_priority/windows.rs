@@ -215,7 +215,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::command_ext::CommandExt as _;
+    use alacritree_common::command_ext::CommandExt as _;
 
     #[test]
     fn a_priority_job_can_move_to_the_thread_that_opens_the_pty() {
@@ -267,7 +267,7 @@ mod tests {
         Subject(
             Command::new("cmd.exe")
                 .args(args)
-                .creation_flags(crate::command_ext::CREATE_NO_WINDOW | class)
+                .creation_flags(alacritree_common::command_ext::CREATE_NO_WINDOW | class)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .spawn()

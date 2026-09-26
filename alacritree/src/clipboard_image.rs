@@ -9,9 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
+use alacritree_common::jobs;
 use arboard::ImageData;
-
-use crate::jobs;
 
 /// A clipboard owner can advertise any dimensions it likes, and encoding runs
 /// on the UI thread during a keystroke.  64 MP is far past any screenshot.

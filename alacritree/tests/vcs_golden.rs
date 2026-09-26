@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use alacritree::command_ext::hidden;
+use alacritree_common::command_ext::hidden;
 
 const UPDATE: &str = "ALACRITREE_UPDATE_GOLDEN";
 

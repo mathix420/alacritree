@@ -1,9 +1,10 @@
 //! The projects sidebar: the state only it owns, the paint pass over it, and
 //! the row painters that pass draws with.
 
-use super::*;
-use crate::multiplexer::{MultiplexerKind, Pane};
+use alacritree_multiplexer::{MultiplexerKind, Pane};
 use alacritree_vcs::Checkout;
+
+use super::*;
 
 pub(super) struct Sidebar {
     /// Reveals the project rows' drag grips.  A transient mode, not persisted:

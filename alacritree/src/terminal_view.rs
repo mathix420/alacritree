@@ -1,3 +1,4 @@
+use alacritree_common::jobs;
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
@@ -24,7 +25,7 @@ use crate::input::{associated_text, event_to_bytes};
 use crate::links::{self, Link};
 use crate::repaint::Repaint;
 use crate::session::{EventProxy, Session, SessionId, SessionKind, TermSize};
-use crate::{decoration_sprites, jobs, mouse, paste};
+use crate::{decoration_sprites, mouse, paste};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn show(

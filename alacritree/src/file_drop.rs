@@ -8,8 +8,9 @@
 
 use std::path::{Path, PathBuf};
 
+use alacritree_common::wsl;
+
 use crate::config::{DropConfig, PathSpelling, ShellQuoting};
-use crate::wsl;
 
 /// Which region a drop landed on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

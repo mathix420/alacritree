@@ -58,7 +58,7 @@ impl LabelTemplates {
         if let Some(branch) = wt.head.label() {
             vars.insert("branch".to_string(), branch.to_string());
         }
-        vars.insert("path".to_string(), crate::wsl::display_path(&wt.path));
+        vars.insert("path".to_string(), alacritree_common::wsl::display_path(&wt.path));
         if let Some(pr) = pr {
             vars.insert("pr".to_string(), format!("#{}", pr.number));
         }
@@ -80,7 +80,7 @@ impl LabelTemplates {
         };
         let mut vars = HashMap::new();
         vars.insert("name".to_string(), project.name.clone());
-        vars.insert("path".to_string(), crate::wsl::display_path(&project.root));
+        vars.insert("path".to_string(), alacritree_common::wsl::display_path(&project.root));
         self.render_or_fallback("project_name", &template, &vars, &project.name)
     }
 

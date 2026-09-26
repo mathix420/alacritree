@@ -547,7 +547,7 @@ fn dispatch(
             // nothing is writing.  Resolved here rather than in `run` because
             // a request a running instance answers never needs the config.
             let resolved = crate::config::load(config.dir, config.overrides).0;
-            crate::tools::configure(resolved.integrations.tool_paths());
+            alacritree_common::tools::configure(resolved.integrations.tool_paths());
             let create = crate::worktree::CreateConfig::new(&resolved);
             if let Some(dir) = resolved.state_dir {
                 crate::state::set_dir(dir);

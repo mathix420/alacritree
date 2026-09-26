@@ -17,8 +17,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub use alacritree_common::settings::IconStyle;
-use alacritree_common::settings::{ClosedSet, RawIconStyle, RgbStr};
+use alacritree_common::settings::{ClosedSet, IconStyle, RawIconStyle, RgbStr};
+use alacritree_common::tools::{Tool, ToolConfig, ToolPaths};
 use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Rgb};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -26,7 +26,6 @@ use strum::{EnumCount, EnumIter, IntoStaticStr};
 
 use crate::bindings::{self, KeyBinding};
 use crate::path_style::PathStyle;
-use crate::tools::{Tool, ToolConfig, ToolPaths};
 
 /// `[env]` carries whatever the user's environment carries, and a config dump
 /// ends up attached to bug reports.  Key names survive: that `FOO` was set is

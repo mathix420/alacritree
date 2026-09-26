@@ -544,8 +544,9 @@ pub(super) fn session_status_mark(status: &RowStatus<'_>) -> Option<(ShownState,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::multiplexer::{Pane, PaneStatus, Side};
     use crate::test_util::{listed_agent, managed};
+    use alacritree_common::side::Side;
+    use alacritree_multiplexer::{Pane, PaneStatus};
 
     const EVERY_STATE: [ShownState; 6] = [
         ShownState::Unknown,

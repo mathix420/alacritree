@@ -84,7 +84,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hooks = [exiting_with("broken", 3), exiting_with("after", 0)];
         let event = CheckoutEvent { main: dir.path(), checkout: dir.path() };
-        let outcomes = crate::jobs::on_this_thread(|b| hooks[..].created(&event, b));
+        let outcomes = alacritree_common::jobs::on_this_thread(|b| hooks[..].created(&event, b));
         assert!(
             matches!(&outcomes[0], Err(HookError::Failed { hook, .. }) if hook == "broken"),
             "{:?}",

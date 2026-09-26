@@ -11,7 +11,7 @@
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use alacritree::multiplexer::Side;
+use alacritree_common::side::Side;
 use alacritree_zellij::{self as zellij, SideListing};
 
 /// How long a check waits for zellij to report a change it just made.

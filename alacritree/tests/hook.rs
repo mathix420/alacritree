@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 
-use alacritree::command_ext::hidden;
+use alacritree_common::command_ext::hidden;
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_alacritree")
@@ -55,13 +55,13 @@ fn with_task() -> Option<Sandbox> {
         let env = vec![("TASKRC", format!("{root}/taskrc")), ("TASKDATA", format!("{root}/data"))];
         return Some(Sandbox { state, _work: work, repo, env });
     }
-    let distro = alacritree::wsl::distros().into_iter().find(|d| d.is_default)?.name;
+    let distro = alacritree_common::wsl::distros().into_iter().find(|d| d.is_default)?.name;
     if !succeeds("wsl.exe", &["-d", &distro, "-e", "sh", "-lc", "command -v task"]) {
         return None;
     }
     let tmp = PathBuf::from(format!(r"\\wsl.localhost\{distro}\tmp"));
     let work = tempfile::Builder::new().prefix("alacritree-hook").tempdir_in(tmp).ok()?;
-    let root = alacritree::wsl::windows_to_linux(work.path())?;
+    let root = alacritree_common::wsl::windows_to_linux(work.path())?;
     let repo = work.path().join("myrepo");
     std::fs::create_dir(&repo).unwrap();
     let linux_repo = format!("{root}/myrepo");
@@ -137,7 +137,7 @@ fn session_start_prints_one_json_object_for_both_harnesses() {
 #[test]
 fn a_linux_cwd_from_inside_wsl_names_the_workspace() {
     let Some(sandbox) = with_task() else { return };
-    let Some(linux) = alacritree::wsl::windows_to_linux(&sandbox.repo) else { return };
+    let Some(linux) = alacritree_common::wsl::windows_to_linux(&sandbox.repo) else { return };
     if !linux.starts_with('/') || !cfg!(windows) {
         return;
     }

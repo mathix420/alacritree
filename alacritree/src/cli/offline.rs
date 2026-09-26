@@ -11,15 +11,16 @@
 
 use std::path::{Path, PathBuf};
 
+use alacritree_common::jobs;
 use alacritree_vcs::{Status, VcsError, VersionControl};
 use serde_json::{Value, json};
 
 use crate::ipc::protocol::{IpcRequest, IpcResult, status_json};
 use crate::projects::{self, NotAProject, Project, project_json};
+use crate::scratchpad;
 use crate::state::{self, PersistedProject, PersistedState};
 use crate::vcs::Vcs;
 use crate::worktree::{self as wt, CreateConfig, CreateRequest};
-use crate::{jobs, scratchpad};
 
 pub(super) fn handle(request: &IpcRequest, config: &CreateConfig) -> IpcResult {
     let Some(path) = state::config_path() else {

@@ -17,6 +17,10 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use alacritree_common::side::Side;
+use alacritree_common::tools::{self, locate};
+use alacritree_common::wsl::{self, ShellChoice};
+use alacritree_common::{command_ext, jobs};
 use alacritree_diff_viewer::{Program, Viewer};
 use serde_json::{Value, json};
 use strum::VariantArray;
@@ -24,11 +28,8 @@ use strum::VariantArray;
 use crate::config::{self, Config, ConfigDiagnosis, ConfigFile, Profile, ShellConfig};
 use crate::crash_log::{Verdict, classify};
 use crate::ipc::protocol::{self, IpcRequest, SendError};
-use crate::multiplexer::Side;
 use crate::shell_decision::{ShellDecision, shell_decision};
-use crate::tools::locate;
-use crate::wsl::{self, ShellChoice};
-use crate::{command_ext, jobs, state, tools};
+use crate::state;
 use alacritree_tasks::TaskError;
 use alacritree_taskwarrior::Taskwarrior;
 

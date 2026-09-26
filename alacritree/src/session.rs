@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+use alacritree_common::wsl_helper::{self, WslProbe};
+use alacritree_multiplexer::{PaneKey, PaneStatus};
 use alacritty_terminal::event::{Event as TermEvent, EventListener, Notify, OnResize, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, Notifier};
 use alacritty_terminal::grid::Dimensions;
@@ -17,10 +19,8 @@ use alacritty_terminal::vte::ansi::{Processor, Rgb, StdSyncHandler};
 
 use crate::clipboard::Target;
 use crate::config::{Config, HoldExitedSessions, Palette};
-use crate::multiplexer::{PaneKey, PaneStatus};
 use crate::process_probe::{self, ProbeHandle};
 use crate::repaint::Repaint;
-use crate::wsl_helper::{self, WslProbe};
 use crate::{colors, scratchpad, wsl_spare};
 
 #[derive(Clone)]
@@ -1447,8 +1447,8 @@ mod tests {
     use alacritty_terminal::Term;
 
     use super::*;
-    use crate::multiplexer::Side;
     use crate::repaint::Recorder;
+    use alacritree_common::side::Side;
 
     /// A repainted frame costs a full grid paint of whatever session is on
     /// screen — milliseconds, at a maximized window.  Output from a session

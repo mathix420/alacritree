@@ -5,7 +5,15 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use alacritree_checkout_hooks::{CheckoutEvent, CheckoutHook, CheckoutHooks};
+use alacritree_common::jobs;
+use alacritree_common::settings::IconStyle;
+use alacritree_common::side::Side;
+use alacritree_common::wsl::{self, ShellChoice};
+use alacritree_common::wsl_helper::{self, WslProbe};
 use alacritree_forge::{PrInfo, PrState};
+use alacritree_multiplexer::{
+    AttachFocus, Managed, MultiplexerSession, PaneKey, PaneStatus, PaneTarget,
+};
 use eframe::CreationContext;
 use egui::{Color32, Context, Frame, Margin, RichText, ScrollArea, SidePanel, Stroke};
 
@@ -23,7 +31,7 @@ use crate::config::{
     DEFAULT_REORDER_ICON, DEFAULT_SEARCH_ICON, DEFAULT_SESSION_ICON,
     DEFAULT_UPSTREAM_DIVERGED_ICON, DEFAULT_UPSTREAM_GONE_ICON, DEFAULT_UPSTREAM_LEVEL_ICON,
     DEFAULT_UPSTREAM_UNTRACKED_ICON, DEFAULT_WORKTREE_ICON, DEFAULT_WORKTREE_MAIN_ICON, FontConfig,
-    IconStyle, Icons, LastSessionClose, PathStyleConfig, ScrollAlign, ScrollbarStyle, SearchDepth,
+    Icons, LastSessionClose, PathStyleConfig, ScrollAlign, ScrollbarStyle, SearchDepth,
     SearchScope, SidebarFocus, SidebarTooltips, StatusIndicators, TextEmphasis, UiFont, UiTheme,
     profile_command,
 };
@@ -32,9 +40,7 @@ use crate::forge::Forge;
 use crate::git_nav::{self, GitSection, SectionCount};
 use crate::in_flight::{Finished, InFlight};
 use crate::modal_gate::{ModalGate, ModalKind};
-use crate::multiplexer::{
-    AttachFocus, Managed, MultiplexerSession, Multiplexers, PaneKey, PaneStatus, PaneTarget, Side,
-};
+use crate::multiplexer::Multiplexers;
 use crate::panel_filter::{self, PanelFilter};
 use crate::path_style::PathStyle;
 use crate::pr_status::{self, PrCache};
@@ -50,10 +56,8 @@ use crate::state::{self, PersistedProject};
 use crate::status_cache::StatusCache;
 use crate::workspace::WorkspaceKey;
 use crate::worktree::{self as wt, CreateRequest, Progress};
-use crate::wsl::{self, ShellChoice};
-use crate::wsl_helper::{self, WslProbe};
 use crate::{
-    clipboard_image, file_drop, ipc, jobs, mouse_hide, notify, paste, path_style, scratchpad,
+    clipboard_image, file_drop, ipc, mouse_hide, notify, paste, path_style, scratchpad,
     sidebar_focus, terminal_view, worktree_liveness,
 };
 use alacritree_vcs::{Checkout, Dirty, Liveness, UpstreamState, VersionControl};
@@ -4108,7 +4112,7 @@ mod tests {
 
     use super::*;
     use crate::config::{SidebarFocus, UiTheme};
-    use crate::multiplexer::{CreatedPane, Launch};
+    use alacritree_multiplexer::{CreatedPane, Launch};
 
     use super::focus::search_reveal_root;
     use super::git_panel::{
@@ -4123,11 +4127,11 @@ mod tests {
         sessions_filter_passes, upstream_badge, worktree_row,
     };
     use super::widgets::agent_hint;
-    use crate::multiplexer::{
-        AttachRequest, MultiplexerKind, Pane, PaneError, PaneStatus, Scripted,
-    };
     use crate::sidebar_model::build_snapshot;
     use crate::test_util::herdr_pane_key;
+    use alacritree_multiplexer::{
+        AttachRequest, MultiplexerKind, Pane, PaneError, PaneStatus, Scripted,
+    };
 
     fn plain_worktree_row<'a>(
         wt: &'a alacritree_vcs::Checkout,
@@ -4341,8 +4345,11 @@ mod tests {
     }
 
     /// An icon styled by its glyph alone.
-    fn glyph_icon(glyph: &str) -> crate::config::IconStyle {
-        crate::config::IconStyle { glyph: Some(glyph.to_string()), ..Default::default() }
+    fn glyph_icon(glyph: &str) -> alacritree_common::settings::IconStyle {
+        alacritree_common::settings::IconStyle {
+            glyph: Some(glyph.to_string()),
+            ..Default::default()
+        }
     }
 
     /// What the scripted multiplexer lists on `side`, replacing whatever it
@@ -5058,7 +5065,7 @@ mod tests {
         app.multiplexers.herdr_mut_for_test().pending_create_mut_for_test().push(PendingCreate {
             job: jobs::Job::panicked(),
             side: Side::Native,
-            request: crate::multiplexer::CreateRequest {
+            request: alacritree_multiplexer::CreateRequest {
                 workspace: None,
                 waiter: Some(reply_tx),
                 focus: AttachFocus::Take,
@@ -5087,7 +5094,7 @@ mod tests {
                 tab_id: "w1:t2".into(),
             })),
             side: Side::Wsl("distro".into()),
-            request: crate::multiplexer::CreateRequest {
+            request: alacritree_multiplexer::CreateRequest {
                 workspace,
                 waiter,
                 focus: AttachFocus::Take,
@@ -7618,7 +7625,7 @@ mod tests {
     fn the_git_header_converts_before_it_abbreviates() {
         let unc = std::path::Path::new(r"\\wsl.localhost\kali-linux\home\lev\Git\monorepo");
         let shown = crate::path_style::render(
-            &crate::wsl::display_path(unc),
+            &alacritree_common::wsl::display_path(unc),
             crate::path_style::PathStyle::Fish,
             Some("/home/lev"),
         );

@@ -2,8 +2,10 @@
 //! laying them out in columns, and carrying out the row the user picks.
 //! The item model and ranking live in the crate-level `command_palette`.
 
+use alacritree_multiplexer::{ListedPane, MultiplexerKind, Pane};
+
 use super::*;
-use crate::multiplexer::{ListedPane, Multiplexer, MultiplexerKind, Pane};
+use crate::multiplexer::Multiplexer;
 
 impl AlacritreeApp {
     /// The Ctrl+K command palette: one fuzzy-searchable, executable list of

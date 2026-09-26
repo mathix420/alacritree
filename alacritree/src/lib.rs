@@ -16,7 +16,6 @@ pub(crate) mod clipboard;
 pub(crate) mod clipboard_image;
 pub(crate) mod color_glyph;
 pub(crate) mod colors;
-pub use alacritree_common::command_ext;
 pub(crate) mod command_palette;
 pub mod config;
 pub mod crash_log;
@@ -38,7 +37,6 @@ pub(crate) mod ime;
 pub mod in_flight;
 pub(crate) mod input;
 pub(crate) mod ipc;
-pub(crate) use alacritree_common::jobs;
 pub(crate) mod links;
 pub mod logdir;
 pub mod logging;
@@ -46,7 +44,7 @@ pub(crate) mod mcp;
 pub(crate) mod modal_gate;
 pub(crate) mod mouse;
 pub(crate) mod mouse_hide;
-pub mod multiplexer;
+pub(crate) mod multiplexer;
 pub(crate) mod notify;
 pub(crate) mod panel_filter;
 pub(crate) mod paste;
@@ -73,14 +71,12 @@ pub(crate) mod tasks;
 pub(crate) mod terminal_view;
 #[cfg(test)]
 mod test_util;
-pub use alacritree_common::tools;
 pub mod vcs;
 #[cfg(windows)]
 pub mod win_session;
 pub(crate) mod workspace;
 pub(crate) mod worktree;
 pub(crate) mod worktree_liveness;
-pub use alacritree_common::{wsl, wsl_helper};
 pub mod wsl_spare;
 
 /// The timing reports inside unit tests read allocation counts too.

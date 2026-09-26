@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use alacritree::command_ext::hidden;
+use alacritree_common::command_ext::hidden;
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_alacritree")

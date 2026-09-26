@@ -12,7 +12,7 @@
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 
-use crate::wsl_helper::{self, WslProbe};
+use alacritree_common::wsl_helper::{self, WslProbe};
 
 /// What the probe found running behind a PTY.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -937,7 +937,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn sysctl_probe_reads_a_real_childs_comm_and_group() {
-        let mut child = crate::command_ext::hidden("/bin/sleep").arg("30").spawn().unwrap();
+        let mut child =
+            alacritree_common::command_ext::hidden("/bin/sleep").arg("30").spawn().unwrap();
         let comm = comm_for_pid(child.id());
         let groups = pgid_tpgid(child.id());
         child.kill().ok();

@@ -7,6 +7,7 @@
 use std::cell::RefCell;
 use std::process::Stdio;
 
+use alacritree_common::{command_ext, jobs};
 use alacritty_terminal::grid::BidirectionalIterator;
 use alacritty_terminal::index::{Direction, Point};
 use alacritty_terminal::term::Term;
@@ -14,7 +15,6 @@ use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 
 use crate::repaint::Repaint;
 use crate::session::EventProxy;
-use crate::{command_ext, jobs};
 
 // Identical to alacritty's built-in URL hint regex so the set of recognised
 // schemes (and the trailing-character rules) stay in sync with what users

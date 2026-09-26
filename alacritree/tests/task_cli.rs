@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::process::Output;
 
-use alacritree::command_ext::hidden;
+use alacritree_common::command_ext::hidden;
 
 // A test has no UI thread for a blocking wait to stall.
 #[allow(clippy::disallowed_methods)]

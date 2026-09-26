@@ -13,12 +13,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use alacritree_common::{wsl, wsl_helper};
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::tty::{self, EventedPty, EventedReadWrite, Options as PtyOptions, Shell};
 
 use crate::focus_priority::PriorityJob;
+use crate::process_probe;
 use crate::session::SESSION_ID_ENV;
-use crate::{process_probe, wsl, wsl_helper};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 

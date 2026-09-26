@@ -6,9 +6,9 @@ use alacritree::app::AlacritreeApp;
 #[cfg(windows)]
 use alacritree::win_session;
 use alacritree::{
-    cli, config, crash_log, dll_search, frame_log, logdir, logging, startup_log, state, tools, wsl,
-    wsl_helper, wsl_spare,
+    cli, config, crash_log, dll_search, frame_log, logdir, logging, startup_log, state, wsl_spare,
 };
+use alacritree_common::{tools, wsl, wsl_helper};
 use clap::Parser;
 
 /// Pre-resized from the 2048x2048 source so we don't embed a 4 MB blob for

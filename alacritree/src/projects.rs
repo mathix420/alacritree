@@ -5,10 +5,10 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
+use alacritree_common::{jobs, wsl};
 use alacritree_vcs::{Checkout, Head, VcsError, VersionControl};
 
 use crate::vcs::Vcs;
-use crate::{jobs, wsl};
 
 #[derive(Debug, Clone)]
 pub struct Project {
@@ -24,7 +24,7 @@ pub struct Project {
     pub trunk: Option<String>,
     pub checkouts: Vec<Checkout>,
     pub expanded: bool,
-    pub shell_override: Option<crate::wsl::ShellChoice>,
+    pub shell_override: Option<alacritree_common::wsl::ShellChoice>,
     /// The distro's own `$HOME` for a WSL project, so a path can collapse to
     /// `~` without guessing the prefix from the path itself.  `None` for a
     /// native project, whose home comes from `home::home_dir()`.

@@ -11,8 +11,9 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::mpsc::Sender;
 
+use alacritree_common::jobs::Job;
+
 use crate::ipc::protocol::IpcResult;
-use crate::jobs::Job;
 
 const ABANDONED: &str = "the work this request waited on was abandoned";
 
@@ -124,7 +125,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::jobs::{Pool, Priority};
+    use alacritree_common::jobs::{Pool, Priority};
 
     /// Poll until something ends, since a pool job lands on its own schedule.
     fn finished_within<K: Eq + Hash + Clone, T>(

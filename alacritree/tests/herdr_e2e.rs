@@ -9,7 +9,7 @@
 //! run, and a window appears while they do.
 
 #![cfg(windows)]
-// A test has no UI thread for a blocking wait to stall, so `alacritree::jobs`
+// A test has no UI thread for a blocking wait to stall, so `alacritree_common::jobs`
 // has nothing to protect here.
 #![allow(clippy::disallowed_methods)]
 

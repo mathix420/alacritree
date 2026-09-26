@@ -10,13 +10,13 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 
 use alacritree_checkout_hooks::{CheckoutEvent, CheckoutHook, CheckoutHooks};
+use alacritree_common::{jobs, wsl};
 use alacritree_vcs::{CreateCheckout, RemoveCheckout, VcsError, VersionControl};
 
 use crate::checkout_hooks::Hook;
 use crate::config::{Config, WorkspaceConfig};
 use crate::repaint::Repaint;
 use crate::vcs::Vcs;
-use crate::{jobs, wsl};
 
 #[derive(Debug)]
 pub(crate) enum Progress {

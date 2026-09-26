@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
+use alacritree_common::jobs;
 use alacritree_vcs::{Status, VcsError, VersionControl};
 use interprocess::local_socket::traits::Listener as _;
 use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, ToFsName};
@@ -23,7 +24,6 @@ use serde_json::json;
 use super::protocol::connect;
 use super::protocol::{IpcRequest, IpcResult, SOCKET_ENV, socket_dir, status_json, unlink_socket};
 use super::route::{AppRequest, ConnectionRequest, DeferredRequest, Route};
-use crate::jobs;
 use crate::repaint::Repaint;
 use crate::worktree::{self as wt, CreateConfig, CreateRequest, Progress};
 

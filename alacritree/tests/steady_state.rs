@@ -6,10 +6,10 @@ use std::time::Instant;
 
 use alacritree::alloc_count::{CountingAllocator, measure};
 use alacritree::in_flight::InFlight;
-use alacritree::multiplexer::Side;
 use alacritree::projects::Project;
 use alacritree::sidebar_focus::{ObservedInputs, SessionInput, UiInputs};
 use alacritree::sidebar_model::{SidebarInputs, SidebarModel};
+use alacritree_common::side::Side;
 use alacritree_herdr::{self as herdr, FollowFocus};
 use alacritree_vcs::{Checkout, Head};
 

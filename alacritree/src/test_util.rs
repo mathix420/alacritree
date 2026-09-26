@@ -4,11 +4,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use crate::config::IntegrationsConfig;
-use crate::multiplexer::{
-    Managed, MultiplexerKind, MultiplexerSession, Multiplexers, Pane, PaneKey, PaneStatus,
-    Scripted, Side,
+use alacritree_common::side::Side;
+use alacritree_multiplexer::{
+    Managed, MultiplexerKind, MultiplexerSession, Pane, PaneKey, PaneStatus, Scripted,
 };
+
+use crate::config::IntegrationsConfig;
+use crate::multiplexer::Multiplexers;
 
 /// The key a pane on `side` is known by, in the multiplexer a test scripts.
 pub(crate) fn pane_key(side: Side, terminal_id: &str) -> PaneKey {

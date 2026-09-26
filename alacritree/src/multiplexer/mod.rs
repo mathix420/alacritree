@@ -6,14 +6,13 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use alacritree_common::side::Side;
 use alacritree_herdr::Herdr;
 #[cfg(test)]
-pub(crate) use alacritree_multiplexer::Scripted;
-use alacritree_multiplexer::ambassador_impl_MultiplexerSession;
-pub use alacritree_multiplexer::{
-    AttachAnswer, AttachFocus, AttachRequest, CreateAnswer, CreateRequest, CreatedPane, Launch,
-    ListedPane, Managed, MultiplexerKind, MultiplexerSession, Pane, PaneError, PaneKey, PaneStatus,
-    PaneTarget, Side, ViewState, ViewStep, cwd_for,
+use alacritree_multiplexer::Scripted;
+use alacritree_multiplexer::{
+    ListedPane, MultiplexerKind, MultiplexerSession, Pane, PaneError, PaneKey,
+    ambassador_impl_MultiplexerSession,
 };
 use alacritree_zellij::Zellij;
 use ambassador::Delegate;
@@ -306,9 +305,11 @@ mod tests {
     #[test]
     #[ignore = "requires WSL"]
     fn multiplexer_command_keeps_the_probe_pid() {
-        use crate::wsl_helper::{new_probe_key, wrap_exec_argv};
-        let distro =
-            crate::wsl::distros().into_iter().find(|d| d.is_default).expect("a default distro");
+        use alacritree_common::wsl_helper::{new_probe_key, wrap_exec_argv};
+        let distro = alacritree_common::wsl::distros()
+            .into_iter()
+            .find(|d| d.is_default)
+            .expect("a default distro");
         let key = new_probe_key();
         let (program, args) = Side::Wsl(distro.name).command("sh", &[
             "-c",
@@ -318,7 +319,10 @@ mod tests {
         ]);
         let args = wrap_exec_argv(&program, &args, &key).expect("wrap multiplexer command");
         #[allow(clippy::disallowed_methods)] // A test waiting on its own child.
-        let output = crate::command_ext::hidden(program).args(args).output().expect("run in WSL");
+        let output = alacritree_common::command_ext::hidden(program)
+            .args(args)
+            .output()
+            .expect("run in WSL");
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         let stdout = String::from_utf8(output.stdout).expect("PID output is UTF-8");
         let pids: Vec<_> = stdout.lines().collect();

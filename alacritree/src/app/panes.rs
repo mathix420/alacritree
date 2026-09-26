@@ -3,11 +3,12 @@
 //! a multiplexer answers comes through [`MultiplexerSession`]; this file only
 //! decides what the app does with the answer.
 
-use super::*;
-use crate::multiplexer::{
+use alacritree_multiplexer::{
     AttachFocus, AttachRequest, CreateRequest, Launch, ListedPane, Managed, MultiplexerKind, Pane,
     PaneError, PaneKey, ViewState,
 };
+
+use super::*;
 
 impl AlacritreeApp {
     /// Opens a pane in a session running the multiplexer's attach client.
@@ -158,7 +159,7 @@ impl AlacritreeApp {
         waiter: Option<mpsc::Sender<ipc::protocol::IpcResult>>,
         focus: AttachFocus,
     ) {
-        let cwd = match crate::multiplexer::cwd_for(&side, workspace.as_deref()) {
+        let cwd = match alacritree_multiplexer::cwd_for(&side, workspace.as_deref()) {
             Ok(cwd) => cwd,
             Err(e) => {
                 self.refuse_multiplexer_request(waiter, e.to_string(), focus);

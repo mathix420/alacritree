@@ -3,9 +3,9 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use alacritree_common::jobs;
 use alacritree_vcs::{ChangeKind, Dirty, Head, Status, VersionControl};
 
-use crate::jobs;
 use crate::repaint::Repaint;
 use crate::vcs::Vcs;
 
