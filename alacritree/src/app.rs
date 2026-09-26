@@ -156,6 +156,7 @@ struct Theme {
     /// The scratchpad editor's text and its placeholder hint.
     editor_text: Color32,
     editor_hint: Color32,
+    tasks: crate::tasks::view::Style,
     git: GitColors,
 }
 
@@ -192,6 +193,8 @@ impl Theme {
         let border =
             config.ui.sidebar_border.map_or_else(|| lighten(sidebar_bg, 0.10), rgb_to_color32);
         let text_muted = blend_toward(text, sidebar_bg, 0.55);
+        let editor_hint = blend_toward(editor_text, terminal_bg, 0.55);
+        let error = rgb_to_color32(config.palette.normal[1]);
         let (font_normal, font_heading) = ui_text_px(&config.font, &config.ui_font);
         Self {
             terminal_bg,
@@ -232,10 +235,11 @@ impl Theme {
             sidebar_tooltips: config.ui.sidebar_tooltips,
             icon_tooltips: config.ui.icon_tooltips,
             scroll_align: egui_scroll_align(config.ui.sidebar_scroll_align),
-            error: rgb_to_color32(config.palette.normal[1]),
+            error,
             ok: rgb_to_color32(config.palette.normal[2]),
             editor_text,
-            editor_hint: blend_toward(editor_text, terminal_bg, 0.55),
+            editor_hint,
+            tasks: tasks_style(&config.ui.tasks, editor_text, editor_hint, error),
             git: GitColors {
                 added: rgb_to_color32(config.palette.normal[2]),
                 modified: rgb_to_color32(config.palette.normal[3]),
@@ -244,6 +248,27 @@ impl Theme {
                 conflicted: rgb_to_color32(config.palette.bright[1]),
             },
         }
+    }
+}
+
+/// `[ui.tasks]` with each unset color derived from the tab's text and hint
+/// colors.
+fn tasks_style(
+    tasks: &crate::config::TasksUi,
+    text: Color32,
+    hint: Color32,
+    error: Color32,
+) -> crate::tasks::view::Style {
+    let color = |c: Option<alacritty_terminal::vte::ansi::Rgb>, fallback| {
+        c.map_or(fallback, rgb_to_color32)
+    };
+    crate::tasks::view::Style {
+        text,
+        dim: hint,
+        error,
+        chevron: egui::Stroke::new(tasks.chevron_thickness, color(tasks.chevron, hint)),
+        chevron_hover: color(tasks.chevron_hover, text),
+        hidden_count: color(tasks.hidden_count, hint),
     }
 }
 
@@ -3209,6 +3234,7 @@ impl AlacritreeApp {
                 let editor_text = theme.editor_text;
                 let editor_hint = theme.editor_hint;
                 let editor_error = theme.error;
+                let tasks_style = theme.tasks;
                 let session = &mut self.sessions[idx];
                 let allow_focus =
                     !modal_open && !self.palette.is_open() && self.focus == PaneFocus::Terminal;
@@ -3226,14 +3252,7 @@ impl AlacritreeApp {
                     )
                 } else if let Some(view) = session.tasks.as_mut() {
                     self.ime.clear();
-                    crate::tasks::view::show(
-                        ui,
-                        view,
-                        allow_focus,
-                        editor_text,
-                        editor_hint,
-                        editor_error,
-                    )
+                    crate::tasks::view::show(ui, view, allow_focus, tasks_style)
                 } else {
                     let started = std::time::Instant::now();
                     let response = terminal_view::show(

@@ -2008,6 +2008,10 @@
           ],
           "type": "string"
         },
+        "tasks": {
+          "$ref": "#/$defs/RawUiTasks",
+          "description": "How the tasks tab draws."
+        },
         "upstream_status": {
           "default": false,
           "description": "Paint a badge on each worktree row for its branch's upstream state.\nLocal refs only: nothing fetches, so a branch deleted on the remote\nreads as tracked until something prunes locally. A linked worktree\nthat overrides `branch.*` in its own `config.worktree` is read from the\nproject root, so that override is not seen.",
@@ -2161,6 +2165,41 @@
           "format": "uint",
           "minimum": 0,
           "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "RawUiTasks": {
+      "properties": {
+        "chevron": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "The sub-task chevron. Unset uses the tab's hint color."
+        },
+        "chevron_hover": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "The sub-task chevron under the pointer. Unset uses the tab's text\ncolor."
+        },
+        "chevron_thickness": {
+          "default": 1.5,
+          "description": "Stroke width of the sub-task chevron, in points.",
+          "format": "float",
+          "type": "number"
+        },
+        "hidden_count": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "The `+N` count of sub-tasks a collapsed task hides. Unset uses the\ntab's hint color."
         }
       },
       "type": "object"

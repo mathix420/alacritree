@@ -574,6 +574,15 @@ Whether session rows can be dragged, and how far a reorder may carry a session.
 - `drag` (boolean, default `false`): Let a session row be dragged with the mouse to reorder it.
 - `scope` ("workspace" | "project" | "anywhere", default `"workspace"`): How far a reorder may carry a session: "workspace" | "project" | "anywhere".
 
+### `[ui.tasks]`
+
+How the tasks tab draws.
+
+- `chevron` (string): The sub-task chevron. Unset uses the tab's hint color.
+- `chevron_hover` (string): The sub-task chevron under the pointer. Unset uses the tab's text color.
+- `chevron_thickness` (number, default `1.5`): Stroke width of the sub-task chevron, in points.
+- `hidden_count` (string): The `+N` count of sub-tasks a collapsed task hides. Unset uses the tab's hint color.
+
 ### `[ui.wsl]`
 
 Deprecated WSL options, superseded by the top-level `[wsl]` table.

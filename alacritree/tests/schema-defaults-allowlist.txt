@@ -76,6 +76,9 @@ RawUiFont.family
 RawUiFont.italic_family
 RawUiFont.size
 RawUiPaste.image_dir
+RawUiTasks.chevron
+RawUiTasks.chevron_hover
+RawUiTasks.hidden_count
 RawUiWsl.automount_root
 RawWorkspace.worktree_dir
 RawWorktreeOverride.project

@@ -570,6 +570,12 @@
     "sidebar_scroll_align": "minimal",
     "sidebar_tooltips": "elided",
     "status_indicators": "dots",
+    "tasks": {
+      "chevron": null,
+      "chevron_hover": null,
+      "chevron_thickness": 1.5,
+      "hidden_count": null
+    },
     "upstream_status": false,
     "vsync": true,
     "worktree_liveness": true,
