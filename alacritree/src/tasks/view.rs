@@ -24,6 +24,7 @@ use alacritree_tasks::{Edit, Filter, NodeMatch, Status, Task, TaskBackend, TaskE
 use crate::projects::Project;
 use crate::tasks::backend::{self, Backend};
 use crate::tasks::facts;
+use crate::vcs::Vcs;
 
 const RELOAD_EVERY: Duration = Duration::from_secs(1);
 const INDENT: f32 = 16.0;
@@ -77,6 +78,63 @@ impl Scope {
     }
 }
 
+const FIRST_RETRY: Duration = Duration::from_secs(1);
+const LAST_RETRY: Duration = Duration::from_secs(60);
+
+/// Asks version control for a worktree's names until it answers. The tab
+/// gets a worktree only when its project has a backend, so an answer of
+/// `Global` means the backend could not be asked, as when `wsl.exe` fails,
+/// and not that the worktree is in no repository.
+struct Resolver {
+    dir: PathBuf,
+    backends: Vec<Vcs>,
+    /// `None` between a failed lookup and its retry.
+    lookup: Option<Job<Place>>,
+    retry_at: Instant,
+    backoff: Duration,
+}
+
+impl Resolver {
+    fn new(dir: PathBuf, backends: Vec<Vcs>) -> Self {
+        let mut resolver =
+            Self { dir, backends, lookup: None, retry_at: Instant::now(), backoff: FIRST_RETRY };
+        resolver.lookup = Some(resolver.spawn());
+        resolver
+    }
+
+    fn spawn(&self) -> Job<Place> {
+        let (dir, backends) = (self.dir.clone(), self.backends.clone());
+        jobs::pool().spawn(Priority::Interactive, move |b| facts::place_for(&dir, &backends, b).1)
+    }
+
+    fn poll(&mut self, now: Instant) -> Option<Place> {
+        let Some(job) = &self.lookup else {
+            if now >= self.retry_at {
+                self.lookup = Some(self.spawn());
+            }
+            return None;
+        };
+        match job.poll() {
+            Some(Place::Global) => {},
+            Some(place) => {
+                self.lookup = None;
+                return Some(place);
+            },
+            None if job.failed() => {},
+            None => return None,
+        }
+        log::warn!(
+            "tasks: no repository found for {}, asking again in {:?}",
+            self.dir.display(),
+            self.backoff
+        );
+        self.lookup = None;
+        self.retry_at = now + self.backoff;
+        self.backoff = (self.backoff * 2).min(LAST_RETRY);
+        None
+    }
+}
+
 /// Edits the tab asks for, with the row a failure is shown on. A frame
 /// queues them and the next one spawns them, so what a frame decided can be
 /// read before the pool runs it.
@@ -101,7 +159,7 @@ pub(crate) struct TasksView {
     backend: Backend,
     scope: Scope,
     /// The worktree's names as `task scope` reads them from git.
-    resolving: Option<Job<Place>>,
+    resolving: Option<Resolver>,
     tasks: Vec<Task>,
     load_error: Option<String>,
     /// A failed add has no row to show on; it stays until the next write.
@@ -135,12 +193,9 @@ impl TasksView {
         backend: Backend,
         scope: Scope,
         worktree: Option<PathBuf>,
-        backends: Vec<crate::vcs::Vcs>,
+        backends: Vec<Vcs>,
     ) -> Self {
-        let resolving = worktree.map(|dir| {
-            jobs::pool()
-                .spawn(Priority::Interactive, move |b| facts::place_for(&dir, &backends, b).1)
-        });
+        let resolving = worktree.map(|dir| Resolver::new(dir, backends));
         Self {
             backend,
             scope,
@@ -271,7 +326,7 @@ impl TasksView {
     /// Spawns queued writes, drains finished jobs, and reloads after any
     /// write or once a second.
     fn tick(&mut self) {
-        if let Some(place) = self.resolving.as_ref().and_then(Job::poll) {
+        if let Some(place) = self.resolving.as_mut().and_then(|r| r.poll(Instant::now())) {
             self.resolving = None;
             self.scope.adopt(&place);
             self.stale = true;
@@ -726,6 +781,40 @@ mod tests {
             answered.adopt(&git(checkout));
             assert_eq!(seeded, answered, "{}", checkout.path.display());
         }
+    }
+
+    /// Polls at `now` until the lookup in flight lands, the way frames do.
+    fn settle(resolver: &mut Resolver, now: Instant) -> Option<Place> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(place) = resolver.poll(now) {
+                return Some(place);
+            }
+            resolver.lookup.as_ref()?;
+            assert!(Instant::now() < deadline, "the lookup never landed");
+            std::thread::yield_now();
+        }
+    }
+
+    /// A worktree the sidebar placed in a repository is in one, so git
+    /// finding none means it could not be asked, and it is asked again.
+    #[test]
+    fn a_lookup_that_finds_no_repository_is_asked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("myrepo");
+        std::fs::create_dir(&path).unwrap();
+        let backends = vec![Vcs::Git(alacritree_git::GitBackend)];
+        let mut resolver = Resolver::new(path.clone(), backends);
+        let start = Instant::now();
+        assert_eq!(settle(&mut resolver, start), None, "no answer while git finds nothing");
+
+        alacritree_git::test_support::init_repo_on(&path, "trunk");
+        assert_eq!(settle(&mut resolver, start), None, "the retry waits");
+        let later = start + Duration::from_secs(3600);
+        assert_eq!(
+            settle(&mut resolver, later),
+            Some(Place::Workspace { repo: "myrepo".into(), branch: "trunk".into() })
+        );
     }
 
     #[test]
