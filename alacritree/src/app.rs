@@ -9540,6 +9540,29 @@ mod tests {
         assert!(!valid_for_focus(&git_action, scope()));
     }
 
+    /// Bound to a bare letter like the other projects filters, the detached
+    /// toggle must leave that letter to the terminal.
+    #[test]
+    fn a_bound_detached_toggle_fires_only_in_the_projects_sidebar() {
+        let bindings = crate::bindings::parse_bindings(vec![crate::bindings::RawBinding {
+            key: "X".into(),
+            mods: None,
+            mode: None,
+            chars: None,
+            action: Some("ToggleDetachedSessionsFilter".into()),
+            command: None,
+        }]);
+        let shortcuts = crate::shortcut::Shortcuts::new(&bindings);
+        let fires = |scope| {
+            let matched = shortcuts.matches(egui::Key::X, egui::Modifiers::NONE);
+            !dispatched_actions(matched, scope).is_empty()
+        };
+
+        assert!(fires(BindingScope { sidebar_focused: true, ..scope() }));
+        assert!(!fires(scope()), "the terminal keeps its key");
+        assert!(!fires(BindingScope { git_focused: true, ..scope() }));
+    }
+
     /// `ScrollPageUp` is unscoped by pane focus, so only the scratchpad
     /// editor stealing it back (via `terminal_only`) should block it.
     #[test]

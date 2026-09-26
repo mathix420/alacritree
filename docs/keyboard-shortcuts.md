@@ -311,8 +311,9 @@ survive:
   session and lists only their sessions. With
   `[ui] sessions_filter_counts_detached` on, a listed detached herdr agent
   also counts and stays listed.
-- `ToggleDetachedSessionsFilter` — flip the runtime
-  `sessions_filter_counts_detached` value. No default key.
+- `ToggleDetachedSessionsFilter` flips the runtime
+  `sessions_filter_counts_detached` value. No default key; a binding acts
+  only while the projects sidebar has focus, like the other filters.
 - `ToggleAttentionFilter` (default `A`) — narrow to workspaces whose session
   wants attention.
 - `TogglePrOpenFilter` / `TogglePrDraftFilter` / `TogglePrMergedFilter` /
