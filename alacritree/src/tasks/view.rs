@@ -37,28 +37,35 @@ pub(crate) struct Scope {
 }
 
 impl Scope {
-    /// The names the sidebar already has, so the tab opens without waiting
-    /// on git. `adopt` replaces them once git has answered.
+    /// The names git would give, worked out from what discovery recorded, so
+    /// the tab opens without waiting on git. `adopt` replaces them once git
+    /// has answered.
     pub(crate) fn for_workspace(project: Option<&Project>, worktree: Option<&Checkout>) -> Self {
         let side = match project.map(|p| wsl::classify(&p.root)) {
             Some(wsl::Location::Wsl { distro, .. }) => Side::Wsl(distro),
             _ => Side::Native,
         };
-        let workspace = project.zip(worktree).map(|(p, wt)| {
-            let branch = wt.head.label().map_or_else(|| wt.name.clone(), str::to_string);
-            node(&Place::Workspace { repo: p.name.clone(), branch }, None)
-        });
-        let repo = project.map(|p| node(&Place::Project { repo: p.name.clone() }, None));
-        Self { side, repo, workspace }
+        let mut scope = Self { side, repo: None, workspace: None };
+        if let Some(project) = project {
+            scope.adopt(&facts::place_of(project, worktree));
+        }
+        scope
     }
 
     /// Takes the names `task scope` gives the worktree, which follow git's
     /// own view of a detached or shared checkout where the sidebar's labels
     /// do not.
     pub(crate) fn adopt(&mut self, place: &Place) {
-        if let Place::Workspace { repo, .. } = place {
-            self.repo = Some(node(&Place::Project { repo: repo.clone() }, None));
-            self.workspace = Some(node(place, None));
+        match place {
+            Place::Global => {},
+            Place::Project { .. } => {
+                self.repo = Some(node(place, None));
+                self.workspace = None;
+            },
+            Place::Workspace { repo, .. } => {
+                self.repo = Some(node(&Place::Project { repo: repo.clone() }, None));
+                self.workspace = Some(node(place, None));
+            },
         }
     }
 
@@ -686,6 +693,39 @@ mod tests {
         let p = project("C:/src/r", "r");
         let w = worktree("C:/src/wt/review", "review", None);
         assert_eq!(Scope::for_workspace(Some(&p), Some(&w)).workspace.as_deref(), Some("r.review"));
+    }
+
+    /// The first frame reads the nodes the store holds the tasks under, even
+    /// when the sidebar's names differ from git's and git never answers.
+    #[test]
+    fn the_first_scope_names_the_nodes_git_would() {
+        let main = worktree("C:/src/monorepo", "main", Some("trunk"));
+        let linked = worktree("C:/src/wt/feat", "feat", Some("feat/x"));
+        let detached = alacritree_vcs::Head {
+            name: None,
+            revision: Some("abc1234".into()),
+            ..Default::default()
+        };
+        let review = Checkout { head: detached, ..worktree("C:/src/wt/review", "review", None) };
+        let project = Project {
+            name: "feat".into(),
+            checkouts: vec![Checkout { is_main: true, ..main }, linked.clone(), review.clone()],
+            ..project("C:/src/wt/feat", "feat")
+        };
+        let git = |checkout: &Checkout| {
+            crate::tasks::facts::place_from(Some(&alacritree_vcs::Located {
+                main: PathBuf::from("C:/src/monorepo"),
+                bare: false,
+                checkout: Some(checkout.path.clone()),
+                head: checkout.head.clone(),
+            }))
+        };
+        for checkout in [&linked, &review] {
+            let seeded = Scope::for_workspace(Some(&project), Some(checkout));
+            let mut answered = seeded.clone();
+            answered.adopt(&git(checkout));
+            assert_eq!(seeded, answered, "{}", checkout.path.display());
+        }
     }
 
     #[test]
