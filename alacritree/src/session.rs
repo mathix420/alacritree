@@ -657,7 +657,7 @@ pub(crate) struct OpenRequest<R> {
 /// The half of a session that only exists once its PTY does.  Applied by
 /// [`Session::attach`]; dropping one instead shuts the PTY down, which is
 /// what happens when the tab it belongs to closes mid-open.
-pub struct Attachment {
+pub(crate) struct Attachment {
     shell_pid: Option<u32>,
     priority_job: Option<crate::focus_priority::PriorityJob>,
     /// `None` only between `into_parts` and the drop that follows it, which
