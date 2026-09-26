@@ -382,7 +382,7 @@ alacritree's own presentation: sidebar colors, icons, tooltips, shell profiles, 
 - `pr_status_concurrency` (integer): Deprecated. This value applies only while `[integrations.gh]` `pr_status_concurrency` is omitted. Remove it after migration.
 - `project_name` (string): Template for a project row's label, taking `$name` and `$path`. A manual rename always wins over it.
 - `reap_descendants_on_close` (boolean, default `false`): End everything a session started when that session closes, at any depth, except processes that ask to break away. Windows only; changing it requires a restart.
-- `return_to_previous_session` (boolean, default `false`): Whether closing the on-screen scratchpad or tasks tab goes back to the session that was on screen before the tab was. Off lands on the sibling `sidebar_focus` picks. Either way a session that has since closed falls back to that sibling.
+- `return_to_previous_session` (boolean, default `true`): Whether closing the on-screen scratchpad or tasks tab goes back to the session that was on screen before the tab was. Off lands on the sibling `sidebar_focus` picks. Either way a session that has since closed falls back to that sibling.
 - `scrollbar` ("floating" | "solid", default `"floating"`): Sidebar scrollbar style: "floating" | "solid".
 - `search_depth` ("workspaces" | "sessions", default `"workspaces"`): How far a sidebar query reaches: "workspaces" matches project and worktree names only; "sessions" also matches session titles and herdr agent names.
 - `search_scope` ("filtered" | "all", default `"filtered"`): Whether a fuzzy query is confined by the panel's active toggle filters: "filtered" | "all".

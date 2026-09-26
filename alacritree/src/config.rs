@@ -1427,7 +1427,7 @@ impl Default for UiTheme {
             confirm_session_detach: true,
             sessions_filter_counts_detached: false,
             last_session_close: LastSessionClose::Respawn,
-            return_to_previous_session: false,
+            return_to_previous_session: true,
             hold_exited_sessions: HoldExitedSessions::default(),
             sidebar_focus: SidebarFocus::default(),
             sidebar_follow_active: false,
@@ -3198,7 +3198,7 @@ impl Default for RawUi {
             confirm_session_detach: true,
             sessions_filter_counts_detached: false,
             last_session_close: ClosedSet::default(),
-            return_to_previous_session: false,
+            return_to_previous_session: true,
             hold_exited_sessions: ClosedSet::default(),
             sidebar_focus: ClosedSet::default(),
             sidebar_follow_active: false,
@@ -5039,9 +5039,11 @@ program = "second"
     }
 
     #[test]
-    fn return_to_previous_session_defaults_off_and_parses() {
-        assert!(!ui_from_toml("").return_to_previous_session);
-        assert!(ui_from_toml("[ui]\nreturn_to_previous_session = true").return_to_previous_session);
+    fn return_to_previous_session_defaults_on_and_parses() {
+        assert!(ui_from_toml("").return_to_previous_session);
+        assert!(
+            !ui_from_toml("[ui]\nreturn_to_previous_session = false").return_to_previous_session
+        );
     }
 
     #[test]

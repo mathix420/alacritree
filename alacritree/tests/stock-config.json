@@ -546,7 +546,7 @@
     },
     "project_name": null,
     "reap_descendants_on_close": false,
-    "return_to_previous_session": false,
+    "return_to_previous_session": true,
     "scrollbar": "floating",
     "search_depth": "workspaces",
     "search_scope": "filtered",
