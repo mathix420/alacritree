@@ -862,10 +862,12 @@ pub struct WslProbe {
 
 const PROBE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+type ProbeCache = Mutex<HashMap<(String, String), Option<String>>>;
+
 /// Last-known foreground `comm` per registered `(distro, probe key)`.
 /// Written only by the poller thread (and tests); read from the UI thread.
-fn probe_cache() -> &'static Mutex<HashMap<(String, String), Option<String>>> {
-    static CACHE: OnceLock<Mutex<HashMap<(String, String), Option<String>>>> = OnceLock::new();
+fn probe_cache() -> &'static ProbeCache {
+    static CACHE: OnceLock<ProbeCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 

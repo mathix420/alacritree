@@ -80,10 +80,7 @@ pub(crate) fn show(
         ui.add_space(pad_y);
     }
     let (rect, response) = ui.allocate_exact_size(
-        Vec2::new(
-            cols as f32 * cell_w + 2.0 * pad_x,
-            rows as f32 * cell_h + (if pad_y > 0.0 { 0.0 } else { 0.0 }),
-        ),
+        Vec2::new(cols as f32 * cell_w + 2.0 * pad_x, rows as f32 * cell_h),
         Sense::click_and_drag(),
     );
     // Snap the grid origin so column/row boundaries stay on integer pixels.
@@ -1071,25 +1068,21 @@ impl GridSnapshot {
 
         // A selection or a link highlight restyles cells the terminal never
         // wrote to, so both edges of the change have to be re-walked.
-        for range in [self.context.selection, context.selection] {
-            if let Some(range) = range {
-                self.damaged.extend(viewport_rows(
-                    range.start,
-                    range.end,
-                    display_offset,
-                    screen_lines,
-                ));
-            }
+        for range in [self.context.selection, context.selection].into_iter().flatten() {
+            self.damaged.extend(viewport_rows(
+                range.start,
+                range.end,
+                display_offset,
+                screen_lines,
+            ));
         }
-        for link in [self.context.link.as_ref(), context.link.as_ref()] {
-            if let Some(link) = link {
-                self.damaged.extend(viewport_rows(
-                    *link.start(),
-                    *link.end(),
-                    display_offset,
-                    screen_lines,
-                ));
-            }
+        for link in [self.context.link.as_ref(), context.link.as_ref()].into_iter().flatten() {
+            self.damaged.extend(viewport_rows(
+                *link.start(),
+                *link.end(),
+                display_offset,
+                screen_lines,
+            ));
         }
         self.context = context;
 
@@ -2351,10 +2344,6 @@ mod tests {
             Some(Rect::from_min_size(Pos2::new(24.0, 0.0), Vec2::new(8.0, 16.0))),
         );
     }
-
-    /// A context whose monospace fallback is scaled far past the primary face,
-    /// so a character the primary lacks comes back several times wider than
-    /// the cell — a Nerd Font icon against a half-width cell, in miniature.
 
     /// Where each glyph of a painted frame was placed.
     fn painted_at(

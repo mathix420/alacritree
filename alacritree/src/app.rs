@@ -776,7 +776,7 @@ impl AlacritreeApp {
     /// Persist one project's `expanded` / `shell` fields without touching the
     /// rest of the file, so a second window's project list survives.
     fn persist_project(&self, root: &Path) {
-        let Some(p) = self.projects.iter().find(|p| &p.root == root) else {
+        let Some(p) = self.projects.iter().find(|p| p.root == root) else {
             return;
         };
         let (expanded, shell, label) =
@@ -1421,7 +1421,7 @@ impl AlacritreeApp {
         reason: CloseReason,
     ) {
         let policy = self.config.ui.last_session_close;
-        let ring = policy.rings().then(|| self.session_ring()).unwrap_or_default();
+        let ring = if policy.rings() { self.session_ring() } else { Default::default() };
         let returns = self.config.ui.return_to_previous_session;
         // A cursor left on the closed tab's row would slide to a sibling and,
         // under `sidebar_focus = "follow"`, take the terminal there too.
@@ -3253,7 +3253,7 @@ impl AlacritreeApp {
 
         let mut sidebar_rect = None;
         if self.show_left_sidebar {
-            let r = self.show_project_sidebar(ctx, panel_frame.clone());
+            let r = self.show_project_sidebar(ctx, panel_frame);
             paint_panel_border(ctx, r.right(), r.y_range(), theme.sidebar_border);
             if theme.focus_outline.sidebar
                 && !modal_open
@@ -8970,14 +8970,14 @@ mod tests {
             })
         };
 
-        let first = resolve_pr_info(&mut memo, &path, true, &poll);
-        let second = resolve_pr_info(&mut memo, &path, true, &poll);
+        let first = resolve_pr_info(&mut memo, &path, true, poll);
+        let second = resolve_pr_info(&mut memo, &path, true, poll);
 
         assert_eq!(lookups.get(), 1, "one lookup per path per frame");
         assert!(second.is_some(), "the duplicate row still renders its badge");
         assert_eq!(first.map(|i| i.number), second.map(|i| i.number));
 
-        let ineligible = resolve_pr_info(&mut memo, &PathBuf::from("/repo/other"), false, &poll);
+        let ineligible = resolve_pr_info(&mut memo, &PathBuf::from("/repo/other"), false, poll);
         assert_eq!(lookups.get(), 1, "an ineligible path never runs the lookup");
         assert!(ineligible.is_none());
     }

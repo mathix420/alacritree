@@ -173,6 +173,7 @@ impl PaletteItem {
         Self::new(PaletteAction::Run(a), section_of(a), keys, a.description(), a.config_name())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn session(
         id: SessionId,
         primary: String,

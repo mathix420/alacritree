@@ -99,6 +99,7 @@ fn editor_id(session_id: u64) -> Id {
 /// Full-pane editor inspired by notes.vercel.app: no toolbar, border, status
 /// chrome, or explicit save action—just a padded text surface that inherits
 /// the terminal pane's background.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn show_editor(
     ui: &mut egui::Ui,
     session_id: u64,
@@ -117,7 +118,7 @@ pub(crate) fn show_editor(
         ui.memory_mut(|memory| memory.surrender_focus(editor_id));
     }
 
-    let response = Frame::default()
+    Frame::default()
         .inner_margin(Margin::same(padding as i8))
         .show(ui, |ui| {
             let inner_size = egui::vec2(
@@ -167,8 +168,7 @@ pub(crate) fn show_editor(
             }
             output.response
         })
-        .inner;
-    response
+        .inner
 }
 
 pub(crate) fn ensure_file(workspace: &WorkspaceKey) -> io::Result<PathBuf> {
@@ -246,7 +246,7 @@ pub(crate) fn read_json(workspace: &WorkspaceKey) -> Result<Value, ReadError> {
 }
 
 fn read_json_at(path: &Path, workspace: &WorkspaceKey) -> Result<Value, ReadError> {
-    let bytes = match fs::read(&path) {
+    let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Ok(json!({
@@ -261,7 +261,7 @@ fn read_json_at(path: &Path, workspace: &WorkspaceKey) -> Result<Value, ReadErro
     };
     let truncated = bytes.len() > MAX_MCP_BYTES;
     let content = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_MCP_BYTES)]).into_owned();
-    let modified_ms = fs::metadata(&path)
+    let modified_ms = fs::metadata(path)
         .ok()
         .and_then(|metadata| metadata.modified().ok())
         .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())

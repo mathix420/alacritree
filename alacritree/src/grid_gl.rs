@@ -130,7 +130,7 @@ enum BuildError {
 /// discovers that, so a retrying build is a leak with no visible cause.
 enum GlSlot {
     Unbuilt,
-    Ready(GlResources),
+    Ready(Box<GlResources>),
     Failed,
 }
 
@@ -170,7 +170,7 @@ impl GpuGrid {
                 let gl = painter.gl().clone();
                 if let GlSlot::Unbuilt = *held {
                     *held = match GlResources::new(&gl, time_gpu) {
-                        Ok(resources) => GlSlot::Ready(resources),
+                        Ok(resources) => GlSlot::Ready(Box::new(resources)),
                         Err(err) => {
                             log::error!("gpu grid disabled: {err}");
                             failed.store(true, Ordering::Relaxed);

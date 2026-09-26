@@ -319,7 +319,7 @@ mod tests {
             ..Default::default()
         });
 
-        mutate_at(&path, |s| s.projects.retain(|p| p.root != PathBuf::from("/repo/drop")));
+        mutate_at(&path, |s| s.projects.retain(|p| p.root != Path::new("/repo/drop")));
 
         assert_eq!(roots(&load_from(&path)), vec![PathBuf::from("/repo/keep")]);
     }

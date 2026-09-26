@@ -966,6 +966,7 @@ pub(super) fn pane_palette_content(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn palette_hover(
     title: &str,
     kind: Option<&str>,

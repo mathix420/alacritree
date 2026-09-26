@@ -848,6 +848,7 @@ impl<R: Repaint> Session<R> {
     /// and attached in one call.  Test-only: the app reaches the same place
     /// through `pending_command`, so that a slow open cannot cost a frame.
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_command(
         repaint: R,
         config: &Config,
@@ -914,6 +915,7 @@ impl<R: Repaint> Session<R> {
     /// without opening its PTY.  The git sidebar drops into `delta` this way
     /// for an inline diff view; once the command exits, `reap_exited_sessions`
     /// removes the tab.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn pending_command(
         repaint: R,
         config: &Config,
@@ -942,6 +944,7 @@ impl<R: Repaint> Session<R> {
     /// The half of a session that costs nothing: ids, the grid, the event
     /// channel and the arguments its PTY will be opened with.  Cheap enough
     /// for a frame, which is the whole point of the split.
+    #[allow(clippy::too_many_arguments)]
     fn pending(
         repaint: R,
         config: &Config,
@@ -1553,29 +1556,6 @@ mod tests {
         assert!(matches!(events.try_recv(), Ok(TermEvent::Title(_))));
     }
 
-    /// Refreshing the process table costs ~12 ms — a dropped frame — and
-    /// `process_probe` runs on the UI thread.  The whole round trip: the call
-    /// registers what it wants and returns with whatever was last computed,
-    /// the refresher answers on its own clock, and it then stops scanning for
-    /// a shell nobody has asked about again.
-    ///
-    /// What a call costs is measured by `report_process_probe_cost` below,
-    /// which reports rather than asserts.  A wall-clock bound here could not
-    /// tell a probe that scanned from a runner that descheduled the thread,
-    /// and the default answer already says no scan produced it.
-
-    /// Starting an agent through a shim (`node`, `python`) is only visible in
-    /// its command line, and it always adds a process.  A remembered scan that
-    /// outlived the tree it ran on would leave the sidebar showing no agent
-    /// for as long as that shell lived.
-
-    /// Not a gate — run it by hand:
-    /// `cargo test -p alacritree --release -- --ignored --nocapture report_process_probe_cost`
-    ///
-    /// `process_probe` runs on the UI thread whenever a session's agent cache
-    /// goes stale, and every visible frame asks for the status. What one call
-    /// costs is what a keystroke can queue behind.
-
     /// Nothing drains a hidden session's channel, because nothing wakes the
     /// loop for it.  Payload-free wakeups therefore cannot go in: a background
     /// agent streaming output would grow the channel for as long as the window
@@ -1592,13 +1572,6 @@ mod tests {
 
         assert_eq!(events.try_iter().count(), 0);
     }
-
-    /// Drives the real sysctl against a real child: its `p_comm` is the
-    /// spawned binary's name and a plain spawn inherits our process group.
-
-    /// Drives the real foreground-group probe against a real PTY shell: an
-    /// idle shell owns its terminal, a running job flips the probe, and the
-    /// job's comm names it as the foreground process.
 
     /// OSC 52 is how Claude Code, tmux and vim copy.  The sequence is
     /// fire-and-forget — the app reports a successful copy either way — so a
@@ -2157,8 +2130,8 @@ mod tests {
     fn a_home_session_starts_in_the_configured_working_directory() {
         let dir = tempfile::tempdir().unwrap();
 
-        let mut config = Config::default();
-        config.working_directory = Some(dir.path().to_path_buf());
+        let config =
+            Config { working_directory: Some(dir.path().to_path_buf()), ..Default::default() };
 
         // The child writes its cwd into a relative path; the file landing in
         // `dir` is itself proof the PTY honored the configured directory.
@@ -2213,8 +2186,8 @@ mod tests {
     #[test]
     fn explicit_dirs_win_and_missing_configured_dirs_are_dropped() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        config.working_directory = Some(tmp.path().join("gone"));
+        let mut config =
+            Config { working_directory: Some(tmp.path().join("gone")), ..Default::default() };
 
         assert_eq!(
             pty_working_directory(Some(tmp.path().to_path_buf()), &config),
@@ -2493,9 +2466,6 @@ mod tests {
         assert!(ensure_working_directory(None).is_ok());
         assert!(ensure_working_directory(Some(tmp.path())).is_ok());
     }
-
-    /// `herdr agent attach` runs as a process named `herdr` but draws one
-    /// agent with no splits, so nothing inside it would ever hand focus back.
 
     /// A WSL attach runs herdr inside the distro, out of reach of the Windows
     /// descendant walk, so without the helper's foreground probe the session
