@@ -14,14 +14,14 @@ pub mod fake;
 pub mod scope;
 pub mod tree;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub use crate::command::{RawTasks, TaskCommand, TasksConfig};
 use crate::scope::GLOBAL;
 
 /// Where a task stands. A store's other states, such as deleted or waiting,
 /// stay out of a listing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     Pending,
@@ -29,7 +29,7 @@ pub enum Status {
 }
 
 /// One task as a store lists it.
-#[derive(Clone, Debug, PartialEq, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Task {
     /// What every edit addresses the task by. Stable for the task's life.
     pub id: String,

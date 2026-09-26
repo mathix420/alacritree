@@ -60,6 +60,7 @@ pub(crate) enum PaletteSection {
     Clipboard,
     Scrollback,
     Sessions,
+    Tasks,
     Workspaces,
     Sidebar,
     Filters,
@@ -77,6 +78,7 @@ impl PaletteSection {
             Self::Clipboard => "Clipboard",
             Self::Scrollback => "Scrollback",
             Self::Sessions => "Sessions",
+            Self::Tasks => "Tasks",
             Self::Workspaces => "Workspaces & projects",
             Self::Sidebar => "Sidebar & focus",
             Self::Filters => "Filters",
@@ -111,6 +113,8 @@ fn section_of(a: NamedAction) -> PaletteSection {
         SelectNextSession(_) | SelectPreviousSession(_) => Sessions,
         ToggleSessionRows(_) | ToggleSessionTabs(_) | ToggleSessionDrag(_) => Sessions,
         MoveSessionUp(_) | MoveSessionDown(_) => Sessions,
+        IndentTask(_) | DedentTask(_) | MoveTaskUp(_) | MoveTaskDown(_) => Tasks,
+        DeleteTask(_) | ToggleCompletedTasks(_) => Tasks,
         SelectNextWorkspace(_) | SelectPreviousWorkspace(_) => Workspaces,
         AddProject(_) | RefreshProjects(_) | SetBaseBranch(_) | ReviewStaged(_)
         | ReviewUnstaged(_) | ReviewBranch(_) => Workspaces,
@@ -314,7 +318,8 @@ fn is_hidden(a: NamedAction) -> bool {
 pub(crate) fn action_items(shortcuts: &Shortcuts, tasks_enabled: bool) -> Vec<PaletteItem> {
     // A tasks action while the integration is off would open nothing.
     let listed = |a: &NamedAction| {
-        !is_hidden(*a) && (tasks_enabled || !matches!(a, NamedAction::OpenTasks(_)))
+        let tasks = matches!(a, NamedAction::OpenTasks(_)) || a.is_tasks_scoped();
+        !is_hidden(*a) && (tasks_enabled || !tasks)
     };
     let mut order: Vec<NamedAction> = NamedAction::iter().filter(listed).collect();
     for action in shortcuts.actions() {

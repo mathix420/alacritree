@@ -1,8 +1,9 @@
 //! The tab's model: tasks split into scope sections, nested by `parent`,
 //! ordered by `order`, folded under collapsed rows, and the edits that
-//! inserting or indenting turns into.
-//! Free of egui so it can be tested without a frame.
+//! inserting, indenting or moving turns into. Free of egui so it can be
+//! tested without a frame.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
 use crate::scope::GLOBAL;
@@ -17,6 +18,21 @@ pub struct Row {
     pub text: String,
     pub status: Status,
     pub started: bool,
+    /// The task's direct subtasks.
+    pub subtasks: Progress,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Progress {
+    pub done: usize,
+    pub total: usize,
+}
+
+/// Which side of the row it is dropped on a moved task lands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Landing {
+    Before,
+    After,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,9 +51,15 @@ pub struct Section {
 }
 
 /// Agents may add tasks with no `order`; those sort after ordered ones,
-/// oldest first, so a new agent task lands at the bottom.
-fn sort_key(t: &Task) -> (bool, i64, String) {
-    (t.order.is_none(), t.order.unwrap_or(0), t.entry.clone().unwrap_or_default())
+/// oldest first, so a new agent task lands at the bottom. Agents also pick
+/// their own `order` and `entry` has whole seconds, so ties are common and
+/// the id settles them.
+fn sort_key(t: &Task) -> (bool, i64, Option<&str>, &str) {
+    (t.order.is_none(), t.order.unwrap_or(0), t.entry.as_deref(), &t.id)
+}
+
+fn by_order(list: &mut [&Task]) {
+    list.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
 }
 
 /// A parent outside `tasks` is treated as none, so a task whose parent was
@@ -67,10 +89,12 @@ pub fn sections(tasks: &[Task], repo: Option<&str>, workspace: Option<&str>) -> 
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
-        let latest = |node: &str| {
-            in_node(node).iter().filter_map(|t| t.modified.clone()).max().unwrap_or_default()
+        // By when the session began rather than when it last changed, so a
+        // section does not jump each time an agent ticks off a task.
+        let began = |node: &str| {
+            tasks.iter().filter(|t| t.node() == node).filter_map(|t| t.entry.as_deref()).min()
         };
-        sessions.sort_by_key(|node| (std::cmp::Reverse(latest(node)), node.to_string()));
+        sessions.sort_by_key(|node| (Reverse(began(node)), *node));
         out.extend(sessions.into_iter().map(|node| section(node, SectionKind::Session)));
     }
     out
@@ -83,7 +107,7 @@ pub fn rows(tasks: &[&Task]) -> Vec<Row> {
         children.entry(parent_of(t, &present)).or_default().push(t);
     }
     for list in children.values_mut() {
-        list.sort_by_key(|t| sort_key(t));
+        by_order(list);
     }
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -91,18 +115,20 @@ pub fn rows(tasks: &[&Task]) -> Vec<Row> {
     // Tasks in a parent cycle have no root to be reached from.
     let mut stranded: Vec<&Task> =
         tasks.iter().copied().filter(|t| !seen.contains(t.id.as_str())).collect();
-    stranded.sort_by_key(|t| sort_key(t));
+    by_order(&mut stranded);
     for t in stranded {
         if seen.insert(t.id.clone()) {
-            out.push(row(t, 0));
+            out.push(row(t, 0, &children));
             walk(&children, Some(&t.id), 1, &mut seen, &mut out);
         }
     }
     out
 }
 
+type Children<'a> = HashMap<Option<&'a str>, Vec<&'a Task>>;
+
 fn walk(
-    children: &HashMap<Option<&str>, Vec<&Task>>,
+    children: &Children<'_>,
     parent: Option<&str>,
     depth: usize,
     seen: &mut HashSet<String>,
@@ -110,19 +136,25 @@ fn walk(
 ) {
     for t in children.get(&parent).into_iter().flatten() {
         if seen.insert(t.id.clone()) {
-            out.push(row(t, depth));
+            out.push(row(t, depth, children));
             walk(children, Some(&t.id), depth + 1, seen, out);
         }
     }
 }
 
-fn row(t: &Task, depth: usize) -> Row {
+fn row(t: &Task, depth: usize, children: &Children<'_>) -> Row {
+    let subtasks =
+        children.get(&Some(t.id.as_str())).map_or_else(Progress::default, |list| Progress {
+            done: list.iter().filter(|c| c.status == Status::Completed).count(),
+            total: list.len(),
+        });
     Row {
         id: t.id.clone(),
         depth,
         text: t.description.clone(),
         status: t.status,
         started: t.started,
+        subtasks,
     }
 }
 
@@ -144,11 +176,23 @@ pub fn fold<'a>(rows: &'a [Row], collapsed: &HashSet<String>) -> Vec<(&'a Row, u
     out
 }
 
+/// `rows` without the completed tasks whose whole subtree is completed, so
+/// every open task still shows under its parents.
+pub fn without_completed(rows: Vec<Row>) -> Vec<Row> {
+    let open_below: Vec<bool> = (0..rows.len())
+        .map(|i| {
+            let below = &rows[i + 1..][..descendants(&rows, i)];
+            rows[i].status == Status::Pending || below.iter().any(|r| r.status == Status::Pending)
+        })
+        .collect();
+    rows.into_iter().zip(open_below).filter_map(|(row, keep)| keep.then_some(row)).collect()
+}
+
 fn siblings<'a>(tasks: &[&'a Task], parent: Option<&str>) -> Vec<&'a Task> {
     let present = present(tasks);
     let mut list: Vec<&Task> =
         tasks.iter().copied().filter(|t| parent_of(t, &present) == parent).collect();
-    list.sort_by_key(|t| sort_key(t));
+    by_order(&mut list);
     list
 }
 
@@ -227,6 +271,89 @@ pub fn dedent(tasks: &[&Task], id: &str) -> Vec<Edit> {
     let (mut edits, order) = slot(&list, index);
     edits.push(Edit::Move { id: id.to_string(), parent: grandparent.map(str::to_string), order });
     edits
+}
+
+pub fn move_up(tasks: &[&Task], id: &str) -> Vec<Edit> {
+    step(tasks, id, Landing::Before)
+}
+
+pub fn move_down(tasks: &[&Task], id: &str) -> Vec<Edit> {
+    step(tasks, id, Landing::After)
+}
+
+/// Past the neighbouring sibling on the `toward` side.
+fn step(tasks: &[&Task], id: &str, toward: Landing) -> Vec<Edit> {
+    let present = present(tasks);
+    let Some(me) = tasks.iter().copied().find(|t| t.id == id) else { return Vec::new() };
+    let group = siblings(tasks, parent_of(me, &present));
+    let Some(pos) = group.iter().position(|t| t.id == id) else { return Vec::new() };
+    let neighbour = match toward {
+        Landing::Before => pos.checked_sub(1),
+        Landing::After => Some(pos + 1),
+    };
+    match neighbour.and_then(|i| group.get(i)) {
+        Some(anchor) => move_to(tasks, id, &anchor.id, toward),
+        None => Vec::new(),
+    }
+}
+
+/// Moves `id` beside `anchor`, as a sibling of it. Nothing happens when
+/// `anchor` is `id` or lies below it, since the task cannot nest in itself.
+pub fn move_to(tasks: &[&Task], id: &str, anchor: &str, landing: Landing) -> Vec<Edit> {
+    let present = present(tasks);
+    let Some(me) = tasks.iter().copied().find(|t| t.id == id) else { return Vec::new() };
+    let Some(target) = tasks.iter().copied().find(|t| t.id == anchor) else { return Vec::new() };
+    if anchor == id || descendant_ids(tasks, id).iter().any(|d| d == anchor) {
+        return Vec::new();
+    }
+    let parent = parent_of(target, &present);
+    let list: Vec<&Task> = siblings(tasks, parent).into_iter().filter(|t| t.id != id).collect();
+    let Some(at) = list.iter().position(|t| t.id == anchor) else { return Vec::new() };
+    let index = match landing {
+        Landing::Before => at.checked_sub(1),
+        Landing::After => Some(at),
+    };
+    let (mut edits, order) = slot(&list, index);
+    edits.push(if parent == parent_of(me, &present) {
+        Edit::Reorder { id: id.to_string(), order }
+    } else {
+        Edit::Move { id: id.to_string(), parent: parent.map(str::to_string), order }
+    });
+    edits
+}
+
+/// Applies a `Move` or `Reorder` to `tasks` the way a store would, so a move
+/// shows before the store confirms it. Any other edit changes nothing.
+pub fn replay(tasks: &mut [Task], edit: &Edit) {
+    match edit {
+        Edit::Move { id, parent, order } => {
+            for t in tasks.iter_mut().filter(|t| &t.id == id) {
+                t.parent = parent.clone();
+                t.order = Some(*order);
+            }
+        },
+        Edit::Reorder { id, order } => {
+            tasks.iter_mut().filter(|t| &t.id == id).for_each(|t| t.order = Some(*order));
+        },
+        _ => {},
+    }
+}
+
+/// Every task nested below `id`, at any depth.
+pub fn descendant_ids(tasks: &[&Task], id: &str) -> Vec<String> {
+    let present = present(tasks);
+    let mut out = Vec::new();
+    let mut frontier = vec![id.to_string()];
+    let mut seen: HashSet<String> = HashSet::from([id.to_string()]);
+    while let Some(parent) = frontier.pop() {
+        for t in tasks.iter().filter(|t| parent_of(t, &present) == Some(parent.as_str())) {
+            if seen.insert(t.id.clone()) {
+                out.push(t.id.clone());
+                frontier.push(t.id.clone());
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -450,5 +577,123 @@ mod tests {
     fn dedent_at_the_root_does_nothing() {
         let t = [task("a", "r", None, Some(1024))];
         assert!(dedent(&refs(&t), "a").is_empty());
+    }
+
+    fn done(mut t: Task) -> Task {
+        t.status = Status::Completed;
+        t
+    }
+
+    #[test]
+    fn equal_order_and_entry_fall_back_to_the_id() {
+        let t = [task("b", "r", None, Some(1024)), task("a", "r", None, Some(1024))];
+        assert_eq!(shape(&rows(&refs(&t))), [("a", 0), ("b", 0)]);
+    }
+
+    #[test]
+    fn a_completed_task_keeps_its_place() {
+        let t = [done(task("a", "r", None, Some(1024))), task("b", "r", None, Some(2048))];
+        assert_eq!(shape(&rows(&refs(&t))), [("a", 0), ("b", 0)]);
+    }
+
+    #[test]
+    fn sessions_keep_their_place_when_a_task_changes() {
+        let at = |id, node: &str, entry: &str, modified: &str| Task {
+            entry: Some(entry.into()),
+            modified: Some(modified.into()),
+            ..task(id, node, None, None)
+        };
+        let t = [
+            at("old", "r.main.old", "20260901T000000Z", "20260925T000000Z"),
+            at("new", "r.main.new", "20260920T000000Z", "20260920T000000Z"),
+        ];
+        let got = sections(&t, Some("r"), Some("r.main"));
+        let nodes: Vec<&str> = got[3..].iter().map(|s| s.node.as_str()).collect();
+        assert_eq!(nodes, ["r.main.new", "r.main.old"], "newest session first");
+    }
+
+    #[test]
+    fn a_parent_counts_its_done_subtasks() {
+        let t = [
+            task("a", "r", None, Some(1024)),
+            done(task("a1", "r", Some("a"), Some(1024))),
+            task("a2", "r", Some("a"), Some(2048)),
+        ];
+        let got = rows(&refs(&t));
+        assert_eq!(got[0].subtasks, Progress { done: 1, total: 2 });
+        assert_eq!(got[1].subtasks, Progress::default());
+    }
+
+    #[test]
+    fn hiding_completed_keeps_a_done_parent_with_open_subtasks() {
+        let t = [
+            done(task("a", "r", None, Some(1024))),
+            task("a1", "r", Some("a"), Some(1024)),
+            done(task("b", "r", None, Some(2048))),
+            done(task("b1", "r", Some("b"), Some(1024))),
+            done(task("c", "r", None, Some(3072))),
+        ];
+        assert_eq!(shape(&without_completed(rows(&refs(&t)))), [("a", 0), ("a1", 1)]);
+    }
+
+    #[test]
+    fn move_up_swaps_with_the_previous_sibling() {
+        let t = [
+            task("a", "r", None, Some(1024)),
+            task("a1", "r", Some("a"), Some(1024)),
+            task("b", "r", None, Some(2048)),
+        ];
+        let got = applied(&t, &move_up(&refs(&t), "b"));
+        assert_eq!(shape(&rows(&refs(&got))), [("b", 0), ("a", 0), ("a1", 1)]);
+        assert!(move_up(&refs(&got), "b").is_empty(), "already first");
+    }
+
+    #[test]
+    fn move_down_swaps_with_the_next_sibling() {
+        let t = [
+            task("a", "r", None, Some(1024)),
+            task("b", "r", None, Some(2048)),
+            task("c", "r", None, Some(3072)),
+        ];
+        let got = applied(&t, &move_down(&refs(&t), "a"));
+        assert_eq!(shape(&rows(&refs(&got))), [("b", 0), ("a", 0), ("c", 0)]);
+    }
+
+    #[test]
+    fn a_completed_task_moves_past_a_pending_one() {
+        let t = [task("a", "r", None, Some(1024)), done(task("b", "r", None, Some(2048)))];
+        let got = applied(&t, &move_up(&refs(&t), "b"));
+        assert_eq!(shape(&rows(&refs(&got))), [("b", 0), ("a", 0)]);
+    }
+
+    #[test]
+    fn a_drop_on_another_parents_child_moves_under_that_parent() {
+        let t = [
+            task("a", "r", None, Some(1024)),
+            task("a1", "r", Some("a"), Some(1024)),
+            task("b", "r", None, Some(2048)),
+        ];
+        let got = applied(&t, &move_to(&refs(&t), "b", "a1", Landing::Before));
+        assert_eq!(shape(&rows(&refs(&got))), [("a", 0), ("b", 1), ("a1", 1)]);
+    }
+
+    #[test]
+    fn a_drop_inside_its_own_subtree_does_nothing() {
+        let t = [task("a", "r", None, Some(1024)), task("a1", "r", Some("a"), Some(1024))];
+        assert!(move_to(&refs(&t), "a", "a1", Landing::After).is_empty());
+        assert!(move_to(&refs(&t), "a", "a", Landing::After).is_empty());
+    }
+
+    #[test]
+    fn the_subtree_holds_every_descendant() {
+        let t = [
+            task("a", "r", None, Some(1024)),
+            task("a1", "r", Some("a"), Some(1024)),
+            task("a11", "r", Some("a1"), Some(1024)),
+            task("b", "r", None, Some(2048)),
+        ];
+        let mut got = descendant_ids(&refs(&t), "a");
+        got.sort();
+        assert_eq!(got, ["a1", "a11"]);
     }
 }

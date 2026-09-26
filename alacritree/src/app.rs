@@ -1182,6 +1182,8 @@ impl AlacritreeApp {
                     scope,
                     worktree.map(|w| w.path.clone()),
                     self.vcs_backends.clone(),
+                    crate::tasks::view::Prefs::from_state(&state::load()),
+                    crate::logdir::log_dir().map(|dir| dir.join("tasks")),
                 ),
             );
             let id = session.id;
@@ -1840,6 +1842,33 @@ impl AlacritreeApp {
         self.sessions.iter().position(|s| s.id == id)
     }
 
+    /// The tasks tab on screen, which a task action runs in.
+    pub(crate) fn active_tasks_view(&mut self) -> Option<&mut crate::tasks::view::TasksView> {
+        let idx = self.active_session_index()?;
+        self.sessions[idx].tasks.as_mut()
+    }
+
+    /// Persists what a tasks tab changed and hands it to the other tabs, so
+    /// every workspace folds the same sections.
+    fn sync_task_prefs(&mut self, from: SessionId) {
+        let Some(view) =
+            self.sessions.iter_mut().find(|s| s.id == from).and_then(|s| s.tasks.as_mut())
+        else {
+            return;
+        };
+        let changes = view.take_pref_changes();
+        if changes.is_empty() {
+            return;
+        }
+        for change in &changes {
+            state::mutate(|s| change.persist(s));
+        }
+        let others = self.sessions.iter_mut().filter(|s| s.id != from);
+        for view in others.filter_map(|s| s.tasks.as_mut()) {
+            changes.iter().for_each(|change| view.apply_pref(change));
+        }
+    }
+
     fn set_active_in_current_workspace(&mut self, id: SessionId) {
         self.sessions.set_active(self.current_workspace.clone(), id);
     }
@@ -2157,6 +2186,7 @@ impl AlacritreeApp {
     fn handle_shortcuts(&mut self, ctx: &Context) {
         let active = self.active_session_index().map(|idx| SessionFocus {
             scratchpad: self.sessions[idx].scratchpad.is_some(),
+            tasks: self.sessions[idx].tasks.is_some(),
             exited: self.sessions[idx].is_exited(),
         });
         let scope = binding_scope(self.focus, self.palette.is_open(), active);
@@ -3279,7 +3309,16 @@ impl AlacritreeApp {
                     )
                 } else if let Some(view) = session.tasks.as_mut() {
                     self.ime.clear();
-                    crate::tasks::view::show(ui, view, allow_focus, tasks_style)
+                    let id = session.id;
+                    let response = crate::tasks::view::show(
+                        ui,
+                        view,
+                        allow_focus,
+                        &self.shortcuts,
+                        tasks_style,
+                    );
+                    self.sync_task_prefs(id);
+                    response
                 } else {
                     let started = std::time::Instant::now();
                     let response = terminal_view::show(
@@ -3499,6 +3538,7 @@ struct BindingScope {
     sidebar_focused: bool,
     git_focused: bool,
     scratchpad_focused: bool,
+    tasks_focused: bool,
     /// The terminal owns focus and the session on screen has exited, so no
     /// child is left to read the keys its bindings would otherwise consume.
     exited_session_focused: bool,
@@ -3508,6 +3548,7 @@ struct BindingScope {
 #[derive(Clone, Copy)]
 struct SessionFocus {
     scratchpad: bool,
+    tasks: bool,
     exited: bool,
 }
 
@@ -3526,6 +3567,7 @@ fn binding_scope(
         sidebar_focused: focus == PaneFocus::ProjectsSidebar && !palette_open,
         git_focused: focus == PaneFocus::GitSidebar && !palette_open,
         scratchpad_focused: active.is_some_and(|s| s.scratchpad),
+        tasks_focused: active.is_some_and(|s| s.tasks),
         exited_session_focused: active.is_some_and(|s| s.exited),
     }
 }
@@ -3534,13 +3576,14 @@ fn binding_scope(
 /// currently owns keyboard focus. Filter actions are scoped to the
 /// sidebar that owns them so a bare letter like `d` doesn't fire a git-panel
 /// filter while the projects sidebar (or the terminal) has focus, and vice
-/// versa. `terminal_only` actions additionally step aside for the scratchpad
-/// editor, which wants those same keys for native text editing.
+/// versa. `terminal_only` actions also step aside for the scratchpad
+/// editor and the tasks tab, which want those same keys for editing text.
 fn valid_for_focus(action: &BindingAction, scope: BindingScope) -> bool {
     let focus_ok = match action {
         BindingAction::Named(n) if n.is_exited_session_scoped() => scope.exited_session_focused,
         BindingAction::Named(n) if n.is_projects_filter_scoped() => scope.sidebar_focused,
         BindingAction::Named(n) if n.is_git_filter_scoped() => scope.git_focused,
+        BindingAction::Named(n) if n.is_tasks_scoped() => scope.tasks_focused,
         BindingAction::Named(n) if n.is_sidebar_scoped() => scope.sidebar_focused,
         _ => true,
     };
@@ -3549,7 +3592,7 @@ fn valid_for_focus(action: &BindingAction, scope: BindingScope) -> bool {
         BindingAction::Named(n) => n.is_terminal_only(),
         BindingAction::Unsupported(_) => false,
     };
-    focus_ok && !(scope.scratchpad_focused && terminal_only)
+    focus_ok && !((scope.scratchpad_focused || scope.tasks_focused) && terminal_only)
 }
 
 /// The actions one key press dispatches. Stacked user bindings can mix a
@@ -9049,9 +9092,10 @@ mod tests {
         assert!(tooltip_shown(&long_frames, &long.secondary));
     }
 
-    const LIVE: SessionFocus = SessionFocus { scratchpad: false, exited: false };
-    const EXITED: SessionFocus = SessionFocus { scratchpad: false, exited: true };
-    const SCRATCHPAD: SessionFocus = SessionFocus { scratchpad: true, exited: false };
+    const LIVE: SessionFocus = SessionFocus { scratchpad: false, tasks: false, exited: false };
+    const EXITED: SessionFocus = SessionFocus { scratchpad: false, tasks: false, exited: true };
+    const SCRATCHPAD: SessionFocus = SessionFocus { scratchpad: true, tasks: false, exited: false };
+    const TASKS: SessionFocus = SessionFocus { scratchpad: false, tasks: true, exited: false };
 
     #[test]
     fn spawn_geometry_prefers_the_active_session_over_the_last_painted_pane() {
@@ -9652,6 +9696,84 @@ mod tests {
         assert!(fires(BindingScope { sidebar_focused: true, ..scope() }));
         assert!(!fires(scope()), "the terminal keeps its key");
         assert!(!fires(BindingScope { git_focused: true, ..scope() }));
+    }
+
+    /// Tab and Alt+arrows are the task actions' defaults, so they may only
+    /// fire in the tasks tab, and the shell keeps them everywhere else.
+    #[test]
+    fn task_actions_act_only_in_the_tasks_tab() {
+        let indent = BindingAction::Named(NamedAction::IndentTask(action::IndentTask));
+        let terminal = |active| binding_scope(PaneFocus::Terminal, false, Some(active));
+        assert!(valid_for_focus(&indent, terminal(TASKS)));
+        assert!(!valid_for_focus(&indent, terminal(LIVE)));
+        assert!(!valid_for_focus(&indent, terminal(SCRATCHPAD)));
+        let reverse_tab = BindingAction::Chars(b"[Z".to_vec());
+        assert!(!valid_for_focus(&reverse_tab, terminal(TASKS)), "no PTY reads it there");
+    }
+
+    fn press_in_tasks_tab(
+        tasks: Vec<alacritree_tasks::Task>,
+        current: &str,
+        key: egui::Key,
+        mods: egui::Modifiers,
+    ) -> Vec<String> {
+        let mut app = test_app();
+        app.shortcuts =
+            crate::shortcut::Shortcuts::new(&crate::bindings::parse_bindings(Vec::new()));
+        let view = crate::tasks::view::TasksView::for_test(tasks, current);
+        let session = Session::spawn_tasks(
+            Context::default(),
+            &app.config,
+            None,
+            TermSize::new(80, 24),
+            (8.0, 16.0),
+            view,
+        );
+        let id = session.id;
+        app.sessions.push(session);
+        app.sessions.set_active(None, id);
+        let ctx = Context::default();
+        let event = egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: mods,
+        };
+        let input = egui::RawInput { events: vec![event], ..Default::default() };
+        let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
+        app.active_tasks_view().expect("the tasks tab is on screen").plain_lines()
+    }
+
+    fn global_task(id: &str, parent: Option<&str>, order: i64) -> alacritree_tasks::Task {
+        alacritree_tasks::Task {
+            parent: parent.map(Into::into),
+            order: Some(order),
+            ..alacritree_tasks::fake::task(id, alacritree_tasks::scope::GLOBAL)
+        }
+    }
+
+    /// Shift+Tab is also the terminals' reverse tab. In the tasks tab it has
+    /// to reach the dedent, and plain Tab must not take it first.
+    #[test]
+    fn shift_tab_in_the_tasks_tab_dedents_the_current_task() {
+        let tasks = vec![global_task("a", None, 1024), global_task("a1", Some("a"), 1024)];
+        let lines = press_in_tasks_tab(tasks, "a1", egui::Key::Tab, egui::Modifiers::SHIFT);
+        assert_eq!(lines, ["## global", "- [ ] a", "- [ ] a1"]);
+    }
+
+    #[test]
+    fn tab_in_the_tasks_tab_indents_the_current_task() {
+        let tasks = vec![global_task("a", None, 1024), global_task("b", None, 2048)];
+        let lines = press_in_tasks_tab(tasks, "b", egui::Key::Tab, egui::Modifiers::NONE);
+        assert_eq!(lines, ["## global", "- [ ] a", "  - [ ] b"]);
+    }
+
+    #[test]
+    fn alt_up_in_the_tasks_tab_moves_the_current_task_up() {
+        let tasks = vec![global_task("a", None, 1024), global_task("b", None, 2048)];
+        let lines = press_in_tasks_tab(tasks, "b", egui::Key::ArrowUp, egui::Modifiers::ALT);
+        assert_eq!(lines, ["## global", "- [ ] b", "- [ ] a"]);
     }
 
     /// `ScrollPageUp` is unscoped by pane focus, so only the scratchpad
