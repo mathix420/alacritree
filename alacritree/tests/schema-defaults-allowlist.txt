@@ -86,6 +86,7 @@ RawUiTasks.active_marker
 RawUiTasks.chevron
 RawUiTasks.chevron_hover
 RawUiTasks.hidden_count
+RawUiTasks.section_chevron
 RawUiWsl.automount_root
 RawWorkspace.worktree_dir
 RawWorktreeOverride.project

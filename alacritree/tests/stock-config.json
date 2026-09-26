@@ -584,7 +584,9 @@
       "chevron": null,
       "chevron_hover": null,
       "chevron_thickness": 1.5,
-      "hidden_count": null
+      "hidden_count": null,
+      "section_chevron": null,
+      "section_chevron_thickness": 2.5
     },
     "upstream_status": false,
     "vsync": true,

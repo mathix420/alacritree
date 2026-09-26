@@ -279,6 +279,10 @@ fn tasks_style(
         error,
         chevron: egui::Stroke::new(tasks.chevron_thickness, color(tasks.chevron, hint)),
         chevron_hover: color(tasks.chevron_hover, text),
+        section_chevron: egui::Stroke::new(
+            tasks.section_chevron_thickness,
+            color(tasks.section_chevron, text),
+        ),
         hidden_count: color(tasks.hidden_count, hint),
         active_marker: egui::Stroke::new(
             tasks.active_marker_thickness,

@@ -585,6 +585,8 @@ How the tasks tab draws.
 - `chevron_hover` (string): The sub-task chevron under the pointer. Unset uses the tab's text color.
 - `chevron_thickness` (number, default `1.5`): Stroke width of the sub-task chevron, in points.
 - `hidden_count` (string): The `+N` count of sub-tasks a collapsed task hides. Unset uses the tab's hint color.
+- `section_chevron` (string): The chevron that folds a whole section. Unset uses the tab's text color.
+- `section_chevron_thickness` (number, default `2.5`): Stroke width of the section chevron, in points.
 
 ### `[ui.tasks.add_button]`
 

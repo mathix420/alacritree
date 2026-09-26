@@ -2271,6 +2271,20 @@
             }
           ],
           "description": "The `+N` count of sub-tasks a collapsed task hides. Unset uses the\ntab's hint color."
+        },
+        "section_chevron": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "The chevron that folds a whole section. Unset uses the tab's text\ncolor."
+        },
+        "section_chevron_thickness": {
+          "default": 2.5,
+          "description": "Stroke width of the section chevron, in points.",
+          "format": "float",
+          "type": "number"
         }
       },
       "type": "object"

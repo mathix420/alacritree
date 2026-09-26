@@ -1124,6 +1124,8 @@ pub struct TasksUi {
     pub chevron: Option<Rgb>,
     pub chevron_hover: Option<Rgb>,
     pub chevron_thickness: f32,
+    pub section_chevron: Option<Rgb>,
+    pub section_chevron_thickness: f32,
     pub hidden_count: Option<Rgb>,
     pub active_marker: Option<Rgb>,
     pub active_marker_thickness: f32,
@@ -2817,6 +2819,11 @@ struct RawUiTasks {
     chevron_hover: Option<RgbStr>,
     /// Stroke width of the sub-task chevron, in points.
     chevron_thickness: f32,
+    /// The chevron that folds a whole section. Unset uses the tab's text
+    /// color.
+    section_chevron: Option<RgbStr>,
+    /// Stroke width of the section chevron, in points.
+    section_chevron_thickness: f32,
     /// The `+N` count of sub-tasks a collapsed task hides. Unset uses the
     /// tab's hint color.
     hidden_count: Option<RgbStr>,
@@ -2838,6 +2845,8 @@ impl Default for RawUiTasks {
             chevron: None,
             chevron_hover: None,
             chevron_thickness: 1.5,
+            section_chevron: None,
+            section_chevron_thickness: 2.5,
             hidden_count: None,
             active_marker: None,
             active_marker_thickness: 2.5,
@@ -2855,6 +2864,8 @@ impl RawUiTasks {
             chevron: rgb(&self.chevron),
             chevron_hover: rgb(&self.chevron_hover),
             chevron_thickness: self.chevron_thickness.max(0.5),
+            section_chevron: rgb(&self.section_chevron),
+            section_chevron_thickness: self.section_chevron_thickness.max(0.5),
             hidden_count: rgb(&self.hidden_count),
             active_marker: rgb(&self.active_marker),
             active_marker_thickness: self.active_marker_thickness.max(0.5),

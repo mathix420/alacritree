@@ -339,6 +339,7 @@ pub(crate) struct Style {
     pub error: Color32,
     pub chevron: Stroke,
     pub chevron_hover: Color32,
+    pub section_chevron: Stroke,
     pub hidden_count: Color32,
     pub active_marker: Stroke,
     pub active_background: Color32,
@@ -357,9 +358,8 @@ pub(crate) struct ButtonStyle {
 fn show_section(ui: &mut Ui, view: &mut TasksView, section: &Section, allow_focus: bool, c: Style) {
     let open = !view.collapsed.contains(&section.node);
     let done = section.rows.iter().filter(|r| r.status == Status::Completed).count();
-    let arrow = if open { "v" } else { ">" };
-    let header = format!("{arrow} {}  {done}/{}", section.node, section.rows.len());
-    if ui.selectable_label(false, RichText::new(header).color(c.text).strong()).clicked() {
+    let header = format!("{}  {done}/{}", section.node, section.rows.len());
+    if heading(ui, open, &header, c).clicked() {
         if open {
             view.collapsed.insert(section.node.clone());
         } else {
@@ -525,9 +525,35 @@ fn show_row(
     }
 }
 
-/// A row-tall square that folds a task's sub-tasks, drawing only a
-/// chevron that points down while `open`. `None` leaves the square blank,
-/// so checkboxes line up at every depth.
+/// A section heading as one click target: the chevron, the gap after it and
+/// the label, all lit together under the pointer.
+fn heading(ui: &mut Ui, open: bool, label: &str, c: Style) -> Response {
+    let galley = WidgetText::from(RichText::new(label).color(c.text).strong()).into_galley(
+        ui,
+        None,
+        f32::INFINITY,
+        egui::TextStyle::Button,
+    );
+    let square = ui.spacing().interact_size.y;
+    let (gap, pad) = (ui.spacing().item_spacing.x, ui.spacing().button_padding.x);
+    let size = vec2(square + gap + galley.size().x + pad, square.max(galley.size().y));
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let hovered = response.hovered();
+    if hovered {
+        let fill = ui.visuals().widgets.hovered;
+        ui.painter().rect_filled(rect, fill.corner_radius, fill.weak_bg_fill);
+    }
+    let chevron = egui::pos2(rect.left() + square / 2.0, rect.center().y);
+    let color = if hovered { c.chevron_hover } else { c.section_chevron.color };
+    paint_chevron(ui, chevron, open, Stroke { color, ..c.section_chevron });
+    let text = egui::pos2(rect.left() + square + gap, rect.center().y - galley.size().y / 2.0);
+    ui.painter().galley(text, galley, c.text);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A row-tall square that folds a section or a task's sub-tasks, drawing
+/// only a chevron that points down while `open`. `None` leaves the square
+/// blank, so checkboxes line up at every depth.
 fn toggle(ui: &mut Ui, open: Option<bool>, stroke: Stroke, hover: Color32) -> bool {
     let sense = if open.is_some() { Sense::click() } else { Sense::hover() };
     let size = Vec2::splat(ui.spacing().interact_size.y);
@@ -719,6 +745,7 @@ mod tests {
             error: Color32::RED,
             chevron: Stroke::new(1.5_f32, Color32::GRAY),
             chevron_hover: Color32::WHITE,
+            section_chevron: Stroke::new(2.5_f32, Color32::WHITE),
             hidden_count: Color32::GRAY,
             active_marker: Stroke::new(2.5_f32, Color32::WHITE),
             active_background: Color32::from_rgb(40, 40, 60),
@@ -1059,5 +1086,28 @@ mod tests {
         let reach = h.ctx.style().spacing.interact_size.y / 2.0 - 1.0;
         h.click(h.painted_chevron("parent") - vec2(reach, reach));
         assert_eq!(h.visible("child"), None);
+    }
+
+    #[test]
+    fn a_section_folds_from_its_chevron_and_its_label() {
+        let mut h = Harness::new(vec![pending("a", "one")]);
+        h.click(h.painted_chevron("global  0/1"));
+        assert_eq!(h.visible("one"), None);
+        h.click(h.text("global  0/1").center());
+        h.text("one");
+    }
+
+    #[test]
+    fn a_section_heading_highlights_and_folds_as_one_target() {
+        let mut h = Harness::new(vec![pending("a", "one")]);
+        let (chevron, label) = (h.painted_chevron("global  0/1"), h.text("global  0/1"));
+        let gap = Pos2::new((chevron.x + label.left()) / 2.0, label.center().y);
+        h.frame(vec![Event::PointerMoved(gap)]);
+        let hover = h.ctx.style().visuals.widgets.hovered.weak_bg_fill;
+        let lit = |at: Pos2| h.fills.iter().any(|(c, r)| *c == hover && r.contains(at));
+        assert!(lit(chevron) && lit(gap) && lit(label.center()));
+
+        h.click(gap);
+        assert_eq!(h.visible("one"), None);
     }
 }
