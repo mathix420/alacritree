@@ -1117,6 +1117,37 @@ impl Default for FocusOutline {
     }
 }
 
+/// `[ui.tasks]`: how the tasks tab draws. Each unset color falls back to
+/// one derived from the terminal palette at resolution time.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct TasksUi {
+    pub chevron: Option<Rgb>,
+    pub chevron_hover: Option<Rgb>,
+    pub chevron_thickness: f32,
+    pub section_chevron: Option<Rgb>,
+    pub section_chevron_thickness: f32,
+    pub hidden_count: Option<Rgb>,
+    pub active_marker: Option<Rgb>,
+    pub active_marker_thickness: f32,
+    pub active_background: Option<Rgb>,
+    pub add_button: TasksButton,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct TasksButton {
+    pub text: Option<Rgb>,
+    pub hover_text: Option<Rgb>,
+    pub fill: Option<Rgb>,
+    pub hover_fill: Option<Rgb>,
+    pub pressed_fill: Option<Rgb>,
+}
+
+impl Default for TasksUi {
+    fn default() -> Self {
+        RawUiTasks::default().resolve()
+    }
+}
+
 impl Default for Icons {
     fn default() -> Self {
         build_icons(RawIcons::default())
@@ -1327,6 +1358,7 @@ pub struct UiTheme {
     pub worktree_liveness: bool,
     pub icons: Icons,
     pub focus_outline: FocusOutline,
+    pub tasks: TasksUi,
     /// `[ui] scrollbar`: sidebar scrollbar style, "floating" or "solid"
     /// (reserved gutter, never covers row icons).
     pub scrollbar: ScrollbarStyle,
@@ -1407,6 +1439,7 @@ impl Default for UiTheme {
             worktree_liveness: true,
             icons: Icons::default(),
             focus_outline: FocusOutline::default(),
+            tasks: TasksUi::default(),
             scrollbar: ScrollbarStyle::Floating,
             sidebar_click_focus: false,
             focus_priority_boost: false,
@@ -2778,6 +2811,94 @@ impl Default for RawFocusOutline {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(default)]
+struct RawUiTasks {
+    /// The sub-task chevron. Unset uses the tab's hint color.
+    chevron: Option<RgbStr>,
+    /// The sub-task chevron under the pointer. Unset uses the tab's text
+    /// color.
+    chevron_hover: Option<RgbStr>,
+    /// Stroke width of the sub-task chevron, in points.
+    chevron_thickness: f32,
+    /// The chevron that folds a whole section. Unset uses the tab's text
+    /// color.
+    section_chevron: Option<RgbStr>,
+    /// Stroke width of the section chevron, in points.
+    section_chevron_thickness: f32,
+    /// The `+N` count of sub-tasks a collapsed task hides. Unset uses the
+    /// tab's hint color.
+    hidden_count: Option<RgbStr>,
+    /// The chevron marking a started task. Unset uses the tab's text color.
+    active_marker: Option<RgbStr>,
+    /// Stroke width of the started-task chevron, in points.
+    active_marker_thickness: f32,
+    /// Background behind a started task's row. Unset is a faint tint of the
+    /// tab's text color over the pane; set it to the terminal background to
+    /// leave started rows unfilled.
+    active_background: Option<RgbStr>,
+    /// The `+ add a task` button under each section.
+    add_button: RawTasksButton,
+}
+
+impl Default for RawUiTasks {
+    fn default() -> Self {
+        Self {
+            chevron: None,
+            chevron_hover: None,
+            chevron_thickness: 1.5,
+            section_chevron: None,
+            section_chevron_thickness: 2.5,
+            hidden_count: None,
+            active_marker: None,
+            active_marker_thickness: 2.5,
+            active_background: None,
+            add_button: RawTasksButton::default(),
+        }
+    }
+}
+
+impl RawUiTasks {
+    fn resolve(&self) -> TasksUi {
+        let rgb = |c: &Option<RgbStr>| c.as_ref().map(|v| v.0);
+        let b = &self.add_button;
+        TasksUi {
+            chevron: rgb(&self.chevron),
+            chevron_hover: rgb(&self.chevron_hover),
+            chevron_thickness: self.chevron_thickness.max(0.5),
+            section_chevron: rgb(&self.section_chevron),
+            section_chevron_thickness: self.section_chevron_thickness.max(0.5),
+            hidden_count: rgb(&self.hidden_count),
+            active_marker: rgb(&self.active_marker),
+            active_marker_thickness: self.active_marker_thickness.max(0.5),
+            active_background: rgb(&self.active_background),
+            add_button: TasksButton {
+                text: rgb(&b.text),
+                hover_text: rgb(&b.hover_text),
+                fill: rgb(&b.fill),
+                hover_fill: rgb(&b.hover_fill),
+                pressed_fill: rgb(&b.pressed_fill),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(default)]
+struct RawTasksButton {
+    /// Label color. Unset uses the sidebar accent.
+    text: Option<RgbStr>,
+    /// Label color under the pointer and while pressed. Unset uses the
+    /// tab's text color.
+    hover_text: Option<RgbStr>,
+    /// Background. Unset tints the terminal background with the accent.
+    fill: Option<RgbStr>,
+    /// Background under the pointer. Unset is a stronger accent tint.
+    hover_fill: Option<RgbStr>,
+    /// Background while pressed. Unset is a stronger accent tint again.
+    pressed_fill: Option<RgbStr>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(default)]
 struct RawUiDrop {
     /// Accept dropped files at all.  `false` turns every target off.
     enabled: bool,
@@ -3024,6 +3145,8 @@ struct RawUi {
     cursor: RawUiCursor,
     /// Outline drawn around whichever pane holds keyboard focus.
     focus_outline: RawFocusOutline,
+    /// How the tasks tab draws.
+    tasks: RawUiTasks,
     /// Clicking a sidebar moves keyboard focus to it.
     sidebar_click_focus: bool,
     /// Put the session on screen, its shell and every process that shell
@@ -3092,6 +3215,7 @@ impl Default for RawUi {
             default_profile: None,
             cursor: RawUiCursor::default(),
             focus_outline: RawFocusOutline::default(),
+            tasks: RawUiTasks::default(),
             sidebar_click_focus: false,
             focus_priority_boost: false,
             async_session_spawn: false,
@@ -3288,6 +3412,7 @@ impl RawConfig {
                 color: self.ui.focus_outline.color.map(|v| v.0),
                 thickness: self.ui.focus_outline.thickness.max(0.5),
             },
+            tasks: self.ui.tasks.resolve(),
             scrollbar: self.ui.scrollbar.get(),
             sidebar_click_focus: self.ui.sidebar_click_focus,
             focus_priority_boost: self.ui.focus_priority_boost,
@@ -4875,6 +5000,30 @@ program = "second"
     fn focus_outline_thickness_clamps() {
         let fo = ui_from_toml("[ui.focus_outline]\nthickness = 0.1").focus_outline;
         assert_eq!(fo.thickness, 0.5);
+    }
+
+    #[test]
+    fn tasks_colors_default_to_the_palette() {
+        let tasks = ui_from_toml("").tasks;
+        assert_eq!(tasks.chevron, None);
+        assert_eq!(tasks.add_button.fill, None);
+    }
+
+    #[test]
+    fn tasks_parses_colors_and_clamps_thickness() {
+        let tasks = ui_from_toml(
+            r##"
+            [ui.tasks]
+            chevron = "#89b4fa"
+            chevron_thickness = 0.1
+            [ui.tasks.add_button]
+            hover_fill = "#313244"
+            "##,
+        )
+        .tasks;
+        assert_eq!(tasks.chevron, Some(Rgb { r: 0x89, g: 0xb4, b: 0xfa }));
+        assert_eq!(tasks.chevron_thickness, 0.5);
+        assert_eq!(tasks.add_button.hover_fill, Some(Rgb { r: 0x31, g: 0x32, b: 0x44 }));
     }
 
     #[test]

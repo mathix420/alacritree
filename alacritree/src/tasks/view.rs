@@ -9,7 +9,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use egui::{Color32, Key, Modifiers, Response, RichText, ScrollArea, Sense, TextEdit, Ui};
+use egui::{
+    Color32, Key, Modifiers, Response, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind,
+    TextEdit, Ui, Vec2, WidgetText, vec2,
+};
 
 use alacritree_common::jobs::{self, Job, Priority};
 use alacritree_common::side::Side;
@@ -24,6 +27,7 @@ use crate::tasks::facts;
 
 const RELOAD_EVERY: Duration = Duration::from_secs(1);
 const INDENT: f32 = 16.0;
+const CHEVRON: f32 = 12.0;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Scope {
@@ -113,6 +117,8 @@ pub(crate) struct TasksView {
     added: Vec<NewRow>,
     new_row: Option<NewRow>,
     collapsed: HashSet<String>,
+    /// Tasks whose sub-tasks are hidden, by id.
+    collapsed_tasks: HashSet<String>,
 }
 
 impl TasksView {
@@ -148,6 +154,7 @@ impl TasksView {
             added: Vec::new(),
             new_row: None,
             collapsed: HashSet::new(),
+            collapsed_tasks: HashSet::new(),
         }
     }
 
@@ -170,10 +177,7 @@ impl TasksView {
                 let rows = &section.rows;
                 let anchor =
                     add.after.as_ref().and_then(|id| rows.iter().position(|r| &r.id == id));
-                let at = anchor.map_or(rows.len(), |i| {
-                    let below = rows[i + 1..].iter().take_while(|r| r.depth > rows[i].depth);
-                    i + 1 + below.count()
-                });
+                let at = anchor.map_or(rows.len(), |i| i + 1 + tree::descendants(rows, i));
                 section.rows.insert(at, Row {
                     id: String::new(),
                     depth: add.depth,
@@ -301,16 +305,9 @@ impl TasksView {
     }
 }
 
-pub(crate) fn show(
-    ui: &mut Ui,
-    view: &mut TasksView,
-    allow_focus: bool,
-    text: Color32,
-    dim: Color32,
-    error: Color32,
-) -> Response {
+pub(crate) fn show(ui: &mut Ui, view: &mut TasksView, allow_focus: bool, style: Style) -> Response {
     view.tick();
-    let response = draw(ui, view, allow_focus, Colors { text, dim, error });
+    let response = draw(ui, view, allow_focus, style);
     if view.outbox.is_empty() {
         ui.ctx().request_repaint_after(RELOAD_EVERY);
     } else {
@@ -319,40 +316,50 @@ pub(crate) fn show(
     response
 }
 
-fn draw(ui: &mut Ui, view: &mut TasksView, allow_focus: bool, colors: Colors) -> Response {
+fn draw(ui: &mut Ui, view: &mut TasksView, allow_focus: bool, style: Style) -> Response {
     // Registered before the rows: egui gives a click to the last widget
     // registered under the pointer, so every row widget wins over this.
     let background = ui.interact(ui.max_rect(), ui.id().with("tasks-tab"), Sense::click());
     ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         for e in view.load_error.iter().chain(&view.write_error) {
-            ui.label(RichText::new(e).color(colors.error));
+            ui.label(RichText::new(e).color(style.error));
         }
         for section in view.sections() {
-            show_section(ui, view, &section, allow_focus, colors);
+            show_section(ui, view, &section, allow_focus, style);
         }
     });
     background
 }
 
-#[derive(Clone, Copy)]
-struct Colors {
-    text: Color32,
-    dim: Color32,
-    error: Color32,
+/// `[ui.tasks]` with every color resolved against the palette.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Style {
+    pub text: Color32,
+    pub dim: Color32,
+    pub error: Color32,
+    pub chevron: Stroke,
+    pub chevron_hover: Color32,
+    pub section_chevron: Stroke,
+    pub hidden_count: Color32,
+    pub active_marker: Stroke,
+    pub active_background: Color32,
+    pub add_button: ButtonStyle,
 }
 
-fn show_section(
-    ui: &mut Ui,
-    view: &mut TasksView,
-    section: &Section,
-    allow_focus: bool,
-    c: Colors,
-) {
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ButtonStyle {
+    pub text: Color32,
+    pub hover_text: Color32,
+    pub fill: Color32,
+    pub hover_fill: Color32,
+    pub pressed_fill: Color32,
+}
+
+fn show_section(ui: &mut Ui, view: &mut TasksView, section: &Section, allow_focus: bool, c: Style) {
     let open = !view.collapsed.contains(&section.node);
     let done = section.rows.iter().filter(|r| r.status == Status::Completed).count();
-    let arrow = if open { "v" } else { ">" };
-    let header = format!("{arrow} {}  {done}/{}", section.node, section.rows.len());
-    if ui.selectable_label(false, RichText::new(header).color(c.text).strong()).clicked() {
+    let header = format!("{}  {done}/{}", section.node, section.rows.len());
+    if heading(ui, open, &header, c).clicked() {
         if open {
             view.collapsed.insert(section.node.clone());
         } else {
@@ -363,17 +370,17 @@ fn show_section(
         return;
     }
     let tasks = view.section_tasks(&section.node);
-    for row in &section.rows {
-        show_row(ui, view, section, &tasks, row, allow_focus, c);
+    for (row, below) in tree::fold(&section.rows, &view.collapsed_tasks) {
+        show_row(ui, view, section, &tasks, row, below, allow_focus, c);
         let follows = |n: &NewRow| n.node == section.node && n.after.as_deref() == Some(&row.id);
         if view.new_row.as_ref().is_some_and(follows) {
-            show_new_row(ui, view, &tasks);
+            show_new_row(ui, view, &tasks, c);
         }
     }
     let adding_first = |n: &NewRow| n.node == section.node && n.after.is_none();
     if view.new_row.as_ref().is_some_and(adding_first) {
-        show_new_row(ui, view, &tasks);
-    } else if ui.small_button(RichText::new("+ add a task").color(c.dim)).clicked() {
+        show_new_row(ui, view, &tasks, c);
+    } else if button(ui, "+ add a task", c.add_button).clicked() {
         // Drawn below the last root row from the next frame on.
         let last_root = section.rows.iter().rev().find(|r| r.depth == 0).map(|r| r.id.clone());
         view.new_row = Some(NewRow {
@@ -386,26 +393,38 @@ fn show_section(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn show_row(
     ui: &mut Ui,
     view: &mut TasksView,
     section: &Section,
     tasks: &[Task],
     row: &Row,
+    below: usize,
     allow_focus: bool,
-    c: Colors,
+    c: Style,
 ) {
     if row.id.is_empty() {
         ui.horizontal(|ui| {
             ui.add_space(row.depth as f32 * INDENT);
+            toggle(ui, None, c.chevron, c.chevron_hover);
             ui.add_enabled(false, egui::Checkbox::without_text(&mut false));
             ui.label(RichText::new(&row.text).color(c.dim));
         });
         return;
     }
     let refs: Vec<&Task> = tasks.iter().collect();
-    ui.horizontal(|ui| {
+    // Reserved before the row's widgets so the fill paints under them once
+    // the row's full rect is known.
+    let background = ui.painter().add(Shape::Noop);
+    let line = ui.horizontal(|ui| {
         ui.add_space(row.depth as f32 * INDENT);
+        let collapsed = view.collapsed_tasks.contains(&row.id);
+        if toggle(ui, (below > 0).then_some(!collapsed), c.chevron, c.chevron_hover)
+            && !view.collapsed_tasks.remove(&row.id)
+        {
+            view.collapsed_tasks.insert(row.id.clone());
+        }
         let mut checked = row.status == Status::Completed;
         if ui.checkbox(&mut checked, "").changed() {
             let id = row.id.clone();
@@ -414,7 +433,11 @@ fn show_row(
             view.write_one(&row.id, if checked { Edit::Done(id) } else { Edit::Undone(id) });
         }
         if row.started {
-            ui.label(RichText::new(">").color(c.text));
+            let (rect, _) = ui.allocate_exact_size(glyph_size(ui), Sense::hover());
+            paint_chevron(ui, rect.center(), false, c.active_marker);
+        }
+        if collapsed && below > 0 {
+            ui.label(RichText::new(format!("+{below}")).color(c.hidden_count));
         }
         let mut buffer = view.drafts.get(&row.id).cloned().unwrap_or_else(|| row.text.clone());
         // Backspace on a row that is already empty deletes it. TextEdit reads
@@ -452,7 +475,14 @@ fn show_row(
                 )
             });
             if tab {
-                view.write(Some(row.id.clone()), tree::indent(&refs, &row.id));
+                let edits = tree::indent(&refs, &row.id);
+                // A row indented under a collapsed task would vanish mid-edit.
+                for edit in &edits {
+                    if let Edit::Move { parent: Some(parent), .. } = edit {
+                        view.collapsed_tasks.remove(parent);
+                    }
+                }
+                view.write(Some(row.id.clone()), edits);
             }
             if shift_tab {
                 view.write(Some(row.id.clone()), tree::dedent(&refs, &row.id));
@@ -481,6 +511,11 @@ fn show_row(
             }
         }
     });
+    if row.started {
+        let radius = ui.visuals().widgets.inactive.corner_radius;
+        let fill = Shape::rect_filled(line.response.rect, radius, c.active_background);
+        ui.painter().set(background, fill);
+    }
     // Below the row, since the text beside it takes the full width.
     if let Some(e) = view.row_errors.get(&row.id) {
         ui.horizontal(|ui| {
@@ -490,14 +525,93 @@ fn show_row(
     }
 }
 
+/// A section heading as one click target: the chevron, the gap after it and
+/// the label, all lit together under the pointer.
+fn heading(ui: &mut Ui, open: bool, label: &str, c: Style) -> Response {
+    let galley = WidgetText::from(RichText::new(label).color(c.text).strong()).into_galley(
+        ui,
+        None,
+        f32::INFINITY,
+        egui::TextStyle::Button,
+    );
+    let square = ui.spacing().interact_size.y;
+    let (gap, pad) = (ui.spacing().item_spacing.x, ui.spacing().button_padding.x);
+    let size = vec2(square + gap + galley.size().x + pad, square.max(galley.size().y));
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let hovered = response.hovered();
+    if hovered {
+        let fill = ui.visuals().widgets.hovered;
+        ui.painter().rect_filled(rect, fill.corner_radius, fill.weak_bg_fill);
+    }
+    let chevron = egui::pos2(rect.left() + square / 2.0, rect.center().y);
+    let color = if hovered { c.chevron_hover } else { c.section_chevron.color };
+    paint_chevron(ui, chevron, open, Stroke { color, ..c.section_chevron });
+    let text = egui::pos2(rect.left() + square + gap, rect.center().y - galley.size().y / 2.0);
+    ui.painter().galley(text, galley, c.text);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A row-tall square that folds a section or a task's sub-tasks, drawing
+/// only a chevron that points down while `open`. `None` leaves the square
+/// blank, so checkboxes line up at every depth.
+fn toggle(ui: &mut Ui, open: Option<bool>, stroke: Stroke, hover: Color32) -> bool {
+    let sense = if open.is_some() { Sense::click() } else { Sense::hover() };
+    let size = Vec2::splat(ui.spacing().interact_size.y);
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    let Some(open) = open else { return false };
+    let color = if response.hovered() { hover } else { stroke.color };
+    paint_chevron(ui, rect.center(), open, Stroke { color, ..stroke });
+    response.clicked()
+}
+
+fn glyph_size(ui: &Ui) -> Vec2 {
+    Vec2::new(CHEVRON, ui.spacing().interact_size.y)
+}
+
+/// A chevron centred on `center`, pointing down when `open` and right
+/// otherwise.
+fn paint_chevron(ui: &Ui, center: egui::Pos2, open: bool, stroke: Stroke) {
+    let r = CHEVRON / 4.0;
+    let points = if open {
+        vec![center + vec2(-r, -r / 2.0), center + vec2(0.0, r / 2.0), center + vec2(r, -r / 2.0)]
+    } else {
+        vec![center + vec2(-r / 2.0, -r), center + vec2(r / 2.0, 0.0), center + vec2(-r / 2.0, r)]
+    };
+    ui.painter().add(Shape::line(points, stroke));
+}
+
+/// A filled button whose fill and label change under the pointer and
+/// again while pressed, outlined in the label color while either holds.
+fn button(ui: &mut Ui, label: &str, b: ButtonStyle) -> Response {
+    let galley =
+        WidgetText::from(label).into_galley(ui, None, f32::INFINITY, egui::TextStyle::Button);
+    let padding = ui.spacing().button_padding;
+    let (rect, response) = ui.allocate_exact_size(galley.size() + 2.0 * padding, Sense::click());
+    let (fill, text) = if response.is_pointer_button_down_on() {
+        (b.pressed_fill, b.hover_text)
+    } else if response.hovered() {
+        (b.hover_fill, b.hover_text)
+    } else {
+        (b.fill, b.text)
+    };
+    let radius = ui.visuals().widgets.inactive.corner_radius;
+    ui.painter().rect_filled(rect, radius, fill);
+    if response.hovered() {
+        ui.painter().rect_stroke(rect, radius, Stroke::new(1.0_f32, text), StrokeKind::Inside);
+    }
+    ui.painter().galley(rect.min + padding, galley, text);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// A store may reject an empty description, so a new row exists only here
 /// until it has text; leaving it empty drops it.
-fn show_new_row(ui: &mut Ui, view: &mut TasksView, tasks: &[Task]) {
+fn show_new_row(ui: &mut Ui, view: &mut TasksView, tasks: &[Task], c: Style) {
     let Some(new) = view.new_row.as_mut() else { return };
     let mut committed = None;
     let mut dropped = false;
     ui.horizontal(|ui| {
         ui.add_space(new.depth as f32 * INDENT);
+        toggle(ui, None, c.chevron, c.chevron_hover);
         let edit = ui.add(
             TextEdit::singleline(&mut new.text).hint_text("new task").desired_width(f32::INFINITY),
         );
@@ -624,6 +738,27 @@ mod tests {
     use egui::epaint::ClippedShape;
     use egui::{CentralPanel, Event, PointerButton, Pos2, RawInput, Rect, Shape, Vec2};
 
+    fn test_style() -> Style {
+        Style {
+            text: Color32::WHITE,
+            dim: Color32::GRAY,
+            error: Color32::RED,
+            chevron: Stroke::new(1.5_f32, Color32::GRAY),
+            chevron_hover: Color32::WHITE,
+            section_chevron: Stroke::new(2.5_f32, Color32::WHITE),
+            hidden_count: Color32::GRAY,
+            active_marker: Stroke::new(2.5_f32, Color32::WHITE),
+            active_background: Color32::from_rgb(40, 40, 60),
+            add_button: ButtonStyle {
+                text: Color32::LIGHT_BLUE,
+                hover_text: Color32::WHITE,
+                fill: Color32::DARK_BLUE,
+                hover_fill: Color32::BLUE,
+                pressed_fill: Color32::BLUE,
+            },
+        }
+    }
+
     fn pending(id: &str, text: &str) -> Task {
         Task {
             description: text.into(),
@@ -640,7 +775,21 @@ mod tests {
         ops: Vec<QueuedWrite>,
         /// Painted text and where it shows, clipped to what is on screen.
         texts: Vec<(String, Rect)>,
+        /// Filled rectangles and their color.
+        fills: Vec<(Color32, Rect)>,
+        /// The bounds of each stroked path, such as a chevron.
+        paths: Vec<Rect>,
         background_clicked: bool,
+        style: Style,
+    }
+
+    fn collect_fills(shape: &Shape, fills: &mut Vec<(Color32, Rect)>, paths: &mut Vec<Rect>) {
+        match shape {
+            Shape::Rect(r) => fills.push((r.fill, r.rect)),
+            Shape::Path(p) => paths.push(Rect::from_points(&p.points)),
+            Shape::Vec(shapes) => shapes.iter().for_each(|s| collect_fills(s, fills, paths)),
+            _ => {},
+        }
     }
 
     fn collect_texts(shape: &Shape, clip: Rect, out: &mut Vec<(String, Rect)>) {
@@ -663,8 +812,17 @@ mod tests {
             let mut view =
                 TasksView::new(Backend::from_config(&Default::default()), scope, None, Vec::new());
             view.tasks = tasks;
-            let mut h =
-                Self { ctx, view, ops: Vec::new(), texts: Vec::new(), background_clicked: false };
+            let (ops, texts, fills, paths) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let mut h = Self {
+                ctx,
+                view,
+                ops,
+                texts,
+                fills,
+                paths,
+                background_clicked: false,
+                style: test_style(),
+            };
             h.frame(Vec::new());
             h
         }
@@ -677,18 +835,21 @@ mod tests {
             };
             let view = &mut self.view;
             let mut clicked = false;
-            let colors = Colors { text: Color32::WHITE, dim: Color32::GRAY, error: Color32::RED };
+            let style = self.style;
             let out = self.ctx.run(input, |ctx| {
                 CentralPanel::default().show(ctx, |ui| {
-                    clicked = draw(ui, view, true, colors).clicked();
+                    clicked = draw(ui, view, true, style).clicked();
                 });
             });
             self.background_clicked = clicked;
             self.ops.append(&mut self.view.outbox);
             self.texts.clear();
+            self.fills.clear();
+            self.paths.clear();
             let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
             for ClippedShape { clip_rect, shape } in &out.shapes {
                 collect_texts(shape, clip_rect.intersect(screen), &mut self.texts);
+                collect_fills(shape, &mut self.fills, &mut self.paths);
             }
         }
 
@@ -704,6 +865,21 @@ mod tests {
         fn checkbox(&self, text: &str) -> Pos2 {
             let rect = self.text(text);
             Pos2::new(rect.left() - 18.0, rect.center().y)
+        }
+
+        /// The centre of the chevron painted on the row showing `text`.
+        fn painted_chevron(&self, text: &str) -> Pos2 {
+            let row = self.text(text);
+            let on_row =
+                |r: &&Rect| r.right() < row.left() && (r.center().y - row.center().y).abs() < 4.0;
+            let leftmost =
+                self.paths.iter().filter(on_row).min_by(|a, b| a.left().total_cmp(&b.left()));
+            leftmost.unwrap_or_else(|| panic!("no chevron on {text:?}")).center()
+        }
+
+        /// The sub-task toggle left of the checkbox on the row showing `text`.
+        fn chevron(&self, text: &str) -> Pos2 {
+            self.checkbox(text) - vec2(22.0, 0.0)
         }
 
         fn click(&mut self, pos: Pos2) {
@@ -839,5 +1015,99 @@ mod tests {
         assert!(matches!(h.ops.as_slice(), [(None, edits)] if edits.len() == 1), "{:?}", h.ops);
 
         assert_eq!(h.view.plain_lines(), ["## global", "- [ ] milk"]);
+    }
+
+    fn child(id: &str, parent: &str, text: &str) -> Task {
+        Task { parent: Some(parent.into()), ..pending(id, text) }
+    }
+
+    #[test]
+    fn collapsing_a_task_hides_its_subtasks_until_expanded() {
+        let mut h = Harness::new(vec![
+            pending("a", "parent"),
+            child("b", "a", "child"),
+            child("c", "b", "grandchild"),
+        ]);
+        let toggle = h.chevron("parent");
+        h.click(toggle);
+        assert_eq!(h.visible("child"), None);
+        assert_eq!(h.visible("grandchild"), None);
+        h.text("+2");
+        assert_eq!(h.view.plain_lines().len(), 4, "agents still read every task");
+
+        h.click(toggle);
+        h.text("child");
+        h.text("grandchild");
+        assert_eq!(h.visible("+2"), None);
+    }
+
+    #[test]
+    fn indenting_under_a_collapsed_task_expands_it() {
+        let mut h = Harness::new(vec![pending("a", "parent"), child("a1", "a", "child"), Task {
+            order: Some(2048),
+            ..pending("b", "next")
+        }]);
+        h.click(h.chevron("parent"));
+        h.edit_end("next");
+        h.key(Key::Tab);
+        h.text("child");
+    }
+
+    #[test]
+    fn a_leaf_lines_up_with_a_parent_and_has_no_toggle() {
+        let mut h = Harness::new(vec![pending("a", "parent"), child("a1", "a", "child"), Task {
+            order: Some(2048),
+            ..pending("b", "alone")
+        }]);
+        assert_eq!(h.text("parent").left(), h.text("alone").left());
+        h.click(h.chevron("alone"));
+        assert!(h.view.collapsed_tasks.is_empty());
+    }
+
+    #[test]
+    fn a_started_task_sits_on_the_active_background() {
+        let mut idle = pending("b", "idle");
+        idle.order = Some(2048);
+        let h = Harness::new(vec![Task { started: true, ..pending("a", "busy") }, idle]);
+        let filled = |text: &str| {
+            let at = h.text(text).center();
+            h.fills.iter().any(|(c, r)| *c == h.style.active_background && r.contains(at))
+        };
+        assert!(filled("busy"));
+        assert!(!filled("idle"));
+    }
+
+    #[test]
+    fn the_toggle_answers_across_a_square_the_row_tall() {
+        let mut h = Harness::new(vec![pending("a", "parent"), child("a1", "a", "child")]);
+        // egui otherwise counts a click near a widget as on it, which would
+        // hide how far the toggle's own rect reaches.
+        h.ctx.style_mut(|s| s.interaction.interact_radius = 0.0);
+        let reach = h.ctx.style().spacing.interact_size.y / 2.0 - 1.0;
+        h.click(h.painted_chevron("parent") - vec2(reach, reach));
+        assert_eq!(h.visible("child"), None);
+    }
+
+    #[test]
+    fn a_section_folds_from_its_chevron_and_its_label() {
+        let mut h = Harness::new(vec![pending("a", "one")]);
+        h.click(h.painted_chevron("global  0/1"));
+        assert_eq!(h.visible("one"), None);
+        h.click(h.text("global  0/1").center());
+        h.text("one");
+    }
+
+    #[test]
+    fn a_section_heading_highlights_and_folds_as_one_target() {
+        let mut h = Harness::new(vec![pending("a", "one")]);
+        let (chevron, label) = (h.painted_chevron("global  0/1"), h.text("global  0/1"));
+        let gap = Pos2::new((chevron.x + label.left()) / 2.0, label.center().y);
+        h.frame(vec![Event::PointerMoved(gap)]);
+        let hover = h.ctx.style().visuals.widgets.hovered.weak_bg_fill;
+        let lit = |at: Pos2| h.fills.iter().any(|(c, r)| *c == hover && r.contains(at));
+        assert!(lit(chevron) && lit(gap) && lit(label.center()));
+
+        h.click(gap);
+        assert_eq!(h.visible("one"), None);
     }
 }

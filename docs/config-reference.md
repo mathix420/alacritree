@@ -574,6 +574,30 @@ Whether session rows can be dragged, and how far a reorder may carry a session.
 - `drag` (boolean, default `false`): Let a session row be dragged with the mouse to reorder it.
 - `scope` ("workspace" | "project" | "anywhere", default `"workspace"`): How far a reorder may carry a session: "workspace" | "project" | "anywhere".
 
+### `[ui.tasks]`
+
+How the tasks tab draws.
+
+- `active_background` (string): Background behind a started task's row. Unset is a faint tint of the tab's text color over the pane; set it to the terminal background to leave started rows unfilled.
+- `active_marker` (string): The chevron marking a started task. Unset uses the tab's text color.
+- `active_marker_thickness` (number, default `2.5`): Stroke width of the started-task chevron, in points.
+- `chevron` (string): The sub-task chevron. Unset uses the tab's hint color.
+- `chevron_hover` (string): The sub-task chevron under the pointer. Unset uses the tab's text color.
+- `chevron_thickness` (number, default `1.5`): Stroke width of the sub-task chevron, in points.
+- `hidden_count` (string): The `+N` count of sub-tasks a collapsed task hides. Unset uses the tab's hint color.
+- `section_chevron` (string): The chevron that folds a whole section. Unset uses the tab's text color.
+- `section_chevron_thickness` (number, default `2.5`): Stroke width of the section chevron, in points.
+
+### `[ui.tasks.add_button]`
+
+The `+ add a task` button under each section.
+
+- `fill` (string): Background. Unset tints the terminal background with the accent.
+- `hover_fill` (string): Background under the pointer. Unset is a stronger accent tint.
+- `hover_text` (string): Label color under the pointer and while pressed. Unset uses the tab's text color.
+- `pressed_fill` (string): Background while pressed. Unset is a stronger accent tint again.
+- `text` (string): Label color. Unset uses the sidebar accent.
+
 ### `[ui.wsl]`
 
 Deprecated WSL options, superseded by the top-level `[wsl]` table.

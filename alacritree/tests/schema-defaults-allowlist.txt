@@ -57,6 +57,11 @@ RawSet.red
 RawSet.white
 RawSet.yellow
 RawShell.program
+RawTasksButton.fill
+RawTasksButton.hover_fill
+RawTasksButton.hover_text
+RawTasksButton.pressed_fill
+RawTasksButton.text
 RawTerminal.shell
 RawTextEmphasis.color
 RawUi.default_profile
@@ -76,6 +81,12 @@ RawUiFont.family
 RawUiFont.italic_family
 RawUiFont.size
 RawUiPaste.image_dir
+RawUiTasks.active_background
+RawUiTasks.active_marker
+RawUiTasks.chevron
+RawUiTasks.chevron_hover
+RawUiTasks.hidden_count
+RawUiTasks.section_chevron
 RawUiWsl.automount_root
 RawWorkspace.worktree_dir
 RawWorktreeOverride.project

@@ -1647,6 +1647,51 @@
       },
       "type": "object"
     },
+    "RawTasksButton": {
+      "properties": {
+        "fill": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Background. Unset tints the terminal background with the accent."
+        },
+        "hover_fill": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Background under the pointer. Unset is a stronger accent tint."
+        },
+        "hover_text": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Label color under the pointer and while pressed. Unset uses the\ntab's text color."
+        },
+        "pressed_fill": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Background while pressed. Unset is a stronger accent tint again."
+        },
+        "text": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Label color. Unset uses the sidebar accent."
+        }
+      },
+      "type": "object"
+    },
     "RawTaskwarrior": {
       "properties": {
         "enabled": {
@@ -2008,6 +2053,10 @@
           ],
           "type": "string"
         },
+        "tasks": {
+          "$ref": "#/$defs/RawUiTasks",
+          "description": "How the tasks tab draws."
+        },
         "upstream_status": {
           "default": false,
           "description": "Paint a badge on each worktree row for its branch's upstream state.\nLocal refs only: nothing fetches, so a branch deleted on the remote\nreads as tracked until something prunes locally. A linked worktree\nthat overrides `branch.*` in its own `config.worktree` is read from the\nproject root, so that override is not seen.",
@@ -2161,6 +2210,81 @@
           "format": "uint",
           "minimum": 0,
           "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "RawUiTasks": {
+      "properties": {
+        "active_background": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "Background behind a started task's row. Unset is a faint tint of the\ntab's text color over the pane; set it to the terminal background to\nleave started rows unfilled."
+        },
+        "active_marker": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "The chevron marking a started task. Unset uses the tab's text color."
+        },
+        "active_marker_thickness": {
+          "default": 2.5,
+          "description": "Stroke width of the started-task chevron, in points.",
+          "format": "float",
+          "type": "number"
+        },
+        "add_button": {
+          "$ref": "#/$defs/RawTasksButton",
+          "description": "The `+ add a task` button under each section."
+        },
+        "chevron": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "The sub-task chevron. Unset uses the tab's hint color."
+        },
+        "chevron_hover": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "The sub-task chevron under the pointer. Unset uses the tab's text\ncolor."
+        },
+        "chevron_thickness": {
+          "default": 1.5,
+          "description": "Stroke width of the sub-task chevron, in points.",
+          "format": "float",
+          "type": "number"
+        },
+        "hidden_count": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "The `+N` count of sub-tasks a collapsed task hides. Unset uses the\ntab's hint color."
+        },
+        "section_chevron": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Color"
+            }
+          ],
+          "description": "The chevron that folds a whole section. Unset uses the tab's text\ncolor."
+        },
+        "section_chevron_thickness": {
+          "default": 2.5,
+          "description": "Stroke width of the section chevron, in points.",
+          "format": "float",
+          "type": "number"
         }
       },
       "type": "object"
