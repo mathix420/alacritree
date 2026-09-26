@@ -1918,7 +1918,7 @@
         },
         "sessions_filter_counts_detached": {
           "default": false,
-          "description": "Whether the sidebar's sessions toggle counts an unattached herdr row\nthe same as a live session: an agent nothing is attached to, and,\nonce `show_panes` is on, an agentless pane.  Off keeps the toggle's\noriginal session-only behavior.",
+          "description": "Whether the sidebar's sessions toggle counts an unattached herdr row\nthe same as a live session: an agent nothing is attached to, and,\nonce `show_panes` is on, an agentless pane.  Off keeps the toggle's\noriginal session-only behavior, and those rows stay hidden even under\na workspace a live session keeps.",
           "type": "boolean"
         },
         "sidebar_accent": {

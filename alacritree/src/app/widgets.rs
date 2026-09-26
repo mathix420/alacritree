@@ -400,6 +400,28 @@ pub(super) fn styled_icon_button(
     resp
 }
 
+/// A text button framed and filled so it reads as clickable, with a brighter
+/// fill under the pointer.
+pub(super) fn framed_button(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    text: RichText,
+    padding: egui::Vec2,
+) -> egui::Response {
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = padding;
+        let widgets = &mut ui.visuals_mut().widgets;
+        widgets.inactive.weak_bg_fill = theme.row_hover_bg;
+        widgets.inactive.bg_stroke = Stroke::new(1.0_f32, theme.sidebar_border);
+        widgets.hovered.weak_bg_fill = theme.row_active_bg;
+        widgets.hovered.bg_stroke = Stroke::new(1.0_f32, theme.sidebar_border);
+        widgets.active.weak_bg_fill = theme.row_active_bg;
+        ui.add(egui::Button::new(text))
+    })
+    .inner
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// Lay out a row whose `trailing` widgets pin to the right edge while `leading`
 /// fills the remaining width — so a `Label::truncate()` inside `leading` knows
 /// exactly how much space it has and ellipsizes cleanly when the panel is narrow.
@@ -434,6 +456,37 @@ where
     })
     .response
     .rect
+}
+
+/// A sidebar's vertical scroll area.  egui clamps a scroll to the content, so
+/// under a centering `scroll_align` the content gets room past each end, or
+/// the rows near either end could never reach the middle.  The area first
+/// opens scrolled past the top room, at its first row.
+pub(super) fn sidebar_scroll_area(
+    ui: &mut egui::Ui,
+    scroll_align: Option<egui::Align>,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    if scroll_align != Some(egui::Align::Center) {
+        ScrollArea::vertical().show(ui, add_contents);
+        return;
+    }
+    let beyond_last_row = (ui.available_height() - ui.spacing().interact_size.y).max(0.0);
+    let top_room = beyond_last_row / 2.0;
+    let opened = ui.make_persistent_id("centering_sidebar_scroll_opened");
+    let first_show = ui.ctx().data_mut(|d| d.get_temp::<()>(opened).is_none());
+    let mut area = ScrollArea::vertical();
+    if first_show {
+        ui.ctx().data_mut(|d| d.insert_temp(opened, ()));
+        area = area.vertical_scroll_offset(top_room);
+    }
+    area.show(ui, |ui| {
+        ui.add_space(top_room);
+        add_contents(ui);
+        // A whole panel less one row, not half: a list shorter than the
+        // panel still needs the range to rest scrolled past the top room.
+        ui.add_space(beyond_last_row);
+    });
 }
 
 /// Apply the configured sidebar scrollbar style to a panel's `Ui`.

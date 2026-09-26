@@ -385,7 +385,7 @@ alacritree's own presentation: sidebar colors, icons, tooltips, shell profiles, 
 - `scrollbar` ("floating" | "solid", default `"floating"`): Sidebar scrollbar style: "floating" | "solid".
 - `search_depth` ("workspaces" | "sessions", default `"workspaces"`): How far a sidebar query reaches: "workspaces" matches project and worktree names only; "sessions" also matches session titles and herdr agent names.
 - `search_scope` ("filtered" | "all", default `"filtered"`): Whether a fuzzy query is confined by the panel's active toggle filters: "filtered" | "all".
-- `sessions_filter_counts_detached` (boolean, default `false`): Whether the sidebar's sessions toggle counts an unattached herdr row the same as a live session: an agent nothing is attached to, and, once `show_panes` is on, an agentless pane. Off keeps the toggle's original session-only behavior.
+- `sessions_filter_counts_detached` (boolean, default `false`): Whether the sidebar's sessions toggle counts an unattached herdr row the same as a live session: an agent nothing is attached to, and, once `show_panes` is on, an agentless pane. Off keeps the toggle's original session-only behavior, and those rows stay hidden even under a workspace a live session keeps.
 - `sidebar_accent` (string): Accent for selected rows and focus outlines. Unset uses the palette's `normal.blue`.
 - `sidebar_attention` (string): Badge color for a session asking to be looked at. Unset uses the palette's `normal.yellow`.
 - `sidebar_background` (string): Sidebar background. Unset derives it from the terminal palette.

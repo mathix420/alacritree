@@ -410,6 +410,7 @@ impl NamedAction {
         matches!(
             self,
             Self::ToggleSessionsFilter(_)
+                | Self::ToggleDetachedSessionsFilter(_)
                 | Self::ToggleAttentionFilter(_)
                 | Self::TogglePrOpenFilter(_)
                 | Self::TogglePrDraftFilter(_)
@@ -2155,8 +2156,9 @@ mod tests {
         ));
     }
 
-    const PROJECT_FILTER_ACTIONS: [NamedAction; 7] = [
+    const PROJECT_FILTER_ACTIONS: [NamedAction; 8] = [
         NamedAction::ToggleSessionsFilter(action::ToggleSessionsFilter),
+        NamedAction::ToggleDetachedSessionsFilter(action::ToggleDetachedSessionsFilter),
         NamedAction::ToggleAttentionFilter(action::ToggleAttentionFilter),
         NamedAction::TogglePrOpenFilter(action::TogglePrOpenFilter),
         NamedAction::TogglePrDraftFilter(action::TogglePrDraftFilter),

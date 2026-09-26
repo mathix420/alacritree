@@ -84,10 +84,10 @@ use sidebar::{
 };
 use widgets::{
     ATTENTION_HINT, ICON_CLUSTER_SPACING, IconHints, ROW_STATUS_ICON_W, RowStatus,
-    apply_scrollbar_style, attention_mark, braille_loader, icon_tooltip, name_tooltip,
-    paint_cursor_outline, paint_row_status_icon, paint_status_mark, path_text, resolve_icon,
-    row_status_icon_size, row_with_trailing, session_status_mark, styled_icon_button,
-    truncating_label,
+    apply_scrollbar_style, attention_mark, braille_loader, framed_button, icon_tooltip,
+    name_tooltip, paint_cursor_outline, paint_row_status_icon, paint_status_mark, path_text,
+    resolve_icon, row_status_icon_size, row_with_trailing, session_status_mark,
+    sidebar_scroll_area, styled_icon_button, truncating_label,
 };
 
 #[derive(Clone, Copy)]
@@ -2565,21 +2565,22 @@ enum SidebarNavStep {
 }
 
 /// Panel title plus its filter chrome, shared by both sidebars: the heading,
-/// then `[s]`-style chips for each active toggle, then a bordered
+/// then an `[s]`-style chip for each of `chips`, then a bordered
 /// `<icon> query▌` input box while searching (`search_icon` comes from
 /// `[ui] search_icon`).  Renders only the title when the filter is idle.
 fn panel_header_filter_ui(
     ui: &mut egui::Ui,
     title: &str,
     filter: &PanelFilter,
+    chips: impl IntoIterator<Item = impl std::fmt::Display>,
     search_icon: &IconStyle<Color32>,
     theme: &Theme,
     toggles_apply: bool,
 ) {
     ui.label(RichText::new(title).color(theme.text).strong());
     let chip = if toggles_apply { theme.accent } else { theme.text_muted };
-    for key in filter.active_toggles() {
-        ui.label(RichText::new(format!("[{key}]")).color(chip).monospace().small());
+    for label in chips {
+        ui.label(RichText::new(format!("[{label}]")).color(chip).monospace().small());
     }
     if filter.mode() == panel_filter::Mode::Search || !filter.query().is_empty() {
         let s = theme.ui_scale;
@@ -7509,6 +7510,32 @@ mod tests {
         assert!(sessions_filter_passes(&[], &listed, &wt, true));
     }
 
+    /// A workspace an attached session lets through the sessions filter must
+    /// not bring its detached panes along unless the filter counts them.
+    #[test]
+    fn sessions_filter_lists_detached_panes_only_when_it_counts_them() {
+        let mut app = test_app();
+        let id = app.sessions[0].id;
+        let pane = herdr_pane_key(Side::Native, "term_home");
+        let listed = sidebar_nav::ListedRows::from([(None, vec![
+            sidebar_nav::WorkspaceEntry::Session(id),
+            sidebar_nav::WorkspaceEntry::Pane(pane.clone()),
+        ])]);
+        app.sidebar.filter.toggle('s');
+
+        assert_eq!(app.build_project_rows(&listed), vec![
+            SidebarRow::Home,
+            SidebarRow::Session(id)
+        ]);
+
+        app.sessions_filter_counts_detached = true;
+        assert_eq!(app.build_project_rows(&listed), vec![
+            SidebarRow::Home,
+            SidebarRow::Session(id),
+            SidebarRow::Pane(pane),
+        ]);
+    }
+
     #[test]
     fn sessions_filter_fails_a_workspace_with_neither_session_nor_agent() {
         let wt = ws("/a/wt1");
@@ -8013,12 +8040,103 @@ mod tests {
         let ctx = egui::Context::default();
         let output = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                panel_header_filter_ui(ui, "Projects", &filter, &icons.search, &theme, true);
+                panel_header_filter_ui(
+                    ui,
+                    "Projects",
+                    &filter,
+                    filter.active_toggles(),
+                    &icons.search,
+                    &theme,
+                    true,
+                );
             });
         });
         let (_, size, _) = painted_glyph_style(&output.shapes, DEFAULT_SEARCH_ICON.as_str())
             .expect("the search icon painted");
         assert_eq!(size, theme.font_normal);
+    }
+
+    const PROJECT_SIDEBAR_HEIGHT: f32 = 400.0;
+
+    /// The shapes of the last of `frames` frames of the projects sidebar,
+    /// painted a second apart so a scroll animation has settled.
+    fn project_sidebar_shapes(
+        app: &mut AlacritreeApp,
+        frames: usize,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let ctx = egui::Context::default();
+        let mut shapes = Vec::new();
+        for frame in 0..frames {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::new(800.0, PROJECT_SIDEBAR_HEIGHT),
+                )),
+                time: Some(frame as f64),
+                ..Default::default()
+            };
+            shapes = ctx
+                .run(input, |ctx| {
+                    app.show_project_sidebar(ctx, egui::Frame::default());
+                })
+                .shapes;
+        }
+        shapes
+    }
+
+    /// The texts one frame of the projects sidebar paints.
+    fn project_sidebar_texts(app: &mut AlacritreeApp) -> Vec<String> {
+        painted_texts(&project_sidebar_shapes(app, 1)).into_iter().map(|(text, _)| text).collect()
+    }
+
+    /// egui clamps a scroll to its content, so without room past either end
+    /// the first row could never reach the middle of the panel.
+    #[test]
+    fn a_centering_sidebar_centers_its_first_row() {
+        let mut app = test_app();
+        app.config.ui.sidebar_scroll_align = crate::config::ScrollAlign::Center;
+        app.theme = Theme::from_config(&app.config);
+        app.focus = PaneFocus::ProjectsSidebar;
+        app.sidebar.model.pin_cursor(SidebarRow::Home);
+
+        let at = painted_glyph_positions(&project_sidebar_shapes(&mut app, 4));
+        let rows_top = at["Projects"].y;
+        let middle = (rows_top + PROJECT_SIDEBAR_HEIGHT) / 2.0;
+        let home = at["Home"].y;
+        assert!((home - middle).abs() < 20.0, "Home sits at {home}, the middle is near {middle}");
+    }
+
+    /// The room past the top is there to scroll into, not to open on.
+    #[test]
+    fn a_centering_sidebar_opens_at_its_first_row() {
+        let mut app = test_app();
+        app.config.ui.sidebar_scroll_align = crate::config::ScrollAlign::Center;
+        app.theme = Theme::from_config(&app.config);
+
+        let at = painted_glyph_positions(&project_sidebar_shapes(&mut app, 2));
+        assert!(at["Home"].y - at["Projects"].y < 40.0, "{at:?}");
+    }
+
+    #[test]
+    fn the_projects_header_marks_a_sessions_filter_that_counts_detached_panes() {
+        let mut app = test_app();
+        app.sidebar.filter.toggle('s');
+        app.sessions_filter_counts_detached = true;
+        let texts = project_sidebar_texts(&mut app);
+        let s = texts.iter().position(|t| t == "[s]").expect("the [s] chip painted");
+        assert_eq!(texts.get(s + 1).map(String::as_str), Some("[detached]"), "{texts:?}");
+
+        app.sessions_filter_counts_detached = false;
+        assert!(!project_sidebar_texts(&mut app).contains(&"[detached]".to_owned()));
+    }
+
+    /// Counting detached panes changes nothing until the sessions filter is
+    /// on, so the header has nothing to mark.
+    #[test]
+    fn the_projects_header_leaves_detached_unmarked_without_the_sessions_filter() {
+        let mut app = test_app();
+        app.sessions_filter_counts_detached = true;
+        assert!(!project_sidebar_texts(&mut app).contains(&"[detached]".to_owned()));
     }
 
     /// Every action button shares the same 16x16 slot while painting a
@@ -9465,6 +9583,29 @@ mod tests {
             BindingAction::Named(NamedAction::ToggleModifiedFilter(action::ToggleModifiedFilter));
         assert!(!valid_for_focus(&projects_action, scope()));
         assert!(!valid_for_focus(&git_action, scope()));
+    }
+
+    /// Bound to a bare letter like the other projects filters, the detached
+    /// toggle must leave that letter to the terminal.
+    #[test]
+    fn a_bound_detached_toggle_fires_only_in_the_projects_sidebar() {
+        let bindings = crate::bindings::parse_bindings(vec![crate::bindings::RawBinding {
+            key: "X".into(),
+            mods: None,
+            mode: None,
+            chars: None,
+            action: Some("ToggleDetachedSessionsFilter".into()),
+            command: None,
+        }]);
+        let shortcuts = crate::shortcut::Shortcuts::new(&bindings);
+        let fires = |scope| {
+            let matched = shortcuts.matches(egui::Key::X, egui::Modifiers::NONE);
+            !dispatched_actions(matched, scope).is_empty()
+        };
+
+        assert!(fires(BindingScope { sidebar_focused: true, ..scope() }));
+        assert!(!fires(scope()), "the terminal keeps its key");
+        assert!(!fires(BindingScope { git_focused: true, ..scope() }));
     }
 
     /// `ScrollPageUp` is unscoped by pane focus, so only the scratchpad

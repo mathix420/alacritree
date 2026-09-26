@@ -84,6 +84,24 @@ impl AlacritreeApp {
         let any_pr = pr_open || pr_draft || pr_merged || pr_closed;
         let any_toggle = any_project_toggle_active(toggle_sessions, toggle_attention, any_pr);
 
+        // A detached pane the sessions filter does not count must not ride in
+        // under a workspace an attached session let through.
+        let attached_only: sidebar_nav::ListedRows;
+        let listed = if toggle_sessions && !self.sessions_filter_counts_detached {
+            attached_only = listed
+                .iter()
+                .map(|(ws, entries)| {
+                    (
+                        ws.clone(),
+                        entries.iter().filter(|e| e.session().is_some()).cloned().collect(),
+                    )
+                })
+                .collect();
+            &attached_only
+        } else {
+            listed
+        };
+
         // Precompute every fuzzy result before building the closures: the
         // matcher needs `&mut self.sidebar.filter`, and releasing that borrow
         // up-front lets the predicates read the rest of `&self` freely.
@@ -226,6 +244,10 @@ impl AlacritreeApp {
                         ui,
                         "Projects",
                         &self.sidebar.filter,
+                        project_filter_chips(
+                            &self.sidebar.filter,
+                            self.sessions_filter_counts_detached,
+                        ),
                         &paint.icons.search,
                         &theme,
                         self.sidebar.filter.toggles_apply(self.sidebar_focus_state.search_scope),
@@ -234,7 +256,7 @@ impl AlacritreeApp {
                 });
                 ui.separator();
 
-                ScrollArea::vertical().show(ui, |ui| {
+                sidebar_scroll_area(ui, theme.scroll_align, |ui| {
                     // Inter-group spacing is emitted above the group that
                     // follows, never after the last one: trailing padding
                     // makes the content measure taller than the rows on
@@ -2227,6 +2249,20 @@ pub(super) fn sessions_filter_passes(
             && listed.get(key).is_some_and(|entries| {
                 entries.iter().any(|e| matches!(e, sidebar_nav::WorkspaceEntry::Pane(_)))
             }))
+}
+
+/// The chips the projects header shows for its active toggles.  Counting
+/// detached panes is app state rather than a toggle, and it changes nothing
+/// until the sessions filter is on, so its chip rides right after `[s]`.
+pub(super) fn project_filter_chips(filter: &PanelFilter, counts_detached: bool) -> Vec<String> {
+    let mut chips = Vec::new();
+    for key in filter.active_toggles() {
+        chips.push(key.to_string());
+        if key == 's' && counts_detached {
+            chips.push("detached".to_owned());
+        }
+    }
+    chips
 }
 
 /// The toggle identities the projects panel accepts.  The PR identities exist
