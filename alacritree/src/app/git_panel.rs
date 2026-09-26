@@ -434,6 +434,7 @@ impl AlacritreeApp {
                         ui,
                         "Git",
                         &self.git_panel.filter,
+                        self.git_panel.filter.active_toggles(),
                         &self.icons.search,
                         &theme,
                         self.git_panel.filter.toggles_apply(self.sidebar_focus_state.search_scope),

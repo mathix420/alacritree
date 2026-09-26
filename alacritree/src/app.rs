@@ -2565,21 +2565,22 @@ enum SidebarNavStep {
 }
 
 /// Panel title plus its filter chrome, shared by both sidebars: the heading,
-/// then `[s]`-style chips for each active toggle, then a bordered
+/// then an `[s]`-style chip for each of `chips`, then a bordered
 /// `<icon> query▌` input box while searching (`search_icon` comes from
 /// `[ui] search_icon`).  Renders only the title when the filter is idle.
 fn panel_header_filter_ui(
     ui: &mut egui::Ui,
     title: &str,
     filter: &PanelFilter,
+    chips: impl IntoIterator<Item = impl std::fmt::Display>,
     search_icon: &IconStyle<Color32>,
     theme: &Theme,
     toggles_apply: bool,
 ) {
     ui.label(RichText::new(title).color(theme.text).strong());
     let chip = if toggles_apply { theme.accent } else { theme.text_muted };
-    for key in filter.active_toggles() {
-        ui.label(RichText::new(format!("[{key}]")).color(chip).monospace().small());
+    for label in chips {
+        ui.label(RichText::new(format!("[{label}]")).color(chip).monospace().small());
     }
     if filter.mode() == panel_filter::Mode::Search || !filter.query().is_empty() {
         let s = theme.ui_scale;
@@ -8013,12 +8014,58 @@ mod tests {
         let ctx = egui::Context::default();
         let output = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                panel_header_filter_ui(ui, "Projects", &filter, &icons.search, &theme, true);
+                panel_header_filter_ui(
+                    ui,
+                    "Projects",
+                    &filter,
+                    filter.active_toggles(),
+                    &icons.search,
+                    &theme,
+                    true,
+                );
             });
         });
         let (_, size, _) = painted_glyph_style(&output.shapes, DEFAULT_SEARCH_ICON.as_str())
             .expect("the search icon painted");
         assert_eq!(size, theme.font_normal);
+    }
+
+    /// The texts one frame of the projects sidebar paints.
+    fn project_sidebar_texts(app: &mut AlacritreeApp) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(800.0, 400.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| {
+            app.show_project_sidebar(ctx, egui::Frame::default());
+        });
+        painted_texts(&output.shapes).into_iter().map(|(text, _)| text).collect()
+    }
+
+    #[test]
+    fn the_projects_header_marks_a_sessions_filter_that_counts_detached_panes() {
+        let mut app = test_app();
+        app.sidebar.filter.toggle('s');
+        app.sessions_filter_counts_detached = true;
+        let texts = project_sidebar_texts(&mut app);
+        let s = texts.iter().position(|t| t == "[s]").expect("the [s] chip painted");
+        assert_eq!(texts.get(s + 1).map(String::as_str), Some("[detached]"), "{texts:?}");
+
+        app.sessions_filter_counts_detached = false;
+        assert!(!project_sidebar_texts(&mut app).contains(&"[detached]".to_owned()));
+    }
+
+    /// Counting detached panes changes nothing until the sessions filter is
+    /// on, so the header has nothing to mark.
+    #[test]
+    fn the_projects_header_leaves_detached_unmarked_without_the_sessions_filter() {
+        let mut app = test_app();
+        app.sessions_filter_counts_detached = true;
+        assert!(!project_sidebar_texts(&mut app).contains(&"[detached]".to_owned()));
     }
 
     /// Every action button shares the same 16x16 slot while painting a

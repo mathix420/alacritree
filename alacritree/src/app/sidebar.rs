@@ -226,6 +226,10 @@ impl AlacritreeApp {
                         ui,
                         "Projects",
                         &self.sidebar.filter,
+                        project_filter_chips(
+                            &self.sidebar.filter,
+                            self.sessions_filter_counts_detached,
+                        ),
                         &paint.icons.search,
                         &theme,
                         self.sidebar.filter.toggles_apply(self.sidebar_focus_state.search_scope),
@@ -2227,6 +2231,20 @@ pub(super) fn sessions_filter_passes(
             && listed.get(key).is_some_and(|entries| {
                 entries.iter().any(|e| matches!(e, sidebar_nav::WorkspaceEntry::Pane(_)))
             }))
+}
+
+/// The chips the projects header shows for its active toggles.  Counting
+/// detached panes is app state rather than a toggle, and it changes nothing
+/// until the sessions filter is on, so its chip rides right after `[s]`.
+pub(super) fn project_filter_chips(filter: &PanelFilter, counts_detached: bool) -> Vec<String> {
+    let mut chips = Vec::new();
+    for key in filter.active_toggles() {
+        chips.push(key.to_string());
+        if key == 's' && counts_detached {
+            chips.push("detached".to_owned());
+        }
+    }
+    chips
 }
 
 /// The toggle identities the projects panel accepts.  The PR identities exist
