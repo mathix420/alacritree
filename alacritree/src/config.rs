@@ -892,8 +892,8 @@ pub enum ScrollAlign {
     /// view, which leaves it against whichever edge it entered from.
     #[default]
     Minimal,
-    /// Park the row in the middle of the panel.  egui clamps to the scroll
-    /// range, so a short list stays put instead of overscrolling.
+    /// Park the row in the middle of the panel.  The list scrolls past its
+    /// first and last rows to do so, leaving blank space above or below.
     Center,
 }
 

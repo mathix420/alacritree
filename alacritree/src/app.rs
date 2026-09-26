@@ -86,8 +86,8 @@ use widgets::{
     ATTENTION_HINT, ICON_CLUSTER_SPACING, IconHints, ROW_STATUS_ICON_W, RowStatus,
     apply_scrollbar_style, attention_mark, braille_loader, framed_button, icon_tooltip,
     name_tooltip, paint_cursor_outline, paint_row_status_icon, paint_status_mark, path_text,
-    resolve_icon, row_status_icon_size, row_with_trailing, session_status_mark, styled_icon_button,
-    truncating_label,
+    resolve_icon, row_status_icon_size, row_with_trailing, session_status_mark,
+    sidebar_scroll_area, styled_icon_button, truncating_label,
 };
 
 #[derive(Clone, Copy)]
@@ -8056,20 +8056,65 @@ mod tests {
         assert_eq!(size, theme.font_normal);
     }
 
+    const PROJECT_SIDEBAR_HEIGHT: f32 = 400.0;
+
+    /// The shapes of the last of `frames` frames of the projects sidebar,
+    /// painted a second apart so a scroll animation has settled.
+    fn project_sidebar_shapes(
+        app: &mut AlacritreeApp,
+        frames: usize,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let ctx = egui::Context::default();
+        let mut shapes = Vec::new();
+        for frame in 0..frames {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::new(800.0, PROJECT_SIDEBAR_HEIGHT),
+                )),
+                time: Some(frame as f64),
+                ..Default::default()
+            };
+            shapes = ctx
+                .run(input, |ctx| {
+                    app.show_project_sidebar(ctx, egui::Frame::default());
+                })
+                .shapes;
+        }
+        shapes
+    }
+
     /// The texts one frame of the projects sidebar paints.
     fn project_sidebar_texts(app: &mut AlacritreeApp) -> Vec<String> {
-        let ctx = egui::Context::default();
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::Vec2::new(800.0, 400.0),
-            )),
-            ..Default::default()
-        };
-        let output = ctx.run(input, |ctx| {
-            app.show_project_sidebar(ctx, egui::Frame::default());
-        });
-        painted_texts(&output.shapes).into_iter().map(|(text, _)| text).collect()
+        painted_texts(&project_sidebar_shapes(app, 1)).into_iter().map(|(text, _)| text).collect()
+    }
+
+    /// egui clamps a scroll to its content, so without room past either end
+    /// the first row could never reach the middle of the panel.
+    #[test]
+    fn a_centering_sidebar_centers_its_first_row() {
+        let mut app = test_app();
+        app.config.ui.sidebar_scroll_align = crate::config::ScrollAlign::Center;
+        app.theme = Theme::from_config(&app.config);
+        app.focus = PaneFocus::ProjectsSidebar;
+        app.sidebar.model.pin_cursor(SidebarRow::Home);
+
+        let at = painted_glyph_positions(&project_sidebar_shapes(&mut app, 4));
+        let rows_top = at["Projects"].y;
+        let middle = (rows_top + PROJECT_SIDEBAR_HEIGHT) / 2.0;
+        let home = at["Home"].y;
+        assert!((home - middle).abs() < 20.0, "Home sits at {home}, the middle is near {middle}");
+    }
+
+    /// The room past the top is there to scroll into, not to open on.
+    #[test]
+    fn a_centering_sidebar_opens_at_its_first_row() {
+        let mut app = test_app();
+        app.config.ui.sidebar_scroll_align = crate::config::ScrollAlign::Center;
+        app.theme = Theme::from_config(&app.config);
+
+        let at = painted_glyph_positions(&project_sidebar_shapes(&mut app, 2));
+        assert!(at["Home"].y - at["Projects"].y < 40.0, "{at:?}");
     }
 
     #[test]

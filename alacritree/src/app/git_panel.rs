@@ -560,7 +560,7 @@ fn paint_git_sidebar_status(
     requests: &mut GitSidebarRequests,
 ) {
     let theme = &view.theme;
-    ScrollArea::vertical().show(ui, |ui| {
+    sidebar_scroll_area(ui, theme.scroll_align, |ui| {
         if let Some(err) = &view.error {
             ui.label(RichText::new(err).color(view.theme.error).small());
             return;

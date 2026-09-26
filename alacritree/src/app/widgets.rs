@@ -458,6 +458,37 @@ where
     .rect
 }
 
+/// A sidebar's vertical scroll area.  egui clamps a scroll to the content, so
+/// under a centering `scroll_align` the content gets room past each end, or
+/// the rows near either end could never reach the middle.  The area first
+/// opens scrolled past the top room, at its first row.
+pub(super) fn sidebar_scroll_area(
+    ui: &mut egui::Ui,
+    scroll_align: Option<egui::Align>,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    if scroll_align != Some(egui::Align::Center) {
+        ScrollArea::vertical().show(ui, add_contents);
+        return;
+    }
+    let beyond_last_row = (ui.available_height() - ui.spacing().interact_size.y).max(0.0);
+    let top_room = beyond_last_row / 2.0;
+    let opened = ui.make_persistent_id("centering_sidebar_scroll_opened");
+    let first_show = ui.ctx().data_mut(|d| d.get_temp::<()>(opened).is_none());
+    let mut area = ScrollArea::vertical();
+    if first_show {
+        ui.ctx().data_mut(|d| d.insert_temp(opened, ()));
+        area = area.vertical_scroll_offset(top_room);
+    }
+    area.show(ui, |ui| {
+        ui.add_space(top_room);
+        add_contents(ui);
+        // A whole panel less one row, not half: a list shorter than the
+        // panel still needs the range to rest scrolled past the top room.
+        ui.add_space(beyond_last_row);
+    });
+}
+
 /// Apply the configured sidebar scrollbar style to a panel's `Ui`.
 ///
 /// `Solid` reserves a gutter right of the content instead of egui's floating

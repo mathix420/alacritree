@@ -256,7 +256,7 @@ impl AlacritreeApp {
                 });
                 ui.separator();
 
-                ScrollArea::vertical().show(ui, |ui| {
+                sidebar_scroll_area(ui, theme.scroll_align, |ui| {
                     // Inter-group spacing is emitted above the group that
                     // follows, never after the last one: trailing padding
                     // makes the content measure taller than the rows on
