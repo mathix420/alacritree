@@ -24,6 +24,7 @@ use alacritree_tasks::{Edit, Filter, NodeMatch, Status, Task, TaskBackend, TaskE
 use crate::projects::Project;
 use crate::tasks::backend::{self, Backend};
 use crate::tasks::facts;
+use crate::vcs::Vcs;
 
 const RELOAD_EVERY: Duration = Duration::from_secs(1);
 const INDENT: f32 = 16.0;
@@ -37,28 +38,35 @@ pub(crate) struct Scope {
 }
 
 impl Scope {
-    /// The names the sidebar already has, so the tab opens without waiting
-    /// on git. `adopt` replaces them once git has answered.
+    /// The names git would give, worked out from what discovery recorded, so
+    /// the tab opens without waiting on git. `adopt` replaces them once git
+    /// has answered.
     pub(crate) fn for_workspace(project: Option<&Project>, worktree: Option<&Checkout>) -> Self {
         let side = match project.map(|p| wsl::classify(&p.root)) {
             Some(wsl::Location::Wsl { distro, .. }) => Side::Wsl(distro),
             _ => Side::Native,
         };
-        let workspace = project.zip(worktree).map(|(p, wt)| {
-            let branch = wt.head.label().map_or_else(|| wt.name.clone(), str::to_string);
-            node(&Place::Workspace { repo: p.name.clone(), branch }, None)
-        });
-        let repo = project.map(|p| node(&Place::Project { repo: p.name.clone() }, None));
-        Self { side, repo, workspace }
+        let mut scope = Self { side, repo: None, workspace: None };
+        if let Some(project) = project {
+            scope.adopt(&facts::place_of(project, worktree));
+        }
+        scope
     }
 
     /// Takes the names `task scope` gives the worktree, which follow git's
     /// own view of a detached or shared checkout where the sidebar's labels
     /// do not.
     pub(crate) fn adopt(&mut self, place: &Place) {
-        if let Place::Workspace { repo, .. } = place {
-            self.repo = Some(node(&Place::Project { repo: repo.clone() }, None));
-            self.workspace = Some(node(place, None));
+        match place {
+            Place::Global => {},
+            Place::Project { .. } => {
+                self.repo = Some(node(place, None));
+                self.workspace = None;
+            },
+            Place::Workspace { repo, .. } => {
+                self.repo = Some(node(&Place::Project { repo: repo.clone() }, None));
+                self.workspace = Some(node(place, None));
+            },
         }
     }
 
@@ -67,6 +75,63 @@ impl Scope {
     pub(crate) fn filter(&self) -> Filter {
         let repo = self.repo.iter().map(|repo| NodeMatch::Subtree(repo.clone()));
         Filter { nodes: repo.chain([NodeMatch::Exact(GLOBAL.to_string())]).collect() }
+    }
+}
+
+const FIRST_RETRY: Duration = Duration::from_secs(1);
+const LAST_RETRY: Duration = Duration::from_secs(60);
+
+/// Asks version control for a worktree's names until it answers. The tab
+/// gets a worktree only when its project has a backend, so an answer of
+/// `Global` means the backend could not be asked, as when `wsl.exe` fails,
+/// and not that the worktree is in no repository.
+struct Resolver {
+    dir: PathBuf,
+    backends: Vec<Vcs>,
+    /// `None` between a failed lookup and its retry.
+    lookup: Option<Job<Place>>,
+    retry_at: Instant,
+    backoff: Duration,
+}
+
+impl Resolver {
+    fn new(dir: PathBuf, backends: Vec<Vcs>) -> Self {
+        let mut resolver =
+            Self { dir, backends, lookup: None, retry_at: Instant::now(), backoff: FIRST_RETRY };
+        resolver.lookup = Some(resolver.spawn());
+        resolver
+    }
+
+    fn spawn(&self) -> Job<Place> {
+        let (dir, backends) = (self.dir.clone(), self.backends.clone());
+        jobs::pool().spawn(Priority::Interactive, move |b| facts::place_for(&dir, &backends, b).1)
+    }
+
+    fn poll(&mut self, now: Instant) -> Option<Place> {
+        let Some(job) = &self.lookup else {
+            if now >= self.retry_at {
+                self.lookup = Some(self.spawn());
+            }
+            return None;
+        };
+        match job.poll() {
+            Some(Place::Global) => {},
+            Some(place) => {
+                self.lookup = None;
+                return Some(place);
+            },
+            None if job.failed() => {},
+            None => return None,
+        }
+        log::warn!(
+            "tasks: no repository found for {}, asking again in {:?}",
+            self.dir.display(),
+            self.backoff
+        );
+        self.lookup = None;
+        self.retry_at = now + self.backoff;
+        self.backoff = (self.backoff * 2).min(LAST_RETRY);
+        None
     }
 }
 
@@ -94,7 +159,7 @@ pub(crate) struct TasksView {
     backend: Backend,
     scope: Scope,
     /// The worktree's names as `task scope` reads them from git.
-    resolving: Option<Job<Place>>,
+    resolving: Option<Resolver>,
     tasks: Vec<Task>,
     load_error: Option<String>,
     /// A failed add has no row to show on; it stays until the next write.
@@ -128,12 +193,9 @@ impl TasksView {
         backend: Backend,
         scope: Scope,
         worktree: Option<PathBuf>,
-        backends: Vec<crate::vcs::Vcs>,
+        backends: Vec<Vcs>,
     ) -> Self {
-        let resolving = worktree.map(|dir| {
-            jobs::pool()
-                .spawn(Priority::Interactive, move |b| facts::place_for(&dir, &backends, b).1)
-        });
+        let resolving = worktree.map(|dir| Resolver::new(dir, backends));
         Self {
             backend,
             scope,
@@ -264,7 +326,7 @@ impl TasksView {
     /// Spawns queued writes, drains finished jobs, and reloads after any
     /// write or once a second.
     fn tick(&mut self) {
-        if let Some(place) = self.resolving.as_ref().and_then(Job::poll) {
+        if let Some(place) = self.resolving.as_mut().and_then(|r| r.poll(Instant::now())) {
             self.resolving = None;
             self.scope.adopt(&place);
             self.stale = true;
@@ -292,6 +354,8 @@ impl TasksView {
         {
             self.reload = None;
             self.finish_reload(epoch, result);
+        } else if self.reload.as_ref().is_some_and(|(_, job)| job.failed()) {
+            self.reload = None;
         }
         let due = self.last_reload.is_none_or(|t| t.elapsed() >= RELOAD_EVERY);
         if self.reload.is_none() && (self.stale || due) {
@@ -686,6 +750,85 @@ mod tests {
         let p = project("C:/src/r", "r");
         let w = worktree("C:/src/wt/review", "review", None);
         assert_eq!(Scope::for_workspace(Some(&p), Some(&w)).workspace.as_deref(), Some("r.review"));
+    }
+
+    /// The first frame reads the nodes the store holds the tasks under, even
+    /// when the sidebar's names differ from git's and git never answers.
+    #[test]
+    fn the_first_scope_names_the_nodes_git_would() {
+        let main = worktree("C:/src/monorepo", "main", Some("trunk"));
+        let linked = worktree("C:/src/wt/feat", "feat", Some("feat/x"));
+        let detached = alacritree_vcs::Head {
+            name: None,
+            revision: Some("abc1234".into()),
+            ..Default::default()
+        };
+        let review = Checkout { head: detached, ..worktree("C:/src/wt/review", "review", None) };
+        let project = Project {
+            name: "feat".into(),
+            checkouts: vec![Checkout { is_main: true, ..main }, linked.clone(), review.clone()],
+            ..project("C:/src/wt/feat", "feat")
+        };
+        let git = |checkout: &Checkout| {
+            crate::tasks::facts::place_from(Some(&alacritree_vcs::Located {
+                main: PathBuf::from("C:/src/monorepo"),
+                bare: false,
+                checkout: Some(checkout.path.clone()),
+                head: checkout.head.clone(),
+            }))
+        };
+        for checkout in [&linked, &review] {
+            let seeded = Scope::for_workspace(Some(&project), Some(checkout));
+            let mut answered = seeded.clone();
+            answered.adopt(&git(checkout));
+            assert_eq!(seeded, answered, "{}", checkout.path.display());
+        }
+    }
+
+    /// Polls at `now` until the lookup in flight lands, the way frames do.
+    fn settle(resolver: &mut Resolver, now: Instant) -> Option<Place> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(place) = resolver.poll(now) {
+                return Some(place);
+            }
+            resolver.lookup.as_ref()?;
+            assert!(Instant::now() < deadline, "the lookup never landed");
+            std::thread::yield_now();
+        }
+    }
+
+    /// A worktree the sidebar placed in a repository is in one, so git
+    /// finding none means it could not be asked, and it is asked again.
+    #[test]
+    fn a_lookup_that_finds_no_repository_is_asked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("myrepo");
+        std::fs::create_dir(&path).unwrap();
+        let backends = vec![Vcs::Git(alacritree_git::GitBackend)];
+        let mut resolver = Resolver::new(path.clone(), backends);
+        let start = Instant::now();
+        assert_eq!(settle(&mut resolver, start), None, "no answer while git finds nothing");
+
+        alacritree_git::test_support::init_repo_on(&path, "trunk");
+        assert_eq!(settle(&mut resolver, start), None, "the retry waits");
+        let later = start + Duration::from_secs(3600);
+        assert_eq!(
+            settle(&mut resolver, later),
+            Some(Place::Workspace { repo: "myrepo".into(), branch: "trunk".into() })
+        );
+    }
+
+    /// A listing that panicked frees the slot, so the next due tick lists
+    /// again instead of waiting on it forever.
+    #[test]
+    fn a_listing_that_panicked_does_not_stop_reloads() {
+        let backend = Backend::from_config(&Default::default());
+        let mut view = TasksView::new(backend, Scope::for_workspace(None, None), None, Vec::new());
+        view.reload = Some((0, Job::panicked()));
+        view.last_reload = Some(Instant::now());
+        view.tick();
+        assert!(view.reload.is_none());
     }
 
     #[test]

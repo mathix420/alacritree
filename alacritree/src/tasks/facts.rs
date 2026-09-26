@@ -8,8 +8,9 @@ use alacritree_common::jobs::Blocking;
 use alacritree_common::side::Side;
 use alacritree_common::wsl;
 use alacritree_tasks::scope::Place;
-use alacritree_vcs::{Located, VersionControl};
+use alacritree_vcs::{Checkout, Located, VersionControl};
 
+use crate::projects::Project;
 use crate::vcs::Vcs;
 
 pub(crate) fn side_of(cwd: &Path) -> (Side, String) {
@@ -24,6 +25,20 @@ pub(crate) fn place_for(cwd: &Path, backends: &[Vcs], b: &Blocking) -> (Side, Pl
     let (side, _) = side_of(cwd);
     let located = backends.iter().find_map(|vcs| vcs.locate(cwd, b));
     (side, place_from(located.as_ref()))
+}
+
+/// What `place_from` answers for `worktree`, read from what discovery already
+/// recorded, so the tab can name its nodes before version control is asked.
+/// Discovery records no bare flag, so a bare repository keeps its `.git`
+/// suffix here until the lookup lands.
+pub(crate) fn place_of(project: &Project, worktree: Option<&Checkout>) -> Place {
+    let main = project.checkouts.iter().find(|c| c.is_main).map_or(&project.root, |c| &c.path);
+    place_from(Some(&Located {
+        main: main.clone(),
+        bare: false,
+        checkout: worktree.map(|wt| wt.path.clone()),
+        head: worktree.map(|wt| wt.head.clone()).unwrap_or_default(),
+    }))
 }
 
 fn normalize(path: &str) -> String {
